@@ -541,8 +541,6 @@ let () =
         else (
           let now = Unix.gettimeofday () in
           let runtime = now -. start_time in
-          (* Run a full major GC so live_words reflects current allocation. *)
-          Gc.full_major ();
           let s = Gc.stat () in
           let heap_mb = s.heap_words * (Sys.word_size / 8) / 1048576 in
           let live_kb = s.live_words * (Sys.word_size / 8) / 1024 in

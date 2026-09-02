@@ -505,6 +505,9 @@ let asset_domain_worker
       else None
     in
     let cached_fng_check_threshold = config.fng_check_threshold in
+    let wakeup_sync =
+      Concurrency.Exchange_wakeup.get_sync_handle asset_with_fees.symbol
+    in
     while Atomic.get state.is_running do
       let latency_this_cycle = !latency_active in
       if !cycle_count = 0 then Logging.debug_f ~section "First cycle for %s" key;
@@ -516,7 +519,7 @@ let asset_domain_worker
          landed mid-cycle (the lost-wakeup race that could stall a quiet
          symbol's domain indefinitely). *)
       let wake_baseline =
-        Concurrency.Exchange_wakeup.get_generation ~symbol:asset_with_fees.symbol
+        Concurrency.Exchange_wakeup.get_generation_fast wakeup_sync
       in
       let cycle_events = ref 0 in
       let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
@@ -1471,8 +1474,8 @@ let asset_domain_worker
             the cycle can no longer be lost to the park. *)
       if (not !should_execute_strategy) || not (has_exec_fn ())
       then
-        Concurrency.Exchange_wakeup.wait_since
-          ~symbol:asset_with_fees.symbol
+        Concurrency.Exchange_wakeup.wait_since_fast
+          wakeup_sync
           ~since:wake_baseline;
       if !exec_ready && (not !latency_active) && !cycle_count - !exec_ready_cycle >= 10
       then (

@@ -6,7 +6,7 @@
   "cycle_mod": 10000,
   "fng_check_threshold": 2.5,
   "gc": {
-    "minor_heap_size": 33554432,
+    "minor_heap_size": 2097152,
     "space_overhead": 120,
     "max_overhead": 1000000,
     "window_size": 10,
@@ -35,7 +35,7 @@
     {
       "symbol": "BTC/USDC",
       "exchange": "hyperliquid",
-      "qty": "0.0002",
+      "qty": "0.00025",
       "grid_interval": [
         0.10,
         0.35
@@ -90,7 +90,7 @@
       "qty": "0.008",
       "grid_interval": [
         2.5,
-        5.0
+        10.0
       ],
       "sell_mult": "0.97",
       "accumulation_buffer": [
@@ -106,7 +106,7 @@
       "qty": "0.15",
       "grid_interval": [
         2.5,
-        5.0
+        10.0
       ],
       "sell_mult": "0.97",
       "accumulation_buffer": [

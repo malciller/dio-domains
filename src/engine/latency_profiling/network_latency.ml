@@ -32,40 +32,60 @@ type t =
 let profilers : (string, t) Hashtbl.t = Hashtbl.create 8
 let mutex = Mutex.create ()
 
-let venue_profilers venue =
-  Mutex.lock mutex;
-  let p =
-    match Hashtbl.find_opt profilers venue with
-    | Some p -> p
-    | None ->
-      let p =
-        { ping =
-            Latency_profiler.create
-              ~bucket_us:1
-              ~max_latency_us:2_000_000
-              (venue ^ ":ws_ping")
-        ; feed =
-            Latency_profiler.create
-              ~bucket_us:100
-              ~max_latency_us:2_000_000
-              (venue ^ ":ws_feed")
-        ; rest =
-            Latency_profiler.create
-              ~bucket_us:100
-              ~max_latency_us:2_000_000
-              (venue ^ ":rest_request")
-        ; signer =
-            Latency_profiler.create
-              ~bucket_us:1
-              ~max_latency_us:100_000
-              (venue ^ ":signer")
-        }
-      in
-      Hashtbl.replace profilers venue p;
-      p
-  in
-  Mutex.unlock mutex;
-  p
+let create_venue_profilers venue =
+  { ping =
+      Latency_profiler.create
+        ~bucket_us:1
+        ~max_latency_us:2_000_000
+        (venue ^ ":ws_ping")
+  ; feed =
+      Latency_profiler.create
+        ~bucket_us:100
+        ~max_latency_us:2_000_000
+        (venue ^ ":ws_feed")
+  ; rest =
+      Latency_profiler.create
+        ~bucket_us:100
+        ~max_latency_us:2_000_000
+        (venue ^ ":rest_request")
+  ; signer =
+      Latency_profiler.create
+        ~bucket_us:1
+        ~max_latency_us:100_000
+        (venue ^ ":signer")
+  }
+;;
+
+let hl_profilers = create_venue_profilers "hyperliquid"
+let kraken_profilers = create_venue_profilers "kraken"
+let lighter_profilers = create_venue_profilers "lighter"
+let alpaca_profilers = create_venue_profilers "alpaca"
+
+let () =
+  Hashtbl.replace profilers "hyperliquid" hl_profilers;
+  Hashtbl.replace profilers "kraken" kraken_profilers;
+  Hashtbl.replace profilers "lighter" lighter_profilers;
+  Hashtbl.replace profilers "alpaca" alpaca_profilers
+;;
+
+let[@inline always] venue_profilers venue =
+  match venue with
+  | "hyperliquid" -> hl_profilers
+  | "kraken" -> kraken_profilers
+  | "lighter" -> lighter_profilers
+  | "alpaca" -> alpaca_profilers
+  | _ ->
+    Mutex.lock mutex;
+    let p =
+      match Hashtbl.find_opt profilers venue with
+      | Some p -> p
+      | None ->
+        let p = create_venue_profilers venue in
+        Hashtbl.replace profilers venue p;
+        p
+    in
+    Mutex.unlock mutex;
+    p
 ;;
 
 (** A span of [seconds] (wall clock delta), for call sites that time with

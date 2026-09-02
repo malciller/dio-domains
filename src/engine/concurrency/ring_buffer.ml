@@ -8,45 +8,69 @@
     Positions are ABSOLUTE and monotonic: [write_pos] counts total writes
     and never wraps. Consumer cursors returned by [get_position] /
     [iter_since] / [read_since] stay valid for the lifetime of the buffer,
-    including across laps and [clear]. This fixes the previous design where
-    positions were taken modulo capacity: a slow consumer whose producer
-    lapped it could observe aliased positions (empty-looking buffers with
-    dropped events) and re-read overwritten slots as new events.
+    including across laps and [clear].
 
     Lap policy: a reader starting behind [write_pos - size] resumes at the
     oldest surviving entry; evicted entries are skipped deterministically.
     During iteration, a slot whose stored sequence number does not match
     the expected position was overwritten mid-iteration (the reader is being
     lapped live) and is skipped rather than mis-delivered.
+
+    Performance: Slots are pre-allocated mutable records, making [write]
+    completely allocation-free (zero minor heap allocation). Power-of-two
+    capacities bypass integer division with bitwise masking.
 *)
 
 (** Fixed-capacity circular buffer parameterized over element type. *)
 module RingBuffer = struct
+  type 'a slot =
+    { mutable value : 'a
+    ; seq : int Atomic.t
+      (** Absolute sequence number of the write that produced this slot. *)
+    }
+
   type 'a t =
-    { data : ('a * int) option Atomic.t array
-      (** Each slot carries the absolute sequence number of the write that
-          produced it, so readers can distinguish intact entries from slots
-          overwritten by a racing writer. *)
+    { slots : 'a slot array
     ; write_pos : int Atomic.t (** Total writes ever performed; never resets. *)
     ; size : int
+    ; mask : int (** Non-negative mask if size is a power of 2, else -1 *)
     }
 
   (** [create size] allocates a ring buffer with [size] slots.
       @raise Invalid_argument if [size <= 0]. *)
   let create size =
     if size <= 0 then invalid_arg "RingBuffer.create: size must be positive";
-    { data = Array.init size (fun _ -> Atomic.make None)
+    let is_pow2 = (size land (size - 1)) = 0 in
+    let mask = if is_pow2 then size - 1 else -1 in
+    let slots =
+      Array.init size (fun _ ->
+        { value = Obj.magic 0
+        ; seq = Atomic.make (-1)
+        })
+    in
+    { slots
     ; write_pos = Atomic.make 0
     ; size
+    ; mask
     }
+  ;;
+
+  let[@inline always] index_of buffer pos =
+    if buffer.mask >= 0
+    then pos land buffer.mask
+    else pos mod buffer.size
   ;;
 
   (** [write buffer value] stores [value] at the current write position
       and advances the (absolute) index. Single-writer only; concurrent
-      writers require external synchronization. *)
-  let write buffer value =
+      writers require external synchronization.
+      Zero allocation on the hot path. *)
+  let[@inline always] write buffer value =
     let pos = Atomic.get buffer.write_pos in
-    Atomic.set buffer.data.(pos mod buffer.size) (Some (value, pos));
+    let idx = index_of buffer pos in
+    let slot = buffer.slots.(idx) in
+    slot.value <- value;
+    Atomic.set slot.seq pos;
     Atomic.set buffer.write_pos (pos + 1)
   ;;
 
@@ -63,23 +87,25 @@ module RingBuffer = struct
         if pos < oldest
         then None
         else (
-          match Atomic.get buffer.data.(pos mod buffer.size) with
-          | Some (v, p) when p = pos -> Some v
-          | _ -> go (pos - 1))
+          let idx = index_of buffer pos in
+          let slot = buffer.slots.(idx) in
+          if Atomic.get slot.seq = pos
+          then Some slot.value
+          else go (pos - 1))
       in
       go (current - 1))
   ;;
 
   (** Clamp a consumer cursor to the oldest surviving entry. Entries below
       the clamp were evicted by the writer lapping the consumer. *)
-  let[@inline] clamp_start buffer last_pos current =
+  let[@inline always] clamp_start buffer last_pos current =
     let oldest = current - buffer.size in
     if last_pos < oldest then oldest else if last_pos < 0 then 0 else last_pos
   ;;
 
   (** [read_since buffer last_pos] collects all elements written since
       [last_pos] up to the current write position. Returns an empty list
-      if no new elements exist. Allocates an intermediate list. *)
+      if no new elements exist. *)
   let read_since buffer last_pos =
     let current_pos = Atomic.get buffer.write_pos in
     if last_pos >= current_pos
@@ -90,10 +116,10 @@ module RingBuffer = struct
         if pos >= current_pos
         then List.rev acc
         else (
+          let idx = index_of buffer pos in
+          let slot = buffer.slots.(idx) in
           let matched =
-            match Atomic.get buffer.data.(pos mod buffer.size) with
-            | Some (event, p) when p = pos -> [ event ]
-            | _ -> []
+            if Atomic.get slot.seq = pos then [ slot.value ] else []
           in
           collect (List.rev_append matched acc) (pos + 1))
       in
@@ -104,16 +130,16 @@ module RingBuffer = struct
       [last_pos] to the current write position without allocating a list.
       Returns the new ABSOLUTE position for the caller to track
       consumption. Inlined to reduce closure overhead on the hot path. *)
-  let[@inline] iter_since buffer last_pos f =
+  let[@inline always] iter_since buffer last_pos f =
     let current_pos = Atomic.get buffer.write_pos in
     if last_pos >= current_pos
     then current_pos
     else (
       let pos = ref (clamp_start buffer last_pos current_pos) in
       while !pos < current_pos do
-        (match Atomic.get buffer.data.(!pos mod buffer.size) with
-         | Some (event, p) when p = !pos -> f event
-         | _ -> ());
+        let idx = index_of buffer !pos in
+        let slot = buffer.slots.(idx) in
+        if Atomic.get slot.seq = !pos then f slot.value;
         incr pos
       done;
       current_pos)
@@ -124,13 +150,14 @@ module RingBuffer = struct
       entries carry their sequence numbers, so the result is always a
       consistent ordering even if the writer advances during the scan. *)
   let read_all buffer =
+    let current = Atomic.get buffer.write_pos in
+    let oldest = max 0 (current - buffer.size) in
     let acc = ref [] in
     Array.iter
       (fun slot ->
-         match Atomic.get slot with
-         | Some (v, p) -> acc := (p, v) :: !acc
-         | None -> ())
-      buffer.data;
+         let p = Atomic.get slot.seq in
+         if p >= oldest && p < current then acc := (p, slot.value) :: !acc)
+      buffer.slots;
     List.sort (fun (a, _) (b, _) -> compare a b) !acc |> List.map snd
   ;;
 
@@ -138,7 +165,7 @@ module RingBuffer = struct
       Consumers use this value as the [last_pos] argument to [read_since]
       or [iter_since]. Unlike the previous modulo-based positions, the
       returned cursor remains comparable across laps and clears. *)
-  let get_position buffer = Atomic.get buffer.write_pos
+  let[@inline always] get_position buffer = Atomic.get buffer.write_pos
 
   (** [clear buffer] drops all stored entries. The write position is NOT
       reset: consumer cursors stay valid (entries written after the clear
@@ -146,8 +173,14 @@ module RingBuffer = struct
       a pre-clear cursor observes "no new data" until the next write
       instead of stalling or re-reading stale slots. Not safe to call
       concurrently with writers. *)
-  let clear buffer = Array.iter (fun atomic -> Atomic.set atomic None) buffer.data
+  let clear buffer =
+    Array.iter
+      (fun slot ->
+         slot.value <- Obj.magic 0;
+         Atomic.set slot.seq (-1))
+      buffer.slots
+  ;;
 
   (** [capacity buffer] returns the fixed slot count of the buffer. *)
-  let capacity buffer = buffer.size
+  let[@inline always] capacity buffer = buffer.size
 end

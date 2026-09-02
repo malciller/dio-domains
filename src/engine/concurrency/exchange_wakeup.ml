@@ -77,9 +77,15 @@ let[@inline] get_sync symbol =
     s
 ;;
 
+type sync_handle = symbol_sync
+
+let get_sync_handle = get_sync
+
+let[@inline] get_generation_fast (sync : sync_handle) = Atomic.get sync.generation
+
 (** Lock-free read of the symbol's current generation. Consumers use this
     as the baseline argument to [wait_since]. *)
-let[@inline] get_generation ~symbol = Atomic.get (get_sync symbol).generation
+let[@inline] get_generation ~symbol = get_generation_fast (get_sync symbol)
 
 (** Signals the condition variable for [symbol], waking the domain worker
     blocked on that symbol. The generation bump happens under the symbol
@@ -115,6 +121,26 @@ let signal_all () =
    the waiter, short enough that an idle park costs negligible CPU. *)
 let default_spin_iterations = 400
 
+(** Fast-path [wait_since] using a pre-resolved [sync_handle], avoiding
+    Map traversal on the hot domain cycle. *)
+let wait_since_fast (sync : sync_handle) ~since =
+  let rec spin i =
+    if Atomic.get sync.generation <> since
+    then ()
+    else if i <= 0
+    then (
+      Mutex.lock sync.mutex;
+      Fun.protect
+        ~finally:(fun () -> Mutex.unlock sync.mutex)
+        (fun () ->
+           while Atomic.get sync.generation = since do
+             Condition.wait sync.condition sync.mutex
+           done))
+    else spin (i - 1)
+  in
+  spin default_spin_iterations
+;;
+
 (** Blocks until the symbol's generation exceeds [since], i.e. until any
     producer signals this symbol after the caller captured its baseline.
     Returns immediately (without taking any lock) when a signal already
@@ -127,23 +153,5 @@ let default_spin_iterations = 400
     both handled by re-checking the generation under the lock). *)
 let wait_since ~symbol ~since =
   let sync = get_sync symbol in
-  let rec spin i =
-    if Atomic.get sync.generation <> since
-    then ()
-    else if i <= 0
-    then (
-      (* Park phase: acquire the symbol mutex BEFORE the predicate loop -
-         [Condition.wait] requires the caller to hold it. Violating that is
-         UB: glibc happens to tolerate it, macOS raises EPERM on the
-         eventual unlock (caught by the concurrency regression tests). *)
-      Mutex.lock sync.mutex;
-      Fun.protect
-        ~finally:(fun () -> Mutex.unlock sync.mutex)
-        (fun () ->
-           while Atomic.get sync.generation = since do
-             Condition.wait sync.condition sync.mutex
-           done))
-    else spin (i - 1)
-  in
-  spin default_spin_iterations
+  wait_since_fast sync ~since
 ;;

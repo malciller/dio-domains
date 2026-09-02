@@ -15,6 +15,24 @@ IMAGE="dio"
 NAME="dio_dashboard"
 SOCK_VOL="dio-sock"
 
+case "${1:-}" in
+  stop)
+    echo "Stopping ${NAME}…"
+    docker rm -f "${NAME}" >/dev/null 2>&1 || true
+    echo "${NAME} stopped."
+    exit 0
+    ;;
+  restart)
+    echo "Restarting ${NAME}…"
+    docker rm -f "${NAME}" >/dev/null 2>&1 || true
+    shift || true
+    ;;
+  status)
+    docker ps -a --filter "name=^/${NAME}$" --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
+    exit 0
+    ;;
+esac
+
 is_running() {
   [[ "$(docker ps -a --filter "name=^/${NAME}$" --format '{{.Running}}')" == "true" ]]
 }
@@ -32,4 +50,4 @@ exec docker run --rm -it \
   --name "${NAME}" \
   -v "${SOCK_VOL}:/var/run/dio" \
   -e TERM="${TERM:-xterm-256color}" \
-  "${IMAGE}" dio-dashboard
+  "${IMAGE}" dio-dashboard "$@"
