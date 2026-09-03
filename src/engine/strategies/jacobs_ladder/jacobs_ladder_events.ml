@@ -217,6 +217,17 @@ let handle_order_failed ~now asset_symbol side reason =
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
+       let failed_sell_price_opt =
+         if side = Sell
+         then
+           List.find_map
+             (fun (id, s, p, _) ->
+                if s = Sell && String.starts_with ~prefix:"pending_sell_" id
+                then Some p
+                else None)
+             state.pending_orders
+         else None
+       in
        state.pending_orders
        <- List.filter (fun (_, s, _, _) -> s <> side) state.pending_orders;
        (match side with
@@ -246,6 +257,10 @@ let handle_order_failed ~now asset_symbol side reason =
          || contains_fragment lower_reason "insufficient spot balance"
          || contains_fragment lower_reason "not enough asset balance"
          || contains_fragment lower_reason "insufficient qty"
+         || contains_fragment lower_reason "insufficient balance"
+         || contains_fragment lower_reason "qty available"
+         || contains_fragment lower_reason "position not found"
+         || contains_fragment lower_reason "asset not held"
        in
        let cooldown = if is_rate_limit || is_wash_trade then 10.0 else 2.0 in
        (match side with
@@ -275,6 +290,33 @@ let handle_order_failed ~now asset_symbol side reason =
               asset_symbol)
         | Sell when is_insufficient_balance ->
           let ecfg = get_exchange_config state.exchange_id in
+          if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> []
+          then (
+            match failed_sell_price_opt with
+            | Some p ->
+              let rec remove_one acc found = function
+                | [] -> List.rev acc
+                | (sp, sq) :: rest
+                  when (not found)
+                       && (abs_float (sp -. p) <= p *. 0.0001
+                           || abs_float (sp -. p) <= 1e-4) ->
+                  Logging.warn_f
+                    ~section
+                    "Purged un-fundable persisted sell level for %s @ %.4f (qty %.8f) \
+                     after exchange rejection: %s"
+                    asset_symbol
+                    sp
+                    sq
+                    reason;
+                  remove_one acc true rest
+                | item :: rest -> remove_one (item :: acc) found rest
+              in
+              let new_levels = remove_one [] false state.persisted_sell_levels in
+              if new_levels <> state.persisted_sell_levels
+              then (
+                state.persisted_sell_levels <- new_levels;
+                state.persistence_dirty <- true)
+            | None -> ());
           if ecfg.sell_failure_sets_asset_low
           then (
             if not state.asset_low
@@ -561,20 +603,75 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
            if dominated then state.highest_startup_oid <- Some order_id);
          (match side with
           | Sell ->
+            let known_open_sell =
+              List.find_opt (fun (oid, _, _) -> oid = order_id) state.open_sell_orders
+            in
+            state.open_sell_orders
+            <- List.filter (fun (oid, _, _) -> oid <> order_id) state.open_sell_orders;
             if state.persisted_sell_levels <> []
             then (
-              let rec remove_one acc found = function
-                | [] -> List.rev acc
-                | (sp, _sq) :: rest
-                  when (not found)
-                       && (abs_float (sp -. sell_fill_price) <= sell_fill_price *. 0.0001
-                           || abs_float (sp -. sell_fill_price) <= 1e-4) ->
-                  remove_one acc true rest
-                | item :: rest -> remove_one (item :: acc) found rest
+              let matched_by_limit =
+                match known_open_sell with
+                | Some (_, limit_p, _) ->
+                  let rec remove_limit acc found = function
+                    | [] -> if found then Some (List.rev acc) else None
+                    | (sp, _sq) :: rest
+                      when (not found)
+                           && (abs_float (sp -. limit_p) <= limit_p *. 0.0001
+                               || abs_float (sp -. limit_p) <= 1e-4) ->
+                      remove_limit acc true rest
+                    | item :: rest -> remove_limit (item :: acc) found rest
+                  in
+                  remove_limit [] false state.persisted_sell_levels
+                | None -> None
               in
-              state.persisted_sell_levels
-              <- remove_one [] false state.persisted_sell_levels;
-              state.persistence_dirty <- true);
+              let final_levels =
+                match matched_by_limit with
+                | Some updated -> updated
+                | None ->
+                  let rec remove_exact acc found = function
+                    | [] -> if found then Some (List.rev acc) else None
+                    | (sp, _sq) :: rest
+                      when (not found)
+                           && (abs_float (sp -. sell_fill_price) <= sell_fill_price *. 0.0001
+                               || abs_float (sp -. sell_fill_price) <= 1e-4) ->
+                      remove_exact acc true rest
+                    | item :: rest -> remove_exact (item :: acc) found rest
+                  in
+                  (match remove_exact [] false state.persisted_sell_levels with
+                   | Some updated -> updated
+                   | None ->
+                     (* Support price improvement: find candidate where sp <= sell_fill_price closest to fill price *)
+                     let candidate =
+                       List.fold_left
+                         (fun best (sp, sq) ->
+                            if sp <= sell_fill_price +. 1e-4
+                            then (
+                              match best with
+                              | None -> Some (sp, sq)
+                              | Some (b_sp, _) -> if sp > b_sp then Some (sp, sq) else best)
+                            else best)
+                         None
+                         state.persisted_sell_levels
+                     in
+                     (match candidate with
+                      | Some (cand_p, _) ->
+                        let rec remove_cand acc found = function
+                          | [] -> List.rev acc
+                          | (sp, _sq) :: rest
+                            when (not found)
+                                 && (abs_float (sp -. cand_p) <= cand_p *. 0.0001
+                                     || abs_float (sp -. cand_p) <= 1e-4) ->
+                          remove_cand acc true rest
+                        | item :: rest -> remove_cand (item :: acc) found rest
+                        in
+                        remove_cand [] false state.persisted_sell_levels
+                      | None -> state.persisted_sell_levels))
+              in
+              if final_levels <> state.persisted_sell_levels
+              then (
+                state.persisted_sell_levels <- final_levels;
+                state.persistence_dirty <- true));
             if acc_qty > 0.0
             then
               state.anticipated_base_credit

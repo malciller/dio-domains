@@ -1287,7 +1287,12 @@ let evaluate_sell_leg
         let rounded_avail = round_qty available asset.symbol asset.exchange in
         if available >= target_q -. 1e-6 && target_q > 0.0
         then
-          if rounded_avail >= target_q && rounded_avail >= min_order_size -. 1e-9
+          if
+            (not is_alpaca)
+            && target_sell_qty_override = None
+            && (not ecfg.remaintain_expired_sells)
+            && rounded_avail >= target_q
+            && rounded_avail >= min_order_size -. 1e-9
           then (
             Logging.debug_f
               ~section
