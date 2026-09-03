@@ -20,14 +20,34 @@
     "refresh_seconds": 300.0,
     "assets": {
       "BTC/USDC": {
-        "target_survival": 0.85,
+        "target_survival": 0.65,
         "min_active_dsurv": 0.0,
-        "qty_cap_mult": 7.5
+        "qty_cap_mult": 2.5
       },
       "HYPE/USDC": {
-        "target_survival": 0.75,
+        "target_survival": 0.65,
         "min_active_dsurv": 0.0,
-        "qty_cap_mult": 4.375
+        "qty_cap_mult": 2.5
+      },
+      "BOTZ": {
+        "target_survival": 0.70,
+        "min_active_dsurv": 0.0,
+        "qty_cap_mult": 2.0
+      },
+      "LIT": {
+        "target_survival": 0.70,
+        "min_active_dsurv": 0.0,
+        "qty_cap_mult": 2.0
+      },
+      "REMX": {
+        "target_survival": 0.70,
+        "min_active_dsurv": 0.0,
+        "qty_cap_mult": 2.0
+      },
+      "SMH": {
+        "target_survival": 0.70,
+        "min_active_dsurv": 0.0,
+        "qty_cap_mult": 2.0
       }
     }
   },
@@ -37,7 +57,7 @@
       "exchange": "hyperliquid",
       "qty": "0.00025",
       "grid_interval": [
-        0.10,
+        0.15,
         0.35
       ],
       "sell_mult": "0.92",
@@ -53,15 +73,15 @@
     {
       "symbol": "HYPE/USDC",
       "exchange": "hyperliquid",
-      "qty": "0.15",
+      "qty": "0.16",
       "grid_interval": [
-        0.3,
-        0.95
+        0.30,
+        0.50
       ],
-      "sell_mult": "0.96",
+      "sell_mult": "0.98",
       "accumulation_buffer": [
-        0.06,
-        0.85
+        0.25,
+        2.00
       ],
       "strategy": "Ladder",
       "testnet": false,
@@ -133,12 +153,12 @@
       "sell_levels": false
     },
     {
-      "symbol": "SPCX",
+      "symbol": "BOTZ",
       "exchange": "alpaca",
-      "qty": "0.1",
+      "qty": "0.28",
       "grid_interval": [
-        0.5,
-        2.5
+        0.30,
+        0.90
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
@@ -151,9 +171,45 @@
       "data_feed": "iex"
     },
     {
-      "symbol": "QQQ",
+      "symbol": "LIT",
       "exchange": "alpaca",
-      "qty": "0.025",
+      "qty": "0.13",
+      "grid_interval": [
+        0.30,
+        0.90
+      ],
+      "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.05,
+        2.00
+      ],
+      "strategy": "Ladder",
+      "testnet": true,
+      "sell_levels": true,
+      "data_feed": "iex"
+    },
+    {
+      "symbol": "REMX",
+      "exchange": "alpaca",
+      "qty": "0.13",
+      "grid_interval": [
+        0.25,
+        0.75
+      ],
+      "sell_mult": "0.999",
+      "accumulation_buffer": [
+        0.05,
+        2.00
+      ],
+      "strategy": "Ladder",
+      "testnet": true,
+      "sell_levels": true,
+      "data_feed": "iex"
+    },
+    {
+      "symbol": "SMH",
+      "exchange": "alpaca",
+      "qty": "0.018",
       "grid_interval": [
         0.25,
         0.75

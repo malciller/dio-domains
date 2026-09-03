@@ -319,12 +319,13 @@ let keys t =
       (try tree |> to_assoc |> List.map fst with
        | _ -> [])
   in
-  let cached =
-    Hashtbl.fold (fun k _ acc -> if List.mem k acc then acc else k :: acc) t.cache []
-  in
+  let key_set = Hashtbl.create 16 in
+  List.iter (fun k -> Hashtbl.replace key_set k ()) from_file;
+  Hashtbl.iter (fun k _ -> Hashtbl.replace key_set k ()) t.cache;
+  let result = Hashtbl.fold (fun k () acc -> k :: acc) key_set [] in
   Mutex.unlock t.cache_mutex;
   Mutex.unlock t.file_mutex;
-  List.rev_append cached from_file
+  result
 ;;
 
 (** Configured strategies registered at startup (from config.json's trading
