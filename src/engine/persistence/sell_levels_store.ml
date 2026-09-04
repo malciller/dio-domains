@@ -29,14 +29,16 @@ let level_of_json json =
   let open Yojson.Basic.Util in
   (* Compact form: [price, qty]. *)
   try
-    match json with
-    | `List [ p; q ] -> Some { price = to_float p; qty = to_float q }
-    | _ ->
-      (* Legacy verbose form: {"price": p, "qty": q}. *)
-      Some
+    let lvl =
+      match json with
+      | `List [ p; q ] -> { price = to_float p; qty = to_float q }
+      | _ ->
+        (* Legacy verbose form: {"price": p, "qty": q}. *)
         { price = json |> member "price" |> to_float
         ; qty = json |> member "qty" |> to_float
         }
+    in
+    if lvl.price > 0.0 && lvl.qty > 0.0 then Some lvl else None
   with
   | _ -> None
 ;;
@@ -47,7 +49,10 @@ let of_json json =
   | _ -> []
 ;;
 
-let to_json t = `List (List.map (fun l -> `List [ `Float l.price; `Float l.qty ]) t)
+let to_json t =
+  let valid_levels = List.filter (fun l -> l.price > 0.0 && l.qty > 0.0) t in
+  `List (List.map (fun l -> `List [ `Float l.price; `Float l.qty ]) valid_levels)
+;;
 
 let orchestrator =
   Persistence_orchestrator.create
@@ -64,7 +69,7 @@ let orchestrator =
 (** Loads the levels for [key]. Returns [] when absent or disabled. *)
 let load ~key =
   match Persistence_orchestrator.load orchestrator ~key with
-  | Some t -> t
+  | Some t -> List.filter (fun l -> l.price > 0.0 && l.qty > 0.0) t
   | None -> []
 ;;
 
@@ -90,19 +95,25 @@ let resolve_key_for_symbol ~symbol =
     Some k
 ;;
 
-let save_async ~key t = Persistence_orchestrator.put_async orchestrator ~key (sort_levels t)
+let save_async ~key t =
+  let valid_levels = List.filter (fun l -> l.price > 0.0 && l.qty > 0.0) t in
+  Persistence_orchestrator.put_async orchestrator ~key (sort_levels valid_levels)
+;;
 
 (** Adopts an order that exists on the exchange but not in memory (also covers
     the async-save crash window). Deduplicates by price-tolerance match. *)
 let adopt_exchange_order ~key level =
-  let current = load ~key in
-  let tol = level.price *. 0.0001 in
-  let is_dup l =
-    abs_float (l.price -. level.price) <= tol
-    || abs_float (l.price -. level.price) <= 1e-4
-  in
-  if List.for_all (fun l -> not (is_dup l)) current
-  then save_async ~key (sort_levels (level :: current))
+  if level.price <= 0.0 || level.qty <= 0.0
+  then ()
+  else (
+    let current = load ~key in
+    let tol = level.price *. 0.0001 in
+    let is_dup l =
+      abs_float (l.price -. level.price) <= tol
+      || abs_float (l.price -. level.price) <= 1e-4
+    in
+    if List.for_all (fun l -> not (is_dup l)) current
+    then save_async ~key (sort_levels (level :: current)))
 ;;
 
 let price_qty_match l r =

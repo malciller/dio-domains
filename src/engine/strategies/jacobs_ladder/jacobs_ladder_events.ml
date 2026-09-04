@@ -231,7 +231,10 @@ let handle_order_failed ~now asset_symbol side reason =
        state.pending_orders
        <- List.filter (fun (_, s, _, _) -> s <> side) state.pending_orders;
        (match side with
-        | Buy -> state.inflight_buy <- false
+        | Buy ->
+          state.last_buy_order_id <- None;
+          state.last_buy_order_price <- None;
+          state.inflight_buy <- false
         | Sell -> state.inflight_sell <- false);
        (match side with
         | Buy -> set_asset_reserved_quote state 0.0
@@ -379,8 +382,11 @@ let handle_order_rejected ~now:_ asset_symbol side price =
                in
                not (matches_side_placement || matches_fallback))
             state.pending_orders;
-       (match side with
-        | Buy -> state.inflight_buy <- false
+        (match side with
+        | Buy ->
+          state.last_buy_order_id <- None;
+          state.last_buy_order_price <- None;
+          state.inflight_buy <- false
         | Sell ->
           state.inflight_sell <- false;
           state.open_sell_orders
@@ -797,16 +803,21 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
        in
        state.pending_orders
        <- List.filter
-            (fun (pending_id, _, _, _) ->
-               let matches =
-                 pending_id = order_id
-                 || (String.starts_with ~prefix:"pending_amend_" pending_id
-                     && String.length pending_id > 14
-                     && String.sub pending_id 14 (String.length pending_id - 14)
-                        = order_id)
-               in
-               not matches)
-            state.pending_orders;
+             (fun (pending_id, s, _, _) ->
+                let matches =
+                  pending_id = order_id
+                  || (String.starts_with ~prefix:"pending_amend_" pending_id
+                      && String.length pending_id > 14
+                      && String.sub pending_id 14 (String.length pending_id - 14)
+                         = order_id)
+                in
+                let is_ghost_placement =
+                  s = side
+                  && (String.starts_with ~prefix:"pending_buy_" pending_id
+                      || String.starts_with ~prefix:"pending_sell_" pending_id)
+                in
+                not (matches || is_ghost_placement))
+             state.pending_orders;
        if not is_being_amended
        then (
          Hashtbl.remove state.amend_cooldowns order_id;
@@ -826,6 +837,7 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
            ());
          if cancelled_side = Buy
          then (
+           set_asset_reserved_quote state 0.0;
            state.inflight_cancel_buy <- false;
            state.inflight_amend_buy <- false;
            Hashtbl.remove state.amend_cooldowns "place_Buy");
@@ -1038,8 +1050,17 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
        (match side with
         | Buy -> state.inflight_amend_buy <- false
         | Sell -> ());
-       let is_order_gone = is_cache_miss || is_cannot_modify || is_margin_error in
-       if is_order_gone
+        let is_tif_rejection =
+          contains_fragment lower_reason "time in force"
+          || contains_fragment lower_reason "alo"
+          || contains_fragment lower_reason "post-only"
+          || contains_fragment lower_reason "post only"
+          || contains_fragment lower_reason "cross"
+        in
+        let is_order_gone =
+          is_cache_miss || is_cannot_modify || is_margin_error || is_tif_rejection
+        in
+        if is_order_gone
        then (
          let cancel_order =
            create_cancel_order order_id asset_symbol Ladder state.exchange_id
@@ -1102,8 +1123,12 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
              | Sell -> state.duplicate_key_sell)))
 ;;
 
-(** No-op shim for pending cancellation cleanup. *)
-let cleanup_pending_cancellation _asset_symbol _order_id = ()
+(** Cleans up in-flight cancellation markers on cancellation failure. *)
+let cleanup_pending_cancellation asset_symbol _order_id =
+  let state = get_strategy_state asset_symbol in
+  state.inflight_cancel_buy <- false;
+  state.inflight_amend_buy <- false
+;;
 
 (* drain lifecycle events queued by the supervisor REST path and dispatch
    them to the handlers. Runs on the domain thread at the top of every cycle,

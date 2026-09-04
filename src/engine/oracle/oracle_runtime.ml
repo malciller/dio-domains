@@ -953,67 +953,66 @@ let run_account_pass
         cancel event this very pass triggers, resuming iff quote covers their
         buy. *)
      let rec drop n = function
+       | l when n <= 0 -> l
        | [] -> []
-       | _ :: r -> if n = 0 then r else drop (n - 1) r
+       | _ :: r -> drop (n - 1) r
      in
      let flagged : string list ref = ref [] in
-     List.iteri
-       (fun i
-         ((t, d, need, _current, outcome) :
-           Oracle_tasks.task * decision * float * float * Oracle_pipeline.outcome option) ->
+     List.iter
+       (fun ((t, d, need, _current, outcome) :
+               Oracle_tasks.task * decision * float * float * Oracle_pipeline.outcome option) ->
           match outcome with
           | None -> ()
           | Some _ when d.active -> ()
-          | Some o ->
-            let eff_target_survival, _, _ =
-              effective_knobs ~config ~symbol:t.symbol
+          | Some _ ->
+            let lower = drop (global_index t + 1) tasks in
+            let claims =
+              lower
+              |> List.filter (fun (lt : Oracle_tasks.task) ->
+                committed_buy_value ~exchange:lt.exchange ~symbol:lt.symbol > 0.0)
+              |> List.map (fun (lt : Oracle_tasks.task) ->
+                (* Global config index: higher index = lower seniority, so
+                   descending sort cancels the least senior first. *)
+                { Oracle_pools.id = key_of_task lt
+                ; priority = global_index lt
+                ; need_quote = 0.0
+                ; resting_buy_quote =
+                    committed_buy_value ~exchange:lt.exchange ~symbol:lt.symbol
+                })
             in
-            if not (o.resolution.d_surv >= eff_target_survival)
-            then ()
-            else (
-              let lower = drop (i + 1) tasks in
-              let claims =
-                lower
-                |> List.filter (fun (lt : Oracle_tasks.task) ->
-                  committed_buy_value ~exchange:lt.exchange ~symbol:lt.symbol > 0.0)
-                |> List.map (fun (lt : Oracle_tasks.task) ->
-                  (* Global config index: higher index = lower seniority, so
-                     descending sort cancels the least senior first. *)
-                  { Oracle_pools.id = key_of_task lt
-                  ; priority = global_index lt
-                  ; need_quote = 0.0
-                  ; resting_buy_quote =
-                      committed_buy_value ~exchange:lt.exchange ~symbol:lt.symbol
-                  })
-              in
-              let plan =
-                Oracle_pools.cascade
-                  ~available:!remaining
-                  ~need
-                  ~trigger_id:(key_of_task t)
-                  ~claims
-              in
-              if plan <> []
-              then (
-                flagged := List.rev_append plan !flagged;
-                Logging.info_f
-                  ~section
-                  "cancellation cascade for %s/%s (need $%.2f vs $%.2f available): \
-                   cancelling resting buys of [%s]"
-                  t.exchange
-                  t.symbol
-                  need
-                  !remaining
-                  (String.concat ", " plan);
-                ())
-              else ()))
+            let plan =
+              Oracle_pools.cascade
+                ~available:!remaining
+                ~need
+                ~trigger_id:(key_of_task t)
+                ~claims
+            in
+            if plan <> []
+            then (
+              flagged := List.rev_append plan !flagged;
+              Logging.info_f
+                ~section
+                "cancellation cascade for %s/%s (need $%.2f vs $%.2f available): \
+                 cancelling resting buys of [%s]"
+                t.exchange
+                t.symbol
+                need
+                !remaining
+                (String.concat ", " plan);
+              ())
+            else ())
        built_rev;
      Lwt.return
        (List.map
           (fun ((_, d, _, _, _) :
                  Oracle_tasks.task * decision * float * float * Oracle_pipeline.outcome option) ->
              if List.mem (Printf.sprintf "%s|%s" d.exchange d.symbol) !flagged
-             then { d with cancel_resting_buys = true }
+             then
+               { d with
+                 cancel_resting_buys = true
+               ; active = false
+               ; reason = "capital reallocated to higher-priority strategy"
+               }
              else d)
           built_rev)
 ;;

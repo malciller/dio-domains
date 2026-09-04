@@ -409,7 +409,12 @@ let sync_open_orders
             Hashtbl.replace persisted_idx bk remaining_bucket;
             (* count the persisted level (keyed by ITS price) as matched. *)
             record_matched (price_key _existing_p);
-            if abs_float (existing_q -. qty) > 1e-6
+            let min_order_size =
+              if state.cached_qty_increment > 0.0
+              then state.cached_qty_increment
+              else 1e-8
+            in
+            if abs_float (existing_q -. qty) > 1e-6 && qty >= min_order_size -. 1e-9 && qty > 0.0
             then (
               state.persisted_sell_levels
               <- List.mapi
@@ -424,48 +429,69 @@ let sync_open_orders
                 existing_q
                 qty)
           | None ->
-            state.persisted_sell_levels
-            <- List.sort
-                 (fun (p1, _) (p2, _) -> Float.compare p2 p1)
-                 ((price, qty) :: state.persisted_sell_levels);
-            state.persistence_dirty <- true;
-            (* the adopted level was matched by this open sell by
-               construction - count it so the end-of-scan split keeps it on
-               the open side. *)
-            record_matched (price_key price);
-            (* The list was re-sorted with a new level: rebuild the price
-               index so later orders in this scan match against the current
-               list (O(m), only on the rare adoption path). *)
-            build_persisted_idx ();
-            Logging.info_f
-              ~section
-              "Adopted open exchange sell order for %s @ %.4f (qty %.8f) into persistent \
-               tracking"
-              asset.symbol
-              price
-              qty);
+            let min_order_size =
+              if state.cached_qty_increment > 0.0
+              then state.cached_qty_increment
+              else 1e-8
+            in
+            if qty >= min_order_size -. 1e-9 && qty > 0.0
+            then (
+              state.persisted_sell_levels
+              <- List.sort
+                   (fun (p1, _) (p2, _) -> Float.compare p2 p1)
+                   ((price, qty) :: state.persisted_sell_levels);
+              state.persistence_dirty <- true;
+              (* the adopted level was matched by this open sell by
+                 construction - count it so the end-of-scan split keeps it on
+                 the open side. *)
+              record_matched (price_key price);
+              (* The list was re-sorted with a new level: rebuild the price
+                 index so later orders in this scan match against the current
+                 list (O(m), only on the rare adoption path). *)
+              build_persisted_idx ();
+              Logging.info_f
+                ~section
+                "Adopted open exchange sell order for %s @ %.4f (qty %.8f) into persistent \
+                 tracking"
+                asset.symbol
+                price
+                qty));
         match !closest_sell_order with
         | None -> closest_sell_order := Some (oid, price)
         | Some (_, best_p) ->
           if price < best_p then closest_sell_order := Some (oid, price)));
+  let is_amend_active =
+    state.inflight_amend_buy
+    || InFlightOrders.is_in_flight state.duplicate_key_buy
+    || (match state.last_buy_order_id with
+        | Some oid ->
+          InFlightAmendments.is_in_flight oid
+          || InFlightAmendments.is_amend_lifecycle_active oid
+          || (match Hashtbl.find_opt state.amend_cooldowns oid with
+              | Some expiry -> now_time < expiry
+              | None -> false)
+        | None -> false)
+  in
   if
     !open_buy_count_from_scan = 0
     && (not state.inflight_cancel_buy)
-    && not state.inflight_buy
+    && (not state.inflight_buy)
+    && not is_amend_active
   then (
-    match !best_buy_id with
-    | Some oid ->
+    if Option.is_some state.last_buy_order_id || Option.is_some state.last_buy_order_price
+    then (
+      let oid = Option.value state.last_buy_order_id ~default:"none" in
+      let p = Option.value state.last_buy_order_price ~default:0.0 in
       Logging.warn_f
         ~section
         "GHOST_BUY_DETECTED [%s] order %s @ %.2f in memory, but not in open orders feed. \
          Clearing."
         asset.symbol
         oid
-        !best_buy_price;
+        p;
       state.last_buy_order_id <- None;
       state.last_buy_order_price <- None;
-      set_asset_reserved_quote state 0.0
-    | None -> ())
+      set_asset_reserved_quote state 0.0))
   else if
     (not state.inflight_cancel_buy)
     && (not state.inflight_buy)
@@ -1059,7 +1085,14 @@ let evaluate_sell_leg
       let pruned = ref [] in
       List.iter
         (fun ((_target_p, target_q) as level) ->
-           if !rem_avail >= target_q -. 1e-6
+           let min_order_size =
+             if state.cached_qty_increment > 0.0
+             then state.cached_qty_increment
+             else 1e-8
+           in
+           if target_q > 0.0
+              && target_q >= min_order_size -. 1e-9
+              && !rem_avail >= target_q -. 1e-6
            then (
              kept_missing := level :: !kept_missing;
              rem_avail := max 0.0 (!rem_avail -. target_q))
@@ -1127,10 +1160,16 @@ let evaluate_sell_leg
       | Some _ -> ask_price
       | None -> ask_price)
   in
+  let min_notional =
+    if state.cached_venue_min_notional > 0.0
+    then state.cached_venue_min_notional
+    else if is_alpaca then 1.0 else 0.0
+  in
   let inventory_ok =
-    if is_alpaca
-    then inventory_basis *. base_ref_price >= state.cached_venue_min_notional -. 1e-9
-    else inventory_basis >= state.cached_venue_min_qty -. 1e-9
+    inventory_basis > 0.0
+    && (if is_alpaca
+        then inventory_basis *. base_ref_price >= min_notional -. 1e-9
+        else inventory_basis >= state.cached_venue_min_qty -. 1e-9)
   in
   let missing_alpaca_sell_grid =
     if ecfg.remaintain_expired_sells
@@ -1190,8 +1229,8 @@ let evaluate_sell_leg
           List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) !missing_after_reconcile
         in
         match missing_sorted_desc with
-        | (tp, tq) :: _ -> Some tp, Some tq
-        | [] -> None, None)
+        | (tp, tq) :: _ when tq > 0.0 -> Some tp, Some tq
+        | _ -> None, None)
       else None, None
     in
     let sell_price =
@@ -1360,10 +1399,16 @@ let evaluate_sell_leg
     then (
       (* The NOTIONAL gate: enforce both venue minimum quantity / increment
          floor and venue quote-notional minimum floor. *)
+      let min_notional =
+        if state.cached_venue_min_notional > 0.0
+        then state.cached_venue_min_notional
+        else if is_alpaca then 1.0 else 0.0
+      in
       let venue_min_ok q =
-        q >= min_order_size -. 1e-9
-        && (state.cached_venue_min_notional <= 0.0
-            || q *. sell_price >= state.cached_venue_min_notional -. 1e-9)
+        q > 0.0
+        && q >= min_order_size -. 1e-9
+        && (min_notional <= 0.0
+            || q *. sell_price >= min_notional -. 1e-9)
       in
       if venue_min_ok effective_sell_qty
       then (
@@ -1381,7 +1426,7 @@ let evaluate_sell_leg
         then (
           sell_pushed := true;
           state.asset_low <- false;
-          if ecfg.remaintain_expired_sells && target_sell_price_opt = None
+          if ecfg.remaintain_expired_sells && target_sell_price_opt = None && effective_sell_qty > 0.0
           then (
             state.persisted_sell_levels
             <- List.sort
@@ -1485,6 +1530,8 @@ let execute_strategy
         | None -> 1.0);
     state.cached_venue_min_notional <- get_min_notional_val asset.symbol asset.exchange;
     state.exchange_reserved_atomic <- Some (get_exchange_reserved_atomic asset.exchange));
+  if state.cached_venue_min_notional <= 0.0
+  then state.cached_venue_min_notional <- get_min_notional_val asset.symbol asset.exchange;
   let ecfg = state.cached_ecfg in
   (* Realtime accumulation buffer (fear-and-greed resolved upstream);
      refreshed every cycle so fill-time reserve decisions see the latest

@@ -309,9 +309,14 @@ let asset_domain_worker
     then (
       let st = Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol in
       st.exchange_id <- asset_with_fees.exchange;
-      st.grid_qty
-      <- (try float_of_string asset_with_fees.qty with
-          | Failure _ -> 0.001);
+      let initial_qty =
+        match oracle_decision_at_startup with
+        | Some d when d.active && d.buy_qty > 0.0 -> d.buy_qty
+        | _ ->
+          (try float_of_string asset_with_fees.qty with
+           | Failure _ -> 0.001)
+      in
+      st.grid_qty <- initial_qty;
       st.cached_sell_mult
       <- (try float_of_string asset_with_fees.sell_mult with
           | Failure _ -> 1.0);
@@ -328,6 +333,10 @@ let asset_domain_worker
            ~default:0.01;
       st.cached_venue_min_qty
       <- Option.value (Ex.get_qty_min ~symbol:asset_with_fees.symbol) ~default:0.01;
+      st.cached_venue_min_notional
+      <- Dio_strategies.Jacobs_ladder.get_min_notional_val
+           asset_with_fees.symbol
+           asset_with_fees.exchange;
       st.persistence_dirty <- false;
       st.persistence_key
       <- Some
@@ -889,6 +898,7 @@ let asset_domain_worker
       in
       let oracle_halted =
         match oracle_decision with
+        | Some d when d.cancel_resting_buys -> true
         | Some d when not d.active ->
           let has_open_buy =
             Ex.fold_open_orders
@@ -990,7 +1000,15 @@ let asset_domain_worker
             asset_with_fees.exchange
             asset_with_fees.symbol
             d.buy_qty
-            d.grid_interval
+            d.grid_interval;
+          if is_grid_strategy
+          then (
+            let st =
+              Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol
+            in
+            st.capital_low <- false;
+            st.capital_low_logged <- false;
+            st.capital_low_at_balance <- 0.0)
         | Some d ->
           Logging.warn_f
             ~section

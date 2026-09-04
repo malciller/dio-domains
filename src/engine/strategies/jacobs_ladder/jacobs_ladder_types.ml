@@ -275,10 +275,15 @@ let rec get_strategy_state asset_symbol =
           Dio_persistence.Sell_levels_store.resolve_key_for_symbol ~symbol:asset_symbol
         with
         | Some key ->
-          List.map
+          List.filter_map
             (fun l ->
-               ( l.Dio_persistence.Sell_levels_store.price
-               , l.Dio_persistence.Sell_levels_store.qty ))
+               if l.Dio_persistence.Sell_levels_store.price > 0.0
+                  && l.Dio_persistence.Sell_levels_store.qty > 0.0
+               then
+                 Some
+                   ( l.Dio_persistence.Sell_levels_store.price
+                   , l.Dio_persistence.Sell_levels_store.qty )
+               else None)
             (Dio_persistence.Sell_levels_store.load ~key)
         | None -> [])
       else []
