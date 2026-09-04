@@ -55,6 +55,7 @@ let get_exchange_module = Jacobs_ladder_config.get_exchange_module
 let get_round_price_fn = Jacobs_ladder_config.get_round_price_fn
 let get_price_increment = Jacobs_ladder_config.get_price_increment
 let get_qty_increment_val = Jacobs_ladder_config.get_qty_increment_val
+let get_min_notional_val = Jacobs_ladder_config.get_min_notional_val
 let round_qty = Jacobs_ladder_config.round_qty
 let venue_lot_qty = Jacobs_ladder_config.venue_lot_qty
 let parse_config_float = Jacobs_ladder_config.parse_config_float
