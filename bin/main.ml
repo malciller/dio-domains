@@ -30,6 +30,10 @@ module Fear_and_greed = Cmc.Fear_and_greed
 (** Register atexit handler to emit a final log entry on process termination. *)
 let () =
   at_exit (fun () ->
+    (* Synchronously flush coalesced persistence writes so in-memory state
+       (accumulation P&L, last_fill_oid, sell levels) is not lost in the
+       async-save coalesce window when the process exits. *)
+    Dio_persistence.Persistence_orchestrator.flush_all ();
     Logging.info ~section:"main" "Process exiting - final cleanup complete")
 ;;
 

@@ -391,9 +391,14 @@ module InFlightAmendments = struct
 
   let last_cleanup = Atomic.make 0.0
 
-  (** Evict entries older than [max_age] seconds (any phase - the Replaced
-      recognition window is bounded by this cleanup). Returns
-      [(0, removed_count)]. *)
+  (** Reap only TERMINAL leftovers older than [max_age] seconds - the
+      [Replaced] recognition window is bounded by this cleanup. [Pending]
+      entries are owned by an in-flight REST request and are always resolved
+      by exactly one guaranteed terminal event (Amended/Amendment_skipped/
+      Amendment_failed) or a recognized cancel; aging one out here would
+      drop the amend-recognition window while the exchange still owns the
+      request, so a mid-flight cancel event would reset tracking as if it
+      were real. Returns [(0, removed_count)]. *)
   let cleanup ?(max_age = 60.0) () =
     let now = Unix.gettimeofday () in
     let last = Atomic.get last_cleanup in
@@ -407,7 +412,10 @@ module InFlightAmendments = struct
         let initial_size = Hashtbl.length registry in
         Hashtbl.filter_map_inplace
           (fun _ (entry : entry) ->
-             if now -. entry.last <= max_age then Some entry else None)
+             match entry.phase with
+             | Pending -> Some entry
+             | Replaced _ | Failed _ | Skipped ->
+               if now -. entry.last <= max_age then Some entry else None)
           registry;
         removed := !removed + (initial_size - Hashtbl.length registry);
         Mutex.unlock mutex

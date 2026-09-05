@@ -5,6 +5,12 @@ open Concurrency
 
 let section = "kraken_executions"
 let ring_buffer_size = Kraken_common_types.default_ring_buffer_size_executions
+
+(* Cumulative count of execution frames dropped (parse failure or unknown/
+   evicted order id). A dropped fill is a silent inventory desync; the
+   cumulative count makes it visible in the warn lines instead of folding
+   into nothing. *)
+let dropped_execution_frames = Atomic.make 0
 let cleanup_handlers_started = Atomic.make false
 
 open Kraken_common_types
@@ -787,11 +793,19 @@ let parse_execution_event json =
         (match s with
          | Some (sym, side) -> Some (sym, Some side)
          | None ->
-           (* Skip events with no symbol attribution, typical of pre-startup orders. *)
-           Logging.debug_f
-             ~section
-             "Skipping event for unknown order %s (likely pre-startup order)"
-             order_id;
+           (* Skip events with no symbol attribution, typical of pre-startup
+              orders. Throttle to a warn once the count grows, since a
+              persistent flood here means order ids are being evicted from
+              the index while fills still arrive - a silent fill loss. *)
+           let n = Atomic.fetch_and_add dropped_execution_frames 1 + 1 in
+           if n <= 10 || n land (n - 1) = 0
+           then
+             Logging.warn_f
+               ~section
+               "Skipping event for unknown order %s (likely pre-startup order); \
+                cumulative drops=%d"
+               order_id
+               n;
            None)
     in
     let symbol =
@@ -960,9 +974,11 @@ let parse_execution_event json =
         }
   with
   | exn ->
+    let n = Atomic.fetch_and_add dropped_execution_frames 1 + 1 in
     Logging.warn_f
       ~section
-      "Failed to parse execution event: %s | JSON: %s"
+      "Failed to parse execution event (cumulative drops=%d): %s | JSON: %s"
+      n
       (Printexc.to_string exn)
       (Yojson.Safe.to_string json);
     None

@@ -249,6 +249,19 @@ module Strategy = struct
         && state.highest_startup_oid <> None
         && state.base_accumulation_enabled
       then (
+        (* last_fill_oid was None (fresh strategy or absent state file): the
+           first-batch fills were all treated as pre-restart history and are
+           NOT accounted. Surface this loudly - a fill that genuinely
+           happened after restart (order placed pre-restart, filled during
+           the down window) is silently excluded from inventory/P&L. *)
+        Logging.warn_f
+          ~section
+          "Startup replay for %s had no persisted last_fill_oid; bootstrapping to \
+           highest_startup_oid=%s. %d fill(s) in the first batch were treated as \
+           pre-restart history and NOT accounted (state file absent or fresh?)."
+          symbol
+          (Option.value state.highest_startup_oid ~default:"none")
+          state.skipped_fills_total;
         state.last_fill_oid <- state.highest_startup_oid;
         let key =
           match state.persistence_key with

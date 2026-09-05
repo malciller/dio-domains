@@ -45,6 +45,82 @@ let price_str order =
 ;;
 
 (* --------------------------------------------------------------------------
+   Rejection-triggered reconciliation
+   -------------------------------------------------------------------------- *)
+
+let contains_fragment s fragment =
+  let sl = String.length s
+  and fl = String.length fragment in
+  let rec loop i = i + fl <= sl && (String.sub s i fl = fragment || loop (i + 1)) in
+  loop 0
+;;
+
+(** True when a placement error means the strategy's inventory view diverged
+    from the venue: a shorting/capacity rejection proves the venue was
+    holding the funds (a resting order the local view missed) or that the
+    position was already consumed (an unobserved fill). Retrying against a
+    stale view just re-sells inventory the account no longer has - the BOTZ
+    20:02 "account is not allowed to short" incident. *)
+let is_inventory_rejection err =
+  let lower = String.lowercase_ascii err in
+  contains_fragment lower "not allowed to short"
+  || contains_fragment lower "insufficient funds"
+  || contains_fragment lower "insufficient balance"
+  || contains_fragment lower "insufficient spot balance"
+  || contains_fragment lower "insufficient qty"
+  || contains_fragment lower "not enough asset balance"
+  || contains_fragment lower "qty available"
+  || contains_fragment lower "position not found"
+  || contains_fragment lower "asset not held"
+;;
+
+let reconciliation_in_flight = Atomic.make false
+
+(** Event-driven reconciliation after an inventory-class placement rejection:
+    re-bootstrap the venue's open orders and balances, then let their
+    completion wakeups re-run the symbol's strategy against fresh state.
+
+    Alpaca only - its balances are GROSS (open-order holds are not netted),
+    so a fill event the strategy missed leaves the ladder believing it still
+    holds sellable inventory. Other venues report tradeable (hold-netted)
+    balances and are not exposed to this desync class. *)
+let refresh_inventory_state_on_rejection (order : strategy_order) err =
+  if
+    String.equal order.exchange "alpaca"
+    && is_inventory_rejection err
+    && Atomic.compare_and_set reconciliation_in_flight false true
+  then
+    Lwt.async (fun () ->
+      Lwt.catch
+        (fun () ->
+           Logging.warn_f
+             ~section
+             "Reconciling venue state after inventory-class rejection: %s %s (%s)"
+             (side_str order)
+             order.symbol
+             err;
+           let jobs =
+             [ Alpaca.Balances.update_balances () ]
+             @
+             if order.side = Sell
+             then [ Alpaca.Executions.bootstrap_open_orders () ]
+             else []
+           in
+           Lwt.join jobs)
+        (fun exn ->
+           Logging.warn_f
+             ~section
+             "Post-rejection reconciliation failed for %s: %s"
+             order.symbol
+             (Printexc.to_string exn);
+           Lwt.return_unit)
+      >>= fun () ->
+      Atomic.set reconciliation_in_flight false;
+      Lwt.return_unit)
+  else ()
+;;
+
+(* --------------------------------------------------------------------------
    Strategy callback implementations
    -------------------------------------------------------------------------- *)
 
@@ -77,6 +153,7 @@ let grid_callbacks : strategy_callbacks =
           order.qty
           (price_str order)
           err;
+        refresh_inventory_state_on_rejection order err;
         Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
           order.symbol
           (Failed { now = Unix.gettimeofday (); side = order.side; reason = err });
@@ -181,6 +258,7 @@ let mm_callbacks : strategy_callbacks =
           order.qty
           (price_str order)
           err;
+        refresh_inventory_state_on_rejection order err;
         (* enqueue instead of calling handlers directly on this Lwt
            fiber - the symbol's domain thread drains and executes them, so
            MM state is never mutated cross-thread against execute_strategy. *)
@@ -520,7 +598,14 @@ let process_single_order
         (match order.order_id with
          | Some target_order_id -> cb.on_amend_fail order target_order_id err
          | None -> ())
-      | Cancel -> () (* Cancel rejections are non-critical *)
+      | Cancel ->
+        (* A cancel rejected because the venue is disconnected must still
+           reach the strategy's [on_cancel_fail] -> cleanup_pending_cancellation.
+           Swallowing it leaves inflight_cancel_buy set forever, which
+           suppresses ghost-buy cleanup and the excess-buy cancellation leg. *)
+        (match order.order_id with
+         | Some target_order_id -> cb.on_cancel_fail order target_order_id
+         | None -> ())
     in
     let connected = is_connected order in
     if connected

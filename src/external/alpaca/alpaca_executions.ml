@@ -5,6 +5,13 @@ open Dio_exchange.Exchange_intf.Types
 
 let section = "alpaca_executions"
 
+(* Cumulative count of fill-class trade updates dropped because they carried
+   unusable money fields (price <= 0, filled_qty <= 0, unparseable side, or
+   empty order id/symbol). Surfaced on every drop so a venue API drift that
+   silently loses fills is visible rather than folding into a silent
+   inventory desync. *)
+let dropped_fill_events = Atomic.make 0
+
 type open_order_internal =
   { order_id : string
   ; symbol : string
@@ -379,6 +386,33 @@ let handle_trade_update json =
     ; cl_ord_id = ord.client_order_id
     }
   in
+  (* Fail-closed on money fields for fill-class events: a fill at price<=0,
+     qty<=0, with an unparseable side, or a missing order id would corrupt
+     inventory direction / P&L if it entered the strategy ledger. Drop it
+     loudly (a dropped fill is healed by the balance-based reconcile; a
+     wrong-side fill actively corrupts). Non-fill events (new/canceled/...)
+     carry no fill money and are unaffected. *)
+  let is_fill_class = String.equal event "fill" || String.equal event "partial_fill" in
+  let side_ok = String.equal ord.side_str "buy" || String.equal ord.side_str "sell" in
+  let money_ok = price > 0.0 && ord.filled_qty > 0.0 in
+  let should_drop =
+    is_fill_class && ((not side_ok) || (not money_ok) || String.equal ord.id "")
+  in
+  if should_drop
+  then (
+    let n = Atomic.fetch_and_add dropped_fill_events 1 in
+    Logging.critical_f
+      ~section
+      "Dropping Alpaca %s event for order %s (side=%s, qty=%.6f, filled=%.6f, \
+       price=%.6f) - unusable money fields; cumulative drops=%d. JSON: %s"
+      event
+      ord.id
+      ord.side_str
+      ord.qty
+      ord.filled_qty
+      price
+      n
+      (Yojson.Safe.to_string json));
   Logging.debug_f
     ~section
     "Trade update [%s]: order %s %s %s %.4f @ %.4f (filled: %.4f, remaining: %.4f)"
@@ -392,35 +426,38 @@ let handle_trade_update json =
     price
     ord.filled_qty
     exec_event.remaining_qty;
-  let store = get_or_create_store ord.symbol in
-  SymbolExecStore.push_event store exec_event;
-  (* Publish to centralized fill event bus for Discord notifications if live trading is enabled *)
-  if
-    (not !Alpaca_types.Config.is_paper)
-    && (event = "fill" || exec_event.order_status = Filled)
+  if not should_drop
   then (
-    let fill_value = ord.filled_qty *. price in
-    let maker_fee_rate =
-      match Dio_exchange.Exchange_intf.Registry.get "alpaca" with
-      | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
-        (match Ex.get_fees ~symbol:ord.symbol with
-         | Some f, _ -> f
-         | _ -> 0.0)
-      | None -> 0.0
-    in
-    let fee = fill_value *. maker_fee_rate in
-    Concurrency.Fill_event_bus.publish_fill
-      { venue = "alpaca"
-      ; symbol = ord.symbol
-      ; side = (if side = Buy then "buy" else "sell")
-      ; amount = ord.filled_qty
-      ; fill_price = price
-      ; value = fill_value
-      ; fee
-      ; timestamp = Unix.time ()
-      ; order_id = ord.id
-      ; trade_id = ord.id
-      });
+    let store = get_or_create_store ord.symbol in
+    SymbolExecStore.push_event store exec_event;
+    (* Publish to centralized fill event bus for Discord notifications if live trading is enabled *)
+    if
+      (not !Alpaca_types.Config.is_paper)
+      && (event = "fill" || exec_event.order_status = Filled)
+    then (
+      let fill_value = ord.filled_qty *. price in
+      let maker_fee_rate =
+        match Dio_exchange.Exchange_intf.Registry.get "alpaca" with
+        | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+          (match Ex.get_fees ~symbol:ord.symbol with
+           | Some f, _ -> f
+           | _ -> 0.0)
+        | None -> 0.0
+      in
+      let fee = fill_value *. maker_fee_rate in
+      Concurrency.Fill_event_bus.publish_fill
+        { venue = "alpaca"
+        ; symbol = ord.symbol
+        ; side = (if side = Buy then "buy" else "sell")
+        ; amount = ord.filled_qty
+        ; fill_price = price
+        ; value = fill_value
+        ; fee
+        ; timestamp = Unix.time ()
+        ; order_id = ord.id
+        ; trade_id = ord.id
+        });
+    ());
   if event = "fill" || event = "partial_fill" || event = "canceled" || event = "rejected"
   then Lwt.async (fun () -> Alpaca_balances.update_balances ())
 ;;

@@ -266,6 +266,7 @@ let decimals_tbl : (string, decimals) Hashtbl.t = Hashtbl.create 16
     Preserved across disconnects and resets so that dynamic subscriptions
     re-subscribe automatically on connection restart. *)
 let all_subscribed_symbols : string list ref = ref []
+
 let subscribed_mutex = Mutex.create ()
 
 let get_all_subscribed_symbols () =
@@ -974,7 +975,20 @@ let prune_stale_data () =
     (fun symbol store ->
        let age = Int64.sub now_ns (Atomic.get store.last_update_ns) in
        if Int64.compare age stale_threshold_ns > 0
-       then stores_to_remove := symbol :: !stores_to_remove
+       then (
+         (* Never prune a store whose symbol is still subscribed: the
+            exchange-side subscription survives the prune, so removing only
+            the local state strands the symbol snapshot-less forever - the
+            health monitor then re-subscribes every 15s and Kraken answers
+            "Already subscribed" in a loop. Store count stays bounded by the
+            subscribed symbol list. *)
+         let still_subscribed =
+           Mutex.lock subscribed_mutex;
+           let sub = List.mem symbol !all_subscribed_symbols in
+           Mutex.unlock subscribed_mutex;
+           sub
+         in
+         if still_subscribed then () else stores_to_remove := symbol :: !stores_to_remove)
        else (
          let bids_count = Hashtbl.length store.bids in
          let asks_count = Hashtbl.length store.asks in
@@ -1089,22 +1103,56 @@ let handle_dispatch json on_heartbeat =
       let err_msg =
         member "error" json |> to_string_option |> Option.value ~default:"Unknown error"
       in
-      Logging.error_f ~section "Kraken orderbook subscription failed for %s: %s" symbol err_msg;
-      if String.equal err_msg "Already subscribed"
+      let is_already_subscribed = String.equal err_msg "Already subscribed" in
+      (* A dedup reply is expected health-monitor churn, not a hard failure. *)
+      if is_already_subscribed
+      then
+        Logging.warn_f
+          ~section
+          "Kraken orderbook subscription deduplicated for %s: %s"
+          symbol
+          err_msg
+      else
+        Logging.error_f
+          ~section
+          "Kraken orderbook subscription failed for %s: %s"
+          symbol
+          err_msg;
+      if is_already_subscribed
       then (
+        (* Kraken dedups per connection: the subscription IS active, but the
+           local store may be missing (pruned after 30min without updates) or
+           snapshot-less. In both cases no snapshot ever arrives on its own,
+           deltas keep being discarded, and the health monitor re-subscribes
+           every 15s - repeating this error forever. Recover event-driven:
+           recreate the store if needed and drive one unsubscribe+resubscribe
+           cycle, which forces a fresh snapshot. *)
         match symbol_opt with
         | Some sym ->
           (match store_opt sym with
-           | Some store when not (Atomic.get store.has_snapshot) ->
+           | Some store
+             when (not (Atomic.get store.has_snapshot))
+                  || (Hashtbl.length store.bids = 0 && Hashtbl.length store.asks = 0) ->
+             (* Snapshot-less, or a snapshot arrived but left an empty book:
+               either way top-of-book stays invalid and the health monitor
+               re-subscribes every 15s. *)
              Logging.warn_f
                ~section
-               "Kraken is already subscribed to %s but local store has no snapshot; requesting resubscribe"
+               "Kraken is already subscribed to %s but local store has no usable book; \
+                requesting resubscribe"
                sym;
              request_resubscribe sym
-           | _ -> ())
+           | None ->
+             Logging.warn_f
+               ~section
+               "Kraken is already subscribed to %s but local store was pruned; \
+                recreating store and requesting resubscribe"
+               sym;
+             let _store = ensure_store sym in
+             request_resubscribe sym
+           | Some _ -> ())
         | None -> ()))
-    else
-      Logging.debug_f ~section "Subscribed to %s orderbook feed" symbol
+    else Logging.debug_f ~section "Subscribed to %s orderbook feed" symbol
   | _, _, Some "unsubscribe" ->
     let success = member "success" json |> to_bool_option |> Option.value ~default:true in
     let symbol = extract_symbol_opt json |> Option.value ~default:"unknown" in
@@ -1114,7 +1162,11 @@ let handle_dispatch json on_heartbeat =
       let err_msg =
         member "error" json |> to_string_option |> Option.value ~default:"Unknown error"
       in
-      Logging.warn_f ~section "Kraken orderbook unsubscription failed for %s: %s" symbol err_msg)
+      Logging.warn_f
+        ~section
+        "Kraken orderbook unsubscription failed for %s: %s"
+        symbol
+        err_msg)
   | Some "status", _, _ -> Logging.debug_f ~section "Status message received"
   | _ ->
     Logging.info_f ~section "Unhandled orderbook payload: %s" (Yojson.Safe.to_string json)
@@ -1222,7 +1274,16 @@ let start_message_handler conn symbols on_failure on_heartbeat =
     then (
       failed := true;
       Lwt_mutex.with_lock state.mutex (fun () ->
-        if state.active_conn = Some conn then state.active_conn <- None;
+        (* Physical equality: [conn] is a record holding closures
+           ([read_frame]/[write_frame]), so structural [=] raises
+           Invalid_argument("compare: functional value") and would abort
+           [notify_failure] - leaving [active_conn] pointing at the dead
+           socket and skipping [on_failure]. *)
+        if
+          match state.active_conn with
+          | Some c -> c == conn
+          | None -> false
+        then state.active_conn <- None;
         Lwt.return_unit)
       >>= fun () ->
       on_failure reason;
@@ -1377,9 +1438,7 @@ and resubscribe_symbol symbol =
     let msg_str = Yojson.Safe.to_string unsub_msg in
     Logging.info_f ~section "Unsubscribing %s before re-subscribing" symbol;
     Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ())
-    >>= fun () ->
-    Lwt_unix.sleep 0.25
-    >>= fun () -> subscribe_symbols [ symbol ]
+    >>= fun () -> Lwt_unix.sleep 0.25 >>= fun () -> subscribe_symbols [ symbol ]
   | None ->
     (* Gap fix: a missing connection is a failure, not a silent success.
        Raising routes into [resubscribe_with_retry]'s backoff loop; if the

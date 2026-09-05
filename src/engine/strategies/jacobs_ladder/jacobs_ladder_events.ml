@@ -382,7 +382,7 @@ let handle_order_rejected ~now:_ asset_symbol side price =
                in
                not (matches_side_placement || matches_fallback))
             state.pending_orders;
-        (match side with
+       (match side with
         | Buy ->
           state.last_buy_order_id <- None;
           state.last_buy_order_price <- None;
@@ -464,13 +464,26 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
        if skip_fill
        then (
          add_processed_fill state order_id;
-         Logging.debug_f
-           ~section
-           "Skipping already processed fill: %s (side=%s)"
-           order_id
-           (match side with
-            | Buy -> "buy"
-            | Sell -> "sell");
+         state.skipped_fill_streak <- state.skipped_fill_streak + 1;
+         state.skipped_fills_total <- state.skipped_fills_total + 1;
+         if state.skipped_fill_streak >= 50
+         then
+           Logging.warn_f
+             ~section
+             "Replay guard skipped %d consecutive fills (total %d) for %s; \
+              last_fill_oid=%s"
+             state.skipped_fill_streak
+             state.skipped_fills_total
+             asset_symbol
+             (Option.value state.last_fill_oid ~default:"none")
+         else
+           Logging.debug_f
+             ~section
+             "Skipping already processed fill: %s (side=%s)"
+             order_id
+             (match side with
+              | Buy -> "buy"
+              | Sell -> "sell");
          if state.startup_replay
          then (
            let dominated =
@@ -482,9 +495,30 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
                 with
                 | _ -> false)
            in
-           if dominated then state.highest_startup_oid <- Some order_id))
+           if dominated then state.highest_startup_oid <- Some order_id)
+         else if state.skipped_fill_streak >= 50
+         then (
+           (* A monotonic high-water skip guard can permanently eat every
+               real fill if the persisted mark lands above the venue's live
+               id space (state restored across accounts/venues, id reset).
+               After 50 consecutive skips with zero processed fills this is
+               the only consistent explanation (ordinary duplicate redelivery
+               is bounded and covered by processed_fills). Reset the mark so
+               real fills flow again; processed_fills still guards in-window
+               redelivery. *)
+           Logging.critical_f
+             ~section
+             "Fill replay guard stuck: %d consecutive skips for %s (last_fill_oid=%s) \
+              indicates the persisted high-water mark is ahead of the venue's live id \
+              space. Resetting last_fill_oid to None so fills process again."
+             state.skipped_fill_streak
+             asset_symbol
+             (Option.value state.last_fill_oid ~default:"none");
+           state.last_fill_oid <- None;
+           state.skipped_fill_streak <- 0))
        else (
          add_processed_fill state order_id;
+         state.skipped_fill_streak <- 0;
          state.pending_orders
          <- List.filter
               (fun (pending_id, _, _, _) ->
@@ -639,7 +673,8 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
                     | [] -> if found then Some (List.rev acc) else None
                     | (sp, _sq) :: rest
                       when (not found)
-                           && (abs_float (sp -. sell_fill_price) <= sell_fill_price *. 0.0001
+                           && (abs_float (sp -. sell_fill_price)
+                               <= sell_fill_price *. 0.0001
                                || abs_float (sp -. sell_fill_price) <= 1e-4) ->
                       remove_exact acc true rest
                     | item :: rest -> remove_exact (item :: acc) found rest
@@ -655,7 +690,8 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
                             then (
                               match best with
                               | None -> Some (sp, sq)
-                              | Some (b_sp, _) -> if sp > b_sp then Some (sp, sq) else best)
+                              | Some (b_sp, _) ->
+                                if sp > b_sp then Some (sp, sq) else best)
                             else best)
                          None
                          state.persisted_sell_levels
@@ -668,8 +704,8 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
                             when (not found)
                                  && (abs_float (sp -. cand_p) <= cand_p *. 0.0001
                                      || abs_float (sp -. cand_p) <= 1e-4) ->
-                          remove_cand acc true rest
-                        | item :: rest -> remove_cand (item :: acc) found rest
+                            remove_cand acc true rest
+                          | item :: rest -> remove_cand (item :: acc) found rest
                         in
                         remove_cand [] false state.persisted_sell_levels
                       | None -> state.persisted_sell_levels))
@@ -801,23 +837,38 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
                  && String.sub pending_id 14 (String.length pending_id - 14) = order_id)
               state.pending_orders
        in
+       (* A "ghost" placement is an order the venue reports as canceled whose id we
+           never tracked (lost ack, TIF/post-only reject after dispatch). Only
+           in that case may the cancel purge in-flight placement tokens of the
+           same side. If the canceled order IS known (a resting buy/sell we
+           are tracking), its cancel is a legitimate cancel of a different
+           order - purging the side's placement tokens here would free the
+           dedup key / clear the in-flight guard of a CONCURRENTLY dispatched
+           placement and allow a duplicate order. *)
+       let is_known_order =
+         (match state.last_buy_order_id with
+          | Some id -> buy_tracking_matches_exchange_event id order_id cl_ord_id
+          | None -> false)
+         || List.exists (fun (sell_id, _, _) -> sell_id = order_id) state.open_sell_orders
+       in
        state.pending_orders
        <- List.filter
-             (fun (pending_id, s, _, _) ->
-                let matches =
-                  pending_id = order_id
-                  || (String.starts_with ~prefix:"pending_amend_" pending_id
-                      && String.length pending_id > 14
-                      && String.sub pending_id 14 (String.length pending_id - 14)
-                         = order_id)
-                in
-                let is_ghost_placement =
-                  s = side
-                  && (String.starts_with ~prefix:"pending_buy_" pending_id
-                      || String.starts_with ~prefix:"pending_sell_" pending_id)
-                in
-                not (matches || is_ghost_placement))
-             state.pending_orders;
+            (fun (pending_id, s, _, _) ->
+               let matches =
+                 pending_id = order_id
+                 || (String.starts_with ~prefix:"pending_amend_" pending_id
+                     && String.length pending_id > 14
+                     && String.sub pending_id 14 (String.length pending_id - 14)
+                        = order_id)
+               in
+               let is_ghost_placement =
+                 (not is_known_order)
+                 && s = side
+                 && (String.starts_with ~prefix:"pending_buy_" pending_id
+                     || String.starts_with ~prefix:"pending_sell_" pending_id)
+               in
+               not (matches || is_ghost_placement))
+            state.pending_orders;
        if not is_being_amended
        then (
          Hashtbl.remove state.amend_cooldowns order_id;
@@ -1050,17 +1101,17 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
        (match side with
         | Buy -> state.inflight_amend_buy <- false
         | Sell -> ());
-        let is_tif_rejection =
-          contains_fragment lower_reason "time in force"
-          || contains_fragment lower_reason "alo"
-          || contains_fragment lower_reason "post-only"
-          || contains_fragment lower_reason "post only"
-          || contains_fragment lower_reason "cross"
-        in
-        let is_order_gone =
-          is_cache_miss || is_cannot_modify || is_margin_error || is_tif_rejection
-        in
-        if is_order_gone
+       let is_tif_rejection =
+         contains_fragment lower_reason "time in force"
+         || contains_fragment lower_reason "alo"
+         || contains_fragment lower_reason "post-only"
+         || contains_fragment lower_reason "post only"
+         || contains_fragment lower_reason "cross"
+       in
+       let is_order_gone =
+         is_cache_miss || is_cannot_modify || is_margin_error || is_tif_rejection
+       in
+       if is_order_gone
        then (
          let cancel_order =
            create_cancel_order order_id asset_symbol Ladder state.exchange_id

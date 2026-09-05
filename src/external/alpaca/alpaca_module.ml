@@ -15,6 +15,21 @@ module Alpaca_impl = struct
   let section = "alpaca_module"
   let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16
 
+  (* Monotonic placement nonce so every logical placement gets a globally
+     unique [client_order_id]. A placement is retried (inside
+     [Alpaca_rest.place_order]) with the SAME id, and Alpaca enforces
+     client_order_id uniqueness - so an ambiguous timeout/connection failure
+     that landed at the venue is rejected on retry instead of silently
+     placing a duplicate order. *)
+  let placement_counter = Atomic.make 0
+  let sanitize_symbol symbol = String.concat "_" (String.split_on_char '/' symbol)
+
+  let next_client_order_id ~symbol ~side =
+    let nonce = Atomic.fetch_and_add placement_counter 1 in
+    let ms = Int64.of_float (Unix.gettimeofday () *. 1000.0) in
+    Printf.sprintf "dio_%s_%s_%Ld_%d" (sanitize_symbol symbol) side ms nonce
+  ;;
+
   let string_of_order_type = function
     | Types.Limit -> "limit"
     | Types.Market -> "market"
@@ -56,7 +71,21 @@ module Alpaca_impl = struct
     =
     let alpaca_side = alpaca_side_of_side side in
     let type_str = string_of_order_type order_type in
+    let side_str =
+      match side with
+      | Types.Buy -> "buy"
+      | Types.Sell -> "sell"
+    in
     let tif_str = Option.map string_of_time_in_force time_in_force in
+    (* When the caller (supervisor dispatcher) does not supply a client id,
+       generate a stable one here - BEFORE the retry loop inside
+       [Alpaca_rest.place_order] - so every retry attempt carries the same
+       id and an ambiguous failure cannot double-place. *)
+    let cl_ord_id =
+      match cl_ord_id with
+      | Some id -> Some id
+      | None -> Some (next_client_order_id ~symbol ~side:side_str)
+    in
     Alpaca_rest.place_order
       ~symbol
       ~qty

@@ -689,10 +689,246 @@ let process_order_updates data_json =
   | `List orders ->
     List.iter
       (fun order_update ->
-         let order_obj = member "order" order_update in
-         let coin = member "coin" order_obj |> to_string in
+         try
+           let order_obj = member "order" order_update in
+           let coin = member "coin" order_obj |> to_string in
+           let order_id =
+             match member "oid" order_obj with
+             | `Int i -> string_of_int i
+             | `String s -> s
+             | _ -> "0"
+           in
+           let symbol_opt =
+             Mutex.lock order_index_mutex;
+             let res = Hashtbl.find_opt order_to_symbol order_id in
+             Mutex.unlock order_index_mutex;
+             match res with
+             | Some s -> Some s
+             | None -> find_registered_symbol coin
+           in
+           match symbol_opt with
+           | Some symbol ->
+             let status = member "status" order_update |> to_string in
+             let price =
+               match member "limitPx" order_obj with
+               | `String s -> float_of_string s
+               | `Float f -> f
+               | `Int i -> float_of_int i
+               | _ -> 0.0
+             in
+             let qty =
+               match member "origSz" order_obj with
+               | `String s -> float_of_string s
+               | `Float f -> f
+               | `Int i -> float_of_int i
+               | _ ->
+                 (match member "sz" order_obj with
+                  | `String s -> float_of_string s
+                  | `Float f -> f
+                  | `Int i -> float_of_int i
+                  | _ -> 0.0)
+             in
+             let side =
+               if member "side" order_obj |> to_string = "B" then Buy else Sell
+             in
+             let cl_ord_id = member "cloid" order_obj |> to_string_option in
+             let store = get_symbol_store symbol in
+             let action_time =
+               match member "timestamp" order_obj with
+               | `Int i -> float_of_int i /. 1000.0
+               | `Float f -> f /. 1000.0
+               | `String s ->
+                 (try float_of_string s /. 1000.0 with
+                  | _ -> Unix.gettimeofday ())
+               | _ -> Unix.gettimeofday ()
+             in
+             let now = action_time in
+             let order_status =
+               match status with
+               | "open" -> NewStatus
+               | "filled" -> FilledStatus
+               | "canceled" -> CanceledStatus
+               | "rejected" -> RejectedStatus
+               | "marginCanceled" -> CanceledStatus
+               | s when is_rejection_status s -> RejectedStatus
+               | s -> UnknownStatus s
+             in
+             let existing_order =
+               Mutex.lock store.orders_mutex;
+               let o = Hashtbl.find_opt store.open_orders order_id in
+               Mutex.unlock store.orders_mutex;
+               o
+             in
+             let is_amended =
+               match existing_order with
+               | Some prev ->
+                 let price_changed =
+                   match prev.limit_price with
+                   | Some p -> abs_float (p -. price) > 1e-12
+                   | None -> price > 1e-12
+                 in
+                 let qty_changed = abs_float (prev.order_qty -. qty) > 1e-12 in
+                 price_changed || qty_changed || status = "amended" || status = "modified"
+               | None -> status = "amended" || status = "modified"
+             in
+             let exec_type =
+               match status with
+               | "open" when is_amended -> Amended
+               | "open" -> New
+               | "amended" | "modified" -> Amended
+               | "filled" -> Filled
+               | "canceled" | "marginCanceled" -> Canceled
+               | "rejected" -> Rejected
+               | s when is_rejection_status s -> Rejected
+               | _ -> Unknown status
+             in
+             let new_cum_qty =
+               match status with
+               | "filled" -> qty
+               | _ ->
+                 (match existing_order with
+                  | Some o -> o.cum_qty
+                  | None -> 0.0)
+             in
+             let new_cum_cost =
+               match status with
+               | "filled" ->
+                 (* Partial fills were already recorded at their traded
+                     prices (o.cum_cost/o.cum_qty VWAP). Blend only the
+                     remaining qty at limitPx instead of rewriting the whole
+                     order at the limit price. *)
+                 (match existing_order with
+                  | Some o when o.cum_qty > 0.0 ->
+                    let remaining = max 0.0 (qty -. o.cum_qty) in
+                    o.cum_cost +. (remaining *. price)
+                  | _ -> qty *. price)
+               | _ ->
+                 (match existing_order with
+                  | Some o -> o.cum_cost
+                  | None -> 0.0)
+             in
+             let new_avg_price =
+               match status with
+               | "filled" ->
+                 (match existing_order with
+                  | Some o when o.cum_qty > 0.0 ->
+                    let remaining = max 0.0 (qty -. o.cum_qty) in
+                    let filled_total = o.cum_qty +. remaining in
+                    if filled_total > 0.0
+                    then (o.cum_cost +. (remaining *. price)) /. filled_total
+                    else price
+                  | _ -> price)
+               | _ ->
+                 (match existing_order with
+                  | Some o -> o.avg_price
+                  | None -> 0.0)
+             in
+             let event : execution_event =
+               { order_id
+               ; symbol
+               ; exec_type
+               ; order_status
+               ; limit_price = Some price
+               ; side
+               ; order_qty = qty
+               ; cum_qty = new_cum_qty
+               ; cum_cost = new_cum_cost
+               ; avg_price = new_avg_price
+               ; timestamp = now
+               ; trade_id = None
+               ; last_qty = (if status = "filled" then Some qty else None)
+               ; last_price = (if status = "filled" then Some price else None)
+               ; fee = None
+               ; cl_ord_id =
+                   (match cl_ord_id with
+                    | Some _ -> cl_ord_id
+                    | None ->
+                      (match existing_order with
+                       | Some o -> o.cl_ord_id
+                       | None -> None))
+               }
+             in
+             let is_terminal_ou =
+               match order_status with
+               | FilledStatus | CanceledStatus | RejectedStatus | ExpiredStatus -> true
+               | _ -> false
+             in
+             (* Guard: if the order is already gone from open_orders
+               (removed by a prior userFills Trade event), skip redundant
+               terminal dispatch from orderUpdates.  The userFills path
+               provides accurate fill_price and fee; orderUpdates uses
+               limitPx which can diverge and corrupt strategy state. *)
+             let is_already_terminal = is_terminal_ou && existing_order = None in
+             if is_already_terminal
+             then
+               Logging.debug_f
+                 ~section
+                 "Skipping redundant %s event for %s [%s] (already processed via \
+                  userFills)"
+                 status
+                 order_id
+                 symbol
+             else (
+               update_orders_internal store event;
+               match order_status with
+               | FilledStatus | RejectedStatus ->
+                 Logging.debug_f
+                   ~section
+                   "Order %s: %s [%s] (reason: %s)"
+                   (String.uppercase_ascii status)
+                   order_id
+                   symbol
+                   status
+               | CanceledStatus ->
+                 Logging.debug_f
+                   ~section
+                   "Order %s: %s [%s] (reason: %s)"
+                   (String.uppercase_ascii status)
+                   order_id
+                   symbol
+                   status
+               | NewStatus when is_amended ->
+                 Logging.info_f
+                   ~section
+                   "Order AMENDED: %s [%s] %.8f @ %.4f"
+                   order_id
+                   symbol
+                   qty
+                   price
+               | NewStatus ->
+                 Logging.debug_f
+                   ~section
+                   "Order OPEN: %s [%s] %.8f @ %.2f"
+                   order_id
+                   symbol
+                   qty
+                   price
+               | _ -> ())
+           | None -> ()
+         with
+         | exn ->
+           Logging.error_f
+             ~section
+             "Failed to process HL order update: %s | JSON: %s"
+             (Printexc.to_string exn)
+             (Yojson.Safe.to_string order_update))
+      orders
+  | _ -> ()
+;;
+
+let process_user_events data_json =
+  let open Yojson.Safe.Util in
+  (* Process fill events from the userEvents/userFills payload. *)
+  let fills =
+    try member "fills" data_json |> to_list with
+    | _ -> []
+  in
+  List.iter
+    (fun fill ->
+       try
+         let coin = member "coin" fill |> to_string in
          let order_id =
-           match member "oid" order_obj with
+           match member "oid" fill with
            | `Int i -> string_of_int i
            | `String s -> s
            | _ -> "0"
@@ -707,31 +943,21 @@ let process_order_updates data_json =
          in
          match symbol_opt with
          | Some symbol ->
-           let status = member "status" order_update |> to_string in
-           let price =
-             match member "limitPx" order_obj with
-             | `String s -> float_of_string s
-             | `Float f -> f
-             | `Int i -> float_of_int i
+           let price = member "px" fill |> to_string |> float_of_string in
+           let size = member "sz" fill |> to_string |> float_of_string in
+           let side = if member "side" fill |> to_string = "B" then Buy else Sell in
+           let tid =
+             match member "tid" fill with
+             | `Int i -> Int64.of_int i
+             | `String s -> Int64.of_string s
+             | _ -> 0L
+           in
+           let fee =
+             try member "fee" fill |> to_string |> float_of_string with
              | _ -> 0.0
            in
-           let qty =
-             match member "origSz" order_obj with
-             | `String s -> float_of_string s
-             | `Float f -> f
-             | `Int i -> float_of_int i
-             | _ ->
-               (match member "sz" order_obj with
-                | `String s -> float_of_string s
-                | `Float f -> f
-                | `Int i -> float_of_int i
-                | _ -> 0.0)
-           in
-           let side = if member "side" order_obj |> to_string = "B" then Buy else Sell in
-           let cl_ord_id = member "cloid" order_obj |> to_string_option in
-           let store = get_symbol_store symbol in
            let action_time =
-             match member "timestamp" order_obj with
+             match member "time" fill with
              | `Int i -> float_of_int i /. 1000.0
              | `Float f -> f /. 1000.0
              | `String s ->
@@ -739,346 +965,156 @@ let process_order_updates data_json =
                 | _ -> Unix.gettimeofday ())
              | _ -> Unix.gettimeofday ()
            in
-           let now = action_time in
-           let order_status =
-             match status with
-             | "open" -> NewStatus
-             | "filled" -> FilledStatus
-             | "canceled" -> CanceledStatus
-             | "rejected" -> RejectedStatus
-             | "marginCanceled" -> CanceledStatus
-             | s when is_rejection_status s -> RejectedStatus
-             | s -> UnknownStatus s
-           in
-           let existing_order =
-             Mutex.lock store.orders_mutex;
-             let o = Hashtbl.find_opt store.open_orders order_id in
-             Mutex.unlock store.orders_mutex;
-             o
-           in
-           let is_amended =
-             match existing_order with
-             | Some prev ->
-               let price_changed =
-                 match prev.limit_price with
-                 | Some p -> abs_float (p -. price) > 1e-12
-                 | None -> price > 1e-12
-               in
-               let qty_changed = abs_float (prev.order_qty -. qty) > 1e-12 in
-               price_changed || qty_changed || status = "amended" || status = "modified"
-             | None -> status = "amended" || status = "modified"
-           in
-           let exec_type =
-             match status with
-             | "open" when is_amended -> Amended
-             | "open" -> New
-             | "amended" | "modified" -> Amended
-             | "filled" -> Filled
-             | "canceled" | "marginCanceled" -> Canceled
-             | "rejected" -> Rejected
-             | s when is_rejection_status s -> Rejected
-             | _ -> Unknown status
-           in
-           let new_cum_qty =
-             match status with
-             | "filled" -> qty
-             | _ ->
-               (match existing_order with
-                | Some o -> o.cum_qty
-                | None -> 0.0)
-           in
-           let new_cum_cost =
-             match status with
-             | "filled" -> qty *. price
-             | _ ->
-               (match existing_order with
-                | Some o -> o.cum_cost
-                | None -> 0.0)
-           in
-           let new_avg_price =
-             match status with
-             | "filled" -> price
-             | _ ->
-               (match existing_order with
-                | Some o -> o.avg_price
-                | None -> 0.0)
-           in
-           let event : execution_event =
-             { order_id
-             ; symbol
-             ; exec_type
-             ; order_status
-             ; limit_price = Some price
-             ; side
-             ; order_qty = qty
-             ; cum_qty = new_cum_qty
-             ; cum_cost = new_cum_cost
-             ; avg_price = new_avg_price
-             ; timestamp = now
-             ; trade_id = None
-             ; last_qty = (if status = "filled" then Some qty else None)
-             ; last_price = (if status = "filled" then Some price else None)
-             ; fee = None
-             ; cl_ord_id =
-                 (match cl_ord_id with
-                  | Some _ -> cl_ord_id
-                  | None ->
-                    (match existing_order with
-                     | Some o -> o.cl_ord_id
-                     | None -> None))
-             }
-           in
-           let is_terminal_ou =
-             match order_status with
-             | FilledStatus | CanceledStatus | RejectedStatus | ExpiredStatus -> true
-             | _ -> false
-           in
-           (* Guard: if the order is already gone from open_orders
-               (removed by a prior userFills Trade event), skip redundant
-               terminal dispatch from orderUpdates.  The userFills path
-               provides accurate fill_price and fee; orderUpdates uses
-               limitPx which can diverge and corrupt strategy state. *)
-           let is_already_terminal = is_terminal_ou && existing_order = None in
-           if is_already_terminal
-           then
-             Logging.debug_f
-               ~section
-               "Skipping redundant %s event for %s [%s] (already processed via userFills)"
-               status
-               order_id
-               symbol
-           else (
-             update_orders_internal store event;
-             match order_status with
-             | FilledStatus | RejectedStatus ->
-               Logging.debug_f
-                 ~section
-                 "Order %s: %s [%s] (reason: %s)"
-                 (String.uppercase_ascii status)
-                 order_id
-                 symbol
-                 status
-             | CanceledStatus ->
-               Logging.debug_f
-                 ~section
-                 "Order %s: %s [%s] (reason: %s)"
-                 (String.uppercase_ascii status)
-                 order_id
-                 symbol
-                 status
-             | NewStatus when is_amended ->
-               Logging.info_f
-                 ~section
-                 "Order AMENDED: %s [%s] %.8f @ %.4f"
-                 order_id
-                 symbol
-                 qty
-                 price
-             | NewStatus ->
-               Logging.debug_f
-                 ~section
-                 "Order OPEN: %s [%s] %.8f @ %.2f"
-                 order_id
-                 symbol
-                 qty
-                 price
-             | _ -> ())
-         | None -> ())
-      orders
-  | _ -> ()
-;;
-
-let process_user_events data_json =
-  let open Yojson.Safe.Util in
-  (* Process fill events from the userEvents/userFills payload. *)
-  let fills =
-    try member "fills" data_json |> to_list with
-    | _ -> []
-  in
-  List.iter
-    (fun fill ->
-       let coin = member "coin" fill |> to_string in
-       let order_id =
-         match member "oid" fill with
-         | `Int i -> string_of_int i
-         | `String s -> s
-         | _ -> "0"
-       in
-       let symbol_opt =
-         Mutex.lock order_index_mutex;
-         let res = Hashtbl.find_opt order_to_symbol order_id in
-         Mutex.unlock order_index_mutex;
-         match res with
-         | Some s -> Some s
-         | None -> find_registered_symbol coin
-       in
-       match symbol_opt with
-       | Some symbol ->
-         let price = member "px" fill |> to_string |> float_of_string in
-         let size = member "sz" fill |> to_string |> float_of_string in
-         let side = if member "side" fill |> to_string = "B" then Buy else Sell in
-         let tid =
-           match member "tid" fill with
-           | `Int i -> Int64.of_int i
-           | `String s -> Int64.of_string s
-           | _ -> 0L
-         in
-         let fee =
-           try member "fee" fill |> to_string |> float_of_string with
-           | _ -> 0.0
-         in
-         let action_time =
-           match member "time" fill with
-           | `Int i -> float_of_int i /. 1000.0
-           | `Float f -> f /. 1000.0
-           | `String s ->
-             (try float_of_string s /. 1000.0 with
-              | _ -> Unix.gettimeofday ())
-           | _ -> Unix.gettimeofday ()
-         in
-         let store = get_symbol_store symbol in
-         (* Deduplicate trade fills using bounded per-symbol trade ID tracking. *)
-         let now = Unix.gettimeofday () in
-         Mutex.lock store.tids_mutex;
-         let already_processed = Hashtbl.mem store.processed_tids tid in
-         if not already_processed
-         then (
-           Hashtbl.replace store.processed_tids tid now;
-           Queue.push tid store.processed_tids_queue;
-           (* FIFO eviction when exceeding max_processed_tids capacity. *)
-           while Hashtbl.length store.processed_tids > max_processed_tids do
-             if Queue.is_empty store.processed_tids_queue
-             then
-               ignore (Hashtbl.length store.processed_tids)
-               (* Queue/table diverged; deferred to periodic cleanup. *)
-             else (
-               let oldest = Queue.pop store.processed_tids_queue in
-               Hashtbl.remove store.processed_tids oldest)
-           done);
-         Mutex.unlock store.tids_mutex;
-         if not already_processed
-         then (
-           (* Hold mutex for the full read-compute-write cycle to prevent double-counted fills. *)
-           Mutex.lock store.orders_mutex;
-           let (existing_order : open_order option) =
-             Hashtbl.find_opt store.open_orders order_id
-           in
-           let cum_qty =
-             match existing_order with
-             | Some o -> o.cum_qty +. size
-             | None -> size
-           in
-           let order_qty =
-             match existing_order with
-             | Some o -> o.order_qty
-             | None -> size
-           in
-           let is_filled = cum_qty >= order_qty -. 1e-6 in
-           let status = if is_filled then FilledStatus else PartiallyFilledStatus in
-           let limit_price =
-             match existing_order with
-             | Some o -> o.limit_price
-             | None -> Some price
-           in
-           let cl_ord_id =
-             match existing_order with
-             | Some o -> o.cl_ord_id
-             | None -> None
-           in
-           let cum_cost =
-             match existing_order with
-             | Some o -> o.cum_cost +. (size *. price)
-             | None -> size *. price
-           in
-           let avg_price = if cum_qty > 0.0 then cum_cost /. cum_qty else price in
-           Mutex.unlock store.orders_mutex;
-           let event : execution_event =
-             { order_id
-             ; symbol
-             ; exec_type = Trade
-             ; order_status = status
-             ; limit_price
-             ; side
-             ; order_qty
-             ; cum_qty
-             ; cum_cost
-             ; avg_price
-             ; timestamp = action_time
-             ; trade_id = Some tid
-             ; last_qty = Some size
-             ; last_price = Some price
-             ; fee = Some fee
-             ; cl_ord_id
-             }
-           in
-           update_orders_internal store event;
-           if is_filled
+           let store = get_symbol_store symbol in
+           (* Deduplicate trade fills using bounded per-symbol trade ID tracking. *)
+           let now = Unix.gettimeofday () in
+           Mutex.lock store.tids_mutex;
+           let already_processed = Hashtbl.mem store.processed_tids tid in
+           if not already_processed
            then (
-             if is_startup_snapshot_done ()
+             Hashtbl.replace store.processed_tids tid now;
+             Queue.push tid store.processed_tids_queue;
+             (* FIFO eviction when exceeding max_processed_tids capacity. *)
+             while Hashtbl.length store.processed_tids > max_processed_tids do
+               if Queue.is_empty store.processed_tids_queue
+               then
+                 ignore (Hashtbl.length store.processed_tids)
+                 (* Queue/table diverged; deferred to periodic cleanup. *)
+               else (
+                 let oldest = Queue.pop store.processed_tids_queue in
+                 Hashtbl.remove store.processed_tids oldest)
+             done);
+           Mutex.unlock store.tids_mutex;
+           if not already_processed
+           then (
+             (* Hold mutex for the full read-compute-write cycle to prevent double-counted fills. *)
+             Mutex.lock store.orders_mutex;
+             let (existing_order : open_order option) =
+               Hashtbl.find_opt store.open_orders order_id
+             in
+             let cum_qty =
+               match existing_order with
+               | Some o -> o.cum_qty +. size
+               | None -> size
+             in
+             let order_qty =
+               match existing_order with
+               | Some o -> o.order_qty
+               | None -> size
+             in
+             let is_filled = cum_qty >= order_qty -. 1e-6 in
+             let status = if is_filled then FilledStatus else PartiallyFilledStatus in
+             let limit_price =
+               match existing_order with
+               | Some o -> o.limit_price
+               | None -> Some price
+             in
+             let cl_ord_id =
+               match existing_order with
+               | Some o -> o.cl_ord_id
+               | None -> None
+             in
+             let cum_cost =
+               match existing_order with
+               | Some o -> o.cum_cost +. (size *. price)
+               | None -> size *. price
+             in
+             let avg_price = if cum_qty > 0.0 then cum_cost /. cum_qty else price in
+             Mutex.unlock store.orders_mutex;
+             let event : execution_event =
+               { order_id
+               ; symbol
+               ; exec_type = Trade
+               ; order_status = status
+               ; limit_price
+               ; side
+               ; order_qty
+               ; cum_qty
+               ; cum_cost
+               ; avg_price
+               ; timestamp = action_time
+               ; trade_id = Some tid
+               ; last_qty = Some size
+               ; last_price = Some price
+               ; fee = Some fee
+               ; cl_ord_id
+               }
+             in
+             update_orders_internal store event;
+             if is_filled
+             then (
+               if is_startup_snapshot_done ()
+               then
+                 Logging.debug_f
+                   ~section
+                   "Order FILLED: %s [%s] %.8f @ %.2f (trade_id: %Ld)"
+                   order_id
+                   symbol
+                   size
+                   price
+                   tid
+               else
+                 Logging.debug_f
+                   ~section
+                   "Order FILLED (startup snapshot): %s [%s] %.8f @ %.2f (trade_id: %Ld)"
+                   order_id
+                   symbol
+                   size
+                   price
+                   tid;
+               (* Publish to centralized fill event bus for Discord notifications *)
+               let fill_value = cum_qty *. avg_price in
+               let maker_fee_rate =
+                 match Dio_exchange.Exchange_intf.Registry.get "hyperliquid" with
+                 | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+                   (match Ex.get_fees ~symbol with
+                    | Some f, _ -> f
+                    | _ -> 0.0)
+                 | None -> 0.0
+               in
+               let estimated_fee = fill_value *. maker_fee_rate in
+               Concurrency.Fill_event_bus.publish_fill
+                 { venue = "hyperliquid"
+                 ; symbol
+                 ; side = (if side = Buy then "buy" else "sell")
+                 ; amount = cum_qty
+                 ; fill_price = avg_price
+                 ; value = fill_value
+                 ; fee = estimated_fee
+                 ; timestamp = action_time
+                 ; order_id
+                 ; trade_id = Int64.to_string tid
+                 })
+             else if is_startup_snapshot_done ()
              then
                Logging.debug_f
                  ~section
-                 "Order FILLED: %s [%s] %.8f @ %.2f (trade_id: %Ld)"
+                 "Order PARTIALLY FILLED: %s [%s] %.8f @ %.2f (filled: %.8f/%.8f)"
                  order_id
                  symbol
                  size
                  price
-                 tid
+                 cum_qty
+                 order_qty
              else
                Logging.debug_f
                  ~section
-                 "Order FILLED (startup snapshot): %s [%s] %.8f @ %.2f (trade_id: %Ld)"
+                 "Order PARTIALLY FILLED (startup snapshot): %s [%s] %.8f @ %.2f \
+                  (filled: %.8f/%.8f)"
                  order_id
                  symbol
                  size
                  price
-                 tid;
-             (* Publish to centralized fill event bus for Discord notifications *)
-             let fill_value = cum_qty *. avg_price in
-             let maker_fee_rate =
-               match Dio_exchange.Exchange_intf.Registry.get "hyperliquid" with
-               | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
-                 (match Ex.get_fees ~symbol with
-                  | Some f, _ -> f
-                  | _ -> 0.0)
-               | None -> 0.0
-             in
-             let estimated_fee = fill_value *. maker_fee_rate in
-             Concurrency.Fill_event_bus.publish_fill
-               { venue = "hyperliquid"
-               ; symbol
-               ; side = (if side = Buy then "buy" else "sell")
-               ; amount = cum_qty
-               ; fill_price = avg_price
-               ; value = fill_value
-               ; fee = estimated_fee
-               ; timestamp = action_time
-               ; order_id
-               ; trade_id = Int64.to_string tid
-               })
-           else if is_startup_snapshot_done ()
-           then
-             Logging.debug_f
-               ~section
-               "Order PARTIALLY FILLED: %s [%s] %.8f @ %.2f (filled: %.8f/%.8f)"
-               order_id
-               symbol
-               size
-               price
-               cum_qty
-               order_qty
-           else
-             Logging.debug_f
-               ~section
-               "Order PARTIALLY FILLED (startup snapshot): %s [%s] %.8f @ %.2f (filled: \
-                %.8f/%.8f)"
-               order_id
-               symbol
-               size
-               price
-               cum_qty
-               order_qty)
-       | None -> ())
+                 cum_qty
+                 order_qty)
+         | None -> ()
+       with
+       | exn ->
+         Logging.error_f
+           ~section
+           "Failed to process HL fill: %s | JSON: %s"
+           (Printexc.to_string exn)
+           (Yojson.Safe.to_string fill))
     fills;
   (* Process non-user cancellation events (exchange-initiated). *)
   let non_user_cancels =

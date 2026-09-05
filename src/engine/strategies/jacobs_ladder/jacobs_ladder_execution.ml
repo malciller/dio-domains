@@ -119,9 +119,7 @@ let evaluate_asset_low_recovery
       then List.fold_left (fun acc (_, _, qty) -> acc +. qty) 0.0 state.open_sell_orders
       else 0.0
     in
-    let available_asset =
-      asset_bal -. state.reserved_base -. locked_in_sells
-    in
+    let available_asset = asset_bal -. state.reserved_base -. locked_in_sells in
     let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
     state.last_seen_asset_balance <- asset_bal;
     let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Sell" in
@@ -139,9 +137,8 @@ let evaluate_asset_low_recovery
       ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell);
       Logging.info_f
         ~section
-        "Asset balance restored for %s (have %.8f, reserved %.8f, \
-         locked_sells %.8f, available %.8f, need %.8f) - resuming sell+buy \
-         placement"
+        "Asset balance restored for %s (have %.8f, reserved %.8f, locked_sells %.8f, \
+         available %.8f, need %.8f) - resuming sell+buy placement"
         asset.symbol
         asset_bal
         state.reserved_base
@@ -200,53 +197,19 @@ let evaluate_capital_low_recovery
         was_at))
 ;;
 
-(** Performs periodic cleanup of stale pending orders and expired amend cooldowns. *)
+(** Expires rate-limit cooldowns and ghost-order markers.
+
+    Pending order/amendment tokens are deliberately NOT swept here. Their
+    lifecycle is purely event-driven: every dispatched place/amend produces
+    exactly one guaranteed terminal event (Ack/Failed, Amended/
+    Amendment_skipped/Amendment_failed, or a recognized cancel), and each of
+    those handlers removes the token, the in-flight flag, and the registry
+    entry. The old 5s age-based sweep resolved state while the exchange
+    could still be executing the request (Alpaca amends exceed 5s under SSL
+    degradation), so a mid-flight cancel event was no longer recognized as
+    the amend's side effect and wrongly reset buy tracking - dropping the
+    sweep removes that race instead of tuning around it. *)
 let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
-  let needs_pending_cleanup =
-    let rec check_stale count = function
-      | [] -> count > 50
-      | (_, _, _, ts) :: rest ->
-        if now -. ts > 5.0 then true else check_stale (count + 1) rest
-    in
-    check_stale 0 state.pending_orders
-  in
-  if needs_pending_cleanup
-  then (
-    let kept_rev, _, _ =
-      List.fold_left
-        (fun (acc, kept, removed) ((order_id, side, _, timestamp) as entry) ->
-           let age = now -. timestamp in
-           if age > 5.0
-           then (
-             Logging.warn_f
-               ~section
-               "Removing stale pending order %s for %s (age: %.1fs)"
-               order_id
-               asset.symbol
-               age;
-             if String.starts_with ~prefix:"pending_amend_" order_id
-             then (
-               let target_oid = String.sub order_id 14 (String.length order_id - 14) in
-               ignore (InFlightAmendments.remove_in_flight_amendment target_oid);
-               if side = Buy then state.inflight_amend_buy <- false)
-             else (
-               let duplicate_key =
-                 match side with
-                 | Buy -> state.duplicate_key_buy
-                 | Sell -> state.duplicate_key_sell
-               in
-               ignore (InFlightOrders.remove_in_flight_order duplicate_key);
-               match side with
-               | Buy -> state.inflight_buy <- false
-               | Sell -> state.inflight_sell <- false);
-             acc, kept, removed + 1)
-           else if kept >= 50
-           then acc, kept, removed + 1
-           else entry :: acc, kept + 1, removed)
-        ([], 0, 0)
-        state.pending_orders
-    in
-    state.pending_orders <- List.rev kept_rev);
   if Hashtbl.length state.amend_cooldowns > 0
   then (
     let to_remove = ref [] in
@@ -299,7 +262,7 @@ let sync_open_orders
   state.open_sell_orders <- [];
   let best_buy_price = ref 0.0 in
   let best_buy_id = ref None in
-    let open_buy_count_from_scan = ref 0 in
+  let open_buy_count_from_scan = ref 0 in
   let has_recent_amend_buy = ref false in
   let locked_in_buys = ref 0.0 in
   let locked_in_sells = ref 0.0 in
@@ -414,7 +377,10 @@ let sync_open_orders
               then state.cached_qty_increment
               else 1e-8
             in
-            if abs_float (existing_q -. qty) > 1e-6 && qty >= min_order_size -. 1e-9 && qty > 0.0
+            if
+              abs_float (existing_q -. qty) > 1e-6
+              && qty >= min_order_size -. 1e-9
+              && qty > 0.0
             then (
               state.persisted_sell_levels
               <- List.mapi
@@ -451,8 +417,8 @@ let sync_open_orders
               build_persisted_idx ();
               Logging.info_f
                 ~section
-                "Adopted open exchange sell order for %s @ %.4f (qty %.8f) into persistent \
-                 tracking"
+                "Adopted open exchange sell order for %s @ %.4f (qty %.8f) into \
+                 persistent tracking"
                 asset.symbol
                 price
                 qty));
@@ -463,14 +429,16 @@ let sync_open_orders
   let is_amend_active =
     state.inflight_amend_buy
     || InFlightOrders.is_in_flight state.duplicate_key_buy
-    || (match state.last_buy_order_id with
-        | Some oid ->
-          InFlightAmendments.is_in_flight oid
-          || InFlightAmendments.is_amend_lifecycle_active oid
-          || (match Hashtbl.find_opt state.amend_cooldowns oid with
-              | Some expiry -> now_time < expiry
-              | None -> false)
+    ||
+    match state.last_buy_order_id with
+    | Some oid ->
+      InFlightAmendments.is_in_flight oid
+      || InFlightAmendments.is_amend_lifecycle_active oid
+      ||
+        (match Hashtbl.find_opt state.amend_cooldowns oid with
+        | Some expiry -> now_time < expiry
         | None -> false)
+    | None -> false
   in
   if
     !open_buy_count_from_scan = 0
@@ -845,8 +813,7 @@ let evaluate_buy_leg
         let zone_violation = (not trail_up) && current_buy_price_rounded > exact_target in
         let should_amend = trail_up || zone_violation in
         (* Release reanchor latch if no action is needed. *)
-        if reanchor_buy && not should_amend
-        then state.force_buy_reanchor <- false;
+        if reanchor_buy && not should_amend then state.force_buy_reanchor <- false;
         if should_amend
         then (
           let effective_amend_price =
@@ -930,8 +897,7 @@ let evaluate_buy_leg
         let trail_up = target_buy_price > current_buy_price in
         (* Nothing warranted: release the latch so the sizing counts as
             adopted without moving the book. *)
-        if reanchor_buy && not trail_up
-        then state.force_buy_reanchor <- false;
+        if reanchor_buy && not trail_up then state.force_buy_reanchor <- false;
         if trail_up
         then (
           let effective_amend_price = target_buy_price in
@@ -1042,10 +1008,7 @@ let evaluate_sell_leg
   let available_base =
     if Float.is_nan asset_balance
     then 0.0
-    else
-      asset_balance
-      -. state.reserved_base
-      -. locked_in_sells
+    else asset_balance -. state.reserved_base -. locked_in_sells
   in
   (* the persisted-sell grid is reconciled ONCE per execution and the
      result is reused by the three persisted-sell branches below. The
@@ -1071,11 +1034,7 @@ let evaluate_sell_leg
     if not (Float.is_nan asset_balance)
     then (
       let available_for_missing_sells =
-        max
-          0.0
-          (asset_balance
-           -. state.reserved_base
-           -. locked_in_sells)
+        max 0.0 (asset_balance -. state.reserved_base -. locked_in_sells)
       in
       let missing_desc =
         List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels
@@ -1086,13 +1045,12 @@ let evaluate_sell_leg
       List.iter
         (fun ((_target_p, target_q) as level) ->
            let min_order_size =
-             if state.cached_qty_increment > 0.0
-             then state.cached_qty_increment
-             else 1e-8
+             if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
            in
-           if target_q > 0.0
-              && target_q >= min_order_size -. 1e-9
-              && !rem_avail >= target_q -. 1e-6
+           if
+             target_q > 0.0
+             && target_q >= min_order_size -. 1e-9
+             && !rem_avail >= target_q -. 1e-6
            then (
              kept_missing := level :: !kept_missing;
              rem_avail := max 0.0 (!rem_avail -. target_q))
@@ -1163,13 +1121,16 @@ let evaluate_sell_leg
   let min_notional =
     if state.cached_venue_min_notional > 0.0
     then state.cached_venue_min_notional
-    else if is_alpaca then 1.0 else 0.0
+    else if is_alpaca
+    then 1.0
+    else 0.0
   in
   let inventory_ok =
     inventory_basis > 0.0
-    && (if is_alpaca
-        then inventory_basis *. base_ref_price >= min_notional -. 1e-9
-        else inventory_basis >= state.cached_venue_min_qty -. 1e-9)
+    &&
+    if is_alpaca
+    then inventory_basis *. base_ref_price >= min_notional -. 1e-9
+    else inventory_basis >= state.cached_venue_min_qty -. 1e-9
   in
   let missing_alpaca_sell_grid =
     if ecfg.remaintain_expired_sells
@@ -1305,24 +1266,16 @@ let evaluate_sell_leg
     let is_accumulation = ecfg.use_accumulation_sells in
     let available =
       if is_accumulation
-      then
-        Float.max 0.0 (asset_bal -. state.reserved_base)
-      else
-        Float.max
-          0.0
-          (asset_bal
-           -. state.reserved_base
-           -. locked_in_sells)
+      then Float.max 0.0 (asset_bal -. state.reserved_base)
+      else Float.max 0.0 (asset_bal -. state.reserved_base -. locked_in_sells)
     in
     let min_order_size =
-      if state.cached_qty_increment > 0.0
-      then state.cached_qty_increment
-      else 1e-8
+      if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
     in
     let target_q = round_qty sell_qty asset.symbol asset.exchange in
     let effective_sell_qty, balance_ok =
       if ecfg.use_reserved_base_guard
-      then
+      then (
         let rounded_avail = round_qty available asset.symbol asset.exchange in
         if available >= target_q -. 1e-6 && target_q > 0.0
         then
@@ -1359,8 +1312,8 @@ let evaluate_sell_leg
           then (
             Logging.debug_f
               ~section
-              "Sell order clamped for %s: available %.8f (bal %.8f - \
-               reserved %.8f) < target_q %.8f -> clamped to %.8f (min_order_size %.8f)"
+              "Sell order clamped for %s: available %.8f (bal %.8f - reserved %.8f) < \
+               target_q %.8f -> clamped to %.8f (min_order_size %.8f)"
               asset.symbol
               available
               asset_bal
@@ -1372,8 +1325,8 @@ let evaluate_sell_leg
           else (
             Logging.debug_f
               ~section
-              "Sell order blocked for %s: available %.8f (bal %.8f - \
-               reserved %.8f) rounds below min_order_size %.8f"
+              "Sell order blocked for %s: available %.8f (bal %.8f - reserved %.8f) \
+               rounds below min_order_size %.8f"
               asset.symbol
               available
               asset_bal
@@ -1383,14 +1336,14 @@ let evaluate_sell_leg
         else (
           Logging.debug_f
             ~section
-            "Sell order blocked for %s: available %.8f (bal %.8f - \
-             reserved %.8f) is below min_order_size %.8f"
+            "Sell order blocked for %s: available %.8f (bal %.8f - reserved %.8f) is \
+             below min_order_size %.8f"
             asset.symbol
             available
             asset_bal
             state.reserved_base
             min_order_size;
-          0.0, false)
+          0.0, false))
       else if target_q >= min_order_size -. 1e-9 && target_q > 0.0
       then target_q, true
       else 0.0, false
@@ -1402,13 +1355,14 @@ let evaluate_sell_leg
       let min_notional =
         if state.cached_venue_min_notional > 0.0
         then state.cached_venue_min_notional
-        else if is_alpaca then 1.0 else 0.0
+        else if is_alpaca
+        then 1.0
+        else 0.0
       in
       let venue_min_ok q =
         q > 0.0
         && q >= min_order_size -. 1e-9
-        && (min_notional <= 0.0
-            || q *. sell_price >= min_notional -. 1e-9)
+        && (min_notional <= 0.0 || q *. sell_price >= min_notional -. 1e-9)
       in
       if venue_min_ok effective_sell_qty
       then (
@@ -1426,7 +1380,10 @@ let evaluate_sell_leg
         then (
           sell_pushed := true;
           state.asset_low <- false;
-          if ecfg.remaintain_expired_sells && target_sell_price_opt = None && effective_sell_qty > 0.0
+          if
+            ecfg.remaintain_expired_sells
+            && target_sell_price_opt = None
+            && effective_sell_qty > 0.0
           then (
             state.persisted_sell_levels
             <- List.sort

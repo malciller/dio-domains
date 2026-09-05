@@ -147,6 +147,12 @@ type strategy_state =
     (* OID of last profit-credited fill; replay resumption point *)
   ; mutable highest_startup_oid : string option
     (* highest fill OID observed during startup; bootstraps new strategies *)
+  ; mutable skipped_fill_streak : int
+    (* consecutive fills skipped by the replay guard; a non-trivial streak
+       (>= 50) outside startup replay signals the persisted high-water mark
+       is ahead of the venue's live id space and triggers a self-heal reset *)
+  ; mutable skipped_fills_total : int
+    (* lifetime count of replay-guard skips; surfaced in WARN/CRITICAL logs *)
   ; mutable anticipated_base_credit : float
     (* base qty from buy fills not yet reflected in balance feed *)
   ; mutable last_seen_asset_balance : float
@@ -277,8 +283,9 @@ let rec get_strategy_state asset_symbol =
         | Some key ->
           List.filter_map
             (fun l ->
-               if l.Dio_persistence.Sell_levels_store.price > 0.0
-                  && l.Dio_persistence.Sell_levels_store.qty > 0.0
+               if
+                 l.Dio_persistence.Sell_levels_store.price > 0.0
+                 && l.Dio_persistence.Sell_levels_store.qty > 0.0
                then
                  Some
                    ( l.Dio_persistence.Sell_levels_store.price
@@ -330,6 +337,8 @@ let rec get_strategy_state asset_symbol =
       ; persisted_idx = Hashtbl.create 16
       ; last_fill_oid = persisted_last_fill_oid
       ; highest_startup_oid = None
+      ; skipped_fill_streak = 0
+      ; skipped_fills_total = 0
       ; anticipated_base_credit = 0.0
       ; last_seen_asset_balance = 0.0
       ; persistence_dirty = false

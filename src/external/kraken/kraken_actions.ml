@@ -167,9 +167,17 @@ let place_order
   : (Kraken_common_types.add_order_result, string) result Lwt.t
   =
   let config =
+    (* Placements must NOT retry on transport errors (Timeout/Connection):
+       the request may have reached the matching engine before the 10s WS
+       response timeout, so a retry can silently double-place (Kraken v2 has
+       no idempotency token for userref-tagged grid orders). We force a
+       single attempt: an ambiguous failure surfaces to the strategy via the
+       Failed event, its in-flight/dedup guards clear, and the ladder
+       re-places on its next cycle - the engine's own reconciliation is the
+       recovery path. Amend/cancel keep their converge-safe retries. *)
     match retry_config with
-    | Some c -> c
-    | None -> default_retry_config
+    | Some c -> { c with max_attempts = 1 }
+    | None -> { default_retry_config with max_attempts = 1 }
   in
   (* Ensure cl_ord_id is stable across retries for idempotency.
      If the caller didn't provide one and order_userref is not set,
