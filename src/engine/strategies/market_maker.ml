@@ -12,9 +12,7 @@
 *)
 
 let section = "market_maker"
-
 let log_interval = 10000
-;;
 
 open Strategy_common
 module Exchange = Dio_exchange.Exchange_intf
@@ -528,42 +526,14 @@ let execute_strategy
   if not state.capital_low
   then (
     let now = Unix.time () in
-    (* Clean up stale pending orders using identity-preserving zero-allocation filter. *)
-    let rec filter_pending kept removed lst =
-      match lst with
-      | [] -> lst
-      | ((order_id, side, _, timestamp) as entry) :: tl ->
-        let age = now -. timestamp in
-        if age > 5.0 || kept >= 50
-        then (
-          if age > 5.0 && should_log
-          then
-            Logging.warn_f
-              ~section
-              "Removing stale pending order %s for %s (age: %.1fs)"
-              order_id
-              asset.symbol
-              age;
-          if age > 5.0
-          then
-            (* Release global trackers to permit immediate re-placement *)
-            if String.starts_with ~prefix:"pending_amend_" order_id
-            then (
-              let target_oid = String.sub order_id 14 (String.length order_id - 14) in
-              ignore (InFlightAmendments.remove_in_flight_amendment target_oid))
-            else (
-              let duplicate_key = generate_side_duplicate_key asset.symbol side in
-              ignore (InFlightOrders.remove_in_flight_order duplicate_key);
-              (* Clear inflight flags for stale placements *)
-              match side with
-              | Buy -> state.inflight_buy <- false
-              | Sell -> state.inflight_sell <- false);
-          filter_pending kept (removed + 1) tl)
-        else (
-          let new_tl = filter_pending (kept + 1) removed tl in
-          if tl == new_tl then lst else entry :: new_tl)
-    in
-    state.pending_orders <- filter_pending 0 0 state.pending_orders;
+    (* Pending order/amendment tokens are resolved purely by events: every
+       dispatched place/amend yields exactly one guaranteed terminal event
+       (Ack/Failed, Amended/Amendment_skipped/Amendment_failed) and each
+       handler removes the token, the in-flight flag, and the registry entry.
+       The old 5s age-based sweep resolved state while the exchange could
+       still be executing the request, so a mid-flight cancel for the old
+       order was no longer recognized as the amend's side effect - dropped
+       instead of tuned. *)
     (* Evict cancelled order blacklist entries older than 15s; cap at 20 *)
     let rec filter_cancelled kept removed lst =
       match lst with

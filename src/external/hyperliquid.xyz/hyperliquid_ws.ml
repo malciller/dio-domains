@@ -61,6 +61,11 @@ let responses_mutex = Lwt_mutex.create ()
 (** Counter of consecutive ping failures, read by the supervisor. *)
 let ping_failures = Atomic.make 0
 
+(* Cumulative count of WebSocket messages dropped because a subscriber's
+   bounded stream (capacity 16) was full. A dropped EXECUTIONS/FILL frame is
+   a silent inventory desync; this counter + throttled warn makes it visible
+   instead of vanishing. *)
+let dropped_subscriber_messages = Atomic.make 0
 let reset_ping_failures () = Atomic.set ping_failures 0
 let get_ping_failures () = Atomic.get ping_failures
 let incr_ping_failures () = Atomic.incr ping_failures
@@ -182,11 +187,35 @@ let broadcast_message json =
   Mutex.unlock pushers_mutex;
   if ps = [] then Logging.warn ~section "No subscribers for WebSocket message!";
   let dead = ref [] in
+  let dropped_this_frame = ref 0 in
   List.iter
     (fun push ->
-       try ignore (push (Some json)) with
-       | _ -> dead := push :: !dead)
+       let ok =
+         try push (Some json) with
+         | _ ->
+           dead := push :: !dead;
+           false
+       in
+       if not ok
+       then (
+         incr dropped_this_frame;
+         let n = Atomic.fetch_and_add dropped_subscriber_messages 1 + 1 in
+         (* Throttled to powers of two so a burst logs a few lines, not one
+            per frame. *)
+         if n land (n - 1) = 0
+         then
+           Logging.warn_f
+             ~section
+             "Hyperliquid subscriber stream full: %d message(s) dropped cumulative \
+              (bounded stream capacity exceeded; execution frames are at risk)"
+             n))
     ps;
+  if !dropped_this_frame > 0
+  then
+    Logging.warn_f
+      ~section
+      "Dropped %d subscriber message(s) this frame (stream full)"
+      !dropped_this_frame;
   if !dead <> []
   then (
     Mutex.lock pushers_mutex;

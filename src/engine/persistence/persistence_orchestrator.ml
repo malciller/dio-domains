@@ -19,6 +19,16 @@
 
 let section = "persistence_orchestrator"
 
+(* Cumulative count of failed disk writes, surfaced on every failure warn so a
+   persistent condition (ENOSPC, EACCES) is visible at a glance rather than
+   buried in repeating lines. *)
+let save_failures = Atomic.make 0
+
+(* Drain closures registered at creation so [flush_all] can synchronously
+   flush every store at shutdown. A closure hides the per-store ['a] so the
+   registry stays homogeneous. *)
+let drainers : (unit -> unit) list ref = ref []
+
 (** Base directory for state files. Resolves to /app/data in Docker, ./data
     locally; DIO_DATA_DIR overrides (used by tests for hermetic fixtures).
     Computed per call so tests can redirect before touching a store. *)
@@ -143,7 +153,9 @@ let salvage_assoc (text : string) : (string * Yojson.Basic.t) list =
 let read_file_unsafe t : Yojson.Basic.t =
   let path = file_path t in
   if not (Sys.file_exists path)
-  then `Assoc []
+  then (
+    Logging.info_f ~section "No state file %s; starting fresh for this store" path;
+    `Assoc [])
   else (
     let text =
       let ic = open_in_bin path in
@@ -195,7 +207,7 @@ let update_entry t key entry_json =
   Fun.protect
     ~finally:(fun () -> Mutex.unlock t.file_mutex)
     (fun () ->
-       try
+       let attempt () =
          let tree =
            match t.file_tree with
            | Some tree -> tree
@@ -208,20 +220,48 @@ let update_entry t key entry_json =
          in
          let updated = List.filter (fun (k, _) -> k <> key) entries in
          write_file_unsafe t (`Assoc ((key, entry_json) :: updated))
-       with
+       in
+       try attempt () with
+       | Sys_error _ | Unix.Unix_error _ ->
+         (* Transient disk failure (ENOSPC, EACCES, rename race): retry once
+            after a short pause before surfacing. This runs under file_mutex;
+            it is only hit on the rare failure path, and update_entry is never
+            called from a hot strategy domain. *)
+         (try Thread.delay 0.05 with
+          | _ -> ());
+         (try attempt () with
+          | exn ->
+            let n = Atomic.fetch_and_add save_failures 1 in
+            Logging.error_f
+              ~section
+              "Failed to persist %s entry %s (cumulative failures=%d): %s"
+              t.filename
+              key
+              n
+              (Printexc.to_string exn))
        | exn ->
-         Logging.warn_f
+         let n = Atomic.fetch_and_add save_failures 1 in
+         Logging.error_f
            ~section
-           "Failed to persist %s entry %s: %s"
+           "Failed to persist %s entry %s (cumulative failures=%d): %s"
            t.filename
            key
+           n
            (Printexc.to_string exn))
 ;;
 
 (** Ensures the whole file is parsed into the per-key cache (lazy first read). Must be called under both mutexes in the caller-chosen order. *)
 let populate_cache_unsafe t =
   let tree = read_file_unsafe t in
-  List.iter (fun (k, v) -> Hashtbl.replace t.cache k v) (t.parse tree)
+  let entries = t.parse tree in
+  List.iter (fun (k, v) -> Hashtbl.replace t.cache k v) entries;
+  Logging.info_f
+    ~section
+    "Loaded %d entr%s for %s from %s"
+    (List.length entries)
+    (if List.length entries = 1 then "y" else "ies")
+    (Filename.basename t.filename)
+    (state_dir ())
 ;;
 
 let load t ~key =
@@ -269,7 +309,38 @@ let rec background_worker t () =
   Mutex.lock t.cache_mutex;
   Hashtbl.iter (fun k v -> Hashtbl.replace t.cache k v) pending;
   Mutex.unlock t.cache_mutex;
-  Hashtbl.iter (fun k v -> update_entry t k (t.serialize v)) pending;
+  (try
+     Hashtbl.iter
+       (fun k v ->
+          (* Serialize is evaluated BEFORE update_entry's internal try, so an
+             exception here would otherwise escape the worker and kill the
+             persistence domain (all future saves silently lost). Guard it
+             per-key: skip the bad entry, keep the rest. *)
+          let json =
+            match t.serialize v with
+            | json -> Some json
+            | exception exn ->
+              Logging.error_f
+                ~section
+                "Failed to serialize %s entry %s: %s (skipped)"
+                t.filename
+                k
+                (Printexc.to_string exn);
+              None
+          in
+          match json with
+          | Some j -> update_entry t k j
+          | None -> ())
+       pending
+   with
+   | exn ->
+     (* Any other escaping exception must not kill the persistence domain -
+        otherwise every future save is silently lost. Log and keep draining. *)
+     Logging.critical_f
+       ~section
+       "Persistence worker for %s aborted a drain cycle (%s); continuing"
+       t.filename
+       (Printexc.to_string exn));
   background_worker t ()
 ;;
 
@@ -299,9 +370,36 @@ let create ~filename ~parse ~serialize =
     ; save_cond = Condition.create ()
     }
   in
+  Logging.info_f ~section "Persistence store %s using data dir %s" filename (state_dir ());
+  let drain () =
+    Mutex.lock t.save_queue_mutex;
+    let pending = Hashtbl.copy t.save_queue in
+    Hashtbl.reset t.save_queue;
+    Mutex.unlock t.save_queue_mutex;
+    Hashtbl.iter
+      (fun k v ->
+         match t.serialize v with
+         | json -> update_entry t k json
+         | exception exn ->
+           Logging.error_f
+             ~section
+             "flush_all: failed to serialize %s entry %s: %s"
+             t.filename
+             k
+             (Printexc.to_string exn))
+      pending
+  in
+  drainers := drain :: !drainers;
   ignore (Domain.spawn (background_worker t));
   t
 ;;
+
+(** Synchronously drain every store's coalesced save queue. Used at shutdown so
+    in-memory state (accumulation P&L, reserved_base, last_fill_oid, sell
+    levels) reaches disk before the process exits, instead of being dropped by
+    the coalesce window. Fire-and-forget background writes that are still
+    queued when SIGTERM/SIGINT lands are otherwise lost. *)
+let flush_all () = List.iter (fun drain -> drain ()) !drainers
 
 (** All keys currently known to the store (cache + file). *)
 let keys t =
