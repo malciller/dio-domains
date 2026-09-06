@@ -485,12 +485,36 @@ let wait_for_execution_data symbols timeout_seconds =
   loop ()
 ;;
 
+(** Deferred global order_to_symbol index update: applied outside
+    orders_mutex to prevent nested locking with order_index_mutex. *)
+let apply_index_action (action : [ `None | `Remove of string | `Add of string * string ]) =
+  match action with
+  | `Remove oid ->
+    Mutex.lock order_index_mutex;
+    Hashtbl.remove order_to_symbol oid;
+    Mutex.unlock order_index_mutex
+  | `Add (oid, sym) ->
+    Mutex.lock order_index_mutex;
+    add_to_order_to_symbol oid sym;
+    Mutex.unlock order_index_mutex
+  | `None -> ()
+;;
+
 (** Core internal handler for order state transitions. Updates the open orders
     table, writes the event to the ring buffer, and signals the relevant domain.
-    Handles terminal removal, amendment blacklist filtering, and userref recovery. *)
-let update_orders_internal ?user_ref store (event : execution_event) =
+    Handles terminal removal, amendment blacklist filtering, and userref recovery.
+
+    Variant below: ASSUMES store.orders_mutex is held. It performs the full
+    read-modify-write (and the lock-free buffer write + domain wakeup) under
+    the caller's lock, so a caller that must compute a merged event from the
+    current table state (e.g. the userFills Trade path) can do so atomically
+    - two concurrent readers could otherwise both compute from the same
+    snapshot and the second write would erase the first fill. Returns the
+    deferred global order_to_symbol index action for the caller to apply
+    after releasing the mutex (nested orders_mutex -> order_index_mutex
+    acquisition is avoided, matching the Kraken architecture). *)
+let update_orders_internal_locked ?user_ref store (event : execution_event) =
   let now = Unix.gettimeofday () in
-  Mutex.lock store.orders_mutex;
   let is_terminal =
     match event.order_status with
     | FilledStatus | CanceledStatus | RejectedStatus | ExpiredStatus -> true
@@ -511,7 +535,6 @@ let update_orders_internal ?user_ref store (event : execution_event) =
   in
   if is_superseded
   then (
-    Mutex.unlock store.orders_mutex;
     Logging.debug_f
       ~section
       "Skipping late WS event for superseded order %s [%s]"
@@ -520,7 +543,8 @@ let update_orders_internal ?user_ref store (event : execution_event) =
     (* Write to ring buffer for event consumers but do not add to open_orders. *)
     RingBuffer.write store.events_buffer event;
     notify_ready store;
-    Concurrency.Exchange_wakeup.signal ~symbol:event.symbol)
+    Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
+    `None)
   else (
     (* Deferred global index action: computed under orders_mutex, applied
      after releasing it. Avoids holding orders_mutex while contending
@@ -534,8 +558,14 @@ let update_orders_internal ?user_ref store (event : execution_event) =
       (* UserRef recovery precedence:
        1. Explicitly provided user_ref (from proactive inject_order).
        2. Previously tracked user_ref on the existing open order.
-       3. Decoded from the cloid hex string (Hyperliquid encodes userref in the
-          trailing 16 hex digits of the client order ID). *)
+       3. Decoded from the cloid hex string. Two layouts share the
+          trailing-16-hex storage:
+          - tagged (hyperliquid_module.next_unique_cloid): bits 63..56 =
+            strategy userref tag, bits 55..0 = unique nonce;
+          - legacy (pre-unique-cloid orders still resting across a deploy):
+            the trailing hex IS the raw userref.
+          A value >= 2^56 can only be tagged (a raw userref never reaches
+          that magnitude), so the layouts are unambiguous. *)
       let recovered_user_ref =
         match user_ref with
         | Some _ -> user_ref
@@ -556,7 +586,18 @@ let update_orders_internal ?user_ref store (event : execution_event) =
                      let last_part =
                        String.sub clean_clid (String.length clean_clid - 16) 16
                      in
-                     let uref = Int64.to_int (Int64.of_string ("0x" ^ last_part)) in
+                     let v = Int64.of_string ("0x" ^ last_part) in
+                     let uref =
+                       (* Logical shift + zero-tag test: a signed compare
+                          would misclassify tags with bit 63 set (tags
+                          128-255) as negative Int64s and fall through to
+                          the legacy decode. Legacy raw userrefs never have
+                          high bits set, so tag > 0 is unambiguous. *)
+                       let tag = Int64.shift_right_logical v 56 in
+                       if Int64.compare tag 0L > 0
+                       then Int64.to_int tag
+                       else Int64.to_int v
+                     in
                      Logging.debug_f
                        ~section
                        "Recovered userref %d from cloid %s"
@@ -591,22 +632,20 @@ let update_orders_internal ?user_ref store (event : execution_event) =
       Hashtbl.replace store.open_orders event.order_id order;
       index_action := `Add (event.order_id, event.symbol));
     publish_open_orders_cache store;
-    Mutex.unlock store.orders_mutex;
-    (* Deferred global order_to_symbol index update: outside orders_mutex
-     to prevent nested locking with order_index_mutex. *)
-    (match !index_action with
-     | `Remove oid ->
-       Mutex.lock order_index_mutex;
-       Hashtbl.remove order_to_symbol oid;
-       Mutex.unlock order_index_mutex
-     | `Add (oid, sym) ->
-       Mutex.lock order_index_mutex;
-       add_to_order_to_symbol oid sym;
-       Mutex.unlock order_index_mutex
-     | `None -> ());
     RingBuffer.write store.events_buffer event;
     notify_ready store;
-    Concurrency.Exchange_wakeup.signal ~symbol:event.symbol)
+    Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
+    !index_action)
+;;
+
+let update_orders_internal ?user_ref store (event : execution_event) =
+  Mutex.lock store.orders_mutex;
+  let index_action =
+    Fun.protect
+      ~finally:(fun () -> Mutex.unlock store.orders_mutex)
+      (fun () -> update_orders_internal_locked ?user_ref store event)
+  in
+  apply_index_action index_action
 ;;
 
 let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
@@ -631,7 +670,28 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
     ; cl_ord_id
     }
   in
-  update_orders_internal ?user_ref store event;
+  Mutex.lock store.orders_mutex;
+  let index_action =
+    Fun.protect
+      ~finally:(fun () -> Mutex.unlock store.orders_mutex)
+      (fun () ->
+         match Hashtbl.find_opt store.open_orders order_id with
+         | Some existing when existing.cum_qty > 0.0 ->
+           (* A WS trade beat this proactive inject (fast IOC fills can be
+              processed before the placement REST response returns). The
+              inject exists only to make the order visible pre-webData2;
+              overwriting it with a fresh cum_qty=0 entry would erase real
+              fill progress. *)
+           Logging.debug_f
+             ~section
+             "Skipping proactive inject for %s: fill progress already tracked \
+              (cum_qty=%.8f)"
+             order_id
+             existing.cum_qty;
+           `None
+         | _ -> update_orders_internal_locked ?user_ref store event)
+  in
+  apply_index_action index_action;
   Logging.debug_f
     ~section
     "Proactively injected open order: %s [%s] %s side %.8f limit_px=%.2f (cloid: %s, \
@@ -987,61 +1047,91 @@ let process_user_events data_json =
            Mutex.unlock store.tids_mutex;
            if not already_processed
            then (
-             (* Hold mutex for the full read-compute-write cycle to prevent double-counted fills. *)
+             (* Hold mutex for the full read-compute-write cycle: the merge
+                 of this fill into the tracked order is computed from the
+                 table snapshot and written back under the same lock, so two
+                 concurrent Trade events can never both compute from the
+                 same snapshot (the second write erasing the first fill).
+                 [was_filled]/[filled_out]/[avg_out]/[qty_out] carry the
+                 computed values out of the protected section for the
+                 logging and fill-publishing block below. *)
+             let was_filled = ref false in
+             let filled_out = ref 0.0 in
+             let avg_out = ref 0.0 in
+             let qty_out = ref 0.0 in
+             (* Fun.protect the window: an unexpected exception between
+                 lock and unlock would permanently deadlock the symbol's
+                 orders_mutex (nothing here currently raises, but the
+                 invariant must not depend on that). *)
              Mutex.lock store.orders_mutex;
-             let (existing_order : open_order option) =
-               Hashtbl.find_opt store.open_orders order_id
+             let index_action =
+               Fun.protect
+                 ~finally:(fun () -> Mutex.unlock store.orders_mutex)
+                 (fun () ->
+                    let (existing_order : open_order option) =
+                      Hashtbl.find_opt store.open_orders order_id
+                    in
+                    let cum_qty =
+                      match existing_order with
+                      | Some o -> o.cum_qty +. size
+                      | None -> size
+                    in
+                    let order_qty =
+                      match existing_order with
+                      | Some o -> o.order_qty
+                      | None -> size
+                    in
+                    let is_filled = cum_qty >= order_qty -. 1e-6 in
+                    let status =
+                      if is_filled then FilledStatus else PartiallyFilledStatus
+                    in
+                    let limit_price =
+                      match existing_order with
+                      | Some o -> o.limit_price
+                      | None -> Some price
+                    in
+                    let cl_ord_id =
+                      match existing_order with
+                      | Some o -> o.cl_ord_id
+                      | None -> None
+                    in
+                    let cum_cost =
+                      match existing_order with
+                      | Some o -> o.cum_cost +. (size *. price)
+                      | None -> size *. price
+                    in
+                    let avg_price =
+                      if cum_qty > 0.0 then cum_cost /. cum_qty else price
+                    in
+                    let event : execution_event =
+                      { order_id
+                      ; symbol
+                      ; exec_type = Trade
+                      ; order_status = status
+                      ; limit_price
+                      ; side
+                      ; order_qty
+                      ; cum_qty
+                      ; cum_cost
+                      ; avg_price
+                      ; timestamp = action_time
+                      ; trade_id = Some tid
+                      ; last_qty = Some size
+                      ; last_price = Some price
+                      ; fee = Some fee
+                      ; cl_ord_id
+                      }
+                    in
+                    Fun.protect
+                      ~finally:(fun () ->
+                        was_filled := is_filled;
+                        filled_out := cum_qty;
+                        avg_out := avg_price;
+                        qty_out := order_qty)
+                      (fun () -> update_orders_internal_locked store event))
              in
-             let cum_qty =
-               match existing_order with
-               | Some o -> o.cum_qty +. size
-               | None -> size
-             in
-             let order_qty =
-               match existing_order with
-               | Some o -> o.order_qty
-               | None -> size
-             in
-             let is_filled = cum_qty >= order_qty -. 1e-6 in
-             let status = if is_filled then FilledStatus else PartiallyFilledStatus in
-             let limit_price =
-               match existing_order with
-               | Some o -> o.limit_price
-               | None -> Some price
-             in
-             let cl_ord_id =
-               match existing_order with
-               | Some o -> o.cl_ord_id
-               | None -> None
-             in
-             let cum_cost =
-               match existing_order with
-               | Some o -> o.cum_cost +. (size *. price)
-               | None -> size *. price
-             in
-             let avg_price = if cum_qty > 0.0 then cum_cost /. cum_qty else price in
-             Mutex.unlock store.orders_mutex;
-             let event : execution_event =
-               { order_id
-               ; symbol
-               ; exec_type = Trade
-               ; order_status = status
-               ; limit_price
-               ; side
-               ; order_qty
-               ; cum_qty
-               ; cum_cost
-               ; avg_price
-               ; timestamp = action_time
-               ; trade_id = Some tid
-               ; last_qty = Some size
-               ; last_price = Some price
-               ; fee = Some fee
-               ; cl_ord_id
-               }
-             in
-             update_orders_internal store event;
-             if is_filled
+             apply_index_action index_action;
+             if !was_filled
              then (
                if is_startup_snapshot_done ()
                then
@@ -1063,7 +1153,7 @@ let process_user_events data_json =
                    price
                    tid;
                (* Publish to centralized fill event bus for Discord notifications *)
-               let fill_value = cum_qty *. avg_price in
+               let fill_value = !filled_out *. !avg_out in
                let maker_fee_rate =
                  match Dio_exchange.Exchange_intf.Registry.get "hyperliquid" with
                  | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
@@ -1077,8 +1167,8 @@ let process_user_events data_json =
                  { venue = "hyperliquid"
                  ; symbol
                  ; side = (if side = Buy then "buy" else "sell")
-                 ; amount = cum_qty
-                 ; fill_price = avg_price
+                 ; amount = !filled_out
+                 ; fill_price = !avg_out
                  ; value = fill_value
                  ; fee = estimated_fee
                  ; timestamp = action_time
@@ -1094,8 +1184,8 @@ let process_user_events data_json =
                  symbol
                  size
                  price
-                 cum_qty
-                 order_qty
+                 !filled_out
+                 !qty_out
              else
                Logging.debug_f
                  ~section
@@ -1105,8 +1195,8 @@ let process_user_events data_json =
                  symbol
                  size
                  price
-                 cum_qty
-                 order_qty)
+                 !filled_out
+                 !qty_out)
          | None -> ()
        with
        | exn ->

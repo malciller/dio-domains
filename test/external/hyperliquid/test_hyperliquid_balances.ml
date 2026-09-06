@@ -120,6 +120,60 @@ let test_staked_zero_without_staking () =
     (Hyperliquid.Balances.get_total_balance asset)
 ;;
 
+let test_staking_poll_does_not_refresh_spendable_freshness () =
+  (* The staking poller updates an EXCLUDED wallet on the same store every
+     ~10s. The store-wide timestamp is bumped, but the tradeable figure is
+     unchanged - freshness consumers (the sell-hold netting guard) must key
+     on the spendable wallets' own timestamp, or a staking poll would
+     certify a stale spot figure as current and release placed-sell holds
+     before the spotState netting actually arrives. *)
+  let asset = "STAKEFRESH/USDC" in
+  let now = Unix.gettimeofday () in
+  let store = Hyperliquid.Balances.get_balance_store asset in
+  (* Spot wallet lands first. *)
+  Hyperliquid.Balances.BalanceStore.update_wallet
+    store
+    ~available:3.0
+    ~total:3.0
+    "spot"
+    asset;
+  (* Simulate the spot message being 60s old. *)
+  let spot_ts = now -. 60.0 in
+  let open Hyperliquid.Balances.BalanceStore in
+  Mutex.lock store.mutex;
+  Hashtbl.replace
+    store.wallets
+    ("spot/" ^ asset)
+    { balance = 3.0
+    ; total = 3.0
+    ; wallet_type = "spot"
+    ; wallet_id = asset
+    ; last_updated = spot_ts
+    };
+  Mutex.unlock store.mutex;
+  (* The staking poller bumps the store-wide timestamp NOW, but contributes
+     nothing to the tradeable figure. *)
+  Hyperliquid.Balances.BalanceStore.update_wallet
+    store
+    ~available:5.0
+    ~total:5.0
+    "staking"
+    asset;
+  Alcotest.(check (float 0.000001))
+    "tradeable excludes the staking wallet"
+    3.0
+    (Hyperliquid.Balances.get_balance asset);
+  let spendable = Hyperliquid.Balances.BalanceStore.get_spendable_last_updated store in
+  Alcotest.(check (float 0.001))
+    "spendable freshness tracks the spot wallet, not the staking poll"
+    spot_ts
+    spendable;
+  Alcotest.(check bool)
+    "the store-wide timestamp WAS bumped by the staking poll (the hazard)"
+    true
+    (Hyperliquid.Balances.BalanceStore.get_last_updated store >= now)
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Balances"
@@ -137,6 +191,10 @@ let () =
             "staked_zero_without_staking"
             `Quick
             test_staked_zero_without_staking
+        ; Alcotest.test_case
+            "staking_poll_does_not_refresh_spendable_freshness"
+            `Quick
+            test_staking_poll_does_not_refresh_spendable_freshness
         ] )
     ]
 ;;

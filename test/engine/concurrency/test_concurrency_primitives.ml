@@ -67,6 +67,100 @@ let test_ring_buffer_clear_keeps_cursors_valid () =
   Alcotest.(check (list int)) "post-clear writes delivered once" [ 6 ] seen
 ;;
 
+(* The writer assigns value = absolute position, so a reader visiting cursor
+   p can only ever be delivered the value p. A lapped mis-delivery (the
+   pre-seqlock bug) surfaced the NEWER payload at the OLDER cursor, which
+   breaks monotonicity within a single drain. *)
+let assert_monotonic_drain b =
+  let seen = Concurrency.Ring_buffer.RingBuffer.read_since b 0 in
+  let rec check prev = function
+    | [] -> ()
+    | v :: rest ->
+      if v <= prev then Alcotest.failf "non-monotonic drain: %d after %d" v prev;
+      check v rest
+  in
+  check (-1) seen;
+  match seen with
+  | [] -> ()
+  | last :: _ ->
+    (* read_latest is called after the drain, so its event position is >=
+        the last delivered one. *)
+    (match Concurrency.Ring_buffer.RingBuffer.read_latest b with
+     | Some v when v < last -> Alcotest.failf "read_latest regressed: %d < %d" v last
+     | _ -> ())
+;;
+
+let test_ring_buffer_writer_lap_race_cross_domain () =
+  let b = Concurrency.Ring_buffer.RingBuffer.create 8 in
+  let stop = Atomic.make false in
+  let writer =
+    Domain.spawn (fun () ->
+      let i = ref 0 in
+      while not (Atomic.get stop) do
+        incr i;
+        Concurrency.Ring_buffer.RingBuffer.write b !i
+      done)
+  in
+  (* Reader hammers full drains while the writer laps it live on another
+     domain; every delivered payload must be the complete event for its
+     cursor (monotonic), never a lapped newer payload at an older cursor. *)
+  for _ = 1 to 3000 do
+    assert_monotonic_drain b
+  done;
+  Atomic.set stop true;
+  Domain.join writer;
+  (* Quiesced exact-replay check: with the writer stopped, the surviving
+     window must be exactly the last [size] events in order - no gaps, no
+     duplicates, no lapped payloads. *)
+  let size = 8 in
+  let n = Concurrency.Ring_buffer.RingBuffer.get_position b in
+  let expected = List.init (min size n) (fun k -> n - min size n + 1 + k) in
+  let seen = Concurrency.Ring_buffer.RingBuffer.read_since b 0 in
+  Alcotest.(check (list int)) "quiesced replay is exact" expected seen
+;;
+
+(* Record payloads make the clear-vs-reader hazard observable: the pre-seqlock
+   [clear] stored [Obj.magic 0] (an immediate) into the payload field BEFORE
+   invalidating [seq], so a reader that validated [seq] just before the clear
+   then read the payload dereferenced integer 0 as a block pointer - a crash
+   for record-typed buffers. With the sentinel protocol that can never be
+   delivered; this test fails by crashing if the guarantee regresses. *)
+type clear_race_payload =
+  { gen : int
+  ; tag : int
+  }
+
+let test_ring_buffer_clear_vs_reader_cross_domain () =
+  let b = Concurrency.Ring_buffer.RingBuffer.create 8 in
+  for i = 1 to 8 do
+    Concurrency.Ring_buffer.RingBuffer.write b { gen = i; tag = i * 3 }
+  done;
+  let stop = Atomic.make false in
+  let clearer =
+    Domain.spawn (fun () ->
+      while not (Atomic.get stop) do
+        Concurrency.Ring_buffer.RingBuffer.clear b
+      done)
+  in
+  let validate name = function
+    | None -> ()
+    | Some { gen; tag } ->
+      if tag <> gen * 3 then Alcotest.failf "%s: torn payload gen=%d tag=%d" name gen tag
+  in
+  let validate1 name p =
+    if p.tag <> p.gen * 3
+    then Alcotest.failf "%s: torn payload gen=%d tag=%d" name p.gen p.tag
+  in
+  for _ = 1 to 5000 do
+    validate "read_latest" (Concurrency.Ring_buffer.RingBuffer.read_latest b);
+    List.iter (validate1 "read_since") (Concurrency.Ring_buffer.RingBuffer.read_since b 0);
+    Concurrency.Ring_buffer.RingBuffer.iter_since b 0 (validate1 "iter_since") |> ignore;
+    List.iter (validate1 "read_all") (Concurrency.Ring_buffer.RingBuffer.read_all b)
+  done;
+  Atomic.set stop true;
+  Domain.join clearer
+;;
+
 let test_wakeup_generation_immediate_return () =
   let symbol = "TEST/WAKEUP" in
   let g0 = Concurrency.Exchange_wakeup.get_generation ~symbol in
@@ -135,6 +229,14 @@ let () =
             "clear_keeps_cursors"
             `Quick
             test_ring_buffer_clear_keeps_cursors_valid
+        ; Alcotest.test_case
+            "writer_lap_cross_domain"
+            `Slow
+            test_ring_buffer_writer_lap_race_cross_domain
+        ; Alcotest.test_case
+            "clear_vs_reader_cross_domain"
+            `Slow
+            test_ring_buffer_clear_vs_reader_cross_domain
         ] )
     ; ( "exchange_wakeup"
       , [ Alcotest.test_case

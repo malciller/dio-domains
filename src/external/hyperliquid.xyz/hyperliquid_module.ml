@@ -21,6 +21,39 @@ module Hyperliquid_impl = struct
       (if testnet then "testnet" else "mainnet")
   ;;
 
+  (* Per-process counter for unique client order ids. *)
+  let cloid_nonce_counter = Atomic.make 0
+
+  (** Builds a UNIQUE client order id tagged with the strategy userref.
+      Layout: the trailing 16 hex digits (the low 64 bits of the 128-bit
+      cloid, which the executions feed's userref recovery reads) carry
+      bits 63..56 = strategy userref tag and bits 55..0 = nonce (unix time
+      in seconds, masked to 36 bits, << 20 | per-process counter, 20 bits).
+      Uniqueness across restarts comes from the time component, so a fresh
+      process cannot regenerate the cloid of an order still resting from a
+      previous run - which is what makes the placement retry loop
+      idempotent: every attempt of one logical order reuses the same cloid,
+      and two different orders never share one. *)
+  let next_unique_cloid (uref : int) : string =
+    let counter =
+      Int64.of_int (Atomic.fetch_and_add cloid_nonce_counter 1 land 0xF_FFFF)
+    in
+    let time_component =
+      Int64.logand (Int64.of_float (Unix.gettimeofday ())) 0xF_FFFF_FFFFL
+    in
+    let nonce =
+      Int64.logor
+        (Int64.shift_left (Int64.logand time_component 0xF_FFFF_FFFFL) 20)
+        counter
+    in
+    let low64 =
+      Int64.logor
+        (Int64.shift_left (Int64.of_int (uref land 0xFF)) 56)
+        (Int64.logand nonce 0x00FF_FFFF_FFFF_FFFFL)
+    in
+    Printf.sprintf "0x%032Lx" low64
+  ;;
+
   (* Per-symbol fee cache. Maps symbol to (perp_maker, perp_taker, spot_maker, spot_taker).
      Populated once during initialize_fees and read on every get_fees call. *)
   let fee_cache : (string, float * float * float * float) Hashtbl.t = Hashtbl.create 16
@@ -123,7 +156,16 @@ module Hyperliquid_impl = struct
     let sz_rounded = Hyperliquid_instruments_feed.round_qty_to_lot symbol qty in
     let constructed_cl_ord_id =
       match order_userref with
-      | Some uref -> Some (Printf.sprintf "0x%032x" uref)
+      | Some uref ->
+        (match cl_ord_id with
+         | Some explicit -> Some explicit
+         | None ->
+           (* Unique per-order cloid: makes the placement retry loop
+              idempotent (a timeout after venue acceptance replays the same
+              cloid instead of landing a second order) and keeps concurrent
+              orders distinguishable - the constant per-strategy cloid this
+              replaced shared one identity across every grid order. *)
+           Some (next_unique_cloid uref))
       | None -> cl_ord_id
     in
     Hyperliquid_actions.place_order
@@ -207,7 +249,14 @@ module Hyperliquid_impl = struct
          let sz_rounded = Hyperliquid_instruments_feed.round_qty_to_lot sym sz in
          let constructed_cl_ord_id =
            match existing.order_userref with
-           | Some uref -> Some (Printf.sprintf "0x%032x" uref)
+           | Some uref ->
+             (match cl_ord_id with
+              | Some explicit -> Some explicit
+              | None ->
+                (* Same unique-cloid discipline as place_order: the
+                    cancel-replace's new leg must not inherit the degenerate
+                    constant strategy cloid. *)
+                Some (next_unique_cloid uref))
            | None -> cl_ord_id
          in
          Hyperliquid_actions.amend_order
@@ -335,11 +384,23 @@ module Hyperliquid_impl = struct
   ;;
 
   (** Age of the balance-store snapshot for [asset], or [None] before the
-      first update. *)
+      first update. Keyed on the SPENDABLE wallets' timestamp: the store-wide
+      timestamp is bumped by the staking poller (every ~10s) even though
+      staking wallets contribute nothing to the tradeable figure - keying on
+      it would certify a stale spot figure as fresh, which the sell-hold
+      netting guard relies on never happening. Falls back to the store-wide
+      timestamp when no spendable wallet record exists yet. *)
   let get_balance_age_fast ~asset =
     let store = Hyperliquid_balances.get_balance_store asset in
     fun () ->
-      let last = Hyperliquid_balances.BalanceStore.get_last_updated store in
+      let spendable =
+        Hyperliquid_balances.BalanceStore.get_spendable_last_updated store
+      in
+      let last =
+        if spendable > 0.0
+        then spendable
+        else Hyperliquid_balances.BalanceStore.get_last_updated store
+      in
       if last > 0.0 then Some (Unix.gettimeofday () -. last) else None
   ;;
 
@@ -468,7 +529,7 @@ module Hyperliquid_impl = struct
              ; filled_qty = e.cum_qty
              ; avg_price = e.avg_price
              ; timestamp = e.timestamp
-             ; is_amended = (e.exec_type = Hyperliquid_executions_feed.Amended)
+             ; is_amended = e.exec_type = Hyperliquid_executions_feed.Amended
              ; cl_ord_id = e.cl_ord_id
              })
       events
@@ -492,7 +553,7 @@ module Hyperliquid_impl = struct
              ; filled_qty = e.cum_qty
              ; avg_price = e.avg_price
              ; timestamp = e.timestamp
-             ; is_amended = (e.exec_type = Hyperliquid_executions_feed.Amended)
+             ; is_amended = e.exec_type = Hyperliquid_executions_feed.Amended
              ; cl_ord_id = e.cl_ord_id
              })
   ;;

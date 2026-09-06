@@ -97,6 +97,62 @@ let reconcile_persisted_sell_levels ~state =
   partition_persisted_sell_levels state.persisted_sell_levels state.open_sell_orders
 ;;
 
+(** Grace window after a sell placement during which its venue-side hold is
+    treated as NOT yet reflected in the balance feed, when the feed provides
+    no freshness signal. Hyperliquid's spotState hold update trails the
+    placement ack by up to seconds; sizing against the un-netted figure in
+    that window is what lets a sell dip into reserved_base under
+    volatility. *)
+let sell_hold_netting_grace_s = 15.0
+
+(** The portion of placed-sell base that the balance feed may not yet be
+    netting: holds placed AFTER the newest balance message (the venue figure
+    then predates them). Holds are released the moment a newer balance
+    message arrives - at that point the venue's own [total - hold] figure
+    includes them and subtracting locally again would double-count. When the
+    feed provides no freshness signal ([base_balance_age = None]), the grace
+    window bounds the conservatism instead. Only meaningful for accumulation
+    venues that do not track pending sells locally (Hyperliquid): venues
+    that track pending sells at dispatch already carry the hold in
+    [open_sell_orders]/[locked_in_sells]. *)
+let unnetted_sell_hold ~state ~ecfg ~base_balance_age ~now =
+  if
+    ecfg.use_accumulation_sells
+    && (not ecfg.track_pending_sells)
+    && state.sell_holds_since_balance <> []
+  then (
+    let cutoff =
+      match base_balance_age with
+      | Some age ->
+        (* The newest balance message's wall-clock time - but never older
+           than the grace: a rejected placement on a quiet book produces no
+           new balance message at all, and the hold must not block sells
+           forever waiting for one. *)
+        Float.max (now -. age) (now -. sell_hold_netting_grace_s)
+      | None -> now -. sell_hold_netting_grace_s
+    in
+    (* Drop resolved/expired holds and sum the rest. Entries are oldest
+       first, so every hold at or after the cutoff is kept contiguously. *)
+    let rec go unnetted acc = function
+      | [] ->
+        state.sell_holds_since_balance <- List.rev acc;
+        unnetted
+      | (placed_at, qty) :: rest when placed_at >= cutoff ->
+        go (unnetted +. qty) ((placed_at, qty) :: acc) rest
+      | _ :: rest -> go unnetted acc rest
+    in
+    go 0.0 [] state.sell_holds_since_balance)
+  else 0.0
+;;
+
+(** Records a placed sell's hold. Kept oldest-first; the release is implicit
+    - a balance message newer than [placed_at] drops it out of the
+    [unnetted_sell_hold] sum, and the list is pruned there so it cannot grow
+    without bound. *)
+let arm_sell_hold ~state ~qty ~now =
+  state.sell_holds_since_balance <- state.sell_holds_since_balance @ [ now, qty ]
+;;
+
 (** Evaluates asset balance recovery and clears asset_low when available balance is restored. *)
 let evaluate_asset_low_recovery
       ~state
@@ -104,6 +160,7 @@ let evaluate_asset_low_recovery
       ~(asset : trading_config)
       ~asset_balance
       ~lot_qty
+      ~unnetted_hold
   =
   if not (Float.is_nan asset_balance)
   then (
@@ -119,7 +176,9 @@ let evaluate_asset_low_recovery
       then List.fold_left (fun acc (_, _, qty) -> acc +. qty) 0.0 state.open_sell_orders
       else 0.0
     in
-    let available_asset = asset_bal -. state.reserved_base -. locked_in_sells in
+    let available_asset =
+      asset_bal -. state.reserved_base -. locked_in_sells -. unnetted_hold
+    in
     let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
     state.last_seen_asset_balance <- asset_bal;
     let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Sell" in
@@ -322,6 +381,7 @@ let sync_open_orders
         | _ -> ())
       else if side_str = "sell"
       then (
+        add_tracked_order_id state oid;
         state.open_sell_orders <- (oid, price, qty) :: state.open_sell_orders;
         locked_in_sells := !locked_in_sells +. qty;
         if ecfg.remaintain_expired_sells
@@ -475,8 +535,10 @@ let sync_open_orders
       in
       if not recent_amend
       then (
+        add_tracked_order_id state best_order_id;
         state.last_buy_order_price <- Some best_price;
         state.last_buy_order_id <- Some best_order_id;
+        state.tif_recovery_pending <- false;
         set_asset_reserved_quote state (best_price *. lot_qty))
     | None -> ());
   if ecfg.merge_preserved_sells
@@ -678,6 +740,9 @@ let evaluate_buy_leg
           then (
             buy_attempted := true;
             state.last_buy_order_price <- Some buy_price;
+            (* The re-attempt landed - any pending TIF-recovery is satisfied
+               (the ack will confirm it as the resting buy). *)
+            state.tif_recovery_pending <- false;
             (* A fresh buy is placed at the current sizing target, so any
                pending re-anchor is satisfied. *)
             state.force_buy_reanchor <- false;
@@ -1004,11 +1069,17 @@ let evaluate_sell_leg
       ~(oracle_halted : bool)
       ~ecfg
       ~locked_in_sells
+      ~base_balance_age
   =
+  (* Placed-sell holds the balance feed may not yet be netting: until a
+     balance message newer than a placement arrives, the venue's
+     [total - hold] figure still counts that base as free, and sizing
+     against it is the reserved_base leak under volatility. *)
+  let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~base_balance_age ~now in
   let available_base =
     if Float.is_nan asset_balance
     then 0.0
-    else asset_balance -. state.reserved_base -. locked_in_sells
+    else asset_balance -. state.reserved_base -. locked_in_sells -. unnetted_hold
   in
   (* the persisted-sell grid is reconciled ONCE per execution and the
      result is reused by the three persisted-sell branches below. The
@@ -1034,7 +1105,7 @@ let evaluate_sell_leg
     if not (Float.is_nan asset_balance)
     then (
       let available_for_missing_sells =
-        max 0.0 (asset_balance -. state.reserved_base -. locked_in_sells)
+        max 0.0 (asset_balance -. state.reserved_base -. locked_in_sells -. unnetted_hold)
       in
       let missing_desc =
         List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels
@@ -1097,7 +1168,7 @@ let evaluate_sell_leg
     if Float.is_nan asset_balance
     then 0.0
     else if is_accumulation_basis
-    then asset_balance -. state.reserved_base
+    then asset_balance -. state.reserved_base -. unnetted_hold
     else available_base
   in
   (* Inventory gate for sell placement: available non-accrued inventory must
@@ -1266,7 +1337,7 @@ let evaluate_sell_leg
     let is_accumulation = ecfg.use_accumulation_sells in
     let available =
       if is_accumulation
-      then Float.max 0.0 (asset_bal -. state.reserved_base)
+      then Float.max 0.0 (asset_bal -. state.reserved_base -. unnetted_hold)
       else Float.max 0.0 (asset_bal -. state.reserved_base -. locked_in_sells)
     in
     let min_order_size =
@@ -1380,6 +1451,20 @@ let evaluate_sell_leg
         then (
           sell_pushed := true;
           state.asset_low <- false;
+          (* Arm the unnetted-hold guard: until a balance message newer than
+             this placement arrives, the venue's [total - hold] figure still
+             counts this base as free, and sizing against it is the
+             reserved_base leak under volatility. *)
+          if is_accumulation && (not ecfg.track_pending_sells) && effective_sell_qty > 0.0
+          then (
+            arm_sell_hold ~state ~qty:effective_sell_qty ~now;
+            Logging.debug_f
+              ~section
+              "Sell hold guard armed for %s: +%.8f (release on next balance message or \
+               %.0fs grace)"
+              asset.symbol
+              effective_sell_qty
+              sell_hold_netting_grace_s);
           if
             ecfg.remaintain_expired_sells
             && target_sell_price_opt = None
@@ -1436,11 +1521,28 @@ let evaluate_sell_leg
     runs: a sell needs only inventory, not quote, so the sell for a
     just-filled buy is placed even when capital is exhausted and the asset is
     halted - the account's capital-recovery path. Without this the last
-    fill's inventory would sit unreclaimable. *)
+    fill's inventory would sit unreclaimable.
+
+    EXCEPTION - TIF recovery ([state.tif_recovery_pending]): a TIF/ALO/
+    post-only reject or a transient placement failure that killed a
+    previously-approved resting buy arms a recovery window during which the
+    buy leg re-attempts through the halt. The window expires 900s after the
+    LAST armed kill - each failed re-attempt re-arms and refreshes it by
+    design, so the recovery keeps re-attempting (2s-cooldown cadence) while
+    the venue keeps rejecting, and the latch decays once the kill events
+    stop. Without the recovery, the halt's "no open buy" rule turns a
+    transient reject into an indefinite buyless gap: the reject removes the
+    resting buy, the halt then sees no open buy, and nothing ever
+    re-attempts until a fill happens to re-anchor. Re-placing the
+    already-approved buy at the fresh price is a restoration of prior
+    commitment (strictly safer after a price drop), not new sizing - the
+    halt still blocks genuinely new commitments, and capital_low still
+    gates every attempt. *)
 let execute_strategy
       ?cached_state
       ?(quote_balance_stale = false)
       ?(oracle_halted = false)
+      ~base_balance_age
       ~now
       (asset : trading_config)
       (current_price : float)
@@ -1499,7 +1601,14 @@ let execute_strategy
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
        let lot_qty = venue_lot_qty state.grid_qty asset.exchange state in
-       evaluate_asset_low_recovery ~state ~ecfg ~asset ~asset_balance ~lot_qty;
+       let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~base_balance_age ~now in
+       evaluate_asset_low_recovery
+         ~state
+         ~ecfg
+         ~asset
+         ~asset_balance
+         ~lot_qty
+         ~unnetted_hold;
        evaluate_capital_low_recovery ~state ~asset ~quote_balance ~current_price ~lot_qty;
        if Float.is_nan current_price
        then (
@@ -1551,10 +1660,32 @@ let execute_strategy
            ())
          else (
            (* Oracle-halted: no buy placement, no buy trailing/amending - a
-               halted asset must not commit more quote capital. The sell leg
-               still runs (see the [oracle_halted] doc on execute_strategy). *)
+                halted asset must not commit more quote capital. The sell leg
+                still runs (see the [oracle_halted] doc on execute_strategy).
+                EXCEPTION - TIF recovery: a TIF/ALO/post-only reject (or a
+                transient placement failure) killed a previously-approved
+                resting buy. Re-attempting it at the fresh price is not a new
+                capital commitment (after a price drop it strictly improves
+                survival margin), and without it the asset sits buyless for
+                the entire oracle-inactive window - the halt's "no open buy"
+                rule turns a transient reject into an indefinite liveness
+                gap. The latch expires (900s) so it cannot pin buys through
+                a genuine, persistent capital halt. *)
+           let recovery_expired =
+             state.tif_recovery_pending && now -. state.tif_recovery_since >= 900.0
+           in
+           if recovery_expired
+           then (
+             state.tif_recovery_pending <- false;
+             Logging.info_f
+               ~section
+               "TIF recovery window expired for %s - resuming normal oracle-gated buying"
+               asset.symbol);
+           let tif_recovery_active =
+             state.tif_recovery_pending && now -. state.tif_recovery_since < 900.0
+           in
            let buy_attempted =
-             if oracle_halted
+             if oracle_halted && not tif_recovery_active
              then false
              else
                evaluate_buy_leg
@@ -1583,5 +1714,6 @@ let execute_strategy
              ~buy_attempted
              ~oracle_halted
              ~ecfg
-             ~locked_in_sells)))
+             ~locked_in_sells
+             ~base_balance_age)))
 ;;

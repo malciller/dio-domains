@@ -97,6 +97,22 @@ type strategy_state =
        rejection is foreordained, so it must not latch capital_low again -
        the fresh balance on the next store update governs. Cleared when a buy
        is placed against sufficient balance or the order acks/fills. *)
+  ; mutable sell_holds_since_balance : (float * float) list
+    (* (placed_at, qty) of sell placements whose venue-side hold may not yet
+       be reflected in the balance feed, oldest first. For accumulation
+       venues with [track_pending_sells = false] (Hyperliquid) a resting
+       sell blocks nothing locally after its ack - [has_active_sell]
+       releases at ack and [open_sell_orders] is rebuilt from the venue
+       feed - so the inventory gate trusts the balance feed's hold-netting
+       to be current. The spotState hold update trails the placement ack by
+       up to seconds, and in that window [asset_balance] still counts the
+       just-sold base as free: a second trigger (a fill seconds later under
+       volatility) sizes its sell against an overstated available and dips
+       into reserved_base. A hold is released the moment a balance message
+       NEWER than the placement arrives (the venue figure then includes the
+       hold - subtracting locally again would double-count), or when the
+       hold is older than the netting grace (no freshness signal / a
+       placement that never landed). *)
   ; mutable resuming_after_balance_flag : bool
     (* true for one cycle after asset_low/capital_low clears; re-gates new sells on accumulation_buffer *)
   ; mutable just_filled_buy : bool
@@ -118,6 +134,25 @@ type strategy_state =
         price satisfies the constraints. *)
   ; mutable reserved_quote : float
     (* quote amount reserved by current open buy for this symbol *)
+  ; mutable tif_recovery_pending : bool
+    (* true when a TIF/ALO/post-only reject (or any terminal placement loss)
+       killed the strategy's buy while it had one approved and resting -
+       the buy leg must re-attempt (re-priced, after the normal 2s cooldown)
+       even while the capital oracle is INACTIVE. Rationale: the oracle halt
+       exists to block NEW capital commitments, but the killed buy was
+       already-approved sizing, and after a price DROP re-placing it at the
+       lower price strictly improves survival margin - leaving the asset
+       buyless while inactive (the [oracle_halted] "no open buy" rule) is
+       the failure mode this latch prevents. Set by the TIF terminal paths
+       in the event handlers (each failed re-attempt re-arms); cleared on
+       buy ack/adoption (a resting buy exists again) and on a buy fill. *)
+  ; mutable tif_recovery_since : float
+    (* unix time the latch was last armed; the window expires 900s after the
+       LAST armed kill (each failed re-attempt re-arms and refreshes the
+       window by design - during a violent move the recovery should keep
+       re-attempting while the venue keeps rejecting). The expiry exists so
+       a latch armed by a stray event cannot pin buys through a genuine,
+       persistent capital-survival halt once the kill events stop. *)
   ; mutable accumulated_profit : float
     (* realized PnL from buy/sell cycles; gates accumulation sell placement *)
   ; mutable reserved_base : float
@@ -150,7 +185,10 @@ type strategy_state =
   ; mutable skipped_fill_streak : int
     (* consecutive fills skipped by the replay guard; a non-trivial streak
        (>= 50) outside startup replay signals the persisted high-water mark
-       is ahead of the venue's live id space and triggers a self-heal reset *)
+       is ahead of the venue's live id space and triggers a self-heal reset.
+       Reset to 0 when startup replay completes (replay skips are by design
+       and must not leak into live-mode counting) and on every processed
+       fill. *)
   ; mutable skipped_fills_total : int
     (* lifetime count of replay-guard skips; surfaced in WARN/CRITICAL logs *)
   ; mutable anticipated_base_credit : float
@@ -194,6 +232,18 @@ type strategy_state =
   ; mutable exchange_reserved_atomic : float Atomic.t option
   ; processed_fills : (string, unit) Hashtbl.t
   ; processed_fills_queue : string Queue.t
+  ; tracked_order_ids : (string, unit) Hashtbl.t
+    (* Bounded set of venue order ids this strategy has EVER tracked (acked,
+       adopted, or filled), FIFO-evicted at 1024. Distinguishes a late WS
+       cancel for a previously-tracked order (id present, no longer current
+       - must not purge placement tokens or clobber a concurrent placement's
+       guards) from a ghost cancel for a never-acked placement (id absent -
+       purge and reset are required for liveness). Degradation note: a late
+       cancel for an order evicted from this window (>1024 orders back)
+       falls back to the pre-fix ghost semantics - purge + full reset. That
+       matches the old behavior exactly, so the window bounds how far back
+       the protection reaches without ever behaving worse than before. *)
+  ; tracked_order_ids_queue : string Queue.t
   ; mutex : Mutex.t (* per-symbol mutex; prevents concurrent strategy execution *)
   }
 
@@ -320,6 +370,9 @@ let rec get_strategy_state asset_symbol =
       ; just_filled_buy = false
       ; force_buy_reanchor = false
       ; reserved_quote = 0.0
+      ; tif_recovery_pending = false
+      ; tif_recovery_since = 0.0
+      ; sell_holds_since_balance = []
       ; accumulated_profit = persisted_accumulated_profit
       ; reserved_base = persisted_reserved_base
       ; last_buy_fill_price = persisted_last_buy_fill_price
@@ -358,6 +411,8 @@ let rec get_strategy_state asset_symbol =
       ; exchange_reserved_atomic = None
       ; processed_fills = Hashtbl.create 1024
       ; processed_fills_queue = Queue.create ()
+      ; tracked_order_ids = Hashtbl.create 256
+      ; tracked_order_ids_queue = Queue.create ()
       ; mutex = Mutex.create ()
       }
     in
@@ -368,4 +423,22 @@ let rec get_strategy_state asset_symbol =
         (Strategy_common.StringMap.add asset_symbol new_state map)
     then new_state
     else get_strategy_state asset_symbol
+;;
+
+(** Records a venue order id in the strategy's bounded ever-tracked set.
+    Shared by the event handlers (ack/fill/amend) and the open-orders
+    adoption scan; see [strategy_state.tracked_order_ids]. Must be called
+    with the strategy mutex held. *)
+let add_tracked_order_id state order_id =
+  if not (Hashtbl.mem state.tracked_order_ids order_id)
+  then (
+    Queue.push order_id state.tracked_order_ids_queue;
+    Hashtbl.replace state.tracked_order_ids order_id ();
+    if Hashtbl.length state.tracked_order_ids > 1024
+    then (
+      try
+        let oldest = Queue.pop state.tracked_order_ids_queue in
+        Hashtbl.remove state.tracked_order_ids oldest
+      with
+      | _ -> ()))
 ;;

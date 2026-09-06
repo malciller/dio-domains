@@ -230,6 +230,7 @@ module Strategy = struct
         ; side : order_side
         ; reason : string
         }
+    | Cancel_cleanup of { order_id : string }
 
   (** Clears the startup_replay flag so subsequent fills are processed normally. *)
   let set_startup_replay_done symbol =
@@ -238,6 +239,13 @@ module Strategy = struct
     if state.startup_replay
     then (
       state.startup_replay <- false;
+      (* Startup replay skips history fills BY DESIGN, and every skip bumps
+         skipped_fill_streak. Without this reset the replayed count leaks
+         into live trading: a strategy that replayed >= 50 historical fills
+         boots with the streak already at the self-heal threshold, so the
+         first ordinary post-replay duplicate would trip the CRITICAL
+         self-heal and wipe a perfectly valid last_fill_oid high-water mark. *)
+      state.skipped_fill_streak <- 0;
       Logging.debug_f
         ~section
         "Startup replay complete for %s (last_fill_oid=%s, accumulated_profit=%.6f)"

@@ -320,7 +320,8 @@ let asset_domain_worker
       st.cached_sell_mult
       <- (try float_of_string asset_with_fees.sell_mult with
           | Failure _ -> 1.0);
-      st.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config asset_with_fees.exchange;
+      st.cached_ecfg
+      <- Dio_strategies.Jacobs_ladder.get_exchange_config asset_with_fees.exchange;
       st.cached_round_price
       <- (fun p -> Ex.round_price ~symbol:asset_with_fees.symbol ~price:p);
       st.cached_price_increment
@@ -328,9 +329,7 @@ let asset_domain_worker
            (Ex.get_price_increment ~symbol:asset_with_fees.symbol)
            ~default:0.01;
       st.cached_qty_increment
-      <- Option.value
-           (Ex.get_qty_increment ~symbol:asset_with_fees.symbol)
-           ~default:0.01;
+      <- Option.value (Ex.get_qty_increment ~symbol:asset_with_fees.symbol) ~default:0.01;
       st.cached_venue_min_qty
       <- Option.value (Ex.get_qty_min ~symbol:asset_with_fees.symbol) ~default:0.01;
       st.cached_venue_min_notional
@@ -442,6 +441,11 @@ let asset_domain_worker
     (* Cached closures for highly efficient, allocation-free balance reporting *)
     let base_balance_fn = Ex.get_tradeable_balance_fast ~asset:base_asset in
     let quote_balance_fn = Ex.get_tradeable_balance_fast ~asset:quote_currency in
+    (* Freshness of the base balance snapshot: the sell-hold guard uses it to
+       release placed-sell holds the moment a balance message newer than the
+       placement arrives (the venue's hold-netting is then already in the
+       figure). *)
+    let base_balance_age_fn = Ex.get_balance_age_fast ~asset:base_asset in
     (* Cached closures for latency-sensitive feed access in the hot loop *)
     let get_ob_pos_fn = Ex.get_orderbook_position_fast ~symbol:asset_with_fees.symbol in
     let get_tob_fn = Ex.get_top_of_book_fast ~symbol:asset_with_fees.symbol in
@@ -501,7 +505,8 @@ let asset_domain_worker
        does gmtime+mktime+DST math per call (alpaca_market_hours.ml:11-105);
        evaluating it on every hot ibkr/alpaca cycle inflated the cycle latency
        profile. *)
-    let mh_cache = ref (None : (float * bool) option) in    (* Cache strategy state references to avoid repeated mutex acquisition
+    let mh_cache = ref (None : (float * bool) option) in
+    (* Cache strategy state references to avoid repeated mutex acquisition
           on the hot path. References are stable while is_running is true. *)
     let cached_grid_state =
       if is_grid_strategy
@@ -527,9 +532,7 @@ let asset_domain_worker
          the wait returns immediately instead of parking through data that
          landed mid-cycle (the lost-wakeup race that could stall a quiet
          symbol's domain indefinitely). *)
-      let wake_baseline =
-        Concurrency.Exchange_wakeup.get_generation_fast wakeup_sync
-      in
+      let wake_baseline = Concurrency.Exchange_wakeup.get_generation_fast wakeup_sync in
       let cycle_events = ref 0 in
       let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
       let alloc_start = if latency_this_cycle then Gc.minor_words () else 0.0 in
@@ -826,15 +829,14 @@ let asset_domain_worker
                      oid
                      order_side
                      price)
-               else (
-                 if is_grid_strategy
-                 then
-                   Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
-                     ~now:now_inject
-                     asset_with_fees.symbol
-                     oid
-                     order_side
-                     price));
+               else if is_grid_strategy
+               then
+                 Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+                   ~now:now_inject
+                   asset_with_fees.symbol
+                   oid
+                   order_side
+                   price);
           exec_ready := true;
           exec_ready_cycle := !cycle_count;
           (* Mark startup replay complete to ungate profit calculation *)
@@ -1197,7 +1199,7 @@ let asset_domain_worker
                 "[%s/%s] Asset not modeled by the capital oracle; orders withheld"
                 asset_with_fees.exchange
                 asset_with_fees.symbol
-            else
+            else (
               match Oracle_runtime.materialized () with
               | None ->
                 Logging.warn_f
@@ -1218,7 +1220,7 @@ let asset_domain_worker
                   ~section
                   "[%s/%s] Capital-oracle never completed a pass; orders withheld"
                   asset_with_fees.exchange
-                  asset_with_fees.symbol))
+                  asset_with_fees.symbol)))
       else ();
       (* The oracle-halt no longer gates the whole execution block: an
          INACTIVE decision halts BUY placement inside the strategy (the
@@ -1409,6 +1411,7 @@ let asset_domain_worker
              ~cached_state:cs
              ~quote_balance_stale
              ~oracle_halted
+             ~base_balance_age:(base_balance_age_fn ())
              ~now
              asset
              !current_price
@@ -1450,10 +1453,10 @@ let asset_domain_worker
       (* Flush deferred accumulation persistence outside the strategy hotloop.
            Only performs file I/O when the dirty flag was set during execute_strategy. *)
       if should_execute
-      then (
+      then
         if is_grid_strategy
         then
-          Dio_strategies.Jacobs_ladder.Strategy.flush_persistence asset_with_fees.symbol);
+          Dio_strategies.Jacobs_ladder.Strategy.flush_persistence asset_with_fees.symbol;
       (* Record cycle work time before blocking. Captures active processing
            latency only, excluding sleep time in Exchange_wakeup.wait_since.
            Only busy cycles (real book/exec/strategy work) are recorded: idle
@@ -1491,10 +1494,7 @@ let asset_domain_worker
             while this cycle ran (generation > baseline), so a signal racing
             the cycle can no longer be lost to the park. *)
       if (not !should_execute_strategy) || not (has_exec_fn ())
-      then
-        Concurrency.Exchange_wakeup.wait_since_fast
-          wakeup_sync
-          ~since:wake_baseline;
+      then Concurrency.Exchange_wakeup.wait_since_fast wakeup_sync ~since:wake_baseline;
       if !exec_ready && (not !latency_active) && !cycle_count - !exec_ready_cycle >= 10
       then (
         latency_active := true;
@@ -1823,5 +1823,17 @@ let stop_all_domains () =
         Thread.delay 0.1;
         wait_for_stop (max_wait -. 0.1)))
   in
-  wait_for_stop 10.0
+  wait_for_stop 10.0;
+  (* Final persistence flush: [flush_persistence] only runs inside the
+     domain cycle, so any strategy state that became dirty in the last
+     cycles before shutdown (accumulation P&L, last_fill_oid, sell levels)
+     would otherwise never reach the save queue - the at_exit [flush_all]
+     drains only what is already queued. Domains are stopped, so this runs
+     after the last mutation of each state and cannot race a cycle. *)
+  List.iter
+    (fun state ->
+       let strategy = state.asset.strategy in
+       if strategy = "jacobs_ladder" || strategy = "Ladder"
+       then Dio_strategies.Jacobs_ladder.Strategy.flush_persistence state.asset.symbol)
+    all_states
 ;;
