@@ -52,6 +52,7 @@ type lifecycle_event =
       ; side : order_side
       ; reason : string
       }
+  | Cancel_cleanup of { order_id : string }
 
 let event_queues : (string, lifecycle_event LockFreeQueue.t) Hashtbl.t = Hashtbl.create 16
 let event_queues_mutex = Mutex.create ()
@@ -155,6 +156,7 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
+       add_tracked_order_id state order_id;
        state.pending_orders
        <- List.filter
             (fun (pending_id, s, p, _) ->
@@ -172,11 +174,15 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
             state.pending_orders;
        (match side with
         | Buy ->
+          add_tracked_order_id state order_id;
           state.last_buy_order_id <- Some order_id;
           state.last_buy_order_price <- Some price;
           state.inflight_buy <- false;
           state.inflight_amend_buy <- false;
           state.last_buy_attempted_insufficient <- false;
+          (* The buy is resting again - any pending TIF-recovery re-attempt
+             is satisfied. *)
+          state.tif_recovery_pending <- false;
           ()
         | Sell ->
           state.inflight_sell <- false;
@@ -266,6 +272,23 @@ let handle_order_failed ~now asset_symbol side reason =
          || contains_fragment lower_reason "asset not held"
        in
        let cooldown = if is_rate_limit || is_wash_trade then 10.0 else 2.0 in
+       (match side with
+        | Buy when not is_insufficient_balance ->
+          (* A terminal placement loss (TIF/ALO/post-only, transient venue
+             errors) must not leave the asset buyless while the capital
+             oracle is INACTIVE: arm TIF recovery so the buy leg re-attempts
+             (re-priced, after the normal cooldown) even through the halt.
+             Insufficient-balance failures are excluded - capital_low owns
+             those and the recovery must not fight a real capital drought. *)
+          state.tif_recovery_pending <- true;
+          state.tif_recovery_since <- Unix.gettimeofday ();
+          Logging.info_f
+            ~section
+            "Buy placement for %s failed (%s) - TIF recovery armed (window 900s, \
+             refreshes on each kill)"
+            asset_symbol
+            reason
+        | _ -> ());
        (match side with
         | Buy when is_insufficient_balance ->
           if state.last_buy_attempted_insufficient
@@ -518,7 +541,12 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
            state.skipped_fill_streak <- 0))
        else (
          add_processed_fill state order_id;
+         add_tracked_order_id state order_id;
          state.skipped_fill_streak <- 0;
+         (* A buy fill means a buy is working again - any pending TIF
+            recovery is satisfied and consumed (the re-anchor places the
+            next pair through the normal cycle). *)
+         if side = Buy then state.tif_recovery_pending <- false;
          state.pending_orders
          <- List.filter
               (fun (pending_id, _, _, _) ->
@@ -851,24 +879,72 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
           | None -> false)
          || List.exists (fun (sell_id, _, _) -> sell_id = order_id) state.open_sell_orders
        in
+       (* A STALE cancel references an order this strategy tracked long ago
+           (acked/adopted/filled) that is no longer current - e.g. the late WS
+           cancel for a buy whose cancel REST call timed out but still landed
+           venue-side, arriving after a replacement placement was dispatched.
+           Such a cancel must not purge placement tokens (the ghost purge
+           below would kill the concurrent placement's token) and must not
+           clobber the placement's guards. A GHOST cancel (never-acked
+           placement, id absent from the tracked set) is the opposite: purge
+           and reset are REQUIRED, otherwise the side wedges forever. *)
+       let is_stale_order_cancel =
+         (not is_known_order) && Hashtbl.mem state.tracked_order_ids order_id
+       in
+       if is_stale_order_cancel
+       then
+         Logging.info_f
+           ~section
+           "Late cancel for previously tracked order %s (%s) on %s - preserving \
+            in-flight placement guards"
+           order_id
+           (match side with
+            | Buy -> "buy"
+            | Sell -> "sell")
+           asset_symbol;
        state.pending_orders
-       <- List.filter
-            (fun (pending_id, s, _, _) ->
-               let matches =
-                 pending_id = order_id
-                 || (String.starts_with ~prefix:"pending_amend_" pending_id
-                     && String.length pending_id > 14
-                     && String.sub pending_id 14 (String.length pending_id - 14)
-                        = order_id)
-               in
-               let is_ghost_placement =
-                 (not is_known_order)
-                 && s = side
-                 && (String.starts_with ~prefix:"pending_buy_" pending_id
-                     || String.starts_with ~prefix:"pending_sell_" pending_id)
-               in
-               not (matches || is_ghost_placement))
-            state.pending_orders;
+       <- (if is_stale_order_cancel
+           then state.pending_orders
+           else (
+             (* A WS kill (reject/cancel/expired) of an in-flight placement
+                surfaces here as a ghost: the pending token is about to be
+                purged. If that placement was our BUY, arm TIF recovery so
+                the buy leg re-attempts promptly rather than leaving the
+                asset buyless while the capital oracle is INACTIVE. *)
+             let buy_placement_died =
+               (not is_known_order)
+               && side = Buy
+               && List.exists
+                    (fun (pending_id, s, _, _) ->
+                       s = Buy && String.starts_with ~prefix:"pending_buy_" pending_id)
+                    state.pending_orders
+             in
+             if buy_placement_died
+             then (
+               state.tif_recovery_pending <- true;
+               state.tif_recovery_since <- Unix.gettimeofday ();
+               Logging.info_f
+                 ~section
+                 "Buy placement for %s died unacked (WS kill) - TIF recovery armed \
+                  (window 900s)"
+                 asset_symbol);
+             List.filter
+               (fun (pending_id, s, _, _) ->
+                  let matches =
+                    pending_id = order_id
+                    || (String.starts_with ~prefix:"pending_amend_" pending_id
+                        && String.length pending_id > 14
+                        && String.sub pending_id 14 (String.length pending_id - 14)
+                           = order_id)
+                  in
+                  let is_ghost_placement =
+                    (not is_known_order)
+                    && s = side
+                    && (String.starts_with ~prefix:"pending_buy_" pending_id
+                        || String.starts_with ~prefix:"pending_sell_" pending_id)
+                  in
+                  not (matches || is_ghost_placement))
+               state.pending_orders));
        if not is_being_amended
        then (
          Hashtbl.remove state.amend_cooldowns order_id;
@@ -886,24 +962,39 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
            state.last_buy_order_id <- None;
            state.last_buy_order_price <- None;
            ());
-         if cancelled_side = Buy
-         then (
-           set_asset_reserved_quote state 0.0;
-           state.inflight_cancel_buy <- false;
-           state.inflight_amend_buy <- false;
-           Hashtbl.remove state.amend_cooldowns "place_Buy");
+         (* The canceled order's own cancel/amend markers always clear: they
+             describe THIS cancel's lifecycle. But the side's placement guards
+             (reserved quote, inflight flag, dedup key) may already belong to
+             a NEWER placement dispatched after this cancel was believed
+             failed - wipe them only when no same-side placement token is
+             alive, i.e. no concurrent placement can be clobbered. *)
+         let placement_in_flight =
+           List.exists
+             (fun (pending_id, s, _, _) ->
+                s = cancelled_side
+                && (String.starts_with ~prefix:"pending_buy_" pending_id
+                    || String.starts_with ~prefix:"pending_sell_" pending_id))
+             state.pending_orders
+         in
+         (match cancelled_side with
+          | Buy ->
+            state.inflight_cancel_buy <- false;
+            state.inflight_amend_buy <- false;
+            Hashtbl.remove state.amend_cooldowns "place_Buy";
+            if not placement_in_flight
+            then (
+              set_asset_reserved_quote state 0.0;
+              state.inflight_buy <- false;
+              ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_buy))
+          | Sell ->
+            if not placement_in_flight
+            then (
+              state.inflight_sell <- false;
+              ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell)));
          state.open_sell_orders
          <- List.filter
               (fun (sell_id, _, _) -> sell_id <> order_id)
-              state.open_sell_orders;
-         (match cancelled_side with
-          | Buy -> state.inflight_buy <- false
-          | Sell -> state.inflight_sell <- false);
-         ignore
-           (InFlightOrders.remove_in_flight_order
-              (match cancelled_side with
-               | Buy -> state.duplicate_key_buy
-               | Sell -> state.duplicate_key_sell)))
+              state.open_sell_orders)
        else
          Logging.info_f
            ~section
@@ -934,6 +1025,7 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
             state.pending_orders;
        (match side with
         | Buy ->
+          add_tracked_order_id state new_order_id;
           (match state.last_buy_order_id with
            | Some target_id when target_id = old_order_id ->
              state.last_buy_order_id <- Some new_order_id;
@@ -966,6 +1058,7 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
                asset_symbol;
              state.inflight_amend_buy <- false)
         | Sell ->
+          add_tracked_order_id state new_order_id;
           let original_sell_count = List.length state.open_sell_orders in
           let old_entry =
             List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders
@@ -1118,6 +1211,21 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
          in
          ignore (push_order ~now ~state cancel_order);
          if side = Buy then state.inflight_cancel_buy <- true;
+         (match side with
+          | Buy when is_tif_rejection ->
+            (* The trailing/amended buy died to a TIF/ALO/post-only reject
+                - typically a violent move making the target momentarily
+                cross. Arm TIF recovery so the buy leg re-attempts promptly
+                at a fresh (re-validated) price instead of leaving the asset
+                buyless while the capital oracle is INACTIVE. *)
+            state.tif_recovery_pending <- true;
+            state.tif_recovery_since <- Unix.gettimeofday ();
+            Logging.info_f
+              ~section
+              "TIF recovery armed for %s - buy leg will re-attempt through the oracle \
+               halt (window 900s)"
+              asset_symbol
+          | _ -> ());
          match side with
          | Buy ->
            (match state.last_buy_order_id with
@@ -1174,11 +1282,19 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
              | Sell -> state.duplicate_key_sell)))
 ;;
 
-(** Cleans up in-flight cancellation markers on cancellation failure. *)
+(** Cleans up in-flight cancellation markers on cancellation failure. Runs
+    on the domain thread (drained as a [Cancel_cleanup] lifecycle event), so
+    the flag writes below are mutex-synchronized like every other handler -
+    the supervisor's REST callbacks enqueue this event instead of mutating
+    strategy state cross-domain. *)
 let cleanup_pending_cancellation asset_symbol _order_id =
   let state = get_strategy_state asset_symbol in
-  state.inflight_cancel_buy <- false;
-  state.inflight_amend_buy <- false
+  Mutex.lock state.mutex;
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock state.mutex)
+    (fun () ->
+       state.inflight_cancel_buy <- false;
+       state.inflight_amend_buy <- false)
 ;;
 
 (* drain lifecycle events queued by the supervisor REST path and dispatch
@@ -1197,6 +1313,7 @@ let dispatch_event symbol (ev : lifecycle_event) =
     handle_order_amendment_skipped ~now symbol order_id side price
   | Amendment_failed { now; order_id; side; reason } ->
     handle_order_amendment_failed ~now symbol order_id side reason
+  | Cancel_cleanup { order_id } -> cleanup_pending_cancellation symbol order_id
 ;;
 
 let drain_events symbol =

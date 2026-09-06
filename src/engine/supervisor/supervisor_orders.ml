@@ -76,6 +76,12 @@ let is_inventory_rejection err =
 
 let reconciliation_in_flight = Atomic.make false
 
+(** Set when a rejection arrives while a reconcile is already running, so
+    the running reconcile re-runs once after finishing instead of silently
+    dropping the suppression (the dropped rejection's desync could predate
+    the running reconcile's balance snapshot). *)
+let reconciliation_pending = Atomic.make false
+
 (** Event-driven reconciliation after an inventory-class placement rejection:
     re-bootstrap the venue's open orders and balances, then let their
     completion wakeups re-run the symbol's strategy against fresh state.
@@ -85,38 +91,59 @@ let reconciliation_in_flight = Atomic.make false
     holds sellable inventory. Other venues report tradeable (hold-netted)
     balances and are not exposed to this desync class. *)
 let refresh_inventory_state_on_rejection (order : strategy_order) err =
-  if
-    String.equal order.exchange "alpaca"
-    && is_inventory_rejection err
-    && Atomic.compare_and_set reconciliation_in_flight false true
-  then
-    Lwt.async (fun () ->
-      Lwt.catch
-        (fun () ->
-           Logging.warn_f
-             ~section
-             "Reconciling venue state after inventory-class rejection: %s %s (%s)"
-             (side_str order)
-             order.symbol
-             err;
-           let jobs =
-             [ Alpaca.Balances.update_balances () ]
-             @
-             if order.side = Sell
-             then [ Alpaca.Executions.bootstrap_open_orders () ]
-             else []
-           in
-           Lwt.join jobs)
-        (fun exn ->
-           Logging.warn_f
-             ~section
-             "Post-rejection reconciliation failed for %s: %s"
-             order.symbol
-             (Printexc.to_string exn);
-           Lwt.return_unit)
-      >>= fun () ->
-      Atomic.set reconciliation_in_flight false;
-      Lwt.return_unit)
+  if String.equal order.exchange "alpaca" && is_inventory_rejection err
+  then (
+    let rec run ~with_open_orders =
+      match Atomic.compare_and_set reconciliation_in_flight false true with
+      | false ->
+        (* A reconcile is already running. Never drop the rejection
+           silently: queue exactly one re-run - the current reconcile's
+           snapshot may predate this rejection's desync. *)
+        Atomic.set reconciliation_pending true;
+        Logging.warn_f
+          ~section
+          "Inventory rejection for %s arrived during an in-flight reconcile - queued \
+           re-run (%s)"
+          order.symbol
+          err
+      | true ->
+        Lwt.async (fun () ->
+          Lwt.catch
+            (fun () ->
+               Logging.warn_f
+                 ~section
+                 "Reconciling venue state after inventory-class rejection: %s %s (%s)"
+                 (side_str order)
+                 order.symbol
+                 err;
+               let jobs =
+                 [ Alpaca.Balances.update_balances () ]
+                 @
+                 if with_open_orders
+                 then [ Alpaca.Executions.bootstrap_open_orders () ]
+                 else []
+               in
+               Lwt.join jobs)
+            (fun exn ->
+               Logging.warn_f
+                 ~section
+                 "Post-rejection reconciliation failed for %s: %s"
+                 order.symbol
+                 (Printexc.to_string exn);
+               Lwt.return_unit)
+          >>= fun () ->
+          Atomic.set reconciliation_in_flight false;
+          (* The queued re-run always includes the open-orders bootstrap:
+             the suppressed rejection's side is unknown here, and the extra
+             bootstrap is a cheap idempotent fetch. *)
+          if Atomic.get reconciliation_pending
+          then (
+            Atomic.set reconciliation_pending false;
+            run ~with_open_orders:true;
+            Lwt.return_unit)
+          else Lwt.return_unit)
+    in
+    run ~with_open_orders:(order.side = Sell))
   else ()
 ;;
 
@@ -226,14 +253,17 @@ let grid_callbacks : strategy_callbacks =
   ; on_cancel_ok =
       (fun order target_order_id ->
         Logging.info_f ~section "✓ Cancelled order: %s" target_order_id;
-        Dio_strategies.Jacobs_ladder.Strategy.cleanup_pending_cancellation
+        (* Enqueue, never mutate directly: these callbacks run on the
+           supervisor's Lwt fiber, and strategy state must only be touched
+           on the symbol's domain thread. *)
+        Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
           order.symbol
-          target_order_id)
+          (Cancel_cleanup { order_id = target_order_id }))
   ; on_cancel_fail =
       (fun order target_order_id ->
-        Dio_strategies.Jacobs_ladder.Strategy.cleanup_pending_cancellation
+        Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
           order.symbol
-          target_order_id)
+          (Cancel_cleanup { order_id = target_order_id }))
   }
 ;;
 
@@ -389,6 +419,26 @@ let callbacks_for_strategy (order : strategy_order) =
    Unified order dispatch
    -------------------------------------------------------------------------- *)
 
+(** Deadline after which a dispatched Place/Amend that has produced no
+    terminal callback is declared failed. Must exceed the worst-case
+    legitimate REST duration including the venue retry budget (3 attempts
+    with up to 30s backoff); 120s keeps the zombie-completion window small
+    while guaranteeing the in-flight guards the removed 5s sweeps used to
+    heal cannot wedge forever - e.g. the Alpaca placement REST has no HTTP
+    timeout, so a black-holed connection produces no terminal event on its
+    own. A REST completion arriving after the deadline fired is a zombie:
+    it is suppressed so exactly one terminal event ever reaches the
+    strategy, mirroring the documented single-attempt tradeoff on Kraken
+    (a request that landed venue-side before the deadline is adopted by the
+    next open-orders scan). *)
+let dispatch_deadline_s = 120.0
+
+(** Latches the first of [f] / the deadline. Returns a runner that executes
+    [f] only if no terminal event has been delivered yet. *)
+let once_only resolved f () =
+  if Atomic.compare_and_set resolved false true then f () else Lwt.return_unit
+;;
+
 (** Dispatches a Place order asynchronously via Order_executor. *)
 let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
   let order_request =
@@ -413,20 +463,46 @@ let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
   in
   Lwt.async (fun () ->
     let%lwt () = Lwt.pause () in
+    let resolved = Atomic.make false in
     Lwt.catch
       (fun () ->
-         Dio_engine.Order_executor.place_order
-           ~token:auth_token
-           ~check_duplicate:false
-           order_request
-         >>= function
-         | Ok result ->
-           Atomic.incr orders_placed;
-           cb.on_place_ok order result.order_id;
-           Lwt.return_unit
-         | Error err ->
-           cb.on_place_fail order err;
-           Lwt.return_unit)
+         Lwt.choose
+           [ (Dio_engine.Order_executor.place_order
+                ~token:auth_token
+                ~check_duplicate:false
+                order_request
+              >>= function
+              | Ok result ->
+                once_only
+                  resolved
+                  (fun () ->
+                     Atomic.incr orders_placed;
+                     cb.on_place_ok order result.order_id;
+                     Lwt.return_unit)
+                  ()
+              | Error err ->
+                once_only
+                  resolved
+                  (fun () ->
+                     cb.on_place_fail order err;
+                     Lwt.return_unit)
+                  ())
+           ; (Lwt_unix.sleep dispatch_deadline_s
+              >>= fun () ->
+              once_only
+                resolved
+                (fun () ->
+                   Logging.error_f
+                     ~section
+                     "⏱ Place dispatch deadline (%.0fs) exceeded for %s %s - \
+                      synthesizing terminal failure"
+                     dispatch_deadline_s
+                     (side_str order)
+                     order.symbol;
+                   cb.on_place_fail order "dispatch deadline exceeded";
+                   Lwt.return_unit)
+                ())
+           ])
       (fun exn ->
          let err = Printexc.to_string exn in
          Logging.error_f
@@ -435,8 +511,12 @@ let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
            (side_str order)
            order.symbol
            err;
-         cb.on_place_fail order err;
-         Lwt.return_unit))
+         once_only
+           resolved
+           (fun () ->
+              cb.on_place_fail order err;
+              Lwt.return_unit)
+           ()))
 ;;
 
 (** Dispatches an Amend order asynchronously via Order_executor. *)
@@ -459,31 +539,67 @@ let dispatch_amend ~auth_token ~orders_placed ~cb (order : strategy_order) targe
   in
   Lwt.async (fun () ->
     let%lwt () = Lwt.pause () in
+    let resolved = Atomic.make false in
     Lwt.catch
       (fun () ->
-         Dio_engine.Order_executor.amend_order ~token:auth_token amend_request
-         >>= function
-         | Ok result ->
-           if result.Dio_exchange.Exchange_intf.Types.amend_id = Some "skipped_no_change"
-           then (
-             cb.on_amend_skipped order target_order_id;
-             Lwt.return_unit)
-           else (
-             Atomic.incr orders_placed;
-             let amend_id_str =
-               match result.Dio_exchange.Exchange_intf.Types.amend_id with
-               | Some id -> id
-               | None -> "none"
-             in
-             Logging.debug_f ~section "✓ Order amended (Amend ID: %s)" amend_id_str;
-             cb.on_amend_ok
-               order
-               target_order_id
-               result.Dio_exchange.Exchange_intf.Types.new_order_id;
-             Lwt.return_unit)
-         | Error err ->
-           cb.on_amend_fail order target_order_id err;
-           Lwt.return_unit)
+         Lwt.choose
+           [ (Dio_engine.Order_executor.amend_order ~token:auth_token amend_request
+              >>= function
+              | Ok result ->
+                if
+                  result.Dio_exchange.Exchange_intf.Types.amend_id
+                  = Some "skipped_no_change"
+                then
+                  once_only
+                    resolved
+                    (fun () ->
+                       cb.on_amend_skipped order target_order_id;
+                       Lwt.return_unit)
+                    ()
+                else
+                  once_only
+                    resolved
+                    (fun () ->
+                       Atomic.incr orders_placed;
+                       let amend_id_str =
+                         match result.Dio_exchange.Exchange_intf.Types.amend_id with
+                         | Some id -> id
+                         | None -> "none"
+                       in
+                       Logging.debug_f
+                         ~section
+                         "✓ Order amended (Amend ID: %s)"
+                         amend_id_str;
+                       cb.on_amend_ok
+                         order
+                         target_order_id
+                         result.Dio_exchange.Exchange_intf.Types.new_order_id;
+                       Lwt.return_unit)
+                    ()
+              | Error err ->
+                once_only
+                  resolved
+                  (fun () ->
+                     cb.on_amend_fail order target_order_id err;
+                     Lwt.return_unit)
+                  ())
+           ; (Lwt_unix.sleep dispatch_deadline_s
+              >>= fun () ->
+              once_only
+                resolved
+                (fun () ->
+                   Logging.error_f
+                     ~section
+                     "⏱ Amend dispatch deadline (%.0fs) exceeded for %s %s (%s) - \
+                      synthesizing terminal failure"
+                     dispatch_deadline_s
+                     (side_str order)
+                     order.symbol
+                     target_order_id;
+                   cb.on_amend_fail order target_order_id "dispatch deadline exceeded";
+                   Lwt.return_unit)
+                ())
+           ])
       (fun exn ->
          let err = Printexc.to_string exn in
          Logging.error_f
@@ -492,8 +608,12 @@ let dispatch_amend ~auth_token ~orders_placed ~cb (order : strategy_order) targe
            (side_str order)
            order.symbol
            err;
-         cb.on_amend_fail order target_order_id err;
-         Lwt.return_unit))
+         once_only
+           resolved
+           (fun () ->
+              cb.on_amend_fail order target_order_id err;
+              Lwt.return_unit)
+           ()))
 ;;
 
 (** Dispatches a Cancel order asynchronously via Order_executor. *)
@@ -576,11 +696,16 @@ let process_single_order
          | Some target_order_id ->
            dispatch_amend ~auth_token ~orders_placed ~cb order target_order_id
          | None ->
+           (* A terminal callback is mandatory now that the 5s sweeps are
+              gone: with no callback and no deadline the amend's
+              pending_amend_ token and InFlightAmendments entry (which
+              cleanup never reaps while Pending) wedge the side forever. *)
            Logging.error_f
              ~section
-             "Amendment request missing target order ID for %s %s"
+             "Amendment request missing target order ID for %s %s - failing fast"
              (side_str order)
-             order.symbol)
+             order.symbol;
+           cb.on_amend_fail order "<missing order id>" "amend without target order id")
       | Cancel ->
         (match order.order_id with
          | Some target_order_id ->

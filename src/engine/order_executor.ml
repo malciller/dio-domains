@@ -264,7 +264,7 @@ let place_order ~token ?retry_config ?(check_duplicate = true) (request : order_
   (* Block new placements during graceful shutdown. *)
   if Atomic.get shutdown_requested
   then Lwt.return (Error "Order placement cancelled due to shutdown")
-  else (
+  else
     with_error_handling ~operation_name:"place_order" (fun () ->
       match validate_order_request request with
       | Error err ->
@@ -340,7 +340,7 @@ let place_order ~token ?retry_config ?(check_duplicate = true) (request : order_
             let stop_time = Mtime_clock.now_ns () in
             let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
             Latency_profiler.record profiler span;
-            Lwt.return result)))
+            Lwt.return result))
 ;;
 
 (** Amends an existing order on the target exchange.
@@ -353,7 +353,7 @@ let amend_order ~token ?retry_config (request : amend_request) =
   (* Block amendments during graceful shutdown. *)
   if Atomic.get shutdown_requested
   then Lwt.return (Error "Order amendment cancelled due to shutdown")
-  else (
+  else
     with_error_handling ~operation_name:"amend_order" (fun () ->
       match validate_amend_request request with
       | Error err ->
@@ -509,7 +509,7 @@ let amend_order ~token ?retry_config (request : amend_request) =
                 InFlightAmendments.note_amendment_failed
                   ~old_id:request.order_id
                   ~reason:err);
-             Lwt.return result))))
+             Lwt.return result)))
 ;;
 
 (** Cancels one or more orders on the target exchange.
@@ -578,17 +578,28 @@ let start_periodic_inflight_cleanup () =
         >>= fun () ->
         if Atomic.get shutdown_requested
         then Lwt.return_unit
-        else (
-          let _drift1, trimmed1 = InFlightOrders.cleanup () in
-          let _drift2, trimmed2 = InFlightAmendments.cleanup () in
-          if trimmed1 > 0 || trimmed2 > 0
-          then
-            Logging.debug_f
-              ~section
-              "Periodic in-flight cleanup: removed %d orders, %d amendments"
-              trimmed1
-              trimmed2;
-          loop ())
+        else
+          (* Guard the sweep: an exception escaping [Lwt.async] would kill
+             this fiber silently and permanently, and the in-flight registry
+             leak this fiber exists to prevent would come back. *)
+          Lwt.catch
+            (fun () ->
+               let _drift1, trimmed1 = InFlightOrders.cleanup () in
+               let _drift2, trimmed2 = InFlightAmendments.cleanup () in
+               if trimmed1 > 0 || trimmed2 > 0
+               then
+                 Logging.debug_f
+                   ~section
+                   "Periodic in-flight cleanup: removed %d orders, %d amendments"
+                   trimmed1
+                   trimmed2;
+               loop ())
+            (fun exn ->
+               Logging.error_f
+                 ~section
+                 "Periodic in-flight cleanup sweep failed: %s (continuing)"
+                 (Printexc.to_string exn);
+               loop ())
       in
       loop ())
 ;;

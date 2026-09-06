@@ -275,6 +275,7 @@ let test_blocked_placement_sell_retries () =
       ~oracle_halted:false
       ~ecfg
       ~locked_in_sells:0.0
+      ~base_balance_age:None
   in
   (* Tick 1: a buy was placed this tick; the sell is on cooldown, so the
      attempt is blocked - the sell must stay owed. *)
@@ -375,6 +376,287 @@ let test_hl_buy_fill_accrues_reserve () =
     (kr_state.last_buy_fill_price = Some 390.0)
 ;;
 
+(* The reserved_base leak under volatility: for accumulation venues with
+   track_pending_sells = false (Hyperliquid), a resting sell blocks nothing
+   locally after its ack, and the inventory gate trusts the balance feed's
+   hold-netting to be current. The spotState hold lags the ack by seconds;
+   sizing in that window counts the just-sold base as free and dips into
+   reserved_base. The unnetted-hold guard must subtract the armed hold until
+   the balance confirms netting (or the grace expires). *)
+let test_unnetted_sell_hold_gates_second_sizing () =
+  let symbol = "UNNET1/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.18;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.98;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.0224;
+  state.accumulated_profit <- 24.0;
+  state.open_sell_orders <- [];
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 88.6;
+  state.last_buy_fill_qty <- Some 0.18;
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.18"
+    ; grid_interval = 0.36
+    ; sell_mult = "0.98"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.25
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  let run_leg ~now ~bal ~age =
+    Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+      ~persisted_reconcile:
+        (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      ~state
+      ~now
+      ~asset
+      ~bid_price:88.5
+      ~ask_price:88.6
+      ~asset_balance:bal
+      ~buy_attempted:false
+      ~oracle_halted:false
+      ~ecfg
+      ~locked_in_sells:0.0
+      ~base_balance_age:(Some age)
+  in
+  (* Tick 1: balance 0.4024, reserved 0.0224 -> available 0.38 -> sell sized
+     to the full available (0.38 free float). The venue is holding it. The
+     balance message is current (age 0.1). *)
+  run_leg ~now:100.0 ~bal:0.4024 ~age:0.1;
+  let pushed1 = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let sell1 =
+    List.find_opt
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell)
+      pushed1
+  in
+  check bool "first sell placed" true (Option.is_some sell1);
+  let qty1 =
+    match sell1 with
+    | Some o -> o.qty
+    | None -> 0.0
+  in
+  drain ();
+  (* Tick 2, moments later: a second buy fill triggers another sell while
+     the venue's spotState has NOT yet netted the first hold - the balance
+     still reads 0.4024 (age 3.0 = newest message predates the placement).
+     Without the guard, available would again be 0.38 and the second sell
+     would dip into the 0.0224 reserve. With the guard, the armed hold
+     (0.38) clamps the second sell to zero. *)
+  state.just_filled_buy <- true;
+  state.last_buy_fill_qty <- Some 0.18;
+  (* The first sell acked (in-flight latch released, dedup key removed); the
+     balance message still predates the placement (age 3.0 at t=102 ->
+     message from t=99): the hold is unnetted and must gate the sizing. *)
+  state.inflight_sell <- false;
+  ignore
+    (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+       state.duplicate_key_sell);
+  run_leg ~now:102.0 ~bal:0.4024 ~age:3.0;
+  let pushed2 = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let sell2_qty =
+    List.fold_left
+      (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+         match o.operation, o.side with
+         | Place, Sell -> acc +. o.qty
+         | _ -> acc)
+      0.0
+      pushed2
+  in
+  check
+    bool
+    "second sell within the netting window does not dip into reserved_base"
+    true
+    (sell2_qty <= 1e-9);
+  drain ();
+  (* Tick 3: a balance message NEWER than the placement arrives (age 0.2 at
+     t=103 -> message from t=102.8, after the placement at t=100) - the
+     venue figure now includes the hold, the guard releases, and the fresh
+     fill's sell is placeable against the netted balance (bal = netted
+     0.0224 + fresh fill 0.18). *)
+  state.just_filled_buy <- true;
+  state.inflight_sell <- false;
+  ignore
+    (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+       state.duplicate_key_sell);
+  run_leg ~now:103.0 ~bal:(0.4024 -. qty1 +. 0.18) ~age:0.2;
+  let pushed3 = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let sell3_qty =
+    List.fold_left
+      (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+         match o.operation, o.side with
+         | Place, Sell -> acc +. o.qty
+         | _ -> acc)
+      0.0
+      pushed3
+  in
+  check
+    bool
+    "after netting is observed, the fresh fill's sell is placeable again"
+    true
+    (sell3_qty >= 0.17 && sell3_qty <= 0.18 +. 1e-6);
+  drain ()
+;;
+
+let test_unnetted_sell_hold_expires_after_grace () =
+  let symbol = "UNNET2/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.18;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.98;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.0;
+  state.accumulated_profit <- 0.0;
+  state.open_sell_orders <- [];
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- false;
+  state.last_buy_fill_price <- Some 88.6;
+  state.last_buy_fill_qty <- Some 0.18;
+  (* Simulate an armed hold whose confirmation never came (e.g. the
+     placement was rejected, or no balance message ever arrived): past the
+     grace window it must decay so sells are not blocked indefinitely. The
+     feed provides no freshness signal here (age None), so the 15s grace
+     governs. No new placement is triggered in this tick (just_filled_buy
+     false, no buy attempt), so the prune alone is exercised. *)
+  state.sell_holds_since_balance <- [ 0.0, 0.38 ];
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.18"
+    ; grid_interval = 0.36
+    ; sell_mult = "0.98"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.25
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:20.0
+    ~asset
+    ~bid_price:88.5
+    ~ask_price:88.6
+    ~asset_balance:0.4024
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:None;
+  check
+    bool
+    "stale unnetted hold decays after the grace window"
+    true
+    (state.sell_holds_since_balance = []);
+  drain ()
+;;
+
+let test_unnetted_sell_hold_capped_even_with_age () =
+  (* A hold must also decay when the feed DOES report freshness but the
+     message is ancient (age 100s > grace): the cutoff caps at now - 15s so
+     a dead feed cannot keep a hold alive forever. No new placement is
+     triggered; the prune alone is exercised. *)
+  let symbol = "UNNET3/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.18;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.98;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.0;
+  state.accumulated_profit <- 0.0;
+  state.open_sell_orders <- [];
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- false;
+  state.last_buy_fill_price <- Some 88.6;
+  state.last_buy_fill_qty <- Some 0.18;
+  let now = Unix.gettimeofday () in
+  (* Placed 100s ago; the newest balance message is equally old. *)
+  state.sell_holds_since_balance <- [ now -. 100.0, 0.38 ];
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.18"
+    ; grid_interval = 0.36
+    ; sell_mult = "0.98"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.25
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now
+    ~asset
+    ~bid_price:88.5
+    ~ask_price:88.6
+    ~asset_balance:0.4024
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:(Some 100.0);
+  check
+    bool
+    "hold older than the grace decays even when the feed reports an ancient age"
+    true
+    (state.sell_holds_since_balance = []);
+  drain ()
+;;
+
 let test_sub_minimum_qty_sell_places () =
   (* Sells are NOT floored at the venue qty minimum - only the quote-notional
      floor gates them (accrual sells sell_mult x qty and residual inventory
@@ -432,6 +714,7 @@ let test_sub_minimum_qty_sell_places () =
     ~buy_attempted:false
     ~ecfg
     ~locked_in_sells:0.0
+    ~base_balance_age:None
     ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let sell_qty =
@@ -546,6 +829,222 @@ let test_order_rejection () =
     51000.0;
   (* Should remove from pending orders *)
   check bool "pending orders cleared" true (List.length state.pending_orders = 0)
+;;
+
+(* TIF/ALO reject recovery: a violent move can make the trailing buy's amend
+   or placement die to a TIF/ALO/post-only reject. Without recovery, the
+   asset sits buyless for the entire oracle-INACTIVE window (the halt's
+   "no open buy" rule turns the transient reject into an indefinite gap).
+   The recovery latch must arm on the TIF kill paths and never on
+   insufficient-balance or stale-cancel paths. *)
+let test_tif_recovery_armed_on_amendment_failed () =
+  let symbol = "TIFREC1/HYPE/USDC" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.tif_recovery_pending <- false;
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_amendment_failed
+    ~now:100.0
+    symbol
+    "tiford1"
+    Dio_strategies.Strategy_common.Buy
+    "Alo order would cross: badAloPxRejected";
+  check
+    bool
+    "amendment TIF reject arms the recovery latch"
+    true
+    state.tif_recovery_pending;
+  check bool "recovery timestamp recorded" true (state.tif_recovery_since > 0.0);
+  drain ()
+;;
+
+let test_tif_recovery_not_armed_on_non_tif_amend_failure () =
+  let symbol = "TIFREC2/HYPE/USDC" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.tif_recovery_pending <- false;
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_amendment_failed
+    ~now:100.0
+    symbol
+    "tiford2"
+    Dio_strategies.Strategy_common.Buy
+    "too many cumulative requests (rate limited)";
+  check
+    bool
+    "non-terminal amend failure keeps tracking (no recovery latch)"
+    false
+    state.tif_recovery_pending;
+  drain ()
+;;
+
+let test_tif_recovery_not_armed_on_insufficient_failed () =
+  let symbol = "TIFREC3/HYPE/USDC" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.tif_recovery_pending <- false;
+  state.last_buy_attempted_insufficient <- false;
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_failed
+    ~now:100.0
+    symbol
+    Dio_strategies.Strategy_common.Buy
+    "insufficient funds for the transaction";
+  check
+    bool
+    "insufficient-balance placement failure does not arm recovery (capital_low owns it)"
+    false
+    state.tif_recovery_pending
+;;
+
+let test_tif_recovery_armed_on_transient_failed () =
+  let symbol = "TIFREC4/HYPE/USDC" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.tif_recovery_pending <- false;
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_failed
+    ~now:100.0
+    symbol
+    Dio_strategies.Strategy_common.Buy
+    "dispatch deadline exceeded";
+  check
+    bool
+    "transient placement failure arms the recovery latch"
+    true
+    state.tif_recovery_pending
+;;
+
+let test_tif_recovery_cleared_on_buy_ack () =
+  let symbol = "TIFREC5/HYPE/USDC" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.tif_recovery_pending <- true;
+  state.tif_recovery_since <- Unix.gettimeofday ();
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+    ~now:200.0
+    symbol
+    "tifack1"
+    Dio_strategies.Strategy_common.Buy
+    85.0;
+  check
+    bool
+    "buy acknowledgment clears the recovery latch (resting buy exists)"
+    false
+    state.tif_recovery_pending
+;;
+
+let test_tif_recovery_armed_on_ghost_buy_ws_kill () =
+  let symbol = "TIFREC6/HYPE/USDC" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.tif_recovery_pending <- false;
+  state.last_buy_order_id <- None;
+  state.open_sell_orders <- [];
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  (* Dispatch a fresh buy placement: push_order registers the pending_buy_
+     token and the in-flight guard. *)
+  let order =
+    Dio_strategies.Jacobs_ladder.create_place_order
+      state.duplicate_key_buy
+      symbol
+      Dio_strategies.Strategy_common.Buy
+      0.5
+      (Some 85.0)
+      true
+      Dio_strategies.Strategy_common.Ladder
+      "hyperliquid"
+  in
+  check
+    bool
+    "placement dispatched"
+    true
+    (Dio_strategies.Jacobs_ladder.push_order ~now:100.0 ~state order);
+  let has_token =
+    List.exists
+      (fun (id, _, _, _) -> String.starts_with ~prefix:"pending_buy_" id)
+      state.pending_orders
+  in
+  check bool "pending_buy_ token registered" true has_token;
+  (* The venue WS rejects the never-acked placement: a cancel event for an
+     untracked id arrives and the ghost purge removes the token - this is a
+     buy-placement kill and must arm recovery. *)
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_cancelled
+    ~now:101.0
+    symbol
+    "ws_rejected_untracked_id"
+    Dio_strategies.Strategy_common.Buy
+    None;
+  check
+    bool
+    "ghost buy token purged"
+    true
+    (not
+       (List.exists
+          (fun (id, _, _, _) -> String.starts_with ~prefix:"pending_buy_" id)
+          state.pending_orders));
+  check
+    bool
+    "WS kill of the in-flight buy placement arms the recovery latch"
+    true
+    state.tif_recovery_pending;
+  drain ()
+;;
+
+let test_tif_recovery_not_armed_on_stale_cancel () =
+  let symbol = "TIFREC7/HYPE/USDC" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.tif_recovery_pending <- false;
+  state.last_buy_order_id <- None;
+  state.open_sell_orders <- [];
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  (* A previously tracked (acked) buy: its id is in the ever-tracked set.
+     Simulate a late WS cancel arriving after the tracking was already
+     wiped (e.g. by the ghost-buy sync): the cancel is STALE - it must not
+     arm recovery, since no placement actually died. *)
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+    ~now:100.0
+    symbol
+    "stale_cancel_id"
+    Dio_strategies.Strategy_common.Buy
+    85.0;
+  check bool "ack cleared the latch" false state.tif_recovery_pending;
+  state.last_buy_order_id <- None;
+  state.last_buy_order_price <- None;
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_cancelled
+    ~now:110.0
+    symbol
+    "stale_cancel_id"
+    Dio_strategies.Strategy_common.Buy
+    None;
+  check
+    bool
+    "stale cancel does not arm the recovery latch"
+    false
+    state.tif_recovery_pending;
+  drain ()
 ;;
 
 let test_accumulation_profit_tracking () =
@@ -813,6 +1312,7 @@ let test_virtual_gtc_sell_grid_maintenance () =
     ~buy_attempted:false
     ~ecfg:ecfg_alpaca
     ~locked_in_sells:0.0
+    ~base_balance_age:None
     ~oracle_halted:false;
   (* Verify that a missing sell order from persisted stack was pushed to order buffer at target price 101.00 *)
   let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
@@ -858,6 +1358,7 @@ let test_virtual_gtc_sell_grid_maintenance () =
     ~buy_attempted:false
     ~ecfg:ecfg_alpaca
     ~locked_in_sells:0.0
+    ~base_balance_age:None
     ~oracle_halted:false;
   check
     bool
@@ -919,6 +1420,7 @@ let test_virtual_gtc_sell_grid_maintenance () =
     ~buy_attempted:false
     ~ecfg:ecfg_kraken
     ~locked_in_sells:0.0
+    ~base_balance_age:None
     ~oracle_halted:false;
   let kraken_popped = Dio_strategies.Strategy_common.LockFreeQueue.read buffer in
   check
@@ -927,8 +1429,6 @@ let test_virtual_gtc_sell_grid_maintenance () =
     true
     (Option.is_none kraken_popped)
 ;;
-
-
 
 let test_halted_ladders_second_sell_beside_resting_one () =
   (* Kraken startup-inactive with a resting sell already on the book: the
@@ -945,7 +1445,7 @@ let test_halted_ladders_second_sell_beside_resting_one () =
   state.cached_sell_mult <- 0.999;
   state.cached_venue_min_qty <- 0.0;
   state.reserved_base <- 0.0;
-  state.open_sell_orders <- [ ("resting1", 462.13, 0.04) ];
+  state.open_sell_orders <- [ "resting1", 462.13, 0.04 ];
   state.just_filled_buy <- false;
   state.last_buy_fill_price <- None;
   state.last_buy_fill_qty <- None;
@@ -983,7 +1483,8 @@ let test_halted_ladders_second_sell_beside_resting_one () =
     ~buy_attempted:false
     ~oracle_halted:true
     ~ecfg
-    ~locked_in_sells:0.04;
+    ~locked_in_sells:0.04
+    ~base_balance_age:None;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let placed =
     List.find_opt
@@ -993,13 +1494,14 @@ let test_halted_ladders_second_sell_beside_resting_one () =
          && o.symbol = symbol)
       pushed
   in
-  (match placed with
-   | None -> Alcotest.fail "expected a second inventory sell beside the resting one"
-   | Some o ->
-     Alcotest.(check bool)
-       "second sell sized by netted tradeable (~0.04004)"
-       (o.qty > 0.0399 && o.qty <= 0.0401)
-       true)
+  match placed with
+  | None -> Alcotest.fail "expected a second inventory sell beside the resting one"
+  | Some o ->
+    Alcotest.(check bool)
+      "second sell sized by netted tradeable (~0.04004)"
+      (o.qty > 0.0399 && o.qty <= 0.0401)
+      true
+;;
 
 let test_halted_startup_places_inventory_sell () =
   (* Spec (sell side / activity gating): when the asset is FIRST placed
@@ -1057,7 +1559,8 @@ let test_halted_startup_places_inventory_sell () =
     ~buy_attempted:false
     ~oracle_halted:true
     ~ecfg
-    ~locked_in_sells:0.0;
+    ~locked_in_sells:0.0
+    ~base_balance_age:None;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let found =
     List.exists
@@ -1067,9 +1570,7 @@ let test_halted_startup_places_inventory_sell () =
          && o.symbol = symbol)
       pushed
   in
-  check bool
-    "startup-inactive places an inventory sell (XMR case)"
-    true found;
+  check bool "startup-inactive places an inventory sell (XMR case)" true found;
   (* And with NO inventory there is no sell: the halt check requires a
      placeable balance. *)
   drain ();
@@ -1086,9 +1587,11 @@ let test_halted_startup_places_inventory_sell () =
     ~buy_attempted:false
     ~oracle_halted:true
     ~ecfg
-    ~locked_in_sells:0.0;
+    ~locked_in_sells:0.0
+    ~base_balance_age:None;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   check bool "no inventory -> no halt-triggered sell" true (pushed = [])
+;;
 
 let test_halted_path_still_places_sell () =
   (* Feature B: when the capital oracle halts an asset (INACTIVE), the
@@ -1149,6 +1652,7 @@ let test_halted_path_still_places_sell () =
     ~buy_attempted:false
     ~ecfg
     ~locked_in_sells:0.0
+    ~base_balance_age:None
     ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let found =
@@ -1245,6 +1749,7 @@ let test_sell_ack_releases_inflight_latch () =
     ~buy_attempted:false
     ~ecfg
     ~locked_in_sells:1.0
+    ~base_balance_age:None
     ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let found =
@@ -1322,6 +1827,7 @@ let test_sell_retry_until_placed () =
       ~buy_attempted:false
       ~ecfg
       ~locked_in_sells:0.0
+      ~base_balance_age:None
       ~oracle_halted:false
   in
   (* Tick 1: the sell is on cooldown (a recent rejection latched it). *)
@@ -1420,6 +1926,7 @@ let test_accumulation_sells_non_accrued_inventory () =
     ~buy_attempted:false
     ~ecfg
     ~locked_in_sells:0.4
+    ~base_balance_age:None
     ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let sell =
@@ -1504,6 +2011,7 @@ let test_nothing_placeable_clears_latch () =
     ~buy_attempted:false
     ~ecfg
     ~locked_in_sells:0.0
+    ~base_balance_age:None
     ~oracle_halted:false;
   check
     bool
@@ -1568,6 +2076,7 @@ let test_kraken_partial_sell_clamp () =
     ~buy_attempted:false
     ~ecfg
     ~locked_in_sells:0.0
+    ~base_balance_age:None
     ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let sell =
@@ -1635,6 +2144,7 @@ let test_alpaca_dollar_floor_gate () =
     ~buy_attempted:false
     ~ecfg
     ~locked_in_sells:0.0
+    ~base_balance_age:None
     ~oracle_halted:false;
   check
     bool
@@ -1654,6 +2164,7 @@ let test_alpaca_dollar_floor_gate () =
     ~buy_attempted:false
     ~ecfg
     ~locked_in_sells:0.0
+    ~base_balance_age:None
     ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let found =
@@ -1722,6 +2233,7 @@ let test_alpaca_sell_anchors_on_fill_not_ask () =
     ~buy_attempted:false
     ~ecfg
     ~locked_in_sells:0.0
+    ~base_balance_age:None
     ~oracle_halted:false;
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   match pushed with
@@ -1783,8 +2295,7 @@ let test_new_buy_respects_2x_gi_closest_sell () =
        ~open_buy_count_from_scan:0
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
-       ~closest_sell_order_initial:(Some ("sell1", 100.40))
-        );
+       ~closest_sell_order_initial:(Some ("sell1", 100.40)));
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
   match pushed with
   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
@@ -1965,8 +2476,7 @@ let test_buy_placement_balance_guard () =
        ~open_buy_count_from_scan:0
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
-       ~closest_sell_order_initial:None
-        );
+       ~closest_sell_order_initial:None);
   check bool "fresh insufficient: capital_low latched" true st.capital_low;
   check int "fresh insufficient: no order pushed" 0 (pending_count ());
   check
@@ -1994,8 +2504,7 @@ let test_buy_placement_balance_guard () =
        ~open_buy_count_from_scan:0
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
-       ~closest_sell_order_initial:None
-        );
+       ~closest_sell_order_initial:None);
   check
     bool
     "stale insufficient: foreordained flag set"
@@ -2028,8 +2537,7 @@ let test_buy_placement_balance_guard () =
        ~open_buy_count_from_scan:0
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
-       ~closest_sell_order_initial:None
-        );
+       ~closest_sell_order_initial:None);
   check
     bool
     "fresh sufficient: foreordained flag cleared"
@@ -2298,12 +2806,9 @@ let eval_buy_trail ~symbol ~grid_qty ~bid ~ask ~resting_price ~resting_qty:_ ~se
        ~open_buy_count_from_scan:1
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
-       ~closest_sell_order_initial:sell_opt
-       );
+       ~closest_sell_order_initial:sell_opt);
   Dio_strategies.Jacobs_ladder.get_pending_orders 10
 ;;
-
-
 
 let test_pure_trailing_no_amend_when_target_below () =
   (* No qty mismatch, market flat relative to the resting buy: the trailing
@@ -2370,8 +2875,7 @@ let test_buy_trail_fires_on_single_tick_move () =
        ~open_buy_count_from_scan:1
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
-       ~closest_sell_order_initial:(Some ("sell1", 105.0))
-       );
+       ~closest_sell_order_initial:(Some ("sell1", 105.0)));
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
   match pushed with
   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
@@ -2432,8 +2936,7 @@ let test_buy_trail_2xgi_anchored_on_sell () =
        ~open_buy_count_from_scan:1
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
-       ~closest_sell_order_initial:(Some ("sell1", 103.50))
-       );
+       ~closest_sell_order_initial:(Some ("sell1", 103.50)));
   let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
   match pushed with
   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
@@ -2497,8 +3000,7 @@ let test_buy_trail_respects_sell_zone_while_tracked () =
          ~open_buy_count_from_scan:1
          ~has_recent_amend_buy:false
          ~locked_in_buys:0.0
-         ~closest_sell_order_initial:sell_opt
-         );
+         ~closest_sell_order_initial:sell_opt);
     let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
     match pushed with
     | [ (o : Dio_strategies.Strategy_common.strategy_order) ] -> o.price
@@ -2578,8 +3080,7 @@ let test_buy_trail_never_enters_sell_zone_until_removed () =
          ~open_buy_count_from_scan:1
          ~has_recent_amend_buy:false
          ~locked_in_buys:0.0
-         ~closest_sell_order_initial:sell_opt
-         );
+         ~closest_sell_order_initial:sell_opt);
     Dio_strategies.Jacobs_ladder.get_pending_orders 10
   in
   (* 1. Bid 101.50, sell 103.00 tracked: buy trails to bid - gi = 100.49,
@@ -2731,6 +3232,18 @@ let () =
             `Quick
             test_hl_buy_fill_accrues_reserve
         ; test_case
+            "unnetted sell hold gates second sizing in the netting window"
+            `Quick
+            test_unnetted_sell_hold_gates_second_sizing
+        ; test_case
+            "stale unnetted sell hold decays after the grace"
+            `Quick
+            test_unnetted_sell_hold_expires_after_grace
+        ; test_case
+            "unnetted sell hold capped even with an ancient balance age"
+            `Quick
+            test_unnetted_sell_hold_capped_even_with_age
+        ; test_case
             "sub-minimum qty sell places (notional is the only floor)"
             `Quick
             test_sub_minimum_qty_sell_places
@@ -2773,6 +3286,31 @@ let () =
             `Quick
             test_order_cancellation_matches_client_order_id
         ; test_case "order rejection" `Quick test_order_rejection
+        ; test_case
+            "amendment TIF reject arms recovery"
+            `Quick
+            test_tif_recovery_armed_on_amendment_failed
+        ; test_case
+            "non-terminal amend failure does not arm recovery"
+            `Quick
+            test_tif_recovery_not_armed_on_non_tif_amend_failure
+        ; test_case
+            "insufficient-balance failure does not arm recovery"
+            `Quick
+            test_tif_recovery_not_armed_on_insufficient_failed
+        ; test_case
+            "transient placement failure arms recovery"
+            `Quick
+            test_tif_recovery_armed_on_transient_failed
+        ; test_case "buy ack clears recovery" `Quick test_tif_recovery_cleared_on_buy_ack
+        ; test_case
+            "ghost buy WS kill arms recovery"
+            `Quick
+            test_tif_recovery_armed_on_ghost_buy_ws_kill
+        ; test_case
+            "stale cancel does not arm recovery"
+            `Quick
+            test_tif_recovery_not_armed_on_stale_cancel
         ] )
     ; ( "accumulation"
       , [ test_case

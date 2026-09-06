@@ -100,8 +100,29 @@ module BalanceStore = struct
   let get_staked_balance store = Atomic.get store.staked_balance
 
   (** Wall-clock timestamp of the last wallet update for this asset
-     (0.0 = never updated). Used for balance-snapshot staleness. *)
+      (0.0 = never updated). Used for balance-snapshot staleness. *)
   let get_last_updated store = Atomic.get store.last_updated
+
+  (** Wall-clock timestamp of the newest SPENDABLE (non-excluded) wallet
+      record - 0.0 when none exists. The store-wide [last_updated] is bumped
+      by every [update_wallet] call, including the staking-balance poller
+      which refreshes excluded wallets that contribute nothing to the
+      tradeable figure (~every 10s for staked tokens like HYPE). Freshness
+      consumers (the sell-hold netting guard) must key on the spendable
+      wallets: a staking poll that leaves the tradeable figure unchanged
+      must not certify it as current. *)
+  let get_spendable_last_updated store =
+    Mutex.lock store.mutex;
+    let t =
+      Hashtbl.fold
+        (fun _ w acc ->
+           if is_excluded_wallet w.wallet_type then acc else Float.max acc w.last_updated)
+        store.wallets
+        0.0
+    in
+    Mutex.unlock store.mutex;
+    t
+  ;;
 end
 
 (* Global mutable state: per-asset balance stores and readiness flag. *)
