@@ -2402,6 +2402,190 @@ let test_alpaca_persistence_never_hijacks_owed_sell () =
   | None -> failwith "expected the dropped rung to be restored"
 ;;
 
+(* Shared Alpaca asset for the excess-inventory sweep tests. *)
+let alpaca_excess_asset ~symbol =
+  { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+  ; symbol
+  ; qty = "1.0"
+  ; grid_interval = 1.0
+  ; sell_mult = "1.0"
+  ; strategy = "Ladder"
+  ; maker_fee = Some 0.0
+  ; taker_fee = None
+  ; accumulation_buffer = 0.05
+  ; base_accumulation = true
+  ; sell_levels_persistence = true
+  }
+;;
+
+let drain_order_buffer () =
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec go () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> go ()
+    | None -> ()
+  in
+  go ()
+;;
+
+let reset_alpaca_excess_state symbol =
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.grid_qty <- 1.0;
+  state.cached_sell_mult <- 1.0;
+  state.cached_qty_increment <- 0.000000001;
+  state.cached_venue_min_qty <- 0.000000001;
+  state.cached_venue_min_notional <- 1.0;
+  state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+  state.cached_price_increment <- 0.01;
+  state.reserved_base <- 0.0;
+  state.open_sell_orders <- [];
+  state.persisted_sell_levels <- [];
+  state.just_filled_buy <- false;
+  state.resuming_after_balance_flag <- false;
+  state.inflight_sell <- false;
+  state.last_buy_fill_price <- None;
+  state.last_buy_fill_qty <- None;
+  ignore
+    (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+       state.duplicate_key_sell);
+  drain_order_buffer ();
+  state
+;;
+
+let pushed_sell_for symbol =
+  List.find_opt
+    (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+       o.operation = Dio_strategies.Strategy_common.Place
+       && o.side = Dio_strategies.Strategy_common.Sell
+       && o.symbol = symbol)
+    (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+;;
+
+let test_alpaca_excess_refills_before_dumping () =
+  (* Ladder [101 x1; 99 x1] is entirely missing and 3.0 is sellable (1.0
+     beyond the ladder). Excess must NOT be folded into a restore: the top
+     missing rung goes out at its OWN recorded qty (1.0), so the ladder is
+     rebuilt rung-by-rung and only a COMPLETE ladder gets the sweep. *)
+  let symbol = "ALPACA_EXCESS_REFILL/USD" in
+  let state = reset_alpaca_excess_state symbol in
+  state.persisted_sell_levels <- [ 101.0, 1.0; 99.0, 1.0 ];
+  let asset = alpaca_excess_asset ~symbol in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:100.0
+    ~ask_price:100.1
+    ~asset_balance:3.0
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:None
+    ~oracle_halted:false;
+  match pushed_sell_for symbol with
+  | Some o ->
+    check
+      (float 0.005)
+      "missing top rung restored at its recorded price"
+      101.0
+      (Option.value o.price ~default:0.0);
+    check
+      (float 1e-6)
+      "missing top rung keeps its own qty (excess waits for a complete ladder)"
+      1.0
+      o.qty
+  | None -> failwith "expected the missing top rung to be restored"
+;;
+
+let test_alpaca_excess_amends_open_top_rung () =
+  (* Ladder fully resting [101 x1; 99 x1] (2.0 committed) with 1.0 more
+     sellable. The sweep must amend the TOP order up to 2.0 (+1.0), leaving the
+     lower rung alone, instead of placing a separate sell or dumping idle. *)
+  let symbol = "ALPACA_EXCESS_AMEND/USD" in
+  let state = reset_alpaca_excess_state symbol in
+  state.persisted_sell_levels <- [ 101.0, 1.0; 99.0, 1.0 ];
+  state.open_sell_orders <- [ "top-oid", 101.0, 1.0; "low-oid", 99.0, 1.0 ];
+  let asset = alpaca_excess_asset ~symbol in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:100.0
+    ~ask_price:100.1
+    ~asset_balance:3.0
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:2.0
+    ~base_balance_age:None
+    ~oracle_halted:false;
+  let amends =
+    List.filter
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Amend
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+  in
+  match amends with
+  | [ o ] ->
+    check
+      (option string)
+      "excess amend targets the top rung's order id"
+      (Some "top-oid")
+      o.order_id;
+    check
+      (float 0.005)
+      "excess amend keeps the top rung price"
+      101.0
+      (Option.value o.price ~default:0.0);
+    check (float 1e-6) "excess amend grows the top rung by the excess" 2.0 o.qty
+  | _ -> failwith "expected exactly one sell amend on the top rung"
+;;
+
+let test_alpaca_excess_excludes_reserved_base () =
+  (* reserved_base is not sellable: balance 3.0 with 2.0 already reserved and
+     1.0 committed to the resting top rung leaves NO excess, so the top rung
+     must not be amended. (If reserved_base leaked into the sweep the top would
+     grow by 1.0.) *)
+  let symbol = "ALPACA_EXCESS_RESERVED/USD" in
+  let state = reset_alpaca_excess_state symbol in
+  state.reserved_base <- 2.0;
+  state.persisted_sell_levels <- [ 101.0, 1.0 ];
+  state.open_sell_orders <- [ "top-oid", 101.0, 1.0 ];
+  let asset = alpaca_excess_asset ~symbol in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:100.0
+    ~ask_price:100.1
+    ~asset_balance:3.0
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:1.0
+    ~base_balance_age:None
+    ~oracle_halted:false;
+  let amends =
+    List.filter
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Amend
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+  in
+  check bool "reserved_base is excluded from the excess (no amend)" true (amends = [])
+;;
+
 let test_alpaca_sell_anchors_on_fill_not_ask () =
   (* Alpaca sell placement is anchored on the fill (fill + gi), NOT pushed up
      to the current ask. Clamping to the ask stacked every new sell on the
@@ -3483,6 +3667,18 @@ let () =
             "alpaca sell anchors on fill, not the ask"
             `Quick
             test_alpaca_sell_anchors_on_fill_not_ask
+        ; test_case
+            "alpaca excess refills the ladder before dumping"
+            `Quick
+            test_alpaca_excess_refills_before_dumping
+        ; test_case
+            "alpaca excess amends an open top rung"
+            `Quick
+            test_alpaca_excess_amends_open_top_rung
+        ; test_case
+            "alpaca excess excludes reserved_base"
+            `Quick
+            test_alpaca_excess_excludes_reserved_base
         ; test_case
             "new buy respects the 2x gi closest-sell cap"
             `Quick
