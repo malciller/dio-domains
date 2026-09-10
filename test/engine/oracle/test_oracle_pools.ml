@@ -157,6 +157,76 @@ let test_sell_qty () =
     0.0
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* simulate_drawdown_survival                                         *)
+(* ------------------------------------------------------------------ *)
+
+let sim ~id ~priority ~current ~gi ~qty ?(fee = 0.0) () =
+  { Dio_oracle.Oracle_pools.id
+  ; priority
+  ; current
+  ; grid_interval = gi
+  ; buy_qty = qty
+  ; maker_fee = fee
+  }
+;;
+
+let test_sim_single_strategy_exhaustion () =
+  (* current 100, gi 10%: rungs 90, 81, 72.9, ... quote 200 buys 90 + 81 =
+     171, the next rung (72.9) does not fit: k = 2, d_surv = 1 - 0.9^2 =
+     0.19 and the deepest filled rung sits at 81. *)
+  let out =
+    Dio_oracle.Oracle_pools.simulate_drawdown_survival
+      ~total_quote:200.0
+      [ sim ~id:"A" ~priority:0 ~current:100.0 ~gi:10.0 ~qty:1.0 () ]
+  in
+  match List.assoc_opt "A" out with
+  | None -> Alcotest.fail "missing sim outcome"
+  | Some o ->
+    near "single-strategy d_surv" o.Dio_oracle.Oracle_pools.d_surv 0.19;
+    near "single-strategy funded price" o.Dio_oracle.Oracle_pools.funded_price 81.0
+;;
+
+let test_sim_priority_shared_capital () =
+  (* Quote 261, two ladders (rungs 90, 81, ...): round 1 funds A then B at
+     90 each, round 2 funds senior A's 81 rung and the pool is dry: A
+     bottoms at 81 (k=2), B at 90 (k=1). *)
+  let out =
+    Dio_oracle.Oracle_pools.simulate_drawdown_survival
+      ~total_quote:261.0
+      [ sim ~id:"A" ~priority:0 ~current:100.0 ~gi:10.0 ~qty:1.0 ()
+      ; sim ~id:"B" ~priority:1 ~current:100.0 ~gi:10.0 ~qty:1.0 ()
+      ]
+  in
+  (match List.assoc_opt "A" out with
+   | None -> Alcotest.fail "missing sim outcome for A"
+   | Some o ->
+     near "senior d_surv" o.Dio_oracle.Oracle_pools.d_surv 0.19;
+     near "senior funded price" o.Dio_oracle.Oracle_pools.funded_price 81.0);
+  match List.assoc_opt "B" out with
+  | None -> Alcotest.fail "missing sim outcome for B"
+  | Some o ->
+    near "junior d_surv" o.Dio_oracle.Oracle_pools.d_surv 0.1;
+    near "junior funded price" o.Dio_oracle.Oracle_pools.funded_price 90.0
+;;
+
+let test_sim_unaffordable_never_leaves_current () =
+  (* Nothing affordable: zero rungs funded, exhaustion at current. *)
+  let out =
+    Dio_oracle.Oracle_pools.simulate_drawdown_survival
+      ~total_quote:10.0
+      [ sim ~id:"A" ~priority:0 ~current:100.0 ~gi:10.0 ~qty:1.0 () ]
+  in
+  match List.assoc_opt "A" out with
+  | None -> Alcotest.fail "missing sim outcome"
+  | Some o ->
+    near "unaffordable d_surv" o.Dio_oracle.Oracle_pools.d_surv 0.0;
+    near
+      "unaffordable funded price is current"
+      o.Dio_oracle.Oracle_pools.funded_price
+      100.0
+;;
+
 let () =
   Alcotest.run
     "oracle_pools"
@@ -181,5 +251,19 @@ let () =
         ; Alcotest.test_case "impossible gives up" `Quick test_cascade_impossible_gives_up
         ] )
     ; "sell qty", [ Alcotest.test_case "pool arithmetic" `Quick test_sell_qty ]
+    ; ( "drawdown sim"
+      , [ Alcotest.test_case
+            "single-strategy exhaustion price"
+            `Quick
+            test_sim_single_strategy_exhaustion
+        ; Alcotest.test_case
+            "priority shared capital"
+            `Quick
+            test_sim_priority_shared_capital
+        ; Alcotest.test_case
+            "unaffordable never leaves current"
+            `Quick
+            test_sim_unaffordable_never_leaves_current
+        ] )
     ]
 ;;

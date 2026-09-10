@@ -83,6 +83,11 @@ type strategy_state =
     (* order_id -> expiry_ts; blocks rebuilt orders *)
   ; mutable asset_low : bool
     (* set when asset balance is insufficient for next sell; pauses sell and buy *)
+  ; mutable last_sell_block_reason : string
+    (* last sell-placement blocker surfaced at warn level; dedup key for the
+       repeat window so per-tick evaluations cannot spam the log *)
+  ; mutable last_sell_block_log_at : float
+    (* unix time of the last deduplicated sell-block log entry *)
   ; mutable capital_low : bool
     (* set when quote balance is insufficient for next buy; pauses strategy *)
   ; mutable capital_low_logged : bool (* suppresses repeated capital-low log warnings *)
@@ -362,6 +367,8 @@ let rec get_strategy_state asset_symbol =
       ; inflight_sell = false
       ; evicted_orders = Hashtbl.create 16
       ; asset_low = false
+      ; last_sell_block_reason = ""
+      ; last_sell_block_log_at = 0.0
       ; capital_low = false
       ; capital_low_logged = false
       ; capital_low_at_balance = 0.0

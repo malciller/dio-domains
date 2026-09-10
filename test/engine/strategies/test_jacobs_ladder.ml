@@ -1,5 +1,10 @@
 open Alcotest
 
+(* Forces the Alpaca exchange module to link and run its registry
+   registration, so venue metadata resolves exactly as in production (the
+   1e-9 fractional increment behind dust-level pruning). *)
+let () = ignore Alpaca.Module.Alpaca_impl.name
+
 let test_initialization () =
   (* Test strategy initialization *)
   check unit "jacobs_ladder init" () (Dio_strategies.Jacobs_ladder.Strategy.init ())
@@ -2178,6 +2183,225 @@ let test_alpaca_dollar_floor_gate () =
   check bool "sell placed above the dollar floor" true found
 ;;
 
+let test_alpaca_verified_nothing_to_sell_consumes_latch () =
+  (* The LIT wedge: a dust balance (venue rejects the sell with 403, balance
+     ~0) + a ghost-buy re-placement arming just_filled_buy + no resting
+     sells + a stale last_buy_fill_price. The trigger is owed but can NEVER
+     place (missing_alpaca_sell_grid requires inventory_ok), so the latch
+     stayed dead-armed forever and the leg re-fired the inventory-gate block
+     warn on every book tick (with the live ref price interpolated into the
+     reason, defeating the dedup window). The verified nothing-to-sell
+     consumption must clear the latch on a fresh below-floor balance, and
+     the persistent grid-maintenance clause must still place the sell the
+     moment inventory recovers - no owed sell is lost. *)
+  let symbol = "ALPACA_LIT_WEDGE/USD" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.grid_qty <- 0.26;
+  state.cached_sell_mult <- 1.0;
+  state.cached_qty_increment <- 0.000000001;
+  state.cached_venue_min_qty <- 0.000000001;
+  state.cached_venue_min_notional <- 1.0;
+  state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+  state.cached_price_increment <- 0.01;
+  state.reserved_base <- 0.0;
+  state.open_sell_orders <- [];
+  state.persisted_sell_levels <- [];
+  state.last_buy_fill_price <- Some 73.95;
+  state.last_buy_fill_qty <- Some 0.26;
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+    ; symbol
+    ; qty = "0.26"
+    ; grid_interval = 0.5
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  let evaluate ~now ~balance ~buy_attempted =
+    drain ();
+    Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+      ~persisted_reconcile:
+        (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      ~state
+      ~now
+      ~asset
+      ~bid_price:(if balance > 0.0 then 73.94 else 71.83)
+      ~ask_price:(if balance > 0.0 then 74.23 else 74.23)
+      ~asset_balance:balance
+      ~buy_attempted
+      ~ecfg
+      ~locked_in_sells:0.0
+      ~base_balance_age:None
+      ~oracle_halted:false
+  in
+  let pushed_sell () =
+    List.find_opt
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+  in
+  (* Tick 1: the ghost-buy placement tick (buy_attempted) arms the latch, but
+     the dust balance is verified below the $1 floor -> consumed, nothing
+     placed, no warn loop. *)
+  state.just_filled_buy <- false;
+  evaluate ~now:100.0 ~balance:0.000000003 ~buy_attempted:true;
+  check bool "no sell pushed on a dust balance" true (pushed_sell () = None);
+  check
+    bool
+    "latch consumed on verified nothing-to-sell (was the dead-armed wedge)"
+    false
+    state.just_filled_buy;
+  (* Tick 2: a later book tick with buy_attempted=false must not re-arm the
+     latch or push anything - the resting state is silent. *)
+  evaluate ~now:101.0 ~balance:0.000000003 ~buy_attempted:false;
+  check
+    bool
+    "resting state neither re-arms the latch nor pushes a sell"
+    (state.just_filled_buy = false && pushed_sell () = None)
+    true;
+  (* Tick 3: inventory recovers above the floor - the persistent
+     (open_sell_orders = [] /\ last_buy_fill_price) grid-maintenance clause
+     places the fill-anchored sell without needing the latch. *)
+  evaluate ~now:102.0 ~balance:0.5 ~buy_attempted:false;
+  match pushed_sell () with
+  | Some o ->
+    check (float 1e-8) "recovered inventory sells the fill qty 1:1" 0.26 o.qty;
+    check bool "sell re-anchors above the fill price" (Option.get o.price > 73.95) true
+  | None -> failwith "expected the grid-maintenance sell after inventory recovery"
+;;
+
+let test_alpaca_persistence_never_hijacks_owed_sell () =
+  (* Persistence model: the sell_levels file restores rungs the venue dropped
+     (fractional Alpaca orders are forced to day TIF); it NEVER dictates the
+     price or sizing of a new sell. A dust persisted level (legacy clamped
+     sizing) must not hijack a buy fill's owed sell - the owed sell is
+     strategy-sized (fill + gi, 1:1 qty) - and an unplaceable restoration
+     level is pruned from the file instead of wedging the maintenance path
+     forever (the exact SMH/REMX/LIT accumulate-only failure). *)
+  let symbol = "ALPACA_PERSIST/USD" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.grid_qty <- 0.26;
+  state.cached_sell_mult <- 1.0;
+  state.cached_qty_increment <- 0.000000001;
+  state.cached_venue_min_qty <- 0.000000001;
+  state.cached_venue_min_notional <- 1.0;
+  state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+  state.cached_price_increment <- 0.01;
+  state.reserved_base <- 0.0;
+  state.open_sell_orders <- [];
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 76.87;
+  state.last_buy_fill_qty <- Some 0.26;
+  (* The prod wedge: a dust persisted level from legacy clamped sizing. *)
+  state.persisted_sell_levels <- [ 75.98, 1e-09 ];
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+    ; symbol
+    ; qty = "0.26"
+    ; grid_interval = 0.5
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  let evaluate ~now =
+    drain ();
+    Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+      ~persisted_reconcile:
+        (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      ~state
+      ~now
+      ~asset
+      ~bid_price:76.9
+      ~ask_price:77.0
+      ~asset_balance:23.4
+      ~buy_attempted:false
+      ~ecfg
+      ~locked_in_sells:0.0
+      ~base_balance_age:None
+      ~oracle_halted:false
+  in
+  let pushed_sell () =
+    List.find_opt
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+  in
+  (* 1. The buy fill's owed sell is strategy-sized (fill + gi = 77.25, 1:1
+     qty) even though a dust level sits in the file. *)
+  evaluate ~now:100.0;
+  (match pushed_sell () with
+   | Some o ->
+     check (float 1e-6) "owed sell keeps strategy qty" 0.26 o.qty;
+     check
+       (float 0.005)
+       "owed sell keeps fill+gi price, not the persisted level"
+       77.25
+       (match o.price with
+        | Some p -> p
+        | None -> 0.0)
+   | None -> failwith "expected the strategy-sized owed sell to be pushed");
+  check
+    bool
+    "dust level still persisted after the owed sell"
+    true
+    (List.exists (fun (p, _) -> p = 75.98) state.persisted_sell_levels);
+  (* 2. With the owed sell resting (acked, latch released) and nothing new
+     owed, the maintenance path restores missing levels: the dust level is
+     selected, fails the $1 floor, and is pruned instead of wedging. *)
+  state.inflight_sell <- false;
+  ignore
+    (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+       state.duplicate_key_sell);
+  state.open_sell_orders <- [ "rest1", 77.25, 0.26 ];
+  evaluate ~now:160.0;
+  let pending2 = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  check bool "nothing pushed while pruning the dust level" true (pending2 = []);
+  (* 3. A real dropped rung is restored at its recorded price/qty. *)
+  state.persisted_sell_levels <- [ 80.0, 0.26 ];
+  evaluate ~now:220.0;
+  match pushed_sell () with
+  | Some o ->
+    check
+      (float 0.005)
+      "restored rung keeps its own price"
+      80.0
+      (match o.price with
+       | Some p -> p
+       | None -> 0.0);
+    check (float 1e-6) "restored rung keeps its own qty" 0.26 o.qty
+  | None -> failwith "expected the dropped rung to be restored"
+;;
+
 let test_alpaca_sell_anchors_on_fill_not_ask () =
   (* Alpaca sell placement is anchored on the fill (fill + gi), NOT pushed up
      to the current ask. Clamping to the ask stacked every new sell on the
@@ -3227,6 +3451,14 @@ let () =
             "alpaca dollar notional floor gate"
             `Quick
             test_alpaca_dollar_floor_gate
+        ; test_case
+            "alpaca verified nothing-to-sell consumes the dead-armed latch"
+            `Quick
+            test_alpaca_verified_nothing_to_sell_consumes_latch
+        ; test_case
+            "alpaca persistence never hijacks an owed sell; dust levels prune"
+            `Quick
+            test_alpaca_persistence_never_hijacks_owed_sell
         ; test_case
             "hl buy fill accrues reserved base (net of base fee)"
             `Quick

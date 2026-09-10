@@ -1,58 +1,12 @@
 open Notty
 open Theme
 
-type selectable_asset =
-  { key : string
-  ; display_name : string
-  ; exchange : string
-  ; symbol : string
-  ; asset : string
-  ; is_strategy : bool
-  ; data : Yojson.Basic.t
-  }
-
 (** Whether the capital oracle's decision for this strategy entry says
     INACTIVE - the oracle-paused state (the grid should not place new
-    orders). [false] when there is no oracle decision yet (before the first
-    pass) or when the entry is not a strategy entry. *)
-let oracle_inactive (data : Yojson.Basic.t) : bool =
-  match data |?> "oracle" with
-  | `Assoc _ as j ->
-    (match j |?> "active" with
-     | `Bool b -> not b
-     | _ -> false)
-  | _ -> false
-;;
+    orders). Kept as aliases so existing callers/tests keep working. *)
+let oracle_inactive = Snapshot.oracle_inactive
 
-(** Paused = the capital oracle says INACTIVE, or the grid's own capital-low
-    flag is set (or the market is closed, judged at render time). If an open
-    resting buy order already exists, the strategy cannot be considered paused
-    by capital/oracle gates since the order is already placed and funded. *)
-let strategy_paused (data : Yojson.Basic.t) : bool =
-  let strat = data |?> "strategy" in
-  let market = data |?> "market" in
-  let has_resting_buy =
-    let strat_price = strat |?> "buy_price" |> to_float_d 0.0 in
-    if strat_price > 0.0
-    then true
-    else (
-      let open_buys =
-        market
-        |?> "buy_orders"
-        |> to_list_d
-        |> List.filter_map (fun o ->
-          let p = o |?> "price" |> to_float_d 0.0 in
-          if p > 0.0 then Some p else None)
-      in
-      open_buys <> [])
-  in
-  if has_resting_buy
-  then strat |?> "market_is_closed" |> to_bool_d false
-  else (
-    oracle_inactive data
-    || strat |?> "capital_low" |> to_bool_d false
-    || strat |?> "market_is_closed" |> to_bool_d false)
-;;
+let strategy_paused = Snapshot.strategy_paused
 
 (** Accumulated quantity: the inventory held that is not committed to a
     resting sell. [staked] is part of [base] but can never be covered by a
@@ -62,110 +16,7 @@ let accum_qty_of ~staked ~pending base =
   staked +. Float.max 0.0 (base -. staked -. pending)
 ;;
 
-let get_selectable_assets json =
-  let strats =
-    match json |?> "strategies" with
-    | `Assoc l -> l
-    | _ -> []
-  in
-  let all_balances = json |?> "all_balances" |> to_list_d in
-  let active_strats, paused_strats =
-    List.partition (fun (_symbol, data) -> not (strategy_paused data)) strats
-  in
-  let strat_keys =
-    List.map
-      (fun (sym, data) ->
-         let exch = data |?> "exchange" |> to_string_d "" in
-         let market = data |?> "market" in
-         let base = market |?> "base_asset" |> to_string_d "" in
-         (exch, sym), (exch, base))
-      strats
-  in
-  let valid_balances =
-    List.filter
-      (fun bal_json ->
-         let balance = bal_json |?> "balance" |> to_float_d 0.0 in
-         let exch = bal_json |?> "exchange" |> to_string_d "" in
-         let asset = bal_json |?> "asset" |> to_string_d "" in
-         let symbol = bal_json |?> "symbol" |> to_string_d "" in
-         let is_strat_asset =
-           List.exists
-             (fun ((ex1, s1), (ex2, b2)) ->
-                (ex1 = exch && (s1 = symbol || s1 = asset)) || (ex2 = exch && b2 = asset))
-             strat_keys
-         in
-         balance > 0.0 && not is_strat_asset)
-      all_balances
-  in
-  let inactive_jsons =
-    List.filter
-      (fun bal_json ->
-         let asset = bal_json |?> "asset" |> to_string_d "?" in
-         let is_quote =
-           asset = "USD"
-           || asset = "USDC"
-           || asset = "USDT"
-           || asset = "ZUSD"
-           || asset = "USDe"
-         in
-         not is_quote)
-      valid_balances
-  in
-  let active_items =
-    List.map
-      (fun (sym, data) ->
-         let exch = data |?> "exchange" |> to_string_d "?" in
-         let exch_tag = exch_tag_of exch in
-         let market = data |?> "market" in
-         let base = market |?> "base_asset" |> to_string_d sym in
-         { key = "strat:" ^ exch ^ ":" ^ sym
-         ; display_name = Printf.sprintf "%s (%s)" sym exch_tag
-         ; exchange = exch
-         ; symbol = sym
-         ; asset = base
-         ; is_strategy = true
-         ; data
-         })
-      active_strats
-  in
-  let paused_items =
-    List.map
-      (fun (sym, data) ->
-         let exch = data |?> "exchange" |> to_string_d "?" in
-         let exch_tag = exch_tag_of exch in
-         let market = data |?> "market" in
-         let base = market |?> "base_asset" |> to_string_d sym in
-         { key = "strat:" ^ exch ^ ":" ^ sym
-         ; display_name = Printf.sprintf "%s (%s)" sym exch_tag
-         ; exchange = exch
-         ; symbol = sym
-         ; asset = base
-         ; is_strategy = true
-         ; data
-         })
-      paused_strats
-  in
-  let inactive_items =
-    List.map
-      (fun bal ->
-         let exch = bal |?> "exchange" |> to_string_d "?" in
-         let asset = bal |?> "asset" |> to_string_d "?" in
-         let symbol = bal |?> "symbol" |> to_string_d asset in
-         let exch_tag = exch_tag_of exch in
-         { key = "bal:" ^ exch ^ ":" ^ asset
-         ; display_name = Printf.sprintf "%s (%s)" asset exch_tag
-         ; exchange = exch
-         ; symbol
-         ; asset
-         ; is_strategy = false
-         ; data = bal
-         })
-      inactive_jsons
-  in
-  active_items @ paused_items @ inactive_items
-;;
-
-let render_strategies ?(selected_index = None) w json =
+let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
   let t = Theme.current () in
   let a_border = t.a_border in
   let a_label = t.a_label in
@@ -179,14 +30,8 @@ let render_strategies ?(selected_index = None) w json =
   let c_bright = t.c_bright in
   let c_near_fill = t.c_near_fill in
   let c_near_sell = t.c_near_sell in
-  let now = Unix.gettimeofday () in
-  let flash_on = fst (modf (now *. 1.5)) < 0.5 in
-  let strats =
-    match json |?> "strategies" with
-    | `Assoc l -> l
-    | _ -> []
-  in
-  let all_balances = json |?> "all_balances" |> to_list_d in
+  let strats = snapshot.strategies in
+  let all_balances = snapshot.balances in
   let is_compact = w < 120 in
   (* Build the column header row, which differs between compact and wide
      layouts. *)
@@ -234,53 +79,39 @@ let render_strategies ?(selected_index = None) w json =
            ; col_right 10 a_label "ACCUM VAL"
            ])
   in
-  let build_strategy_row ?(is_selected = false) is_even (symbol, data) =
-    let exchange = data |?> "exchange" |> to_string_d "?" in
-    let strat = data |?> "strategy" in
-    let market = data |?> "market" in
-    let stype = strat |?> "type" |> to_string_d "?" in
-    let cap_low = strat |?> "capital_low" |> to_bool_d false in
-    let bid = market |?> "bid" |> to_float_d 0.0 in
-    let ask = market |?> "ask" |> to_float_d 0.0 in
-    let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
-    let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
-    let staked_bal = market |?> "staked_balance" |> to_float_d 0.0 in
+  let build_strategy_row ?(is_selected = false) is_even (symbol, (s : Snapshot.strategy)) =
+    let exchange = s.exchange in
+    let stype = s.type_ in
+    let cap_low = s.capital_low in
+    let bid = s.market.bid in
+    let ask = s.market.ask in
+    let mid = s.market.mid in
+    let base_bal = s.market.base_balance in
+    let staked_bal = s.market.staked_balance in
     let hold_value = base_bal *. mid in
     (* The resting buy price prefers the strategy's tracked price because it
        follows amendments, then falls back to the exchange's real open buy
        orders. This keeps a committed buy visible even when the domain is
        halted by an oracle INACTIVE decision and its state goes stale. *)
     let buy_price =
-      let strat_price = strat |?> "buy_price" |> to_float_d 0.0 in
-      if strat_price > 0.0
-      then strat_price
+      if s.buy_price > 0.0
+      then s.buy_price
       else (
-        let open_buys =
-          market
-          |?> "buy_orders"
-          |> to_list_d
-          |> List.filter_map (fun o ->
-            let p = o |?> "price" |> to_float_d 0.0 in
-            if p > 0.0 then Some p else None)
-        in
-        match open_buys with
+        match s.market.buy_orders with
         | [] -> 0.0
-        | prices -> List.fold_left min (List.hd prices) prices)
+        | o :: rest ->
+          List.fold_left (fun acc (o : Snapshot.order) -> min acc o.price) o.price rest)
     in
     let sell_orders =
-      let strat_sells = strat |?> "sell_orders" |> to_list_d in
-      if strat_sells <> [] then strat_sells else market |?> "sell_orders" |> to_list_d
+      if s.sell_orders <> [] then s.sell_orders else s.market.sell_orders
     in
-    let sell_count =
-      let sc = strat |?> "sell_count" |> to_int_d 0 in
-      if sc > 0 then sc else List.length sell_orders
-    in
+    let sell_count = s.sell_count in
     let unrealized_profit, pending_sell_qty =
       List.fold_left
-        (fun (up, qty_acc) s ->
-           let sp = s |?> "price" |> to_float_d 0.0 in
-           let sq = s |?> "qty" |> to_float_d 0.0 in
-           if sp > 0.0 && sq > 0.0 then up +. (sp *. sq), qty_acc +. sq else up, qty_acc)
+        (fun (up, qty_acc) (o : Snapshot.order) ->
+           if o.price > 0.0 && o.qty > 0.0
+           then up +. (o.price *. o.qty), qty_acc +. o.qty
+           else up, qty_acc)
         (0.0, 0.0)
         sell_orders
     in
@@ -296,9 +127,10 @@ let render_strategies ?(selected_index = None) w json =
     let closest_sell_dist_pct =
       let sell_prices =
         List.filter_map
-          (fun s ->
-             let sp = s |?> "price" |> to_float_d 0.0 in
-             if sp > 0.0 && mid > 0.0 then Some ((sp -. mid) /. mid *. 100.0) else None)
+          (fun (o : Snapshot.order) ->
+             if o.price > 0.0 && mid > 0.0
+             then Some ((o.price -. mid) /. mid *. 100.0)
+             else None)
           sell_orders
       in
       match sell_prices with
@@ -310,16 +142,14 @@ let render_strategies ?(selected_index = None) w json =
              (List.hd prices)
              prices)
     in
-    let grid_interval_lo = data |?> "grid_interval_lo" |> to_float_d 1.0 in
+    let grid_interval_lo = s.grid_interval_lo in
     let grid_interval = if grid_interval_lo > 0.0 then grid_interval_lo else 1.0 in
     let close_thresh = 0.5 *. grid_interval in
     let far_thresh = 2.0 *. grid_interval in
     let closest_sell_price_opt =
       let sell_prices =
         List.filter_map
-          (fun s ->
-             let sp = s |?> "price" |> to_float_d 0.0 in
-             if sp > 0.0 then Some sp else None)
+          (fun (o : Snapshot.order) -> if o.price > 0.0 then Some o.price else None)
           sell_orders
       in
       match sell_prices with
@@ -358,8 +188,13 @@ let render_strategies ?(selected_index = None) w json =
         in
         is_near_buy, false
     in
-    let flash_buy = near_buy && flash_on in
-    let flash_sell = near_sell && flash_on in
+    let flash_buy =
+      Anim.flash ~key:("buy:" ^ exchange ^ ":" ^ symbol) ~active:near_buy ~tau:0.35 > 0.05
+    in
+    let flash_sell =
+      Anim.flash ~key:("sell:" ^ exchange ^ ":" ^ symbol) ~active:near_sell ~tau:0.35
+      > 0.05
+    in
     let bg_color =
       if flash_buy
       then c_near_fill
@@ -395,11 +230,11 @@ let render_strategies ?(selected_index = None) w json =
       else I.string a_border_outer " │"
     in
     let gauge_img = render_proximity_slider 17 execution_proximity_opt in
-    let market_is_closed = strat |?> "market_is_closed" |> to_bool_d false in
-    let oracle_paused = oracle_inactive data in
+    let market_is_closed = s.market_is_closed in
+    let oracle_paused = oracle_inactive s in
     let has_resting_buy = buy_price > 0.0 in
     let status_str, status_attr =
-      if (not has_resting_buy && (oracle_paused || cap_low)) || market_is_closed
+      if ((not has_resting_buy) && (oracle_paused || cap_low)) || market_is_closed
       then "⏸", a_yellow
       else "▶", a_green
     in
@@ -570,33 +405,31 @@ let render_strategies ?(selected_index = None) w json =
            ])
   in
   let active_rows_data, paused_rows_data =
-    List.partition (fun (_symbol, data) -> not (strategy_paused data)) strats
+    List.partition (fun (_symbol, s) -> not (strategy_paused s)) strats
   in
-  let build_balance_row ?(is_selected = false) is_even bal_json img_is_quote =
-    let exchange = bal_json |?> "exchange" |> to_string_d "?" in
-    let asset = bal_json |?> "asset" |> to_string_d "?" in
-    let balance = bal_json |?> "balance" |> to_float_d 0.0 in
+  let build_balance_row ?(is_selected = false) is_even (b : Snapshot.balance) img_is_quote
+    =
+    let exchange = b.exchange in
+    let asset = b.asset in
+    let balance = b.balance in
     let exch_tag = exch_tag_of exchange in
-    let bid = bal_json |?> "bid" |> to_float_d 0.0 in
-    let ask = bal_json |?> "ask" |> to_float_d 0.0 in
-    let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
+    let bid = b.bid in
+    let ask = b.ask in
+    let mid = b.mid in
     let hold_value = balance *. mid in
-    let sell_orders = bal_json |?> "sell_orders" |> to_list_d in
-    let sell_count =
-      let sc = bal_json |?> "sell_count" |> to_int_d 0 in
-      if sc > 0 then sc else List.length sell_orders
-    in
+    let sell_orders = b.sell_orders in
+    let sell_count = b.sell_count in
     let unrealized_profit, pending_sell_qty =
       List.fold_left
-        (fun (up, qty_acc) s ->
-           let sp = s |?> "price" |> to_float_d 0.0 in
-           let sq = s |?> "qty" |> to_float_d 0.0 in
-           if sp > 0.0 && sq > 0.0 then up +. (sp *. sq), qty_acc +. sq else up, qty_acc)
+        (fun (up, qty_acc) (o : Snapshot.order) ->
+           if o.price > 0.0 && o.qty > 0.0
+           then up +. (o.price *. o.qty), qty_acc +. o.qty
+           else up, qty_acc)
         (0.0, 0.0)
         sell_orders
     in
     let is_quote = img_is_quote in
-    let staked_bal = bal_json |?> "staked_balance" |> to_float_d 0.0 in
+    let staked_bal = b.staked_balance in
     let accum_holding =
       if is_quote
       then 0.0
@@ -606,9 +439,10 @@ let render_strategies ?(selected_index = None) w json =
     let closest_sell_dist_pct =
       let sell_prices =
         List.filter_map
-          (fun s ->
-             let sp = s |?> "price" |> to_float_d 0.0 in
-             if sp > 0.0 && mid > 0.0 then Some ((sp -. mid) /. mid *. 100.0) else None)
+          (fun (o : Snapshot.order) ->
+             if o.price > 0.0 && mid > 0.0
+             then Some ((o.price -. mid) /. mid *. 100.0)
+             else None)
           sell_orders
       in
       match sell_prices with
@@ -623,9 +457,7 @@ let render_strategies ?(selected_index = None) w json =
     let closest_sell_price_opt =
       let sell_prices =
         List.filter_map
-          (fun s ->
-             let sp = s |?> "price" |> to_float_d 0.0 in
-             if sp > 0.0 then Some sp else None)
+          (fun (o : Snapshot.order) -> if o.price > 0.0 then Some o.price else None)
           sell_orders
       in
       match sell_prices with
@@ -637,7 +469,10 @@ let render_strategies ?(selected_index = None) w json =
       | Some d -> abs_float d <= 0.25
       | None -> false
     in
-    let flash_sell = near_sell && flash_on in
+    let flash_sell =
+      Anim.flash ~key:("bsell:" ^ exchange ^ ":" ^ asset) ~active:near_sell ~tau:0.35
+      > 0.05
+    in
     let bg_color =
       if flash_sell then c_near_sell else if is_even then c_panel else c_bg
     in
@@ -832,56 +667,32 @@ let render_strategies ?(selected_index = None) w json =
   in
   let strat_keys =
     List.map
-      (fun (sym, data) ->
-         let exch = data |?> "exchange" |> to_string_d "" in
-         let market = data |?> "market" in
-         let base = market |?> "base_asset" |> to_string_d "" in
-         (exch, sym), (exch, base))
+      (fun (sym, (s : Snapshot.strategy)) ->
+         let base = if s.market.base_asset = "" then sym else s.market.base_asset in
+         (s.exchange, sym), (s.exchange, base))
       strats
   in
   let valid_balances =
     List.filter
-      (fun bal_json ->
-         let balance = bal_json |?> "balance" |> to_float_d 0.0 in
-         let exch = bal_json |?> "exchange" |> to_string_d "" in
-         let asset = bal_json |?> "asset" |> to_string_d "" in
-         let symbol = bal_json |?> "symbol" |> to_string_d "" in
+      (fun (b : Snapshot.balance) ->
          let is_strat_asset =
            List.exists
              (fun ((ex1, s1), (ex2, b2)) ->
-                (ex1 = exch && (s1 = symbol || s1 = asset)) || (ex2 = exch && b2 = asset))
+                (ex1 = b.exchange && (s1 = b.symbol || s1 = b.asset))
+                || (ex2 = b.exchange && b2 = b.asset))
              strat_keys
          in
-         balance > 0.0 && not is_strat_asset)
+         b.balance > 0.0 && not is_strat_asset)
       all_balances
   in
-  let inactive_jsons =
+  let inactive_rows_data =
     List.filter
-      (fun bal_json ->
-         let asset = bal_json |?> "asset" |> to_string_d "?" in
-         let is_quote =
-           asset = "USD"
-           || asset = "USDC"
-           || asset = "USDT"
-           || asset = "ZUSD"
-           || asset = "USDe"
-         in
-         not is_quote)
+      (fun (b : Snapshot.balance) -> not (Snapshot.is_quote_asset b.asset))
       valid_balances
   in
-  let quote_jsons =
+  let quote_rows_data =
     List.filter
-      (fun bal_json ->
-         let balance = bal_json |?> "balance" |> to_float_d 0.0 in
-         let asset = bal_json |?> "asset" |> to_string_d "?" in
-         let is_quote =
-           asset = "USD"
-           || asset = "USDC"
-           || asset = "USDT"
-           || asset = "ZUSD"
-           || asset = "USDe"
-         in
-         balance > 0.0 && is_quote)
+      (fun (b : Snapshot.balance) -> b.balance > 0.0 && Snapshot.is_quote_asset b.asset)
       all_balances
   in
   let curr_row_idx = ref 0 in
@@ -909,41 +720,37 @@ let render_strategies ?(selected_index = None) w json =
   in
   let inactive_rows =
     List.map
-      (fun bal ->
+      (fun (b : Snapshot.balance) ->
          let idx = !curr_row_idx in
          incr curr_row_idx;
          build_balance_row
            ~is_selected:(selected_index = Some idx)
            (idx mod 2 = 1)
-           bal
+           b
            false)
-      inactive_jsons
+      inactive_rows_data
   in
   let quote_rows =
     List.mapi
-      (fun idx bal -> build_balance_row ~is_selected:false (idx mod 2 = 1) bal true)
-      quote_jsons
+      (fun idx (b : Snapshot.balance) ->
+         build_balance_row ~is_selected:false (idx mod 2 = 1) b true)
+      quote_rows_data
   in
   let total_up_strats, total_hold_strats, total_accum_val_strats =
     List.fold_left
-      (fun (up_acc, hold_acc, accum_val_acc) (_symbol, data) ->
-         let strat = data |?> "strategy" in
-         let market = data |?> "market" in
-         let bid = market |?> "bid" |> to_float_d 0.0 in
-         let ask = market |?> "ask" |> to_float_d 0.0 in
-         let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
-         let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
-         let staked_bal = market |?> "staked_balance" |> to_float_d 0.0 in
+      (fun (up_acc, hold_acc, accum_val_acc) (_symbol, (s : Snapshot.strategy)) ->
+         let mid = s.market.mid in
+         let base_bal = s.market.base_balance in
+         let staked_bal = s.market.staked_balance in
          let sell_orders =
-           let strat_sells = strat |?> "sell_orders" |> to_list_d in
-           if strat_sells <> [] then strat_sells else market |?> "sell_orders" |> to_list_d
+           if s.sell_orders <> [] then s.sell_orders else s.market.sell_orders
          in
          let strat_up, pending_sell_qty =
            List.fold_left
-             (fun (a, q_acc) s ->
-                let sp = s |?> "price" |> to_float_d 0.0 in
-                let sq = s |?> "qty" |> to_float_d 0.0 in
-                if sp > 0.0 && sq > 0.0 then a +. (sp *. sq), q_acc +. sq else a, q_acc)
+             (fun (a, q_acc) (o : Snapshot.order) ->
+                if o.price > 0.0 && o.qty > 0.0
+                then a +. (o.price *. o.qty), q_acc +. o.qty
+                else a, q_acc)
              (0.0, 0.0)
              sell_orders
          in
@@ -959,46 +766,30 @@ let render_strategies ?(selected_index = None) w json =
   in
   let total_up_bals, total_hold_bals, total_accum_val_bals =
     List.fold_left
-      (fun (up_acc, hold_acc, accum_val_acc) bal_json ->
-         let balance = bal_json |?> "balance" |> to_float_d 0.0 in
-         let asset = bal_json |?> "asset" |> to_string_d "?" in
-         if balance <= 0.0
+      (fun (up_acc, hold_acc, accum_val_acc) (b : Snapshot.balance) ->
+         if b.balance <= 0.0
          then up_acc, hold_acc, accum_val_acc
          else (
-           let bid = bal_json |?> "bid" |> to_float_d 0.0 in
-           let ask = bal_json |?> "ask" |> to_float_d 0.0 in
-           let mid =
-             if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask
-           in
-           let is_quote =
-             asset = "USD"
-             || asset = "USDC"
-             || asset = "USDT"
-             || asset = "ZUSD"
-             || asset = "USDe"
-           in
-           let sell_orders = bal_json |?> "sell_orders" |> to_list_d in
+           let mid = b.mid in
+           let is_quote = Snapshot.is_quote_asset b.asset in
            let bal_up, pending_sell_qty =
              List.fold_left
-               (fun (a, q_acc) s ->
-                  let sp = s |?> "price" |> to_float_d 0.0 in
-                  let sq = s |?> "qty" |> to_float_d 0.0 in
-                  if sp > 0.0 && sq > 0.0 then a +. (sp *. sq), q_acc +. sq else a, q_acc)
+               (fun (a, q_acc) (o : Snapshot.order) ->
+                  if o.price > 0.0 && o.qty > 0.0
+                  then a +. (o.price *. o.qty), q_acc +. o.qty
+                  else a, q_acc)
                (0.0, 0.0)
-               sell_orders
+               b.sell_orders
            in
            let accum_holding =
              if is_quote
              then 0.0
              else
-               accum_qty_of
-                 ~staked:(bal_json |?> "staked_balance" |> to_float_d 0.0)
-                 ~pending:pending_sell_qty
-                 balance
+               accum_qty_of ~staked:b.staked_balance ~pending:pending_sell_qty b.balance
            in
            let accum_hold_value = accum_holding *. mid in
            ( up_acc +. bal_up
-           , hold_acc +. (balance *. mid)
+           , hold_acc +. (b.balance *. mid)
            , accum_val_acc +. accum_hold_value )))
       (0.0, 0.0, 0.0)
       all_balances
@@ -1008,17 +799,10 @@ let render_strategies ?(selected_index = None) w json =
   let total_accum_val = total_accum_val_strats +. total_accum_val_bals in
   let total_quote_val =
     List.fold_left
-      (fun acc bal_json ->
-         let asset = bal_json |?> "asset" |> to_string_d "" in
-         let balance = bal_json |?> "balance" |> to_float_d 0.0 in
-         let is_quote =
-           asset = "USD"
-           || asset = "USDC"
-           || asset = "USDT"
-           || asset = "ZUSD"
-           || asset = "USDe"
-         in
-         if is_quote && balance > 0.0 then acc +. balance else acc)
+      (fun acc (b : Snapshot.balance) ->
+         if Snapshot.is_quote_asset b.asset && b.balance > 0.0
+         then acc +. b.balance
+         else acc)
       0.0
       all_balances
   in
@@ -1058,20 +842,21 @@ let render_strategies ?(selected_index = None) w json =
       [ I.string A.(fg c_label ++ bg c_bg) ("  " ^ lbl ^ ": "); I.string vattr value_s ]
   in
   let summary_bar =
+    let cash_t = Anim.tween ~key:"holdings.cash" ~target:total_quote_val ~tau:0.35 in
+    let accum_t = Anim.tween ~key:"holdings.accum" ~target:total_accum_val ~tau:0.35 in
+    let hold_t = Anim.tween ~key:"holdings.hold" ~target:total_hold_val ~tau:0.35 in
+    let sell_t = Anim.tween ~key:"holdings.sell" ~target:total_up ~tau:0.35 in
     close_row
       w
       (I.hcat
          [ I.string A.(fg c_border ++ bg c_bg) " │"
-         ; kv "Cash" (format_usd total_quote_val) A.(fg c_cyan ++ bg c_bg ++ st bold)
+         ; kv "Cash" (format_usd cash_t) A.(fg c_cyan ++ bg c_bg ++ st bold)
          ; pipe
-         ; kv
-             "Accum Val"
-             (format_usd total_accum_val)
-             A.(fg c_bright ++ bg c_bg ++ st bold)
+         ; kv "Accum Val" (format_usd accum_t) A.(fg c_bright ++ bg c_bg ++ st bold)
          ; pipe
-         ; kv "Hold Val" (format_usd total_hold_val) A.(fg c_bright ++ bg c_bg ++ st bold)
+         ; kv "Hold Val" (format_usd hold_t) A.(fg c_bright ++ bg c_bg ++ st bold)
          ; pipe
-         ; kv "Sell Val" (format_pnl total_up) up_attr
+         ; kv "Sell Val" (format_pnl sell_t) up_attr
          ])
   in
   let summary_section =

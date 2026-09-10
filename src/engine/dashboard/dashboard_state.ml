@@ -506,6 +506,7 @@ let json_of_decision (d : Dio_oracle.Oracle_runtime.decision) =
     ; "qty", `Float d.buy_qty
     ; "grid_interval", `Float d.grid_interval
     ; "d_surv", `Float d.d_surv
+    ; "exhaustion_price", `Float d.exhaustion_price
     ; "regime", `String d.regime
     ; "branch", `String d.branch
     ; "cancel_resting_buys", `Bool d.cancel_resting_buys
@@ -661,12 +662,11 @@ let build_snapshot () =
                   in
                   let tob =
                     match Ex.get_top_of_book ~symbol with
-                    | Some (b, bs, a, as_) when b > 0.0 || a > 0.0 ->
-                      Some (b, bs, a, as_)
+                    | Some (b, bs, a, as_) when b > 0.0 || a > 0.0 -> Some (b, bs, a, as_)
                     | _ ->
                       if is_quote
                       then None
-                      else (
+                      else
                         List.find_map
                           (fun other_exch ->
                              if other_exch = exch_name
@@ -676,9 +676,7 @@ let build_snapshot () =
                                | None -> None
                                | Some (module OtherEx) ->
                                  let other_quote =
-                                   match
-                                     Exchange.Types.exchange_of_string other_exch
-                                   with
+                                   match Exchange.Types.exchange_of_string other_exch with
                                    | Hyperliquid | Lighter -> "USDC"
                                    | Kraken | Ibkr | Alpaca | Custom _ -> "USD"
                                  in
@@ -691,7 +689,7 @@ let build_snapshot () =
                                      | Some (b, bs, a, as_) when b > 0.0 || a > 0.0 ->
                                        Some (b, bs, a, as_)
                                      | _ -> None))))
-                          exchange_names)
+                          exchange_names
                   in
                   let bid_json, ask_json =
                     match tob with

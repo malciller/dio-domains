@@ -124,17 +124,27 @@ type sim_strategy =
   ; maker_fee : float
   }
 
+(** One strategy's simulated outcome: the survived drawdown fraction of the
+    current price (clamped 0..1) and the price of the deepest rung the
+    strategy actually funded under shared capital - the spec's [P_funded],
+    i.e. the exhaustion point of its ladder. *)
+type sim_outcome =
+  { d_surv : float
+  ; funded_price : float
+  }
+
 (** Simulates a shared market drawdown across active strategies on a venue,
     executing 1 order per strategy sequentially in configuration priority order
     until venue quote capital is exhausted. Returns an association list of
-    (strategy_id, price_drop_percentage_survived). *)
-let simulate_drawdown_survival
-      ~(total_quote : float)
-      (strategies : sim_strategy list)
-  : (string * float) list
+    (strategy_id, { d_surv; funded_price }). *)
+let simulate_drawdown_survival ~(total_quote : float) (strategies : sim_strategy list)
+  : (string * sim_outcome) list
   =
   if strategies = [] || total_quote <= 0.0
-  then List.map (fun (s : sim_strategy) -> s.id, 0.0) strategies
+  then
+    List.map
+      (fun (s : sim_strategy) -> s.id, { d_surv = 0.0; funded_price = s.current })
+      strategies
   else (
     let valid =
       List.filter
@@ -176,11 +186,13 @@ let simulate_drawdown_survival
     List.map
       (fun (s : sim_strategy) ->
          match Hashtbl.find_opt counts s.id with
-         | None -> s.id, 0.0
+         | None -> s.id, { d_surv = 0.0; funded_price = s.current }
          | Some k ->
            let step = Float.max 1e-6 (1.0 -. (s.grid_interval /. 100.0)) in
-           let d_surv = Float.max 0.0 (Float.min 1.0 (1.0 -. (step ** float_of_int k))) in
-           s.id, d_surv)
+           let drop_factor = step ** float_of_int k in
+           let d_surv = Float.max 0.0 (Float.min 1.0 (1.0 -. drop_factor)) in
+           (* Deepest rung actually funded: k rungs down the geometric
+              ladder (k = 0 exhausts at the current price itself). *)
+           s.id, { d_surv; funded_price = s.current *. drop_factor })
       strategies)
 ;;
-

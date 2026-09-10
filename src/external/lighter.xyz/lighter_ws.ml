@@ -425,7 +425,10 @@ let rec connect_one
        in
        let client = `TLS (`Hostname connect_host, `IP ip, `Port connect_port) in
        let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
-       Websocket_lwt_unix.connect ~ctx client uri
+       (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP
+          connection during the handshake would otherwise block the
+          reconnect (which runs on the main Lwt loop) indefinitely. *)
+       Lwt_unix.with_timeout 20.0 (fun () -> Websocket_lwt_unix.connect ~ctx client uri)
        >>= fun conn ->
        Lwt_mutex.with_lock state.connection_mutex (fun () ->
          state.active_connection := Some conn;

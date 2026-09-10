@@ -15,56 +15,30 @@ let group_tbl : (string, (Notty.attr * string * float * float * float) list) Has
   Hashtbl.create 16
 ;;
 
-let render_ticker w json =
+let render_ticker w (snapshot : Snapshot.t) =
   let t = Theme.current () in
-  let strats =
-    match json |?> "strategies" with
-    | `Assoc l -> l
-    | _ -> []
-  in
-  let all_balances = json |?> "all_balances" |> to_list_d in
+  let strats = snapshot.strategies in
+  let all_balances = snapshot.balances in
   (* Gather all strategies that currently have a usable mid price. *)
   let all_strategies =
     List.filter_map
-      (fun (symbol, data) ->
-         let market = data |?> "market" in
-         let bid = market |?> "bid" |> to_float_d 0.0 in
-         let ask = market |?> "ask" |> to_float_d 0.0 in
-         let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
-         if mid <= 0.0
-         then None
-         else (
-           let exchange = data |?> "exchange" |> to_string_d "?" in
-           Some (exchange, symbol, mid, bid, ask)))
+      (fun (symbol, (st : Snapshot.strategy)) ->
+         let bid = st.market.bid in
+         let ask = st.market.ask in
+         let mid = st.market.mid in
+         if mid <= 0.0 then None else Some (st.exchange, symbol, mid, bid, ask))
       strats
   in
   (* Also gather non-quote balances from all_balances in case the engine
      decides to push them in the future. *)
   let non_quote_bals =
     List.filter_map
-      (fun bal_json ->
-         let asset = bal_json |?> "asset" |> to_string_d "?" in
-         let exchange = bal_json |?> "exchange" |> to_string_d "?" in
-         let is_quote =
-           asset = "USD"
-           || asset = "USDC"
-           || asset = "USDT"
-           || asset = "ZUSD"
-           || asset = "USDe"
-         in
-         if not is_quote
-         then (
-           let bid = bal_json |?> "bid" |> to_float_d 0.0 in
-           let ask = bal_json |?> "ask" |> to_float_d 0.0 in
-           let mid =
-             if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask
-           in
-           if mid <= 0.0
-           then None
-           else (
-             let symbol = bal_json |?> "symbol" |> to_string_d asset in
-             Some (exchange, symbol, mid, bid, ask)))
-         else None)
+      (fun (b : Snapshot.balance) ->
+         if Snapshot.is_quote_asset b.asset
+         then None
+         else if b.mid <= 0.0
+         then None
+         else Some (b.exchange, b.symbol, b.mid, b.bid, b.ask))
       all_balances
   in
   let combined = all_strategies @ non_quote_bals in

@@ -36,6 +36,17 @@ let make_headers () =
 (** Records an Alpaca REST round trip in the "alpaca" venue profiler. *)
 let record_rest_span span = Network_latency.record_rest "alpaca" span
 
+(** Deadline for every REST round trip (connect + request + response).
+
+    Alpaca's TLS transport occasionally dies without a TCP-level close (the
+    "SSL connection() error: error:00:000000" family); without a deadline the
+    in-flight request hangs inside the kernel read until the venue's side of
+    the socket gives up - observed at 16+ minutes. [Lwt_unix.with_timeout]
+    cancels the request on expiry, which closes the underlying connection fd
+    and unblocks the wedged read; the raised [Lwt_unix.Timeout] classifies
+    as [Timeout] and is retried by [retry_http_exceptions]. *)
+let rest_timeout_s = 30.0
+
 let json_to_float = function
   | `Float f -> f
   | `Int i -> float_of_int i
@@ -234,10 +245,11 @@ let place_order
     Lwt.catch
       (fun () ->
          let rest_start = Mtime_clock.now_ns () in
-         Cohttp_lwt_unix.Client.post
-           ~headers
-           ~body:(Cohttp_lwt.Body.of_string req_body)
-           url
+         Lwt_unix.with_timeout rest_timeout_s (fun () ->
+           Cohttp_lwt_unix.Client.post
+             ~headers
+             ~body:(Cohttp_lwt.Body.of_string req_body)
+             url)
          >>= fun (resp, body) ->
          let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
          Cohttp_lwt.Body.to_string body
@@ -320,10 +332,11 @@ let amend_order ~order_id ?qty ?limit_price ?cl_ord_id () =
     Lwt.catch
       (fun () ->
          let rest_start = Mtime_clock.now_ns () in
-         Cohttp_lwt_unix.Client.patch
-           ~headers
-           ~body:(Cohttp_lwt.Body.of_string req_body)
-           url
+         Lwt_unix.with_timeout rest_timeout_s (fun () ->
+           Cohttp_lwt_unix.Client.patch
+             ~headers
+             ~body:(Cohttp_lwt.Body.of_string req_body)
+             url)
          >>= fun (resp, body) ->
          let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
          Cohttp_lwt.Body.to_string body
@@ -384,7 +397,8 @@ let cancel_order order_id =
     Lwt.catch
       (fun () ->
          let rest_start = Mtime_clock.now_ns () in
-         Cohttp_lwt_unix.Client.delete ~headers url
+         Lwt_unix.with_timeout rest_timeout_s (fun () ->
+           Cohttp_lwt_unix.Client.delete ~headers url)
          >>= fun (resp, body) ->
          let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
          Cohttp_lwt.Body.to_string body
@@ -430,7 +444,8 @@ let get_open_orders () =
     in
     let url = Uri.of_string url_str in
     let rest_start = Mtime_clock.now_ns () in
-    Cohttp_lwt_unix.Client.get ~headers url
+    Lwt_unix.with_timeout rest_timeout_s (fun () ->
+      Cohttp_lwt_unix.Client.get ~headers url)
     >>= fun (resp, body) ->
     let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
     Cohttp_lwt.Body.to_string body
@@ -491,7 +506,8 @@ let get_account () =
   Lwt.catch
     (fun () ->
        let rest_start = Mtime_clock.now_ns () in
-       Cohttp_lwt_unix.Client.get ~headers url
+       Lwt_unix.with_timeout rest_timeout_s (fun () ->
+         Cohttp_lwt_unix.Client.get ~headers url)
        >>= fun (resp, body) ->
        let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
        Cohttp_lwt.Body.to_string body
@@ -544,7 +560,8 @@ let get_positions () =
   Lwt.catch
     (fun () ->
        let rest_start = Mtime_clock.now_ns () in
-       Cohttp_lwt_unix.Client.get ~headers url
+       Lwt_unix.with_timeout rest_timeout_s (fun () ->
+         Cohttp_lwt_unix.Client.get ~headers url)
        >>= fun (resp, body) ->
        let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
        Cohttp_lwt.Body.to_string body

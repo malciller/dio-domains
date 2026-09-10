@@ -5,3 +5,15 @@
 (test
  (name test_dashboard_holdings)
  (libraries dio.dashboard_ui dio.latency_profiling mtime alcotest))
+
+(test
+ (name test_dashboard_snapshot)
+ (libraries dio.dashboard_ui alcotest))
+
+(test
+ (name test_dashboard_raster)
+ (libraries dio.dashboard_ui notty alcotest))
+
+(executable
+ (name bench_dashboard)
+ (libraries dio.dashboard_ui notty notty.unix yojson unix))

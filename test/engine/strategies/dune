@@ -8,7 +8,7 @@
 
 (test
  (name test_jacobs_ladder)
- (libraries dio.strategies dio.engine dio.hyperliquid alcotest))
+ (libraries dio.strategies dio.engine dio.hyperliquid dio.alpaca alcotest))
 
 (test
  (name test_auto_hedger)

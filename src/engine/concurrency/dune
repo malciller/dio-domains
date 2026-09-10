@@ -9,5 +9,5 @@
   Exchange_wakeup
   Lwt_util
   Fill_event_bus
-  Parse_worker)
-)
+  Parse_worker
+  Main_loop_watchdog))

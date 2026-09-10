@@ -173,6 +173,45 @@ let test_d_surv () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* exhaustion_price_of                                                *)
+(* ------------------------------------------------------------------ *)
+
+let test_exhaustion_price () =
+  let ep = Dio_oracle.Oracle_core.exhaustion_price_of in
+  (* Inverts the survival fraction: the 0.38 partial walk from the d_surv
+     test bottoms out at its last funded rung (81 on the 100 -> 50 ladder). *)
+  near
+    "partial survival lands on last funded rung"
+    (ep ~current:100.0 ~funded_floor:50.0 ~d_surv:0.38)
+    81.0;
+  (* Full depth funded: the bottom rung is the funded floor itself. *)
+  near
+    "full depth bottoms at the floor"
+    (ep ~current:100.0 ~funded_floor:50.0 ~d_surv:1.0)
+    50.0;
+  (* Surplus d_surv > 1 clamps to the funded ladder's last rung. *)
+  near
+    "surplus clamps to the floor"
+    (ep ~current:100.0 ~funded_floor:50.0 ~d_surv:1.5)
+    50.0;
+  (* First rung unaffordable: nothing fills, exhaustion at current. *)
+  near
+    "zero survival exhausts at current"
+    (ep ~current:100.0 ~funded_floor:50.0 ~d_surv:0.0)
+    100.0;
+  (* Non-finite d_surv (no funded depth below current): current itself. *)
+  near
+    "infinite d_surv exhausts at current"
+    (ep ~current:100.0 ~funded_floor:50.0 ~d_surv:Float.infinity)
+    100.0;
+  (* Living at/below the funded floor: no depth to fund, current. *)
+  near
+    "at the floor exhausts at current"
+    (ep ~current:40.0 ~funded_floor:50.0 ~d_surv:0.5)
+    40.0
+;;
+
+(* ------------------------------------------------------------------ *)
 (* resolve                                                            *)
 (* ------------------------------------------------------------------ *)
 
@@ -425,7 +464,10 @@ let () =
       , [ Alcotest.test_case "spec worked example" `Quick test_runway_worked_example
         ; Alcotest.test_case "three regimes" `Quick test_regimes
         ] )
-    ; "survival", [ Alcotest.test_case "d_surv fractions" `Quick test_d_surv ]
+    ; ( "survival"
+      , [ Alcotest.test_case "d_surv fractions" `Quick test_d_surv
+        ; Alcotest.test_case "exhaustion price" `Quick test_exhaustion_price
+        ] )
     ; ( "search"
       , [ Alcotest.test_case "unreachable branch" `Quick test_resolve_unreachable
         ; Alcotest.test_case "surplus branch" `Quick test_resolve_surplus

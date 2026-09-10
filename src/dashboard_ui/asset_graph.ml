@@ -50,6 +50,10 @@ let window_seconds = 900.0
     Tracks live mid prices as well as active buy and sell order price levels over 15 minutes. *)
 let price_history : (string, price_snapshot Queue.t) Hashtbl.t = Hashtbl.create 32
 
+(** Most recently recorded snapshot per asset key, so the append guard below
+    does not have to traverse the entire queue on every push. *)
+let last_snapshots : (string, price_snapshot) Hashtbl.t = Hashtbl.create 32
+
 (** Global zoom level per asset key.
     0 = Full view showing all orders.
     Higher values = zoomed in around mid price (capped at 1 order on each side). *)
@@ -64,51 +68,34 @@ let set_zoom asset_key z = Hashtbl.replace zoom_levels asset_key (max 0 z)
 let zoom_in asset_key = set_zoom asset_key (get_zoom asset_key + 1)
 let zoom_out asset_key = set_zoom asset_key (max 0 (get_zoom asset_key - 1))
 
-let record_all_prices json =
-  let assets = Holdings.get_selectable_assets json in
+let order_prices (os : Snapshot.order list) =
+  List.filter_map
+    (fun (o : Snapshot.order) ->
+       if o.price > 0.0 && o.qty > 0.0 then Some o.price else None)
+    os
+;;
+
+let to_triples (os : Snapshot.order list) =
+  List.map (fun (o : Snapshot.order) -> o.id, o.price, o.qty) os
+;;
+
+let record_all_prices (snapshot : Snapshot.t) =
+  let assets = snapshot.assets in
   let now = Unix.gettimeofday () in
   List.iter
-    (fun (a : Holdings.selectable_asset) ->
-       let market = if a.is_strategy then a.data |?> "market" else a.data in
-       let bid = market |?> "bid" |> to_float_d 0.0 in
-       let ask = market |?> "ask" |> to_float_d 0.0 in
+    (fun (a : Snapshot.selectable_asset) ->
+       let bid, ask, buy_ps, sell_ps =
+         match a.kind with
+         | Snapshot.Strategy s ->
+           let buy_ps =
+             (* The strategy's own resting-buy target is tracked as a price,
+                not an order list, so it is the only buy level available. *)
+             if s.buy_price > 0.0 then [ s.buy_price ] else []
+           in
+           s.market.bid, s.market.ask, buy_ps, order_prices s.sell_orders
+         | Snapshot.Balance b -> b.bid, b.ask, [], order_prices b.sell_orders
+       in
        let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
-       let strat_json = if a.is_strategy then a.data |?> "strategy" else `Null in
-       let sell_orders_json =
-         if a.is_strategy
-         then strat_json |?> "sell_orders" |> to_list_d
-         else a.data |?> "sell_orders" |> to_list_d
-       in
-       let sell_ps =
-         List.filter_map
-           (fun s ->
-              let p = s |?> "price" |> to_float_d 0.0 in
-              let q = s |?> "qty" |> to_float_d 0.0 in
-              if p > 0.0 && q > 0.0 then Some p else None)
-           sell_orders_json
-       in
-       let buy_orders_json =
-         if a.is_strategy
-         then strat_json |?> "buy_orders" |> to_list_d
-         else a.data |?> "buy_orders" |> to_list_d
-       in
-       let buy_orders_parsed =
-         List.filter_map
-           (fun s ->
-              let p = s |?> "price" |> to_float_d 0.0 in
-              let q = s |?> "qty" |> to_float_d 0.0 in
-              if p > 0.0 && q > 0.0 then Some p else None)
-           buy_orders_json
-       in
-       let buy_ps =
-         if buy_orders_parsed <> []
-         then buy_orders_parsed
-         else if a.is_strategy
-         then (
-           let bp = strat_json |?> "buy_price" |> to_float_d 0.0 in
-           if bp > 0.0 then [ bp ] else [])
-         else []
-       in
        if mid > 0.0
        then (
          let q =
@@ -126,26 +113,23 @@ let record_all_prices json =
            ignore (Queue.pop q)
          done;
          let should_push =
-           if Queue.is_empty q
-           then true
-           else (
-             let last_snap =
-               Queue.fold
-                 (fun _ item -> item)
-                 { timestamp = 0.0; mid_p = 0.0; buy_ps = []; sell_ps = [] }
-                 q
-             in
+           match Hashtbl.find_opt last_snapshots a.key with
+           | None -> true
+           | Some last_snap ->
              now -. last_snap.timestamp >= 1.0
              || abs_float (mid -. last_snap.mid_p) > 0.000001
              || buy_ps <> last_snap.buy_ps
-             || sell_ps <> last_snap.sell_ps)
+             || sell_ps <> last_snap.sell_ps
          in
          if should_push
-         then Queue.push { timestamp = now; mid_p = mid; buy_ps; sell_ps } q))
+         then (
+           let snap = { timestamp = now; mid_p = mid; buy_ps; sell_ps } in
+           Queue.push snap q;
+           Hashtbl.replace last_snapshots a.key snap)))
     assets
 ;;
 
-let render_asset_detail w h asset_key json =
+let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
   let t = Theme.current () in
   let a_border = t.a_border in
   let a_label = t.a_label in
@@ -167,14 +151,14 @@ let render_asset_detail w h asset_key json =
   let c_text = t.c_text in
   let c_bright = t.c_bright in
   let c_magenta = t.c_magenta in
-  let assets = Holdings.get_selectable_assets json in
+  let assets = snapshot.assets in
   let asset_opt =
     if asset_key = ""
     then (
       match assets with
       | head :: _ -> Some head
       | [] -> None)
-    else List.find_opt (fun (a : Holdings.selectable_asset) -> a.key = asset_key) assets
+    else List.find_opt (fun (a : Snapshot.selectable_asset) -> a.key = asset_key) assets
   in
   match asset_opt with
   | None ->
@@ -190,60 +174,66 @@ let render_asset_detail w h asset_key json =
     let exch_attr = exch_sym_attr a.exchange in
     let header_bar = section_title ~title_attr:exch_attr w title_str in
     (* Extract the market data block, which lives under "market" for
-       strategy assets and directly on the entry for balances. *)
-    let market = if a.is_strategy then a.data |?> "market" else a.data in
-    let bid = market |?> "bid" |> to_float_d 0.0 in
-    let ask = market |?> "ask" |> to_float_d 0.0 in
-    let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
-    let base_bal =
-      if a.is_strategy
-      then market |?> "base_balance" |> to_float_d 0.0
-      else a.data |?> "balance" |> to_float_d 0.0
+       strategy assets and is synthesized from the balance entry for
+       balances. *)
+    let market =
+      match a.kind with
+      | Snapshot.Strategy s -> s.market
+      | Snapshot.Balance b ->
+        { Snapshot.empty_market with
+          bid = b.bid
+        ; ask = b.ask
+        ; mid = b.mid
+        ; bids = b.bids
+        ; asks = b.asks
+        ; base_balance = b.balance
+        ; staked_balance = b.staked_balance
+        ; sell_orders = b.sell_orders
+        }
     in
-    let quote_bal = market |?> "quote_balance" |> to_float_d 0.0 in
+    let bid = market.bid in
+    let ask = market.ask in
+    let mid = market.mid in
+    let base_bal = market.base_balance in
+    let quote_bal = market.quote_balance in
     let hold_val = base_bal *. mid in
-    (* Record the live mid price and active order levels into the rolling
-       history buffer. *)
-    record_all_prices json;
     (* Extract the strategy and order details for the summary card. *)
-    let strat_json = if a.is_strategy then a.data |?> "strategy" else `Null in
-    let stype =
-      if a.is_strategy then strat_json |?> "type" |> to_string_d "Ladder" else "Balance"
+    let strat_opt =
+      match a.kind with
+      | Snapshot.Strategy s -> Some s
+      | _ -> None
     in
-    let last_buy_fill = strat_json |?> "last_buy_fill" |> to_float_d 0.0 in
-    let last_sell_fill = strat_json |?> "last_sell_fill" |> to_float_d 0.0 in
+    let stype =
+      match strat_opt with
+      | Some s -> s.type_
+      | None -> "Balance"
+    in
+    let last_buy_fill =
+      match strat_opt with
+      | Some s -> s.last_buy_fill
+      | None -> 0.0
+    in
+    let last_sell_fill =
+      match strat_opt with
+      | Some s -> s.last_sell_fill
+      | None -> 0.0
+    in
     (* Collect the sell orders, preferring the strategy's own list and
        falling back to the exchange feed. *)
-    let market_json = a.data |?> "market" in
-    let sell_orders_json =
-      let strat_sells =
-        if a.is_strategy then strat_json |?> "sell_orders" |> to_list_d else []
-      in
-      if strat_sells <> []
-      then strat_sells
-      else if a.is_strategy
-      then market_json |?> "sell_orders" |> to_list_d
-      else a.data |?> "sell_orders" |> to_list_d
-    in
     let sell_orders =
-      List.filter_map
-        (fun s ->
-           let id = s |?> "id" |> to_string_d "?" in
-           let price = s |?> "price" |> to_float_d 0.0 in
-           let qty = s |?> "qty" |> to_float_d 0.0 in
-           if price > 0.0 && qty > 0.0 then Some (id, price, qty) else None)
-        sell_orders_json
+      match a.kind with
+      | Snapshot.Strategy s ->
+        if s.sell_orders <> []
+        then to_triples s.sell_orders
+        else to_triples s.market.sell_orders
+      | Snapshot.Balance b -> to_triples b.sell_orders
     in
     (* Calculate the accumulated holding and its value, excluding the
        pending sell quantity. *)
     let pending_sell_qty =
       List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 sell_orders
     in
-    let staked_bal =
-      if a.is_strategy
-      then market |?> "staked_balance" |> to_float_d 0.0
-      else a.data |?> "staked_balance" |> to_float_d 0.0
-    in
+    let staked_bal = market.staked_balance in
     (* Staked HYPE is part of [base_bal] but can never be covered by a
        resting sell (it is not tradeable), so it is never reduced by the
        pending sell quantity. *)
@@ -253,42 +243,23 @@ let render_asset_detail w h asset_key json =
     let accum_val = accum_qty *. mid in
     (* Collect the buy orders and distinguish real exchange orders from
        synthetic strategy targets. *)
-    let buy_orders_json =
-      let strat_buys =
-        if a.is_strategy then strat_json |?> "buy_orders" |> to_list_d else []
-      in
-      if strat_buys <> []
-      then strat_buys
-      else if a.is_strategy
-      then market_json |?> "buy_orders" |> to_list_d
-      else a.data |?> "buy_orders" |> to_list_d
+    let cap_low =
+      match strat_opt with
+      | Some s -> s.capital_low
+      | None -> false
     in
     let buy_orders_parsed =
-      List.filter_map
-        (fun s ->
-           let id = s |?> "id" |> to_string_d "?" in
-           let price = s |?> "price" |> to_float_d 0.0 in
-           let qty = s |?> "qty" |> to_float_d 0.0 in
-           if price > 0.0 && qty > 0.0 then Some (id, price, qty) else None)
-        buy_orders_json
-    in
-    let cap_low =
-      if a.is_strategy then strat_json |?> "capital_low" |> to_bool_d false else false
+      match a.kind with
+      | Snapshot.Strategy s -> to_triples s.market.buy_orders
+      | Snapshot.Balance _ -> []
     in
     let buy_orders, is_synthetic_buy =
       if buy_orders_parsed <> []
       then buy_orders_parsed, false
-      else if a.is_strategy
-      then (
-        let bp = strat_json |?> "buy_price" |> to_float_d 0.0 in
-        let bq =
-          strat_json
-          |?> "buy_qty"
-          |> to_float_d (strat_json |?> "grid_qty" |> to_float_d 0.0)
-        in
-        let bid_id = strat_json |?> "buy_id" |> to_string_d "buy" in
-        if bp > 0.0 then [ bid_id, bp, bq ], cap_low else [], false)
-      else [], false
+      else (
+        match strat_opt with
+        | Some s when s.buy_price > 0.0 -> [ s.buy_id, s.buy_price, s.buy_qty ], cap_low
+        | _ -> [], false)
     in
     (* Asset summary card layout: line 1 shows the strategy type, the
        bid/mid/ask prices, and the holding; line 2 shows the last buy/sell
@@ -365,23 +336,17 @@ let render_asset_detail w h asset_key json =
          the ACTIVE/INACTIVE verdict (the oracle-paused state), the sizing,
          and the reason. It is rendered only when a decision exists. *)
       let oracle_line =
-        let oracle = if a.is_strategy then a.data |?> "oracle" else `Null in
-        match oracle with
-        | `Assoc _ ->
-          let o_active = oracle |?> "active" |> to_bool_d false in
-          let o_buy_qty =
-            match oracle |?> "buy_qty" with
-            | `Float q -> q
-            | _ -> oracle |?> "qty" |> to_float_d 0.0
-          in
-          let o_mdd = oracle |?> "max_drawdown_pct" |> to_float_d 0.0 in
-          let o_gi = oracle |?> "grid_interval" |> to_float_d 0.0 in
-          let o_dsurv = oracle |?> "d_surv" |> to_float_d 0.0 in
-          let o_reason = oracle |?> "reason" |> to_string_d "" in
+        match strat_opt with
+        | Some { oracle = Some o; _ } ->
+          let o_active = o.active in
+          let o_buy_qty = o.buy_qty in
+          let o_mdd = o.max_drawdown_pct in
+          let o_gi = o.grid_interval in
+          let o_dsurv = o.d_surv in
+          let o_exhaust = o.exhaustion_price in
+          let o_reason = o.reason in
           let status_img =
-            if o_active
-            then I.string a_green "ACTIVE"
-            else I.string a_yellow "INACTIVE"
+            if o_active then I.string a_green "ACTIVE" else I.string a_yellow "INACTIVE"
           in
           let metrics_items =
             [ I.string a_label " Oracle: "
@@ -391,18 +356,33 @@ let render_asset_detail w h asset_key json =
             ; I.string a_text (if o_gi > 0.0 then Printf.sprintf "%.4f%%" o_gi else "--")
             ; I.string a_dim " │ "
             ; I.string a_label "Buy Qty: "
-            ; I.string a_cyan (if o_buy_qty > 0.0 then format_qty o_buy_qty ^ " " ^ a.asset else "--")
+            ; I.string
+                a_cyan
+                (if o_buy_qty > 0.0 then format_qty o_buy_qty ^ " " ^ a.asset else "--")
             ; I.string a_dim " │ "
             ; I.string a_label "MDD: "
-            ; I.string a_cyan (if o_mdd > 0.0 then Printf.sprintf "%.1f%%" (o_mdd *. 100.0) else "--")
+            ; I.string
+                a_cyan
+                (if o_mdd > 0.0 then Printf.sprintf "%.1f%%" (o_mdd *. 100.0) else "--")
             ; I.string a_dim " │ "
             ; I.string a_label "D_surv: "
             ; I.string a_bright (Printf.sprintf "%.1f%%" (o_dsurv *. 100.0))
+            ; I.string a_dim " │ "
+            ; I.string a_label "Exhaust: "
+            ; I.string
+                a_bright
+                (if o_exhaust > 0.0 && Float.is_finite o_exhaust
+                 then format_price o_exhaust
+                 else "--")
             ]
           in
           let reason_items =
             if o_reason <> ""
-            then [ I.string a_dim " │ "; I.string a_label "Reason: "; I.string a_dim o_reason ]
+            then
+              [ I.string a_dim " │ "
+              ; I.string a_label "Reason: "
+              ; I.string a_dim o_reason
+              ]
             else []
           in
           Some (I.hcat (metrics_items @ reason_items))
@@ -526,24 +506,28 @@ let render_asset_detail w h asset_key json =
     let canvas_h = max 8 (h - 8) in
     let sub_h = canvas_h * 4 in
     let sub_w = canvas_w * 2 in
+    (* The "liquid" depth fill near the mid price is a dimmed accent tint
+       blended into the theme background. Derived from the active theme so it
+       stays coherent across all 18 palettes (the old constants were hardcoded
+       Tokyo Night colors). *)
+    let liquid_base = blend_rgb t.accent_rgb t.bg_rgb 0.6 in
+    (* Ambient breathing of the depth fill while the data stream is live; only
+       the chart rows that actually change are re-transmitted. *)
+    let live_pulse =
+      if !Anim.reduced_motion || not (Anim.active ()) then 0.0 else 0.10 *. Anim.pulse ()
+    in
     (* Extract the L2 order book depth from the market data. *)
-    let ob_bids_json = market |?> "bids" |> to_list_d in
-    let ob_asks_json = market |?> "asks" |> to_list_d in
     let ob_bids_raw =
       List.filter_map
-        (fun s ->
-           let p = s |?> "price" |> to_float_d 0.0 in
-           let q = s |?> "qty" |> to_float_d 0.0 in
-           if p > 0.0 then Some (p, q) else None)
-        ob_bids_json
+        (fun (l : Snapshot.level) ->
+           if l.price > 0.0 then Some (l.price, l.qty) else None)
+        market.bids
     in
     let ob_asks_raw =
       List.filter_map
-        (fun s ->
-           let p = s |?> "price" |> to_float_d 0.0 in
-           let q = s |?> "qty" |> to_float_d 0.0 in
-           if p > 0.0 then Some (p, q) else None)
-        ob_asks_json
+        (fun (l : Snapshot.level) ->
+           if l.price > 0.0 then Some (l.price, l.qty) else None)
+        market.asks
     in
     (* Fall back to synthesized levels when the order book feed has only a
        single top-of-book level or is missing entirely. *)
@@ -563,16 +547,11 @@ let render_asset_detail w h asset_key json =
     in
     (* Extract trade prints when present, for example from Alpaca or other
        trade feeds. *)
-    let ob_trades_json = market |?> "trades" |> to_list_d in
     let ob_trades_raw =
       List.filter_map
-        (fun s ->
-           let p = s |?> "price" |> to_float_d 0.0 in
-           let q = s |?> "qty" |> to_float_d 0.0 in
-           let ts = s |?> "timestamp" |> to_float_d 0.0 in
-           let side = s |?> "side" |> to_string_d "trade" in
-           if p > 0.0 then Some (p, q, ts, side) else None)
-        ob_trades_json
+        (fun (tr : Snapshot.trade) ->
+           if tr.price > 0.0 then Some (tr.price, tr.qty, tr.timestamp, tr.side) else None)
+        market.trades
     in
     let is_alpaca = String.equal (String.lowercase_ascii a.exchange) "alpaca" in
     let show_trade_prints = is_alpaca || ob_trades_raw <> [] in
@@ -983,7 +962,11 @@ let render_asset_detail w h asset_key json =
       then (
         match buy_orders_parsed with
         | [] ->
-          let bp = strat_json |?> "buy_price" |> to_float_d 0.0 in
+          let bp =
+            match strat_opt with
+            | Some s -> s.buy_price
+            | None -> 0.0
+          in
           if bp > 0.0 then Some (price_to_row bp) else None
         | _ -> None)
       else None
@@ -1086,20 +1069,26 @@ let render_asset_detail w h asset_key json =
               else 0.0
             in
             let fill_rgb =
-              color_blend (75, 62, 32) (26, 27, 38) (min 1.0 (fill_dist *. 1.5))
+              color_blend
+                liquid_base
+                t.bg_rgb
+                (min 1.0 (fill_dist *. (1.5 +. live_pulse)))
             in
             let bg_attr = if is_in_liquid then A.bg fill_rgb else A.bg c_bg in
             let combined_mask = !mid_mask lor !buy_mask lor !sell_mask in
             if combined_mask <> 0
             then (
               let str = braille_to_utf8 combined_mask in
+              (* Overlapping traces collapse to the theme's dominant trace
+                 color (mid wins, then buy/sell); colors themselves are
+                 theme-derived rather than hardcoded. *)
               let fg_color =
                 if !mid_mask <> 0 && !buy_mask <> 0
-                then color_blend (158, 206, 106) (125, 207, 255) 0.5
+                then c_green
                 else if !mid_mask <> 0 && !sell_mask <> 0
-                then color_blend (158, 206, 106) (226, 104, 160) 0.5
+                then c_green
                 else if !buy_mask <> 0 && !sell_mask <> 0
-                then color_blend (125, 207, 255) (226, 104, 160) 0.5
+                then c_cyan
                 else if !mid_mask <> 0
                 then c_green
                 else if !buy_mask <> 0

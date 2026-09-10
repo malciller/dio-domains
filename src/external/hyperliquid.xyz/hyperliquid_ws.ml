@@ -21,6 +21,12 @@ type raw_subscription =
 let is_connected_ref = Atomic.make false
 let is_connected () = Atomic.get is_connected_ref
 
+(** Bound on the TLS + WebSocket upgrade handshake. A half-open TCP
+    connection during the handshake would otherwise block the reconnect
+    (which runs on the main Lwt loop) indefinitely. [Lwt_unix.with_timeout]
+    cancels the in-flight connect, closing its underlying fd. *)
+let ws_connect_timeout_s = 20.0
+
 (** Mvar signaled each time a new connection is established.
     Consumers call [wait_for_connected] to block on this rather than polling.
     Refilled after each successful connect so subsequent callers also wake. *)
@@ -555,7 +561,8 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
        in
        let client = `TLS (`Hostname hostname, `IP ip, `Port port) in
        let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
-       Websocket_lwt_unix.connect ~ctx client uri
+       Lwt_unix.with_timeout ws_connect_timeout_s (fun () ->
+         Websocket_lwt_unix.connect ~ctx client uri)
        >>= fun conn ->
        Lwt_mutex.with_lock connection_mutex (fun () ->
          active_connection := Some conn;

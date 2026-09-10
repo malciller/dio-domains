@@ -12,6 +12,7 @@ let make_decision () =
   ; max_drawdown_pct = 0.85
   ; grid_interval = 5.0
   ; d_surv = 0.0
+  ; exhaustion_price = 26400.0
   ; regime = "floor extension"
   ; branch = "unreachable"
   ; cancel_resting_buys = false
@@ -51,6 +52,9 @@ let test_decision_fields () =
   (match field j "d_surv" with
    | Some (`Float d) -> Alcotest.(check (float 1e-9)) "d_surv" 0.0 d
    | _ -> Alcotest.fail "missing d_surv");
+  (match field j "exhaustion_price" with
+   | Some (`Float p) -> Alcotest.(check (float 1e-9)) "exhaustion_price" 26400.0 p
+   | _ -> Alcotest.fail "missing exhaustion_price");
   (match field j "regime" with
    | Some (`String r) -> Alcotest.(check string) "regime" "floor extension" r
    | _ -> Alcotest.fail "missing regime");

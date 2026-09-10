@@ -547,7 +547,10 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
        in
        let client = `TLS (`Hostname host, `IP ip, `Port port) in
        let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
-       Websocket_lwt_unix.connect ~ctx client uri
+       (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP
+          connection during the handshake would otherwise block the
+          reconnect (which runs on the main Lwt loop) indefinitely. *)
+       Lwt_unix.with_timeout 20.0 (fun () -> Websocket_lwt_unix.connect ~ctx client uri)
        >>= fun conn ->
        active_conn := Some conn;
        Logging.debug_f ~section "Connected to Alpaca Trading WS at %s" url_str;

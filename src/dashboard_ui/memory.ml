@@ -8,20 +8,20 @@ let pressure_last_time = ref 0.0
 let max_seen_heap_ref = ref 0
 let pressure_blocks = [| "⠀"; "⡀"; "⣀"; "⣄"; "⣤"; "⣦"; "⣶"; "⣷"; "⣿" |]
 
-let render_memory w json =
+let render_memory w (snapshot : Snapshot.t) =
   let t = Theme.current () in
-  let mem = json |?> "memory" in
+  let mem = snapshot.memory in
   let title = section_title w "MEMORY & GC" in
-  let heap = mem |?> "heap_mb" |> to_int_d 0 in
-  let live = mem |?> "live_kb" |> to_int_d 0 in
-  let free = mem |?> "free_kb" |> to_int_d 0 in
-  let major = mem |?> "gc_major" |> to_int_d 0 in
-  let minor = mem |?> "gc_minor" |> to_int_d 0 in
-  let compact = mem |?> "compactions" |> to_int_d 0 in
-  let frags = mem |?> "fragments" |> to_int_d 0 in
+  let heap = mem.heap_mb in
+  let live = mem.live_kb in
+  let free = mem.free_kb in
+  let major = mem.gc_major in
+  let minor = mem.gc_minor in
+  let compact = mem.compactions in
+  let frags = mem.fragments in
   let total_kb = float_of_int (live + free) in
   let live_ratio = if total_kb > 0.0 then float_of_int live /. total_kb else 0.0 in
-  let space_overhead = mem |?> "space_overhead" |> to_int_d 80 in
+  let space_overhead = mem.space_overhead in
   let expected_live_ratio = 100.0 /. (100.0 +. float_of_int space_overhead) in
   let normalized_pressure =
     if expected_live_ratio > 0.0 then live_ratio /. expected_live_ratio else 0.0
@@ -65,13 +65,19 @@ let render_memory w json =
   done;
   let row3 =
     I.hcat
-      ([ I.string t.a_border " │"; I.string t.a_dim "  PRESSURE "; I.string t.a_border "╭" ]
+      ([ I.string t.a_border " │"
+       ; I.string t.a_dim "  PRESSURE "
+       ; I.string t.a_border "╭"
+       ]
        @ !spark_imgs_top
        @ [ I.string t.a_border "╮" ])
   in
   let row4 =
     I.hcat
-      ([ I.string t.a_border " │"; I.string t.a_dim "           "; I.string t.a_border "╰" ]
+      ([ I.string t.a_border " │"
+       ; I.string t.a_dim "           "
+       ; I.string t.a_border "╰"
+       ]
        @ !spark_imgs_bot
        @ [ I.string t.a_border "╯" ])
   in
@@ -121,15 +127,15 @@ let render_memory w json =
     ]
 ;;
 
-let render_memory_card w json =
+let render_memory_card w (snapshot : Snapshot.t) =
   let t = Theme.current () in
-  let mem = json |?> "memory" in
-  let heap = mem |?> "heap_mb" |> to_int_d 0 in
-  let live = mem |?> "live_kb" |> to_int_d 0 in
-  let free = mem |?> "free_kb" |> to_int_d 0 in
-  let major = mem |?> "gc_major" |> to_int_d 0 in
-  let minor = mem |?> "gc_minor" |> to_int_d 0 in
-  let compact = mem |?> "compactions" |> to_int_d 0 in
+  let mem = snapshot.memory in
+  let heap = mem.heap_mb in
+  let live = mem.live_kb in
+  let free = mem.free_kb in
+  let major = mem.gc_major in
+  let minor = mem.gc_minor in
+  let compact = mem.compactions in
   let total_kb = float_of_int (live + free) in
   let live_ratio = if total_kb > 0.0 then float_of_int live /. total_kb else 0.0 in
   let max_seen_heap = max !max_seen_heap_ref heap in
