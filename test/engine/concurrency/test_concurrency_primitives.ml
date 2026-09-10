@@ -216,6 +216,27 @@ let test_parse_worker_roundtrip () =
   Alcotest.(check bool) "handler executed" true (Atomic.get hits >= 1)
 ;;
 
+let test_watchdog_staleness () =
+  let open Concurrency.Main_loop_watchdog in
+  (* A fresh beat survives many beat intervals without tripping. *)
+  Alcotest.(check bool)
+    "fresh beat healthy"
+    (is_stalled ~last_beat:1000.0 ~now:1025.0)
+    false;
+  (* Exactly at the threshold is still healthy (strictly-greater rule):
+     several sequential bounded TLS ops must not false-trigger. *)
+  Alcotest.(check bool)
+    "threshold not exceeded"
+    (is_stalled ~last_beat:1000.0 ~now:1060.0)
+    false;
+  (* Past the threshold the loop is presumed wedged. *)
+  Alcotest.(check bool)
+    "past threshold trips"
+    (is_stalled ~last_beat:1000.0 ~now:1061.0)
+    true;
+  Alcotest.(check bool) "long stall trips" (is_stalled ~last_beat:0.0 ~now:600.0) true
+;;
+
 let () =
   Alcotest.run
     "concurrency primitives"
@@ -250,5 +271,7 @@ let () =
         ] )
     ; ( "parse_worker"
       , [ Alcotest.test_case "roundtrip" `Quick test_parse_worker_roundtrip ] )
+    ; ( "main_loop_watchdog"
+      , [ Alcotest.test_case "stall threshold" `Quick test_watchdog_staleness ] )
     ]
 ;;

@@ -18,28 +18,27 @@ let strategy_json ?(oracle = `Null) ?(capital_low = false) ?(market_closed = fal
 
 let oracle_json active = `Assoc [ "active", `Bool active; "reason", `String "test" ]
 
+(* Build the typed strategy view of a strategy-entry fixture. *)
+let strategy_of_json json = Dashboard_ui.Snapshot.parse_strategy "TEST/USDC" json
+
 let test_oracle_inactive () =
   (* No oracle decision yet (before the first pass): not oracle-paused. *)
   Alcotest.(check bool)
     "no decision -> not oracle-paused"
-    (Dashboard_ui.Holdings.oracle_inactive (strategy_json ()))
+    (Dashboard_ui.Holdings.oracle_inactive (strategy_of_json (strategy_json ())))
     false;
   (* Oracle says ACTIVE -> not paused. *)
   Alcotest.(check bool)
     "active decision -> not oracle-paused"
-    (Dashboard_ui.Holdings.oracle_inactive (strategy_json ~oracle:(oracle_json true) ()))
+    (Dashboard_ui.Holdings.oracle_inactive
+       (strategy_of_json (strategy_json ~oracle:(oracle_json true) ())))
     false;
   (* Oracle says INACTIVE -> paused. *)
   Alcotest.(check bool)
     "inactive decision -> oracle-paused"
-    (Dashboard_ui.Holdings.oracle_inactive (strategy_json ~oracle:(oracle_json false) ()))
-    true;
-  (* A balance (non-strategy) entry has no oracle field at all. *)
-  Alcotest.(check bool)
-    "balance entry -> not oracle-paused"
     (Dashboard_ui.Holdings.oracle_inactive
-       (`Assoc [ "asset", `String "X"; "balance", `Float 1.0 ]))
-    false
+       (strategy_of_json (strategy_json ~oracle:(oracle_json false) ())))
+    true
 ;;
 
 let test_strategy_paused () =
@@ -47,23 +46,27 @@ let test_strategy_paused () =
      closed. *)
   Alcotest.(check bool)
     "quiet active grid -> running"
-    (Dashboard_ui.Holdings.strategy_paused (strategy_json ()))
+    (Dashboard_ui.Holdings.strategy_paused (strategy_of_json (strategy_json ())))
     false;
   Alcotest.(check bool)
     "capital-low grid -> paused"
-    (Dashboard_ui.Holdings.strategy_paused (strategy_json ~capital_low:true ()))
+    (Dashboard_ui.Holdings.strategy_paused
+       (strategy_of_json (strategy_json ~capital_low:true ())))
     true;
   Alcotest.(check bool)
     "oracle-INACTIVE grid -> paused (the fix)"
-    (Dashboard_ui.Holdings.strategy_paused (strategy_json ~oracle:(oracle_json false) ()))
+    (Dashboard_ui.Holdings.strategy_paused
+       (strategy_of_json (strategy_json ~oracle:(oracle_json false) ())))
     true;
   Alcotest.(check bool)
     "market closed -> paused"
-    (Dashboard_ui.Holdings.strategy_paused (strategy_json ~market_closed:true ()))
+    (Dashboard_ui.Holdings.strategy_paused
+       (strategy_of_json (strategy_json ~market_closed:true ())))
     true;
   Alcotest.(check bool)
     "oracle-ACTIVE grid -> running"
-    (Dashboard_ui.Holdings.strategy_paused (strategy_json ~oracle:(oracle_json true) ()))
+    (Dashboard_ui.Holdings.strategy_paused
+       (strategy_of_json (strategy_json ~oracle:(oracle_json true) ())))
     false
 ;;
 
@@ -177,22 +180,28 @@ let test_latency_page_render () =
   Latencies.set_page 0;
   Alcotest.(check bool)
     "CORE page renders"
-    (Notty.I.height (Latencies.render_latencies 180 json) > 0)
+    (Notty.I.height (Latencies.render_latencies 180 (Dashboard_ui.Snapshot.of_json json))
+     > 0)
     true;
   Alcotest.(check bool)
     "CORE page renders compact"
-    (Notty.I.height (Latencies.render_latencies 100 json) > 0)
+    (Notty.I.height (Latencies.render_latencies 100 (Dashboard_ui.Snapshot.of_json json))
+     > 0)
     true;
   Latencies.set_page 1;
   Alcotest.(check bool)
     "NETWORK page renders"
-    (Notty.I.height (Latencies.render_latencies 180 json) > 0)
+    (Notty.I.height (Latencies.render_latencies 180 (Dashboard_ui.Snapshot.of_json json))
+     > 0)
     true;
   Latencies.set_page 0;
   (* A snapshot with no latency map renders nothing. *)
   Alcotest.(check bool)
     "no latencies renders empty"
-    (Notty.I.height (Latencies.render_latencies 180 (`Assoc [ "timestamp", `Float 1.0 ]))
+    (Notty.I.height
+       (Latencies.render_latencies
+          180
+          (Dashboard_ui.Snapshot.of_json (`Assoc [ "timestamp", `Float 1.0 ])))
      = 0)
     true
 ;;
@@ -302,12 +311,18 @@ let test_latency_persistence () =
   let open Dashboard_ui in
   Latencies.set_page 1;
   (* Fresh window populates the persistence cache. *)
-  ignore (Latencies.render_latencies 180 (ping_json "AAA/USDC" ~fresh:true));
+  ignore
+    (Latencies.render_latencies
+       180
+       (Dashboard_ui.Snapshot.of_json (ping_json "AAA/USDC" ~fresh:true)));
   (* An idle window for the same symbol keeps the last measured values on
      screen instead of reverting to "idle" (short-lived metrics like ping
      stay visible between windows). *)
   let persisted =
-    render_to_text (Latencies.render_latencies 180 (ping_json "AAA/USDC" ~fresh:false))
+    render_to_text
+      (Latencies.render_latencies
+         180
+         (Dashboard_ui.Snapshot.of_json (ping_json "AAA/USDC" ~fresh:false)))
   in
   Alcotest.(check bool)
     "idle window persists the last value"
@@ -319,7 +334,10 @@ let test_latency_persistence () =
     true;
   (* A symbol that was never measured still shows idle. *)
   let never =
-    render_to_text (Latencies.render_latencies 180 (ping_json "BBB/USDC" ~fresh:false))
+    render_to_text
+      (Latencies.render_latencies
+         180
+         (Dashboard_ui.Snapshot.of_json (ping_json "BBB/USDC" ~fresh:false)))
   in
   Alcotest.(check bool)
     "unmeasured symbol still shows idle"

@@ -19,6 +19,11 @@ let get_conduit_ctx = Kraken_common_types.get_conduit_ctx
 let orderbook_depth = Kraken_common_types.default_orderbook_depth
 let ring_buffer_size = Kraken_common_types.default_ring_buffer_size_orderbook
 
+(** Bound on the TLS + WebSocket upgrade handshake: a half-open TCP
+    connection during the handshake would otherwise block the reconnect
+    (which runs on the main Lwt loop) indefinitely. *)
+let ws_connect_timeout_s = 20.0
+
 (** Atomic flag indicating whether cleanup handlers have been initialized. *)
 let cleanup_handlers_started = Atomic.make false
 
@@ -1504,7 +1509,8 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   in
   let client = `TLS (`Hostname "ws.kraken.com", `IP ip, `Port 443) in
   let ctx = get_conduit_ctx () in
-  Websocket_lwt_unix.connect ~ctx client uri
+  Lwt_unix.with_timeout ws_connect_timeout_s (fun () ->
+    Websocket_lwt_unix.connect ~ctx client uri)
   >>= fun conn ->
   Lwt_mutex.with_lock state.mutex (fun () ->
     state.active_conn <- Some conn;

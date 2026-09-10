@@ -481,7 +481,10 @@ let connect _token : Websocket_lwt_unix.conn Lwt.t =
   in
   let client = `TLS (`Hostname "ws-auth.kraken.com", `IP ip, `Port 443) in
   let ctx = get_conduit_ctx () in
-  Websocket_lwt_unix.connect ~ctx client uri
+  (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP connection
+     during the handshake would otherwise block the reconnect (which runs on
+     the main Lwt loop) indefinitely. *)
+  Lwt_unix.with_timeout 20.0 (fun () -> Websocket_lwt_unix.connect ~ctx client uri)
   >>= fun conn ->
   Logging.debug ~section "Trading WebSocket connection established";
   Lwt.return conn

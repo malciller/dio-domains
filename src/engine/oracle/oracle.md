@@ -169,6 +169,9 @@ For each strategy `s`:
 `P_funded = s.current * (1.0 - s.grid_interval / 100.0)^k`
 `D_surv = (s.current - P_funded) / s.current = 1.0 - (1.0 - s.grid_interval / 100.0)^k`
 
+`P_funded` (the deepest rung actually funded - the exhaustion price) is
+reported alongside `D_surv` in the decision record and the dashboard.
+
 For inactive strategies:
 `D_surv = 0.0`
 

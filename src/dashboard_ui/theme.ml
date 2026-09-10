@@ -225,15 +225,55 @@ let format_latency_us f =
     distinctly from microsecond cells. *)
 let is_sub_us f = f > 0.0 && f < 1.0
 
-let utf8_len s =
-  let len = ref 0 in
-  for i = 0 to String.length s - 1 do
-    if Char.code s.[i] land 0xC0 <> 0x80 then incr len
-  done;
-  !len
+(** Display width of a string as Notty renders it. Pure ASCII is the fast
+    path; anything else defers to Notty's Uucp-backed grapheme width so wide
+    glyphs and emoji align with the renderer instead of drifting. *)
+let display_width s =
+  let n = String.length s in
+  let rec ascii i =
+    i >= n || (Char.code (String.unsafe_get s i) land 0x80 = 0 && ascii (i + 1))
+  in
+  if ascii 0 then n else I.width (I.string A.empty s)
 ;;
 
-let truncate_string n s = if utf8_len s <= n then s else String.sub s 0 (n - 1) ^ "."
+let utf8_len = display_width
+
+(** Truncate to at most [n] display columns, appending "." when shortened.
+    Cuts on UTF-8 codepoint boundaries so it never emits a partial glyph. *)
+let truncate_string n s =
+  if display_width s <= n
+  then s
+  else (
+    let buf = Buffer.create (max 0 n) in
+    let width = ref 0 in
+    let i = ref 0 in
+    let len = String.length s in
+    while !i < len && !width < n - 1 do
+      let c = Char.code (String.unsafe_get s !i) in
+      let clen =
+        if c < 0x80 then 1 else if c < 0xE0 then 2 else if c < 0xF0 then 3 else 4
+      in
+      let clen = min clen (len - !i) in
+      let piece = String.sub s !i clen in
+      Buffer.add_string buf piece;
+      width := !width + display_width piece;
+      i := !i + clen
+    done;
+    Buffer.add_char buf '.';
+    Buffer.contents buf)
+;;
+
+(* Repeat a UTF-8 string [n] times without building an intermediate list. *)
+let repeat_str s n =
+  let n = max 0 n in
+  let buf = Buffer.create (String.length s * n) in
+  for _ = 1 to n do
+    Buffer.add_string buf s
+  done;
+  Buffer.contents buf
+;;
+
+let repeat_char c n = repeat_str (String.make 1 c) n
 
 (* -------------------------------------------------------------------------- *)
 (* Multi-Theme Palette System                                                 *)
@@ -1367,8 +1407,8 @@ let render_progress_bar w ratio attr =
   let fill_w = int_of_float (float (max 0 (w - 2)) *. ratio) in
   let fill_w = max 0 (min (w - 2) fill_w) in
   let empty_w = w - 2 - fill_w in
-  let fill_str = String.concat "" (List.init fill_w (fun _ -> "⣿")) in
-  let empty_str = String.concat "" (List.init empty_w (fun _ -> "─")) in
+  let fill_str = repeat_str "⣿" fill_w in
+  let empty_str = repeat_str "─" empty_w in
   I.hcat
     [ I.string t.a_border "["
     ; I.string attr fill_str
@@ -1399,12 +1439,15 @@ let render_sparkline w data max_val attr_fn =
 
 (* Gradient utilities for 3D/shaded aesthetics *)
 
-let color_blend (r1, g1, b1) (r2, g2, b2) ratio =
+let blend_rgb (r1, g1, b1) (r2, g2, b2) ratio =
   let clamp x = max 0 (min 255 x) in
-  let r = r1 + int_of_float (float (r2 - r1) *. ratio) in
-  let g = g1 + int_of_float (float (g2 - g1) *. ratio) in
-  let b = b1 + int_of_float (float (b2 - b1) *. ratio) in
-  A.rgb_888 ~r:(clamp r) ~g:(clamp g) ~b:(clamp b)
+  let mix v1 v2 = v1 + int_of_float (float (v2 - v1) *. ratio) in
+  clamp (mix r1 r2), clamp (mix g1 g2), clamp (mix b1 b2)
+;;
+
+let color_blend a b ratio =
+  let r, g, b = blend_rgb a b ratio in
+  A.rgb_888 ~r ~g ~b
 ;;
 
 let section_title ?title_attr w label =
@@ -1455,10 +1498,8 @@ let render_proximity_slider w pos_pct_opt =
   match pos_pct_opt with
   | None ->
     let mid_w = inner_w / 2 in
-    let left_dashes = String.concat "" (List.init mid_w (fun _ -> "─")) in
-    let right_dashes =
-      String.concat "" (List.init (inner_w - 1 - mid_w) (fun _ -> "─"))
-    in
+    let left_dashes = repeat_str "─" mid_w in
+    let right_dashes = repeat_str "─" (inner_w - 1 - mid_w) in
     I.hcat
       [ I.string t.a_border "├"
       ; I.string t.a_dim left_dashes
@@ -1481,9 +1522,9 @@ let render_proximity_slider w pos_pct_opt =
     in
     I.hcat
       [ I.string t.a_green "┠"
-      ; I.string t.a_green (String.concat "" (List.init left_w (fun _ -> "━")))
+      ; I.string t.a_green (repeat_str "━" left_w)
       ; I.string dot_attr "◈"
-      ; I.string t.a_red (String.concat "" (List.init right_w (fun _ -> "━")))
+      ; I.string t.a_red (repeat_str "━" right_w)
       ; I.string t.a_red "┨"
       ]
 ;;
@@ -1497,9 +1538,7 @@ let render_card w title content_rows =
   let top_bar =
     I.hcat
       [ title_img
-      ; I.string
-          A.(fg t.c_border ++ bg t.c_bg)
-          (String.concat "" (List.init fill_w (fun _ -> "─")))
+      ; I.string A.(fg t.c_border ++ bg t.c_bg) (repeat_str "─" fill_w)
       ; I.string A.(fg t.c_border ++ bg t.c_bg) "╮"
       ]
   in
@@ -1519,9 +1558,7 @@ let render_card w title content_rows =
   let bot_bar =
     I.hcat
       [ I.string A.(fg t.c_border ++ bg t.c_bg) " ╰"
-      ; I.string
-          A.(fg t.c_border ++ bg t.c_bg)
-          (String.concat "" (List.init bot_fill (fun _ -> "─")))
+      ; I.string A.(fg t.c_border ++ bg t.c_bg) (repeat_str "─" bot_fill)
       ; I.string A.(fg t.c_border ++ bg t.c_bg) "╯"
       ]
   in
@@ -1531,14 +1568,6 @@ let render_card w title content_rows =
 (* -------------------------------------------------------------------------- *)
 (* Theme Selector Modal Dialog with Windowed Scrolling                        *)
 (* -------------------------------------------------------------------------- *)
-
-let repeat_str s n =
-  let buf = Buffer.create (String.length s * max 0 n) in
-  for _ = 1 to max 0 n do
-    Buffer.add_string buf s
-  done;
-  Buffer.contents buf
-;;
 
 let render_theme_modal ~target_w ~target_h ~cursor_idx =
   let t = !active_theme_ref in

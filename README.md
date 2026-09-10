@@ -328,7 +328,10 @@ runway this asset has actually walked?"
 - **Survival replay**: a candidate `(grid_interval, buy_qty)` walks the
   funded depth geometrically, paying each buy plus venue fees;
   `d_surv` is the fraction of that depth survived before the quote runs out
-  (>= 1.0 means fully funded).
+  (>= 1.0 means fully funded). The exhaustion price - the deepest rung
+  fillable with available capital - is reported alongside it: the
+  venue-simulated shared-capital bottom rung (`P_funded`) for active
+  strategies, the single-asset replay's exhaustion point for inactive ones.
 - **Parameter search**: `buy_qty` within `[qty, qty * qty_cap_mult]`,
   `grid_interval` within `[gi_min, gi_max]` (the strategy entry's bounds).
   Branches, in order: *Unreachable* (no candidate meets the funded-depth

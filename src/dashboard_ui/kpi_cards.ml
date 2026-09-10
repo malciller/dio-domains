@@ -25,12 +25,10 @@ let render_card_row w cards =
        let title_img = I.string A.(fg t.c_title ++ bg t.c_bg ++ st bold) title_str in
        let title_len = I.width title_img in
        let dash_count = max 0 (iw + 1 - title_len) in
-       let dashes =
-         I.string
-           A.(fg t.c_border ++ bg t.c_bg)
-           (String.concat "" (List.init dash_count (fun _ -> "─")))
+       let dashes = I.string A.(fg t.c_border ++ bg t.c_bg) (repeat_str "─" dash_count) in
+       let div_top =
+         I.string A.(fg t.c_border ++ bg t.c_bg) (if is_last then "╮" else "┬")
        in
-       let div_top = I.string A.(fg t.c_border ++ bg t.c_bg) (if is_last then "╮" else "┬") in
        top_imgs := !top_imgs @ [ title_img; dashes; div_top ];
        (* Build the two body rows for this card. *)
        let div_mid = I.string A.(fg t.c_border ++ bg t.c_bg) "│" in
@@ -44,106 +42,75 @@ let render_card_row w cards =
        body_row2_imgs := !body_row2_imgs @ [ c_r2 ];
        (* Build the bottom bar piece for this card. *)
        let bot_dashes =
-         I.string
-           A.(fg t.c_border ++ bg t.c_bg)
-           (String.concat "" (List.init (iw + 1) (fun _ -> "─")))
+         I.string A.(fg t.c_border ++ bg t.c_bg) (repeat_str "─" (iw + 1))
        in
-       let div_bot = I.string A.(fg t.c_border ++ bg t.c_bg) (if is_last then "╯" else "┴") in
+       let div_bot =
+         I.string A.(fg t.c_border ++ bg t.c_bg) (if is_last then "╯" else "┴")
+       in
        bot_imgs := !bot_imgs @ [ bot_dashes; div_bot ])
     cards;
   I.vcat
     [ I.hcat !top_imgs; I.hcat !body_row1_imgs; I.hcat !body_row2_imgs; I.hcat !bot_imgs ]
 ;;
 
-let render_kpi_cards w json =
+let render_kpi_cards w (s : Snapshot.t) =
   let t = Theme.current () in
-  let strats =
-    match json |?> "strategies" with
-    | `Assoc l -> l
-    | _ -> []
-  in
-  let all_balances = json |?> "all_balances" |> to_list_d in
+  let strats = s.strategies in
+  let all_balances = s.balances in
   let total_hold_strats =
     List.fold_left
-      (fun hv_acc (_sym, data) ->
-         let market = data |?> "market" in
-         let bid = market |?> "bid" |> to_float_d 0.0 in
-         let ask = market |?> "ask" |> to_float_d 0.0 in
-         let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
-         let base_bal = market |?> "base_balance" |> to_float_d 0.0 in
-         hv_acc +. (base_bal *. mid))
+      (fun hv_acc (_sym, (st : Snapshot.strategy)) ->
+         hv_acc +. (st.market.base_balance *. st.market.mid))
       0.0
       strats
   in
   let total_hold_bals, total_quote_val =
     List.fold_left
-      (fun (hv_acc, q_acc) bal_json ->
-         let balance = bal_json |?> "balance" |> to_float_d 0.0 in
-         let asset = bal_json |?> "asset" |> to_string_d "?" in
-         if balance <= 0.0
+      (fun (hv_acc, q_acc) (b : Snapshot.balance) ->
+         if b.balance <= 0.0
          then hv_acc, q_acc
-         else (
-           let is_quote =
-             asset = "USD"
-             || asset = "USDC"
-             || asset = "USDT"
-             || asset = "ZUSD"
-             || asset = "USDe"
-           in
-           if is_quote
-           then hv_acc, q_acc +. balance
-           else (
-             let bid = bal_json |?> "bid" |> to_float_d 0.0 in
-             let ask = bal_json |?> "ask" |> to_float_d 0.0 in
-             let mid =
-               if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask
-             in
-             hv_acc +. (balance *. mid), q_acc)))
+         else if Snapshot.is_quote_asset b.asset
+         then hv_acc, q_acc +. b.balance
+         else hv_acc +. (b.balance *. b.mid), q_acc)
       (0.0, 0.0)
       all_balances
   in
   let total_hold_val = total_hold_strats +. total_hold_bals in
   let net_worth = total_hold_val +. total_quote_val in
+  (* Animate headline money so updates roll rather than snap. Cheap now that
+     the renderer transmits only changed rows. *)
+  let net_worth_t = Anim.tween ~key:"kpi.networth" ~target:net_worth ~tau:0.35 in
+  let cash_t = Anim.tween ~key:"kpi.cash" ~target:total_quote_val ~tau:0.35 in
   let c1_row1 =
-    I.hcat [ col 10 t.a_dim "NET WORTH"; col_right 12 t.a_bright (format_usd net_worth) ]
+    I.hcat
+      [ col 10 t.a_dim "NET WORTH"; col_right 12 t.a_bright (format_usd net_worth_t) ]
   in
   (* The PORTFOLIO card shows cash on the second line: accumulated value
      already has its own slot in the HOLDINGS & STRATEGY summary bar. *)
   let c1_row2 =
-    I.hcat [ col 10 t.a_dim "CASH"; col_right 12 t.a_cyan (format_usd total_quote_val) ]
+    I.hcat [ col 10 t.a_dim "CASH"; col_right 12 t.a_cyan (format_usd cash_t) ]
   in
   let card1 = "PORTFOLIO", c1_row1, c1_row2 in
-  let uptime = json |?> "uptime_s" |> to_float_d 0.0 in
-  let recent_fills = json |?> "recent_fills" |> to_list_d in
-  let lats =
-    match json |?> "latencies" with
-    | `Assoc l -> l
-    | _ -> []
-  in
-  let snapshot_ts = json |?> "timestamp" |> to_float_d 0.0 in
+  let uptime = s.uptime_s in
+  let recent_fills = s.fills in
+  let lats = s.latencies in
+  let snapshot_ts = s.timestamp in
   (* Classify strategy activity from consistent windows: a strategy is
      active when it ran this window and idle when it is running with a
      fresh cycle window but executed nothing (the S1/S2 states). *)
   let strat_active, strat_idle, exec_per_sec =
     List.fold_left
-      (fun (a, i, e) (_sym, metrics) ->
-         let mlist =
-           match metrics with
-           | `Assoc l -> l
-           | _ -> []
-         in
-         match List.assoc_opt "strategy" mlist with
-         | Some data ->
-           let window_end = data |?> "window_end" |> to_float_d 0.0 in
+      (fun (a, i, e) (_sym, (metrics : (string * Snapshot.latency_metric) list)) ->
+         match List.assoc_opt "strategy" metrics with
+         | Some m ->
            let fresh =
-             window_end > 0.0 && snapshot_ts > 0.0 && snapshot_ts -. window_end < 15.0
+             m.window_end > 0.0 && snapshot_ts > 0.0 && snapshot_ts -. m.window_end < 15.0
            in
            if not fresh
            then a, i, e
-           else (
-             let execs = data |?> "executions" |> to_int_d 0 in
-             let eps = data |?> "executions_per_sec" |> to_float_d 0.0 in
-             if execs > 0 then a + 1, i, e +. eps else a, i + 1, e)
+           else if m.executions > 0
+           then a + 1, i, e +. m.executions_per_sec
+           else a, i + 1, e
          | None -> a, i, e)
       (0, 0, 0.0)
       lats
@@ -176,25 +143,14 @@ let render_kpi_cards w json =
      of the most recently completed oracle pass. The reading is fresh when a
      pass window exists within the refresh horizon, since the oracle
      re-analyzes roughly every 5 minutes. *)
-  let oracle_lat =
-    match json |?> "oracle_latency" with
-    | `Assoc l ->
-      (match List.assoc_opt "pass" l with
-       | Some data -> Some data
-       | None -> None)
-    | _ -> None
-  in
+  let oracle_lat = List.assoc_opt "pass" s.oracle_latency in
   let oracle_p50, oracle_p99, oracle_fresh =
     match oracle_lat with
-    | Some data ->
-      let window_end = data |?> "window_end" |> to_float_d 0.0 in
-      let samples = data |?> "samples" |> to_int_d 0 in
+    | Some m ->
       let fresh =
-        window_end > 0.0 && snapshot_ts > 0.0 && snapshot_ts -. window_end < 600.0
+        m.window_end > 0.0 && snapshot_ts > 0.0 && snapshot_ts -. m.window_end < 600.0
       in
-      ( data |?> "p50" |> to_float_d 0.0
-      , data |?> "p99" |> to_float_d 0.0
-      , fresh && samples > 0 )
+      m.p50, m.p99, fresh && m.samples > 0
     | None -> 0.0, 0.0, false
   in
   (* Oracle pass thresholds: a pass normally completes in a few seconds
@@ -224,17 +180,19 @@ let render_kpi_cards w json =
       ]
   in
   let card3 = "LATENCY", c3_row1, c3_row2 in
-  let mem = json |?> "memory" in
-  let heap_mb = mem |?> "heap_mb" |> to_int_d 0 in
-  let live_kb = mem |?> "live_kb" |> to_int_d 0 in
-  let free_kb = mem |?> "free_kb" |> to_int_d 0 in
+  let mem = s.memory in
+  let heap_mb = mem.heap_mb in
+  let live_kb = mem.live_kb in
+  let free_kb = mem.free_kb in
   let total_kb = float_of_int (live_kb + free_kb) in
   let live_pct =
     if total_kb > 0.0 then float_of_int live_kb /. total_kb *. 100.0 else 0.0
   in
   let c4_row1 =
     I.hcat
-      [ col 10 t.a_dim "HEAP SIZE"; col_right 12 t.a_yellow (Printf.sprintf "%d MB" heap_mb) ]
+      [ col 10 t.a_dim "HEAP SIZE"
+      ; col_right 12 t.a_yellow (Printf.sprintf "%d MB" heap_mb)
+      ]
   in
   let c4_row2 =
     I.hcat

@@ -582,6 +582,13 @@ let () =
   setup_signal_handlers ();
   (* Register fatal signal handlers (SIGSEGV, SIGABRT, etc.) for crash diagnostics. *)
   setup_fatal_signal_handlers ();
+  (* Main-loop watchdog: the whole engine (feeds, order processing, health
+     monitor, dashboard server, per-asset wakeups) hinges on the main Lwt
+     event loop, and a loop wedged in an unbounded blocking op previously
+     froze the entire process silently. The watchdog thread detects a lost
+     main-loop heartbeat and force-exits for supervised restart. *)
+  Concurrency.Main_loop_watchdog.start ();
+  Lwt.async Concurrency.Main_loop_watchdog.beat_loop;
   (* Install Lwt async exception hook. *)
   setup_lwt_exception_handler ();
   Logging.info ~section:"main" "Starting Dio Trading Engine...";

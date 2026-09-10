@@ -5,50 +5,47 @@ open Theme
     Scrolls recent filled orders horizontally across the screen below the holdings.
 *)
 
-let local_fills : Yojson.Basic.t list ref = ref []
+let local_fills : Snapshot.fill list ref = ref []
 let capacity = 10
 let initialized = ref false
 
-let render_fills w json =
-  let t = Theme.current () in
-  let engine_fills = json |?> "recent_fills" |> to_list_d in
-  (* Merge engine fills into local_fills on every render cycle.
-     On startup, the engine seeds historical fills into the ring buffer
-     so engine_fills is non-empty from the first snapshot. New live fills
-     are detected by timestamp comparison and prepended. *)
-  let () =
-    if not !initialized
+(** Merge engine fills into [local_fills]. On startup the engine seeds
+    historical fills into its ring buffer, so the list is non-empty from the
+    first snapshot. New live fills are detected by timestamp comparison and
+    prepended. *)
+let merge_engine_fills (engine_fills : Snapshot.fill list) =
+  if not !initialized
+  then (
+    if engine_fills <> []
     then (
-      if engine_fills <> []
-      then (
-        local_fills := [ List.hd engine_fills ];
-        initialized := true))
-    else (
-      let latest_ts =
-        match !local_fills with
-        | [] -> 0.0
-        | f :: _ -> f |?> "timestamp" |> to_float_d 0.0
+      local_fills := [ List.hd engine_fills ];
+      initialized := true))
+  else (
+    let latest_ts =
+      match !local_fills with
+      | [] -> 0.0
+      | f :: _ -> f.timestamp
+    in
+    let new_fills =
+      List.filter (fun (f : Snapshot.fill) -> f.timestamp > latest_ts) engine_fills
+    in
+    if new_fills <> []
+    then (
+      let combined = new_fills @ !local_fills in
+      let rec take n l acc =
+        if n <= 0
+        then List.rev acc
+        else (
+          match l with
+          | [] -> List.rev acc
+          | h :: t -> take (n - 1) t (h :: acc))
       in
-      let new_fills =
-        List.filter
-          (fun f ->
-             let ts = f |?> "timestamp" |> to_float_d 0.0 in
-             ts > latest_ts)
-          engine_fills
-      in
-      if new_fills <> []
-      then (
-        let combined = new_fills @ !local_fills in
-        let rec take n l acc =
-          if n <= 0
-          then List.rev acc
-          else (
-            match l with
-            | [] -> List.rev acc
-            | h :: t -> take (n - 1) t (h :: acc))
-        in
-        local_fills := take capacity combined []))
-  in
+      local_fills := take capacity combined []))
+;;
+
+let render_fills w (snapshot : Snapshot.t) =
+  let t = Theme.current () in
+  merge_engine_fills snapshot.fills;
   let fills = !local_fills in
   if fills = []
   then I.empty
@@ -56,15 +53,15 @@ let render_fills w json =
     (
     let chunks =
       List.map
-        (fun bal_json ->
-           let venue = bal_json |?> "venue" |> to_string_d "?" in
-           let symbol = bal_json |?> "symbol" |> to_string_d "?" in
-           let side = bal_json |?> "side" |> to_string_d "?" |> String.uppercase_ascii in
-           let amount = bal_json |?> "amount" |> to_float_d 0.0 in
-           let price = bal_json |?> "fill_price" |> to_float_d 0.0 in
-           let timestamp = bal_json |?> "timestamp" |> to_float_d 0.0 in
+        (fun (f : Snapshot.fill) ->
+           let venue = f.venue in
+           let symbol = f.symbol in
+           let side = String.uppercase_ascii f.side in
+           let amount = f.amount in
+           let price = f.fill_price in
+           let timestamp = f.timestamp in
            (* Format the time elapsed since the fill as a compact
-               duration. *)
+              duration. *)
            let now = Unix.gettimeofday () in
            let diff = max 0.0 (now -. timestamp) in
            let time_str =
@@ -75,7 +72,9 @@ let render_fills w json =
              else Printf.sprintf "%.1fh" (diff /. 3600.0)
            in
            let side_attr =
-             if side = "BUY" then A.(fg t.c_green ++ st bold) else A.(fg t.c_red ++ st bold)
+             if side = "BUY"
+             then A.(fg t.c_green ++ st bold)
+             else A.(fg t.c_red ++ st bold)
            in
            let sym_attr = exch_sym_attr (String.lowercase_ascii venue) in
            let amount_str = format_qty amount in
@@ -107,42 +106,9 @@ let render_fills w json =
     I.(padded </> I.string A.(bg t.c_bg) (String.make w ' ')))
 ;;
 
-let render_fills_card w json =
+let render_fills_card w (snapshot : Snapshot.t) =
   let t = Theme.current () in
-  let engine_fills = json |?> "recent_fills" |> to_list_d in
-  let () =
-    if not !initialized
-    then (
-      if engine_fills <> []
-      then (
-        local_fills := [ List.hd engine_fills ];
-        initialized := true))
-    else (
-      let latest_ts =
-        match !local_fills with
-        | [] -> 0.0
-        | f :: _ -> f |?> "timestamp" |> to_float_d 0.0
-      in
-      let new_fills =
-        List.filter
-          (fun f ->
-             let ts = f |?> "timestamp" |> to_float_d 0.0 in
-             ts > latest_ts)
-          engine_fills
-      in
-      if new_fills <> []
-      then (
-        let combined = new_fills @ !local_fills in
-        let rec take n l acc =
-          if n <= 0
-          then List.rev acc
-          else (
-            match l with
-            | [] -> List.rev acc
-            | h :: t -> take (n - 1) t (h :: acc))
-        in
-        local_fills := take capacity combined []))
-  in
+  merge_engine_fills snapshot.fills;
   let fills = !local_fills in
   if fills = []
   then render_card w "LIVE FILLS" [ I.string t.a_dim "No recent fills recorded" ]
@@ -150,13 +116,13 @@ let render_fills_card w json =
     let now = Unix.gettimeofday () in
     let fill_rows =
       List.map
-        (fun f_json ->
-           let venue = f_json |?> "venue" |> to_string_d "?" in
-           let symbol = f_json |?> "symbol" |> to_string_d "?" in
-           let side = f_json |?> "side" |> to_string_d "?" |> String.uppercase_ascii in
-           let amount = f_json |?> "amount" |> to_float_d 0.0 in
-           let price = f_json |?> "fill_price" |> to_float_d 0.0 in
-           let timestamp = f_json |?> "timestamp" |> to_float_d 0.0 in
+        (fun (f : Snapshot.fill) ->
+           let venue = f.venue in
+           let symbol = f.symbol in
+           let side = String.uppercase_ascii f.side in
+           let amount = f.amount in
+           let price = f.fill_price in
+           let timestamp = f.timestamp in
            let diff = max 0.0 (now -. timestamp) in
            let time_str =
              if diff < 60.0

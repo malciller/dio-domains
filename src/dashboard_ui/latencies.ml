@@ -18,7 +18,7 @@ open Theme
 *)
 
 let history_len = 15
-let hist_tbl : (string, float array) Hashtbl.t = Hashtbl.create 32
+let hist_tbl : (string * string, float array) Hashtbl.t = Hashtbl.create 32
 let hist_max = 128
 
 (** Active latency page (index into [metric_pages]). Switched with ←/→ from
@@ -43,7 +43,7 @@ let ema_smooth (arr : float array) ~alpha =
     sparklines repopulate within seconds. *)
 let update_hist symbol metric p99 =
   if Hashtbl.length hist_tbl > hist_max then Hashtbl.clear hist_tbl;
-  let key = symbol ^ "\x00" ^ metric in
+  let key = symbol, metric in
   let arr =
     try Hashtbl.find hist_tbl key with
     | Not_found ->
@@ -65,10 +65,31 @@ let update_hist symbol metric p99 =
     refreshed by windows with samples; a window with zero samples keeps the
     previous values rendered dimmed until a fresh one arrives. Evicts
     everything when the table outgrows [last_vals_max]. *)
-let last_vals : (string, float * float * float) Hashtbl.t = Hashtbl.create 64
+let last_vals : (string * string, float * float * float) Hashtbl.t = Hashtbl.create 64
 
 let last_vals_max = 256
-let last_value symbol metric = Hashtbl.find_opt last_vals (symbol ^ "\x00" ^ metric)
+let last_value symbol metric = Hashtbl.find_opt last_vals (symbol, metric)
+
+(** Current rolling p99 history for a (symbol, metric), or a zeroed array. *)
+let hist_of symbol metric =
+  match Hashtbl.find_opt hist_tbl (symbol, metric) with
+  | Some a -> a
+  | None -> Array.make history_len 0.0
+;;
+
+(** Advance the sparkline history once per snapshot, at the data cadence.
+    This must NOT run on every render: the frame clock runs at up to 30 fps,
+    and shifting the history per frame would scroll the sparkline absurdly
+    fast and make the section differ every frame (re-emitting it endlessly). *)
+let ingest (snapshot : Snapshot.t) =
+  List.iter
+    (fun (_symbol, metrics) ->
+       List.iter
+         (fun (label, (m : Snapshot.latency_metric)) ->
+            if m.samples > 0 then ignore (update_hist _symbol label m.p99))
+         metrics)
+    snapshot.latencies
+;;
 
 (** Freshness tolerance per metric label: the oracle windows are published
     once per analysis pass (~5 min cadence + jitter), everything else every
@@ -168,7 +189,9 @@ let take_first n l =
     switch keys. *)
 let render_latency_title w =
   let t = Theme.current () in
-  let left = I.string A.(fg t.c_title ++ bg t.c_bg ++ st bold) " ╭── ENGINE LATENCY ── " in
+  let left =
+    I.string A.(fg t.c_title ++ bg t.c_bg ++ st bold) " ╭── ENGINE LATENCY ── "
+  in
   let tabs =
     List.mapi
       (fun i p ->
@@ -194,19 +217,12 @@ let render_latency_title w =
   I.hcat ((prefix :: gradient_lines) @ [ end_border ])
 ;;
 
-let render_latencies w json =
+let render_latencies w (snapshot : Snapshot.t) =
   let t = Theme.current () in
-  let lats =
-    match json |?> "latencies" with
-    | `Assoc l -> l
-    | _ -> []
-  in
+  let lats = snapshot.latencies in
   (* Build a symbol -> exchange lookup table from the strategies. *)
   let sym_to_exch =
-    match json |?> "strategies" with
-    | `Assoc l ->
-      List.map (fun (sym, data) -> sym, data |?> "exchange" |> to_string_d "") l
-    | _ -> []
+    List.map (fun (sym, (s : Snapshot.strategy)) -> sym, s.exchange) snapshot.strategies
   in
   let exch_of_symbol sym =
     match List.assoc_opt sym sym_to_exch with
@@ -219,22 +235,16 @@ let render_latencies w json =
      running domains stay visible instead of flickering out between resets.
      Freshness is checked across ALL pages so rows stay stable when the user
      flips pages. *)
-  let snapshot_ts = json |?> "timestamp" |> to_float_d 0.0 in
+  let snapshot_ts = snapshot.timestamp in
   let all_page_labels = List.concat_map (fun p -> p.metrics) metric_pages in
-  let row_is_active (_symbol, metrics) =
-    let mlist =
-      match metrics with
-      | `Assoc l -> l
-      | _ -> []
-    in
+  let row_is_active (_symbol, (metrics : (string * Snapshot.latency_metric) list)) =
     List.exists
       (fun label ->
-         match List.assoc_opt label mlist with
-         | Some data ->
-           let window_end = data |?> "window_end" |> to_float_d 0.0 in
-           window_end > 0.0
+         match List.assoc_opt label metrics with
+         | Some m ->
+           m.window_end > 0.0
            && snapshot_ts > 0.0
-           && snapshot_ts -. window_end < freshness_tolerance label
+           && snapshot_ts -. m.window_end < freshness_tolerance label
          | None -> false)
       all_page_labels
   in
@@ -367,19 +377,10 @@ let render_latencies w json =
              in
              I.hcat (I.string a_dim (String.make empty_w ' ') :: blocks)
            in
-           let mlist =
-             match metrics with
-             | `Assoc l -> l
-             | _ -> []
-           in
+           let mlist = metrics in
            let find_metric label =
              match List.assoc_opt label mlist with
-             | Some data ->
-               let p50 = data |?> "p50" |> to_float_d 0.0 in
-               let p99 = data |?> "p99" |> to_float_d 0.0 in
-               let p999 = data |?> "p999" |> to_float_d 0.0 in
-               let samples = data |?> "samples" |> to_int_d 0 in
-               p50, p99, p999, samples
+             | Some (m : Snapshot.latency_metric) -> m.p50, m.p99, m.p999, m.samples
              | None -> 0.0, 0.0, 0.0, 0
            in
            let worst_sev =
@@ -399,7 +400,7 @@ let render_latencies w json =
                   let img =
                     if samples > 0
                     then (
-                      Hashtbl.replace last_vals (symbol ^ "\x00" ^ label) (p50, p99, p999);
+                      Hashtbl.replace last_vals (symbol, label) (p50, p99, p999);
                       let s50 = severity label p50 samples in
                       let s99 = max s50 (severity label p99 samples) in
                       let s999 = max s99 (severity label p999 samples) in
@@ -436,17 +437,16 @@ let render_latencies w json =
                   if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
                page_cols
            in
-           let _, trend_p99, _, trend_samples = find_metric page.trend_metric in
-           let trend_p99, trend_stale =
+           let _, _, _, trend_samples = find_metric page.trend_metric in
+           let trend_stale =
              if trend_samples > 0
-             then trend_p99, false
+             then false
              else (
                match last_value symbol page.trend_metric with
-               | Some (_, lp99, _) -> lp99, true
-               | None -> trend_p99, false)
+               | Some _ -> true
+               | None -> false)
            in
-           let t_arr = update_hist symbol page.trend_metric trend_p99 in
-           let t_smooth = ema_smooth t_arr ~alpha:0.5 in
+           let t_smooth = ema_smooth (hist_of symbol page.trend_metric) ~alpha:0.5 in
            let trend_spark =
              render_sparkline_local trend_col_w t_smooth page.trend_max_us (fun v ->
                if trend_stale
@@ -457,11 +457,9 @@ let render_latencies w json =
            let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
            let exec_s_cell =
              match List.assoc_opt "strategy" mlist with
-             | Some data ->
-               let eps = data |?> "executions_per_sec" |> to_float_d 0.0 in
-               let execs = data |?> "executions" |> to_int_d 0 in
-               if execs > 0
-               then col_right 7 a_bright (Printf.sprintf "%.1f/s" eps)
+             | Some (m : Snapshot.latency_metric) ->
+               if m.executions > 0
+               then col_right 7 a_bright (Printf.sprintf "%.1f/s" m.executions_per_sec)
                else col_right 7 a_dim "idle"
              | None -> col_right 7 a_dim "--"
            in

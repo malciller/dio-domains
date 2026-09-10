@@ -378,8 +378,7 @@ let handle_message_str ?on_auth_success ?on_auth_error content =
              in
              let close_p = j |> member "c" |> json_to_float in
              Logging.debug_f ~section "[%s] Bar close: %.2f" symbol close_p
-           | "heartbeat" ->
-             Logging.debug ~section "Alpaca Market Data WS heartbeat"
+           | "heartbeat" -> Logging.debug ~section "Alpaca Market Data WS heartbeat"
            | "success" ->
              let msg =
                j |> member "msg" |> to_string_option |> Option.value ~default:""
@@ -509,7 +508,10 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
        in
        let client = `TLS (`Hostname host, `IP ip, `Port port) in
        let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
-       Websocket_lwt_unix.connect ~ctx client uri
+       (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP
+          connection during the handshake would otherwise block the
+          reconnect (which runs on the main Lwt loop) indefinitely. *)
+       Lwt_unix.with_timeout 20.0 (fun () -> Websocket_lwt_unix.connect ~ctx client uri)
        >>= fun conn ->
        active_conn := Some conn;
        Logging.info_f

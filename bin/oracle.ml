@@ -93,6 +93,7 @@ let knobs_for ~(config : Dio_engine.Config.config option) ~(symbol : string)
 type row =
   { exchange : string
   ; symbol : string
+  ; current : float (** Live price used for the replay (0.0 when unusable). *)
   ; outcome : Dio_oracle.Oracle_pipeline.outcome option
   ; error : string
   }
@@ -122,6 +123,7 @@ let analyze_one
          Lwt.return
            { exchange = tc.exchange
            ; symbol = tc.symbol
+           ; current
            ; outcome = None
            ; error = "no usable close in history"
            }
@@ -167,27 +169,42 @@ let analyze_one
            Lwt.return
              { exchange = tc.exchange
              ; symbol = tc.symbol
+             ; current
              ; outcome = None
              ; error = "no references"
              }
          | Some o ->
            Lwt.return
-             { exchange = tc.exchange; symbol = tc.symbol; outcome = Some o; error = "" }))
+             { exchange = tc.exchange
+             ; symbol = tc.symbol
+             ; current
+             ; outcome = Some o
+             ; error = ""
+             }))
     (fun exn ->
        Lwt.return
          { exchange = tc.exchange
          ; symbol = tc.symbol
+         ; current = 0.0
          ; outcome = None
          ; error = Printexc.to_string exn
          })
 ;;
 
-let string_of_outcome (o : Dio_oracle.Oracle_pipeline.outcome) =
+let string_of_outcome (r : row) (o : Dio_oracle.Oracle_pipeline.outcome) =
+  let exhaust =
+    Dio_oracle.Oracle_core.exhaustion_price_of
+      ~current:r.current
+      ~funded_floor:o.runway.funded_floor
+      ~d_surv:o.resolution.d_surv
+  in
   Printf.sprintf
-    "%-18s %-11s d_surv %.3f | floor %12.6g ath %12.6g atl %12.6g mdd %5.1f%%"
+    "%-18s %-11s d_surv %.3f exhaust %12.6g | floor %12.6g ath %12.6g atl %12.6g mdd \
+     %5.1f%%"
     (Dio_oracle.Oracle_runtime.string_of_regime o.runway.regime)
     (Dio_oracle.Oracle_runtime.string_of_branch o.resolution.branch)
     o.resolution.d_surv
+    exhaust
     o.runway.floor_price
     o.refs.ath
     o.refs.atl
@@ -238,7 +255,7 @@ let print_table rows args =
            d.grid_interval
            d.buy_qty
            (sell_qty_of_args args)
-           (string_of_outcome o))
+           (string_of_outcome r o))
     rows
 ;;
 
@@ -258,8 +275,17 @@ let print_json rows args =
                 ; "buy_qty", `Float d.buy_qty
                 ; "sell_qty", `Float (sell_qty_of_args args)
                 ; "d_surv", `Float o.resolution.d_surv
-                ; "regime", `String (Dio_oracle.Oracle_runtime.string_of_regime o.runway.regime)
-                ; "branch", `String (Dio_oracle.Oracle_runtime.string_of_branch o.resolution.branch)
+                ; ( "exhaustion_price"
+                  , `Float
+                      (Dio_oracle.Oracle_core.exhaustion_price_of
+                         ~current:r.current
+                         ~funded_floor:o.runway.funded_floor
+                         ~d_surv:o.resolution.d_surv) )
+                ; ( "regime"
+                  , `String (Dio_oracle.Oracle_runtime.string_of_regime o.runway.regime) )
+                ; ( "branch"
+                  , `String
+                      (Dio_oracle.Oracle_runtime.string_of_branch o.resolution.branch) )
                 ; "floor_price", `Float o.runway.floor_price
                 ; "ath", `Float o.refs.ath
                 ; "atl", `Float o.refs.atl

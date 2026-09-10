@@ -196,6 +196,22 @@ let d_surv_of
     else Float.max 0.0 (Float.min 1.0 ((current -. !last_price) /. depth)))
 ;;
 
+(** The price of the deepest rung a candidate ladder can actually fill with
+    its quote - the exhaustion point behind [d_surv]. Inverts the survival
+    fraction against the funded depth: exhausted walks (d_surv in [0,1]) map
+    to a rung price in [funded_floor, current]; a surplus d_surv > 1 clamps
+    to the funded floor (the funded ladder's own last rung). A non-finite
+    d_surv (no funded depth below current) or d_surv <= 0 (not even the
+    first rung is affordable) exhausts at [current] itself. *)
+let exhaustion_price_of ~(current : float) ~(funded_floor : float) ~(d_surv : float)
+  : float
+  =
+  if (not (Float.is_finite d_surv)) || current <= 0.0 || current <= funded_floor
+  then current
+  else
+    Float.max funded_floor (current -. (Float.max 0.0 d_surv *. (current -. funded_floor)))
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Parameter search                                                   *)
 (* ------------------------------------------------------------------ *)
