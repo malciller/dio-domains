@@ -1045,6 +1045,82 @@ let evaluate_buy_leg
   !buy_attempted
 ;;
 
+(** Alpaca excess-inventory sweep.
+
+    The persisted sell-level file is the ladder of record: missing rungs are
+    restored at their recorded price/qty first. Only once the ladder is
+    COMPLETE (the caller gates on no missing rungs, no owed sell, nothing
+    in-flight) is the remaining sellable base EXCESS. Rather than leaving it
+    idle (the SMH/REMX/LIT accumulate-only failure) or dumping the whole
+    balance into a single order (why the non-Alpaca surplus sweep was disabled
+    here), the excess is routed to the TOP of the ladder: the highest-priced
+    rung in the tracker absorbs it, so the surplus is only offered back at the
+    best price.
+
+    [reserved_base] is never part of the sweep: [available] already excludes it
+    (it is not sellable), so the excess is computed from that reduced figure.
+
+    The top rung is amended to a larger quantity (a qty-only amend at the same
+    price, so its fill anchor is unchanged). *)
+let evaluate_excess_sweep
+      ~state
+      ~now
+      ~(asset : trading_config)
+      ~(available : float)
+      ~(min_notional : float)
+  =
+  match state.persisted_sell_levels with
+  | (top_price, _) :: _ when top_price > 0.0 ->
+    let min_order_size =
+      if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
+    in
+    let excess = Float.max 0.0 available in
+    if excess >= min_order_size -. 1e-9
+    then (
+      let top_open =
+        List.find_opt
+          (fun (oid, p, _q) ->
+             (not (String.starts_with ~prefix:"pending" oid))
+             && (abs_float (p -. top_price) <= top_price *. 0.0001
+                 || abs_float (p -. top_price) <= 1e-4))
+          state.open_sell_orders
+      in
+      match top_open with
+      | None -> ()
+      | Some (oid, top_open_price, top_open_qty) ->
+        let target_q = round_qty (top_open_qty +. excess) asset.symbol asset.exchange in
+        let delta = target_q -. top_open_qty in
+        if
+          delta >= min_order_size -. 1e-9
+          && (min_notional <= 0.0 || target_q *. top_open_price >= min_notional -. 1e-9)
+          && (not (InFlightAmendments.is_in_flight oid))
+          && (not (Hashtbl.mem state.amend_cooldowns oid))
+          && not (has_active_sell state)
+        then (
+          let order =
+            create_amend_order
+              oid
+              asset.symbol
+              Sell
+              target_q
+              (Some top_open_price)
+              true
+              Ladder
+              asset.exchange
+          in
+          ignore (push_order ~now ~state order);
+          Logging.info_f
+            ~section
+            "Excess inventory sweep for %s: amended top rung @ %.4f %.8f -> %.8f (+%.8f \
+             excess)"
+            asset.symbol
+            top_open_price
+            top_open_qty
+            target_q
+            delta))
+  | _ -> ()
+;;
+
 (** Evaluates buy-triggered and Alpaca-exclusive inventory-maintenance sell
     placement leg.
     [persisted_reconcile] is the (open_levels, missing_levels) split that
@@ -1342,7 +1418,13 @@ let evaluate_sell_leg
           List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) !missing_after_reconcile
         in
         match missing_sorted_desc with
-        | (tp, tq) :: _ when tq > 0.0 -> Some tp, Some tq
+        | (tp, tq) :: _ when tq > 0.0 ->
+          (* A missing rung is restored at its OWN recorded price/qty. Excess
+             inventory is never folded into a restore: it is swept to the top
+             of the ladder only once every rung is back (see
+             [evaluate_excess_sweep]), so a restore can never resurrect a dust
+             level or balloon a rung into the whole balance. *)
+          Some tp, Some tq
         | _ -> None, None)
       else None, None
     in
@@ -1679,6 +1761,28 @@ let evaluate_sell_leg
       (Float.max 0.0 inventory_basis)
       min_notional
       base_ref_price);
+  (* Alpaca excess-inventory sweep: the ladder is refilled first (every rung
+     restored from the tracker); only once NO rung is missing do we dump the
+     leftover sellable base onto the TOP rung as a qty-only amend, so the
+     surplus is offered at the best price instead of sitting idle. Runs after
+     the retry block so a blocked owed sell keeps its reservation and never
+     races the amend. [available_base] already excludes reserved_base. *)
+  if
+    ecfg.remaintain_expired_sells
+    && !missing_after_reconcile = []
+    && (not state.just_filled_buy)
+    && (not state.resuming_after_balance_flag)
+    && (not buy_attempted)
+    && (not !sell_pushed)
+    && (not (has_active_sell state))
+    && not (Float.is_nan asset_balance)
+  then
+    evaluate_excess_sweep
+      ~state
+      ~now
+      ~asset
+      ~available:(Float.max 0.0 available_base)
+      ~min_notional;
   state.resuming_after_balance_flag <- false
 ;;
 
