@@ -265,65 +265,80 @@ let send_with_retry ~webhook_url payload =
     batches fills into webhook payloads, and sends them with rate limiting. *)
 let consumer_loop ~webhook_url () =
   let read_pos = ref (Concurrency.Fill_event_bus.get_position ()) in
+  let done_p, done_u = Lwt.wait () in
   let rec loop () =
-    if !read_pos = Concurrency.Fill_event_bus.get_position ()
-    then
-      (* No new fills, wait for the condition variable to be signaled *)
-      Concurrency.Fill_event_bus.wait_for_fill () >>= fun () -> loop ()
-    else (
-      (* New fills available, drain them all *)
-      let fills = ref [] in
-      let new_pos =
-        Concurrency.Fill_event_bus.iter_since !read_pos (fun fill ->
-          fills := fill :: !fills)
-      in
-      read_pos := new_pos;
-      (* Drop stale fills (>5min old) to skip replayed historical fills on reconnect *)
-      let now = Unix.gettimeofday () in
-      let max_age = 300.0 in
-      let fills =
-        List.rev !fills
-        |> List.filter (fun (f : Concurrency.Fill_event_bus.fill_event) ->
-          let age = now -. f.timestamp in
-          if age > max_age
-          then (
-            Logging.debug_f
-              ~section
-              "Dropping stale fill for %s/%s (age=%.0fs)"
-              f.venue
-              f.symbol
-              age;
-            false)
-          else true)
-      in
-      if fills <> []
-      then (
-        Logging.debug_f
-          ~section
-          "Processing %d fill event(s) for Discord"
-          (List.length fills);
-        (* Split into batches of max_fills_per_message *)
-        let rec send_batches remaining =
-          match remaining with
-          | [] -> Lwt.return_unit
-          | _ ->
-            let batch, rest =
-              let rec take n acc = function
-                | [] -> List.rev acc, []
-                | _ when n = 0 -> List.rev acc, remaining
-                | x :: xs -> take (n - 1) (x :: acc) xs
-              in
-              take max_fills_per_message [] remaining
-            in
-            (match build_webhook_payload batch with
-             | Some payload ->
-               send_with_retry ~webhook_url payload >>= fun () -> send_batches rest
-             | None -> send_batches rest)
-        in
-        send_batches fills >>= fun () -> loop ())
-      else loop ())
+    Lwt.catch
+      (fun () ->
+         if !read_pos = Concurrency.Fill_event_bus.get_position ()
+         then (
+           (* No new fills, wait for the condition variable to be signaled *)
+           Concurrency.Fill_event_bus.wait_for_fill ()
+           >>= fun () ->
+           Lwt.async loop;
+           Lwt.return_unit)
+         else (
+           (* New fills available, drain them all *)
+           let fills = ref [] in
+           let new_pos =
+             Concurrency.Fill_event_bus.iter_since !read_pos (fun fill ->
+               fills := fill :: !fills)
+           in
+           read_pos := new_pos;
+           (* Drop stale fills (>5min old) to skip replayed historical fills on reconnect *)
+           let now = Unix.gettimeofday () in
+           let max_age = 300.0 in
+           let fills =
+             List.rev !fills
+             |> List.filter (fun (f : Concurrency.Fill_event_bus.fill_event) ->
+               let age = now -. f.timestamp in
+               if age > max_age
+               then (
+                 Logging.debug_f
+                   ~section
+                   "Dropping stale fill for %s/%s (age=%.0fs)"
+                   f.venue
+                   f.symbol
+                   age;
+                 false)
+               else true)
+           in
+           if fills <> []
+           then (
+             Logging.debug_f
+               ~section
+               "Processing %d fill event(s) for Discord"
+               (List.length fills);
+             (* Split into batches of max_fills_per_message *)
+             let rec send_batches remaining =
+               match remaining with
+               | [] -> Lwt.return_unit
+               | _ ->
+                 let batch, rest =
+                   let rec take n acc = function
+                     | [] -> List.rev acc, []
+                     | _ when n = 0 -> List.rev acc, remaining
+                     | x :: xs -> take (n - 1) (x :: acc) xs
+                   in
+                   take max_fills_per_message [] remaining
+                 in
+                 (match build_webhook_payload batch with
+                  | Some payload ->
+                    send_with_retry ~webhook_url payload >>= fun () -> send_batches rest
+                  | None -> send_batches rest)
+             in
+             send_batches fills
+             >>= fun () ->
+             Lwt.async loop;
+             Lwt.return_unit)
+           else (
+             Lwt.async loop;
+             Lwt.return_unit)))
+      (fun exn ->
+         if Lwt.is_sleeping done_p then Lwt.wakeup_later_exn done_u exn;
+         Lwt.return_unit)
   in
-  loop ()
+  Lwt.async loop;
+  done_p
 ;;
 
 (* Initialization. *)

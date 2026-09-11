@@ -30,6 +30,41 @@ module StringMap = Map.Make (String)
 let profilers : Latency_profiler.t StringMap.t Atomic.t = Atomic.make StringMap.empty
 let profilers_mutex = Mutex.create ()
 
+(** Hard cap on the profiler cache. [snapshot_symbol_profilers] creates three
+    profilers ("place"/"amend"/"cancel") per symbol, so without a bound the
+    map grows for every symbol a domain is ever spawned for. On overflow the
+    least-sampled entry is evicted, keeping telemetry for the hottest symbols
+    (the pre-Atomic implementation applied the same cap). *)
+let max_profilers = 64
+
+let profiler_samples (p : Latency_profiler.t) =
+  match Latency_profiler.published_snapshot p with
+  | Some snap -> snap.Latency_profiler.samples
+  | None -> 0
+;;
+
+let evict_least_sampled map =
+  match
+    StringMap.fold
+      (fun key p best ->
+         let count = profiler_samples p in
+         match best with
+         | None -> Some (key, count)
+         | Some (_, min_count) when count < min_count -> Some (key, count)
+         | some -> some)
+      map
+      None
+  with
+  | None -> map
+  | Some (key, _) ->
+    Logging.warn_f
+      ~section
+      "profilers table at capacity (%d); evicting least-sampled entry '%s'"
+      max_profilers
+      key;
+    StringMap.remove key map
+;;
+
 let get_profiler symbol operation =
   let key = symbol ^ ":" ^ operation in
   let current = Atomic.get profilers in
@@ -43,6 +78,9 @@ let get_profiler symbol operation =
       | Some p -> p
       | None ->
         let p = Latency_profiler.create ~bucket_us:1000 ~max_latency_us:2_000_000 key in
+        let map =
+          if StringMap.cardinal map >= max_profilers then evict_least_sampled map else map
+        in
         Atomic.set profilers (StringMap.add key p map);
         p
     in

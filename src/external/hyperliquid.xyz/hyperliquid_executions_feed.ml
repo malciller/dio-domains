@@ -361,6 +361,21 @@ let cleanup_stale_orders () =
             if now -. arrival_time > 600.0 then tids_to_remove := tid :: !tids_to_remove)
          store.processed_tids;
        List.iter (Hashtbl.remove store.processed_tids) !tids_to_remove;
+       (* Purge orphaned entries from processed_tids_queue, mirroring the
+          order_to_symbol_queue rebuild below. The FIFO eviction loop only
+          fires once the table exceeds [max_processed_tids]; on low trade-rate
+          symbols the table shrinks via the age-based removal above while the
+          queue retains every id, leaking one int64 per unique trade id for
+          the process lifetime. Retain only ids still present in the table. *)
+       let original_queue_len = Queue.length store.processed_tids_queue in
+       if original_queue_len > 0
+       then (
+         let temp = Queue.create () in
+         Queue.iter
+           (fun tid -> if Hashtbl.mem store.processed_tids tid then Queue.push tid temp)
+           store.processed_tids_queue;
+         Queue.clear store.processed_tids_queue;
+         Queue.transfer temp store.processed_tids_queue);
        let tids_removed = List.length !tids_to_remove in
        Mutex.unlock store.tids_mutex;
        if tids_removed > 0

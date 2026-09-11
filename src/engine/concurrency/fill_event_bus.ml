@@ -93,15 +93,34 @@ let iter_since last_pos f = RingBuffer.iter_since buffer last_pos f
     published. Polls the generation counter at 50ms: the sole consumer is
     the Discord notifier, so event-driven wakeup buys nothing and the poll
     keeps publishers domain-safe. Returns immediately if a fill was
-    published since the caller captured its position. *)
+    published since the caller captured its position.
+
+    The polling tail is spawned via [Lwt.async] rather than chaining the next
+    sleep with [Lwt.bind]: a raw [>>= fun () -> loop ()] accumulates an Lwt
+    [Forward] node per 50ms tick while idle, and the head promise retained by
+    the caller pins the whole chain. [waiter] is a cancellable [Lwt.task], so
+    if the caller cancels the wait the detached poll observes it at the next
+    tick and stops. *)
 let wait_for_fill ?(poll_interval = 0.05) () =
   let g = Atomic.get generation in
-  let rec loop () =
-    if Atomic.get generation <> g
-    then Lwt.return_unit
-    else Lwt.bind (Lwt_unix.sleep poll_interval) loop
-  in
-  loop ()
+  if Atomic.get generation <> g
+  then Lwt.return_unit
+  else (
+    let waiter, wakener = Lwt.task () in
+    let rec poll () =
+      Lwt.bind (Lwt_unix.sleep poll_interval) (fun () ->
+        if Atomic.get generation <> g
+        then (
+          if Lwt.is_sleeping waiter then Lwt.wakeup_later wakener ();
+          Lwt.return_unit)
+        else if Lwt.is_sleeping waiter
+        then (
+          Lwt.async poll;
+          Lwt.return_unit)
+        else Lwt.return_unit)
+    in
+    Lwt.async poll;
+    waiter)
 ;;
 
 (** Read and sort the entire buffer returning the most recent fills first. *)

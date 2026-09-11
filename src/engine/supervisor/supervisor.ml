@@ -104,26 +104,47 @@ let oracle_connect_fn
       (conn : Supervisor_types.supervised_connection)
       ~(config : Oracle_runtime.runtime_config)
       ~(trading : Dio_strategies.Strategy_common.trading_config list)
-            ~(on_publish : string list -> Oracle_runtime.decision list -> unit)
+      ~(on_publish : string list -> Oracle_runtime.decision list -> unit)
       ()
   : unit Lwt.t
   =
   set_state conn Connected;
   update_data_heartbeat conn;
-  let rec liveness () =
-    if Atomic.get shutdown_requested
+  (* Heartbeat alongside the oracle loop. The periodic tail is spawned via
+     [Lwt.async] to sever the [Forward] chain (a raw recursive [>>=] adds a
+     node per interval for the loop's whole lifetime), while [liveness] stays
+     a cancellable task so [Lwt.pick] stops it as soon as the oracle loop
+     ends. Behaviour matches the previous chained version: sleep first, then
+     update; resolve on shutdown or cancellation. *)
+  let heartbeat_stopped = Atomic.make false in
+  let liveness, liveness_wakener = Lwt.task () in
+  Lwt.on_cancel liveness (fun () -> Atomic.set heartbeat_stopped true);
+  let resolve_liveness () =
+    if Lwt.is_sleeping liveness then Lwt.wakeup_later liveness_wakener ()
+  in
+  let rec heartbeat () =
+    if Atomic.get heartbeat_stopped
     then Lwt.return_unit
+    else if Atomic.get shutdown_requested
+    then (
+      resolve_liveness ();
+      Lwt.return_unit)
     else
       Lwt_unix.sleep oracle_heartbeat_interval
       >>= fun () ->
-      if Atomic.get shutdown_requested
+      if Atomic.get heartbeat_stopped
       then Lwt.return_unit
+      else if Atomic.get shutdown_requested
+      then (
+        resolve_liveness ();
+        Lwt.return_unit)
       else (
         update_data_heartbeat conn;
-        liveness ())
+        Lwt.async heartbeat;
+        Lwt.return_unit)
   in
-  Lwt.pick
-    [ Oracle_runtime.run_loop ~config ~trading ~on_publish (); liveness () ]
+  Lwt.async heartbeat;
+  Lwt.pick [ Oracle_runtime.run_loop ~config ~trading ~on_publish (); liveness ]
   >>= fun () ->
   (* The loop ended: normal when either shutdown flag is set (the engine's
      supervisor shutdown sets both); abnormal otherwise - surface it as a
@@ -143,7 +164,7 @@ let oracle_connect_fn
 let start_oracle
       ~(config : Oracle_runtime.runtime_config)
       ~(trading : Dio_strategies.Strategy_common.trading_config list)
-            ~(on_publish : string list -> Oracle_runtime.decision list -> unit)
+      ~(on_publish : string list -> Oracle_runtime.decision list -> unit)
       ()
   =
   let conn = register ~name:"oracle" ~connect_fn:None in
