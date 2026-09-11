@@ -293,6 +293,23 @@ let unreflected_buy_credit ~state ~base_balance_age ~now =
     go 0.0 [] state.buy_credits_since_balance)
 ;;
 
+(** Venue-authoritative immediately-sellable base for [asset], read straight
+    from the venue module (Alpaca's [qty_available]: total minus base held by
+    resting open orders). Returns NaN when the venue exposes no such figure or
+    the lookup fails, so callers fall back to the local
+    gross-minus-reconstructed-holds basis. Only Alpaca needs this today; the
+    other venues' tradeable accessor is already hold-netted. *)
+let venue_available_base ~(asset : trading_config) =
+  if Exchange.Types.exchange_of_string asset.exchange <> Alpaca
+  then Float.nan
+  else (
+    match get_exchange_module asset.exchange with
+    | Some (module Ex : Exchange.S) ->
+      (try Ex.get_available_balance_fast ~asset:asset.symbol () with
+       | _ -> Float.nan)
+    | None -> Float.nan)
+;;
+
 (** Evaluates asset balance recovery and clears asset_low when available balance is restored. *)
 let evaluate_asset_low_recovery
       ~state
@@ -311,13 +328,24 @@ let evaluate_asset_low_recovery
     let asset_bal = state.position_base +. unreflected in
     let qty_f = lot_qty in
     let asset_needed_fast = qty_f in
+    let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
+    let asset_available = venue_available_base ~asset in
     let locked_in_sells =
       if ecfg.use_reserved_base_guard && not ecfg.use_accumulation_sells
       then List.fold_left (fun acc (_, _, qty) -> acc +. qty) 0.0 state.open_sell_orders
       else 0.0
     in
     let available_asset =
-      asset_bal -. state.reserved_base -. locked_in_sells -. unnetted_hold
+      if is_alpaca && not (Float.is_nan asset_available)
+      then
+        (* Alpaca: the venue's own [qty_available] is authoritative for what is
+           free of resting holds. The stale poll is bridged with the un-polled
+           buy credit overlay; [locked_in_sells] is NOT subtracted (it is the
+           eventually-consistent reconstruction this path exists to avoid). *)
+        Float.max
+          0.0
+          (asset_available +. unreflected -. state.reserved_base -. unnetted_hold)
+      else asset_bal -. state.reserved_base -. locked_in_sells -. unnetted_hold
     in
     let balance_actually_changed = asset_balance > state.last_seen_asset_balance in
     state.last_seen_asset_balance <- asset_balance;
@@ -1211,6 +1239,7 @@ let evaluate_excess_sweep
       ~now
       ~(asset : trading_config)
       ~(available : float)
+      ~(lot_qty : float)
       ~(min_notional : float)
   =
   match state.persisted_sell_levels with
@@ -1218,7 +1247,15 @@ let evaluate_excess_sweep
     let min_order_size =
       if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
     in
-    let excess = Float.max 0.0 available in
+    (* Cap the sweep at ONE grid lot per invocation. The sweep exists to clear
+       residual/dust inventory onto the best rung, not to concentrate the whole
+       book on a single price. An uncapped sweep turns any transient
+       over-estimate of sellable inventory (e.g. Alpaca's reconstructed hold
+       lagging the venue during an amend) into a rung sized to the entire
+       position, which then fills in one print. The per-sweep cap bounds the
+       blast radius; the amend cooldown then limits how fast it can repeat. *)
+    let sweep_cap = Float.max lot_qty min_order_size in
+    let excess = Float.min (Float.max 0.0 available) sweep_cap in
     if excess >= min_order_size -. 1e-9
     then (
       let top_open =
@@ -1318,6 +1355,8 @@ let evaluate_sell_leg
       ~locked_in_sells
       ~base_balance_age
   =
+  let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
+  let asset_available = venue_available_base ~asset in
   (* Placed-sell holds the balance feed may not yet be netting: until a
      balance message newer than a placement arrives, the venue's
      [total - hold] figure still counts that base as free, and sizing
@@ -1334,9 +1373,24 @@ let evaluate_sell_leg
     (if state.position_initialized then state.position_base else asset_balance)
     +. unreflected_credit
   in
+  (* Alpaca's sellable base: venue [qty_available] (free of resting holds) plus
+     un-polled buy credits, minus the reserve. This replaces the
+     [gross - reconstructed_holds] computation that dipped into the reserve
+     whenever the SSE open-order cache transiently undercounted holds (amend
+     replace windows, missed events). *)
+  let alpaca_available =
+    if Float.is_nan asset_available
+    then ledger_balance -. state.reserved_base -. locked_in_sells -. unnetted_hold
+    else
+      Float.max
+        0.0
+        (asset_available +. unreflected_credit -. state.reserved_base -. unnetted_hold)
+  in
   let available_base =
     if Float.is_nan asset_balance
     then 0.0
+    else if is_alpaca
+    then alpaca_available
     else ledger_balance -. state.reserved_base -. locked_in_sells -. unnetted_hold
   in
   (* the persisted-sell grid is reconciled ONCE per execution and the
@@ -1362,9 +1416,7 @@ let evaluate_sell_leg
     let open_levels, missing_levels = persisted_reconcile in
     if not (Float.is_nan asset_balance)
     then (
-      let available_for_missing_sells =
-        max 0.0 (ledger_balance -. state.reserved_base -. locked_in_sells -. unnetted_hold)
-      in
+      let available_for_missing_sells = Float.max 0.0 available_base in
       let missing_desc =
         List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels
       in
@@ -1411,7 +1463,6 @@ let evaluate_sell_leg
            q;
          state.last_sell_fill_price <- Some p)
       !pruned_missing);
-  let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
   (* Balance basis per venue: accumulation venues (Hyperliquid, Lighter,
      IBKR, Kraken) report balances that ALREADY net out open-order holds -
      Hyperliquid's store subtracts the hold at ingestion, and Kraken's
@@ -1675,6 +1726,8 @@ let evaluate_sell_leg
     let available =
       if is_accumulation
       then Float.max 0.0 (asset_bal -. state.reserved_base -. unnetted_hold)
+      else if is_alpaca
+      then alpaca_available
       else Float.max 0.0 (asset_bal -. state.reserved_base -. locked_in_sells)
     in
     let min_order_size =
@@ -1950,13 +2003,19 @@ let evaluate_sell_leg
     && (not !sell_pushed)
     && (not (has_active_sell state))
     && not (Float.is_nan asset_balance)
-  then
+  then (
+    let sweep_lot =
+      match state.last_buy_fill_qty with
+      | Some q when q > 0.0 -> q
+      | _ -> venue_lot_qty state.grid_qty asset.exchange state
+    in
     evaluate_excess_sweep
       ~state
       ~now
       ~asset
       ~available:(Float.max 0.0 available_base)
-      ~min_notional;
+      ~lot_qty:sweep_lot
+      ~min_notional);
   state.resuming_after_balance_flag <- false
 ;;
 

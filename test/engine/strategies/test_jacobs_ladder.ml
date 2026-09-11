@@ -3963,6 +3963,88 @@ let test_alpaca_excess_excludes_reserved_base () =
   check bool "reserved_base is excluded from the excess (no amend)" true (amends = [])
 ;;
 
+let test_alpaca_venue_available_blocks_reserve_dip () =
+  (* The venue's own free figure is authoritative. Here the account shows gross
+     3.0 but only reserved_base is free (everything else is held), while the
+     engine's reconstructed locked_in_sells is 0.0 (the amend-window
+     undercount). Sizing against gross-minus-reconstructed-holds would offer a
+     full lot out of the reserve; the venue-authoritative basis must place
+     nothing. *)
+  let symbol = "ALPACA_VENUE_AVAIL/USD" in
+  let state = reset_alpaca_excess_state symbol in
+  state.reserved_base <- 0.00234;
+  state.open_sell_orders <- [];
+  state.persisted_sell_levels <- [];
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 100.0;
+  state.last_buy_fill_qty <- Some 1.0;
+  Alpaca.Balances.set_available_balance_for_test symbol 0.00234;
+  let asset = alpaca_excess_asset ~symbol in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:100.0
+    ~ask_price:100.1
+    ~asset_balance:3.0
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:None
+    ~oracle_halted:false;
+  check
+    bool
+    "venue free == reserved_base offers nothing (no sell out of the reserve)"
+    true
+    (pushed_sell_for symbol = None)
+;;
+
+let test_alpaca_excess_sweep_capped_to_one_lot () =
+  (* A single sweep may grow the top rung by at most one grid lot. An uncapped
+     sweep turns any transient over-estimate of sellable inventory into a rung
+     sized to the whole position. Ladder 101x1 fully resting, 5.0 sellable,
+     lot 1.0: the top rung must end at 2.0, not 6.0. *)
+  let symbol = "ALPACA_SWEEP_CAP/USD" in
+  let state = reset_alpaca_excess_state symbol in
+  state.persisted_sell_levels <- [ 101.0, 1.0 ];
+  state.open_sell_orders <- [ "cap-top-oid", 101.0, 1.0 ];
+  let asset = alpaca_excess_asset ~symbol in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:100.0
+    ~ask_price:100.1
+    ~asset_balance:6.0
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:1.0
+    ~base_balance_age:None
+    ~oracle_halted:false;
+  let amends =
+    List.filter
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Amend
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+  in
+  match amends with
+  | [ o ] ->
+    check (float 1e-6) "excess sweep grows the top rung by at most one lot" 2.0 o.qty
+  | _ ->
+    failwith
+      (Printf.sprintf
+         "expected exactly one capped sell amend on the top rung, got %d"
+         (List.length amends))
+;;
+
 let test_alpaca_sell_anchors_on_fill_not_ask () =
   (* Alpaca sell placement is anchored on the fill (fill + gi), NOT pushed up
      to the current ask. Clamping to the ask stacked every new sell on the
@@ -5144,6 +5226,14 @@ let () =
             "alpaca excess excludes reserved_base"
             `Quick
             test_alpaca_excess_excludes_reserved_base
+        ; test_case
+            "alpaca venue free == reserved_base offers nothing"
+            `Quick
+            test_alpaca_venue_available_blocks_reserve_dip
+        ; test_case
+            "alpaca excess sweep is capped to one lot"
+            `Quick
+            test_alpaca_excess_sweep_capped_to_one_lot
         ; test_case
             "new buy respects the 2x gi closest-sell cap"
             `Quick

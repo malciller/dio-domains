@@ -323,6 +323,16 @@ module type S = sig
   (** Return a fast path closure for fetching live tradeable balance of [asset] without lock acquisition overhead. *)
   val get_tradeable_balance_fast : asset:string -> unit -> float
 
+  (** Return a fast path closure for fetching the venue-authoritative
+      immediately-sellable quantity of [asset] (total minus base held by
+      resting open orders). On venues that already report a hold-netted
+      tradeable figure this equals [get_tradeable_balance_fast]; on Alpaca,
+      whose stored balance is GROSS, it returns the venue's [qty_available].
+      Returns [0.0] (or [nan] where the venue distinguishes "unknown") when the
+      figure is unavailable; callers must treat that as not-sellable and fall
+      back to their local basis. *)
+  val get_available_balance_fast : asset:string -> unit -> float
+
   (** Return a fast path closure yielding the age (seconds) of the cached
       [asset] balance snapshot, or [None] when the exchange does not track
       freshness. A fresh snapshot is authoritative: strategies that cannot

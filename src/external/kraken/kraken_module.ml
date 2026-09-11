@@ -279,6 +279,9 @@ module Kraken_impl = struct
         (Kraken_balances_feed.BalanceStore.get_balance store -. open_order_holds asset)
   ;;
 
+  (* Kraken's tradeable figure is already hold-netted. *)
+  let get_available_balance_fast = get_tradeable_balance_fast
+
   (** Age of the balances-feed snapshot for [asset], or [None] before the
       first update. *)
   let get_balance_age_fast ~asset =

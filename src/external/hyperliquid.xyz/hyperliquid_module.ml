@@ -383,6 +383,9 @@ module Hyperliquid_impl = struct
     fun () -> Hyperliquid_balances.BalanceStore.get_balance store
   ;;
 
+  (* Hyperliquid's tradeable figure is already hold-netted. *)
+  let get_available_balance_fast = get_tradeable_balance_fast
+
   (** Age of the balance-store snapshot for [asset], or [None] before the
       first update. Keyed on the SPENDABLE wallets' timestamp: the store-wide
       timestamp is bumped by the staking poller (every ~10s) even though

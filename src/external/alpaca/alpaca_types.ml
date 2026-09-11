@@ -179,6 +179,11 @@ type position_record =
   ; symbol : string
   ; exchange : string
   ; qty : float
+  ; qty_available : float
+    (** Venue-authoritative immediately-sellable quantity: [qty] minus the base
+        held by resting open orders (Alpaca's [qty_available]). This is the only
+        ground truth for Alpaca's free inventory - the engine otherwise has to
+        reconstruct the hold from its eventually-consistent open-order cache. *)
   ; market_value : float
   ; avg_entry_price : float
   ; current_price : float

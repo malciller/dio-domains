@@ -14,6 +14,14 @@ let balances : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 
 
 let total_balances : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
 
+(** Immediately-sellable balance per asset ([qty] minus open-order holds,
+    Alpaca's [qty_available]). Published from the same poll as [balances], so
+    the strategy can size sells against the venue's own free figure instead of
+    reconstructing holds from the eventually-consistent open-order cache. *)
+let available_balances : (string, float) Hashtbl.t Atomic.t =
+  Atomic.make (Hashtbl.create 16)
+;;
+
 (** Published position mark prices. Lock-free Atomic table for fallback TOB when WS quotes are quiet. *)
 let position_marks : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
 
@@ -45,6 +53,27 @@ let get_total_balance asset =
      | _ -> 0.0)
 ;;
 
+(** Venue-authoritative immediately-sellable quantity for [asset]. Returns NaN
+    when the poll did not report an entry for [asset], so callers fall back to
+    their local basis instead of treating "unknown" as "nothing sellable". *)
+let get_available_balance asset =
+  let t = Atomic.get available_balances in
+  let key = if asset = "USDC" then "USD" else asset in
+  try Hashtbl.find t key with
+  | _ ->
+    (try Hashtbl.find t asset with
+     | _ -> Float.nan)
+;;
+
+(** Test hook: publish one asset's available balance without a network poll, so
+    the venue-authoritative sell-sizing path can be exercised in unit tests. *)
+let set_available_balance_for_test asset v =
+  let t = Atomic.get available_balances in
+  let copy = Hashtbl.copy t in
+  Hashtbl.replace copy asset v;
+  Atomic.set available_balances copy
+;;
+
 let get_position_price asset =
   let t = Atomic.get position_marks in
   Hashtbl.find_opt t asset
@@ -72,9 +101,12 @@ let update_balances () =
     let new_balances = Hashtbl.create 16 in
     let new_total = Hashtbl.create 16 in
     let new_marks = Hashtbl.create 16 in
+    let new_available = Hashtbl.create 16 in
     Hashtbl.replace new_balances "USD" acc.cash;
     Hashtbl.replace new_total "USD" acc.equity;
+    Hashtbl.replace new_available "USD" acc.cash;
     Hashtbl.replace new_balances "USDC" acc.cash;
+    Hashtbl.replace new_available "USDC" acc.cash;
     Logging.debug_f
       ~section
       "Alpaca Account updated: buying_power=%.2f, cash=%.2f, equity=%.2f, \
@@ -99,6 +131,7 @@ let update_balances () =
          (fun (p : Alpaca_types.position_record) ->
             Hashtbl.replace new_balances p.symbol p.qty;
             Hashtbl.replace new_total p.symbol p.qty;
+            Hashtbl.replace new_available p.symbol p.qty_available;
             if p.current_price > 0.0
             then Hashtbl.replace new_marks p.symbol p.current_price;
             Logging.debug_f
@@ -115,6 +148,7 @@ let update_balances () =
        Logging.warn_f ~section "Failed to fetch positions during balance poll: %s" err);
     Atomic.set balances new_balances;
     Atomic.set total_balances new_total;
+    Atomic.set available_balances new_available;
     Atomic.set position_marks new_marks;
     Atomic.set initial_data_received true;
     Atomic.set last_update (Unix.time ());
