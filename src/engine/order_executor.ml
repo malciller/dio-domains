@@ -461,9 +461,11 @@ let amend_order ~token ?retry_config (request : amend_request) =
            then (
              (* Amendment suppressed as a no-op: terminal lifecycle state. *)
              InFlightAmendments.note_amendment_skipped ~old_id:request.order_id;
-             (* Log at INFO so no-op suppression is visible: previously this
-                 path was silent, making repeated suppressed amends look like
-                 a hung order. *)
+             (* No-op suppression is an expected logical outcome, not an
+                 execution event: log it at DEBUG so the INFO stream stays
+                 free of per-tick amendment chatter, while still letting
+                 `logging_level = debug` reveal it when a hung order is
+                 suspected. *)
              let reason =
                match request.new_quantity with
                | Some nq ->
@@ -476,7 +478,7 @@ let amend_order ~token ?retry_config (request : amend_request) =
                    "price=%.10f"
                    (Option.value request.new_limit_price ~default:0.0)
              in
-             Logging.info_f
+             Logging.debug_f
                ~section
                "Amendment suppressed for order %s (no-op: %s unchanged)"
                request.order_id

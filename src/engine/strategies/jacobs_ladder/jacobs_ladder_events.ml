@@ -645,7 +645,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
              then
                state.buy_credits_since_balance
                <- state.buy_credits_since_balance @ [ now, pending ];
-             Logging.info_f
+             Logging.debug_f
                ~section
                "Pending base credit for %s: +%.8f (already reflected: %.8f, unreflected \
                 credits: %d) from buy fill %s"
@@ -664,7 +664,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
            state.last_buy_attempted_insufficient <- false;
            if is_superseded_old_fill
            then
-             Logging.info_f
+             Logging.debug_f
                ~section
                "Buy fill for superseded order %s for %s (replaced by amendment); \
                 preserving resting buy tracking"
@@ -917,7 +917,7 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
        in
        if is_stale_order_cancel
        then
-         Logging.info_f
+         Logging.debug_f
            ~section
            "Late cancel for previously tracked order %s (%s) on %s - preserving \
             in-flight placement guards"
@@ -1056,14 +1056,14 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
              state.last_buy_order_price <- Some price;
              if old_order_id = new_order_id
              then
-               Logging.info_f
+               Logging.debug_f
                  ~section
                  "Amended buy order price in tracking: %s @ %.4f for %s"
                  old_order_id
                  price
                  asset_symbol
              else
-               Logging.info_f
+               Logging.debug_f
                  ~section
                  "Amended buy order ID in tracking: %s -> %s @ %.4f for %s"
                  old_order_id
@@ -1074,7 +1074,7 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
            | _ ->
              state.last_buy_order_id <- Some new_order_id;
              state.last_buy_order_price <- Some price;
-             Logging.info_f
+             Logging.debug_f
                ~section
                "External buy order amendment in tracking: %s @ %.4f for %s"
                new_order_id
@@ -1092,7 +1092,7 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
             | Some (_, _, q) -> q
             | None -> venue_lot_qty state.grid_qty state.exchange_id state
           in
-          Logging.info_f
+          Logging.debug_f
             ~section
             "SELL_AMEND [%s] %s -> %s @ %.2f: old_entry=%s old_qty=%.8f sells_before=%d"
             asset_symbol
@@ -1127,7 +1127,7 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
              <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) updated;
              state.persistence_dirty <- true
            | _ -> ());
-          Logging.info_f
+          Logging.debug_f
             ~section
             "SELL_AMEND [%s] result: sells_after=%d"
             asset_symbol

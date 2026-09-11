@@ -1217,7 +1217,10 @@ let evaluate_excess_sweep
               asset.exchange
           in
           ignore (push_order ~now ~state order);
-          Logging.info_f
+          (* A real qty increase is a meaningful execution event; a
+             rounding-dust sweep that leaves the top rung unchanged is
+             internal churn and belongs at DEBUG, not in the INFO stream. *)
+          (if delta > 1e-9 then Logging.info_f else Logging.debug_f)
             ~section
             "Excess inventory sweep for %s: amended top rung @ %.4f %.8f -> %.8f (+%.8f \
              excess)"
