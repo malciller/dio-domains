@@ -1,4 +1,8 @@
-(** WebSocket trade execution stream for Alpaca. Manages open order state and execution event ring buffers. *)
+(** Alpaca trade execution stream, delivered by the Events API over
+    Server-Sent Events ([GET /v2/events/trades]). Manages open order state and
+    execution event ring buffers. The legacy v1 [wss://.../stream]
+    trade_updates WebSocket is deprecated by Alpaca (HTTP 500) and must not be
+    reinstated. *)
 
 open Lwt.Infix
 open Dio_exchange.Exchange_intf.Types
@@ -206,15 +210,30 @@ let get_or_create_store symbol =
   store
 ;;
 
-let active_conn : Websocket_lwt_unix.conn option ref = ref None
+(* Alpaca trade events arrive over the Events API as Server-Sent Events
+   (SSE), NOT the legacy WebSocket: the v1 [wss://.../stream] trade_updates
+   endpoint is deprecated and currently returns HTTP 500.
 
-(* Ping/pong liveness tracking.
-   The supervisor monitor loop calls [send_ping] on a 15s cadence and expects
-   a [bool]; a Pong frame arriving in the read loop broadcasts [pong_condition]
-   and stamps [last_pong_time] so the waiter can resolve. [last_pong_time] also
-   closes the race where the Pong lands before [send_ping] starts waiting. *)
-let last_pong_time = ref 0.0
-let pong_condition = Lwt_condition.create ()
+   [sse_active] mirrors "the HTTP response stream is open"; [last_activity] is
+   the wall-clock of the most recent SSE line (a data frame OR a comment
+   heartbeat) and backs the supervisor's ping probe, since SSE has no
+   protocol-level ping; [last_event_id] carries the last event ULID so a
+   reconnect resumes with [since_id] and no gap. *)
+let sse_active = Atomic.make false
+let last_activity = ref 0.0
+let last_event_id : string option ref = ref None
+
+(** Bounded startup backfill: the first connect of a process asks for events
+    since now - 15min so a short restart does not lose fills. Every reconnect
+    after that resumes exactly from [last_event_id]. Replayed fills are safe:
+    the strategy's per-order high-water guard drops already-applied fills. *)
+let trade_events_backfill_s = 900.0
+
+(** Idle time after which the connectivity probe reports a stalled stream.
+    SSE servers emit comment heartbeats well inside this; the value is
+    deliberately generous so a quiet-but-healthy stream is not torn down by
+    the probe's shorter timeout. *)
+let sse_idle_failure_s = 60.0
 
 let get_open_order symbol order_id =
   match Hashtbl.find_opt stores symbol with
@@ -352,7 +371,7 @@ let bootstrap_open_orders () =
     Lwt.return_unit
 ;;
 
-let handle_trade_update json =
+let apply_trade_update json =
   let open Yojson.Safe.Util in
   let event = json |> member "event" |> to_string_option |> Option.value ~default:"" in
   let order_json = json |> member "order" in
@@ -462,211 +481,217 @@ let handle_trade_update json =
   then Lwt.async (fun () -> Alpaca_balances.update_balances ())
 ;;
 
-let handle_message_str content =
-  let trimmed = String.trim content in
-  if trimmed <> ""
+(** Primary entry point for one trade event. The Events API delivers the
+    [TradeUpdateEventV2] object directly (no legacy [{stream,data}] wrapper):
+    [event], [order], and (for fills) [price]/[qty] sit at the top level, which
+    is exactly the shape [apply_trade_update] already consumes. Records the
+    monotonic [event_id] for resumable reconnects. [trade_bust] /
+    [trade_correct] reverse/correct a prior execution; the fill ledger has no
+    reversal model, so they are surfaced loudly and left alone. *)
+let handle_trade_update json =
+  let open Yojson.Safe.Util in
+  (match json |> member "event_id" with
+   | `String id -> last_event_id := Some id
+   | _ -> ());
+  let event = json |> member "event" |> to_string_option |> Option.value ~default:"" in
+  if event = "trade_bust" || event = "trade_correct"
   then (
-    try
-      let json = Yojson.Safe.from_string trimmed in
-      let items =
-        match json with
-        | `List l -> l
-        | _ -> [ json ]
-      in
-      List.iter
-        (fun item ->
-           let open Yojson.Safe.Util in
-           let stream =
-             item |> member "stream" |> to_string_option |> Option.value ~default:""
-           in
-           match stream with
-           | "trade_updates" ->
-             let data = item |> member "data" in
-             handle_trade_update data
-           | "authorization" ->
-             let data = item |> member "data" in
-             let status =
-               data |> member "status" |> to_string_option |> Option.value ~default:""
-             in
-             let action =
-               data |> member "action" |> to_string_option |> Option.value ~default:""
-             in
-             Logging.debug_f
-               ~section
-               "Alpaca Trading WS authorization status: %s (action: %s)"
-               status
-               action
-           | "listening" ->
-             let data = item |> member "data" in
-             let streams =
-               data |> member "streams" |> to_list |> List.filter_map to_string_option
-             in
-             Logging.debug_f
-               ~section
-               "Alpaca Trading WS listening on streams: [%s]"
-               (String.concat ", " streams)
-           | "error" ->
-             let msg =
-               item
-               |> member "data"
-               |> member "message"
-               |> to_string_option
-               |> Option.value ~default:""
-             in
-             Logging.error_f ~section "Alpaca Trading WS error: %s" msg
-           | other ->
-             Logging.debug_f
-               ~section
-               "Alpaca Trading WS frame (%s): %s"
-               other
-               (Yojson.Safe.to_string item))
-        items
-    with
-    | exn ->
-      Logging.error_f
-        ~section
-        "Failed to parse Alpaca trading WS frame: %s (content: %s)"
-        (Printexc.to_string exn)
-        content)
+    Logging.warn_f
+      ~section
+      "Alpaca %s event not modeled by the execution ledger (previous_execution_id=%s); \
+       leaving inventory as-is, balance reconcile will heal. JSON: %s"
+      event
+      (json
+       |> member "previous_execution_id"
+       |> to_string_option
+       |> Option.value ~default:"")
+      (Yojson.Safe.to_string json);
+    Lwt.async (fun () -> Alpaca_balances.update_balances ()))
+  else apply_trade_update json
 ;;
 
+(* -- Events API (Server-Sent Events) transport ------------------------ *)
+
+(** RFC3339 UTC timestamp for the [since] query param. *)
+let iso8601_utc (t : float) : string =
+  let tm = Unix.gmtime t in
+  Printf.sprintf
+    "%04d-%02d-%02dT%02d:%02d:%02dZ"
+    (tm.Unix.tm_year + 1900)
+    (tm.Unix.tm_mon + 1)
+    tm.Unix.tm_mday
+    tm.Unix.tm_hour
+    tm.Unix.tm_min
+    tm.Unix.tm_sec
+;;
+
+(** Stream URI: resume exactly from [last_event_id] when known, else request a
+    bounded startup backfill. *)
+let events_uri () =
+  let base = Uri.of_string (Alpaca_types.Config.trading_events_url ()) in
+  match !last_event_id with
+  | Some id -> Uri.with_query' base [ "since_id", id ]
+  | None ->
+    Uri.with_query'
+      base
+      [ "since", iso8601_utc (Unix.gettimeofday () -. trade_events_backfill_s) ]
+;;
+
+let event_stream_headers () =
+  Cohttp.Header.of_list
+    [ "APCA-API-KEY-ID", Alpaca_types.Config.api_key ()
+    ; "APCA-API-SECRET-KEY", Alpaca_types.Config.api_secret ()
+    ; "Accept", "text/event-stream"
+    ; "Cache-Control", "no-cache"
+    ; "Accept-Encoding", "identity"
+    ]
+;;
+
+let starts_with ~prefix s =
+  String.length s >= String.length prefix
+  && String.equal (String.sub s 0 (String.length prefix)) prefix
+;;
+
+let strip_trailing_cr s =
+  let n = String.length s in
+  if n > 0 && Char.equal s.[n - 1] '\r' then String.sub s 0 (n - 1) else s
+;;
+
+(** Consumes the SSE body until EOF. A blank line dispatches the accumulated
+    [data:] payload; every line (including [:] comment heartbeats) refreshes
+    [last_activity] and the supervisor heartbeat. *)
+let consume_event_stream ~on_heartbeat body =
+  let stream = Cohttp_lwt.Body.to_stream body in
+  let line_buf = Buffer.create 1024 in
+  let data_buf = Buffer.create 512 in
+  let dispatch () =
+    let raw = String.trim (Buffer.contents data_buf) in
+    Buffer.clear data_buf;
+    if raw <> ""
+    then (
+      match Yojson.Safe.from_string raw with
+      | json -> handle_trade_update json
+      | exception exn ->
+        Logging.error_f
+          ~section
+          "Failed to parse Alpaca trade event: %s (payload: %s)"
+          (Printexc.to_string exn)
+          raw)
+  in
+  let handle_line line =
+    last_activity := Unix.gettimeofday ();
+    on_heartbeat ();
+    if String.equal line ""
+    then dispatch ()
+    else if Char.equal line.[0] ':'
+    then () (* comment / heartbeat *)
+    else if starts_with ~prefix:"data:" line
+    then (
+      let payload = String.sub line 5 (String.length line - 5) in
+      let payload =
+        if String.length payload > 0 && Char.equal payload.[0] ' '
+        then String.sub payload 1 (String.length payload - 1)
+        else payload
+      in
+      if Buffer.length data_buf > 0 then Buffer.add_char data_buf '\n';
+      Buffer.add_string data_buf payload)
+    else () (* event:/id:/retry: - we read those from the JSON body *)
+  in
+  let rec scan chunk i start =
+    let len = String.length chunk in
+    if i >= len
+    then (if start < len then Buffer.add_substring line_buf chunk start (len - start))
+    else if Char.equal chunk.[i] '\n'
+    then (
+      Buffer.add_substring line_buf chunk start (i - start);
+      let line = strip_trailing_cr (Buffer.contents line_buf) in
+      Buffer.clear line_buf;
+      handle_line line;
+      scan chunk (i + 1) (i + 1))
+    else scan chunk (i + 1) start
+  in
+  let rec loop () =
+    Lwt_stream.get stream
+    >>= function
+    | None -> Lwt.return_unit
+    | Some chunk ->
+      scan chunk 0 0;
+      loop ()
+  in
+  loop ()
+  >>= fun () ->
+  dispatch ();
+  Lwt.return_unit
+;;
+
+(** Opens the Events API SSE stream and consumes it until EOF. Preserves the
+    supervised-feed contract: [on_connected] once the response is 2xx,
+    [on_failure] on end/error, reconnection owned by the supervisor (which
+    resumes from [last_event_id]). *)
 let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
-  let url_str = Alpaca_types.Config.trading_ws_url () in
-  let uri = Uri.of_string url_str in
-  let host = Uri.host uri |> Option.value ~default:"paper-api.alpaca.markets" in
-  let port = Uri.port uri |> Option.value ~default:443 in
   Lwt.catch
     (fun () ->
-       Lwt_unix.getaddrinfo host (string_of_int port) [ Unix.AI_FAMILY Unix.PF_INET ]
-       >>= fun addresses ->
-       let ip =
-         match addresses with
-         | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ ->
-           Ipaddr_unix.of_inet_addr addr
-         | _ -> failwith ("Failed to resolve host " ^ host)
-       in
-       let client = `TLS (`Hostname host, `IP ip, `Port port) in
-       let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
-       (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP
-          connection during the handshake would otherwise block the
-          reconnect (which runs on the main Lwt loop) indefinitely. *)
-       Lwt_unix.with_timeout 20.0 (fun () -> Websocket_lwt_unix.connect ~ctx client uri)
-       >>= fun conn ->
-       active_conn := Some conn;
-       Logging.debug_f ~section "Connected to Alpaca Trading WS at %s" url_str;
-       (* Send the WebSocket authentication request. *)
-       let auth_msg =
-         `Assoc
-           [ "action", `String "authenticate"
-           ; ( "data"
-             , `Assoc
-                 [ "key_id", `String (Alpaca_types.Config.api_key ())
-                 ; "secret_key", `String (Alpaca_types.Config.api_secret ())
-                 ] )
-           ]
-         |> Yojson.Safe.to_string
-       in
-       Logging.debug ~section "Sending Alpaca Trading WS authentication...";
-       Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:auth_msg ())
-       >>= fun () ->
-       (* Request the trade_updates stream from the server. *)
-       let listen_msg =
-         `Assoc
-           [ "action", `String "listen"
-           ; "data", `Assoc [ "streams", `List [ `String "trade_updates" ] ]
-           ]
-         |> Yojson.Safe.to_string
-       in
-       Logging.debug
+       let uri = events_uri () in
+       Logging.debug_f
          ~section
-         "Sending Alpaca Trading WS listen request for trade_updates...";
-       Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:listen_msg ())
-       >>= fun () ->
-       on_connected ();
-       bootstrap_open_orders ()
-       >>= fun () ->
-       let rec read_loop () =
-         Websocket_lwt_unix.read conn
-         >>= fun frame ->
-         on_heartbeat ();
-         (match frame.Websocket.Frame.opcode with
-          | Websocket.Frame.Opcode.Ping ->
-            let pong_frame =
-              Websocket.Frame.create
-                ~opcode:Websocket.Frame.Opcode.Pong
-                ~content:frame.Websocket.Frame.content
-                ()
-            in
-            Websocket_lwt_unix.write conn pong_frame
-          | Websocket.Frame.Opcode.Pong ->
-            (* Reply to our active [send_ping]; resolves any pending waiter. *)
-            last_pong_time := Unix.gettimeofday ();
-            Lwt_condition.broadcast pong_condition ();
-            Lwt.return_unit
-          | Websocket.Frame.Opcode.Close ->
-            Lwt.fail (Failure "Alpaca Trading WS received Close frame from server")
-          | _ ->
-            let content = String.trim frame.Websocket.Frame.content in
-            if content <> "" then handle_message_str content;
-            Lwt.return_unit)
-         >>= fun () -> read_loop ()
-       in
-       read_loop ())
+         "Connecting to Alpaca trade events stream at %s"
+         (Uri.to_string uri);
+       (* Bound only the TLS + response-header phase: the body is a
+          long-lived stream and must not be cancelled by a timeout. *)
+       Lwt_unix.with_timeout 20.0 (fun () ->
+         Cohttp_lwt_unix.Client.get ~headers:(event_stream_headers ()) uri)
+       >>= fun (resp, body) ->
+       let status = Cohttp.Response.status resp in
+       if not (Cohttp.Code.is_success (Cohttp.Code.code_of_status status))
+       then
+         Lwt.fail
+           (Failure
+              (Printf.sprintf
+                 "Alpaca trade events stream HTTP %s"
+                 (Cohttp.Code.string_of_status status)))
+       else (
+         Atomic.set sse_active true;
+         last_activity := Unix.gettimeofday ();
+         on_connected ();
+         Logging.info_f
+           ~section
+           "Connected to Alpaca trade events stream at %s"
+           (Uri.to_string uri);
+         bootstrap_open_orders ()
+         >>= fun () ->
+         consume_event_stream ~on_heartbeat body
+         >>= fun () ->
+         Atomic.set sse_active false;
+         Logging.warn_f ~section "Alpaca trade events stream ended; reconnecting";
+         on_failure "trade events stream ended";
+         Lwt.return_unit))
     (fun exn ->
-       active_conn := None;
+       Atomic.set sse_active false;
        let err = Printexc.to_string exn in
-       Logging.error_f ~section "Alpaca trading WS disconnected: %s" err;
+       Logging.error_f ~section "Alpaca trade events stream disconnected: %s" err;
        on_failure err;
        Lwt.return_unit)
 ;;
 
-(** Sends a protocol-level WebSocket Ping frame and waits for the matching
-    Pong within [timeout_ms]. Returns [true] when the Pong arrived, [false]
-    on timeout or send failure. Records the round trip in the "alpaca" venue
-    profiler (the dashboard's ws_ping column). *)
+(** Connectivity probe for the supervised monitor loop. SSE has no protocol
+    ping, so liveness means "the stream is open and produced a line (data or
+    comment heartbeat) within [sse_idle_failure_s]". Returns [false] when
+    disconnected, preserving the existing monitor/test contract. *)
 let send_ping ~req_id ~timeout_ms : bool Lwt.t =
-  match !active_conn with
-  | None -> Lwt.return false
-  | Some conn ->
-    let send_time = Unix.gettimeofday () in
-    Lwt.catch
-      (fun () ->
-         let payload = Printf.sprintf "dio:%d:%.6f" req_id send_time in
-         Websocket_lwt_unix.write
-           conn
-           (Websocket.Frame.create
-              ~opcode:Websocket.Frame.Opcode.Ping
-              ~content:payload
-              ())
-         >>= fun () ->
-         let timeout = float_of_int timeout_ms /. 1000.0 in
-         Lwt.pick
-           [ (Lwt_condition.wait pong_condition
-              >>= fun () ->
-              (* Guard against a stale Pong from an earlier ping. *)
-              if !last_pong_time >= send_time
-              then (
-                Network_latency.record_ping_s "alpaca" (Unix.gettimeofday () -. send_time);
-                Lwt.return true)
-              else Lwt.return false)
-           ; (Lwt_unix.sleep timeout
-              >>= fun () ->
-              (* The Pong may have landed just before the timeout fired. *)
-              if !last_pong_time >= send_time
-              then (
-                Network_latency.record_ping_s "alpaca" (Unix.gettimeofday () -. send_time);
-                Lwt.return true)
-              else (
-                Logging.warn_f
-                  ~section
-                  "Alpaca trading WS ping timed out (req_id: %d)"
-                  req_id;
-                Lwt.return false))
-           ])
-      (fun exn ->
-         Logging.warn_f
-           ~section
-           "Alpaca trading WS ping send failed: %s"
-           (Printexc.to_string exn);
-         Lwt.return false)
+  ignore req_id;
+  ignore timeout_ms;
+  if not (Atomic.get sse_active)
+  then Lwt.return false
+  else (
+    let idle = Unix.gettimeofday () -. !last_activity in
+    if idle <= sse_idle_failure_s
+    then (
+      Network_latency.record_ping_s "alpaca" idle;
+      Lwt.return true)
+    else (
+      Logging.warn_f
+        ~section
+        "Alpaca trade events stream idle for %.0fs (no data/heartbeat)"
+        idle;
+      Lwt.return false))
 ;;

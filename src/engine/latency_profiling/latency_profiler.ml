@@ -139,6 +139,41 @@ let[@inline] record t span =
     t.max_cause <- None)
 ;;
 
+(** [record_max t span] is [record] but returns [true] when [span] established
+    a new window maximum, so the caller can build an expensive cause string
+    only on that rare path instead of allocating a cause closure (and boxing
+    its captured floats) on every recorded cycle. *)
+let[@inline] record_max t span =
+  let ns = Int64.to_int (Span.to_uint64_ns span) in
+  if ns < 1000
+  then (
+    t.ns_buckets.(ns) <- t.ns_buckets.(ns) + 1;
+    t.sub_us_samples <- t.sub_us_samples + 1)
+  else (
+    let us = ns / 1000 in
+    if us < t.bucket_us
+    then t.us_buckets.(us - 1) <- t.us_buckets.(us - 1) + 1
+    else (
+      let bucket_idx = us / t.bucket_us in
+      if bucket_idx >= t.bucket_count
+      then (
+        t.buckets.(t.bucket_count - 1) <- t.buckets.(t.bucket_count - 1) + 1;
+        t.overflow <- t.overflow + 1)
+      else t.buckets.(bucket_idx) <- t.buckets.(bucket_idx) + 1));
+  t.samples <- t.samples + 1;
+  if ns > t.max_latency_ns
+  then (
+    t.max_latency_ns <- ns;
+    t.max_cause <- None;
+    true)
+  else false
+;;
+
+(** [set_cause t cause] attaches a cause string to the current window's
+    maximum sample. Only meaningful immediately after [record_max] returned
+    [true] (the maximum it just recorded). *)
+let set_cause t cause = t.max_cause <- Some cause
+
 (** [record_with_cause t span cause_thunk] is like [record] but if the span
     establishes a new maximum latency, it evaluates [cause_thunk ()] and
     records the result as the cause. *)

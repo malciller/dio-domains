@@ -2860,6 +2860,194 @@ let test_halted_path_still_places_sell () =
   check bool "halted path still places the sell for a just-filled buy" true found
 ;;
 
+let test_capital_low_still_places_bottom_rung_sell () =
+  (* Capital exhaustion without an oracle INACTIVE decision: the buy leg
+     latched [capital_low] locally (quote no longer covers the next buy) and
+     skipped placement, but the oracle had not yet (or will never) publish an
+     inactive decision. The last buy fill's inventory must STILL be offered as
+     the bottom-rung sell on every venue - otherwise the strategy sits paused
+     with unsold inventory and over-accumulates. Exercises evaluate_sell_leg
+     exactly as the domain calls it on that tick: buy_attempted=false,
+     just_filled_buy=false, oracle_halted=false, capital_low=true. *)
+  let symbol = "CAPLOW/XMR/USD" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.grid_qty <- 0.05;
+  state.maker_fee <- 0.0026;
+  state.cached_sell_mult <- 0.999;
+  state.cached_qty_increment <- 0.01;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 0.0;
+  state.reserved_base <- 0.0;
+  state.accumulated_profit <- 0.0;
+  state.open_sell_orders <- [];
+  state.persisted_sell_levels <- [];
+  state.position_initialized <- true;
+  state.position_base <- 0.05;
+  state.just_filled_buy <- false;
+  state.last_buy_fill_price <- Some 462.0;
+  state.last_buy_fill_qty <- Some 0.05;
+  state.capital_low <- true;
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    ; symbol
+    ; qty = "0.05"
+    ; grid_interval = 5.0
+    ; sell_mult = "0.999"
+    ; strategy = "jacobs_ladder"
+    ; maker_fee = Some 0.0026
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:461.0
+    ~ask_price:462.1
+    ~asset_balance:0.05
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:None;
+  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let placed =
+    List.find_opt
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      pushed
+  in
+  match placed with
+  | None -> Alcotest.fail "capital_low with inventory must place the bottom-rung sell"
+  | Some o ->
+    (* Never touches reserved_base: the sell is clamped to non-reserved
+       inventory (0.05 here). *)
+    Alcotest.(check bool)
+      "sell within non-reserved inventory"
+      (o.qty > 0.0 && o.qty <= 0.05 +. 1e-9)
+      true
+;;
+
+let test_burst_tracked_venue_no_reserved_dip () =
+  (* Kraken/IBKR/Lighter are accumulation venues WITH track_pending_sells;
+     their tradeable figure (total - hold) still trails a placement, so a
+     burst that acks several sells before the balance adopts the hold used to
+     size a second sell against a stale-high figure and dump reserved_base.
+     The unnetted-hold guard must now apply here too: with a fresh balance
+     message that PREDATES the first placement, the armed hold clamps the
+     second sell to zero. *)
+  let symbol = "BURSTTRACK/XMR/USD" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.grid_qty <- 0.05;
+  state.maker_fee <- 0.0026;
+  state.cached_sell_mult <- 0.999;
+  state.cached_qty_increment <- 0.01;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 0.0;
+  state.reserved_base <- 0.02;
+  state.accumulated_profit <- 0.0;
+  state.open_sell_orders <- [];
+  state.persisted_sell_levels <- [];
+  state.position_initialized <- true;
+  state.position_base <- 0.05;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 462.0;
+  state.last_buy_fill_qty <- Some 0.05;
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    ; symbol
+    ; qty = "0.05"
+    ; grid_interval = 5.0
+    ; sell_mult = "0.999"
+    ; strategy = "jacobs_ladder"
+    ; maker_fee = Some 0.0026
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  let run_leg ~now ~age =
+    Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+      ~persisted_reconcile:
+        (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      ~state
+      ~now
+      ~asset
+      ~bid_price:461.0
+      ~ask_price:462.1
+      ~asset_balance:0.05
+      ~buy_attempted:false
+      ~oracle_halted:false
+      ~ecfg
+      ~locked_in_sells:0.0
+      ~base_balance_age:(Some age)
+  in
+  drain ();
+  (* Tick 1: reserved 0.02 leaves 0.03 free -> the first sell goes out and
+     arms its hold. *)
+  run_leg ~now:100.0 ~age:0.1;
+  let qty1 =
+    List.fold_left
+      (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+         match o.operation, o.side with
+         | Place, Sell -> acc +. o.qty
+         | _ -> acc)
+      0.0
+      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+  in
+  check bool "first sell placed" true (qty1 > 0.0);
+  drain ();
+  (* Tick 2, moments later: a second fill triggers another sell while the
+     balance message still predates the first placement (age 3.0 at t=102 ->
+     message from t=99). The armed hold must clamp the second sell to zero. *)
+  state.just_filled_buy <- true;
+  state.last_buy_fill_qty <- Some 0.05;
+  state.inflight_sell <- false;
+  ignore
+    (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+       state.duplicate_key_sell);
+  run_leg ~now:102.0 ~age:3.0;
+  let qty2 =
+    List.fold_left
+      (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+         match o.operation, o.side with
+         | Place, Sell -> acc +. o.qty
+         | _ -> acc)
+      0.0
+      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+  in
+  check
+    bool
+    "second sell within the netting window does not dip into reserved_base"
+    true
+    (qty2 <= 1e-9)
+;;
+
 let test_sell_ack_releases_inflight_latch () =
   (* A sell placement's in-flight marker must be released on ACK (not left
      latched while the sell rests on the book): has_active_sell then means "a
@@ -4788,6 +4976,14 @@ let () =
             "halted path still places the sell for a just-filled buy"
             `Quick
             test_halted_path_still_places_sell
+        ; test_case
+            "capital_low still places the bottom-rung sell"
+            `Quick
+            test_capital_low_still_places_bottom_rung_sell
+        ; test_case
+            "burst on a tracked accumulation venue never dips into reserved_base"
+            `Quick
+            test_burst_tracked_venue_no_reserved_dip
         ; test_case
             "sell ack releases the in-flight latch (multi-sell ladder)"
             `Quick

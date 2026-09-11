@@ -66,10 +66,23 @@ module BalanceStore = struct
   let update_wallet store ~available ~total wallet_type wallet_id =
     let wallet_key = wallet_type ^ "/" ^ wallet_id in
     let now = Unix.gettimeofday () in
-    let wallet_data =
-      { balance = available; total; wallet_type; wallet_id; last_updated = now }
-    in
     Mutex.lock store.mutex;
+    let wallet_data =
+      match Hashtbl.find_opt store.wallets wallet_key with
+      | Some prev when Float.equal prev.balance available && Float.equal prev.total total
+        ->
+        (* This asset's balance did not move: KEEP the original change
+           timestamp. Hyperliquid pushes one spotState snapshot for the whole
+           account, so a fill on another coin re-sends this unchanged entry.
+           Bumping [last_updated] here used to certify THIS asset's figure as
+           fresh on another asset's activity, which advanced its venue
+           timestamp and cleared its sell-hold guard - letting the strategy
+           sell base that was still committed (reserved_base). Per-asset
+           freshness must reflect when THIS asset moved, not when any
+           snapshot arrived. *)
+        prev
+      | _ -> { balance = available; total; wallet_type; wallet_id; last_updated = now }
+    in
     Hashtbl.replace store.wallets wallet_key wallet_data;
     let total =
       Hashtbl.fold (fun _ wallet acc -> acc +. wallet.total) store.wallets 0.0

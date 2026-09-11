@@ -169,14 +169,14 @@ type engine_profilers =
 let engine_profs =
   lazy
     { prof_pass =
-        Latency_profiler.create ~bucket_us:1_000 ~max_latency_us:60_000_000 "oracle:pass"
+        Latency_profiler.create ~bucket_us:1_000 ~max_latency_us:10_000_000 "oracle:pass"
     ; prof_balance =
         Latency_profiler.create
           ~bucket_us:1_000
-          ~max_latency_us:60_000_000
+          ~max_latency_us:10_000_000
           "oracle:balance"
     ; prof_fetch =
-        Latency_profiler.create ~bucket_us:1_000 ~max_latency_us:60_000_000 "oracle:fetch"
+        Latency_profiler.create ~bucket_us:1_000 ~max_latency_us:10_000_000 "oracle:fetch"
     }
 ;;
 
@@ -193,7 +193,7 @@ let asset_profiler_of symbol =
       let p =
         Latency_profiler.create
           ~bucket_us:1
-          ~max_latency_us:100_000
+          ~max_latency_us:10_000
           ("oracle:asset:" ^ symbol)
       in
       Hashtbl.replace asset_profiler_cache symbol p;
@@ -250,6 +250,13 @@ let get_refresh_generation () = Atomic.get refresh_generation
 let history_changed : bool Atomic.t = Atomic.make false
 let history_cache : (string * string, Oracle_types.series) Hashtbl.t = Hashtbl.create 16
 
+(** References derived from each asset's bars, invalidated only when the
+    merged history actually changes ([refresh_asset_history] below). The
+    O(history_len) reference scan is otherwise invariant across passes. *)
+let references_cache : (string * string, Oracle_core.references) Hashtbl.t =
+  Hashtbl.create 16
+;;
+
 let history_of_cached ~(offline : bool) ~(exchange : string) ~(symbol : string)
   : Oracle_types.series Lwt.t
   =
@@ -289,6 +296,7 @@ let refresh_asset_history ~(offline : bool) ~(exchange : string) ~(symbol : stri
          | None -> true
        in
        Hashtbl.replace history_cache (exchange, symbol) series;
+       if changed then Hashtbl.remove references_cache (exchange, symbol);
        changed)
     (fun exn ->
        Logging.warn_f
@@ -360,11 +368,28 @@ let request_pass () =
     | _ -> ())
 ;;
 
-(** Awaits the next wake byte and drains the pipe, clearing [wake_pending] so
-    the next [request_pass] writes again. A wake byte written before this call
-    makes [wait_read] return immediately, so a request landing between the
-    predicate check and the wait cannot be lost. *)
-let wake_wait () =
+(** Lwt-side fan-out for wakeups. Touched ONLY on the main Lwt domain: the
+    single pump fiber below drains the self-pipe and broadcasts this
+    condition, and every [wait_until] waits on it. Domain workers never touch
+    Lwt - they only call [request_pass].
+
+    A self-pipe read fd is a single-reader object: two concurrent
+    [Lwt_unix.wait_read] waiters (the pass loop and the refresh loop both call
+    [wait_until]) can race to consume one coalesced byte, leaving the loser
+    parked until its deadline. Funnelling every wake through one pump fiber
+    and broadcasting a condition restores the all-waiters wake semantics the
+    previous [Lwt_condition] design had, without ever calling Lwt from a
+    worker domain. *)
+let wake_condition : unit Lwt_condition.t = Lwt_condition.create ()
+
+let waker_started = Atomic.make false
+
+(** Single reader of the self-pipe. Drains every pending byte, clears
+    [wake_pending], then broadcasts to all Lwt waiters. Because the broadcast
+    happens after each drain, a [request_pass] that coalesces into an existing
+    pending byte is still covered by this iteration's broadcast (or by the
+    predicate re-check in [wait_until]). *)
+let rec pump_wake () =
   Lwt_unix.wait_read wake_lwt_read_fd
   >>= fun () ->
   let buf = Bytes.create 64 in
@@ -376,27 +401,38 @@ let wake_wait () =
    with
    | _ -> ());
   Atomic.set wake_pending false;
-  Lwt.return_unit
+  Lwt_condition.broadcast wake_condition ();
+  pump_wake ()
+;;
+
+(** Starts the pump fiber. Idempotent; must run on the main Lwt domain. *)
+let start_waker () =
+  if Atomic.compare_and_set waker_started false true then Lwt.async pump_wake
 ;;
 
 let pass_requested_changed generation = Atomic.get pass_requested <> generation
 
 (** Sleeps until the deadline OR any wake (pass request, shutdown).
-    The predicate is rechecked after every wake or timeout, so a coalesced or
-    dropped pipe write is recovered on the next iteration. *)
+    Register-then-recheck closes the lost-wakeup race: a request landing
+    between the predicate check and the waiter registration is caught by the
+    self-broadcast, since the waiter is registered by then. *)
 let rec wait_until ~(deadline : float) ~(generation : int) () =
   if is_stopped () || pass_requested_changed generation
   then Lwt.return_unit
   else (
+    start_waker ();
     let now = Unix.gettimeofday () in
     if now >= deadline
     then Lwt.return_unit
-    else
+    else (
+      let w = Lwt_condition.wait wake_condition in
+      if is_stopped () || pass_requested_changed generation
+      then Lwt_condition.broadcast wake_condition ();
       Lwt.pick
-        [ (wake_wait () >|= fun () -> ())
+        [ (w >|= fun () -> ())
         ; (Lwt_unix.sleep (Float.max 0.0 (deadline -. now)) >|= fun () -> ())
         ]
-      >>= fun () -> wait_until ~deadline ~generation ())
+      >>= fun () -> wait_until ~deadline ~generation ()))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -463,6 +499,33 @@ let resting_sell_base ~(exchange : string) ~(symbol : string) : float =
       if o.side = Exchange.Types.Sell && o.remaining_qty > 0.0
       then acc +. o.remaining_qty
       else acc)
+;;
+
+(** One traversal of an asset's open orders yielding every quantity the pass
+    needs: whether a resting buy exists, the quote committed to resting buys,
+    and the base tied up in resting sells. Replaces three independent
+    [fold_open_orders] walks (each with its own registry lookup and per-order
+    [open_order] record build) with one. *)
+let open_orders_summary ~(exchange : string) ~(symbol : string) : bool * float * float =
+  match Exchange.Registry.get exchange with
+  | None -> false, 0.0, 0.0
+  | Some (module Ex) ->
+    Ex.fold_open_orders
+      ~symbol
+      ~init:(false, 0.0, 0.0)
+      ~f:(fun (has_buy, committed, sell_base) (o : Exchange.Types.open_order) ->
+        if o.remaining_qty <= 0.0
+        then has_buy, committed, sell_base
+        else (
+          match o.side with
+          | Exchange.Types.Buy ->
+            let px =
+              match o.limit_price with
+              | Some p -> p
+              | None -> 0.0
+            in
+            true, committed +. (o.remaining_qty *. px), sell_base
+          | Exchange.Types.Sell -> has_buy, committed, sell_base +. o.remaining_qty))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -689,79 +752,53 @@ let refresh_balance_of_task (task : Oracle_tasks.task) : unit Lwt.t =
        Lwt.return ())
 ;;
 
-(** Available quote for an account RIGHT NOW: live store when present,
-    else the cached snapshot; plus in-process pending deltas measured at the
-    snapshot's epoch. Zero network. *)
-let available_quote_now (a : account) : float option =
+(** A consistent per-account balance view for one synchronous pass: the live
+    store snapshot when present, else the cached snapshot, plus the epoch its
+    pending in-process deltas were measured against. Built ONCE per account so
+    the per-asset helpers below no longer rebuild it 2-4 times per asset
+    (Kraken's rebuild is O(balances x symbols) with per-term list allocation). *)
+type account_snapshot =
+  { acs_snap : Oracle_balances.snapshot
+  ; acs_epoch : int
+  }
+
+let account_snapshot_of (a : account) : account_snapshot option =
   let id = account_id a in
-  let snap_opt =
-    match
-      Oracle_balances.snapshot_of_live_store
-        ~exchange:a.a_exchange
-        ~testnet:a.a_testnet
-        ()
-    with
-    | Some snap -> Some snap
-    | None -> Option.map (fun p -> p.snap) (Hashtbl.find_opt pool_cache id)
-  in
-  match snap_opt with
-  | None -> None
-  | Some snap ->
-    let epoch =
-      match Hashtbl.find_opt pool_cache id with
-      | Some p
-        when Option.is_none
-               (Oracle_balances.snapshot_of_live_store
-                  ~exchange:a.a_exchange
-                  ~testnet:a.a_testnet
-                  ()) -> p.ps_epoch
-      | _ -> Atomic.get balance_epoch
-    in
-    let dq, pending = pending_deltas id epoch in
-    if pending <> [] then prune_pending id epoch;
-    Some (Float.max 0.0 (Oracle_balances.available_quote snap ~quote:a.a_quote +. dq))
+  match
+    Oracle_balances.snapshot_of_live_store ~exchange:a.a_exchange ~testnet:a.a_testnet ()
+  with
+  | Some snap -> Some { acs_snap = snap; acs_epoch = Atomic.get balance_epoch }
+  | None ->
+    Option.map
+      (fun p -> { acs_snap = p.snap; acs_epoch = p.ps_epoch })
+      (Hashtbl.find_opt pool_cache id)
 ;;
 
-(** Available base for one symbol right now (same sources), minus nothing:
-    reserved_base is excluded upstream by the execution layer's
-    available_trading_balance. Resting sells are subtracted separately via
-    the open-order registry. Zero network. *)
-let available_base_now (a : account) ~(symbol : string) : float option =
+(** Available quote within a hoisted snapshot: live/cached balance plus the
+    in-process pending deltas measured at the snapshot's epoch. Zero network. *)
+let available_quote_in (a : account) (acs : account_snapshot) : float =
   let id = account_id a in
-  let snap_opt =
-    match
-      Oracle_balances.snapshot_of_live_store
-        ~exchange:a.a_exchange
-        ~testnet:a.a_testnet
-        ()
-    with
-    | Some snap -> Some snap
-    | None -> Option.map (fun p -> p.snap) (Hashtbl.find_opt pool_cache id)
+  let dq, pending = pending_deltas id acs.acs_epoch in
+  if pending <> [] then prune_pending id acs.acs_epoch;
+  Float.max 0.0 (Oracle_balances.available_quote acs.acs_snap ~quote:a.a_quote +. dq)
+;;
+
+(** Available base for one symbol within a hoisted snapshot (same sources),
+    minus nothing: reserved_base is excluded upstream by the execution layer's
+    available_trading_balance. Resting sells are subtracted separately. *)
+let available_base_in (a : account) ~(symbol : string) (acs : account_snapshot) : float =
+  let id = account_id a in
+  let base, _ = split_symbol symbol in
+  let _, pending = pending_deltas id acs.acs_epoch in
+  let db =
+    List.fold_left
+      (fun acc (e : pool_event) ->
+         if String.equal e.pe_base_asset base then acc +. e.pe_delta_base else acc)
+      0.0
+      pending
   in
-  match snap_opt with
-  | None -> None
-  | Some snap ->
-    let base, _ = split_symbol symbol in
-    let epoch =
-      match Hashtbl.find_opt pool_cache id with
-      | Some p
-        when Option.is_none
-               (Oracle_balances.snapshot_of_live_store
-                  ~exchange:a.a_exchange
-                  ~testnet:a.a_testnet
-                  ()) -> p.ps_epoch
-      | _ -> Atomic.get balance_epoch
-    in
-    let _, pending = pending_deltas id epoch in
-    let db =
-      List.fold_left
-        (fun acc (e : pool_event) ->
-           if String.equal e.pe_base_asset base then acc +. e.pe_delta_base else acc)
-        0.0
-        pending
-    in
-    if pending <> [] then prune_pending id epoch;
-    Some (Float.max 0.0 (Oracle_balances.available_asset snap ~asset:base +. db))
+  if pending <> [] then prune_pending id acs.acs_epoch;
+  Float.max 0.0 (Oracle_balances.available_asset acs.acs_snap ~asset:base +. db)
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -807,7 +844,7 @@ let run_account_pass
       ~(tasks : Oracle_tasks.task list)
   : decision list Lwt.t
   =
-  match available_quote_now account with
+  match account_snapshot_of account with
   | None ->
     Logging.warn_f
       ~section
@@ -822,13 +859,35 @@ let run_account_pass
                  String.equal t.exchange d.exchange && String.equal t.symbol d.symbol)
               tasks)
          (decisions ()))
-  | Some pool ->
+  | Some acs ->
+    let pool = available_quote_in account acs in
+    (* Per-task open-order summary and config-derived bounds are invariant
+       across the pass (they depend only on venue state and config), so
+       resolve them once here instead of 2-3x inside the sizing loop. This
+       also gives [committed_venue_buys] the same values the loop consumes. *)
+    let task_rows =
+      List.map
+        (fun (t : Oracle_tasks.task) ->
+           let summary = open_orders_summary ~exchange:t.exchange ~symbol:t.symbol in
+           let target_survival, min_active_dsurv, qty_cap_mult =
+             effective_knobs ~config ~symbol:t.symbol
+           in
+           let qty_raw = float_of_string_opt t.config.qty |> Option.value ~default:0.0 in
+           let bounds =
+             { Oracle_core.qty = Float.max 1e-12 qty_raw
+             ; qty_cap_mult = Float.max 1.0 qty_cap_mult
+             ; gi_min = fst t.config.grid_interval
+             ; gi_max = snd t.config.grid_interval
+             }
+           in
+           t, summary, target_survival, min_active_dsurv, bounds)
+        tasks
+    in
     let committed_venue_buys =
       List.fold_left
-        (fun acc (t : Oracle_tasks.task) ->
-           acc +. committed_buy_value ~exchange:t.exchange ~symbol:t.symbol)
+        (fun acc (_, (_, committed, _), _, _, _) -> acc +. committed)
         0.0
-        tasks
+        task_rows
     in
     let total_venue_quote = pool +. committed_venue_buys in
     let remaining = ref pool in
@@ -839,20 +898,13 @@ let run_account_pass
       =
       ref []
     in
-    List.iteri
-      (fun _idx (t : Oracle_tasks.task) ->
+    List.iter
+      (fun ( (t : Oracle_tasks.task)
+           , (resting_buy, committed_buy, resting_sell)
+           , target_survival
+           , min_active_dsurv
+           , bounds ) ->
          let t_asset = Mtime_clock.now_ns () in
-         let target_survival, min_active_dsurv, qty_cap_mult =
-           effective_knobs ~config ~symbol:t.symbol
-         in
-         let qty_raw = float_of_string_opt t.config.qty |> Option.value ~default:0.0 in
-         let bounds =
-           { Oracle_core.qty = Float.max 1e-12 qty_raw
-           ; qty_cap_mult = Float.max 1.0 qty_cap_mult
-           ; gi_min = fst t.config.grid_interval
-           ; gi_max = snd t.config.grid_interval
-           }
-         in
          (* No usable data yet: publish NOTHING for this asset rather than a
             garbage-zero inactive decision - a fabricated decision would open
             the domain's startup gate on values that were never computed.
@@ -882,10 +934,6 @@ let run_account_pass
                  ~symbol:t.symbol
                  ~fallback:fallback_close
              in
-             let resting_buy = has_resting_buy ~exchange:t.exchange ~symbol:t.symbol in
-             let committed_buy =
-               committed_buy_value ~exchange:t.exchange ~symbol:t.symbol
-             in
              let effective_quote =
                if resting_buy then !remaining +. committed_buy else !remaining
              in
@@ -903,18 +951,29 @@ let run_account_pass
                ; has_resting_buy = resting_buy
                }
              in
-             match Oracle_pipeline.decide ~inputs with
+             let refs_opt =
+               match Hashtbl.find_opt references_cache (t.exchange, t.symbol) with
+               | Some r -> Some r
+               | None ->
+                 (match Oracle_core.references_of ~bars:series.bars with
+                  | Some r as some ->
+                    Hashtbl.replace references_cache (t.exchange, t.symbol) r;
+                    some
+                  | None -> None)
+             in
+             match
+               match refs_opt with
+               | None -> None
+               | Some refs -> Oracle_pipeline.decide_from_refs ~refs ~inputs
+             with
              | None -> skip_asset "references unavailable"
              | Some o ->
-               let base_avail =
-                 Option.value (available_base_now account ~symbol:t.symbol) ~default:0.0
-               in
+               let base_avail = available_base_in account ~symbol:t.symbol acs in
                let sell_qty =
                  Oracle_pools.sell_qty_of
                    ~base_balance:base_avail
                    ~reserved_base:0.0
-                   ~resting_sell_base:
-                     (resting_sell_base ~exchange:t.exchange ~symbol:t.symbol)
+                   ~resting_sell_base:resting_sell
                in
                let reason =
                  if o.decision.active
@@ -957,7 +1016,7 @@ let run_account_pass
                if d.active && (not resting_buy) && need <= !remaining +. 1e-9
                then remaining := !remaining -. need;
                built := (t, d, need, current, Some o) :: !built))
-      tasks;
+      task_rows;
     let built_rev = List.rev !built in
     let key_of_task (t : Oracle_tasks.task) =
       Printf.sprintf "%s|%s" t.exchange t.symbol

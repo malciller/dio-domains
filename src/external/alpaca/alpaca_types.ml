@@ -39,11 +39,13 @@ module Config = struct
     if !is_paper then "https://paper-api.alpaca.markets" else "https://api.alpaca.markets"
   ;;
 
-  let trading_ws_url () =
-    if !is_paper
-    then "wss://paper-api.alpaca.markets/stream"
-    else "wss://api.alpaca.markets/stream"
-  ;;
+  (** Trade events (fills, partial fills, cancels, replaces, rejects) are
+      delivered by Alpaca's Events API over Server-Sent Events. The legacy v1
+      [wss://.../stream] trade_updates WebSocket is deprecated by Alpaca and
+      currently answers the upgrade with HTTP 500 - do not reintroduce it. The
+      Events stream works against the retail host; auth is the same
+      [APCA-API-KEY-ID] / [APCA-API-SECRET-KEY] headers as REST. *)
+  let trading_events_url () = rest_base_url () ^ "/v2/events/trades"
 
   let data_ws_url () = Printf.sprintf "wss://stream.data.alpaca.markets/v2/%s" !data_feed
 

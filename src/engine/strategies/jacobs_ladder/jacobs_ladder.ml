@@ -18,6 +18,7 @@ type exchange_config = Jacobs_ladder_types.exchange_config =
   ; use_accumulation_sells : bool
   ; sell_failure_sets_asset_low : bool
   ; use_reserved_base_guard : bool
+  ; use_unnetted_sell_hold : bool
   ; asset_low_requires_balance_change : bool
   ; merge_preserved_sells : bool
   ; check_stale_balance : bool

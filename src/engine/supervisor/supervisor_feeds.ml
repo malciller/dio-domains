@@ -210,8 +210,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                Hyperliquid.Instruments_feed.wait_until_ready ()
                >>= fun () ->
                Hyperliquid.Ws.subscribe_to_feeds ~symbols:hyperliquid_symbols ~wallet
-               >>= fun () ->
-               Hyperliquid.Module.fetch_open_orders_ws ())
+               >>= fun () -> Hyperliquid.Module.fetch_open_orders_ws ())
            in
            Hyperliquid.Ws.connect_and_monitor
              ~testnet:hyperliquid_testnet
