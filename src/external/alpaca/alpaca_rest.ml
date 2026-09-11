@@ -594,6 +594,10 @@ let get_positions () =
                       |> to_string_option
                       |> Option.value ~default:""
                   ; qty = j |> member "qty" |> json_to_float
+                  ; qty_available =
+                      (match json_to_float_opt (j |> member "qty_available") with
+                       | Some a -> a
+                       | None -> j |> member "qty" |> json_to_float)
                   ; market_value = j |> member "market_value" |> json_to_float
                   ; avg_entry_price = j |> member "avg_entry_price" |> json_to_float
                   ; current_price = j |> member "current_price" |> json_to_float

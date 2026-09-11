@@ -326,14 +326,6 @@ let fold_open_orders symbol ~init ~f =
   | None -> init
 ;;
 
-let initialize symbols =
-  List.iter
-    (fun sym ->
-       let store = get_or_create_store sym in
-       SymbolExecStore.mark_ready store)
-    symbols
-;;
-
 let bootstrap_open_orders () =
   Alpaca_rest.get_open_orders ()
   >>= function
@@ -369,6 +361,49 @@ let bootstrap_open_orders () =
     Hashtbl.iter (fun _store_sym store -> SymbolExecStore.mark_ready store) stores;
     Mutex.unlock stores_mutex;
     Lwt.return_unit
+;;
+
+(** Period between background open-order reconciles. The SSE feed is the
+    hot-path source, but a dropped/out-of-order event (or a missed amend
+    replace) permanently desyncs the store until the next reconnect or
+    inventory rejection. A periodic REST snapshot heals that drift within one
+    interval. *)
+let open_orders_resync_interval_s = 10.0
+
+let open_orders_resync_running = Atomic.make false
+
+(** Starts the periodic open-order reconcile once. Idempotent: later calls
+    (e.g. an SSE reconnect) are no-ops. *)
+let start_open_orders_resync () =
+  if Atomic.compare_and_set open_orders_resync_running false true
+  then (
+    let rec loop () =
+      Lwt_unix.sleep open_orders_resync_interval_s
+      >>= fun () ->
+      Lwt.catch bootstrap_open_orders (fun exn ->
+        Logging.warn_f
+          ~section
+          "Periodic open-orders resync failed: %s"
+          (Printexc.to_string exn);
+        Lwt.return_unit)
+      >>= fun () -> loop ()
+    in
+    Lwt.async (fun () ->
+      Lwt.catch loop (fun exn ->
+        Logging.error_f
+          ~section
+          "Periodic open-orders resync loop died: %s"
+          (Printexc.to_string exn);
+        Lwt.return_unit)))
+;;
+
+let initialize symbols =
+  List.iter
+    (fun sym ->
+       let store = get_or_create_store sym in
+       SymbolExecStore.mark_ready store)
+    symbols;
+  start_open_orders_resync ()
 ;;
 
 let apply_trade_update json =
