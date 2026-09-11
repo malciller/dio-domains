@@ -1197,6 +1197,20 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
        let is_cannot_modify =
          contains_fragment lower_reason "cannot modify canceled or filled"
        in
+       (* Alpaca reports a terminal order on the amend/fallback-cancel path as
+          [order is already in "filled" state] (JSON-escaped, so the embedded
+          quotes carry backslashes). Match the stable words rather than the
+          quoted fragment. Such an order is gone: keeping it tracked re-issues
+          the same doomed cancel+replace on every cooldown. *)
+       let is_already_terminal =
+         (contains_fragment lower_reason "already in"
+          && (contains_fragment lower_reason "filled"
+              || contains_fragment lower_reason "canceled"
+              || contains_fragment lower_reason "cancelled"))
+         || contains_fragment lower_reason "already filled"
+         || contains_fragment lower_reason "already canceled"
+         || contains_fragment lower_reason "already cancelled"
+       in
        let is_margin_error =
          contains_fragment lower_reason "insufficient"
          || contains_fragment lower_reason "margin"
@@ -1208,7 +1222,8 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
        let cooldown_duration =
          if is_rate_limit
          then 10.0
-         else if is_cache_miss || is_cannot_modify || is_margin_error
+         else if
+           is_cache_miss || is_cannot_modify || is_margin_error || is_already_terminal
          then 0.5
          else 2.0
        in
@@ -1226,8 +1241,20 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
          || contains_fragment lower_reason "cross"
        in
        let is_order_gone =
-         is_cache_miss || is_cannot_modify || is_margin_error || is_tif_rejection
+         is_cache_miss
+         || is_cannot_modify
+         || is_margin_error
+         || is_tif_rejection
+         || is_already_terminal
        in
+       (* A venue-terminal order can linger in the local open-order cache if the
+          terminal trade-update was missed. Evict it from the open-orders scan so
+          the adoption path cannot re-adopt the stale entry as the resting buy
+          and re-issue the same failed cancel+replace. The TTL mirrors the
+          cleanup window used by [sync_open_orders]; the entry is harmless once
+          the order also leaves the venue cache. *)
+       if is_already_terminal
+       then Hashtbl.replace state.evicted_orders order_id (now +. 900.0);
        if is_order_gone
        then (
          let cancel_order =
