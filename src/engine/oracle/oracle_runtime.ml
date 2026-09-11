@@ -312,19 +312,78 @@ let shutdown_requested = Atomic.make false
 let is_stopped () = Atomic.get shutdown_requested
 let shutdown () = Atomic.set shutdown_requested true
 let pass_requested : int Atomic.t = Atomic.make 0
-let wake_condition : unit Lwt_condition.t = Lwt_condition.create ()
 
+(** Domain-safe wake channel for [request_pass].
+
+    [request_pass] is invoked from per-symbol domain worker threads
+    ([notify_fill] / [notify_order_cancel] run inside the domain's execution
+    cycle), while [wait_until] runs on the main Lwt domain. [Lwt_condition] is
+    NOT safe to touch from a non-Lwt domain: the worker would race the
+    scheduler on Lwt's unsynchronized waiter list, and a wake can run the
+    oracle's continuation on the domain's own stack - charging oracle work to
+    the trading cycle and inflating execution latency. Signal through a
+    self-pipe instead (same pattern as [Strategy_common.OrderSignal]): a
+    non-blocking byte write from any domain wakes the Lwt read without
+    touching Lwt internals. *)
+let wake_read_fd, wake_write_fd =
+  let r, w = Unix.pipe ~cloexec:true () in
+  Unix.set_nonblock r;
+  Unix.set_nonblock w;
+  r, w
+;;
+
+(** Lwt wrapper for the read end of the self-pipe. Created once at module
+    init to avoid per-wait allocation. *)
+let wake_lwt_read_fd =
+  Lwt_unix.of_unix_file_descr ~blocking:false ~set_flags:false wake_read_fd
+;;
+
+(** Coalesces multiple [request_pass] calls into a single pipe write. The
+    monotonically increasing [pass_requested] counter carries the actual wake
+    semantics, so dropping a coalesced byte is always recovered by the
+    predicate recheck in [wait_until]. *)
+let wake_pending = Atomic.make false
+
+(** Reusable one-byte payload; [Unix.write] never mutates it. *)
+let wake_byte = Bytes.make 1 '\x00'
+
+(** Requests a pass and wakes the oracle loop. Safe from any domain: the
+    counter increment and the coalesced non-blocking pipe write are the only
+    effects, and neither touches Lwt. *)
 let request_pass () =
   Atomic.incr pass_requested;
-  Lwt_condition.broadcast wake_condition ()
+  if not (Atomic.exchange wake_pending true)
+  then (
+    try ignore (Unix.write wake_write_fd wake_byte 0 1) with
+    | Unix.Unix_error (Unix.EAGAIN, _, _) -> ()
+    | Unix.Unix_error (Unix.EWOULDBLOCK, _, _) -> ()
+    | _ -> ())
+;;
+
+(** Awaits the next wake byte and drains the pipe, clearing [wake_pending] so
+    the next [request_pass] writes again. A wake byte written before this call
+    makes [wait_read] return immediately, so a request landing between the
+    predicate check and the wait cannot be lost. *)
+let wake_wait () =
+  Lwt_unix.wait_read wake_lwt_read_fd
+  >>= fun () ->
+  let buf = Bytes.create 64 in
+  (try
+     while true do
+       let n = Unix.read wake_read_fd buf 0 64 in
+       if n = 0 then raise Exit
+     done
+   with
+   | _ -> ());
+  Atomic.set wake_pending false;
+  Lwt.return_unit
 ;;
 
 let pass_requested_changed generation = Atomic.get pass_requested <> generation
 
 (** Sleeps until the deadline OR any wake (pass request, shutdown).
-    Register-then-recheck closes the lost-wakeup race: an event landing
-    between the predicate check and the wait registration is caught by the
-    self-broadcast, since the waiter is registered by then. *)
+    The predicate is rechecked after every wake or timeout, so a coalesced or
+    dropped pipe write is recovered on the next iteration. *)
 let rec wait_until ~(deadline : float) ~(generation : int) () =
   if is_stopped () || pass_requested_changed generation
   then Lwt.return_unit
@@ -332,15 +391,12 @@ let rec wait_until ~(deadline : float) ~(generation : int) () =
     let now = Unix.gettimeofday () in
     if now >= deadline
     then Lwt.return_unit
-    else (
-      let w = Lwt_condition.wait wake_condition in
-      if is_stopped () || pass_requested_changed generation
-      then Lwt_condition.broadcast wake_condition ();
+    else
       Lwt.pick
-        [ (w >|= fun () -> ())
+        [ (wake_wait () >|= fun () -> ())
         ; (Lwt_unix.sleep (Float.max 0.0 (deadline -. now)) >|= fun () -> ())
         ]
-      >>= fun () -> wait_until ~deadline ~generation ()))
+      >>= fun () -> wait_until ~deadline ~generation ())
 ;;
 
 (* ------------------------------------------------------------------ *)

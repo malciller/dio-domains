@@ -675,6 +675,234 @@ let test_unnetted_sell_hold_capped_even_with_age () =
   drain ()
 ;;
 
+let test_unnetted_sell_hold_releases_on_newer_message () =
+  (* The production wedge: a sell hold was armed, then a buy fill raised the
+     venue figure in the same window the sell's hold was applied, so the
+     tradeable net never dropped. The old drop-only release kept the hold armed
+     for the whole grace and blocked the owed 1:1 sell, so inventory piled up
+     until the next trigger dumped it as one oversized sell. A balance message
+     generated AFTER the placement already contains the hold, so the overlay
+     must retire and the owed sell must place. *)
+  let symbol = "UNNET4/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.15;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.98;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.19917916;
+  state.accumulated_profit <- 0.0;
+  state.open_sell_orders <- [];
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 82.309;
+  state.last_buy_fill_qty <- Some 0.15;
+  state.position_base <- 0.35512940;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 99.0;
+  state.buy_credits_since_balance <- [];
+  (* The sell's hold was armed at t=100; the newest balance message is from
+     t=109 (age 1.0 at now 110), i.e. newer than the placement. *)
+  state.sell_holds_since_balance <- [ 100.0, 0.15 ];
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.15"
+    ; grid_interval = 0.4
+    ; sell_mult = "0.98"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.25
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:110.0
+    ~asset
+    ~bid_price:82.30
+    ~ask_price:82.31
+    ~asset_balance:0.35512940
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:(Some 1.0);
+  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let sell_qty =
+    List.fold_left
+      (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+         match o.operation, o.side with
+         | Place, Sell when o.symbol = symbol -> acc +. o.qty
+         | _ -> acc)
+      0.0
+      pushed
+  in
+  check
+    bool
+    "a balance message newer than the placement releases the hold and places the owed \
+     sell"
+    true
+    (sell_qty >= 0.15 -. 1e-9);
+  check
+    bool
+    "the released hold leaves the tracking list (only the new placement's hold remains)"
+    true
+    (match state.sell_holds_since_balance with
+     | [ (t, q) ] -> t >= 110.0 -. 1e-9 && q >= 0.15 -. 1e-9
+     | _ -> false);
+  drain ()
+;;
+
+let test_unnetted_sell_hold_burst_downmove () =
+  (* Violent down-move burst, end to end through the venue-feed lag: several
+     buys fill faster than the spot grid can offer them. For each rung the
+     balance snapshot that nets the PREVIOUS rung's resting-sell hold also
+     carries the new buy, so the tradeable net never drops (delta 0) and the
+     old drop-only release left every prior hold armed. Each message also
+     PREDATES the new fill's credit, so that credit is pruned and cannot offset
+     the stale hold. Without the message-time release the armed holds stack and
+     block every subsequent sell, so inventory piles up until the grace expires
+     and it dumps as one oversized sell. Every rung's owed 1:1 sell must place
+     at the single lot size instead. *)
+  let symbol = "BURST_HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.15;
+  (* Zero fee so a fill's buy credit is exactly the lot qty; a fee would only
+     perturb the arithmetic, not the mechanism. *)
+  state.maker_fee <- 0.0;
+  state.cached_sell_mult <- 0.999;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.199;
+  state.accumulated_profit <- 0.0;
+  state.open_sell_orders <- [];
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- false;
+  state.position_base <- 0.199;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 0.0;
+  state.buy_credits_since_balance <- [];
+  state.sell_holds_since_balance <- [];
+  state.last_buy_fill_price <- None;
+  state.last_buy_fill_qty <- None;
+  Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done symbol;
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.15"
+    ; grid_interval = 0.4
+    ; sell_mult = "0.999"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.25
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  let lot = 0.15 in
+  (* Venue model: total base includes holds; a placed sell locks its qty. *)
+  let venue_total = ref 0.199 in
+  let venue_hold = ref 0.0 in
+  let sold = ref [] in
+  drain ();
+  for i = 0 to 4 do
+    let fill_now = 100.0 +. (float_of_int i *. 1.0) in
+    (* 1) a buy fills at the falling price, crediting base. *)
+    venue_total := !venue_total +. lot;
+    Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+      ~now:fill_now
+      symbol
+      (Printf.sprintf "burst_buy_%d" i)
+      Dio_strategies.Strategy_common.Buy
+      ~fill_price:(82.0 -. (float_of_int i *. 0.5))
+      ~fill_qty:lot
+      None;
+    (* 2) the venue emits a balance snapshot after BOTH the new fill and the
+          previous resting sell's hold: the tradeable net is unchanged (no drop
+          to observe), and the message is newer than the armed hold. *)
+    let msg_now = fill_now +. 0.5 in
+    Dio_strategies.Jacobs_ladder.reconcile_position
+      ~state
+      ~now:msg_now
+      ~base_balance_age:(Some 0.0)
+      ~asset_balance:(!venue_total -. !venue_hold);
+    (* 3) the sell leg runs; the owed 1:1 sell must place at the single lot. *)
+    Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+      ~persisted_reconcile:
+        (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      ~state
+      ~now:(msg_now +. 0.5)
+      ~asset
+      ~bid_price:(82.0 -. (float_of_int i *. 0.5))
+      ~ask_price:(82.0 -. (float_of_int i *. 0.5) +. 0.01)
+      ~asset_balance:(!venue_total -. !venue_hold)
+      ~buy_attempted:false
+      ~oracle_halted:false
+      ~ecfg
+      ~locked_in_sells:0.0
+      ~base_balance_age:(Some 0.0);
+    let qty =
+      List.fold_left
+        (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+           match o.operation, o.side with
+           | Place, Sell when o.symbol = symbol -> acc +. o.qty
+           | _ -> acc)
+        0.0
+        (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+    in
+    sold := (i, qty) :: !sold;
+    (* A blocked rung places nothing and locks nothing - the pile-up the test
+       guards against. *)
+    venue_hold := !venue_hold +. qty;
+    drain ()
+  done;
+  let sold = List.rev !sold in
+  let placed_count = List.length (List.filter (fun (_, q) -> q >= lot -. 1e-6) sold) in
+  let oversized = List.exists (fun (_, q) -> q > lot +. 1e-6) sold in
+  check
+    bool
+    "every rung of a masking down-move burst places its own 1:1 sell"
+    true
+    (placed_count = 5);
+  check
+    bool
+    "no rung dumps accumulated inventory as an oversized sell"
+    true
+    (not oversized);
+  check
+    bool
+    "cumulative sold base equals the burst's buy lots (no over-accumulation)"
+    true
+    (abs_float (List.fold_left (fun a (_, q) -> a +. q) 0.0 sold -. (5.0 *. lot)) < 1e-6)
+;;
+
 let test_position_ledger_bridges_unreflected_fill () =
   (* The over-accumulation desync: a buy fill fires the 1:1 sell before the
      venue's balance feed has netted the fill. Sizing off the raw snapshot
@@ -4620,6 +4848,14 @@ let () =
             "unnetted sell hold capped even with an ancient balance age"
             `Quick
             test_unnetted_sell_hold_capped_even_with_age
+        ; test_case
+            "newer balance message releases the unnetted sell hold"
+            `Quick
+            test_unnetted_sell_hold_releases_on_newer_message
+        ; test_case
+            "down-move burst places every rung's sell (no hold pile-up)"
+            `Quick
+            test_unnetted_sell_hold_burst_downmove
         ; test_case
             "position ledger bridges an unreflected buy fill"
             `Quick

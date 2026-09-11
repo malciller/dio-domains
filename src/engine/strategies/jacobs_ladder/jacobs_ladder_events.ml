@@ -529,7 +529,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
                is bounded and covered by processed_fills). Reset the mark so
                real fills flow again; processed_fills still guards in-window
                redelivery. *)
-           Logging.critical_f
+           Logging.critical_async_f
              ~section
              "Fill replay guard stuck: %d consecutive skips for %s (last_fill_oid=%s) \
               indicates the persisted high-water mark is ahead of the venue's live id \

@@ -157,13 +157,13 @@
       "exchange": "alpaca",
       "qty": "0.28",
       "grid_interval": [
-        0.30,
-        0.90
+        0.15,
+        0.25
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
         0.05,
-        2.00
+        0.40
       ],
       "strategy": "Ladder",
       "testnet": true,
@@ -175,13 +175,13 @@
       "exchange": "alpaca",
       "qty": "0.13",
       "grid_interval": [
-        0.30,
-        0.90
+        0.15,
+        0.25
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
         0.05,
-        2.00
+        0.40
       ],
       "strategy": "Ladder",
       "testnet": true,
@@ -193,13 +193,13 @@
       "exchange": "alpaca",
       "qty": "0.13",
       "grid_interval": [
-        0.25,
-        0.75
+        0.15,
+        0.25
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
         0.05,
-        2.00
+        0.40
       ],
       "strategy": "Ladder",
       "testnet": true,
@@ -211,13 +211,13 @@
       "exchange": "alpaca",
       "qty": "0.018",
       "grid_interval": [
-        0.25,
-        0.75
+        0.15,
+        0.25
       ],
       "sell_mult": "0.999",
       "accumulation_buffer": [
         0.05,
-        2.00
+        0.40
       ],
       "strategy": "Ladder",
       "testnet": true,
