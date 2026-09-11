@@ -460,7 +460,7 @@ let add_processed_fill state order_id =
 ;;
 
 (** Handles order fill. *)
-let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty cl_ord_id =
+let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl_ord_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect
@@ -618,24 +618,41 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
               when the profit window exceeds the buffer (see below). *)
            if acc_qty > 0.0 && not state.startup_replay
            then (
-             (* The anticipated credit mirrors what the venue actually
-                 credits: on Hyperliquid-like spot venues the buy fee is
-                 subtracted from the received BASE, so crediting the raw
-                 fill qty would overstate inventory by the fee on every
-                 fill - exactly the balance-vs-credit drift that lets a
-                 sell dip into reserved_base. *)
+             (* Record the buy credit for the fill-aware sizing bridge rather
+                 than mutating a running ledger: on Hyperliquid-like spot
+                 venues the buy fee is subtracted from the received BASE, so
+                 crediting the raw fill qty would overstate inventory by the
+                 fee on every fill - exactly the balance-vs-ledger drift that
+                 lets a sell dip into reserved_base.
+
+                 Draw down [attributed_balance_increase] first: the balance
+                 feed may have already adopted this fill (independent feeds,
+                 message before execution event), and adding the credit then
+                 would double-count it. Only the unmatched remainder is an
+                 unreflected credit. *)
              let credit_qty =
                if hl_like_spot_fee_exchange state.exchange_id && state.maker_fee > 0.0
                then Float.max 0.0 (acc_qty -. (state.maker_fee *. acc_qty))
                else acc_qty
              in
-             state.anticipated_base_credit <- state.anticipated_base_credit +. credit_qty;
+             let already_reflected =
+               Float.min credit_qty state.attributed_balance_increase
+             in
+             state.attributed_balance_increase
+             <- Float.max 0.0 (state.attributed_balance_increase -. already_reflected);
+             let pending = credit_qty -. already_reflected in
+             if pending > 1e-12
+             then
+               state.buy_credits_since_balance
+               <- state.buy_credits_since_balance @ [ now, pending ];
              Logging.info_f
                ~section
-               "Anticipated base credit for %s: +%.8f (total: %.8f) from buy fill %s"
+               "Pending base credit for %s: +%.8f (already reflected: %.8f, unreflected \
+                credits: %d) from buy fill %s"
                asset_symbol
-               credit_qty
-               state.anticipated_base_credit
+               pending
+               already_reflected
+               (List.length state.buy_credits_since_balance)
                order_id);
            (* A buy fill does not complete a sell placement: the sell's own
                ack/fill/cancel events own the sell in-flight lifecycle, so the
@@ -744,8 +761,15 @@ let handle_order_filled ~now:_ asset_symbol order_id side ~fill_price ~fill_qty 
                 state.persistence_dirty <- true));
             if acc_qty > 0.0
             then
-              state.anticipated_base_credit
-              <- Float.max 0.0 (state.anticipated_base_credit -. acc_qty);
+              if
+                (* Accumulation venues report tradeable = total - open-order
+                 hold: when a resting sell fills, the hold release offsets the
+                 total drop, so the venue figure does not fall and the ledger
+                 must not decrement here (that would double-count against
+                 [unnetted_hold]); the venue reconciliation absorbs the netting.
+                 Gross-balance venues fall by the sold qty at fill. *)
+                not state.cached_ecfg.use_accumulation_sells
+              then state.position_base <- Float.max 0.0 (state.position_base -. acc_qty);
             state.last_sell_fill_qty <- Some acc_qty;
             (* Spec-aligned sell fill: profit is measured against the LAST
                BUY fill (single local buy/sell cycle pair). The legacy

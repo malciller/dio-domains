@@ -22,12 +22,12 @@
       "BTC/USDC": {
         "target_survival": 0.65,
         "min_active_dsurv": 0.0,
-        "qty_cap_mult": 2.5
+        "qty_cap_mult": 3.0
       },
       "HYPE/USDC": {
-        "target_survival": 0.65,
+        "target_survival": 0.5,
         "min_active_dsurv": 0.0,
-        "qty_cap_mult": 2.5
+        "qty_cap_mult": 3.0
       },
       "BOTZ": {
         "target_survival": 0.70,
@@ -57,10 +57,10 @@
       "exchange": "hyperliquid",
       "qty": "0.00020",
       "grid_interval": [
-        0.18,
-        0.25
+        0.16,
+        0.16
       ],
-      "sell_mult": "0.92",
+      "sell_mult": "0.90",
       "accumulation_buffer": [
         0.08,
         0.40
@@ -73,15 +73,15 @@
     {
       "symbol": "HYPE/USDC",
       "exchange": "hyperliquid",
-      "qty": "0.18",
+      "qty": "0.2",
       "grid_interval": [
-        0.28,
-        0.36
+        0.16,
+        0.16
       ],
       "sell_mult": "0.98",
       "accumulation_buffer": [
-        0.25,
-        2.00
+        0.10,
+        0.40
       ],
       "strategy": "Ladder",
       "testnet": false,
@@ -93,13 +93,13 @@
       "exchange": "kraken",
       "qty": "0.04",
       "grid_interval": [
-        2.5,
-        5.0
+        1.6,
+        1.6
       ],
       "sell_mult": "0.97",
       "accumulation_buffer": [
         0.10,
-        1.50
+        0.80
       ],
       "strategy": "Ladder",
       "sell_levels": false

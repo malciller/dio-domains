@@ -330,7 +330,8 @@ let test_hl_buy_fill_accrues_reserve () =
   state.maker_fee <- 0.0004;
   state.cached_sell_mult <- 0.999;
   state.reserved_base <- 0.0;
-  state.anticipated_base_credit <- 0.0;
+  state.position_base <- 0.0;
+  state.buy_credits_since_balance <- [];
   Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done symbol;
   Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
     ~now:0.0
@@ -354,9 +355,12 @@ let test_hl_buy_fill_accrues_reserve () =
   check bool "hl buy reference qty recorded" true (state.last_buy_fill_qty = Some 0.5);
   check
     bool
-    "hl anticipated credit is net of the base-side buy fee"
+    "hl pending buy credit is net of the base-side buy fee"
     true
-    (abs_float (state.anticipated_base_credit -. landed) < 1e-9);
+    (abs_float
+       (List.fold_left (fun acc (_, q) -> acc +. q) 0.0 state.buy_credits_since_balance
+        -. landed)
+     < 1e-9);
   (* Kraken aligns identically: buy fill updates refs only, no reserve. *)
   let kr_symbol = "KR_ACCRUAL/XMR/USD" in
   let kr_state = Dio_strategies.Jacobs_ladder.get_strategy_state kr_symbol in
@@ -660,6 +664,861 @@ let test_unnetted_sell_hold_capped_even_with_age () =
     true
     (state.sell_holds_since_balance = []);
   drain ()
+;;
+
+let test_position_ledger_bridges_unreflected_fill () =
+  (* The over-accumulation desync: a buy fill fires the 1:1 sell before the
+     venue's balance feed has netted the fill. Sizing off the raw snapshot
+     then reads bal - reserved_base = dust and blocks the sell, so the buy
+     leg chains while inventory piles up. The windowed buy credit overlays the
+     just-filled qty onto the last-known venue figure, so the sale sizes
+     against the fill even though the feed is still pre-fill. *)
+  let symbol = "LEDGER1/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.2;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.98;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.19117916;
+  state.accumulated_profit <- 0.0;
+  state.open_sell_orders <- [];
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 79.0;
+  state.last_buy_fill_qty <- Some 0.2;
+  (* Venue figure is the pre-fill snapshot (dust above the reserve); the
+     just-filled 0.2 rides in the unreflected-credit overlay. *)
+  state.position_base <- 0.1936;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 999.0;
+  state.buy_credits_since_balance <- [ 999.5, 0.2 ];
+  state.sell_holds_since_balance <- [];
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.2"
+    ; grid_interval = 0.16
+    ; sell_mult = "0.98"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.3
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  (* Sanity: the raw snapshot really would block the sale (dust over the
+     reserve), proving the credit is what makes it placeable. *)
+  check
+    bool
+    "stale venue snapshot alone is below the venue floor"
+    true
+    (0.1936 -. state.reserved_base < state.cached_qty_increment);
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:1000.0
+    ~asset
+    ~bid_price:79.0
+    ~ask_price:79.1
+    ~asset_balance:0.1936
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:(Some 0.5);
+  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let sell_qty =
+    List.fold_left
+      (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+         match o.operation, o.side with
+         | Place, Sell when o.symbol = symbol -> acc +. o.qty
+         | _ -> acc)
+      0.0
+      pushed
+  in
+  check
+    bool
+    "unreflected fill sells the 1:1 lot despite the stale snapshot"
+    true
+    (sell_qty >= 0.2 -. 1e-6 && sell_qty <= 0.2 +. 1e-6);
+  drain ()
+;;
+
+let test_position_reconcile_freshness_gate () =
+  (* A new balance message is authoritative: adopt the venue figure and drop
+     every buy credit its generation time covers. A message that does not
+     advance the feed timestamp must leave both the ledger and the overlay
+     untouched. *)
+  let symbol = "LEDGER2/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.reserved_base <- 0.19117916;
+  state.position_base <- 0.4;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 998.0;
+  state.buy_credits_since_balance <- [ 998.5, 0.2 ];
+  (* New message generated at 999 (now 1000.5, age 1.5): adopt the venue
+     figure and prune the credit it already covers. *)
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:1000.5
+    ~base_balance_age:(Some 1.5)
+    ~asset_balance:0.2;
+  check
+    bool
+    "new venue message replaces the ledger"
+    true
+    (abs_float (state.position_base -. 0.2) < 1e-12);
+  check
+    bool
+    "credits the message already covers are pruned"
+    true
+    (state.buy_credits_since_balance = []);
+  (* A later fill arrives, then a message that does NOT advance the feed
+     timestamp: neither the adopted value nor the fresh credit is disturbed. *)
+  state.buy_credits_since_balance <- [ 999.7, 0.15 ];
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:1000.1
+    ~base_balance_age:(Some 1.4)
+    ~asset_balance:0.2;
+  check
+    bool
+    "a non-advancing message does not clobber the ledger"
+    true
+    (abs_float (state.position_base -. 0.2) < 1e-12);
+  check
+    bool
+    "a non-advancing message does not prune fresh credits"
+    true
+    (List.length state.buy_credits_since_balance = 1);
+  (* The feed catches up (generated 1001.5): adopt the new value and prune. *)
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:1002.0
+    ~base_balance_age:(Some 0.5)
+    ~asset_balance:0.39;
+  check
+    bool
+    "fresher venue message replaces the ledger, including downward corrections"
+    true
+    (abs_float (state.position_base -. 0.39) < 1e-12);
+  check
+    bool
+    "credits covered by the catching-up message are pruned"
+    true
+    (state.buy_credits_since_balance = [])
+;;
+
+let test_position_reconcile_lower_balance_cannot_dip_reserve () =
+  (* After adopting a lower venue figure, the sellable figure is position_base
+     minus the reserve, clamped at zero - adoption cannot leave a sellable
+     amount above the venue's own free inventory. *)
+  let symbol = "LEDGER3/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.reserved_base <- 0.19117916;
+  state.position_base <- 0.9;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 500.0;
+  state.buy_credits_since_balance <- [];
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:501.0
+    ~base_balance_age:(Some 0.5)
+    ~asset_balance:0.1936;
+  check
+    bool
+    "ledger adopts the lower venue figure"
+    true
+    (abs_float (state.position_base -. 0.1936) < 1e-12);
+  let available = Float.max 0.0 (state.position_base -. state.reserved_base) in
+  check
+    bool
+    "adopted lower balance leaves no sellable amount above the venue free base"
+    true
+    (available <= state.position_base -. state.reserved_base +. 1e-12
+     && available < state.cached_qty_increment)
+;;
+
+let test_position_seed_prunes_covered_credit () =
+  (* Init race: a buy fill is processed before the first balance message, so
+     it sits in the overlay; the first message was generated after the fill
+     and already includes it. The seed must prune the covered credit or the
+     fill is counted twice and a sell can reach reserved_base. *)
+  let symbol = "LEDGER4/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.reserved_base <- 0.19117916;
+  state.position_initialized <- false;
+  state.position_base <- 0.0;
+  state.position_venue_ts <- 0.0;
+  state.buy_credits_since_balance <- [ 998.5, 0.2 ];
+  (* First message generated at 999 (after the fill at 998.5). *)
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:1000.5
+    ~base_balance_age:(Some 1.5)
+    ~asset_balance:0.39117916;
+  check
+    bool
+    "first message seeds the ledger"
+    true
+    (abs_float (state.position_base -. 0.39117916) < 1e-12);
+  check
+    bool
+    "seed message prunes the covered credit"
+    true
+    (state.buy_credits_since_balance = []);
+  check
+    bool
+    "seeded ledger leaves only the free float above the reserve"
+    true
+    (abs_float (state.position_base -. state.reserved_base -. 0.2) < 1e-9)
+;;
+
+let test_position_seed_keeps_newer_credit () =
+  (* Counter-case to the init race: the first message was generated BEFORE the
+     fill, so it does not include it. The credit must survive the seed so the
+     just-filled buy is still sellable. *)
+  let symbol = "LEDGER5/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.reserved_base <- 0.19117916;
+  state.position_initialized <- false;
+  state.position_base <- 0.0;
+  state.position_venue_ts <- 0.0;
+  state.buy_credits_since_balance <- [ 999.5, 0.2 ];
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:1000.5
+    ~base_balance_age:(Some 1.5)
+    ~asset_balance:0.1936;
+  check
+    bool
+    "seed adopts the pre-fill venue figure"
+    true
+    (abs_float (state.position_base -. 0.1936) < 1e-12);
+  check
+    bool
+    "credit newer than the seed message is kept"
+    true
+    (List.length state.buy_credits_since_balance = 1)
+;;
+
+let test_position_stale_message_does_not_regress_ledger () =
+  (* Out-of-order / replayed feed message with an older generation time must
+     not lower the ledger (WS reconnect replay, clock skew). *)
+  let symbol = "LEDGER6/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.position_base <- 0.4;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 1000.0;
+  state.buy_credits_since_balance <- [];
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:1000.1
+    ~base_balance_age:(Some 10.0)
+    ~asset_balance:0.05;
+  check
+    bool
+    "an older-generation message does not regress the ledger"
+    true
+    (abs_float (state.position_base -. 0.4) < 1e-12)
+;;
+
+let test_position_partial_credit_prune () =
+  (* A message generated between two fills covers the older but not the newer:
+     only the newer credit may survive. *)
+  let symbol = "LEDGER7/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.position_base <- 0.2;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 998.0;
+  state.buy_credits_since_balance <- [ 998.5, 0.1; 999.5, 0.2 ];
+  (* Message generated at 999.5; fill at 998.5 covered, fill at 999.5 not. *)
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:1000.0
+    ~base_balance_age:(Some 0.5)
+    ~asset_balance:0.25;
+  check
+    bool
+    "adopts the venue figure"
+    true
+    (abs_float (state.position_base -. 0.25) < 1e-12);
+  check
+    bool
+    "only the covered credit is pruned"
+    true
+    (state.buy_credits_since_balance = [ 999.5, 0.2 ])
+;;
+
+let test_position_balance_before_fill_no_double_credit () =
+  (* Independently-fed balance can adopt a buy fill BEFORE its execution event
+     lands. The fill must not then be added to the overlay again, or the sell
+     sizes the same base twice - the production over-sell: fill 0.2, adopted
+     0.4, sell 0.4, insufficient-balance reject. *)
+  let symbol = "LEDGER17/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.2;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.98;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.19517916;
+  state.position_base <- 0.19994;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 1000.0;
+  state.attributed_balance_increase <- 0.0;
+  state.buy_credits_since_balance <- [];
+  state.open_sell_orders <- [];
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.startup_replay <- false;
+  state.last_fill_oid <- None;
+  (* Balance message already includes the 0.2 fill. *)
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:1001.0
+    ~base_balance_age:(Some 0.0)
+    ~asset_balance:0.39986;
+  check
+    bool
+    "venue adopts the post-fill figure"
+    true
+    (abs_float (state.position_base -. 0.39986) < 1e-12);
+  check
+    bool
+    "the adopted increase is tracked for attribution"
+    true
+    (state.attributed_balance_increase > 0.19);
+  (* Execution event for the same fill arrives after the balance message. *)
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+    ~now:1001.2
+    symbol
+    "542258992352"
+    Dio_strategies.Strategy_common.Buy
+    ~fill_price:81.37
+    ~fill_qty:0.2
+    None;
+  check
+    bool
+    "fill already adopted is not re-added to the overlay"
+    true
+    (state.buy_credits_since_balance = []);
+  check
+    bool
+    "adopted-increase pool is drawn down"
+    true
+    (abs_float state.attributed_balance_increase < 1e-9);
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.2"
+    ; grid_interval = 0.16
+    ; sell_mult = "0.98"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.3
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:1001.3
+    ~asset
+    ~bid_price:81.35
+    ~ask_price:81.37
+    ~asset_balance:0.39986
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:(Some 0.3);
+  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let sell_qty =
+    List.fold_left
+      (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+         match o.operation, o.side with
+         | Place, Sell when o.symbol = symbol -> acc +. o.qty
+         | _ -> acc)
+      0.0
+      pushed
+  in
+  check
+    bool
+    "sell sizes the one real lot, not the doubled base"
+    true
+    (sell_qty >= 0.2 -. 1e-6 && sell_qty <= 0.2 +. 1e-6);
+  drain ()
+;;
+
+let test_position_upward_reconcile_adopts_venue () =
+  (* The venue reports more than we tracked (a fill we never saw): the venue is
+     authoritative, so adopt upward rather than keeping the stale ledger. *)
+  let symbol = "LEDGER8/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.position_base <- 0.1;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 1000.0;
+  state.buy_credits_since_balance <- [];
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:1001.0
+    ~base_balance_age:(Some 0.5)
+    ~asset_balance:0.5;
+  check
+    bool
+    "missed-fill venue figure is adopted upward"
+    true
+    (abs_float (state.position_base -. 0.5) < 1e-12)
+;;
+
+let test_position_nan_balance_does_not_seed () =
+  (* Startup / feed outage: a NaN snapshot must not seed or mutate the ledger
+     or prune credits. *)
+  let symbol = "LEDGER9/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.position_initialized <- false;
+  state.position_base <- 0.0;
+  state.position_venue_ts <- 0.0;
+  state.buy_credits_since_balance <- [ 999.5, 0.2 ];
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:1000.0
+    ~base_balance_age:(Some 0.5)
+    ~asset_balance:Float.nan;
+  check bool "NaN balance does not seed the ledger" false state.position_initialized;
+  check
+    bool
+    "NaN balance does not prune credits"
+    true
+    (List.length state.buy_credits_since_balance = 1)
+;;
+
+let test_position_buy_credit_and_sell_hold_cancel () =
+  (* Churn inside the feed-lag window: the bought base is immediately offered
+     again, so the pending buy credit and the unnetted sell hold must cancel.
+     The sale must not size against base that is already committed to the
+     resting sell. *)
+  let symbol = "LEDGER10/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.2;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.98;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.19117916;
+  state.open_sell_orders <- [];
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 79.0;
+  state.last_buy_fill_qty <- Some 0.2;
+  state.position_base <- 0.1936;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 999.0;
+  state.buy_credits_since_balance <- [ 999.5, 0.2 ];
+  state.sell_holds_since_balance <- [ 999.5, 0.2 ];
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.2"
+    ; grid_interval = 0.16
+    ; sell_mult = "0.98"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.3
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:1000.0
+    ~asset
+    ~bid_price:79.0
+    ~ask_price:79.1
+    ~asset_balance:0.1936
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:(Some 0.5);
+  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let sell_qty =
+    List.fold_left
+      (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+         match o.operation, o.side with
+         | Place, Sell when o.symbol = symbol -> acc +. o.qty
+         | _ -> acc)
+      0.0
+      pushed
+  in
+  check
+    bool
+    "buy credit offset by the unnetted sell hold does not place a second sell"
+    true
+    (sell_qty < 1e-9);
+  drain ()
+;;
+
+let test_position_dead_feed_credit_expires () =
+  (* No balance freshness beyond the grace: the credit must decay so it cannot
+     size a sale against base the feed never confirmed. *)
+  let symbol = "LEDGER11/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.2;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.98;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.19117916;
+  state.open_sell_orders <- [];
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 79.0;
+  state.last_buy_fill_qty <- Some 0.2;
+  state.position_base <- 0.1936;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 0.0;
+  state.buy_credits_since_balance <- [ 900.0, 0.2 ];
+  state.sell_holds_since_balance <- [];
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.2"
+    ; grid_interval = 0.16
+    ; sell_mult = "0.98"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.3
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:1000.0
+    ~asset
+    ~bid_price:79.0
+    ~ask_price:79.1
+    ~asset_balance:0.1936
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:None;
+  check
+    bool
+    "stale credit decays after the grace"
+    true
+    (state.buy_credits_since_balance = []);
+  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  check
+    bool
+    "expired credit cannot size a sale"
+    true
+    (not
+       (List.exists
+          (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+             o.operation = Dio_strategies.Strategy_common.Place
+             && o.side = Dio_strategies.Strategy_common.Sell
+             && o.symbol = symbol)
+          pushed));
+  drain ()
+;;
+
+let test_position_reserved_exceeds_ledger_clamps () =
+  (* Over-reserved dust: the ledger is below reserved_base, so there is
+     nothing sellable and no negative size. *)
+  let symbol = "LEDGER12/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.2;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.98;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.19117916;
+  state.open_sell_orders <- [];
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 79.0;
+  state.last_buy_fill_qty <- Some 0.2;
+  state.position_base <- 0.1;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 999.0;
+  state.buy_credits_since_balance <- [];
+  state.sell_holds_since_balance <- [];
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.2"
+    ; grid_interval = 0.16
+    ; sell_mult = "0.98"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.3
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:1000.0
+    ~asset
+    ~bid_price:79.0
+    ~ask_price:79.1
+    ~asset_balance:0.1
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:(Some 0.5);
+  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  check
+    bool
+    "reserved-exceeding ledger places nothing and never sizes negative"
+    true
+    (not
+       (List.exists
+          (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+             o.operation = Dio_strategies.Strategy_common.Place
+             && o.side = Dio_strategies.Strategy_common.Sell
+             && o.symbol = symbol)
+          pushed));
+  drain ()
+;;
+
+let test_position_startup_replay_records_no_credit () =
+  (* Historical fills replayed at startup (above the persisted high-water
+     mark) must not create live pending credits: the venue already holds that
+     base and the seed will count it. *)
+  let symbol = "LEDGER13/BTC/USDC" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.0002;
+  state.maker_fee <- 0.0004;
+  state.reserved_base <- 0.0;
+  state.position_base <- 0.0;
+  state.buy_credits_since_balance <- [];
+  state.startup_replay <- true;
+  state.last_fill_oid <- Some "1";
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+    ~now:500.0
+    symbol
+    "2"
+    Dio_strategies.Strategy_common.Buy
+    ~fill_price:77000.0
+    ~fill_qty:0.0002
+    None;
+  check
+    bool
+    "startup replay records no pending buy credit"
+    true
+    (state.buy_credits_since_balance = [])
+;;
+
+let test_position_gross_venue_sell_fill_decrements () =
+  (* Gross-balance venues (Alpaca) report the full holding, so the ledger
+     falls by the sold qty at fill, clamped at zero. *)
+  let symbol = "LEDGER14/QQQ" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca";
+  state.grid_qty <- 0.5;
+  state.cached_sell_mult <- 0.9;
+  state.reserved_base <- 0.0;
+  state.accumulated_profit <- 0.0;
+  state.accumulation_buffer <- 0.0;
+  state.position_base <- 0.1;
+  state.position_initialized <- true;
+  state.last_buy_fill_price <- Some 100.0;
+  state.last_buy_fill_qty <- Some 0.5;
+  state.base_accumulation_enabled <- false;
+  state.startup_replay <- false;
+  state.last_fill_oid <- None;
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+    ~now:600.0
+    symbol
+    "gross-sell-1"
+    Dio_strategies.Strategy_common.Sell
+    ~fill_price:101.0
+    ~fill_qty:0.5
+    None;
+  check
+    bool
+    "gross venue sell fill decrements the ledger and clamps at zero"
+    true
+    (state.position_base = 0.0)
+;;
+
+let test_position_accumulation_sell_fill_keeps_ledger () =
+  (* Accumulation venues net the resting-sell hold, so the venue figure - and
+     therefore the ledger - does not move on a sell fill; the reconciliation
+     absorbs the netting. Decrementing here would double-count. *)
+  let symbol = "LEDGER15/HYPE/USDC" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid";
+  state.grid_qty <- 0.2;
+  state.cached_sell_mult <- 0.98;
+  state.reserved_base <- 0.0;
+  state.accumulated_profit <- 0.0;
+  state.accumulation_buffer <- 0.0;
+  state.position_base <- 0.4;
+  state.position_initialized <- true;
+  state.last_buy_fill_price <- Some 79.0;
+  state.last_buy_fill_qty <- Some 0.2;
+  state.base_accumulation_enabled <- false;
+  state.startup_replay <- false;
+  state.last_fill_oid <- None;
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+    ~now:600.0
+    symbol
+    "accum-sell-1"
+    Dio_strategies.Strategy_common.Sell
+    ~fill_price:79.1
+    ~fill_qty:0.2
+    None;
+  check
+    bool
+    "accumulation venue sell fill leaves the ledger untouched"
+    true
+    (abs_float (state.position_base -. 0.4) < 1e-12)
+;;
+
+let test_position_asset_low_recovery_sees_pending_credit () =
+  (* Recovery must use the fill-aware ledger, or a latched asset_low never
+     clears on the fill tick and sells stay wedged after a burst rejection. *)
+  let symbol = "LEDGER16/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid";
+  state.reserved_base <- 0.19117916;
+  state.position_base <- 0.1936;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 999.0;
+  state.buy_credits_since_balance <- [ 999.5, 0.2 ];
+  state.asset_low <- true;
+  state.last_seen_asset_balance <- 0.1936;
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.2"
+    ; grid_interval = 0.16
+    ; sell_mult = "0.98"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.3
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  Dio_strategies.Jacobs_ladder.evaluate_asset_low_recovery
+    ~state
+    ~now:1000.0
+    ~base_balance_age:(Some 0.5)
+    ~ecfg
+    ~asset
+    ~asset_balance:0.1936
+    ~lot_qty:0.2
+    ~unnetted_hold:0.0;
+  check
+    bool
+    "asset_low clears on the fill-aware ledger even with a stale spot snapshot"
+    false
+    state.asset_low;
+  check
+    bool
+    "recovery arms the sell+buy resume flag"
+    true
+    state.resuming_after_balance_flag
 ;;
 
 let test_sub_minimum_qty_sell_places () =
@@ -3659,6 +4518,74 @@ let () =
             "unnetted sell hold capped even with an ancient balance age"
             `Quick
             test_unnetted_sell_hold_capped_even_with_age
+        ; test_case
+            "position ledger bridges an unreflected buy fill"
+            `Quick
+            test_position_ledger_bridges_unreflected_fill
+        ; test_case
+            "position reconciliation is freshness-gated"
+            `Quick
+            test_position_reconcile_freshness_gate
+        ; test_case
+            "adopted lower venue balance cannot free reserved base"
+            `Quick
+            test_position_reconcile_lower_balance_cannot_dip_reserve
+        ; test_case
+            "seed prunes a credit the first message already covers"
+            `Quick
+            test_position_seed_prunes_covered_credit
+        ; test_case
+            "seed keeps a credit newer than the first message"
+            `Quick
+            test_position_seed_keeps_newer_credit
+        ; test_case
+            "older-generation message cannot regress the ledger"
+            `Quick
+            test_position_stale_message_does_not_regress_ledger
+        ; test_case
+            "a message between two fills prunes only the covered credit"
+            `Quick
+            test_position_partial_credit_prune
+        ; test_case
+            "a missed-fill venue figure is adopted upward"
+            `Quick
+            test_position_upward_reconcile_adopts_venue
+        ; test_case
+            "balance message before its fill event does not double-credit"
+            `Quick
+            test_position_balance_before_fill_no_double_credit
+        ; test_case
+            "NaN balance neither seeds nor prunes"
+            `Quick
+            test_position_nan_balance_does_not_seed
+        ; test_case
+            "buy credit and unnetted sell hold cancel in the lag window"
+            `Quick
+            test_position_buy_credit_and_sell_hold_cancel
+        ; test_case
+            "credit decays when the feed goes silent past the grace"
+            `Quick
+            test_position_dead_feed_credit_expires
+        ; test_case
+            "reserved-exceeding ledger places nothing (no negative size)"
+            `Quick
+            test_position_reserved_exceeds_ledger_clamps
+        ; test_case
+            "startup replay records no pending credit"
+            `Quick
+            test_position_startup_replay_records_no_credit
+        ; test_case
+            "gross venue sell fill decrements the ledger"
+            `Quick
+            test_position_gross_venue_sell_fill_decrements
+        ; test_case
+            "accumulation venue sell fill leaves the ledger"
+            `Quick
+            test_position_accumulation_sell_fill_keeps_ledger
+        ; test_case
+            "asset_low recovery uses the fill-aware ledger"
+            `Quick
+            test_position_asset_low_recovery_sees_pending_credit
         ; test_case
             "sub-minimum qty sell places (notional is the only floor)"
             `Quick

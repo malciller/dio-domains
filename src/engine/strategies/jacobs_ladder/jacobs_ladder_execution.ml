@@ -172,9 +172,105 @@ let log_sell_block ?(kind = "") ~state ~now ~symbol reason =
     Logging.warn_f ~section "Sell placement blocked for %s: %s" symbol reason)
 ;;
 
+(** Cutoff for the buy-credit freshness window: the newest balance message's
+    wall-clock time, but never older than the grace - a dead feed must not keep
+    a credit alive forever. Mirrors the [unnetted_sell_hold] cutoff. *)
+let unreflected_cutoff ~now ~base_balance_age =
+  match base_balance_age with
+  | Some age -> Float.max (now -. age) (now -. sell_hold_netting_grace_s)
+  | None -> now -. sell_hold_netting_grace_s
+;;
+
+(** Reconciles the in-memory position ledger to the venue balance feed.
+
+    A new venue balance message is authoritative for the base it reports, so
+    [position_base] is adopted outright (replacement, never a sum of running
+    totals - the failure mode of the removed anticipated-credit overlay, which
+    added fills on top of the venue figure and could size a sell past
+    [reserved_base]). Any buy credit the message's generation time already
+    covers is dropped from the overlay; credits newer than the message stay,
+    so a just-filled buy remains sellable until the feed nets it. *)
+let reconcile_position ~state ~now ~base_balance_age ~asset_balance =
+  if not (Float.is_nan asset_balance)
+  then (
+    let venue_ts =
+      match base_balance_age with
+      | Some age -> now -. age
+      | None -> now
+    in
+    (* A new message advanced the feed timestamp (preferred), or - when the
+       feed exposes no freshness - changed the value. The epsilon absorbs the
+       wall-clock jitter between capturing [now] and evaluating the age. *)
+    let is_new_message =
+      match base_balance_age with
+      | Some _ -> venue_ts > state.position_venue_ts +. 0.001
+      | None -> asset_balance <> state.last_seen_asset_balance
+    in
+    if (not state.position_initialized) || is_new_message
+    then (
+      (* Track how far the adopted figure moved since the last adoption. A
+         positive move can already contain buy fills whose execution events
+         have not arrived yet (executions and balances are independent feeds),
+         so buy fills draw this down before entering the overlay - otherwise a
+         balance message that arrives before its fill event is counted twice,
+         once in [position_base] and once in the overlay, and a sell can size
+         past the holdings. Deposits that arrive before their (nonexistent)
+         fill merely under-credit, which is the safe direction. *)
+      let delta = asset_balance -. state.position_base in
+      if state.position_initialized
+      then
+        state.attributed_balance_increase
+        <- Float.max 0.0 (state.attributed_balance_increase +. delta)
+      else state.attributed_balance_increase <- 0.0;
+      state.position_base <- asset_balance;
+      state.position_initialized <- true;
+      state.position_venue_ts <- venue_ts;
+      (* Retire overlay credits the adopted increase already covers, oldest
+         first, then drop anything older than the message generation (belt and
+         suspenders for a dead feed). *)
+      let pool = ref state.attributed_balance_increase in
+      let consumed =
+        List.filter_map
+          (fun (ts, q) ->
+             if !pool <= 0.0
+             then Some (ts, q)
+             else (
+               let take = Float.min !pool q in
+               pool := !pool -. take;
+               let left = q -. take in
+               if left > 1e-12 then Some (ts, left) else None))
+          state.buy_credits_since_balance
+      in
+      state.attributed_balance_increase <- !pool;
+      let cutoff = unreflected_cutoff ~now ~base_balance_age in
+      state.buy_credits_since_balance
+      <- List.filter (fun (ts, _) -> ts >= cutoff) consumed))
+;;
+
+(** Sum of buy-fill credits the balance feed has not yet netted: fills at/after
+    the newest balance message (or within the grace when the feed is silent).
+    Entries are pruned so the overlay cannot grow without bound, and the sum is
+    added to [position_base] for sizing. *)
+let unreflected_buy_credit ~state ~base_balance_age ~now =
+  if state.buy_credits_since_balance = []
+  then 0.0
+  else (
+    let cutoff = unreflected_cutoff ~now ~base_balance_age in
+    let rec go sum acc = function
+      | [] ->
+        state.buy_credits_since_balance <- List.rev acc;
+        sum
+      | (ts, q) :: rest when ts >= cutoff -> go (sum +. q) ((ts, q) :: acc) rest
+      | _ :: rest -> go sum acc rest
+    in
+    go 0.0 [] state.buy_credits_since_balance)
+;;
+
 (** Evaluates asset balance recovery and clears asset_low when available balance is restored. *)
 let evaluate_asset_low_recovery
       ~state
+      ~now
+      ~base_balance_age
       ~ecfg
       ~(asset : trading_config)
       ~asset_balance
@@ -183,11 +279,9 @@ let evaluate_asset_low_recovery
   =
   if not (Float.is_nan asset_balance)
   then (
-    let asset_bal = asset_balance in
-    if asset_bal > state.last_seen_asset_balance && state.anticipated_base_credit > 0.0
-    then (
-      let delta = asset_bal -. state.last_seen_asset_balance in
-      state.anticipated_base_credit <- max 0.0 (state.anticipated_base_credit -. delta));
+    reconcile_position ~state ~now ~base_balance_age ~asset_balance;
+    let unreflected = unreflected_buy_credit ~state ~base_balance_age ~now in
+    let asset_bal = state.position_base +. unreflected in
     let qty_f = lot_qty in
     let asset_needed_fast = qty_f in
     let locked_in_sells =
@@ -198,8 +292,8 @@ let evaluate_asset_low_recovery
     let available_asset =
       asset_bal -. state.reserved_base -. locked_in_sells -. unnetted_hold
     in
-    let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
-    state.last_seen_asset_balance <- asset_bal;
+    let balance_actually_changed = asset_balance > state.last_seen_asset_balance in
+    state.last_seen_asset_balance <- asset_balance;
     let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Sell" in
     let should_clear =
       if ecfg.asset_low_requires_balance_change
@@ -1176,10 +1270,21 @@ let evaluate_sell_leg
      [total - hold] figure still counts that base as free, and sizing
      against it is the reserved_base leak under volatility. *)
   let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~base_balance_age ~now in
+  (* Sizing reads the in-memory position ledger, not the raw venue snapshot:
+     the ledger is the venue figure plus the timestamp-windowed buy credits the
+     feed has not netted (see [unreflected_buy_credit]), so the 1:1 sell is
+     placeable on the fill tick without waiting for the balance feed. Fall
+     back to the snapshot when the ledger has not been seeded yet (direct
+     callers/tests). *)
+  let unreflected_credit = unreflected_buy_credit ~state ~base_balance_age ~now in
+  let ledger_balance =
+    (if state.position_initialized then state.position_base else asset_balance)
+    +. unreflected_credit
+  in
   let available_base =
     if Float.is_nan asset_balance
     then 0.0
-    else asset_balance -. state.reserved_base -. locked_in_sells -. unnetted_hold
+    else ledger_balance -. state.reserved_base -. locked_in_sells -. unnetted_hold
   in
   (* the persisted-sell grid is reconciled ONCE per execution and the
      result is reused by the three persisted-sell branches below. The
@@ -1205,7 +1310,7 @@ let evaluate_sell_leg
     if not (Float.is_nan asset_balance)
     then (
       let available_for_missing_sells =
-        max 0.0 (asset_balance -. state.reserved_base -. locked_in_sells -. unnetted_hold)
+        max 0.0 (ledger_balance -. state.reserved_base -. locked_in_sells -. unnetted_hold)
       in
       let missing_desc =
         List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels
@@ -1268,7 +1373,7 @@ let evaluate_sell_leg
     if Float.is_nan asset_balance
     then 0.0
     else if is_accumulation_basis
-    then asset_balance -. state.reserved_base -. unnetted_hold
+    then ledger_balance -. state.reserved_base -. unnetted_hold
     else available_base
   in
   (* Inventory gate for sell placement: available non-accrued inventory must
@@ -1380,7 +1485,7 @@ let evaluate_sell_leg
     && (not state.asset_low)
     && not is_sell_on_cooldown
   then (
-    let asset_bal = asset_balance in
+    let asset_bal = ledger_balance in
     let grid_interval = asset.grid_interval in
     let qty =
       match state.last_buy_fill_qty with
@@ -1882,6 +1987,8 @@ let execute_strategy
        let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~base_balance_age ~now in
        evaluate_asset_low_recovery
          ~state
+         ~now
+         ~base_balance_age
          ~ecfg
          ~asset
          ~asset_balance
