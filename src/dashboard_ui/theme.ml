@@ -1276,9 +1276,12 @@ let load_saved_theme ?(config_file = "config.json") () =
         if Sys.file_exists p
         then (
           try
-            let ic = open_in p in
-            let line = String.trim (input_line ic) in
-            close_in ic;
+            let line =
+              let ic = open_in p in
+              Fun.protect
+                ~finally:(fun () -> close_in_noerr ic)
+                (fun () -> String.trim (input_line ic))
+            in
             ignore (set_theme_by_id line)
           with
           | _ -> try_paths rest)
