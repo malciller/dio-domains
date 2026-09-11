@@ -113,14 +113,17 @@ type metric_group =
 
 (** The latency pages.
     - CORE: the per-domain pipeline measurements, namely the oracle pass,
-      orderbook update, strategy run, execution broadcast, and the full
-      cycle span (wake -> consume -> strategy -> exec), all in one table.
+      orderbook update, per-cycle prep (oracle apply / halt+reclaim / gate /
+      balance + F&G reads), the strategy run, execution broadcast, and the
+      full cycle span (wake -> consume -> prep -> strategy -> exec), all in
+      one table. PREP separates the pre-execution bookkeeping that used to be
+      charged to STRAT.
     - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed
       gap, REST round-trip, signer time). The engine does not publish these
       yet, so the cells render "--" until it does. *)
 let metric_pages =
   [ { page_label = "CORE"
-    ; metrics = [ "oracle"; "orderbook"; "strategy"; "execution"; "cycle" ]
+    ; metrics = [ "oracle"; "orderbook"; "prep"; "strategy"; "execution"; "cycle" ]
     ; trend_metric = "oracle"
     ; trend_label = "(ORACLE P99)"
     ; trend_max_us = 10.0
@@ -166,6 +169,7 @@ let trend_col_w = 12
 let short_label = function
   | "oracle" -> "ORACLE"
   | "orderbook" -> "OB"
+  | "prep" -> "PREP"
   | "strategy" -> "STRAT"
   | "execution" -> "EXEC"
   | "cycle" -> "CYCLE"
@@ -256,9 +260,10 @@ let render_latencies w (snapshot : Snapshot.t) =
     let latency_thresholds label =
       match label with
       | "orderbook" -> 10.0, 30.0
+      | "prep" -> 20.0, 50.0
       | "strategy" -> 30.0, 75.0
       | "execution" -> 50.0, 150.0
-      | "oracle" -> 1_000_000.0, 10_000_000.0
+      | "oracle" -> 10.0, 20.0
       | "cycle" -> 100.0, 1_000.0
       | "ws_ping" -> 20_000.0, 100_000.0
       | "ws_feed" -> 50_000.0, 200_000.0

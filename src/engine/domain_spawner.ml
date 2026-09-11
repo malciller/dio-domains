@@ -56,6 +56,7 @@ let shutdown_requested = Atomic.make false
 type domain_profilers =
   { prof_ob : Latency_profiler.t
   ; prof_exec : Latency_profiler.t
+  ; prof_prep : Latency_profiler.t
   ; prof_strategy : Latency_profiler.t
   ; prof_cycle : Latency_profiler.t
   }
@@ -76,6 +77,7 @@ let get_domain_profilers symbol =
               ~bucket_us:10
               ~max_latency_us:250_000
               (symbol ^ ":exec")
+        ; prof_prep = Latency_profiler.create (symbol ^ ":prep")
         ; prof_strategy = Latency_profiler.create (symbol ^ ":strategy")
         ; prof_cycle =
             Latency_profiler.create
@@ -454,7 +456,7 @@ let asset_domain_worker
     in
     let has_exec_fn = Ex.has_execution_data_fast ~symbol:asset_with_fees.symbol in
     let cycle_count = ref 0 in
-    let { prof_ob; prof_exec; prof_strategy; prof_cycle } =
+    let { prof_ob; prof_exec; prof_prep; prof_strategy; prof_cycle } =
       get_domain_profilers asset_with_fees.symbol
     in
     (* Rolling latency window: publish + reset each profiler every
@@ -490,6 +492,7 @@ let asset_domain_worker
         prof_strategy
         (Dio_strategies.Strategy_common.Order_actions.snapshot_and_reset
            asset_with_fees.symbol);
+      ignore (Latency_profiler.snapshot_and_reset prof_prep);
       ignore (Latency_profiler.snapshot_and_reset prof_strategy);
       ignore (Latency_profiler.snapshot_and_reset prof_cycle);
       (* Refresh the window-scoped GC sampling pair once per window. *)
@@ -1240,6 +1243,14 @@ let asset_domain_worker
         && (not equity_market_closed)
         && !oracle_gate_open
       in
+      (* Boundary between the per-cycle PREP work (exec-drain end -> just
+         before the strategy call) and the STRATEGY work. [t3] is the end of
+         the exec phase; the whole block below until the strategy call is the
+         capital-oracle decision apply, halt/reclaim evaluation, startup gate,
+         balance reads and F&G re-evaluation. It used to be charged to STRAT,
+         which made STRAT read 100us+ on the oracle-heavy symbols; the prep
+         profiler isolates it so STRAT is the strategy call alone. *)
+      let t3_strategy = ref t3 in
       if should_execute
       then (
         should_execute_strategy := false;
@@ -1408,6 +1419,10 @@ let asset_domain_worker
              can report executions/sec and last-execution time even when the
              window's latency sample count is zero. *)
         Latency_profiler.tick_exec prof_strategy ~now;
+        (* PREP/STRATEGY split point: everything above this line (oracle
+           apply, halt/reclaim, gate, balance + F&G prep) is charged to
+           [prof_prep]; only the strategy call itself is STRAT. *)
+        t3_strategy := if latency_this_cycle then Mtime_clock.now_ns () else 0L;
         (match !grid_strategy_asset_ref, cached_grid_state with
          | Some asset, Some cs ->
            Dio_strategies.Jacobs_ladder.Strategy.execute
@@ -1451,8 +1466,13 @@ let asset_domain_worker
         | _ -> ());
       let t4 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
       if should_execute && latency_this_cycle
-      then
-        Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub t4 t3));
+      then (
+        Latency_profiler.record
+          prof_prep
+          (Mtime.Span.of_uint64_ns (Int64.sub !t3_strategy t3));
+        Latency_profiler.record
+          prof_strategy
+          (Mtime.Span.of_uint64_ns (Int64.sub t4 !t3_strategy)));
       (* Exec histogram writes deferred from [t3] (see above): now outside both
          the STRAT and CYCLE measured spans. *)
       (match exec_per_event_ns with
@@ -1814,6 +1834,7 @@ let get_domain_profiler_snapshots () =
        let snaps =
          [ "orderbook", Latency_profiler.published_snapshot profs.prof_ob
          ; "execution", Latency_profiler.published_snapshot profs.prof_exec
+         ; "prep", Latency_profiler.published_snapshot profs.prof_prep
          ; "strategy", Latency_profiler.published_snapshot profs.prof_strategy
          ; "cycle", Latency_profiler.published_snapshot profs.prof_cycle
          ]

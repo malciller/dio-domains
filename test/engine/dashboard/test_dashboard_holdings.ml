@@ -115,6 +115,7 @@ let latency_json () =
   let domain_lats =
     [ "oracle", snap
     ; "orderbook", snap
+    ; "prep", snap
     ; "strategy", snap
     ; "execution", snap
     ; "cycle", snap
@@ -141,7 +142,7 @@ let test_latency_pages () =
   (* CORE merges the pipeline stages AND the full cycle span. *)
   Alcotest.(check (list string))
     "CORE columns"
-    [ "oracle"; "orderbook"; "strategy"; "execution"; "cycle" ]
+    [ "oracle"; "orderbook"; "prep"; "strategy"; "execution"; "cycle" ]
     (Latencies.page_metrics 0);
   let net = Latencies.page_metrics 1 in
   Alcotest.(check bool)
