@@ -1338,7 +1338,7 @@ let asset_domain_worker
                     ~grid_interval:asset_with_fees.accumulation_buffer
                     ~fear_and_greed:current_fng
                 in
-                Logging.info_f
+                Logging.debug_f
                   ~section
                   "[%s/%s] Re-evaluated accumulation_buffer to %.4f (range %.4f-%.4f)"
                   asset_with_fees.exchange
