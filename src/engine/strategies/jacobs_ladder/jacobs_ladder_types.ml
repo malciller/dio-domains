@@ -196,8 +196,36 @@ type strategy_state =
        fill. *)
   ; mutable skipped_fills_total : int
     (* lifetime count of replay-guard skips; surfaced in WARN/CRITICAL logs *)
-  ; mutable anticipated_base_credit : float
-    (* base qty from buy fills not yet reflected in balance feed *)
+  ; mutable position_base : float
+    (* In-memory tracked base holdings: the sell-sizing source of truth.
+       Seeded from and reconciled to the venue's reported figure on every new
+       balance message, and overlaid by [buy_credits_since_balance] for fills
+       the feed has not netted yet - so a just-filled buy is immediately
+       sellable without waiting for the feed. The venue figure is never summed
+       with a drifting accumulator (the removed anticipated-credit overlay):
+       it is adopted outright, and the only addition is the timestamp-windowed
+       set of fills newer than the newest balance message. Same basis as the
+       venue's reported figure (tradeable for accumulation venues, gross for
+       Alpaca). *)
+  ; mutable position_initialized : bool
+    (* true once [position_base] has been seeded from a venue balance *)
+  ; mutable buy_credits_since_balance : (float * float) list
+    (* (fill wall-clock time, credited qty) for buy fills not yet reflected in
+       the balance feed, oldest first. Mirrors [sell_holds_since_balance]:
+       entries at/after the newest balance message are summed into the sizing
+       inventory; older entries are pruned. Bounds the bridge to the feed-lag
+       window so it cannot persist and overstate like the old accumulator. *)
+  ; mutable attributed_balance_increase : float
+    (* Venue balance increase already adopted into [position_base] but not yet
+       matched to a buy fill. The executions and balance feeds are independent,
+       so a balance message that already contains a fill can be processed
+       BEFORE the fill event; without this, the fill would be counted twice
+       (once in the adopted figure, once in the overlay) and a sell could size
+       past the holdings. Each buy fill draws this down first; only the
+       unmatched remainder enters the overlay. Deposits that arrive before
+       their (nonexistent) fill merely under-credit - the safe direction. *)
+  ; mutable position_venue_ts : float
+    (* wall-clock time of the venue balance message last reconciled *)
   ; mutable last_seen_asset_balance : float
     (* previous asset_bal value; used to detect balance feed updates *)
   ; mutable persistence_dirty : bool
@@ -399,7 +427,11 @@ let rec get_strategy_state asset_symbol =
       ; highest_startup_oid = None
       ; skipped_fill_streak = 0
       ; skipped_fills_total = 0
-      ; anticipated_base_credit = 0.0
+      ; position_base = 0.0
+      ; position_initialized = false
+      ; buy_credits_since_balance = []
+      ; attributed_balance_increase = 0.0
+      ; position_venue_ts = 0.0
       ; last_seen_asset_balance = 0.0
       ; persistence_dirty = false
       ; persistence_key = None
