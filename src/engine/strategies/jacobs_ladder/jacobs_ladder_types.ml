@@ -104,20 +104,22 @@ type strategy_state =
        is placed against sufficient balance or the order acks/fills. *)
   ; mutable sell_holds_since_balance : (float * float) list
     (* (placed_at, qty) of sell placements whose venue-side hold may not yet
-       be reflected in the balance feed, oldest first. For accumulation
-       venues with [track_pending_sells = false] (Hyperliquid) a resting
-       sell blocks nothing locally after its ack - [has_active_sell]
-       releases at ack and [open_sell_orders] is rebuilt from the venue
-       feed - so the inventory gate trusts the balance feed's hold-netting
-       to be current. The spotState hold update trails the placement ack by
-       up to seconds, and in that window [asset_balance] still counts the
-       just-sold base as free: a second trigger (a fill seconds later under
-       volatility) sizes its sell against an overstated available and dips
-       into reserved_base. A hold is released the moment a balance message
-       NEWER than the placement arrives (the venue figure then includes the
-       hold - subtracting locally again would double-count), or when the
-       hold is older than the netting grace (no freshness signal / a
-       placement that never landed). *)
+       be reflected in the balance feed, oldest first. For accumulation venues
+       with [track_pending_sells = false] (Hyperliquid) a resting sell blocks
+       nothing locally after its ack - [has_active_sell] releases at ack and
+       [open_sell_orders] is rebuilt from the venue feed - so the inventory
+       gate trusts the balance feed's hold-netting to be current. The
+       spotState hold update trails the placement ack by up to seconds, and in
+       that window [asset_balance] still counts the just-sold base as free: a
+       second trigger sizes its sell against an overstated available and dips
+       into reserved_base.
+
+       Release is by CONSUMPTION: each observed tradeable drop (the hold
+       reduces tradeable by exactly the held qty) retires the OLDEST hold(s)
+       FIFO. Per-hold baselines were gameable - an older hold netting dropped
+       tradeable below a newer hold's baseline and released the newer hold
+       early, over-offering a full lot. Buys only raise tradeable, so they
+       never consume a hold. The grace still bounds a dead feed. *)
   ; mutable resuming_after_balance_flag : bool
     (* true for one cycle after asset_low/capital_low clears; re-gates new sells on accumulation_buffer *)
   ; mutable just_filled_buy : bool

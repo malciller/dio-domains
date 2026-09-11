@@ -55,7 +55,7 @@
     {
       "symbol": "BTC/USDC",
       "exchange": "hyperliquid",
-      "qty": "0.00020",
+      "qty": "0.00016",
       "grid_interval": [
         0.16,
         0.16
@@ -73,7 +73,7 @@
     {
       "symbol": "HYPE/USDC",
       "exchange": "hyperliquid",
-      "qty": "0.2",
+      "qty": "0.15",
       "grid_interval": [
         0.16,
         0.16
