@@ -214,6 +214,15 @@ let clean_bars (bars : Oracle_types.bar list) : Oracle_types.bar list =
   Array.to_list clean
 ;;
 
+(** Read-only cache access for offline / cache-only runs: the cleaned view of
+    whatever is on disk for this asset, with NO network fallback. A cache miss
+    returns [] (the caller's existing "no usable history" handling applies). *)
+let read_cached ?(dir = cache_dir) ~(exchange : string) ~(symbol : string) ()
+  : Oracle_types.bar list
+  =
+  load_bars ~dir ~exchange ~symbol |> clean_bars
+;;
+
 (** The delta-fetch policy, one asset at a time:
     - cache current (last bar >= today-1, or - for a bounded history given
       [complete_through] - the last bar already reaches that end date):
