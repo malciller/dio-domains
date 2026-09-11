@@ -219,11 +219,18 @@ let set_log_callback callback = log_callback := callback
     to prevent interleaved log lines from concurrent workers. *)
 let output_mutex = Mutex.create ()
 
+(** Guards the [sections] registry only. Deliberately separate from
+    [output_mutex]: [get_section] runs on the trading hot path (via
+    [will_log], whenever a domain's Domain.DLS section cache misses), and
+    must never block behind the drain thread's [output_mutex], which it holds
+    across a potentially blocking [flush]. *)
+let sections_mutex = Mutex.create ()
+
 let get_section name =
   match Hashtbl.find_opt sections name with
   | Some s -> s
   | None ->
-    Mutex.lock output_mutex;
+    Mutex.lock sections_mutex;
     let s =
       match Hashtbl.find_opt sections name with
       | Some s -> s
@@ -232,7 +239,7 @@ let get_section name =
         Hashtbl.replace sections name s;
         s
     in
-    Mutex.unlock output_mutex;
+    Mutex.unlock sections_mutex;
     s
 ;;
 
@@ -596,6 +603,27 @@ let error_f ~section (fmt : ('a, unit, string, unit) format4) =
 let critical_f ~section (fmt : ('a, unit, string, unit) format4) =
   if will_log CRITICAL section
   then Printf.ksprintf (fun msg -> log_sync CRITICAL section msg) fmt
+  else Printf.ifprintf () fmt
+;;
+
+(** Deferred (non-blocking) sibling of [critical_f].
+
+    Formats at CRITICAL severity but enqueues on the async drain queue with a
+    prompt-flush request, like WARN/ERROR, instead of draining and flushing
+    synchronously under [output_mutex]. Use this for CRITICAL messages emitted
+    from latency-sensitive paths (e.g. an order-fill handler running inside a
+    domain's execution cycle): a full or slow output pipe would otherwise block
+    the caller in [flush] for the duration of the backpressure, inflating
+    execution latency. The line still reaches the output within ~1ms. *)
+let critical_async_f ~section (fmt : ('a, unit, string, unit) format4) =
+  if will_log CRITICAL section && not !quiet_mode
+  then
+    Printf.ksprintf
+      (fun msg ->
+         let formatted = format_line CRITICAL section msg in
+         start_async_drain ();
+         log_async_urgent formatted)
+      fmt
   else Printf.ifprintf () fmt
 ;;
 

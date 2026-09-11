@@ -105,21 +105,37 @@ let reconcile_persisted_sell_levels ~state =
     volatility. *)
 let sell_hold_netting_grace_s = 15.0
 
+(** Freshness cutoff shared by the two feed-lag overlays (un-netted sell holds
+    and un-netted buy credits): the newest balance message's wall-clock time,
+    but never older than the grace - a dead feed must not keep an overlay alive
+    forever. Entries at/after the cutoff belong to the lag window; older
+    entries are retired. *)
+let unreflected_cutoff ~now ~base_balance_age =
+  match base_balance_age with
+  | Some age -> Float.max (now -. age) (now -. sell_hold_netting_grace_s)
+  | None -> now -. sell_hold_netting_grace_s
+;;
+
 (** The portion of placed-sell base that the balance feed may not yet be
-    netting: holds not yet retired by an observed tradeable drop. Only
-    meaningful for accumulation venues that do not track pending sells locally
-    (Hyperliquid): venues that track pending sells at dispatch already carry
-    the hold in [open_sell_orders]/[locked_in_sells]. *)
-let unnetted_sell_hold ~state ~ecfg ~now =
+    netting. Only meaningful for accumulation venues that do not track pending
+    sells locally (Hyperliquid): venues that track pending sells at dispatch
+    already carry the hold in [open_sell_orders]/[locked_in_sells].
+
+    A hold is outstanding only while the newest balance message still PREDATES
+    its placement. The moment a message generated after the placement arrives,
+    the venue's hold is already in the adopted figure, so the overlay must be
+    retired even when a concurrent buy fill masked the tradeable drop - the old
+    drop-only release let the hold linger the full grace and blocked the owed
+    1:1 sell, piling inventory until it dumped as one oversized sell. The grace
+    still bounds a dead feed. [consume_sell_hold_netting] additionally retires
+    holds on an observed drop for the case where no newer message arrives. *)
+let unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age =
   if
     ecfg.use_accumulation_sells
     && (not ecfg.track_pending_sells)
     && state.sell_holds_since_balance <> []
   then (
-    (* Holds are retired FIFO by [consume_sell_hold_netting] when a tradeable
-       drop is observed (see [reconcile_position]); here we only drop entries
-       past the grace so a dead feed cannot block sells forever. *)
-    let cutoff = now -. sell_hold_netting_grace_s in
+    let cutoff = unreflected_cutoff ~now ~base_balance_age in
     let rec go unnetted acc = function
       | [] ->
         state.sell_holds_since_balance <- List.rev acc;
@@ -179,15 +195,6 @@ let log_sell_block ?(kind = "") ~state ~now ~symbol reason =
     state.last_sell_block_reason <- key;
     state.last_sell_block_log_at <- now;
     Logging.warn_f ~section "Sell placement blocked for %s: %s" symbol reason)
-;;
-
-(** Cutoff for the buy-credit freshness window: the newest balance message's
-    wall-clock time, but never older than the grace - a dead feed must not keep
-    a credit alive forever. Mirrors the [unnetted_sell_hold] cutoff. *)
-let unreflected_cutoff ~now ~base_balance_age =
-  match base_balance_age with
-  | Some age -> Float.max (now -. age) (now -. sell_hold_netting_grace_s)
-  | None -> now -. sell_hold_netting_grace_s
 ;;
 
 (** Reconciles the in-memory position ledger to the venue balance feed.
@@ -1286,7 +1293,7 @@ let evaluate_sell_leg
      balance message newer than a placement arrives, the venue's
      [total - hold] figure still counts that base as free, and sizing
      against it is the reserved_base leak under volatility. *)
-  let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~now in
+  let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age in
   (* Sizing reads the in-memory position ledger, not the raw venue snapshot:
      the ledger is the venue figure plus the timestamp-windowed buy credits the
      feed has not netted (see [unreflected_buy_credit]), so the 1:1 sell is
@@ -2001,7 +2008,7 @@ let execute_strategy
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
        let lot_qty = venue_lot_qty state.grid_qty asset.exchange state in
-       let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~now in
+       let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age in
        evaluate_asset_low_recovery
          ~state
          ~now
