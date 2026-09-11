@@ -499,17 +499,26 @@ let test_unnetted_sell_hold_gates_second_sizing () =
     true
     (sell2_qty <= 1e-9);
   drain ();
-  (* Tick 3: a balance message NEWER than the placement arrives (age 0.2 at
-     t=103 -> message from t=102.8, after the placement at t=100) - the
-     venue figure now includes the hold, the guard releases, and the fresh
-     fill's sell is placeable against the netted balance (bal = netted
-     0.0224 + fresh fill 0.18). *)
+  (* Tick 3: the venue nets the hold (tradeable drops by the full held qty,
+     0.4024 -> 0.0224), which retires it; the fresh fill's 0.18 is not yet in
+     the venue figure and rides the buy-credit bridge. The fresh fill's sell
+     is placeable against the netted balance (0.0224 + 0.18 - 0.0224 reserved). *)
   state.just_filled_buy <- true;
   state.inflight_sell <- false;
+  state.position_base <- 0.4024;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 99.0;
+  state.buy_credits_since_balance <- [ 103.0, 0.18 ];
+  state.attributed_balance_increase <- 0.0;
   ignore
     (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
        state.duplicate_key_sell);
-  run_leg ~now:103.0 ~bal:(0.4024 -. qty1 +. 0.18) ~age:0.2;
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:103.0
+    ~base_balance_age:(Some 0.2)
+    ~asset_balance:(0.4024 -. qty1);
+  run_leg ~now:103.0 ~bal:(0.4024 -. qty1) ~age:0.2;
   let pushed3 = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   let sell3_qty =
     List.fold_left
@@ -1519,6 +1528,55 @@ let test_position_asset_low_recovery_sees_pending_credit () =
     "recovery arms the sell+buy resume flag"
     true
     state.resuming_after_balance_flag
+;;
+
+let test_position_sell_hold_releases_fifo_on_netting () =
+  (* A resting sell's hold is retired only by an observed tradeable drop, and
+     drops retire the OLDEST hold first. Per-hold baselines were gameable: an
+     older hold netting dropped tradeable below a newer hold's baseline and
+     released the newer, un-netted hold, over-offering a full lot. Buys only
+     raise tradeable, so they must never consume a hold. *)
+  let symbol = "LEDGER18/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.buy_credits_since_balance <- [];
+  state.attributed_balance_increase <- 0.0;
+  state.sell_holds_since_balance <- [ 1000.0, 0.15; 1001.0, 0.15 ];
+  state.position_base <- 0.5;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 999.0;
+  (* A 0.15 tradeable drop (the older hold netting) must retire only the
+     oldest hold, leaving the newer one outstanding. *)
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:1002.0
+    ~base_balance_age:(Some 0.5)
+    ~asset_balance:0.35;
+  check
+    bool
+    "a drop retires the oldest hold only (FIFO)"
+    true
+    (state.sell_holds_since_balance = [ 1001.0, 0.15 ]);
+  check
+    bool
+    "the adopted drop is reflected in the ledger"
+    true
+    (abs_float (state.position_base -. 0.35) < 1e-12);
+  (* A buy-driven increase (delta > 0) must not consume any hold. *)
+  state.sell_holds_since_balance <- [ 1003.0, 0.2 ];
+  state.position_base <- 0.35;
+  state.position_venue_ts <- 1002.0;
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:1004.0
+    ~base_balance_age:(Some 0.5)
+    ~asset_balance:0.5;
+  check
+    bool
+    "a buy-driven increase does not consume a sell hold"
+    true
+    (state.sell_holds_since_balance = [ 1003.0, 0.2 ])
 ;;
 
 let test_sub_minimum_qty_sell_places () =
@@ -4630,6 +4688,10 @@ let () =
             "asset_low recovery uses the fill-aware ledger"
             `Quick
             test_position_asset_low_recovery_sees_pending_credit
+        ; test_case
+            "sell hold netting retires the oldest hold FIFO, buys never do"
+            `Quick
+            test_position_sell_hold_releases_fifo_on_netting
         ; test_case
             "sub-minimum qty sell places (notional is the only floor)"
             `Quick
