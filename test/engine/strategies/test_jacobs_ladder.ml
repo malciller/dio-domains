@@ -1754,6 +1754,50 @@ let test_tif_recovery_not_armed_on_non_tif_amend_failure () =
   drain ()
 ;;
 
+(* Alpaca reports a terminal order on the amend/fallback-cancel path as
+   [order is already in "filled" state] (JSON-escaped in the reason). That is a
+   terminal (order-gone) failure, not a transient one: tracking must clear and
+   the id must be evicted so the open-orders scan cannot re-adopt the stale
+   venue cache entry and re-issue the same failed cancel+replace every cooldown. *)
+let test_alpaca_filled_amend_failure_clears_tracking () =
+  let symbol = "TERM1/SMH/USD" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.tif_recovery_pending <- false;
+  state.last_buy_order_id <- Some "ab4f2af3";
+  state.last_buy_order_price <- Some 566.63;
+  Hashtbl.remove state.evicted_orders "ab4f2af3";
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_amendment_failed
+    ~now:100.0
+    symbol
+    "ab4f2af3"
+    Dio_strategies.Strategy_common.Buy
+    {|Fallback cancel_order failed: HTTP 422 cancelling ab4f2af3: {"code":42210000,"message":"order is already in \"filled\" state"}|};
+  check
+    (option string)
+    "terminal amend failure clears tracked buy id"
+    None
+    state.last_buy_order_id;
+  check
+    bool
+    "terminal amend failure evicts stale order from scan"
+    true
+    (Hashtbl.mem state.evicted_orders "ab4f2af3");
+  check
+    bool
+    "terminal (non-TIF) amend failure does not arm recovery"
+    false
+    state.tif_recovery_pending;
+  drain ()
+;;
+
 let test_tif_recovery_not_armed_on_insufficient_failed () =
   let symbol = "TIFREC3/HYPE/USDC" in
   let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
@@ -4649,6 +4693,10 @@ let () =
             "non-terminal amend failure does not arm recovery"
             `Quick
             test_tif_recovery_not_armed_on_non_tif_amend_failure
+        ; test_case
+            "Alpaca filled amend failure clears tracking and evicts"
+            `Quick
+            test_alpaca_filled_amend_failure_clears_tracking
         ; test_case
             "insufficient-balance failure does not arm recovery"
             `Quick
