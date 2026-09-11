@@ -32,6 +32,11 @@ type exchange_config =
     (** Set asset_low on sell insufficient-balance rejection *)
   ; use_reserved_base_guard : bool
     (** Check reserved_base + locked_in_sells before selling *)
+  ; use_unnetted_sell_hold : bool
+    (** Arm/consume the placed-sell hold overlay so a sell never sizes against
+        base still committed to a resting sell whose venue hold the balance
+        feed has not netted yet. Per-venue opt-in: only venues whose tradeable
+        figure (total - open-order hold) trails a placement need it. *)
   ; asset_low_requires_balance_change : bool
     (** true: clear asset_low only on balance increase *)
   ; merge_preserved_sells : bool
@@ -104,22 +109,19 @@ type strategy_state =
        is placed against sufficient balance or the order acks/fills. *)
   ; mutable sell_holds_since_balance : (float * float) list
     (* (placed_at, qty) of sell placements whose venue-side hold may not yet
-       be reflected in the balance feed, oldest first. For accumulation venues
-       with [track_pending_sells = false] (Hyperliquid) a resting sell blocks
-       nothing locally after its ack - [has_active_sell] releases at ack and
-       [open_sell_orders] is rebuilt from the venue feed - so the inventory
-       gate trusts the balance feed's hold-netting to be current. The
-       spotState hold update trails the placement ack by up to seconds, and in
-       that window [asset_balance] still counts the just-sold base as free: a
-       second trigger sizes its sell against an overstated available and dips
-       into reserved_base.
+       be reflected in the balance feed, oldest first. Applies to EVERY
+       accumulation venue: the tradeable figure (total - open-order hold) trails
+       a placement, so in that window [asset_balance] still counts the
+       just-sold base as free and a second trigger sizes its sell against an
+       overstated available and dips into reserved_base. Gating this on
+       [track_pending_sells = false] (Hyperliquid only) left Kraken/IBKR/Lighter
+       exposed to exactly that leak under volume bursts.
 
        Release is by CONSUMPTION: each observed tradeable drop (the hold
        reduces tradeable by exactly the held qty) retires the OLDEST hold(s)
        FIFO. Per-hold baselines were gameable - an older hold netting dropped
        tradeable below a newer hold's baseline and released the newer hold
-       early, over-offering a full lot. Buys only raise tradeable, so they
-       never consume a hold. The grace still bounds a dead feed. *)
+       early, over-offering a full lot. The grace still bounds a dead feed. *)
   ; mutable resuming_after_balance_flag : bool
     (* true for one cycle after asset_low/capital_low clears; re-gates new sells on accumulation_buffer *)
   ; mutable just_filled_buy : bool
@@ -289,6 +291,7 @@ let default_kraken_config =
   ; use_accumulation_sells = true
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
+  ; use_unnetted_sell_hold = true
   ; asset_low_requires_balance_change = true
   ; merge_preserved_sells = true
   ; check_stale_balance = true
@@ -296,13 +299,48 @@ let default_kraken_config =
   }
 ;;
 
-(** Global registry of per-symbol strategy states. *)
+(** Global registry of per-strategy states. Keyed by "strategy:symbol:venue"
+    when the configured-strategy registry resolves the symbol uniquely, else
+    by symbol (tests / pre-config access). Two strategies sharing a symbol
+    must not share accumulation/hold/ledger state. *)
 let strategy_states = Atomic.make Strategy_common.StringMap.empty
+
+(** Symbol -> resolved state key, invalidated when the configured-strategy
+    registry changes. Keeps the hot-path lookup off the O(entries) registry
+    scan. *)
+let state_key_cache : (string, string * int) Hashtbl.t = Hashtbl.create 32
+
+let state_key_mutex = Mutex.create ()
+
+let state_key_of_symbol asset_symbol =
+  let version =
+    Dio_persistence.Persistence_orchestrator.current_configured_strategies_version ()
+  in
+  Mutex.lock state_key_mutex;
+  let key =
+    match Hashtbl.find_opt state_key_cache asset_symbol with
+    | Some (k, v) when v = version -> k
+    | _ ->
+      let k =
+        match
+          Dio_persistence.Persistence_orchestrator.unique_configured_strategy_for_symbol
+            asset_symbol
+        with
+        | Some (strategy, venue) -> strategy ^ ":" ^ asset_symbol ^ ":" ^ venue
+        | None -> asset_symbol
+      in
+      Hashtbl.replace state_key_cache asset_symbol (k, version);
+      k
+  in
+  Mutex.unlock state_key_mutex;
+  key
+;;
 
 (** Retrieves or lazily initializes the strategy state for [asset_symbol]. *)
 let rec get_strategy_state asset_symbol =
+  let state_key = state_key_of_symbol asset_symbol in
   let map = Atomic.get strategy_states in
-  match Strategy_common.StringMap.find_opt asset_symbol map with
+  match Strategy_common.StringMap.find_opt state_key map with
   | Some state -> state
   | None ->
     (* Hydrate from the split persistence stores. STRICT opt-out: when a
@@ -461,7 +499,7 @@ let rec get_strategy_state asset_symbol =
       Atomic.compare_and_set
         strategy_states
         map
-        (Strategy_common.StringMap.add asset_symbol new_state map)
+        (Strategy_common.StringMap.add state_key new_state map)
     then new_state
     else get_strategy_state asset_symbol
 ;;

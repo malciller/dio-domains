@@ -80,7 +80,6 @@ let[@inline] get_sync symbol =
 type sync_handle = symbol_sync
 
 let get_sync_handle = get_sync
-
 let[@inline] get_generation_fast (sync : sync_handle) = Atomic.get sync.generation
 
 (** Lock-free read of the symbol's current generation. Consumers use this
@@ -116,10 +115,13 @@ let signal_all () =
     all_syncs
 ;;
 
-(* Spin iterations before parking. Tuned to roughly one microsecond on
-   server-class hardware: long enough to absorb a producer racing ahead of
-   the waiter, short enough that an idle park costs negligible CPU. *)
-let default_spin_iterations = 400
+(* Spin iterations before parking. Absorbs a producer racing ahead of the
+   waiter, but kept modest: each iteration is an atomic read, and with many
+   domains the old 400-iteration spin burned significant aggregate CPU on
+   every idle park. The generation re-check makes the spin purely a latency
+   optimization, so a shorter spin costs at most a futex wake/sleep round-trip
+   in the rare race case. *)
+let default_spin_iterations = 100
 
 (** Fast-path [wait_since] using a pre-resolved [sync_handle], avoiding
     Map traversal on the hot domain cycle. *)

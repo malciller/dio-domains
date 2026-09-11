@@ -174,6 +174,44 @@ let test_staking_poll_does_not_refresh_spendable_freshness () =
     (Hyperliquid.Balances.BalanceStore.get_last_updated store >= now)
 ;;
 
+let test_unchanged_resend_does_not_refresh_freshness () =
+  (* Hyperliquid pushes one spotState snapshot for the WHOLE account, so a
+     fill on another coin re-sends this asset's unchanged entry. Freshness for
+     THIS asset must not advance on that - otherwise another asset's activity
+     clears this asset's sell-hold guard and the strategy sells committed
+     reserved_base. *)
+  let asset = "XFILL/USDC" in
+  let now = Unix.gettimeofday () in
+  let store = Hyperliquid.Balances.get_balance_store asset in
+  let open Hyperliquid.Balances.BalanceStore in
+  update_wallet store ~available:0.5 ~total:0.5 "spot" asset;
+  let spot_ts = now -. 60.0 in
+  Mutex.lock store.mutex;
+  Hashtbl.replace
+    store.wallets
+    ("spot/" ^ asset)
+    { balance = 0.5
+    ; total = 0.5
+    ; wallet_type = "spot"
+    ; wallet_id = asset
+    ; last_updated = spot_ts
+    };
+  Mutex.unlock store.mutex;
+  (* Another coin's fill triggers a whole-account snapshot: this asset's entry
+     is re-sent with the SAME value. *)
+  update_wallet store ~available:0.5 ~total:0.5 "spot" asset;
+  Alcotest.(check (float 0.001))
+    "an unchanged re-send does NOT advance this asset's freshness"
+    spot_ts
+    (get_spendable_last_updated store);
+  (* A real move in THIS asset's balance DOES advance it. *)
+  update_wallet store ~available:0.4 ~total:0.4 "spot" asset;
+  Alcotest.(check bool)
+    "a real change advances this asset's freshness"
+    true
+    (get_spendable_last_updated store > spot_ts)
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Balances"
@@ -195,6 +233,10 @@ let () =
             "staking_poll_does_not_refresh_spendable_freshness"
             `Quick
             test_staking_poll_does_not_refresh_spendable_freshness
+        ; Alcotest.test_case
+            "unchanged whole-account re-send does not refresh another asset"
+            `Quick
+            test_unchanged_resend_does_not_refresh_freshness
         ] )
     ]
 ;;

@@ -173,27 +173,28 @@ let d_surv_of
   else (
     let step = 1.0 -. (gi /. 100.0) in
     let depth = current -. funded_floor in
-    let remaining = ref quote in
-    let last_price = ref current in
-    let funded_whole_depth = ref true in
-    let p = ref (current *. step) in
-    while !funded_whole_depth && !p >= funded_floor -. 1e-12 do
-      let cost = buy_qty *. !p *. (1.0 +. fees.maker_fee) in
-      if cost <= !remaining +. 1e-9
+    let fee_mult = 1.0 +. fees.maker_fee in
+    (* Unboxed tail-recursive walk: the accumulators stay float registers, so
+       the per-rung loop allocates nothing. The former [float ref]s allocated
+       one heap block per rung per candidate - the dominant allocation in the
+       survival search (24x24 candidates x up to ~200 rungs per asset pass). *)
+    let rec walk remaining last_price p =
+      if p >= funded_floor -. 1e-12
       then (
-        remaining := !remaining -. cost;
-        last_price := !p;
-        p := !p *. step)
-      else funded_whole_depth := false
-    done;
-    if !funded_whole_depth
+        let cost = buy_qty *. p *. fee_mult in
+        if cost <= remaining +. 1e-9
+        then walk (remaining -. cost) p (p *. step)
+        else false, last_price, remaining)
+      else true, last_price, remaining
+    in
+    let funded_whole_depth, last_price, remaining =
+      walk quote current (current *. step)
+    in
+    if funded_whole_depth
     then
       1.0
-      +. Float.min
-           1.0
-           (!remaining
-            /. Float.max 1e-12 (buy_qty *. !last_price *. (1.0 +. fees.maker_fee)))
-    else Float.max 0.0 (Float.min 1.0 ((current -. !last_price) /. depth)))
+      +. Float.min 1.0 (remaining /. Float.max 1e-12 (buy_qty *. last_price *. fee_mult))
+    else Float.max 0.0 (Float.min 1.0 ((current -. last_price) /. depth)))
 ;;
 
 (** The price of the deepest rung a candidate ladder can actually fill with
@@ -285,38 +286,53 @@ let resolve
         =
         ref None
       in
+      let last_gi = ref nan in
       for i = 0 to resolution - 1 do
         let gi_v = gi_lo +. ((gi_hi -. gi_lo) *. float_of_int i /. (n -. 1.0)) in
-        for j = 0 to resolution - 1 do
-          let buy_qty =
-            qty_min +. ((qty_max -. qty_min) *. float_of_int j /. (n -. 1.0))
-          in
-          let dsv = ds gi_v buy_qty in
-          if dsv >= 1.0
-          then (
-            let qty_norm = (buy_qty -. qty_min) /. (qty_max -. qty_min) in
-            let tight_norm = (gi_hi -. gi_v) /. Float.max 1e-12 (gi_hi -. gi_lo) in
-            let aggressive_score = (qty_norm +. tight_norm) /. 2.0 in
-            let conservative_score = 1.0 -. aggressive_score in
-            let score =
-              (aggressiveness *. aggressive_score)
-              +. ((1.0 -. aggressiveness) *. conservative_score)
+        (* A degenerate grid axis (gi_min = gi_max, as configured for the
+           tight-grid assets) yields the identical [gi_v] for every i;
+           evaluate that spacing once instead of [resolution] times. *)
+        if gi_v <> !last_gi
+        then (
+          last_gi := gi_v;
+          (* For a fixed gi, d_surv is monotone non-increasing in buy_qty
+             (a larger size costs strictly more per rung). Once a candidate
+             misses the target, every larger size misses it too, so the scan
+             stops at the first failure. *)
+          let j = ref 0 in
+          let failed = ref false in
+          while (not !failed) && !j < resolution do
+            let buy_qty =
+              qty_min +. ((qty_max -. qty_min) *. float_of_int !j /. (n -. 1.0))
             in
-            let better =
-              match !best with
-              | None -> true
-              | Some (bs, bqty, bgi, _) ->
-                if score > bs +. 1e-12
-                then true
-                else if score < bs -. 1e-12
-                then false
-                else
-                  (* Ties: prefer larger size, then tighter spacing. *)
-                  buy_qty > bqty +. 1e-12
-                  || (Float.abs (buy_qty -. bqty) <= 1e-12 && gi_v < bgi)
-            in
-            if better then best := Some (score, buy_qty, gi_v, dsv))
-        done
+            let dsv = ds gi_v buy_qty in
+            if dsv >= 1.0
+            then (
+              let qty_norm = (buy_qty -. qty_min) /. (qty_max -. qty_min) in
+              let tight_norm = (gi_hi -. gi_v) /. Float.max 1e-12 (gi_hi -. gi_lo) in
+              let aggressive_score = (qty_norm +. tight_norm) /. 2.0 in
+              let conservative_score = 1.0 -. aggressive_score in
+              let score =
+                (aggressiveness *. aggressive_score)
+                +. ((1.0 -. aggressiveness) *. conservative_score)
+              in
+              let better =
+                match !best with
+                | None -> true
+                | Some (bs, bqty, bgi, _) ->
+                  if score > bs +. 1e-12
+                  then true
+                  else if score < bs -. 1e-12
+                  then false
+                  else
+                    (* Ties: prefer larger size, then tighter spacing. *)
+                    buy_qty > bqty +. 1e-12
+                    || (Float.abs (buy_qty -. bqty) <= 1e-12 && gi_v < bgi)
+              in
+              if better then best := Some (score, buy_qty, gi_v, dsv);
+              incr j)
+            else failed := true
+          done)
       done;
       match !best with
       | Some (_, buy_qty, gi_v, dsv) ->

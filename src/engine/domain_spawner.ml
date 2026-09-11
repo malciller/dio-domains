@@ -74,13 +74,13 @@ let get_domain_profilers symbol =
         ; prof_exec =
             Latency_profiler.create
               ~bucket_us:10
-              ~max_latency_us:1_000_000
+              ~max_latency_us:250_000
               (symbol ^ ":exec")
         ; prof_strategy = Latency_profiler.create (symbol ^ ":strategy")
         ; prof_cycle =
             Latency_profiler.create
               ~bucket_us:10
-              ~max_latency_us:1_000_000
+              ~max_latency_us:250_000
               (symbol ^ ":cycle")
         }
       in
@@ -778,17 +778,20 @@ let asset_domain_worker
         exec_read_pos := new_pos;
         exec_checked := true);
       let t3 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
-      if did_exec && latency_this_cycle && was_exec_ready && !event_count > 0
-      then (
-        let elapsed_ns = Int64.sub t3 t2 in
-        let per_event_ns =
-          if !event_count > 1
-          then Int64.div elapsed_ns (Int64.of_int !event_count)
-          else elapsed_ns
-        in
-        for _ = 1 to !event_count do
-          Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns per_event_ns)
-        done);
+      (* Defer the per-event exec histogram writes until after [t4] so they are
+         not charged to the STRAT/CYCLE samples: with N events this loop ran N
+         bucket updates inside the measured span, self-inflating exactly the
+         exec-heavy cycles that define the tail. *)
+      let exec_per_event_ns =
+        if did_exec && latency_this_cycle && was_exec_ready && !event_count > 0
+        then (
+          let elapsed_ns = Int64.sub t3 t2 in
+          Some
+            (if !event_count > 1
+             then Int64.div elapsed_ns (Int64.of_int !event_count)
+             else elapsed_ns))
+        else None
+      in
       (* Fallback gate for domains with no open orders: if no exec events
            arrived and the execution data is ready (snapshot ingested), open
            the gate so the strategy can place its initial order. *)
@@ -1450,6 +1453,14 @@ let asset_domain_worker
       if should_execute && latency_this_cycle
       then
         Latency_profiler.record prof_strategy (Mtime.Span.of_uint64_ns (Int64.sub t4 t3));
+      (* Exec histogram writes deferred from [t3] (see above): now outside both
+         the STRAT and CYCLE measured spans. *)
+      (match exec_per_event_ns with
+       | Some ns ->
+         for _ = 1 to !event_count do
+           Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns ns)
+         done
+       | None -> ());
       (* Flush deferred accumulation persistence outside the strategy hotloop.
            Only performs file I/O when the dirty flag was set during execute_strategy. *)
       if should_execute
@@ -1464,21 +1475,25 @@ let asset_domain_worker
       let cycle_busy = did_ob || did_exec || should_execute in
       let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub t4 t1) in
       if latency_this_cycle && cycle_busy
-      then (
-        let cause_thunk () =
+      then
+        if
+          (* Build the cause string only when this cycle is a new window
+           maximum. The previous version allocated a closure (and boxed
+           [alloc_start]) on every measured cycle just to be told it was not
+           a max. *)
+          Latency_profiler.record_max prof_cycle cycle_span
+        then (
           let alloc_diff = Gc.minor_words () -. alloc_start in
-          (* GC stats are window-scoped; the cause string uses the last
-             [publish_windows] pair, never a per-cycle [Gc.quick_stat]. *)
           let gc_str = Gc_monitor.diff_to_string !gc_start !gc_end in
-          Printf.sprintf
-            "ob:%B ex:%d st:%B al:%.0fw%s"
-            did_ob
-            !cycle_events
-            should_execute
-            alloc_diff
-            gc_str
-        in
-        Latency_profiler.record_with_cause prof_cycle cycle_span cause_thunk);
+          Latency_profiler.set_cause
+            prof_cycle
+            (Printf.sprintf
+               "ob:%B ex:%d st:%B al:%.0fw%s"
+               did_ob
+               !cycle_events
+               should_execute
+               alloc_diff
+               gc_str));
       (* Roll the latency window on a fixed time cadence rather than a cycle
            count: at typical domain cycle rates the old cycle_mod gate (10000
            cycles) accumulated minutes of samples before an abrupt wipe. *)
@@ -1493,7 +1508,15 @@ let asset_domain_worker
             [wait_since] returns immediately if any producer signalled
             while this cycle ran (generation > baseline), so a signal racing
             the cycle can no longer be lost to the park. *)
-      if (not !should_execute_strategy) || not (has_exec_fn ())
+      (* Park whenever this cycle produced no executable work. The old gate
+         only checked [should_execute_strategy] and [has_exec_fn], so a latched
+         execute flag whose execution was blocked (notably the equity session
+         being closed) skipped the wait and spun at 100% CPU. The flag stays
+         set, so the next wake re-evaluates and executes as soon as conditions
+         allow - and every condition that can unblock it is event-driven: a new
+         book/exec frame, an oracle publish, or the first data at the session
+         open. No polling sleep. *)
+      if not should_execute
       then Concurrency.Exchange_wakeup.wait_since_fast wakeup_sync ~since:wake_baseline;
       if !exec_ready && (not !latency_active) && !cycle_count - !exec_ready_cycle >= 10
       then (

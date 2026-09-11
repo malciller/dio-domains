@@ -117,23 +117,29 @@ let unreflected_cutoff ~now ~base_balance_age =
 ;;
 
 (** The portion of placed-sell base that the balance feed may not yet be
-    netting. Only meaningful for accumulation venues that do not track pending
-    sells locally (Hyperliquid): venues that track pending sells at dispatch
-    already carry the hold in [open_sell_orders]/[locked_in_sells].
+    netting. Applies to EVERY accumulation venue (Hyperliquid, Kraken, IBKR,
+    Lighter): all report a tradeable figure with open-order holds removed, and
+    in all of them that figure trails a placement (or the balance message that
+    adopts it trails the order feed), so sizing against it in the window can
+    dip into reserved_base. Gating this on [track_pending_sells = false] (only
+    Hyperliquid) left Kraken/IBKR/Lighter exposed: under a volume burst several
+    sells ack before the balance adopts the hold, and each sizes against a
+    stale-high tradeable - the observed reserved_base dump that then bought
+    back the full amount on the next buy fill.
 
-    A hold is outstanding only while the newest balance message still PREDATES
-    its placement. The moment a message generated after the placement arrives,
-    the venue's hold is already in the adopted figure, so the overlay must be
-    retired even when a concurrent buy fill masked the tradeable drop - the old
-    drop-only release let the hold linger the full grace and blocked the owed
-    1:1 sell, piling inventory until it dumped as one oversized sell. The grace
-    still bounds a dead feed. [consume_sell_hold_netting] additionally retires
-    holds on an observed drop for the case where no newer message arrives. *)
+    A hold is outstanding only while the newest balance message for THIS asset
+    still PREDATES its placement. The moment a message generated after the
+    placement arrives, the venue's hold is already in the adopted figure, so
+    the overlay must be retired even when a concurrent buy fill masked the
+    tradeable drop. Crucially, the freshness the caller supplies is PER-ASSET:
+    Hyperliquid pushes one whole-account spotState snapshot, and a fill on
+    another coin must not advance this asset's timestamp (see
+    Hyperliquid_balances.BalanceStore.update_wallet) - otherwise another
+    asset's activity would clear this asset's guard. The grace still bounds a
+    dead feed. [consume_sell_hold_netting] additionally retires holds on an
+    observed drop. *)
 let unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age =
-  if
-    ecfg.use_accumulation_sells
-    && (not ecfg.track_pending_sells)
-    && state.sell_holds_since_balance <> []
+  if ecfg.use_unnetted_sell_hold && state.sell_holds_since_balance <> []
   then (
     let cutoff = unreflected_cutoff ~now ~base_balance_age in
     let rec go unnetted acc = function
@@ -451,7 +457,6 @@ let sync_open_orders
     <- List.filter (fun (_, _, ts) -> now_time -. ts < 10.0) state.recently_injected_sells;
     if List.length state.recently_injected_sells > 20
     then state.recently_injected_sells <- take 20 state.recently_injected_sells);
-  let preserved_sells = state.recently_injected_sells in
   state.open_sell_orders <- [];
   let best_buy_price = ref 0.0 in
   let best_buy_id = ref None in
@@ -488,6 +493,28 @@ let sync_open_orders
       state.persisted_sell_levels
   in
   build_persisted_idx ();
+  (* Deferred persisted-level qty updates. Writing each update straight into
+     [state.persisted_sell_levels] via [List.mapi] inside the open-order scan
+     made reconciliation O(k*m) (k changed levels x a full-list rebuild each).
+     Collect them and apply once; matching only keys off prices, so deferring
+     the qtys is behavior-preserving. Flushed before any adoption re-sorts the
+     list (which invalidates indices) and once at the end of the scan. *)
+  let pending_level_updates = ref [] in
+  let apply_pending_level_updates () =
+    match !pending_level_updates with
+    | [] -> ()
+    | updates ->
+      pending_level_updates := [];
+      let tbl = Hashtbl.create (List.length updates) in
+      List.iter (fun (idx, p, q) -> Hashtbl.replace tbl idx (p, q)) updates;
+      state.persisted_sell_levels
+      <- List.mapi
+           (fun i item ->
+              match Hashtbl.find_opt tbl i with
+              | Some (p, q) -> p, q
+              | None -> item)
+           state.persisted_sell_levels
+  in
   let record_matched pk =
     Hashtbl.replace
       matched_level_counts
@@ -549,7 +576,12 @@ let sync_open_orders
                        | _ -> ()))
                   bucket
             in
-            List.iter consider_bucket [ k - 1; k; k + 1 ];
+            (* Direct calls instead of [List.iter] over a 3-element list: the
+               list (and its list-cell allocation) per open sell is pure
+               overhead on the hot path. *)
+            consider_bucket (k - 1);
+            consider_bucket k;
+            consider_bucket (k + 1);
             match !best with
             | Some (bk, (idx, _p, _q)) ->
               let remaining =
@@ -576,10 +608,7 @@ let sync_open_orders
               && qty >= min_order_size -. 1e-9
               && qty > 0.0
             then (
-              state.persisted_sell_levels
-              <- List.mapi
-                   (fun i item -> if i = idx then price, qty else item)
-                   state.persisted_sell_levels;
+              pending_level_updates := (idx, price, qty) :: !pending_level_updates;
               state.persistence_dirty <- true;
               Logging.info_f
                 ~section
@@ -589,6 +618,10 @@ let sync_open_orders
                 existing_q
                 qty)
           | None ->
+            (* Flush deferred qty updates first: the sort/insert below shifts
+               persisted-level indices, so pending updates keyed by index must
+               land before it. *)
+            apply_pending_level_updates ();
             let min_order_size =
               if state.cached_qty_increment > 0.0
               then state.cached_qty_increment
@@ -620,6 +653,7 @@ let sync_open_orders
         | None -> closest_sell_order := Some (oid, price)
         | Some (_, best_p) ->
           if price < best_p then closest_sell_order := Some (oid, price)));
+  apply_pending_level_updates ();
   let is_amend_active =
     state.inflight_amend_buy
     || InFlightOrders.is_in_flight state.duplicate_key_buy
@@ -675,15 +709,10 @@ let sync_open_orders
         state.tif_recovery_pending <- false;
         set_asset_reserved_quote state (best_price *. lot_qty))
     | None -> ());
-  if ecfg.merge_preserved_sells
-  then
-    List.iter
-      (fun (preserved_id, _preserved_price, _) ->
-         let already_present =
-           List.exists (fun (id, _, _) -> id = preserved_id) state.open_sell_orders
-         in
-         if not already_present then ())
-      preserved_sells;
+  (* NOTE: the former [merge_preserved_sells] loop here computed an
+     [already_present] membership test and then did nothing with it (its body
+     was a no-op [if ... then ()]); it was pure O(p*n) work per execution on
+     every exchange config. Removed. *)
   (* split the final persisted list into open/missing by draining the
      per-price-key match counts (multiset semantics - duplicate levels at the
      same price each consume one count, exactly mirroring
@@ -1456,7 +1485,17 @@ let evaluate_sell_leg
      below (NaN balance, cooldown, retry latch) keep this from spamming;
      after placement the hold leaves the tradeable figure, so the next tick
      naturally finds nothing left to sell. *)
-  let halt_inventory_check = oracle_halted && inventory_ok in
+  (* Capital exhaustion: either the oracle has published an INACTIVE decision
+     for this asset, or the buy leg latched [capital_low] locally because the
+     available quote no longer covers the next buy (its balance was fresh, so
+     it skipped a guaranteed-reject placement). Both mean "no more quote to
+     commit" and must still place the bottom-rung sell for the inventory we
+     already own, on EVERY venue - otherwise a buy fill that consumed the last
+     quote leaves the filled base unsold and the strategy paused longer than
+     necessary (and over-accumulating). Placement is inventory-gated and
+     clamped to non-reserved base, so it can never dip into reserved_base. *)
+  let capital_exhausted = oracle_halted || state.capital_low in
+  let halt_inventory_check = capital_exhausted && inventory_ok in
   let should_trigger_sell =
     if ecfg.remaintain_expired_sells
     then missing_alpaca_sell_grid || halt_inventory_check
@@ -1569,12 +1608,18 @@ let evaluate_sell_leg
             | Some fill_p -> fill_p
             | None -> bid_price)
           else (
-            (* Non-Alpaca venues: untouched existing re-anchoring behavior *)
+            (* Non-Alpaca venues: the existing re-anchoring behavior, EXCEPT
+               under capital exhaustion. There the bottom-rung recovery sell
+               must stay on the ladder rung above the last buy fill (fill + gi)
+               so it fills on a bounce and preserves the grid's economics -
+               re-anchoring it down to a drifted bid would sell at a loss and
+               still leave the ladder unanchored. *)
             match state.last_buy_fill_price with
             | Some fill_p
-              when (not state.resuming_after_balance_flag)
-                   && abs_float (bid_price -. fill_p)
-                      <= bid_price *. (grid_interval /. 100.0) -> fill_p
+              when capital_exhausted
+                   || ((not state.resuming_after_balance_flag)
+                       && abs_float (bid_price -. fill_p)
+                          <= bid_price *. (grid_interval /. 100.0)) -> fill_p
             | Some fill_p ->
               Logging.debug_f
                 ~section
@@ -1762,11 +1807,11 @@ let evaluate_sell_leg
           sell_pushed := true;
           state.asset_low <- false;
           state.last_sell_block_reason <- "";
-          (* Arm the unnetted-hold guard: until a balance message newer than
-             this placement arrives, the venue's [total - hold] figure still
-             counts this base as free, and sizing against it is the
-             reserved_base leak under volatility. *)
-          if is_accumulation && (not ecfg.track_pending_sells) && effective_sell_qty > 0.0
+          (* Arm the unnetted-hold guard for venues that opt in: until a
+             value-changing balance adoption or a tradeable drop nets it, the
+             venue's [total - hold] figure may still count this base as free,
+             and sizing against it is the reserved_base leak under bursts. *)
+          if ecfg.use_unnetted_sell_hold && effective_sell_qty > 0.0
           then (
             arm_sell_hold ~state ~qty:effective_sell_qty ~now;
             Logging.debug_f

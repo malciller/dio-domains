@@ -52,39 +52,45 @@ let history_of ~(offline : bool) ~(exchange : string) ~(symbol : string)
   else Oracle_fetch.deepen_series ~no_deep_history:false ~offline:false venue >|= fst
 ;;
 
+(** One pure pass given already-computed [refs]: history references in,
+    decision out. The runtime caches [refs] per history version, so the
+    O(history_len) reference scan does not run on every pass. *)
+let decide_from_refs ~(refs : Oracle_core.references) ~(inputs : inputs) : outcome option =
+  let runway =
+    Oracle_core.runway_of
+      ~current:inputs.current_price
+      ~refs
+      ~target_survival:inputs.target_survival
+  in
+  let resolution =
+    Oracle_core.resolve
+      ~regime:runway.regime
+      ~current:inputs.current_price
+      ~funded_floor:runway.funded_floor
+      ~aggressiveness:runway.aggressiveness
+      ~bounds:inputs.bounds
+      ~quote:inputs.available_quote
+      ~fees:inputs.fees
+      ~target_survival:inputs.target_survival
+      ()
+  in
+  let decision =
+    Oracle_core.decision_of
+      ~resolution
+      ~sell_qty:inputs.sell_qty
+      ~available_quote:inputs.available_quote
+      ~current:inputs.current_price
+      ~min_active_dsurv:inputs.min_active_dsurv
+      ~has_resting_buy:inputs.has_resting_buy
+      ()
+  in
+  Some { refs; runway; resolution; decision }
+;;
+
 (** One pure pass: history in, decision out. [None] when there is no usable
     history (empty or all-invalid bars) - no decision can be made. *)
 let decide ~(inputs : inputs) : outcome option =
   match Oracle_core.references_of ~bars:inputs.bars with
   | None -> None
-  | Some refs ->
-    let runway =
-      Oracle_core.runway_of
-        ~current:inputs.current_price
-        ~refs
-        ~target_survival:inputs.target_survival
-    in
-    let resolution =
-      Oracle_core.resolve
-        ~regime:runway.regime
-        ~current:inputs.current_price
-        ~funded_floor:runway.funded_floor
-        ~aggressiveness:runway.aggressiveness
-        ~bounds:inputs.bounds
-        ~quote:inputs.available_quote
-        ~fees:inputs.fees
-        ~target_survival:inputs.target_survival
-        ()
-    in
-    let decision =
-      Oracle_core.decision_of
-        ~resolution
-        ~sell_qty:inputs.sell_qty
-        ~available_quote:inputs.available_quote
-        ~current:inputs.current_price
-        ~min_active_dsurv:inputs.min_active_dsurv
-        ~has_resting_buy:inputs.has_resting_buy
-        ()
-    in
-    Some { refs; runway; resolution; decision }
+  | Some refs -> decide_from_refs ~refs ~inputs
 ;;

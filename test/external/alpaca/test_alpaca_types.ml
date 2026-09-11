@@ -19,20 +19,23 @@ let test_rest_live_url () =
   restore_defaults ()
 ;;
 
-let test_trading_ws_paper_url () =
+let test_trading_events_paper_url () =
   Alpaca.Module.Config.set_testnet true;
-  let url = Alpaca.Types.Config.trading_ws_url () in
+  let url = Alpaca.Types.Config.trading_events_url () in
   Alcotest.(check string)
-    "paper trading ws url"
-    "wss://paper-api.alpaca.markets/stream"
+    "paper trade events url"
+    "https://paper-api.alpaca.markets/v2/events/trades"
     url;
   restore_defaults ()
 ;;
 
-let test_trading_ws_live_url () =
+let test_trading_events_live_url () =
   Alpaca.Module.Config.set_testnet false;
-  let url = Alpaca.Types.Config.trading_ws_url () in
-  Alcotest.(check string) "live trading ws url" "wss://api.alpaca.markets/stream" url;
+  let url = Alpaca.Types.Config.trading_events_url () in
+  Alcotest.(check string)
+    "live trade events url"
+    "https://api.alpaca.markets/v2/events/trades"
+    url;
   restore_defaults ()
 ;;
 
@@ -265,9 +268,9 @@ let () =
       , [ Alcotest.test_case "paper" `Quick test_rest_paper_url
         ; Alcotest.test_case "live" `Quick test_rest_live_url
         ] )
-    ; ( "trading ws urls"
-      , [ Alcotest.test_case "paper" `Quick test_trading_ws_paper_url
-        ; Alcotest.test_case "live" `Quick test_trading_ws_live_url
+    ; ( "trading events urls"
+      , [ Alcotest.test_case "paper" `Quick test_trading_events_paper_url
+        ; Alcotest.test_case "live" `Quick test_trading_events_live_url
         ] )
     ; ( "data feed"
       , [ Alcotest.test_case "iex" `Quick test_set_data_feed_iex

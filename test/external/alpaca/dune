@@ -4,7 +4,7 @@
 
 (test
  (name test_alpaca_ws)
- (libraries dio.alpaca dio.latency_profiling lwt alcotest))
+ (libraries dio.alpaca dio.latency_profiling lwt cohttp-lwt yojson uri alcotest))
 
 (test
  (name test_alpaca_oracle)

@@ -435,7 +435,16 @@ let keys t =
     that store entirely (zero reads), not just zero writes. *)
 let configured_strategies : (string * string * string * bool * bool) list ref = ref []
 
-let register_configured_strategies entries = configured_strategies := entries
+(** Bumped whenever the configured-strategy registry is (re)registered, so
+    callers that cache a symbol -> strategy:venue resolution can invalidate. *)
+let configured_strategies_version = Atomic.make 0
+
+let register_configured_strategies entries =
+  configured_strategies := entries;
+  Atomic.incr configured_strategies_version
+;;
+
+let current_configured_strategies_version () = Atomic.get configured_strategies_version
 
 (** Returns the unique configured strategy matching [symbol], or None (zero or
     ambiguous matches). *)
