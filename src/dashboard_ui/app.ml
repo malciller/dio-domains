@@ -244,7 +244,6 @@ let run ?(config_file = "config.json") () =
         else (
           match ch with
           | 't' | 'T' -> parse (i + 1) (`Key_theme :: acc)
-          | 'f' | 'F' -> parse (i + 1) (`Key_focus :: acc)
           | 'q' | 'Q' -> parse (i + 1) (`Key_quit :: acc)
           | 'k' | 'K' -> parse (i + 1) (`Key_up :: acc)
           | 'j' | 'J' -> parse (i + 1) (`Key_down :: acc)
@@ -362,8 +361,6 @@ let run ?(config_file = "config.json") () =
         | `DetailView asset_key ->
           Asset_graph.render_asset_detail w h asset_key !snapshot
           |> I.hsnap ~align:`Left w
-        | `FocusView asset_key ->
-          Focus_chart.render w h asset_key !snapshot |> I.hsnap ~align:`Left w
       in
       let content_img =
         if I.height content_img < h
@@ -559,12 +556,6 @@ let run ?(config_file = "config.json") () =
                         let idx = min (asset_count - 1) (max 0 !selected_index_ref) in
                         let asset = List.nth assets idx in
                         view_mode_ref := `DetailView asset.key)
-                    | `Key_focus ->
-                      if asset_count > 0
-                      then (
-                        let idx = min (asset_count - 1) (max 0 !selected_index_ref) in
-                        let asset = List.nth assets idx in
-                        view_mode_ref := `FocusView asset.key)
                     | `Key_back -> quit := true
                     | `Key_left -> Latencies.prev_page ()
                     | `Key_right -> Latencies.next_page ()
@@ -577,7 +568,6 @@ let run ?(config_file = "config.json") () =
                       original_theme_id := (Theme.current ()).id
                     | `Key_quit -> quit := true
                     | `Key_back -> view_mode_ref := `MainView
-                    | `Key_focus -> view_mode_ref := `FocusView curr_key
                     | `Key_up | `Key_left ->
                       if asset_count > 0
                       then (
@@ -608,44 +598,6 @@ let run ?(config_file = "config.json") () =
                         view_mode_ref := `DetailView new_asset.key)
                     | `Key_zoom_in -> Asset_graph.zoom_in curr_key
                     | `Key_zoom_out -> Asset_graph.zoom_out curr_key
-                    | _ -> ())
-                 | `FocusView curr_key ->
-                   (match action with
-                    | `Key_theme ->
-                      theme_modal_open := true;
-                      theme_cursor_idx := Theme.current_theme_index ();
-                      original_theme_id := (Theme.current ()).id
-                    | `Key_quit -> quit := true
-                    | `Key_back -> view_mode_ref := `DetailView curr_key
-                    | `Key_focus -> view_mode_ref := `MainView
-                    | `Key_up | `Key_left ->
-                      if asset_count > 0
-                      then (
-                        let curr_idx =
-                          match find_asset_index curr_key assets with
-                          | Some i -> i
-                          | None -> 0
-                        in
-                        let new_idx =
-                          if curr_idx > 0 then curr_idx - 1 else asset_count - 1
-                        in
-                        selected_index_ref := new_idx;
-                        let new_asset = List.nth assets new_idx in
-                        view_mode_ref := `FocusView new_asset.key)
-                    | `Key_down | `Key_right ->
-                      if asset_count > 0
-                      then (
-                        let curr_idx =
-                          match find_asset_index curr_key assets with
-                          | Some i -> i
-                          | None -> 0
-                        in
-                        let new_idx =
-                          if curr_idx < asset_count - 1 then curr_idx + 1 else 0
-                        in
-                        selected_index_ref := new_idx;
-                        let new_asset = List.nth assets new_idx in
-                        view_mode_ref := `FocusView new_asset.key)
                     | _ -> ())))
             actions;
           dirty := true));
