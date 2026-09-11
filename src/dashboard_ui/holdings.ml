@@ -188,13 +188,13 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         in
         is_near_buy, false
     in
-    let flash_buy =
-      Anim.flash ~key:("buy:" ^ exchange ^ ":" ^ symbol) ~active:near_buy ~tau:0.35 > 0.05
-    in
-    let flash_sell =
-      Anim.flash ~key:("sell:" ^ exchange ^ ":" ^ symbol) ~active:near_sell ~tau:0.35
-      > 0.05
-    in
+    (* Blink the near-fill tint while price sits close to execution. A solid
+       tint (the previous [Anim.flash]-while-active behavior) read as a static
+       highlight, losing the "about to fill" cue. *)
+    if near_buy || near_sell then Anim.motion_pending := true;
+    let blink_on = Anim.blink () in
+    let flash_buy = near_buy && blink_on in
+    let flash_sell = near_sell && blink_on in
     let bg_color =
       if flash_buy
       then c_near_fill
@@ -469,10 +469,8 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       | Some d -> abs_float d <= 0.25
       | None -> false
     in
-    let flash_sell =
-      Anim.flash ~key:("bsell:" ^ exchange ^ ":" ^ asset) ~active:near_sell ~tau:0.35
-      > 0.05
-    in
+    if near_sell then Anim.motion_pending := true;
+    let flash_sell = near_sell && Anim.blink () in
     let bg_color =
       if flash_sell then c_near_sell else if is_even then c_panel else c_bg
     in

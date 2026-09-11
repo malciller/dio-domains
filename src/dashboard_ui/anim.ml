@@ -112,3 +112,12 @@ let active ?(window = 1.5) () = now () -. !last_activity < window
 
 (** Smooth 0..1 breathing value for ambient effects. *)
 let pulse () = 0.5 +. (0.5 *. sin (now () *. 3.0))
+
+(** Square-wave blink: [true] for the [duty] fraction of each [hz] cycle.
+    Steady-on under [reduced_motion]. This is the near-fill proximity cue - a
+    solid tint reads as "highlighted but static", so the highlight must blink.
+    Callers mark [motion_pending] while the condition holds so the render loop
+    keeps redrawing. *)
+let blink ?(hz = 1.5) ?(duty = 0.5) () =
+  if !reduced_motion then true else fst (Float.modf (now () *. hz)) < duty
+;;
