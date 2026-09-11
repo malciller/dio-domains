@@ -21,7 +21,6 @@ let idle_interval = ref 2.0
 let motion_pending = ref false
 
 let clamp01 x = if x < 0.0 then 0.0 else if x > 1.0 then 1.0 else x
-let lerp a b t = a +. ((b -. a) *. t)
 
 let ease_in_out t =
   let t = clamp01 t in
