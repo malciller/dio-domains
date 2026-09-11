@@ -71,7 +71,7 @@ Applied at process start through `Gc.set`. Units for `minor_heap_size` and `majo
 
 | Key | Default | Repo config |
 | --- | --- | --- |
-| `minor_heap_size` | `33554432` | `33554432` |
+| `minor_heap_size` | `33554432` | `2097152` |
 | `space_overhead` | `120` | `120` |
 | `max_overhead` | `1000000` | `1000000` |
 | `window_size` | `10` | `10` |
@@ -86,7 +86,7 @@ Each element of `trading` configures one symbol on one exchange:
 {
   "symbol": "BTC/USDC",
   "exchange": "hyperliquid",
-  "qty": 0.01,
+  "qty": "0.01",
   "grid_interval": [1.0, 5.0],
   "strategy": "jacobs_ladder",
   "maker_fee": null
@@ -95,26 +95,27 @@ Each element of `trading` configures one symbol on one exchange:
 
 | Key | Applies to | Meaning |
 | --- | --- | --- |
-| `symbol` | all | Exchange symbol, e.g. `BTC/USD` (Kraken), `BTC` (Hyperliquid spot), `AAPL` (IBKR, Alpaca) |
+| `symbol` | all | Exchange symbol, e.g. `BTC/USD` (Kraken), `BTC` (Hyperliquid perp), `BTC/USDC` (Hyperliquid spot), `AAPL` (IBKR, Alpaca) |
 | `exchange` | all | `kraken`, `hyperliquid`, `lighter`, `ibkr`, or `alpaca` |
-| `qty` | all | Base order size in base currency |
-| `grid_interval` | jacobs_ladder | `[gi_min, gi_max]`: the hardened bounds (in %) the oracle's parameter search walks; the strategy never reads them |
-| `min_usd_balance` | MM only | Lower bound on account quote balance; MM halts below this |
-| `max_exposure` | MM only | Upper bound on quote exposure for one symbol; MM halts above this |
+| `qty` | all | Base order size in base currency, encoded as a string (e.g. `"0.01"`) |
+| `grid_interval` | jacobs_ladder | `[gi_min, gi_max]`: the hardened bounds (in %) the oracle's parameter search walks; the strategy reads only the oracle's resolved interval, never these bounds |
+| `min_usd_balance` | MM only | Lower bound on account quote balance; MM pauses buys below this |
+| `max_exposure` | MM only | Upper bound on quote exposure for one symbol; MM pauses buys above this |
 | `strategy` | all | `jacobs_ladder` (aliases `Ladder`) or market making (`MM`, alias `market_maker`) |
 | `maker_fee`, `taker_fee` | all | Explicit fee overrides (fractions, e.g. `0.0016`); `null` means use venue default or live fee lookup |
 | `testnet` | HL, Lighter, IBKR, Alpaca | Route to sandbox/paper endpoints. Rejected for Kraken |
 | `hedge` | Hyperliquid only | Enable the experimental perp short auto-hedge. Rejected elsewhere |
 | `accumulation_buffer` | all | `[min, max]` retained quote profit buffer required before base accumulation; resolved live from Fear & Greed (crypto venues) |
-| `data_feed` | Alpaca | `iex` (free, delayed) or `sip` (paid, real-time) |
+| `data_feed` | Alpaca | `iex` (free) or `sip` (paid, full-market); accepted on any recognized venue, consumed only by Alpaca |
 | `sell_mult` | jacobs_ladder | Fraction of each ladder rung's qty sold per rung fill (`1.0` sells the full rung; smaller values accrue base) |
 | `base_accumulation` | all | Persist accumulated base and profit state for this entry (default `true`) |
 | `sell_levels` | jacobs_ladder | Persist pending sell levels for this entry (default `false`) |
 
 Venue-specific restrictions are enforced at startup:
 
-- `testnet`, `hedge`, and `data_feed` are rejected for Kraken.
 - `hedge` is Hyperliquid-only.
+- `testnet` is accepted for Hyperliquid, Lighter, IBKR, and Alpaca; rejected for Kraken.
+- `testnet`, `hedge`, `data_feed`, and `accumulation_buffer` are rejected for unrecognized (custom) exchanges.
 
 ### Oracle
 
@@ -126,7 +127,7 @@ rejected at startup.
 | --- | --- | --- |
 | `qty_cap_mult` | `1.5` | Buy-size upper bound multiplier: the search sizes `buy_qty` within `[qty, qty * qty_cap_mult]` |
 | `target_survival` | `0.95` | Fraction of the historical max drawdown the runway covers: `runway_pct = max_drawdown_pct * target_survival`. Drives sizing only - never activity |
-| `min_active_dsurv` | `0.0` | Active gate: a strategy is active iff its replayed `d_surv >= min_active_dsurv`, subject to affordability |
+| `min_active_dsurv` | `0.0` | Active gate: a strategy is active iff its replayed `d_surv >= min_active_dsurv` (or it has a resting buy to preserve), subject to affordability |
 | `refresh_seconds` | `300.0` | Background fallback poll for history and balances (decisions are event-driven: fills/cancels re-resolve immediately) |
 | `assets` | unset | Per-symbol overrides keyed by symbol, each accepting `{ target_survival, min_active_dsurv, qty_cap_mult }` |
 
@@ -140,10 +141,10 @@ Credentials and one-off knobs live in the environment. The engine loads `.env` i
 | --- | --- | --- |
 | `KRAKEN_API_KEY` | Kraken | |
 | `KRAKEN_API_SECRET` | Kraken | |
-| `HYPERLIQUID_WALLET_ADDRESS` | Hyperliquid | Wallet that signs orders |
+| `HYPERLIQUID_WALLET_ADDRESS` | Hyperliquid | Account address used for balances and fee queries |
 | `HYPERLIQUID_PRIVATE_KEY` | Hyperliquid | Private key for the EIP-712 order signer |
 | `IBKR_GATEWAY_HOST` | IBKR | Default `127.0.0.1` |
-| `IBKR_GATEWAY_PORT` | IBKR | Default `4002` (paper), forced to `4001` in live mode |
+| `IBKR_GATEWAY_PORT` | IBKR | Default `4002`; live mode forces `4001` when unset |
 | `IBKR_TRADING_MODE` | IBKR | `paper` or `live`; default `paper` |
 | `IBKR_CLIENT_ID` | IBKR | Default `0` |
 | `IBKR_ACCOUNT_ID` | IBKR | Optional; auto-detected when unset |
@@ -157,6 +158,13 @@ Credentials and one-off knobs live in the environment. The engine loads `.env` i
 | `CMC_API_KEY` | Fear-and-Greed | CoinMarketCap API key; missing key falls back to a neutral value |
 | `DISCORD_WEBHOOK_URL` | Discord notifier | Fill notifications; unset disables Discord |
 | `DIO_BACKTRACE` | Engine | When set, pretty-prints OCaml backtraces on crashes |
+| `DIO_DATA_DIR` | Persistence | State directory override; defaults to `/app/data` when `/app` exists, else `data` |
+| `DIO_WATCHDOG_OFF` | Engine | When set, disables the main-loop watchdog |
+| `COLUMNS` | Engine | Fallback log width when stdout is not a TTY (default width `200`) |
+| `DIO_MOTION` | Dashboard | `off`/`0`/`false`/`no` disables animations |
+| `DIO_FPS` | Dashboard | Caps the animated frame rate (default `30.0`) |
+| `DIO_DAMAGE` | Dashboard | `off`/`0`/`false`/`no` forces full-frame redraws instead of incremental damage rendering |
+| `HOME` | Dashboard | Used for the persisted `~/.dio_theme` theme path |
 
 ---
 
@@ -164,11 +172,11 @@ Credentials and one-off knobs live in the environment. The engine loads `.env` i
 
 ### Kraken
 
-REST + WebSocket. Order book and authenticated feeds arrive over websockets; balance comes from the authenticated feed. Fees are looked up live (volume tiers) with a `0.0016` / `0.0026` maker/taker fallback. Order sizes are floored to the venue tick and lot size. No `testnet` mode.
+REST + WebSocket. Order book and authenticated feeds arrive over websockets; balance comes from the authenticated feed. Fees are looked up live from volume tiers (`TradeVolume`); the capital-oracle adapter falls back to `0.0016` / `0.0026` maker/taker, and a failed live fee fetch at startup is fatal. Prices are rounded to the nearest venue tick; the strategy layer floors order quantities to the venue lot size. No `testnet` mode.
 
 ### Hyperliquid
 
-Spot and perpetual trading with an EIP-712 signer. Bare symbols (`BTC`) resolve to spot; `BTC/USDC` maps through the spot universe. Testnet via `"testnet": true`. `min_notional` is enforced at `10.0` USDC for spot symbols containing `/`.
+Spot and perpetual trading with an EIP-712 signer. Bare symbols (`BTC`) resolve to the perpetual; `BTC/USDC` maps through the spot universe. Testnet via `"testnet": true`. `min_notional` is enforced at `10.0` USDC for spot symbols containing `/` (the oracle sizes against spot balances).
 
 The engine signs with the wallet key from `HYPERLIQUID_PRIVATE_KEY`. The agent contract (`Agent(string source, bytes32 connectionId)`) is constructed internally; there is no separate agent-address environment variable.
 
@@ -180,11 +188,11 @@ Lighter orders are time-limited (~28-day GTT). A renewal daemon cancel-and-repla
 
 ### Interactive Brokers
 
-Connects to an IB Gateway (e.g. `gnzsnz/ib-gateway-docker`) over TCP. `testnet` forces paper mode on port `4002`; live mode forces port `4001`. Live trading is entirely limit-based; the engine floors order quantities to whole shares. Account ID auto-detects unless `IBKR_ACCOUNT_ID` is set.
+Connects to an IB Gateway (e.g. `gnzsnz/ib-gateway-docker`) over TCP. `testnet` forces paper mode on port `4002`; live mode forces port `4001` (unless `IBKR_GATEWAY_PORT` is set). The grid strategy submits limit orders only; the engine floors order quantities to whole shares. Account ID auto-detects unless `IBKR_ACCOUNT_ID` is set.
 
 ### Alpaca
 
-US equities, paper or live. `data_feed` selects `iex` (free, 15-minute delayed bars) or `sip` (paid, real-time). The engine respects extended trading hours (pre-market 4 AM to 9:30 AM, after-hours 4 PM to 8 PM, overnight 8 PM to 4 AM ET) and uses `day` TIF with the extended-hours flag when needed. Alpaca pairs are 1:1 (no accumulation up-sizing) and fees default to zero.
+US equities, paper or live. `data_feed` selects `iex` (free) or `sip` (paid, full-market). The engine respects extended trading hours (pre-market 4 AM to 9:30 AM, after-hours 4 PM to 8 PM, overnight 8 PM to 4 AM ET); it attaches the extended-hours flag to limit orders in extended sessions and forces `day` TIF only for fractional equity orders (otherwise the requested TIF, default `gtc`, passes through). `min_notional` is `1.0`. Alpaca pairs are 1:1 (no accumulation up-sizing) and fees default to zero.
 
 ---
 
@@ -192,25 +200,33 @@ US equities, paper or live. `data_feed` selects `iex` (free, 15-minute delayed b
 
 ### Grid (jacobs_ladder)
 
-The default strategy. A pure executor: it buys price drops and sells the
-bought base to offset volatility drag, with every sizing and activity value
-coming from the oracle's decision record (`active`, `grid_interval`,
-`buy_qty`, `sell_qty`). There is no config fallback path - before an oracle
-decision exists for an asset the strategy places nothing.
+The ladder strategy (`"strategy": "jacobs_ladder"` or `"Ladder"`). A pure
+executor: it buys price drops and sells the bought base to offset volatility
+drag. The oracle's decision record is `{active, grid_interval, buy_qty,
+sell_qty}`; the grid consumes `active`, `grid_interval`, and `buy_qty`, and
+sizes sells locally (see below). There is no config fallback path - before an
+oracle decision exists for an asset the strategy places nothing.
 
-- Buy side: exactly one resting buy below the current price, trailing upward.
-- Sell side: layered sells above the current price, one per filled buy, fill-
-  anchored at `buy_fill_price * (1 + grid_interval)`; never cancelled once
-  placed. Sells run even while inactive: they need inventory, not quote.
-- Balance model: the execution layer exposes `available_trading_balance`
-  (already net of reserved_base); sell size is the oracle's `sell_qty` -
-  the venue base pool minus reserved_base minus base tied in resting sells.
+- Buy side: exactly one resting buy below the current price, trailing upward
+  (amended down when it would intrude into the sell zone).
+- Sell side: layered sells above the current price, one per filled buy (and
+  placed on a buy placement too), fill-anchored at
+  `buy_fill_price * (1 + grid_interval / 100)`. On non-Alpaca venues the anchor
+  re-bases to the live bid once the bid has drifted more than one grid step
+  from the last fill. Sells are not proactively repriced or cancelled once
+  placed, though a failed amendment can cancel a stale order. Sells run even
+  while inactive: they need inventory, not quote.
+- Balance model: sell size is the last buy fill quantity (falling back to the
+  venue lot of the grid qty), capped by sellable base. On non-accumulation
+  venues that is `base - reserved_base - base locked in resting sells`; on
+  accumulation venues it is `ledger balance - reserved_base - unnetted hold`
+  (resting-sell base is deliberately not subtracted).
 
 Accrual lives in the persistence layer: profitable sell fills reserve base via
 `Base_accumulation_store`, which survives engine restarts. Base accumulation is
 pre-funded out of realized quote earnings: base is reserved only when
 accumulated net profit covers the acquisition cost of the withheld base plus the
-configured `accumulation_buffer`, and accumulated profit is debited by that
+Fear & Greed-interpolated `accumulation_buffer`, and accumulated profit is debited by that
 acquisition cost upon reservation, preventing quote balance bleed.
 
 ### Market Maker (MM)
@@ -221,11 +237,11 @@ acquisition cost upon reservation, preventing quote balance bleed.
 - Sell price = best ask (rounded to the venue tick).
 - A profitability guard refuses a spread that cannot cover round-trip fees: the rounded spread (sell minus buy) must be at least `ask * (2 * fee + 0.0001)`.
 
-Per-symbol `min_usd_balance` and `max_exposure` bound the account; crossing either halts that symbol.
+Per-symbol `min_usd_balance` and `max_exposure` bound the account; crossing either pauses new buys on that symbol and places an emergency sell of free inventory.
 
 ### Auto-Hedge (Hyperliquid, experimental)
 
-`auto_hedger.ml`. Maintains one perp short per grid cycle: when the grid buys spot, it opens a short if none is open; when the grid sells, it closes the hedge. Hedges use IOC limit orders at the perp top of book. Enable with `"hedge": true` on a Hyperliquid entry.
+`auto_hedger.ml`. Maintains one perp short per grid cycle: when the grid buys spot, it opens a short if none is open; when the grid sells, it closes the hedge. Hedges use GTC limit orders at the perp top of book, falling back to a market order when no perp top of book is available. Enable with `"hedge": true` on a Hyperliquid entry.
 
 ---
 
@@ -258,10 +274,11 @@ Connections in the registry: `hyperliquid_ws`, `lighter_ws`, `kraken_orderbook_w
 
 Health rules:
 
-- Exponential restart backoff `0/2/4/...` capped at 30 seconds (300 seconds for `ibkr_gateway` and `lighter_ws`).
+- Exponential restart backoff `0/2/4/...` capped at 30 seconds (300 seconds for `ibkr_gateway` and `lighter_ws`; Alpaca feeds wait 2 seconds on their first attempt).
 - A connection idle for 60 seconds is restarted; a websocket stuck connecting for 120 seconds is killed.
-- Websocket ping/pong: 15-second interval, 5-second timeout, 3 missed pongs before restart. Passive data feeds must heartbeat at least every 60 seconds.
-- Circuit breaker: 5 consecutive failures open the breaker for 5 minutes, then it re-tries in half-open mode.
+- Websocket ping/pong: 15-second interval, 5-second timeout (10 seconds for `kraken_auth_ws`), 3 missed pongs before restart. `kraken_orderbook_ws` is not pinged and relies on the passive heartbeat. Passive data feeds must heartbeat at least every 60 seconds (`ibkr_gateway` is exempt).
+- Circuit breaker: 5 consecutive failures open the breaker for 5 minutes, then it re-tries in half-open mode. It is currently wired only for `ibkr_gateway`.
+- Main-loop watchdog (`main_loop_watchdog.ml`): the main Lwt loop beats every 5 seconds; a stall over 60 seconds force-exits the process for supervised restart. `DIO_WATCHDOG_OFF` disables it.
 
 ### Domains and wakeups
 
@@ -273,11 +290,11 @@ Order lifecycle events from REST callbacks (acks, rejects, amend results) do not
 
 ### Feed parsing
 
-High-rate frame parsing runs on a dedicated worker domain (`src/engine/concurrency/parse_worker.ml`) rather than the Lwt scheduler thread that multiplexes all venue sockets. Kraken's WebSocket client diverts executions and orderbook frames by raw-string prefix before any JSON parsing; the worker parses and dispatches them sequentially, preserving per-venue order. When the worker's queue fills, frames fall back to inline parsing - never dropped (Kraken book updates are deltas, so a dropped update would desync the local book). Hyperliquid's l2Book channel needs no offloading: its top-of-book is extracted by a zero-copy string scan into an Atomic snapshot, and the full-book JSON parse only happens on the dashboard cadence.
+High-rate frame parsing runs on a dedicated worker domain (`src/engine/concurrency/parse_worker.ml`) rather than the Lwt scheduler thread that multiplexes all venue sockets. Kraken's WebSocket client diverts execution frames by raw-string prefix before any JSON parsing; orderbook frames are submitted unconditionally. The worker parses and dispatches them sequentially, preserving per-venue order. When the worker's queue fills, frames fall back to inline parsing - never dropped (Kraken book updates are deltas, so a dropped update would desync the local book). Hyperliquid's l2Book channel needs no offloading: its top-of-book is extracted by a zero-copy string scan into an Atomic snapshot, and the full-book JSON parse only happens on the dashboard cadence.
 
 ### Order executor
 
-Strategies enqueue intents into a lock-free MPSC queue (capacity 64k). The executor shards in-flight orders by `duplicate_key` across 64 shards, tracks amendments, and suppresses redundant no-change amendments. After a restart the executor re-syncs against open orders fetched from the venue before domains resume.
+Strategies enqueue intents into a lock-free MPSC queue (capacity 64k). The executor shards in-flight orders by `duplicate_key` across 64 shards, tracks amendments, and suppresses redundant no-change amendments. After a restart the supervisor re-syncs against open orders fetched from the venue before domains resume.
 
 ### Error handling
 
@@ -289,12 +306,12 @@ All exchange I/O funnels through `error_handling.ml`: callers classify errors (`
 
 ### Persistence
 
-State lives in two JSON files under `data/`, written atomically (temp file + rename):
+State lives in two JSON files under the state directory (`data/`, or `$DIO_DATA_DIR`; `/app/data` in Docker), written atomically (temp file + rename):
 
-- `accumulation_state.json` (`base_accumulation_store.ml`, orchestrated by `persistence_orchestrator.ml`): per `{strategy}:{symbol}:{venue}` key, fields `reserved_base`, `accumulated_profit`, `last_fill_oid`, `last_buy_fill_price`, `last_sell_fill_price`, `last_buy_fill_qty`, `last_sell_fill_qty`. Opt-in per trading entry via `base_accumulation`.
-- `sell_levels_state.json` (`sell_levels_store.ml`): pending sell levels for entries with `sell_levels: true`.
+- `accumulation_state.json` (`base_accumulation_store.ml`, orchestrated by `persistence_orchestrator.ml`): per `{strategy}:{symbol}:{venue}` key, fields `reserved_base`, `accumulated_profit`, `last_fill_oid`, `last_buy_fill_price`, `last_sell_fill_price`, `last_buy_fill_qty`, `last_sell_fill_qty`. Enabled per trading entry via `base_accumulation` (default `true`).
+- `sell_levels_state.json` (`sell_levels_store.ml`): pending sell levels for entries with `sell_levels: true` (default `false`).
 
-On startup, a legacy flat `data/accumulated_state.json` is migrated into these files and renamed to `accumulated_state.json.migrated.<ts>`. Used by the Jacobs ladder on Hyperliquid, Lighter, IBKR, and Alpaca. In Docker, mount `/app/data`.
+On startup, a legacy flat `data/accumulated_state.json` is migrated into these files and renamed to `accumulated_state.json.migrated.<ts>`. Used by the Jacobs ladder on all venues (including Kraken). In Docker, mount `/app/data`.
 
 ---
 
@@ -320,31 +337,38 @@ runway this asset has actually walked?"
   `runway_pct = max_drawdown_pct * target_survival`;
   `floor_price = ath * (1 - runway_pct)`. Three regimes, evaluated in order:
   *Normal* (`current > floor_price`: fund the remaining drop),
-  *Floor extension* (at/below the floor: funding extends down to ATL),
-  *Unprecedented lows* (at the deepest drawdown AND at/below ATL:
-  maximum conservatism). Aggressiveness = `realized_dd / max_drawdown_pct`
-  biases parameter selection toward tighter grids and larger sizes deeper in
-  the runway; it never overrides survival requirements or bounds.
+  *Unprecedented lows* (at the deepest drawdown AND at/below ATL: maximum
+  conservatism), *Floor extension* (at/below the floor but not at the deepest
+  drawdown: funding extends down to ATL). `realized_dd` is clamped to `[0,1]`
+  and `max_drawdown_pct` is capped just below `1.0`. Aggressiveness =
+  `realized_dd / max_drawdown_pct` (clamped to `[0,1]`) biases parameter
+  selection toward tighter grids and larger sizes deeper in the runway; it
+  never overrides survival requirements or bounds.
 - **Survival replay**: a candidate `(grid_interval, buy_qty)` walks the
   funded depth geometrically, paying each buy plus venue fees;
   `d_surv` is the fraction of that depth survived before the quote runs out
   (>= 1.0 means fully funded). The exhaustion price - the deepest rung
   fillable with available capital - is reported alongside it: the
   venue-simulated shared-capital bottom rung (`P_funded`) for active
-  strategies, the single-asset replay's exhaustion point for inactive ones.
+  strategies, the single-asset replay's exhaustion point for inactive ones
+  (inactive decisions report `d_surv = 0.0`).
 - **Parameter search**: `buy_qty` within `[qty, qty * qty_cap_mult]`,
   `grid_interval` within `[gi_min, gi_max]` (the strategy entry's bounds).
-  Branches, in order: *Unreachable* (no candidate meets the funded-depth
-  requirement -> conservative corner `qty` / `gi_max`); *Reachable* (largest
-  size at tightest spacing keeping `d_surv >= target_survival`,
-  aggressiveness-biased); *Surplus* (the aggressive corner exceeds the target
-  with quote left over -> `qty_max` / `gi_min`).
+  Branches, in order: the deepest-drawdown *Unprecedented lows* case
+  short-circuits to the conservative corner (`qty` / `gi_max`); *Surplus* (the
+  aggressive corner is fully funded with quote left over -> `qty_max` /
+  `gi_min`); *Reachable* (largest size at tightest spacing that is still fully
+  funded, aggressiveness-biased); otherwise *Unreachable* (conservative
+  corner). The funded-depth test is the fully-funded `d_surv >= 1.0`, not
+  `target_survival`; `target_survival` only sets the funded floor via
+  `runway_pct`.
 - **Decision record**: exactly `{active, grid_interval, buy_qty, sell_qty}`,
   raw floats, generated by exactly one code path. Values are emitted for
   inactive strategies too, for visibility and immediate reactivation. All
   normalization (tick/lot rounding, min notional) happens at the exchange
-  layer. Activity: `active <=> d_surv >= min_active_dsurv` subject to
-  affordability; sells always run (they need inventory, not quote).
+  layer. Activity: `active` when `d_surv >= min_active_dsurv` (or a resting buy
+  must be preserved) and the next buy is affordable; sells always run (they
+  need inventory, not quote).
 
 ### Pooling, priority & cascades
 
@@ -352,9 +376,9 @@ Pools are per venue: one quote pool shared by that venue's strategies, never
 crossing venues (two strategies may share one symbol on one venue).
 Allocation walks strategies in config presentation order (first = highest
 priority): each strategy sizes against the entire remaining availability, its
-next buy ties up `buy_qty * current`, unfundable strategies are skipped and
-capacity passes down - a lower-priority strategy is never starved while quote
-exists. When a higher-priority need cannot fit, the cancellation cascade
+next buy ties up `buy_qty * current`, and a strategy whose next buy does not
+fit is skipped while remaining capacity passes down the list. When a
+higher-priority need cannot fit, the cancellation cascade
 cancels lower-priority resting buys - many lesser orders may be cancelled to
 satisfy one greater - until it fits; if no combination fits, resolution
 proceeds to the next-highest priority. Every cancelled strategy re-evaluates
@@ -375,7 +399,8 @@ woken per pass.
 
 Runs the exact decision pipeline offline against configured assets and prints
 the decision surface - the four contract values plus diagnostics - without
-touching live balances:
+touching live balances. It supports the Kraken, Hyperliquid, and Alpaca venue
+adapters (Lighter and IBKR have no oracle adapter):
 
 ```sh
 dune exec dio-oracle                          # every trading entry, table output

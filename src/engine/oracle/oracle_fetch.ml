@@ -148,15 +148,14 @@ let merge_series ~(venue : Oracle_types.series) ~(deep : Oracle_types.series)
 
 (** Fetch one symbol's daily series through the registry (cached per run,
     and disk-cached via Oracle_cache: full history on first use, one small
-    delta request per refresh after that). [offline] bypasses the disk cache
-    and requests exactly the [start_date]..[end_date] window (CLI use);
-    [feed] is the Alpaca-only IEX/SIP knob. *)
+    delta request per refresh after that). [offline] never touches the
+    network: it serves only the disk cache (empty on a cache miss), for CLI
+    cache-only runs; [feed] is the Alpaca-only IEX/SIP knob. *)
 let fetch_series_for
       ?(offline = false)
       ~(exchange : string)
       ~(symbol : string)
       ?feed
-      ?start_date
       ?end_date
       ()
   : Oracle_types.series Lwt.t
@@ -165,11 +164,11 @@ let fetch_series_for
   | Some series -> Lwt.return series
   | None ->
     let fetch =
-      match Exchange.Oracle.Registry.get exchange with
-      | Some (module V) ->
-        if offline
-        then V.fetch_bars ?feed ?end_date ~from:start_date ~symbol ()
-        else
+      if offline
+      then Lwt.return (Oracle_cache.read_cached ~exchange ~symbol ())
+      else (
+        match Exchange.Oracle.Registry.get exchange with
+        | Some (module V) ->
           Oracle_cache.with_delta
             ~exchange
             ~symbol
@@ -177,7 +176,7 @@ let fetch_series_for
             ~fetch:(fun boundary ->
               V.fetch_bars ?feed ?end_date ~from:boundary ~symbol ())
             ()
-      | None -> invalid_arg ("oracle_fetch: unknown exchange " ^ exchange)
+        | None -> invalid_arg ("oracle_fetch: unknown exchange " ^ exchange))
     in
     fetch
     >|= fun bars ->

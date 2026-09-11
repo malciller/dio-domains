@@ -369,6 +369,33 @@ let test_with_delta_fetch_failure_falls_back () =
       (List.map (fun b -> b.Dio_oracle.Oracle_types.close) result))
 ;;
 
+let test_read_cached_no_network () =
+  (* Cache-only runs must serve exactly what is on disk and never fetch: a
+     populated cache returns the cleaned bars, a cache miss returns []. *)
+  with_tmp_dir (fun dir ->
+    let bars =
+      [ mk_bar ~date:"2025-01-01" ~close:10.0 ~volume:1.0
+      ; mk_bar ~date:"2025-01-02" ~close:11.0 ~volume:2.0
+      ]
+    in
+    Dio_oracle.Oracle_cache.save_bars ~dir ~exchange:"kraken" ~symbol:"XMR/USD" bars;
+    Alcotest.(check (list (float 1e-9)))
+      "serves cached bars"
+      [ 10.0; 11.0 ]
+      (List.map
+         (fun b -> b.Dio_oracle.Oracle_types.close)
+         (Dio_oracle.Oracle_cache.read_cached
+            ~dir
+            ~exchange:"kraken"
+            ~symbol:"XMR/USD"
+            ()));
+    Alcotest.(check int)
+      "cache miss is empty, not fetched"
+      0
+      (List.length
+         (Dio_oracle.Oracle_cache.read_cached ~dir ~exchange:"kraken" ~symbol:"NOPE" ())))
+;;
+
 let () =
   Alcotest.run
     "oracle_cache"
@@ -411,6 +438,10 @@ let () =
             "failed delta falls back to cached history"
             `Quick
             test_with_delta_fetch_failure_falls_back
+        ; Alcotest.test_case
+            "cache-only read serves disk, never fetches"
+            `Quick
+            test_read_cached_no_network
         ] )
     ]
 ;;
