@@ -1,6 +1,7 @@
 (library
  (name ws_lwt)
  (public_name dio.ws_lwt)
+ (modules ws_lwt)
  (libraries
   websocket
   conduit-lwt-unix

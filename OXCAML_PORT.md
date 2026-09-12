@@ -193,9 +193,9 @@ Owner column is free text (agent/session id). Keep one `IN_PROGRESS` at a time p
 | WS1 | `notty` → `notty-community` (dep swap + code/API check) | WS0 | **DONE (flambda)** | this session |
 | WS2 | Fix `lwt_ppx+ox` AST mismatch (pin compatible `ppxlib`/`ppxlib_ast`) | WS0 | **DONE (resolution)** | this session |
 | WS2b | Resolve `lwt 6` vs `lwt_log < 6` (pulled by `websocket-lwt-unix`); pin `alcotest = 1.9.0+ox` | WS2 | **DONE (flambda)** | this session |
-| WS3 | `digestif` — patch modes OR replace with `mirage-crypto` hashes | WS0 | TODO | |
-| WS4 | `msgpck` / `ocplib-endian` — patch or replace encoder | WS0 | TODO | |
-| WS5 | `cohttp-lwt(-unix)` — patch local/global mode errors | WS0 | TODO | |
+| WS3 | `digestif` — patch modes OR replace with `mirage-crypto` hashes | WS0 | **DONE (overlay; flambda-verified)** | this session |
+| WS4 | `msgpck` / `ocplib-endian` — patch or replace encoder | WS0 | **DONE (flambda)** | this session |
+| WS5 | `cohttp-lwt` — patch local/global mode errors (overlay `4.0.0+dio1`) | WS0 | **IN_PROGRESS (overlay built; flambda-green; OxCaml verify pending)** | this session |
 | WS6 | `websocket-lwt-unix` / `conduit` — verify then patch | WS0 | TODO | |
 | WS7 | `secp256k1` bindings — verify then patch | WS0 | TODO | |
 | WS8 | Audit remaining deps (`uri`, `base64`, `mtime`, `ipaddr`, `ctypes`, `alcotest`, `ssl`, `mirage-crypto*`, `websocket`, `yojson`) under OxCaml | WS4-WS7 | TODO | |
@@ -251,17 +251,76 @@ Owner column is free text (agent/session id). Keep one `IN_PROGRESS` at a time p
 - Acceptance: all hash call sites produce identical digests vs the flambda build (test
   vectors / golden files).
 
+**Resolution (2026-09-12) — Route B (exclude the optional pure-OCaml backend).**
+- The replace-with-`mirage-crypto` route is **not viable**: `mirage-crypto >= 1.0.0`
+  removed `Mirage_crypto.Hash` and *depends on* `digestif`; `digestif` is also a hard
+  dep of `mirage-crypto-rng`. Keccak-256 (Ethereum padding `0x01`) has no `mirage-crypto`
+  equivalent in any version. `digestif` must build regardless of our call sites.
+- Chose **Route B** over Route A because macOS cannot build OxCaml, so Route A's mode
+  annotations cannot be compile-validated here; Route B does not touch any mode-sensitive
+  source. `src-ocaml/dune` declared the optional `digestif.ocaml` library; it is removed
+  from the overlay build so the default `digestif.c` (`(default_implementation digestif.c)`
+  in `src/dune`) is the only implementation. Consumers request the virtual library
+  `digestif`, so no API change and byte output is identical (C backend either way).
+- Overlay package: `oxcaml-port/opam-overlay/packages/digestif/digestif.1.3.1+dio1/`
+  (`opam` + `files/oxcaml.patch`). Patch touches four dune files only: `src-ocaml/dune`
+  (drop library stanza), and `test/ocaml/dune`, `fuzz/dune`, `fuzz/ocaml/dune`
+  (redirect `digestif.ocaml` → `digestif.c` so the test/fuzz suites still build).
+- Verified on `5.2.0+flambda` (see Action Log): patch applies with `patch -p1` and
+  `git apply --check`; `dune build -p digestif` exits 0; digestif's own known-answer
+  suites pass (684 tests incl. SHA256/SHA512/HMAC/Keccak-256); a before/after program
+  printing SHA256/HMAC-SHA512/Keccak-256 is byte-identical on unpatched vs patched.
+- **Not verified by execution under OxCaml** (this macOS host cannot build OxCaml). The
+  OxCaml-side basis is the prior Docker log `/tmp/docker_oxcaml_build3.log`: only the
+  `src-ocaml/baijiu_*.ml` library failed; `digestif.c` and its C stubs built. Removing
+  that library is therefore sufficient. Re-verify in Docker at WS9.
+- Overlay metadata validated in an isolated opam root (`OPAMROOT=… opam init --bare
+  … dio-ox file://…/opam-overlay`): `opam show digestif.1.3.1+dio1` reports the expected
+  url/checksum/patches/extra-files, and `opam lint` passes. The overlay `repo` marker was
+  added concurrently by the WS4 session.
+- Wiring still needed (WS0/WS9): the Docker switch must add this overlay repo and select
+  `1.3.1+dio1` over upstream `1.3.1` (e.g. an OxCaml-only `digestif` version constraint).
+  Also confirmed the pinned OxCaml repo `bb455526` ships **no** `digestif`/`oxcaml-digestif`
+  package.
+
 ### WS4 — msgpck
 - Used for Hyperliquid action signing/serialization. Depends on `ocplib-endian`.
 - Approach: patch `ocplib-endian` and/or `msgpck` for OxCaml; or replace with a small
   internal msgpack encoder if the surface is narrow. Do **not** change the wire format.
 - Acceptance: Hyperliquid signing produces byte-identical output vs flambda (golden test).
+- **DONE (flambda-verified, 2026-09-12):** only `msgpck` fails; `ocplib-endian.1.2` is fine
+  (corrects the §4.2 attribution). Overlay package
+  `oxcaml-port/opam-overlay/packages/msgpck/msgpck.1.7+dio1/` carries
+  `files/oxcaml.patch`, which eta-expands `SIBO.blit`/`BIBO.blit` (`src/msgpck.ml:37,49`)
+  into global-typed `fun` wrappers so the recorded `blit` type matches `STRING.blit`.
+  `StringBuf`/`BytesBuf` (the runtime path, `SIBUFO`/`BIBUFO`) are untouched.
+  Verified on `5.2.0+flambda`: `git apply --check` and `patch --dry-run -p1` pass against
+  a clean 1.7 tree; `dune build -p msgpck` exits 0 after `patch -p1`; a `StringBuf.write`
+  vector harness (12 cases, including the documented sample order action) is byte-identical
+  before/after. OxCaml end-to-end was **not** run (macOS cannot build it; see Action Log).
 
 ### WS5 — cohttp-lwt
-- Symptom: `local`/`global` mode error in `body.ml`.
-- Approach: prefer a newer `cohttp`/`cohttp-lwt` release if it compiles under OxCaml;
-  otherwise patch the offending function and ship in overlay. Check the REST call sites
-  (`src/external/*`) still work.
+- Symptom: `local`/`global` mode error in `body.ml:50` (partial application
+  `Lwt_stream.iter (Buffer.add_string b) s`).
+- Version-bump ruled out: the offending expression is byte-identical in `cohttp-lwt`
+  4.0.0 and the latest 6.3.0 (`opam source cohttp-lwt.6.3.0`), so no release avoids the
+  patch. Bumping would also force `cohttp-lwt-unix >= 5.3` and `conduit-lwt-unix >= 5`,
+  changing the OxCaml closure that currently settles at `cohttp-lwt-unix 4.0.0` +
+  `conduit-lwt-unix 2.2.2`.
+- Chosen: patch 4.0.0 via overlay `cohttp-lwt.4.0.0+dio1` (`files/oxcaml.patch`):
+  eta-expand `Buffer.add_string b` (body.ml:50) and `(Request|Response).write_body writer`
+  (client.ml:54,64,116; server.ml:126). API and runtime behaviour unchanged.
+- Overlay also ships `cohttp.4.0.0+dio1` and `cohttp-lwt-unix.4.0.0+dio1` (version-only,
+  no patch): the cohttp packages are coupled by `depends: "cohttp" {= version}` /
+  `"cohttp-lwt" {= version}`, so a `+dio1` `cohttp-lwt` requires matching `+dio1` cohttp
+  packages (otherwise `cohttp-lwt-unix.4.0.0` selects the unpatched `cohttp-lwt.4.0.0`).
+- Verification (macOS): `patch -p1 --dry-run` clean; applied to a clean 4.0.0 tree;
+  `dune build -p cohttp-lwt` on `5.2.0+flambda` exit 0. opam resolution with the overlay
+  repo added: `cohttp-lwt-unix.4.0.0+dio1 -> cohttp-lwt.4.0.0+dio1 -> cohttp.4.0.0+dio1`.
+- Still open: OxCaml build (macOS cannot build OxCaml); `cohttp-lwt-unix` sources are
+  unpatched (e.g. `callback spec` partial application at
+  `cohttp-lwt-unix/src/server.ml:69` may hit the same mode error) — extend the overlay
+  `cohttp-lwt-unix.4.0.0+dio1` if the Docker build reaches it and fails.
 - Acceptance: REST request/response round-trip test passes.
 
 ### WS6/WS7 — websocket/conduit/secp256k1
@@ -287,9 +346,10 @@ Owner column is free text (agent/session id). Keep one `IN_PROGRESS` at a time p
 | `lwt_log` | was pulled by `websocket-lwt-unix` | — | no | **no longer a dependency** (WS2b dropped `websocket-lwt-unix`) | — | |
 | `alcotest` | tests | (unpinned) | yes | must resolve to `1.9.0+ox` on OxCaml | project constraint left broad (classic-flambda unaffected); the OxCaml build must pass `--update-invariant` or explicitly resolve `alcotest` to `1.9.0+ox` (WS2b) | |
 | `notty-community` | logging/TUI | `0.2.4` (default) / `0.2.4+ox2` (ox repo) | yes | flambda green; OxCaml `+ox2` selects automatically | WS1 — API identical to notty 0.2.3 (`Notty`/`Notty_unix`); expose `notty-community{,.unix}` | this session |
-| `digestif` | hashing | 1.3.1 | no | **fails** | WS3 | |
-| `cohttp-lwt` | REST | 4.0.0 | no | **fails** | WS5 | |
-| `msgpck` | HL msgpack | 1.7 | no | **fails** | WS4 | |
+| `digestif` | hashing | 1.3.1 → overlay `1.3.1+dio1` | overlay (Route B) | **patched (flambda-verified)** | WS3: `oxcaml-port/opam-overlay/packages/digestif/digestif.1.3.1+dio1` drops the unused `digestif.ocaml` backend; default `digestif.c` retained | this session |
+| `cohttp-lwt` | REST | 4.0.0 | now yes (dio overlay) | overlay `cohttp-lwt.4.0.0+dio1` (eta-expand partial applications); flambda `dune build -p cohttp-lwt` green | WS5 — OxCaml verify pending | this session |
+| `cohttp` / `cohttp-lwt-unix` | REST (coupling) | 4.0.0 | no (version-only) | overlaid as `+dio1` purely to satisfy `cohttp-lwt {= version}`; sources unpatched | WS5 | this session |
+| `msgpck` | HL msgpack | `1.7+dio1` (overlay) | overlay (dio) | patched; flambda build + byte-identical vectors | WS4: overlay `msgpck.1.7+dio1` eta-expands `SIBO`/`BIBO.blit`; runtime `StringBuf` path untouched | this session |
 | `websocket-lwt-unix` | WS feeds | 2.17 | no | **DROPPED** (pulled `lwt_log`, capping `lwt < 6`) | WS2b: replaced by internal `dio.ws_lwt` over base `websocket` + `conduit-lwt-unix` | |
 | `websocket` | WS framing | 2.17 | no | kept; no `lwt_log` | base framing used by `dio.ws_lwt` (WS2b) | |
 | `conduit-lwt-unix` | transport | 7.0.0 | no | unknown | WS6 | |
@@ -499,5 +559,126 @@ Newest last. Format: `### YYYY-MM-DD — <session/agent> — <task ids>` then wh
   remains in §8).
 - Next: implement the three dependency patches via the §5 overlay (WS3, WS4,
   WS5), then re-run the Docker builder; expect G2 to pass.
+
+### 2026-09-12 — WS3 session — WS3
+- Obtained `digestif.1.3.1` via `opam source digestif.1.3.1
+  --switch=5.2.0+flambda --dir=/tmp/digestif-src` (this opam is 2.3.0, which
+  spells the flag `--dir`, not `--dest`). Confirmed the download-cache archive
+  hashes to the opam `url.checksum` (sha256
+  `3927949a…c88466`, sha512 `436dcd82…2707`).
+- Confirmed the pinned OxCaml repo `bb455526` has **no** `digestif` /
+  `oxcaml-digestif` package. Also confirmed the local `5.2.0+ox` switch is a
+  misnamed **MetaOCaml `ocaml-variants.5.3.0+BER`** (`flambda: false`), not
+  OxCaml — so it cannot validate mode errors.
+- Created overlay package
+  `oxcaml-port/opam-overlay/packages/digestif/digestif.1.3.1+dio1/`:
+  - `opam` — same src/checksums/depends/conflicts as upstream 1.3.1;
+    `version: "1.3.1+dio1"`, `patches: ["oxcaml.patch"]`, `extra-files`
+    (sha256 of the patch).
+  - `files/oxcaml.patch` — Route B. Removes the optional pure-OCaml
+    `digestif.ocaml` library stanza from `src-ocaml/dune` (the 8
+    `baijiu_*.ml` mode failures are never compiled), leaving the default C
+    backend `digestif.c`; redirects `digestif.ocaml` → `digestif.c` in
+    `test/ocaml/dune`, `fuzz/dune`, `fuzz/ocaml/dune` so the test/fuzz
+    suites still build/run.
+- Verification (all on `5.2.0+flambda`; macOS cannot build OxCaml):
+  - `patch --dry-run -p1` and `git apply --check -p1` on a clean 1.3.1 tree:
+    both exit 0 (4 files).
+  - fresh copy + `patch -p1` + `dune build -p digestif -j 4`: exit 0.
+  - digestif's own known-answer suites (`@test/ocaml/runtest`,
+    `@test/c/runtest`, `@test/conv/runtest`): all green — e.g. `test/ocaml`
+    now exercises `digestif.c` and reports `684 tests run`, including
+    SHA256/SHA512/HMAC, SHA3 FIPS-202 and Keccak-256 vectors.
+  - byte-identity: tiny program printing SHA256(""), SHA256(fox),
+    HMAC-SHA512(key,fox), Keccak-256(""), Keccak-256("abc"), raw length;
+    outputs from unpatched 1.3.1 and patched are **identical** (e.g.
+    `KECCAK256(empty)=c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`,
+    `SHA256(empty)=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
+- Not executed under OxCaml; the OxCaml claim rests on
+  `/tmp/docker_oxcaml_build3.log` (only `src-ocaml/baijiu_*.ml` failed;
+  `digestif.c` + stubs built). Re-verify at WS9/G2.
+- Overlay metadata validated in an isolated opam root
+  (`OPAMROOT=…/ws3/opamroot-digestif opam init --bare … dio-ox
+  file://…/opam-overlay`): `opam show digestif.1.3.1+dio1` shows the expected
+  url/checksum and `patches`/`extra-files`; `opam lint` Passed. The overlay
+  `repo` marker was added concurrently by the WS4 session.
+- Follow-up wiring (WS0/WS9): the Docker switch must add the overlay repo and
+  make the solver pick `1.3.1+dio1` over upstream `1.3.1`.
+- No commit; `deploy.sh` not run.
+
+### 2026-09-12 — WS4 session — WS4
+- Adopted §5 option A for `msgpck`. Created the first overlay package:
+  - `oxcaml-port/opam-overlay/repo` (`opam-version: "2.0"`).
+  - `oxcaml-port/opam-overlay/packages/msgpck/msgpck.1.7+dio1/opam` — copy of the
+    official 1.7 opam file with `version: "1.7+dio1"`, the unchanged `url { src;
+    checksum }` (tarball `ff7065bf…` / `7d71baa9…`), plus
+    `patches: ["oxcaml.patch"]` and `extra-files: [["oxcaml.patch" "sha256=e50ab58c…"]]`.
+    `depends` unchanged.
+  - `.../files/oxcaml.patch` (sha256 `e50ab58cedb1fa07ae171c27018f6ea6aa631b878a3950278bd4afe787a42100`).
+- Source provenance: the official 1.7 tarball was taken from the opam download
+  cache (`~/.opam/download-cache/sha256/ff/ff7065bf…`); `shasum -a 256`/`-a 512`
+  match the opam metadata exactly (`ff7065bf590af502a1b1622ff3b5280805c122033d68cf6b53da32c31ecb5f5d`,
+  `7d71baa9614f890f669bb52181a295e51d6735ab9786fd7bc69c123721f801232a314ec98b8e59ccf8d2c1541f8fcc084ebf1d47189fd45632621c4a246d0368`).
+- Patch (only 4 changed lines; `StringBuf`/`BytesBuf` untouched):
+  eta-expand `SIBO.blit` and `BIBO.blit` from
+  `let blit = Bytes.blit_string` to
+  `let blit src src_pos dst dst_pos len = Bytes.blit_string src src_pos dst dst_pos len`.
+  This gives the wrapper a global arrow type so it matches `STRING.blit`
+  (`src/msgpck.ml:25`) under OxCaml's mode system; the deprecated `set_*` alerts are
+  non-fatal under opam's `dune build -p` (release profile).
+- Verification (all on local `5.2.0+flambda`; OxCaml cannot be built on this macOS host):
+  - a. `git apply --check` → exit 0; `patch --dry-run -p1` → exit 0, against a clean
+    official 1.7 tree.
+  - b. Fresh copy + `patch -p1 < …/files/oxcaml.patch` + `dune build -p msgpck` → exit 0
+    (`_build/default/src/msgpck.cma` produced).
+  - c. Byte-identity: a throwaway `bytecheck` executable linked against a *clean* copy
+    and a *patched* copy, serializing 12 `Msgpck.StringBuf.write` vectors (sample order
+    action, empty order, modify Int/Int64, cancel, cancelByCloid, batchModify,
+    usdClassTransfer, int/int64 boundaries, string lengths, scalars). The sample vector
+    matches the documented reference exactly
+    (`83a474797065…a26e61`); `diff` of clean vs patched output → empty (identical).
+  - d. Overlay parsed by an isolated opam root (`OPAMROOT=/tmp/… opam init --bare
+    … dio-ox file://…/opam-overlay`): `opam show msgpck.1.7+dio1` reports the correct
+    url/checksums; `opam lint` → Passed. The overlay was **not** installed/compiled in
+    the real switch (would mutate it), so opam's own apply-patch step was exercised only
+    via the identical `patch -p1` used by `opam`.
+- **Not proven / limitation:** the patched package was not compiled by the OxCaml
+  compiler. The mode fix is reasoned (global `fun` wrapper accepting `Bytes.blit_string`'s
+  `@ local` args) and matches the WS4 analysis, but no `5.2.0+ox` build was run because
+  macOS cannot build OxCaml and a Docker rebuild was out of scope for this session. The
+  Docker overlay wiring (`dio-ox=file:///app/oxcaml-port/opam-overlay` in §8's switch
+  block) is left for WS9/G2.
+- No repository files under `src/` or `test/` were changed; no commit made.
+
+### 2026-09-12 — WS5 session — WS5
+- Version bump ruled out. `opam source cohttp-lwt.4.0.0/6.3.0 --dir=…`: the offending
+  expression `Lwt_stream.iter (Buffer.add_string b) s` is byte-identical in `body.ml:50`
+  of 4.0.0 and the latest 6.3.0, so no release avoids the patch. Bumping would also force
+  `cohttp-lwt-unix >= 5.3` → `conduit-lwt-unix >= 5`, changing the OxCaml closure that
+  currently settles at `cohttp-lwt-unix 4.0.0` + `conduit-lwt-unix 2.2.2`
+  (`docker_oxcaml_build5.log`).
+- Patched 4.0.0 via overlay
+  `oxcaml-port/opam-overlay/packages/cohttp-lwt/cohttp-lwt.4.0.0+dio1/` (`opam` +
+  `files/oxcaml.patch`, sha256 `2ed838a2e3b50fafe3b71470585537de0ba17c8ba1df38ef2930453284e190b2`).
+  Patch eta-expands the partial applications OxCaml's mode system infers "local":
+  `Buffer.add_string b` (`body.ml:50`) and `(Request|Response).write_body writer`
+  (`client.ml:54,64,116`, `server.ml:126`). Public API and runtime behaviour unchanged.
+- Also created `cohttp.4.0.0+dio1` and `cohttp-lwt-unix.4.0.0+dio1` (version-only, no
+  patch): the cohttp packages are coupled by `depends: "cohttp" {= version}` /
+  `"cohttp-lwt" {= version}`, so `cohttp-lwt-unix.4.0.0` would otherwise demand the
+  unpatched `cohttp-lwt = 4.0.0` and bypass the patch. Confirmed with opam (overlay repo
+  added to the `5.2.0+flambda` switch, then removed): `opam install
+  cohttp-lwt-unix.4.0.0+dio1 --dry-run` → `cohttp 5.3.1 -> 4.0.0+dio1 [required by
+  cohttp-lwt]`, `cohttp-lwt 5.3.0 -> 4.0.0+dio1 [required by cohttp-lwt-unix]`.
+- Verification (macOS; OxCaml cannot be built on this host):
+  - `patch -p1 --dry-run --batch` against a clean `cohttp-v4.0.0` tree → exit 0, no offsets.
+  - Fresh copy + `patch -p1` + `dune build -p cohttp-lwt -j 4` on `5.2.0+flambda` → exit 0
+    (`_build/default/cohttp-lwt/src/cohttp_lwt.a` and `.cmx` objects produced).
+  - `opam` parses the three overlay opams and resolves the `{= version}` coupling (above).
+- Not verified: compilation under `5.2.0+ox` (no OxCaml host). `cohttp-lwt-unix` sources
+  are unpatched; `callback spec` (`cohttp-lwt-unix/src/server.ml:69`) is another
+  partial-application-to-global candidate, to check/extend if the Docker builder reaches it.
+- Docker overlay wiring (`dio-ox=file:///app/oxcaml-port/opam-overlay`, §8) is still WS0/WS9.
+- No `src/`/`test/` changes; no commit; `deploy.sh` not run.
 
 
