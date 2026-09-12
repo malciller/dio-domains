@@ -28,6 +28,9 @@ module Kraken_instruments_feed = Kraken_instruments_feed
 (** WebSocket feed subscription for L2 order book snapshots and incremental updates. *)
 module Kraken_orderbook_feed = Kraken_orderbook_feed
 
+(** REST client for fetching all open orders (bypasses the WS snapshot cap). *)
+module Kraken_open_orders = Kraken_open_orders
+
 (** WebSocket client for submitting and managing orders via the Kraken trading channel. *)
 module Kraken_trading_client = Kraken_trading_client
 

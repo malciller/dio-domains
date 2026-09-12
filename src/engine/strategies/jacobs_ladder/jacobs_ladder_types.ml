@@ -37,6 +37,14 @@ type exchange_config =
         base still committed to a resting sell whose venue hold the balance
         feed has not netted yet. Per-venue opt-in: only venues whose tradeable
         figure (total - open-order hold) trails a placement need it. *)
+  ; balance_nets_open_order_holds : bool
+    (** true: the venue's reported holding already excludes base committed to
+        open sell orders (netted at ingestion or derived on read from the SAME
+        open-order source as the in-flight ledger). The sellable formula then
+        subtracts only the ledger's un-netted excess
+        [max 0 (ledger_total - feed_total)] so a venue feed that drops a live
+        order cannot silently free that base. false: the venue reports the
+        GROSS holding, so the full ledger total is subtracted. *)
   ; asset_low_requires_balance_change : bool
     (** true: clear asset_low only on balance increase *)
   ; merge_preserved_sells : bool
@@ -71,6 +79,25 @@ type strategy_state =
     (* (target_price, qty) stack for Alpaca GTC *)
   ; mutable recently_injected_sells : (string * float * float) list
     (* (order_id, price, timestamp) *)
+  ; mutable sell_commitments : (string * float * float * bool * bool * float) list
+    (* (order_id, price, qty, seen_in_feed, acked, armed_at) - the authoritative
+       in-flight sell ledger. Every sell this strategy dispatches is recorded
+       here the instant it is pushed (keyed by the temporary pending_sell_
+       id), re-keyed to the venue id on ack/amend (acked := true), updated to
+       the venue's remaining qty while the open-order feed lists it
+       (seen_in_feed := true), and removed only on a terminal event
+       (fill/cancel/reject/fail). It is the ONE source of "base already
+       committed to a sell" that every venue's sellable-base formula
+       subtracts; a venue open-order feed that drops a live resting sell
+       (reconnect/truncation) can no longer make that base look free. An
+       order that was never seen in the feed is only expired by the dispatch
+       window if it was also never acked; an acked order is real base held by
+       the venue and is kept until its terminal event. *)
+  ; mutable feed_locked_sell_base : float
+    (* Total base the venue's OWN open-order feed reported as committed to
+       sells on the last [sync_open_orders] scan (0.0 before the first scan).
+       Compared against the ledger total to derive the un-netted excess on
+       net-balance venues. *)
   ; mutable pending_orders : (string * order_side * float * float) list
     (* (order_id, side, price, timestamp) *)
   ; mutable last_cycle : int
@@ -292,6 +319,7 @@ let default_kraken_config =
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; use_unnetted_sell_hold = true
+  ; balance_nets_open_order_holds = true
   ; asset_low_requires_balance_change = true
   ; merge_preserved_sells = true
   ; check_stale_balance = true
@@ -424,6 +452,8 @@ let rec get_strategy_state asset_symbol =
       ; open_sell_orders = []
       ; persisted_sell_levels
       ; recently_injected_sells = []
+      ; sell_commitments = []
+      ; feed_locked_sell_base = 0.0
       ; pending_orders = []
       ; last_cycle = 0
       ; last_order_time = 0.0

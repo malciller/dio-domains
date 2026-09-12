@@ -104,6 +104,36 @@ let json_of_grid_strategy exchange symbol =
     | Alpaca -> not (Alpaca.Market_hours.is_market_open ())
     | _ -> false
   in
+  (* The live sell set the SELLS count reports. The venue feed alone is not
+     enough: Kraken's open-order cache can drop a resting sell, which showed
+     as 0 pending sells while the order still rested. The in-flight ledger is
+     armed at dispatch and kept across feed gaps, so union it with the feed
+     (dedup by order id; the feed wins when it lists the order, since its
+     remaining qty is fresher). No new column - this is the same count. *)
+  let sell_orders =
+    let seen = Hashtbl.create 16 in
+    let from_feed =
+      List.filter
+        (fun (oid, _, _) ->
+           if Hashtbl.mem seen oid
+           then false
+           else (
+             Hashtbl.replace seen oid ();
+             true))
+        state.open_sell_orders
+    in
+    let from_ledger =
+      List.filter_map
+        (fun (oid, price, qty, _seen_in_feed, _acked, _armed_at) ->
+           if Hashtbl.mem seen oid
+           then None
+           else (
+             Hashtbl.replace seen oid ();
+             Some (oid, price, qty)))
+        state.sell_commitments
+    in
+    from_feed @ from_ledger
+  in
   `Assoc
     [ "type", `String "Ladder"
     ; "buy_price", json_of_float_opt state.last_buy_order_price
@@ -114,8 +144,8 @@ let json_of_grid_strategy exchange symbol =
           (List.map
              (fun (oid, price, qty) ->
                 `Assoc [ "id", `String oid; "price", `Float price; "qty", `Float qty ])
-             state.open_sell_orders) )
-    ; "sell_count", `Int (List.length state.open_sell_orders)
+             sell_orders) )
+    ; "sell_count", `Int (List.length sell_orders)
     ; "accumulated_profit", `Float state.accumulated_profit
     ; "reserved_base", `Float state.reserved_base
     ; "reserved_quote", `Float state.reserved_quote

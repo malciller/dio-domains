@@ -1807,6 +1807,206 @@ let test_position_sell_hold_releases_fifo_on_netting () =
     (state.sell_holds_since_balance = [ 1003.0, 0.2 ])
 ;;
 
+let test_sell_never_offers_locked_inventory () =
+  (* REGRESSION (the production XMR over-sell): base committed to a resting
+     sell must NEVER be offered again, on any venue, even when the reported
+     figure is gross and the open-order feed has dropped the order.
+     reserved 0.0048 + resting sell 0.0388 + gross holding 0.0836 (incl. a
+     just-filled 0.04 buy): only 0.04 is sellable - NOT 0.0788. *)
+  let symbol = "LEDGER19/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.04;
+  state.maker_fee <- 0.0;
+  state.cached_sell_mult <- 1.0;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 0.0;
+  state.reserved_base <- 0.0048;
+  state.position_base <- 0.0836;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 999.0;
+  state.buy_credits_since_balance <- [];
+  state.attributed_balance_increase <- 0.0;
+  state.sell_holds_since_balance <- [];
+  state.open_sell_orders <- [ "resting-sell", 537.78, 0.0388 ];
+  state.sell_commitments <- [ "resting-sell", 537.78, 0.0388, true, true, 0.0 ];
+  state.feed_locked_sell_base <- 0.0;
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 528.83;
+  state.last_buy_fill_qty <- Some 0.04;
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.04"
+    ; grid_interval = 0.16
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:1000.0
+    ~asset
+    ~bid_price:528.83
+    ~ask_price:528.90
+    ~asset_balance:0.0836
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:(Dio_strategies.Jacobs_ladder.committed_sell_base state)
+    ~base_balance_age:(Some 0.5);
+  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let sell_qty =
+    List.fold_left
+      (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+         match o.operation, o.side with
+         | Place, Sell when o.symbol = symbol -> acc +. o.qty
+         | _ -> acc)
+      0.0
+      pushed
+  in
+  check
+    bool
+    "locked resting-sell base is never offered again (sells only the free 0.04)"
+    true
+    (abs_float (sell_qty -. 0.04) < 1e-6);
+  check
+    bool
+    "the over-sell amount (gross - reserved = 0.0788) is impossible"
+    true
+    (sell_qty < 0.0788 -. 1e-6);
+  (* Dispatch arms the ledger: the new sell joins the resting one. *)
+  check
+    bool
+    "the dispatched sell is added to the commitment ledger"
+    true
+    (abs_float (Dio_strategies.Jacobs_ladder.committed_sell_base state -. 0.0788) < 1e-6);
+  drain ()
+;;
+
+let test_inflight_sell_commitment_survives_feed_gap () =
+  (* The in-flight sell ledger keeps base committed across the venue feed: a
+     dispatched sell is reserved before the feed lists it; the feed refreshes
+     its qty while listed; and a feed that stops listing a LIVE order
+     (reconnect / truncated snapshot) does NOT free the base until the
+     terminal event. This is the Kraken/IBKR/Lighter failure made impossible. *)
+  let symbol = "LEDGER20/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid";
+  state.open_sell_orders <- [];
+  state.sell_commitments <- [];
+  state.pending_orders <- [];
+  state.last_buy_order_id <- None;
+  state.last_buy_order_price <- None;
+  state.inflight_sell <- false;
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.2"
+    ; grid_interval = 0.16
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let now = Unix.gettimeofday () in
+  let feed = ref [] in
+  let iter_open_orders f = List.iter (fun (a, b, c, d, e) -> f a b c d e) !feed in
+  let locked () =
+    let _, _, _, locked, _, _, _ =
+      Dio_strategies.Jacobs_ladder.sync_open_orders
+        ~state
+        ~now
+        ~asset
+        ~bid_price:100.0
+        ~lot_qty:0.2
+        ~iter_open_orders
+        ~ecfg
+    in
+    locked
+  in
+  (* 1) Dispatched, not yet acked/listed: the base is already committed. *)
+  Dio_strategies.Jacobs_ladder.arm_sell_commitment
+    ~state
+    ~id:"pending_sell_100.00"
+    ~price:100.0
+    ~qty:0.2;
+  let l1 = locked () in
+  check
+    bool
+    "a dispatched, not-yet-listed sell stays committed"
+    true
+    (abs_float (l1 -. 0.2) < 1e-9);
+  check
+    bool
+    "the in-flight sell is merged into the open-order view"
+    true
+    (List.exists (fun (id, _, _) -> id = "pending_sell_100.00") state.open_sell_orders);
+  (* 2) Ack re-keys to the venue id; still not listed. *)
+  Dio_strategies.Jacobs_ladder.rekey_sell_commitment
+    ~state
+    ~old_id:"pending_sell_100.00"
+    ~new_id:"venue-1"
+    ~price:100.5
+    ~qty:0.2
+    ~acked:true;
+  let l2 = locked () in
+  check
+    bool
+    "an acked sell stays committed before the feed lists it"
+    true
+    (abs_float (l2 -. 0.2) < 1e-9);
+  (* 3) The feed lists it and then refreshes the remaining qty. *)
+  feed := [ "venue-1", 100.5, 0.2, "sell", None ];
+  let l3 = locked () in
+  check bool "a feed-listed sell stays committed" true (abs_float (l3 -. 0.2) < 1e-9);
+  feed := [ "venue-1", 100.5, 0.12, "sell", None ];
+  let l4 = locked () in
+  check
+    bool
+    "the feed refreshes the committed remaining qty"
+    true
+    (abs_float (l4 -. 0.12) < 1e-9);
+  (* 4) The feed drops the live order: base stays committed (this is the
+     Kraken reconnect/truncation case). *)
+  feed := [];
+  let l5 = locked () in
+  check
+    bool
+    "a feed-dropped live sell stays committed (no free base)"
+    true
+    (abs_float (l5 -. 0.12) < 1e-9);
+  (* 5) Only a terminal event releases it. *)
+  Dio_strategies.Jacobs_ladder.remove_sell_commitment ~state ~id:"venue-1";
+  let l6 = locked () in
+  check bool "a terminal event releases the commitment" true (l6 < 1e-12)
+;;
+
 let test_sub_minimum_qty_sell_places () =
   (* Sells are NOT floored at the venue qty minimum - only the quote-notional
      floor gates them (accrual sells sell_mult x qty and residual inventory
@@ -2628,9 +2828,11 @@ let test_halted_ladders_second_sell_beside_resting_one () =
   (* Kraken startup-inactive with a resting sell already on the book: the
      free inventory must STILL sell - laddered as a second order beside the
      resting one. The balance the domain passes is the NETTED tradeable
-     figure (open-order holds removed at the feed), so the inventory gate
-     must not subtract the resting-sell hold again: 0.04004 tradeable,
-     reserved 0 -> a sell of ~0.04004 goes out even though one sell rests. *)
+     figure (the venue feed listed the 0.04 hold and it is netted out), so
+     the ledger's excess over the feed is zero and the second sell is sized
+     by the free 0.04004 - NOT blocked. (When the venue feed DROPS a live
+     order the excess rises by its qty and the base stays committed; see
+     [test_inflight_sell_commitment_survives_feed_gap].) *)
   let symbol = "LADDER2/XMR/USD" in
   let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
   state.exchange_id <- "kraken";
@@ -2640,6 +2842,8 @@ let test_halted_ladders_second_sell_beside_resting_one () =
   state.cached_venue_min_qty <- 0.0;
   state.reserved_base <- 0.0;
   state.open_sell_orders <- [ "resting1", 462.13, 0.04 ];
+  state.sell_commitments <- [ "resting1", 462.13, 0.04, true, true, 0.0 ];
+  state.feed_locked_sell_base <- 0.04;
   state.just_filled_buy <- false;
   state.last_buy_fill_price <- None;
   state.last_buy_fill_qty <- None;
@@ -3247,14 +3451,12 @@ let test_sell_retry_until_placed () =
 ;;
 
 let test_accumulation_sells_non_accrued_inventory () =
-  (* Accumulation venues (Hyperliquid/Lighter/IBKR): the sell is sized PURELY
-     by the non-accrued inventory = available balance - reserved_base. The
-     venue's tradeable balance already nets the base held by resting sells
-     (Hyperliquid reports total - hold), so locked_in_sells must NOT be
-     subtracted again - subtracting it double-counted the resting-sell hold
-     and understated the inventory below the floor, which blocked the sell for
-     the startup case (BTC: free 0.00112536, reserved 0.0006248, sellable
-     0.00050056 > venue min 0.0005). *)
+  (* Accumulation venues (Hyperliquid/Lighter/IBKR): the sell is sized by the
+     non-accrued, uncommitted inventory. On a NET-balance venue whose feed
+     listed the resting sell, the venue tradeable already removed that hold,
+     so the ledger's excess over the feed is zero and the sell is NOT
+     reduced by the resting-sell hold again. (The ledger still guarantees the
+     base stays committed if the feed later drops the order.) *)
   let symbol = "FLOOR_FALLBACK/BTC/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
   let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
@@ -3267,6 +3469,8 @@ let test_accumulation_sells_non_accrued_inventory () =
   state.reserved_base <- 0.5;
   state.accumulated_profit <- 2.0;
   state.open_sell_orders <- [];
+  state.sell_commitments <- [ "resting", 62369.0, 0.4, true, true, 0.0 ];
+  state.feed_locked_sell_base <- 0.4;
   state.just_filled_buy <- true;
   state.last_buy_fill_price <- Some 62369.0;
   state.last_buy_fill_qty <- Some 0.5;
@@ -3292,10 +3496,10 @@ let test_accumulation_sells_non_accrued_inventory () =
     | None -> ()
   in
   drain ();
-  (* A resting sell of 0.4 locks inventory; the venue's tradeable balance
-     (1.00112) already nets it, so the sellable must NOT be reduced by locked
-     again: sellable = 1.00112 - 0.5 = 0.50112 -> round 0.50 is pushed, not
-     the double-counted 0.10. *)
+  (* A resting sell of 0.4 locks inventory and the venue feed listed it, so
+     the tradeable balance already nets it: the ledger's excess over the feed
+     is zero and the sellable is 1.00112 - 0.5 = 0.50, not the double-counted
+     0.10. *)
   Dio_strategies.Jacobs_ladder.evaluate_sell_leg
     ~persisted_reconcile:
       (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
@@ -4150,6 +4354,7 @@ let test_new_buy_respects_2x_gi_closest_sell () =
      99.50 - above the cap, so the cap must pull it down to 99.396. *)
   ignore
     (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+       ~oracle_halted:false
        ~state:st
        ~now
        ~asset
@@ -4180,6 +4385,83 @@ let test_new_buy_respects_2x_gi_closest_sell () =
          "buy respects the sell-anchored 2x gi closest-sell cap"
          true
          (p <= cap +. 1e-6)
+     | None -> failwith "buy missing price")
+  | _ -> failwith "expected exactly one buy order"
+;;
+
+let test_fresh_buy_clamps_against_companion_sell () =
+  (* REGRESSION: the fresh buy leg runs BEFORE the sell leg, so the companion
+     sell it is about to place is not in the open-order feed yet. Clamping the
+     fresh buy only against the sells already in the feed let a buy passed
+     against a HIGHER stale sell land inside the NEWER, lower companion sell's
+     2x gi zone; the next tick then amended it down (the place-then-amend
+     churn). The clamp must anticipate the companion sell.
+
+     Geometry (gi 0.5%, 2-decimal rounding):
+       last buy fill = 100.00, bid/ask = 100.40 (within one gi of the fill)
+       companion sell = 100.00 * 1.005 = 100.50
+       companion floor = 100.50 - 2*gi*100.50 = 99.495
+       stale feed sell = 101.00 -> old floor 99.99 (would NOT bind)
+       raw grid buy = 100.40 * 0.995 = 99.90 (the price that used to churn) *)
+  let symbol = "SPACE_COMPANION/USD" in
+  let st = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  st.exchange_id <- "kraken";
+  st.grid_qty <- 1.0;
+  st.last_buy_fill_price <- Some 100.00;
+  (* A buy just filled, so the sell leg owes (and will place) the companion
+     sell this same tick. *)
+  st.just_filled_buy <- true;
+  st.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+  let grid_interval = 0.5 in
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval
+    ; sell_mult = "1.0"
+    ; strategy = "jacobs_ladder"
+    ; maker_fee = Some 0.001
+    ; taker_fee = Some 0.002
+    ; accumulation_buffer = 0.01
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
+    }
+  in
+  let iter_open_orders _ = () in
+  let now = Unix.gettimeofday () in
+  ignore (Dio_strategies.Jacobs_ladder.get_pending_orders 100);
+  ignore
+    (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+       ~oracle_halted:false
+       ~state:st
+       ~now
+       ~asset
+       ~bid_price:100.40
+       ~ask_price:100.40
+       ~quote_balance:1000.0
+       ~quote_balance_stale:false
+       ~cycle:1
+       ~iter_open_orders
+       ~open_buy_count_from_scan:0
+       ~has_recent_amend_buy:false
+       ~locked_in_buys:0.0
+       ~closest_sell_order_initial:(Some ("stale_sell", 101.00)));
+  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
+  match pushed with
+  | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
+    (match o.price with
+     | Some p ->
+       let companion_floor = 100.50 -. (100.50 *. (2.0 *. 0.5 /. 100.0)) in
+       check
+         bool
+         "fresh buy sits at/below the companion sell's 2x gi floor"
+         true
+         (p <= companion_floor +. 1e-6);
+       check
+         bool
+         "companion sell (not the stale feed sell) is the binding clamp"
+         true
+         (p < 99.90 -. 1e-6)
      | None -> failwith "buy missing price")
   | _ -> failwith "expected exactly one buy order"
 ;;
@@ -4331,6 +4613,7 @@ let test_buy_placement_balance_guard () =
   (* 1. Fresh balance, insufficient -> no order pushed, capital_low latched. *)
   ignore
     (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+       ~oracle_halted:false
        ~state:st
        ~now
        ~asset
@@ -4359,6 +4642,7 @@ let test_buy_placement_balance_guard () =
   Hashtbl.remove st.amend_cooldowns "place_Buy";
   ignore
     (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+       ~oracle_halted:false
        ~state:st
        ~now:(now +. 1.0)
        ~asset
@@ -4392,6 +4676,7 @@ let test_buy_placement_balance_guard () =
   Hashtbl.remove st.amend_cooldowns "place_Buy";
   ignore
     (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+       ~oracle_halted:false
        ~state:st
        ~now:(now +. 2.0)
        ~asset
@@ -4661,6 +4946,7 @@ let eval_buy_trail ~symbol ~grid_qty ~bid ~ask ~resting_price ~resting_qty:_ ~se
   ignore (Dio_strategies.Jacobs_ladder.get_pending_orders 100);
   ignore
     (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+       ~oracle_halted:false
        ~state:st
        ~now
        ~asset
@@ -4730,6 +5016,7 @@ let test_buy_trail_fires_on_single_tick_move () =
   ignore (Dio_strategies.Jacobs_ladder.get_pending_orders 100);
   ignore
     (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+       ~oracle_halted:false
        ~state:st
        ~now
        ~asset
@@ -4791,6 +5078,7 @@ let test_buy_trail_2xgi_anchored_on_sell () =
   ignore (Dio_strategies.Jacobs_ladder.get_pending_orders 100);
   ignore
     (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+       ~oracle_halted:false
        ~state:st
        ~now
        ~asset
@@ -4855,6 +5143,7 @@ let test_buy_trail_respects_sell_zone_while_tracked () =
     ignore (Dio_strategies.Jacobs_ladder.get_pending_orders 100);
     ignore
       (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+         ~oracle_halted:false
          ~state:st
          ~now
          ~asset
@@ -4935,6 +5224,7 @@ let test_buy_trail_never_enters_sell_zone_until_removed () =
          buy_id);
     ignore
       (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+         ~oracle_halted:false
          ~state:st
          ~now
          ~asset
@@ -4987,6 +5277,338 @@ let test_buy_trail_never_enters_sell_zone_until_removed () =
       (Some 102.96)
       o.price
   | _ -> failwith "expected a resume amend"
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Cross-venue invariant: base committed to a resting/in-flight sell   *)
+(* is NEVER available, on every venue, in every trade.                 *)
+(* ------------------------------------------------------------------ *)
+
+let sell_matrix_asset ~exchange ~symbol ~qty =
+  { Dio_strategies.Jacobs_ladder.exchange
+  ; symbol
+  ; qty
+  ; grid_interval = 0.16
+  ; sell_mult = "1.0"
+  ; strategy = "Ladder"
+  ; maker_fee = Some 0.0
+  ; taker_fee = None
+  ; accumulation_buffer = 0.0
+  ; base_accumulation = true
+  ; sell_levels_persistence = false
+  }
+;;
+
+(** Drives the REAL sell leg for one venue and returns the placed sell qty. *)
+let sell_matrix_feed_and_size
+      ~exchange
+      ~symbol
+      ~reported
+      ~ledger
+      ~reserved
+      ~free
+      ~feed_healthy
+  =
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- exchange;
+  state.grid_qty <- free;
+  state.maker_fee <- 0.0;
+  state.cached_sell_mult <- 1.0;
+  state.cached_qty_increment <- 0.01;
+  state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+  state.cached_price_increment <- 0.01;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 0.0;
+  state.reserved_base <- reserved;
+  state.accumulated_profit <- 0.0;
+  state.open_sell_orders <- [ "resting", 100.0, ledger ];
+  state.sell_commitments <- [ "resting", 100.0, ledger, true, true, 0.0 ];
+  state.feed_locked_sell_base <- (if feed_healthy then ledger else 0.0);
+  state.sell_holds_since_balance <- [];
+  state.buy_credits_since_balance <- [];
+  state.attributed_balance_increase <- 0.0;
+  state.position_base <- 0.0;
+  state.position_initialized <- false;
+  state.position_venue_ts <- 0.0;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 100.0;
+  state.last_buy_fill_qty <- Some free;
+  state.asset_low <- false;
+  state.inflight_sell <- false;
+  state.inflight_buy <- false;
+  state.persisted_sell_levels <- [];
+  (* Alpaca's authoritative free figure already excludes resting holds. *)
+  if exchange = "alpaca"
+  then Alpaca.Balances.set_available_balance_for_test symbol (reserved +. free);
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config exchange in
+  let asset = sell_matrix_asset ~exchange ~symbol ~qty:(Printf.sprintf "%.4f" free) in
+  drain_order_buffer ();
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:1000.0
+    ~asset
+    ~bid_price:100.0
+    ~ask_price:100.05
+    ~asset_balance:reported
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:(Dio_strategies.Jacobs_ladder.committed_sell_base state)
+    ~base_balance_age:None;
+  let sell = pushed_sell_for symbol in
+  drain_order_buffer ();
+  match sell with
+  | Some o -> o.qty
+  | None -> 0.0
+;;
+
+let test_sellable_base_matrix_all_venues () =
+  (* THE regression the bug keeps escaping through: for every venue and both
+     a healthy feed and a dropped/gross feed, the placed sell must be the
+     free lot only. The production over-sell was free + locked (0.5). *)
+  let venues = [ "kraken"; "hyperliquid"; "ibkr"; "lighter"; "alpaca" ] in
+  let ledger = 0.4 in
+  let reserved = 0.05 in
+  let free = 0.1 in
+  let idx = ref 0 in
+  List.iter
+    (fun exchange ->
+       (* Mirrors exchange_config.balance_nets_open_order_holds. *)
+       let nets =
+         exchange = "kraken" || exchange = "hyperliquid" || exchange = "alpaca"
+       in
+       List.iter
+         (fun feed_healthy ->
+            incr idx;
+            let symbol = Printf.sprintf "SELLMATRIX%d/USD" !idx in
+            (* What the domain passes as the venue's reported base holding:
+               a net venue with a healthy feed already removed the resting
+               hold; a gross venue (or a net venue whose feed dropped the
+               order) still contains the locked 0.4. *)
+            let reported =
+              if nets && feed_healthy
+              then reserved +. free
+              else reserved +. ledger +. free
+            in
+            let qty =
+              sell_matrix_feed_and_size
+                ~exchange
+                ~symbol
+                ~reported
+                ~ledger
+                ~reserved
+                ~free
+                ~feed_healthy
+            in
+            check
+              (float 1e-9)
+              (Printf.sprintf
+                 "%s feed=%s: sells only the free lot (locked base excluded)"
+                 exchange
+                 (if feed_healthy then "healthy" else "dropped"))
+              free
+              qty)
+         [ true; false ])
+    venues
+;;
+
+let test_sell_commitment_lifecycle_all_venues () =
+  (* The ledger across the REAL lifecycle for every venue: dispatch arms it,
+     ack re-keys it, the feed lists/refreshes it, a feed drop keeps the base
+     committed, and a sell fill releases it. *)
+  let venues = [ "kraken"; "hyperliquid"; "ibkr"; "lighter"; "alpaca" ] in
+  List.iter
+    (fun exchange ->
+       let symbol = Printf.sprintf "LIFECYCLE_%s/USD" (String.uppercase_ascii exchange) in
+       let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+       state.exchange_id <- exchange;
+       state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config exchange;
+       state.cached_qty_increment <- 0.01;
+       state.cached_price_increment <- 0.01;
+       state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+       state.cached_venue_min_qty <- 0.0;
+       state.cached_venue_min_notional <- 0.0;
+       state.grid_qty <- 0.2;
+       state.maker_fee <- 0.0;
+       state.cached_sell_mult <- 1.0;
+       state.accumulation_buffer <- 0.0;
+       state.base_accumulation_enabled <- true;
+       state.reserved_base <- 0.0;
+       state.accumulated_profit <- 0.0;
+       state.open_sell_orders <- [];
+       state.sell_commitments <- [];
+       state.feed_locked_sell_base <- 0.0;
+       state.sell_holds_since_balance <- [];
+       state.buy_credits_since_balance <- [];
+       state.attributed_balance_increase <- 0.0;
+       state.persisted_sell_levels <- [];
+       state.pending_orders <- [];
+       state.last_buy_order_id <- None;
+       state.last_buy_order_price <- None;
+       state.inflight_sell <- false;
+       state.asset_low <- false;
+       state.startup_replay <- false;
+       state.last_fill_oid <- None;
+       state.last_buy_fill_price <- Some 100.0;
+       state.last_buy_fill_qty <- Some 0.2;
+       drain_order_buffer ();
+       let asset = sell_matrix_asset ~exchange ~symbol ~qty:"0.2" in
+       let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config exchange in
+       let now = Unix.gettimeofday () in
+       let label msg = Printf.sprintf "%s: %s" exchange msg in
+       (* 1. Dispatch arms the ledger before any confirmation. *)
+       let order =
+         Dio_strategies.Jacobs_ladder.create_place_order
+           state.duplicate_key_sell
+           symbol
+           Dio_strategies.Strategy_common.Sell
+           0.2
+           (Some 100.0)
+           true
+           Dio_strategies.Strategy_common.Ladder
+           exchange
+       in
+       ignore (Dio_strategies.Jacobs_ladder.push_order ~now ~state order);
+       check
+         (float 1e-9)
+         (label "dispatch arms the ledger")
+         0.2
+         (Dio_strategies.Jacobs_ladder.committed_sell_base state);
+       (* 2. Ack re-keys to the venue id and marks it acked. *)
+       Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+         ~now:(now +. 0.1)
+         symbol
+         "life-oid"
+         Dio_strategies.Strategy_common.Sell
+         100.0;
+       check
+         (float 1e-9)
+         (label "ack keeps the base committed")
+         0.2
+         (Dio_strategies.Jacobs_ladder.committed_sell_base state);
+       check
+         bool
+         (label "ack re-keys to the venue order id")
+         true
+         (List.exists (fun (id, _, _, _, _, _) -> id = "life-oid") state.sell_commitments);
+       (* 3. Feed lists it; 4. feed drops it. *)
+       let feed = ref [ "life-oid", 100.0, 0.2, "sell", None ] in
+       let iter_open_orders f = List.iter (fun (a, b, c, d, e) -> f a b c d e) !feed in
+       let sync () =
+         let _, _, _, locked, _, _, _ =
+           Dio_strategies.Jacobs_ladder.sync_open_orders
+             ~state
+             ~now
+             ~asset
+             ~bid_price:100.0
+             ~lot_qty:0.2
+             ~iter_open_orders
+             ~ecfg
+         in
+         locked
+       in
+       ignore (sync ());
+       check
+         (float 1e-9)
+         (label "a listed sell stays committed")
+         0.2
+         (Dio_strategies.Jacobs_ladder.committed_sell_base state);
+       feed := [];
+       ignore (sync ());
+       check
+         (float 1e-9)
+         (label "a feed-dropped live sell stays committed")
+         0.2
+         (Dio_strategies.Jacobs_ladder.committed_sell_base state);
+       (* The buy leg must still see it (wash-trade / 2*gi clamps). *)
+       check
+         bool
+         (label "an in-flight sell remains visible to the buy leg")
+         true
+         (List.exists (fun (id, _, _) -> id = "life-oid") state.open_sell_orders);
+       let effective =
+         Dio_strategies.Jacobs_ladder.effective_committed_sell_base
+           ~ecfg
+           ~ledger_total:(Dio_strategies.Jacobs_ladder.committed_sell_base state)
+           ~feed_total:state.feed_locked_sell_base
+           ~unnetted_hold:0.0
+       in
+       check (float 1e-9) (label "dropped-feed base is subtracted in full") 0.2 effective;
+       (* 5. A full fill releases the commitment. *)
+       Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+         ~now:(now +. 1.0)
+         symbol
+         "life-oid"
+         Dio_strategies.Strategy_common.Sell
+         ~fill_price:100.0
+         ~fill_qty:0.2
+         None;
+       check
+         (float 1e-9)
+         (label "a sell fill releases the commitment")
+         0.0
+         (Dio_strategies.Jacobs_ladder.committed_sell_base state))
+    venues
+;;
+
+let test_terminal_sell_fill_releases_full_commitment () =
+  (* REGRESSION (Hyperliquid): the orderUpdates "filled" event retires the
+     order from the open-order feed and is filtered out of the strategy
+     stream, so the userEvents Trade that reaches [handle_order_filled] can
+     report only the final partial size. A terminal fill must release the
+     WHOLE commitment by id, not merely the reported qty, or the earlier
+     fills' base stays locked forever - the stale sell still shown on the
+     dashboard (negative closest-sell distance) and the under-counted
+     sellable balance that re-buys into the phantom reservation. *)
+  let symbol = "TERMINAL_FILL/USDC" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid";
+  state.cached_qty_increment <- 0.01;
+  state.cached_price_increment <- 0.01;
+  state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 0.0;
+  state.grid_qty <- 0.2;
+  state.maker_fee <- 0.0;
+  state.cached_sell_mult <- 1.0;
+  state.accumulation_buffer <- 0.0;
+  state.base_accumulation_enabled <- true;
+  state.reserved_base <- 0.0;
+  state.accumulated_profit <- 0.0;
+  state.sell_commitments <- [ "part-oid", 100.0, 0.2, true, true, 0.0 ];
+  state.open_sell_orders <- [ "part-oid", 100.0, 0.2 ];
+  state.feed_locked_sell_base <- 0.2;
+  state.sell_holds_since_balance <- [];
+  state.buy_credits_since_balance <- [];
+  state.attributed_balance_increase <- 0.0;
+  state.persisted_sell_levels <- [];
+  state.pending_orders <- [];
+  state.last_buy_fill_price <- Some 99.0;
+  state.last_buy_fill_qty <- Some 0.2;
+  state.startup_replay <- false;
+  state.last_fill_oid <- None;
+  Hashtbl.reset state.processed_fills;
+  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+    ~now:1000.0
+    symbol
+    "part-oid"
+    Dio_strategies.Strategy_common.Sell
+    ~fill_price:100.0
+    ~fill_qty:0.05
+    None;
+  check
+    (float 1e-9)
+    "terminal fill releases the whole commitment"
+    0.0
+    (Dio_strategies.Jacobs_ladder.committed_sell_base state);
+  check
+    bool
+    "the filled sell is dropped from the open-order view"
+    true
+    (not (List.exists (fun (id, _, _) -> id = "part-oid") state.open_sell_orders))
 ;;
 
 let () =
@@ -5207,6 +5829,26 @@ let () =
             `Quick
             test_position_sell_hold_releases_fifo_on_netting
         ; test_case
+            "locked resting-sell base is never offered again"
+            `Quick
+            test_sell_never_offers_locked_inventory
+        ; test_case
+            "in-flight sell commitment survives a venue feed gap"
+            `Quick
+            test_inflight_sell_commitment_survives_feed_gap
+        ; test_case
+            "sellable base excludes locked inventory on every venue (matrix)"
+            `Quick
+            test_sellable_base_matrix_all_venues
+        ; test_case
+            "sell commitment lifecycle on every venue"
+            `Quick
+            test_sell_commitment_lifecycle_all_venues
+        ; test_case
+            "terminal sell fill releases the whole commitment"
+            `Quick
+            test_terminal_sell_fill_releases_full_commitment
+        ; test_case
             "sub-minimum qty sell places (notional is the only floor)"
             `Quick
             test_sub_minimum_qty_sell_places
@@ -5238,6 +5880,10 @@ let () =
             "new buy respects the 2x gi closest-sell cap"
             `Quick
             test_new_buy_respects_2x_gi_closest_sell
+        ; test_case
+            "fresh buy clamps against the companion (not-yet-placed) sell"
+            `Quick
+            test_fresh_buy_clamps_against_companion_sell
         ] )
     ; ( "reclaim"
       , [ test_case

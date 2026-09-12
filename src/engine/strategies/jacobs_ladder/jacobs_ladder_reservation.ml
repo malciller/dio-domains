@@ -137,3 +137,119 @@ let can_place_sell_order (_qty : float) asset_balance asset_needed =
 let has_active_sell state =
   state.inflight_sell || InFlightOrders.is_in_flight state.duplicate_key_sell
 ;;
+
+(* ------------------------------------------------------------------ *)
+(* Sell-commitment ledger                                              *)
+(*                                                                     *)
+(* The single source of truth for base already committed to a sell on   *)
+(* ANY venue. Sellable base is always:                                  *)
+(*                                                                     *)
+(*   spot_holding - reserved_base - committed_sell_base                 *)
+(*                                                                     *)
+(* The venue-specific part is only [spot_holding] (and, on Alpaca, the  *)
+(* venue's own free figure). A resting or in-flight sell's base is      *)
+(* NEVER offered again, no matter what the venue's open-order feed      *)
+(* reports. This is what makes in-flight inventory correct under high   *)
+(* order volume and reconciles the local ledger to the exchange: the    *)
+(* feed updates quantities while it lists an order, but a feed that     *)
+(* drops a live order (reconnect / snapshot truncation) can no longer   *)
+(* make its base look free.                                             *)
+(* ------------------------------------------------------------------ *)
+
+(** How long a dispatched sell with no venue confirmation is kept as committed
+    base. Only applies to an order that was never acked and never seen in the
+    feed (a lost dispatch); an acked order is real base the venue holds and is
+    kept until its terminal event. *)
+let sell_commitment_in_flight_timeout_s = 120.0
+
+(** Inserts or updates a commitment, preserving the earliest arm time. *)
+let upsert_sell_commitment ~state ~id ~price ~qty ~seen ~acked =
+  let found = ref false in
+  state.sell_commitments
+  <- List.map
+       (fun (i, p, q, s, a, ts) ->
+          if i = id
+          then (
+            found := true;
+            id, price, qty, s || seen, a || acked, ts)
+          else i, p, q, s, a, ts)
+       state.sell_commitments;
+  if not !found
+  then
+    state.sell_commitments
+    <- (id, price, qty, seen, acked, Unix.gettimeofday ()) :: state.sell_commitments
+;;
+
+(** Records a just-dispatched sell (keyed by its temporary pending id). *)
+let arm_sell_commitment ~state ~id ~price ~qty =
+  if qty > 0.0 then upsert_sell_commitment ~state ~id ~price ~qty ~seen:false ~acked:false
+;;
+
+(** Moves a commitment to the venue order id once ack/amend supplies it. If
+    the old id is unknown (the order was adopted straight from the feed), the
+    new id is inserted. [acked] marks the order as accepted by the venue, so
+    it is never expired by the dispatch window. *)
+let rekey_sell_commitment ~state ~old_id ~new_id ~price ~qty ~acked =
+  let q = if qty > 0.0 then qty else 0.0 in
+  if old_id = new_id
+  then (
+    match List.find_opt (fun (i, _, _, _, _, _) -> i = old_id) state.sell_commitments with
+    | Some (_, _, old_q, seen, a, _) ->
+      upsert_sell_commitment
+        ~state
+        ~id:new_id
+        ~price
+        ~qty:(if q > 0.0 then q else old_q)
+        ~seen
+        ~acked:(a || acked)
+    | None -> upsert_sell_commitment ~state ~id:new_id ~price ~qty:q ~seen:false ~acked)
+  else (
+    match List.find_opt (fun (i, _, _, _, _, _) -> i = old_id) state.sell_commitments with
+    | Some (_, _, old_q, seen, a, ts) ->
+      state.sell_commitments
+      <- (new_id, price, (if q > 0.0 then q else old_q), seen, a || acked, ts)
+         :: List.filter
+              (fun (i, _, _, _, _, _) -> i <> old_id && i <> new_id)
+              state.sell_commitments
+    | None -> upsert_sell_commitment ~state ~id:new_id ~price ~qty:q ~seen:false ~acked)
+;;
+
+(** Terminal event: the sell no longer holds base. *)
+let remove_sell_commitment ~state ~id =
+  state.sell_commitments
+  <- List.filter (fun (i, _, _, _, _, _) -> i <> id) state.sell_commitments
+;;
+
+(** Terminal event for a placement that never got a venue id. *)
+let remove_pending_sell_commitments ~state =
+  state.sell_commitments
+  <- List.filter
+       (fun (i, _, _, _, _, _) -> not (String.starts_with ~prefix:"pending_sell_" i))
+       state.sell_commitments
+;;
+
+(** Total base committed to live sells (the ledger). *)
+let committed_sell_base state =
+  List.fold_left (fun acc (_, _, q, _, _, _) -> acc +. q) 0.0 state.sell_commitments
+;;
+
+(** The base to subtract from the venue's reported holding:
+
+      spot_holding - reserved_base - committed_sell_base
+
+    - Net-balance venues ([balance_nets_open_order_holds]): the venue already
+      removed the open-order holds it knows about ([feed_total]), so the only
+      extra to remove is the ledger's EXCESS over the feed - in-flight orders
+      the feed has not listed, plus live orders the feed has dropped. The
+      time-based [unnetted_hold] overlay is kept as a floor for the window
+      where the feed lists a fresh order but the balance figure still trails
+      it. This makes a venue feed that drops a live order unable to free that
+      base: the ledger keeps it, the feed total falls, and the excess rises by
+      exactly the dropped qty.
+    - Gross-balance venues: the venue removed nothing, so the WHOLE ledger is
+      subtracted. *)
+let effective_committed_sell_base ~ecfg ~ledger_total ~feed_total ~unnetted_hold =
+  if ecfg.balance_nets_open_order_holds
+  then Float.max (Float.max 0.0 (ledger_total -. feed_total)) unnetted_hold
+  else ledger_total
+;;
