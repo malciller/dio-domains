@@ -800,3 +800,24 @@ Newest last. Format: `### YYYY-MM-DD — <session/agent> — <task ids>` then wh
   dependency install). Verified: a fresh OCaml 5.2 switch now resolves
   `cohttp-lwt-unix 6.3.0` / `conduit-lwt-unix 8.0.0` cleanly; OxCaml build still
   resolves `lwt_ppx 6.0.0+ox` and passes 69/69 with zero alerts.
+
+### 2026-09-12 — split base/app images; compiler pinned; CI updated
+- The OxCaml compiler was being recompiled on nearly every deploy because the
+  Dockerfile's switch-creation layer kept changing and Docker invalidated the
+  cached layer. Split into two images:
+  - `Dockerfile.base` – toolchain + all opam deps. Tagged
+    `dio-oxcaml-base:5.2.0minus40`. Slow, changes rarely.
+  - `Dockerfile` – `FROM ${DIO_BASE_IMAGE}`, copies source and compiles the
+    engine. Fast.
+  `deploy.sh` builds the base only if the tag is missing (guarded by
+  `docker image inspect`), then builds the app image.
+- Pinned `oxcaml-compiler` at switch creation (`5.2.0minus40`). A deploy on prod
+  had resolved `5.2.0minus25` (via `oxcaml.archived`) whose flambda2 register
+  allocator failed on `asset_domain_worker`:
+  `register allocation was not successful after 50 rounds`. The pin prevents
+  backtracking; resolution to `minus40` verified.
+- CI `build-test-oxcaml` updated to the same two-image process: build the base
+  (cached via GHA cache on GitHub / persisted daemon layers on Gitea), then the
+  engine image, then run tests against its builder stage.
+- Open risk: whether `minus40` compiles `asset_domain_worker` successfully is
+  not yet proven — the next CI run / deploy is the test.
