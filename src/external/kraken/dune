@@ -7,7 +7,6 @@
   digestif
   lwt
   lwt.unix
-  dotenv
   logging
   uri
   threads

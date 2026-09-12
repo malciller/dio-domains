@@ -28,7 +28,7 @@ let set_cached v =
 ;;
 
 let load_dotenv () =
-  try Dotenv.export ~path:".env" () with
+  try Logging.load_dotenv ~path:".env" () with
   | _ -> ()
 ;;
 

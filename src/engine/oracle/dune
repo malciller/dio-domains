@@ -18,7 +18,6 @@
   unix
   yojson
   lwt
-  dotenv
   mtime
   mtime.clock.os
   dio.logging

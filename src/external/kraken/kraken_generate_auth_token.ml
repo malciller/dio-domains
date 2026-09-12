@@ -22,7 +22,7 @@ let section = "kraken_generate_auth_token"
 let get_api_credentials_from_env () : (string * string) Lwt.t =
   Lwt.catch
     (fun () ->
-       Dotenv.export ~path:".env" ();
+       Logging.load_dotenv ~path:".env" ();
        Lwt.return_unit)
     (fun _ -> Lwt.return_unit)
   >>= fun () ->

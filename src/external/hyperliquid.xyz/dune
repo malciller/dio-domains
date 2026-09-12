@@ -7,7 +7,6 @@
   digestif
   lwt
   lwt.unix
-  dotenv
   logging
   msgpck
   secp256k1

@@ -5,7 +5,6 @@
   yojson
   lwt
   lwt.unix
-  dotenv
   logging
   cohttp-lwt-unix
   uri

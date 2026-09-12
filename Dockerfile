@@ -1,7 +1,12 @@
 # ────────────────────────────────────────────────────────────────────────────────
 # Dio – Dockerfile (multi-stage)
-# Stage 1: build  – Ubuntu 22.04 + OCaml 5.2.0 + full native build
+# Stage 1: build  – Ubuntu 22.04 + OCaml 5.2.0 (classic flambda) + full native build
 # Stage 2: runtime – minimal Ubuntu with only shared libs + binaries
+#
+# The builder creates a classic-flambda 5.2 switch on top of the stock
+# (non-flambda) base image. The release profile adds -O3 (see ./dune), which
+# turns on cross-module inlining, closure elimination and unboxing on the
+# trading hot path. The runtime stage is unchanged.
 # ────────────────────────────────────────────────────────────────────────────────
 
 # ==============================================================================
@@ -45,6 +50,23 @@ WORKDIR /app
 RUN chown opam:opam /app
 
 USER opam
+
+# 3a. Create a classic-flambda OCaml 5.2 switch. The stock switch in the base
+#     image is built without flambda, so the release-profile -O3 optimizations
+#     (see ./dune) would be ignored. This layer is cached and only rebuilt when
+#     the base image changes.
+RUN --mount=type=cache,target=/home/opam/.opam/download-cache,uid=1000,gid=1000 \
+    opam update -y \
+    && opam switch create 5.2.0+flambda \
+         ocaml-variants.5.2.0+options \
+         ocaml-option-flambda
+
+# 3b. Select the flambda switch for every subsequent layer and fail the build
+#     immediately if the resulting compiler is not flambda-enabled.
+ENV OPAMSWITCH=5.2.0+flambda
+RUN eval $(opam env) \
+    && test "$(ocamlopt -config-var flambda)" = "true" \
+    && ocamlopt -config-var version
 
 # 4. Copy project descriptors first (layer-cache friendly)
 COPY --chown=opam:opam dio.opam dune-project ./

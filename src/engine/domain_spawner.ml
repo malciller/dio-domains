@@ -607,6 +607,24 @@ let asset_domain_worker
       let wake_baseline = Concurrency.Exchange_wakeup.get_generation_fast wakeup_sync in
       let cycle_events = ref 0 in
       let lifecycle_events = ref 0 in
+      (* Latency safepoint. When execution events are pending, the EVENTS drain
+         below runs synchronously on THIS domain thread and allocates (list
+         rebuilds in the strategy handlers, oracle pool events). A minor
+         collection triggered by those allocations is stop-the-world for this
+         domain, so one unlucky collection inside a multi-event batch is
+         recorded against every event in it (the [elapsed / event_count]
+         average), which is what produced the 100us per-event EVENTS spikes.
+         Forcing the domain's pending minor collection HERE - before any
+         measured span - means the drain starts with the full minor heap free
+         and cannot trigger a collection of its own for any realistic burst
+         (hundreds of events per batch is <100KB against a 2MiB heap). The
+         collection is moved, not added: it is the same work the runtime would
+         otherwise do on the next allocation, just paid outside the windows.
+         The exec position is sampled once here and reused by the drain so the
+         gate and the iteration observe the same producer position. *)
+      let current_pos = get_exec_pos_fn () in
+      let did_exec = current_pos <> !exec_read_pos in
+      if did_exec then Gc.minor ();
       (* Per-cycle GC counters: captured at cycle start and at the cause site so
          a spike can be attributed to a minor/major collection. The start
          capture is SAMPLED ([gc_sample_mask]) because [Gc.quick_stat] allocates
@@ -665,8 +683,6 @@ let asset_domain_worker
       in
       if did_ob && latency_this_cycle then Latency_profiler.record_ns prof_ob (t2 - t1);
       let was_exec_ready = !exec_ready in
-      let current_pos = get_exec_pos_fn () in
-      let did_exec = current_pos <> !exec_read_pos in
       let event_count = ref 0 in
       if did_exec
       then (

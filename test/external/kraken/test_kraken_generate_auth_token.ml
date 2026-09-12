@@ -78,7 +78,7 @@ let test_env_file_loading () =
     (Lwt_main.run
        (Lwt.catch
           (fun () ->
-             (Dotenv.export ~path:".env") ();
+             (Logging.load_dotenv ~path:".env") ();
              Lwt.return true)
           (fun _ -> Lwt.return false)));
   (* The test passes as long as it doesn't crash *)

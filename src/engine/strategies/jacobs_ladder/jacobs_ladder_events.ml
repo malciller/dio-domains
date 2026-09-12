@@ -149,6 +149,33 @@ let flush_persistence asset_symbol =
     | None -> ())
 ;;
 
+(** [filter_keep_if_needed keep xs] is [List.filter keep xs] but returns [xs]
+    physically unchanged when nothing is dropped. The lifecycle handlers below
+    usually find no matching pending token (it was already consumed), and
+    [List.filter] would still copy the whole list on every event - allocation
+    that fills this domain's minor heap and can force a stop-the-world minor
+    collection inside the execution-event drain. Sharing the original list is
+    safe: these lists are immutable and only ever replaced wholesale. *)
+let filter_keep_if_needed keep xs =
+  let rec all_kept = function
+    | [] -> true
+    | x :: rest -> keep x && all_kept rest
+  in
+  if all_kept xs then xs else List.filter keep xs
+;;
+
+(** Non-allocating equivalent of
+    [String.starts_with s ~prefix:"pending_amend_" && String.sub s 14
+    (String.length s - 14) = target]. The old predicates allocated a fresh
+    substring for every pending entry scanned ("pending_amend_" is 14 bytes). *)
+let pending_amend_for s target =
+  String.starts_with ~prefix:"pending_amend_" s
+  && String.length s = 14 + String.length target
+  &&
+  let rec eq i = i >= String.length target || (s.[14 + i] = target.[i] && eq (i + 1)) in
+  eq 0
+;;
+
 (** Handles order placement acknowledgment. *)
 let handle_order_acknowledged ~now asset_symbol order_id side price =
   let state = get_strategy_state asset_symbol in
@@ -158,7 +185,7 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
     (fun () ->
        add_tracked_order_id state order_id;
        state.pending_orders
-       <- List.filter
+       <- filter_keep_if_needed
             (fun (pending_id, s, p, _) ->
                let is_placement_prefix =
                  String.starts_with ~prefix:"pending_buy_" pending_id
@@ -267,7 +294,7 @@ let handle_order_failed ~now asset_symbol side reason =
          else None
        in
        state.pending_orders
-       <- List.filter (fun (_, s, _, _) -> s <> side) state.pending_orders;
+       <- filter_keep_if_needed (fun (_, s, _, _) -> s <> side) state.pending_orders;
        (match side with
         | Buy ->
           state.last_buy_order_id <- None;
@@ -279,7 +306,7 @@ let handle_order_failed ~now asset_symbol side reason =
         | Sell ->
           remove_pending_sell_commitments ~state;
           state.open_sell_orders
-          <- List.filter
+          <- filter_keep_if_needed
                (fun (oid, _, _) -> not (String.starts_with ~prefix:"pending_sell_" oid))
                state.open_sell_orders);
        let duplicate_key =
@@ -420,7 +447,7 @@ let handle_order_rejected ~now:_ asset_symbol side price =
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
        state.pending_orders
-       <- List.filter
+       <- filter_keep_if_needed
             (fun (pending_id, s, p, _) ->
                let is_placement_prefix =
                  String.starts_with ~prefix:"pending_buy_" pending_id
@@ -447,7 +474,7 @@ let handle_order_rejected ~now:_ asset_symbol side price =
           state.inflight_sell <- false;
           remove_pending_sell_commitments ~state;
           state.open_sell_orders
-          <- List.filter
+          <- filter_keep_if_needed
                (fun (oid, _, _) -> not (String.starts_with ~prefix:"pending_sell_" oid))
                state.open_sell_orders);
        let duplicate_key =
@@ -582,13 +609,8 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
             next pair through the normal cycle). *)
          if side = Buy then state.tif_recovery_pending <- false;
          state.pending_orders
-         <- List.filter
-              (fun (pending_id, _, _, _) ->
-                 not
-                   (String.starts_with ~prefix:"pending_amend_" pending_id
-                    && String.length pending_id > 14
-                    && String.sub pending_id 14 (String.length pending_id - 14) = order_id
-                   ))
+         <- filter_keep_if_needed
+              (fun (pending_id, _, _, _) -> not (pending_amend_for pending_id order_id))
               state.pending_orders;
          let sell_fill_price =
            match
@@ -598,7 +620,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
            | None -> fill_price
          in
          state.open_sell_orders
-         <- List.filter
+         <- filter_keep_if_needed
               (fun (sell_id, _, _) -> sell_id <> order_id)
               state.open_sell_orders;
          let _was_tracked_buy =
@@ -738,7 +760,9 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
               List.find_opt (fun (oid, _, _) -> oid = order_id) state.open_sell_orders
             in
             state.open_sell_orders
-            <- List.filter (fun (oid, _, _) -> oid <> order_id) state.open_sell_orders;
+            <- filter_keep_if_needed
+                 (fun (oid, _, _) -> oid <> order_id)
+                 state.open_sell_orders;
             if state.persisted_sell_levels <> []
             then (
               let matched_by_limit =
@@ -929,10 +953,7 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
        let is_being_amended =
          InFlightAmendments.is_amend_lifecycle_active order_id
          || List.exists
-              (fun (pending_id, _, _, _) ->
-                 String.starts_with ~prefix:"pending_amend_" pending_id
-                 && String.length pending_id > 14
-                 && String.sub pending_id 14 (String.length pending_id - 14) = order_id)
+              (fun (pending_id, _, _, _) -> pending_amend_for pending_id order_id)
               state.pending_orders
        in
        (* A "ghost" placement is an order the venue reports as canceled whose id we
@@ -998,14 +1019,10 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
                  "Buy placement for %s died unacked (WS kill) - TIF recovery armed \
                   (window 900s)"
                  asset_symbol);
-             List.filter
+             filter_keep_if_needed
                (fun (pending_id, s, _, _) ->
                   let matches =
-                    pending_id = order_id
-                    || (String.starts_with ~prefix:"pending_amend_" pending_id
-                        && String.length pending_id > 14
-                        && String.sub pending_id 14 (String.length pending_id - 14)
-                           = order_id)
+                    pending_id = order_id || pending_amend_for pending_id order_id
                   in
                   let is_ghost_placement =
                     (not is_known_order)
@@ -1062,7 +1079,7 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
               state.inflight_sell <- false;
               ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell)));
          state.open_sell_orders
-         <- List.filter
+         <- filter_keep_if_needed
               (fun (sell_id, _, _) -> sell_id <> order_id)
               state.open_sell_orders;
          remove_sell_commitment ~state ~id:order_id)
@@ -1083,16 +1100,11 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
        state.pending_orders
-       <- List.filter
+       <- filter_keep_if_needed
             (fun (pending_id, _s, _p, _) ->
-               let matches_amend =
-                 String.starts_with ~prefix:"pending_amend_" pending_id
-                 && (String.sub pending_id 14 (String.length pending_id - 14)
-                     = old_order_id
-                     || String.sub pending_id 14 (String.length pending_id - 14)
-                        = new_order_id)
-               in
-               not matches_amend)
+               not
+                 (pending_amend_for pending_id old_order_id
+                  || pending_amend_for pending_id new_order_id))
             state.pending_orders;
        (match side with
         | Buy ->
@@ -1160,7 +1172,7 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
             original_sell_count;
           state.open_sell_orders
           <- (new_order_id, price, old_qty)
-             :: List.filter
+             :: filter_keep_if_needed
                   (fun (sell_id, _, _) -> sell_id <> old_order_id)
                   state.open_sell_orders;
           state.recently_injected_sells
@@ -1205,13 +1217,8 @@ let handle_order_amendment_skipped ~now asset_symbol order_id side _ =
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
        state.pending_orders
-       <- List.filter
-            (fun (pending_id, _s, _p, _) ->
-               let matches_amend =
-                 String.starts_with ~prefix:"pending_amend_" pending_id
-                 && String.sub pending_id 14 (String.length pending_id - 14) = order_id
-               in
-               not matches_amend)
+       <- filter_keep_if_needed
+            (fun (pending_id, _s, _p, _) -> not (pending_amend_for pending_id order_id))
             state.pending_orders;
        (* Throttle re-issue of a suppressed amendment. *)
        Hashtbl.replace state.amend_cooldowns order_id (now +. 5.0);
@@ -1233,14 +1240,8 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
        state.pending_orders
-       <- List.filter
-            (fun (pending_id, _s, _p, _) ->
-               let matches_amend =
-                 String.starts_with ~prefix:"pending_amend_" pending_id
-                 && String.length pending_id > 14
-                 && String.sub pending_id 14 (String.length pending_id - 14) = order_id
-               in
-               not matches_amend)
+       <- filter_keep_if_needed
+            (fun (pending_id, _s, _p, _) -> not (pending_amend_for pending_id order_id))
             state.pending_orders;
        let lower_reason = String.lowercase_ascii reason in
        let is_cache_miss =
@@ -1349,7 +1350,7 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
          | Sell ->
            let original_sell_count = List.length state.open_sell_orders in
            state.open_sell_orders
-           <- List.filter
+           <- filter_keep_if_needed
                 (fun (sell_id, _, _) -> sell_id <> order_id)
                 state.open_sell_orders;
            remove_sell_commitment ~state ~id:order_id;

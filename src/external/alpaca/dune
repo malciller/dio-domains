@@ -9,7 +9,6 @@
   websocket-lwt-unix
   mtime
   mtime.clock.os
-  dotenv
   logging
   uri
   threads

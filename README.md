@@ -422,12 +422,22 @@ The oracle configuration section of `config.json` drives both the runtime and th
 a. OCaml 5.2 (any distribution: opam, Nix, or Homebrew).
 b. `opam` and `dune`.
 c. Linux or macOS. WSL2 is supported.
+d. Release builds use a classic-flambda OCaml 5.2 compiler. The release profile adds `-O3` (see `./dune`); non-flambda compilers ignore it. The Docker image creates a `5.2.0+flambda` switch automatically, so this only matters for local release builds.
 
 ### 10.2 Build
 
 ```sh
 opam install . --deps-only
 dune build
+```
+
+Local development builds use the `dev` profile, so they do not need flambda. To build a release binary locally:
+
+```sh
+opam switch create 5.2.0+flambda ocaml-variants.5.2.0+options ocaml-option-flambda
+eval $(opam env)
+opam install . --deps-only
+dune build --profile=release
 ```
 
 ### 10.3 Execution
