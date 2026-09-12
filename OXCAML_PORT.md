@@ -760,3 +760,24 @@ Newest last. Format: `### YYYY-MM-DD — <session/agent> — <task ids>` then wh
   container `dune runtest --force` `EXIT=0`, 69/69, `Alert = 0`. Local
   classic-flambda `dune build` + `dune runtest` still green (69/69).
 - Next: WS9 amd64 validation, then WS10 (G5 prod rollout).
+
+### 2026-09-12 — CI on GitHub + Gitea — build-test-oxcaml
+- `.github/workflows/ci.yml` is shared by both GitHub Actions and the Gitea
+  act_runner (Gitea is configured to read `.github/workflows`). Two jobs:
+  - `build-test`: classic-flambda OCaml 5.2 build + tests (unchanged toolchain
+    for `main`). Uses `runs-on: ubuntu-latest`; the `actions/cache` dune-cache
+    step is guarded by `if: github.server_url == 'https://github.com'` because
+    act_runner does not implement it.
+  - `build-test-oxcaml`: builds the OxCaml Docker builder stage and runs the
+    container test suite. The build step branches on `github.server_url`:
+    on GitHub it uses `docker/build-push-action` + `type=gha` cache; on a
+    self-hosted Gitea runner it uses plain `docker buildx build` (the daemon
+    persists between runs, so Dockerfile layer caching applies). The test step
+    bind-mounts `test/` (excluded by `.dockerignore`) and **fails the job if any
+    `Alert ` appears**, enforcing the zero-alert invariant.
+- Requirement: the OxCaml job needs a runner with Docker and >= 16 GB RAM.
+  Verified locally: the exact self-hosted command runs `dune runtest --force`
+  green (69/69) with zero alerts.
+- Note: `--cache-to type=local` is **not** used — the docker driver does not
+  support cache export (verified), and `docker/build-push-action` handles
+  ephemeral GitHub runners instead.
