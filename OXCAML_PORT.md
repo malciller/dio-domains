@@ -191,7 +191,8 @@ Owner column is free text (agent/session id). Keep one `IN_PROGRESS` at a time p
 | --- | --- | --- | --- | --- |
 | WS0 | Build harness: reproducible Docker builder target + local Linux dev switch; capture baseline logs | — | TODO | |
 | WS1 | `notty` → `notty-community` (dep swap + code/API check) | WS0 | TODO | |
-| WS2 | Fix `lwt_ppx+ox` AST mismatch (pin compatible `ppxlib`/`ppxlib_ast`) | WS0 | TODO | |
+| WS2 | Fix `lwt_ppx+ox` AST mismatch (pin compatible `ppxlib`/`ppxlib_ast`) | WS0 | **DONE (resolution)** | this session |
+| WS2b | Resolve `lwt 6` vs `lwt_log < 6` (pulled by `websocket-lwt-unix`); pin `alcotest = 1.9.0+ox` | WS2 | IN_PROGRESS | |
 | WS3 | `digestif` — patch modes OR replace with `mirage-crypto` hashes | WS0 | TODO | |
 | WS4 | `msgpck` / `ocplib-endian` — patch or replace encoder | WS0 | TODO | |
 | WS5 | `cohttp-lwt(-unix)` — patch local/global mode errors | WS0 | TODO | |
@@ -222,6 +223,23 @@ Owner column is free text (agent/session id). Keep one `IN_PROGRESS` at a time p
   in the overlay.
 - Acceptance: `let%lwt` compiles in a trivial file and in the full tree.
 - Note: this is the highest-risk task — the entire codebase uses `lwt_ppx`.
+
+### WS2b — `lwt 6` / `lwt_log` collision
+- **Cause (proven):** OxCaml's `lwt_ppx 6.0.0+ox` requires `lwt >= 6`; but
+  `dio -> websocket-lwt-unix -> lwt_log >= 1.1.1 -> lwt < 6.0.0`. These cannot both hold.
+- The stale alternative `lwt_ppx 5.9.1+ox` needs `lwt < 6` but is built against the older
+  AST and fails with `Pexp_let expects 4 argument(s)` under `ppxlib 0.33.0+ox2`.
+- `lwt_log` is NOT used by our source (grep clean); it is a hard dep of
+  `websocket-lwt-unix`. Note that **`lwt_log` is deprecated by its own authors**.
+- **Options (pick one, record here):**
+  1. Patch `lwt_log` to allow `lwt 6` and ship `oxcaml-lwt_log`-style overlay package.
+  2. Drop `websocket-lwt-unix` for a direct `websocket` + small Lwt wrapper; we already
+     use `websocket-lwt-unix` only in `src/external/{alpaca,hyperliquid,kraken,lighter}` and
+     one kraken test. Direct `websocket` (no `lwt_log`) keeps `lwt 6`.
+  3. Find an older/newer `websocket-lwt-unix` whose `lwt_log` bound is `>= 6`.
+- **Also:** pin `alcotest` to `1.9.0+ox` (only version the OxCaml patch accepts). The
+  current unpinned `alcotest` conflicts with the OxCaml `alcotest` invariant.
+- Acceptance: resolution no longer reports `lwt_log`/`lwt`/`alcotest` conflicts.
 
 ### WS3 — digestif
 - Symptom: mode errors in `src-ocaml/baijiu_*.ml` (`feed`/`blit` local modes).
@@ -263,8 +281,11 @@ Owner column is free text (agent/session id). Keep one `IN_PROGRESS` at a time p
 
 | Dep | Used for | Pinned now | Ox patched? | Status | Fix route | Owner |
 | --- | --- | --- | --- | --- | --- | --- |
-| `ocaml-variants` | compiler | `5.2.0+ox` | — | builds | pin repo commit | |
-| `lwt_ppx` | `let%lwt` ppx | `+ox` | yes | **fails** | WS2 | |
+| `ocaml-variants` | compiler | `5.2.0+ox` | — | builds | repo pinned `bb455526` (2026-08-31) | |
+| `lwt_ppx` | `let%lwt` ppx | `>= 6.0.0` (dio) | yes | **fixed in resolution**: pin `>= 6.0.0` forces `6.0.0+ox`; `5.9.1+ox` was stale vs `ppxlib 0.33.0+ox2` | WS2 — pinned, re-verify in WS9 | this session |
+| `lwt` | runtime | (unpinned) | yes | `6.0.0+ox` required by `lwt_ppx 6`; conflicts with `lwt_log` (see below) | WS2b | |
+| `lwt_log` | pulled by `websocket-lwt-unix` | — | no | **blocks `lwt 6`** (`lwt < 6.0.0`) | WS2b: drop/replace `websocket-lwt-unix` or patch `lwt_log` | |
+| `alcotest` | tests | (unpinned) | yes | must resolve to `1.9.0+ox` | pin `alcotest = 1.9.0+ox` under OxCaml | |
 | `notty` | logging/TUI | 0.2.3 | no (`notty-community`) | **fails** | WS1 | |
 | `digestif` | hashing | 1.3.1 | no | **fails** | WS3 | |
 | `cohttp-lwt` | REST | 4.0.0 | no | **fails** | WS5 | |
@@ -374,5 +395,24 @@ Newest last. Format: `### YYYY-MM-DD — <session/agent> — <task ids>` then wh
   flambda so it stays buildable; OxCaml switch block preserved in §8 for re-application.
 - Created branch `oxcaml` and this document. No port code yet.
 - Next: WS0 (harness) then WS2 (lwt_ppx) since it gates the whole tree.
+
+### 2026-09-12 — follow-up session — WS0, WS2, WS2b opened
+- WS0 partial: pinned OxCaml opam repo commit `bb4555262936283daf5cbc82423509d4e7069b15`
+  (2026-08-31). Captured reproduction command in §8. Patch-carrying strategy still TODO.
+- WS2 root-caused and fixed in resolution:
+  - Solver picked `lwt_ppx 5.9.1+ox`, which requires `lwt < 6` and is built against an older
+    AST; it fails with `Pexp_let expects 4 argument(s)` under `ppxlib 0.33.0+ox2`.
+  - Pinned `lwt_ppx >= 6.0.0` in `dune-project`/`dio.opam`; this forces `lwt_ppx 6.0.0+ox`
+    (matched to `ppxlib 0.33.0+ox2` and `lwt 6.0.0+ox`).
+  - Verified local classic-flambda build + 69/69 tests still green with the pin.
+- Docker `linux/arm64` run after WS2 (`/tmp/docker_oxcaml_build4.log`): the `lwt_ppx` error
+  is gone. New blockers surfaced:
+  - `lwt_ppx 6 -> lwt >= 6` vs `websocket-lwt-unix -> lwt_log -> lwt < 6.0.0` (WS2b).
+  - `alcotest` must pin to `1.9.0+ox` (WS2b).
+  - `conduit-lwt-unix < 2` chain via `ppx_sexp_conv`/`base` (WS6, later versions may avoid).
+- Reverted the branch Dockerfile to flambda after the experiment; OxCaml block remains in §8.
+- Committed and pushed `OXCAML_PORT.md` to `gitea/oxcaml`.
+- Next: WS2b choose option (recommend option 2: drop `websocket-lwt-unix` for direct
+  `websocket`), then WS1 (`notty`), WS3 (`digestif`).
 
 <!-- Append new entries below. -->

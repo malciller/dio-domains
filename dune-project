@@ -24,7 +24,8 @@
   (yojson
    (>= 2.2.2))
   lwt
-  lwt_ppx
+  (lwt_ppx
+   (>= 6.0.0))
   lwt_ssl
   mirage-crypto-rng
   cohttp-lwt-unix
