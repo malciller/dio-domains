@@ -223,10 +223,12 @@ let asset_domain_worker
     (* One-shot warning: the startup-window-elapsed withhold causes fire at
        most once per domain (see the closed-gate branch below). *)
     let no_signal_warned = ref false in
-    (* The grid strategy asset is materialized ONLY from an ACTIVE
-       capital-oracle decision. With none, the ref stays None and the
-       startup gate below stays closed: there is no fallback sizing path, so
-       the strategy places nothing until the oracle publishes. *)
+    (* At startup the grid strategy asset is pre-materialized from an ACTIVE
+       capital-oracle decision only. With none (no decision yet, or an
+       INACTIVE one) the ref starts None and the startup gate below stays
+       closed: there is no fallback sizing path, so the BUY leg places nothing
+       until the oracle publishes. The decision handler in the loop
+       materializes an INACTIVE asset too, so its sell leg runs under halt. *)
     let grid_asset_of
           ?(qty = asset_with_fees.qty)
           ?(accumulation_buffer = resolved_accumulation_buffer)
@@ -246,10 +248,11 @@ let asset_domain_worker
       ; sell_levels_persistence = asset_with_fees.sell_levels
       }
     in
-    (* The strategy materializes ONLY from an ACTIVE capital-oracle decision:
-       there is no Fear & Greed and no configuration fallback sizing path.
-       An INACTIVE decision leaves the ref unset here; the decision handler
-       below materializes it so the sell leg can run under halt. *)
+    (* The strategy materializes from the FIRST capital-oracle decision, ACTIVE
+       or INACTIVE: there is no Fear & Greed and no configuration fallback
+       sizing path, so an ACTIVE startup decision sizes it here, while an
+       INACTIVE one is materialized by the decision handler below so the sell
+       leg can run under halt. *)
     let grid_strategy_asset_ref =
       if asset_with_fees.strategy = "jacobs_ladder" || asset_with_fees.strategy = "Ladder"
       then (
@@ -919,10 +922,22 @@ let asset_domain_worker
         | _ -> false
       in
       (match oracle_decision, !grid_strategy_asset_ref with
-       | Some d, None when d.active ->
-         (* First oracle decision after a no-signal startup (no F&G was
-            available): materialize the grid strategy from the decision. *)
-         let qty_str = Printf.sprintf "%.8g" d.buy_qty in
+       | Some d, None ->
+         (* Materialize the grid strategy on the FIRST oracle decision, ACTIVE
+            OR INACTIVE. A halted asset must still run its sell leg: it needs to
+            adopt pre-existing resting inventory, track fills/cancels, and place
+            inventory sells - buys are withheld by the [oracle_halted] flag
+            inside execute_strategy, not by skipping execution entirely.
+            Materializing only on ACTIVE decisions left every startup-inactive
+            asset with no strategy loop at all, so its open-order/ledger sell
+            state stayed empty and the dashboard sell count read 0. An INACTIVE
+            decision may carry a zero/placeholder buy size, so fall back to the
+            configured qty for the grid size in that case. *)
+         let qty_str =
+           if d.buy_qty > 0.0
+           then Printf.sprintf "%.8g" d.buy_qty
+           else asset_with_fees.qty
+         in
          grid_strategy_asset_ref
          := Some (grid_asset_of ~qty:qty_str ~grid_interval:d.grid_interval ());
          let st =
@@ -931,19 +946,22 @@ let asset_domain_worker
          (try st.grid_qty <- float_of_string qty_str with
           | Failure _ -> ());
          (* Re-check any already-resting buy against the decision's spacing:
-             the re-anchor amends DOWN only when the resting price actually
-             violates a ladder constraint (it sits inside a sell's 2*gi
-             restricted zone); an order already within one grid interval of
-             the market is left alone - it trails up as usual. *)
-         st.force_buy_reanchor <- true;
+              the re-anchor amends DOWN only when the resting price actually
+              violates a ladder constraint (it sits inside a sell's 2*gi
+              restricted zone); an order already within one grid interval of
+              the market is left alone - it trails up as usual. Only an ACTIVE
+              decision arms it: under halt the buy leg places/re-anchors
+              nothing. *)
+         if d.active then st.force_buy_reanchor <- true;
          should_execute_strategy := true;
          Logging.debug_f
            ~section
-           "[%s/%s] Capital oracle decision materialized: qty %.8g gi %.4f%% (D_surv \
+           "[%s/%s] Capital oracle decision materialized (%s): qty %s gi %.4f%% (D_surv \
             %.1f%%)"
            asset_with_fees.exchange
            asset_with_fees.symbol
-           d.buy_qty
+           (if d.active then "ACTIVE" else "INACTIVE")
+           qty_str
            d.grid_interval
            (d.d_surv *. 100.0)
        | Some d, Some asset when d.active ->

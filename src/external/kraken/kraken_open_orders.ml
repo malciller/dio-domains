@@ -24,7 +24,41 @@ let status_of_string s =
   | s -> Kraken_executions_feed.UnknownStatus s
 ;;
 
-let get_open_orders () : Kraken_executions_feed.execution_event list Lwt.t =
+(** Canonical, slash-free pair name (legacy REST [descr.pair] form) so a REST
+    order can be mapped back to the configured symbol. Mirrors the instruments
+    feed's canonicalizer (XXBT/XBT -> BTC, ZUSD -> USD, ...). *)
+let canonical_pair s =
+  let s = String.concat "" (String.split_on_char '/' s) in
+  let uppercase = String.uppercase_ascii s in
+  let no_xbt =
+    if String.length uppercase >= 4 && String.sub uppercase 0 4 = "XXBT"
+    then "BTC" ^ String.sub uppercase 4 (String.length uppercase - 4)
+    else if String.length uppercase >= 3 && String.sub uppercase 0 3 = "XBT"
+    then "BTC" ^ String.sub uppercase 3 (String.length uppercase - 3)
+    else if String.length uppercase >= 5 && String.sub uppercase 0 5 = "XXETH"
+    then "ETH" ^ String.sub uppercase 5 (String.length uppercase - 5)
+    else if String.length uppercase >= 4 && String.sub uppercase 0 4 = "XETH"
+    then "ETH" ^ String.sub uppercase 4 (String.length uppercase - 4)
+    else uppercase
+  in
+  if String.length no_xbt >= 4 && String.sub no_xbt (String.length no_xbt - 4) 4 = "ZUSD"
+  then String.sub no_xbt 0 (String.length no_xbt - 4) ^ "USD"
+  else if
+    String.length no_xbt >= 4 && String.sub no_xbt (String.length no_xbt - 4) 4 = "ZEUR"
+  then String.sub no_xbt 0 (String.length no_xbt - 4) ^ "EUR"
+  else no_xbt
+;;
+
+(** Maps a REST [descr.pair] to the configured strategy symbol (e.g.
+    "XMRUSD" -> "XMR/USD"); falls back to the raw pair when unmatched. *)
+let resolve_symbol ~symbols pair =
+  let target = canonical_pair pair in
+  match List.find_opt (fun sym -> canonical_pair sym = target) symbols with
+  | Some sym -> sym
+  | None -> pair
+;;
+
+let get_open_orders ~symbols () : Kraken_executions_feed.execution_event list Lwt.t =
   Lwt.catch
     (fun () ->
        Kraken_get_fee.get_api_credentials_from_env ()
@@ -80,7 +114,9 @@ let get_open_orders () : Kraken_executions_feed.execution_event list Lwt.t =
                (fun (order_id, order_json) ->
                   try
                     let desc = member "descr" order_json in
-                    let symbol = member "pair" desc |> to_string in
+                    let symbol =
+                      resolve_symbol ~symbols (member "pair" desc |> to_string)
+                    in
                     let side_str = member "type" desc |> to_string in
                     let status_str = member "status" order_json |> to_string in
                     let vol = member "vol" order_json |> to_string |> float_of_string in

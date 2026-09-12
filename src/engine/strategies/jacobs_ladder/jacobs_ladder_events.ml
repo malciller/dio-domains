@@ -199,6 +199,26 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
           ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell);
           state.recently_injected_sells
           <- (order_id, price, now) :: state.recently_injected_sells;
+          (* Re-key the in-flight commitment from the temporary pending id to
+              the venue order id. Matching by price is exact enough: only one
+              sell placement is in flight at a time (the dedup key is released
+              when this ack lands). *)
+          (match
+             List.find_opt
+               (fun (i, p, _q, _s, _a, _ts) ->
+                  String.starts_with ~prefix:"pending_sell_" i
+                  && abs_float (p -. price) < price *. 0.01)
+               state.sell_commitments
+           with
+           | Some (pid, _, _, _, _, _) ->
+             rekey_sell_commitment
+               ~state
+               ~old_id:pid
+               ~new_id:order_id
+               ~price
+               ~qty:0.0
+               ~acked:true
+           | None -> ());
           let replaced = ref false in
           state.open_sell_orders
           <- List.map
@@ -245,6 +265,7 @@ let handle_order_failed ~now asset_symbol side reason =
        (match side with
         | Buy -> set_asset_reserved_quote state 0.0
         | Sell ->
+          remove_pending_sell_commitments ~state;
           state.open_sell_orders
           <- List.filter
                (fun (oid, _, _) -> not (String.starts_with ~prefix:"pending_sell_" oid))
@@ -412,6 +433,7 @@ let handle_order_rejected ~now:_ asset_symbol side price =
           state.inflight_buy <- false
         | Sell ->
           state.inflight_sell <- false;
+          remove_pending_sell_commitments ~state;
           state.open_sell_orders
           <- List.filter
                (fun (oid, _, _) -> not (String.starts_with ~prefix:"pending_sell_" oid))
@@ -688,6 +710,18 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
            if dominated then state.highest_startup_oid <- Some order_id);
          (match side with
           | Sell ->
+            (* A [Filled] event is TERMINAL for the order: release the whole
+               commitment by id, never merely the reported fill qty. On
+               Hyperliquid the orderUpdates "filled" event retires the order
+               from the open-order feed (and is filtered out of the strategy
+               stream), so the userEvents Trade that reaches us can be left
+               computing from an untracked order and report only the LAST
+               partial size; subtracting that would strand the earlier fills'
+               base in the ledger forever (the retained stale sell / negative
+               closest-sell distance, and the under-counted sellable balance
+               that then re-buys). Partial fills arrive as [PartiallyFilled]
+               and never reach this handler. *)
+            remove_sell_commitment ~state ~id:order_id;
             let known_open_sell =
               List.find_opt (fun (oid, _, _) -> oid = order_id) state.open_sell_orders
             in
@@ -1018,7 +1052,8 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
          state.open_sell_orders
          <- List.filter
               (fun (sell_id, _, _) -> sell_id <> order_id)
-              state.open_sell_orders)
+              state.open_sell_orders;
+         remove_sell_commitment ~state ~id:order_id)
        else
          Logging.info_f
            ~section
@@ -1092,6 +1127,13 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
             | Some (_, _, q) -> q
             | None -> venue_lot_qty state.grid_qty state.exchange_id state
           in
+          rekey_sell_commitment
+            ~state
+            ~old_id:old_order_id
+            ~new_id:new_order_id
+            ~price
+            ~qty:old_qty
+            ~acked:true;
           Logging.debug_f
             ~section
             "SELL_AMEND [%s] %s -> %s @ %.2f: old_entry=%s old_qty=%.8f sells_before=%d"
@@ -1298,6 +1340,7 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
            <- List.filter
                 (fun (sell_id, _, _) -> sell_id <> order_id)
                 state.open_sell_orders;
+           remove_sell_commitment ~state ~id:order_id;
            if List.length state.open_sell_orders < original_sell_count
            then
              Logging.info_f

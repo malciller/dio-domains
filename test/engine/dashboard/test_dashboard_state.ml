@@ -85,6 +85,27 @@ let test_keyed_by_symbol () =
     true
 ;;
 
+let test_ladder_sell_count_uses_ledger () =
+  (* The SELLS count must report the live sell set, not only what the venue
+     feed lists. Kraken's open-order feed can drop a resting sell, which
+     showed as 0 pending sells while the order still rested; the in-flight
+     ledger is armed at dispatch and is the authority. Feed empty + two ledger
+     commitments => count 2. *)
+  let symbol = "DASH_SELLCOUNT/XMR/USD" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.open_sell_orders <- [];
+  state.sell_commitments
+  <- [ "oid-a", 539.67, 0.3, false, false, 0.0; "oid-b", 540.10, 0.2, true, true, 0.0 ];
+  let j = Dio_dashboard.Dashboard_state.json_of_grid_strategy "kraken" symbol in
+  (match field j "sell_count" with
+   | Some (`Int n) -> Alcotest.(check int) "ledger sells counted" 2 n
+   | _ -> Alcotest.fail "missing sell_count");
+  match field j "sell_orders" with
+  | Some (`List l) ->
+    Alcotest.(check int) "sell_orders carries the ledger sells" 2 (List.length l)
+  | _ -> Alcotest.fail "missing sell_orders"
+;;
+
 let () =
   Alcotest.run
     "dashboard_state"
@@ -94,6 +115,10 @@ let () =
             `Quick
             test_decision_fields
         ; Alcotest.test_case "decisions keyed by symbol" `Quick test_keyed_by_symbol
+        ; Alcotest.test_case
+            "ladder SELLS count includes the in-flight ledger"
+            `Quick
+            test_ladder_sell_count_uses_ledger
         ] )
     ]
 ;;

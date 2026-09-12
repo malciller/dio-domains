@@ -330,9 +330,14 @@ let evaluate_asset_low_recovery
     let asset_needed_fast = qty_f in
     let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
     let asset_available = venue_available_base ~asset in
-    let locked_in_sells =
-      if ecfg.use_reserved_base_guard && not ecfg.use_accumulation_sells
-      then List.fold_left (fun acc (_, _, qty) -> acc +. qty) 0.0 state.open_sell_orders
+    let committed_sell =
+      if ecfg.use_reserved_base_guard
+      then
+        effective_committed_sell_base
+          ~ecfg
+          ~ledger_total:(committed_sell_base state)
+          ~feed_total:state.feed_locked_sell_base
+          ~unnetted_hold
       else 0.0
     in
     let available_asset =
@@ -340,12 +345,12 @@ let evaluate_asset_low_recovery
       then
         (* Alpaca: the venue's own [qty_available] is authoritative for what is
            free of resting holds. The stale poll is bridged with the un-polled
-           buy credit overlay; [locked_in_sells] is NOT subtracted (it is the
+           buy credit overlay; the ledger is NOT subtracted here (it is the
            eventually-consistent reconstruction this path exists to avoid). *)
         Float.max
           0.0
           (asset_available +. unreflected -. state.reserved_base -. unnetted_hold)
-      else asset_bal -. state.reserved_base -. locked_in_sells -. unnetted_hold
+      else asset_bal -. state.reserved_base -. committed_sell
     in
     let balance_actually_changed = asset_balance > state.last_seen_asset_balance in
     state.last_seen_asset_balance <- asset_balance;
@@ -369,7 +374,7 @@ let evaluate_asset_low_recovery
         asset.symbol
         asset_bal
         state.reserved_base
-        locked_in_sells
+        committed_sell
         available_asset
         asset_needed_fast))
 ;;
@@ -492,6 +497,9 @@ let sync_open_orders
   let has_recent_amend_buy = ref false in
   let locked_in_buys = ref 0.0 in
   let locked_in_sells = ref 0.0 in
+  (* (order_id -> (price, remaining qty)) for the sells the venue feed lists
+     this scan; consumed by the in-flight ledger reconcile below. *)
+  let feed_sell_qty : (string, float * float) Hashtbl.t = Hashtbl.create 16 in
   let closest_sell_order = ref None in
   let matched_persisted_indices = state.matched_persisted_indices in
   Hashtbl.clear matched_persisted_indices;
@@ -572,7 +580,11 @@ let sync_open_orders
       then (
         add_tracked_order_id state oid;
         state.open_sell_orders <- (oid, price, qty) :: state.open_sell_orders;
-        locked_in_sells := !locked_in_sells +. qty;
+        Hashtbl.replace feed_sell_qty oid (price, qty);
+        (* Refresh the in-flight ledger with the venue's live remaining qty;
+           a sell adopted straight from the feed (no prior local arm) is
+           entered here so it is reserved from now on. *)
+        upsert_sell_commitment ~state ~id:oid ~price ~qty ~seen:true ~acked:true;
         if ecfg.remaintain_expired_sells
         then (
           let k = price_key price in
@@ -682,6 +694,37 @@ let sync_open_orders
         | Some (_, best_p) ->
           if price < best_p then closest_sell_order := Some (oid, price)));
   apply_pending_level_updates ();
+  (* Reconcile the in-flight sell ledger with this scan's feed. The ledger is
+     the authority for "base committed to a sell": the feed refreshes an
+     order's remaining qty while it lists it, but an order the feed has
+     stopped listing (reconnect / truncated snapshot / dropped hold) stays
+     reserved until its terminal event fires. An order that was never listed
+     AND never acked is kept only within the dispatch window (a lost
+     placement); an acked order is real base the venue holds and is kept
+     regardless. Local-only commitments are merged back into
+     [open_sell_orders] so the buy leg's wash-trade and 2*gi clamps still see
+     them. [locked_in_sells] is then the ledger total - the ONE committed
+     amount that every venue's sellable-base formula subtracts. *)
+  state.sell_commitments
+  <- List.filter_map
+       (fun (id, price, qty, seen, acked, armed) ->
+          match Hashtbl.find_opt feed_sell_qty id with
+          | Some (feed_price, feed_qty) ->
+            Some (id, feed_price, feed_qty, true, true, armed)
+          | None ->
+            if seen || acked
+            then (
+              state.open_sell_orders <- (id, price, qty) :: state.open_sell_orders;
+              Some (id, price, qty, seen, acked, armed))
+            else if now_time -. armed <= sell_commitment_in_flight_timeout_s
+            then (
+              state.open_sell_orders <- (id, price, qty) :: state.open_sell_orders;
+              Some (id, price, qty, false, false, armed))
+            else None)
+       state.sell_commitments;
+  state.feed_locked_sell_base
+  <- Hashtbl.fold (fun _ (_p, q) acc -> acc +. q) feed_sell_qty 0.0;
+  locked_in_sells := committed_sell_base state;
   let is_amend_active =
     state.inflight_amend_buy
     || InFlightOrders.is_in_flight state.duplicate_key_buy
@@ -772,8 +815,61 @@ let compute_buy_ref_price ~bid_price ~ask_price =
   if bid_price > 0.0 then bid_price else ask_price
 ;;
 
+(** Price a newly-OWED sell would be placed at, given the current book. This is
+    the single source of truth shared by [evaluate_sell_leg] (which places the
+    sell) and [evaluate_buy_leg] (which pre-clamps a fresh buy against the
+    companion sell's restricted zone in the SAME tick).
+
+    Why the buy leg needs it: the buy leg runs before the sell leg, so the
+    companion sell is not yet in the open-order feed when the fresh buy is
+    clamped. On a tick where a buy just filled, the sell leg then places a
+    fresh sell one rung LOWER than the closest sell the buy was clamped
+    against; the buy therefore lands inside the new sell's [2*gi] zone and is
+    amended back down on the next tick (the observed place-then-amend churn).
+    Clamping against this prospective price up front makes the placed buy equal
+    to what the amend would have produced - without the round trip.
+
+    A change here MUST keep [evaluate_sell_leg]'s placement and this
+    anticipation in lockstep; the two callers pass identical inputs. *)
+let owed_sell_price
+      ~(state : strategy_state)
+      ~(asset : trading_config)
+      ~(ecfg : exchange_config)
+      ~bid_price
+      ~ask_price
+      ~(capital_exhausted : bool)
+  =
+  let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
+  let grid_interval = asset.grid_interval in
+  let base_price_for_sell =
+    if ecfg.remaintain_expired_sells
+    then (
+      match state.last_buy_fill_price with
+      | Some fill_p -> fill_p
+      | None -> bid_price)
+    else (
+      match state.last_buy_fill_price with
+      | Some fill_p
+        when capital_exhausted
+             || ((not state.resuming_after_balance_flag)
+                 && abs_float (bid_price -. fill_p)
+                    <= bid_price *. (grid_interval /. 100.0)) -> fill_p
+      | Some _ -> bid_price
+      | None -> bid_price)
+  in
+  let raw_sell_price =
+    calculate_grid_price base_price_for_sell grid_interval true state
+  in
+  if is_alpaca
+  then raw_sell_price
+  else if ask_price > 0.0
+  then max raw_sell_price ask_price
+  else raw_sell_price
+;;
+
 (** Evaluates buy placement, multi-buy cancellation, and buy trailing. *)
 let evaluate_buy_leg
+      ~oracle_halted
       ~state
       ~now
       ~(asset : trading_config)
@@ -871,12 +967,44 @@ let evaluate_buy_leg
        when it amends). As in the trailing leg the clamp is PRICE-INDEPENDENT:
        while a sell is tracked by order management the fresh buy is kept at
        least 2*gi below it; the clamp is released only when the sell is
-       removed from tracking. *)
+       removed from tracking.
+
+       The buys already in the feed are not the only sells that matter: the
+       companion sell the sell leg will place LATER in this same tick is not
+       yet visible here, and in a falling market it lands a rung below the
+       closest existing sell. Clamping only against the existing feed made the
+       fresh buy pass, then the companion sell's zone caught it and the next
+       tick amended it down. The prospective sell is therefore computed with
+       the shared [owed_sell_price] and folded into the same clamp, so the
+       placed buy already equals the amend target. *)
+    let floor_for_sell sell_price =
+      sell_price -. (sell_price *. (2.0 *. grid_interval /. 100.0))
+    in
     let buy_price =
       match closest_sell_order_initial with
-      | Some (_, sell_price) ->
-        min buy_price (sell_price -. (sell_price *. (2.0 *. grid_interval /. 100.0)))
+      | Some (_, sell_price) -> min buy_price (floor_for_sell sell_price)
       | None -> buy_price
+    in
+    (* Only anticipate the companion sell when the sell leg is actually owed
+       one WITH inventory behind it - a just-filled buy or a balance recovery.
+       There the sell will rest at [owed_sell_price] and the 2*gi clamp is real.
+       Gating on those signals keeps a below-market buy from being pulled down
+       against a sell that will never place (e.g. no sellable inventory), which
+       would only add an up-amend on the next tick. *)
+    let buy_price =
+      if state.just_filled_buy || state.resuming_after_balance_flag
+      then (
+        let companion_sell_price =
+          owed_sell_price
+            ~state
+            ~asset
+            ~ecfg:state.cached_ecfg
+            ~bid_price
+            ~ask_price
+            ~capital_exhausted:(oracle_halted || state.capital_low)
+        in
+        min buy_price (floor_for_sell companion_sell_price))
+      else buy_price
     in
     let buy_cooldown_key = "place_Buy" in
     let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_cooldown_key in
@@ -1327,14 +1455,21 @@ let evaluate_excess_sweep
     dead-armed forever and the block logging re-fires every tick (the LIT
     dust-balance spam).
 
-    Sell sizing: accumulation venues (Hyperliquid/Lighter/IBKR) size the sell
-    PURELY by the non-accrued inventory = available balance - reserved_base.
-    The venue's available balance is tradeable (total - hold from open
-    orders), so resting-sell holds are already netted and locked_in_sells is
-    NOT subtracted again - subtracting it double-counted the hold and
-    understated the inventory below the floor, blocking the sell. Non-
-    accumulation venues size by qty * sell_mult (Kraken), clamped to the
-    sellable inventory. The result must clear the venue's QUOTE-NOTIONAL
+    Sell sizing: base already committed to a resting or in-flight sell is
+    NEVER sellable on ANY venue. The single formula is
+
+      available = spot_holding - reserved_base - committed_sell_base
+
+    where [committed_sell_base] is the base the venue has not already removed
+    from its reported figure for us (see [effective_committed_sell_base]):
+    the ledger's excess over the venue feed on net-balance venues (never
+    below the short [unnetted_hold] feed-lag overlay), and the whole in-flight
+    sell ledger on gross-balance venues. Venue differences live ONLY in how
+    the spot holding is obtained: accumulation venues use the venue's reported
+    figure (tradeable on Hyperliquid, gross on Kraken/IBKR/Lighter); Alpaca
+    uses the venue's own [qty_available] (already free of resting holds). The
+    ledger is what makes this correct even when a venue's open-order feed
+    drops a live order. The result must clear the venue's QUOTE-NOTIONAL
     minimum ([cached_venue_min_notional]; Alpaca's minimum is a dollar
     notional, Hyperliquid's a 10 USDC spot floor). Sells are deliberately
     NOT floored at [cached_venue_min_qty]: accrual sells (sell_mult x qty)
@@ -1362,6 +1497,17 @@ let evaluate_sell_leg
      [total - hold] figure still counts that base as free, and sizing
      against it is the reserved_base leak under volatility. *)
   let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age in
+  (* The base to subtract from the venue's reported holding: the ledger total
+     on gross-balance venues, and the ledger's excess over the venue feed
+     (never below the unnetted overlay) on net-balance venues. See
+     [effective_committed_sell_base]. *)
+  let committed_sell =
+    effective_committed_sell_base
+      ~ecfg
+      ~ledger_total:locked_in_sells
+      ~feed_total:state.feed_locked_sell_base
+      ~unnetted_hold
+  in
   (* Sizing reads the in-memory position ledger, not the raw venue snapshot:
      the ledger is the venue figure plus the timestamp-windowed buy credits the
      feed has not netted (see [unreflected_buy_credit]), so the 1:1 sell is
@@ -1380,7 +1526,7 @@ let evaluate_sell_leg
      replace windows, missed events). *)
   let alpaca_available =
     if Float.is_nan asset_available
-    then ledger_balance -. state.reserved_base -. locked_in_sells -. unnetted_hold
+    then ledger_balance -. state.reserved_base -. committed_sell
     else
       Float.max
         0.0
@@ -1391,7 +1537,7 @@ let evaluate_sell_leg
     then 0.0
     else if is_alpaca
     then alpaca_available
-    else ledger_balance -. state.reserved_base -. locked_in_sells -. unnetted_hold
+    else ledger_balance -. state.reserved_base -. committed_sell
   in
   (* the persisted-sell grid is reconciled ONCE per execution and the
      result is reused by the three persisted-sell branches below. The
@@ -1463,21 +1609,20 @@ let evaluate_sell_leg
            q;
          state.last_sell_fill_price <- Some p)
       !pruned_missing);
-  (* Balance basis per venue: accumulation venues (Hyperliquid, Lighter,
-     IBKR, Kraken) report balances that ALREADY net out open-order holds -
-     Hyperliquid's store subtracts the hold at ingestion, and Kraken's
-     tradeable accessor derives holds from its executions feed on read - so
-     subtracting [locked_in_sells] again would double-count the resting-sell
-     hold and zero out real inventory. Non-accumulation venues (Alpaca cash)
-     report gross balances, so the hold is subtracted here. This MUST be the
-     same basis the sizing branch below uses ([available]), or the inventory
-     gate and the sizing disagree. *)
+  (* Balance basis per venue: [locked_in_sells] (the in-flight sell ledger
+     total) is subtracted on EVERY venue so base committed to a resting or
+     in-flight sell is never considered free, regardless of whether the
+     venue's reported figure nets open-order holds. The venue difference is
+     only the spot figure: accumulation venues use [ledger_balance], Alpaca
+     uses its venue-authoritative [qty_available]. This MUST be the same
+     basis the sizing branch below uses ([available]), or the inventory gate
+     and the sizing disagree. *)
   let is_accumulation_basis = ecfg.use_accumulation_sells in
   let inventory_basis =
     if Float.is_nan asset_balance
     then 0.0
     else if is_accumulation_basis
-    then ledger_balance -. state.reserved_base -. unnetted_hold
+    then ledger_balance -. state.reserved_base -. committed_sell
     else available_base
   in
   (* Inventory gate for sell placement: available non-accrued inventory must
@@ -1600,7 +1745,6 @@ let evaluate_sell_leg
     && not is_sell_on_cooldown
   then (
     let asset_bal = ledger_balance in
-    let grid_interval = asset.grid_interval in
     let qty =
       match state.last_buy_fill_qty with
       | Some q when q > 0.0 -> q
@@ -1651,57 +1795,13 @@ let evaluate_sell_leg
       match target_sell_price_opt with
       | Some tp -> tp
       | None ->
-        let base_price_for_sell =
-          if ecfg.remaintain_expired_sells
-          then (
-            (* Alpaca: Strictly use buy fill price to prevent selling at a loss during price drops *)
-            match state.last_buy_fill_price with
-            | Some fill_p -> fill_p
-            | None -> bid_price)
-          else (
-            (* Non-Alpaca venues: the existing re-anchoring behavior, EXCEPT
-               under capital exhaustion. There the bottom-rung recovery sell
-               must stay on the ladder rung above the last buy fill (fill + gi)
-               so it fills on a bounce and preserves the grid's economics -
-               re-anchoring it down to a drifted bid would sell at a loss and
-               still leave the ladder unanchored. *)
-            match state.last_buy_fill_price with
-            | Some fill_p
-              when capital_exhausted
-                   || ((not state.resuming_after_balance_flag)
-                       && abs_float (bid_price -. fill_p)
-                          <= bid_price *. (grid_interval /. 100.0)) -> fill_p
-            | Some fill_p ->
-              Logging.debug_f
-                ~section
-                "Re-anchoring sell base price for %s to bid %.4f (last fill %.4f drifted \
-                 or resuming_after_balance=%B)"
-                asset.symbol
-                bid_price
-                fill_p
-                state.resuming_after_balance_flag;
-              bid_price
-            | None -> bid_price)
-        in
-        let raw_sell_price =
-          calculate_grid_price base_price_for_sell grid_interval true state
-        in
-        if is_alpaca
-        then
-          (* Alpaca: the sell is anchored on the fill + gi - it must NOT be
-             pushed up to the current ask. Clamping to the ask made every new
-             sell land on the same price while the market bounced (SPCX sells
-             stacking at 138.50) instead of laddering down as the price moved
-             down. With the fill anchor the sell rungs descend with the fills
-             (equidistant at the grid interval), the current price stays
-             inside the pair's 2*gi bracket, and the sell can never be below
-             fill + gi, so the fill-anchored profitability is preserved. When
-             the market is above the sell, the resting sell simply fills at
-             the better market price (Alpaca ignores post-only). *)
-          raw_sell_price
-        else if ask_price > 0.0
-        then max raw_sell_price ask_price
-        else raw_sell_price
+        (* The owed sell price (fill/bid anchor + gi, lifted to the ask on
+           non-Alpaca venues) lives in [owed_sell_price] so the fresh-buy leg
+           can anticipate the exact same price when it clamps in this tick.
+           Re-anchoring to the bid (rather than the drifted fill) is decided
+           there, including the capital-exhaustion exception that keeps the
+           recovery rung at fill + gi. *)
+        owed_sell_price ~state ~asset ~ecfg ~bid_price ~ask_price ~capital_exhausted
     in
     (* Sell quantity: every filled buy owes exactly one 1:1 sell of what it
        bought (the persisted replacement level restores its own qty). All
@@ -1712,23 +1812,19 @@ let evaluate_sell_leg
       | Some tq -> tq
       | None -> qty
     in
-    (* Non-accrued sellable inventory (the amount not accrued into
-       reserved_base). On accumulation venues (Hyperliquid/Lighter/IBKR) the
-       venue's available balance is tradeable - total minus the hold from open
-       orders (see Hyperliquid_balances.BalanceStore) - so base held by
-       resting sells is ALREADY netted out of [asset_balance]; subtracting
-       [locked_in_sells] again double-counted the resting-sell hold and
-       understated the inventory below the floor, which blocked the sell. Per
-       the sizing directive, accumulation venues size the sell PURELY by this
-       non-accrued inventory. Non-accumulation venues (Alpaca, Kraken) report
-       full balances, so resting sells are subtracted explicitly. *)
+    (* Non-accrued, uncommitted sellable inventory. Base committed to a
+       resting or in-flight sell is subtracted on EVERY venue via
+       [locked_in_sells] (the in-flight sell ledger), so it can never be
+       offered again - not even when the venue reports a gross figure or its
+       open-order feed momentarily drops a live order. Alpaca uses the
+       venue's own [qty_available], which is already free of resting holds. *)
     let is_accumulation = ecfg.use_accumulation_sells in
     let available =
       if is_accumulation
-      then Float.max 0.0 (asset_bal -. state.reserved_base -. unnetted_hold)
+      then Float.max 0.0 (asset_bal -. state.reserved_base -. committed_sell)
       else if is_alpaca
       then alpaca_available
-      else Float.max 0.0 (asset_bal -. state.reserved_base -. locked_in_sells)
+      else Float.max 0.0 (asset_bal -. state.reserved_base -. committed_sell)
     in
     let min_order_size =
       if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
@@ -2202,6 +2298,7 @@ let execute_strategy
              then false
              else
                evaluate_buy_leg
+                 ~oracle_halted
                  ~state
                  ~now
                  ~asset

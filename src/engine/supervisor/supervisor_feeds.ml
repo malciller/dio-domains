@@ -404,6 +404,45 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
       Logging.warn_f ~section "Alpaca open-orders bootstrap timed out after 10s";
       Lwt.return_unit
   in
+  (* Kraken: the WS executions snapshot caps snap_orders, so orders resting
+     before this process started (or beyond the cap) are absent and the
+     snapshot reconcile drops any cached copy. Restore them from REST
+     /OpenOrders now and after every snapshot/reconnect so the strategy's
+     open-order scan (and the dashboard sell count) sees pre-existing sells as
+     committed inventory, not free. *)
+  if has_kraken
+  then
+    Kraken.Kraken_executions_feed.set_on_snapshot_hook (fun () ->
+      Lwt.async (fun () ->
+        Lwt.catch
+          (fun () ->
+             Kraken.Kraken_open_orders.get_open_orders ~symbols:kraken_symbols ()
+             >|= Kraken.Kraken_executions_feed.inject_open_orders)
+          (fun exn ->
+             Logging.warn_f
+               ~section
+               "Kraken open-orders bootstrap after snapshot failed: %s"
+               (Printexc.to_string exn);
+             Lwt.return_unit)));
+  let%lwt () =
+    let open_orders_p =
+      if has_kraken
+      then
+        Lwt.pick
+          [ (Kraken.Kraken_open_orders.get_open_orders ~symbols:kraken_symbols ()
+             >|= fun events ->
+             Kraken.Kraken_executions_feed.inject_open_orders events;
+             `Ok)
+          ; (Lwt_unix.sleep 10.0 >|= fun () -> `Timed_out)
+          ]
+      else Lwt.return `Ok
+    in
+    match%lwt open_orders_p with
+    | `Ok -> Lwt.return_unit
+    | `Timed_out ->
+      Logging.warn_f ~section "Kraken open-orders bootstrap timed out after 10s";
+      Lwt.return_unit
+  in
   (* Step 7: Register and start remaining supervised WebSocket connections *)
   Logging.info ~section "Step 7: Starting Kraken websocket connections...";
   (* Kraken orderbook feed *)

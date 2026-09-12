@@ -3,6 +3,7 @@
 open Strategy_common
 open Jacobs_ladder_types
 open Jacobs_ladder_config
+open Jacobs_ladder_reservation
 
 (** Shared order ringbuffer across all strategy domains. *)
 let order_buffer = LockFreeQueue.create ()
@@ -137,16 +138,29 @@ let push_order ~now ?state order =
         (match order.operation with
          | Place ->
            let order_ecfg = get_exchange_config order.exchange in
+           let order_price = Option.value order.price ~default:0.0 in
+           let temp_order_id =
+             Printf.sprintf
+               "pending_%s_%.2f"
+               (string_of_order_side order.side)
+               order_price
+           in
+           (* Arm the in-flight sell ledger at dispatch, for EVERY venue
+               (including the track_pending_sells=false ones): the base leaves
+               the sellable pool the instant the order is pushed, before any
+               ack or venue-feed visibility, and is only released on a
+               terminal event. *)
+           (match order.side with
+            | Sell ->
+              arm_sell_commitment
+                ~state
+                ~id:temp_order_id
+                ~price:order_price
+                ~qty:order.qty
+            | Buy -> ());
            let skip_pending = (not order_ecfg.track_pending_sells) && order.side = Sell in
            if not skip_pending
            then (
-             let temp_order_id =
-               Printf.sprintf
-                 "pending_%s_%.2f"
-                 (string_of_order_side order.side)
-                 (Option.value order.price ~default:0.0)
-             in
-             let order_price = Option.value order.price ~default:0.0 in
              let timestamp = now in
              state.pending_orders
              <- (temp_order_id, order.side, order_price, timestamp)
@@ -154,8 +168,7 @@ let push_order ~now ?state order =
              match order.side, order.price with
              | Sell, Some price ->
                state.open_sell_orders
-               <- (temp_order_id, price, order.qty) :: state.open_sell_orders;
-               ()
+               <- (temp_order_id, price, order.qty) :: state.open_sell_orders
              | _ -> ())
          | Amend ->
            let temp_order_id =

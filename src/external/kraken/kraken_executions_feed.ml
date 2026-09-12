@@ -984,6 +984,30 @@ let parse_execution_event json =
     None
 ;;
 
+(** Hook invoked after every execution snapshot has been ingested and
+    reconciled. The supervisor wires this to the REST /OpenOrders bootstrap:
+    Kraken caps the WS [snap_orders] payload, so resting orders placed before
+    this process started (or beyond the cap) are absent from the snapshot and
+    the reconcile below would prunes them. Kept as a hook to avoid a module
+    cycle - the REST fetcher already depends on this module. *)
+let on_snapshot_hook : (unit -> unit) ref = ref (fun () -> ())
+
+let set_on_snapshot_hook f = on_snapshot_hook := f
+
+(** Injects authoritative open orders fetched out-of-band (REST /OpenOrders,
+    no cap) into the same cache the strategy's open-order scan reads, so
+    pre-existing resting orders are adopted instead of looking like free
+    inventory. Non-terminal events upsert; terminal events remove. *)
+let inject_open_orders (events : execution_event list) =
+  List.iter
+    (fun (event : execution_event) ->
+       let store = get_symbol_store event.symbol in
+       update_open_orders store event;
+       Atomic.set store.last_event_time event.timestamp;
+       notify_ready store)
+    events
+;;
+
 (** Processes an execution snapshot: ingests events and reconciles stale open orders. *)
 let handle_snapshot json on_heartbeat =
   try
@@ -1068,7 +1092,9 @@ let handle_snapshot json on_heartbeat =
       all_symbols;
     Logging.debug_f ~section "Execution snapshot processed and reconciled";
     (* Lock the adaptive order_to_symbol cap after startup snapshot ingestion. *)
-    lock_order_to_symbol_cap ()
+    lock_order_to_symbol_cap ();
+    (* Restore orders the (possibly capped) WS snapshot omitted. *)
+    !on_snapshot_hook ()
   with
   | exn ->
     Logging.error_f

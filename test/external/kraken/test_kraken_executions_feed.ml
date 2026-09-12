@@ -291,6 +291,81 @@ let test_ring_buffer_capacity () =
     (List.mem 1 data_after_overflow)
 ;;
 
+let make_open_sell ~id ~symbol ~qty ~price =
+  { Kraken.Kraken_executions_feed.order_id = id
+  ; symbol
+  ; exec_type = Kraken.Kraken_executions_feed.Restated
+  ; order_status = Kraken.Kraken_executions_feed.NewStatus
+  ; side = Kraken.Kraken_executions_feed.Sell
+  ; order_qty = qty
+  ; cum_qty = 0.0
+  ; cum_cost = 0.0
+  ; avg_price = price
+  ; limit_price = Some price
+  ; last_qty = None
+  ; last_price = None
+  ; fee = None
+  ; trade_id = None
+  ; order_userref = None
+  ; cl_ord_id = None
+  ; timestamp = Unix.gettimeofday ()
+  }
+;;
+
+let test_inject_pre_existing_open_sell () =
+  (* REGRESSION: orders that existed before this process started (or beyond
+     the WS snap_orders cap) must be adoptable. The REST /OpenOrders bootstrap
+     injects them into the same cache the strategy's open-order scan reads, so
+     pre-existing sells are reserved inventory, not free. *)
+  let symbol = "PREEXIST/USD" in
+  Kraken.Kraken_executions_feed.inject_open_orders
+    [ make_open_sell ~id:"preexist-sell-1" ~symbol ~qty:0.75 ~price:539.67
+    ; make_open_sell ~id:"preexist-sell-2" ~symbol ~qty:0.25 ~price:544.10
+    ];
+  let orders = Kraken.Kraken_executions_feed.get_open_orders symbol in
+  Alcotest.(check int) "injected open sells are visible" 2 (List.length orders);
+  Alcotest.(check bool)
+    "injected remaining qty is carried"
+    true
+    (List.exists
+       (fun (o : Kraken.Kraken_executions_feed.open_order) ->
+          o.order_id = "preexist-sell-1" && abs_float (o.remaining_qty -. 0.75) < 1e-9)
+       orders)
+;;
+
+let test_snapshot_hook_fires () =
+  (* The supervisor wires the REST bootstrap to this hook. Every snapshot
+     (initial subscribe AND every reconnect) must fire it, because the
+     snapshot reconcile removes cached orders absent from the (capped)
+     snapshot - including the ones the bootstrap just restored. *)
+  let calls = ref 0 in
+  Kraken.Kraken_executions_feed.set_on_snapshot_hook (fun () -> incr calls);
+  Kraken.Kraken_executions_feed.handle_snapshot
+    (`Assoc [ "data", `List [] ])
+    (fun () -> ());
+  Alcotest.(check int) "snapshot hook fired" 1 !calls;
+  Kraken.Kraken_executions_feed.set_on_snapshot_hook (fun () -> ())
+;;
+
+let test_resolve_rest_pair_to_symbol () =
+  (* REST /OpenOrders [descr.pair] arrives in the legacy pair form; it must be
+     mapped to the configured symbol or the injected order lands under a key
+     the strategy never scans. *)
+  let symbols = [ "XMR/USD"; "BTC/USD"; "ETH/USD" ] in
+  Alcotest.(check string)
+    "altname maps to the configured symbol"
+    "XMR/USD"
+    (Kraken.Kraken_open_orders.resolve_symbol ~symbols "XMRUSD");
+  Alcotest.(check string)
+    "legacy XXBTZUSD maps to BTC/USD"
+    "BTC/USD"
+    (Kraken.Kraken_open_orders.resolve_symbol ~symbols "XXBTZUSD");
+  Alcotest.(check string)
+    "unknown pair falls back to raw"
+    "FOOUSDT"
+    (Kraken.Kraken_open_orders.resolve_symbol ~symbols "FOOUSDT")
+;;
+
 let () =
   Alcotest.run
     "Kraken Executions Feed"
@@ -308,6 +383,18 @@ let () =
             `Quick
             test_execution_event_structure
         ; Alcotest.test_case "open order structure" `Quick test_open_order_structure
+        ; Alcotest.test_case
+            "pre-existing open sells can be injected"
+            `Quick
+            test_inject_pre_existing_open_sell
+        ; Alcotest.test_case
+            "snapshot fires the open-orders restore hook"
+            `Quick
+            test_snapshot_hook_fires
+        ; Alcotest.test_case
+            "REST pair resolves to the configured symbol"
+            `Quick
+            test_resolve_rest_pair_to_symbol
         ] )
     ; ( "ring buffer"
       , [ Alcotest.test_case "ring buffer operations" `Quick test_ring_buffer_operations

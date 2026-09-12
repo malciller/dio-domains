@@ -19,6 +19,7 @@ type exchange_config = Jacobs_ladder_types.exchange_config =
   ; sell_failure_sets_asset_low : bool
   ; use_reserved_base_guard : bool
   ; use_unnetted_sell_hold : bool
+  ; balance_nets_open_order_holds : bool
   ; asset_low_requires_balance_change : bool
   ; merge_preserved_sells : bool
   ; check_stale_balance : bool
@@ -72,6 +73,26 @@ let can_place_buy_order = Jacobs_ladder_reservation.can_place_buy_order
 let can_place_sell_order = Jacobs_ladder_reservation.can_place_sell_order
 let amend_allowed = Jacobs_ladder_reservation.amend_allowed
 let has_active_sell = Jacobs_ladder_reservation.has_active_sell
+
+let sell_commitment_in_flight_timeout_s =
+  Jacobs_ladder_reservation.sell_commitment_in_flight_timeout_s
+;;
+
+let upsert_sell_commitment = Jacobs_ladder_reservation.upsert_sell_commitment
+let arm_sell_commitment = Jacobs_ladder_reservation.arm_sell_commitment
+let rekey_sell_commitment = Jacobs_ladder_reservation.rekey_sell_commitment
+let remove_sell_commitment = Jacobs_ladder_reservation.remove_sell_commitment
+
+let remove_pending_sell_commitments =
+  Jacobs_ladder_reservation.remove_pending_sell_commitments
+;;
+
+let committed_sell_base = Jacobs_ladder_reservation.committed_sell_base
+
+let effective_committed_sell_base =
+  Jacobs_ladder_reservation.effective_committed_sell_base
+;;
+
 let order_buffer = Jacobs_ladder_orders.order_buffer
 let get_order_buffer = Jacobs_ladder_orders.get_order_buffer
 let create_place_order = Jacobs_ladder_orders.create_place_order
