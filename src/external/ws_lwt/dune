@@ -1,7 +1,7 @@
 (library
  (name ws_lwt)
  (public_name dio.ws_lwt)
- (modules ws_lwt)
+ (modules ws_lwt ctx)
  (libraries
   websocket
   conduit-lwt-unix
@@ -11,3 +11,17 @@
   base64
   uri
   ipaddr.unix))
+
+; Compatibility shim for [Conduit_lwt_unix.default_ctx], whose type changed from
+; [ctx Lazy.t] (Conduit >= 3) to [ctx] (Conduit < 3, used by the OxCaml bundle).
+; The classic-flambda toolchain reports [flambda = true]; the OxCaml compiler
+; does not. Generate ctx.ml from the matching source at build time.
+(rule
+ (targets ctx.ml)
+ (enabled_if %{ocaml-config:flambda})
+ (action (copy ctx_lazy.ml ctx.ml)))
+
+(rule
+ (targets ctx.ml)
+ (enabled_if (not %{ocaml-config:flambda}))
+ (action (copy ctx_direct.ml ctx.ml)))

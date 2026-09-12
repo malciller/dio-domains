@@ -51,28 +51,37 @@ RUN chown opam:opam /app
 
 USER opam
 
-# 3a. Copy the OxCaml patch overlay BEFORE the switch so it can be registered as
-#     an opam repository. It carries patched builds of libraries that do not
-#     compile under OxCaml (see oxcaml-port/opam-overlay/README.md).
-COPY --chown=opam:opam oxcaml-port/opam-overlay /app/oxcaml-port/opam-overlay
-
-# 3b. Create the OxCaml switch from the OxCaml opam repository, with the local
-#     overlay registered after it. This compiles the OxCaml (flambda2) compiler,
-#     so the layer is cached and only rebuilt when the base image or this
-#     command changes. autoconf/automake are already installed above (OxCaml's
-#     bootstrap needs them).
+# 3a. Create the OxCaml switch from the OxCaml opam repository. This compiles
+#     the OxCaml (flambda2) compiler, so the layer is cached and only rebuilt
+#     when the base image or this command changes. autoconf/automake are
+#     already installed above (OxCaml's bootstrap needs them).
+#
+#     The local patch overlay is deliberately NOT referenced here: its contents
+#     affect only dependency builds, so keeping it out of this layer means
+#     editing a patch does not invalidate (and recompile) the compiler.
 RUN --mount=type=cache,target=/home/opam/.opam/download-cache,uid=1000,gid=1000 \
     opam update -y \
     && opam switch create 5.2.0+ox ocaml-variants.5.2.0+ox \
-         --repos ox=git+https://github.com/oxcaml/opam-repository.git,\
-dio-ox=file:///app/oxcaml-port/opam-overlay,default
+         --repos ox=git+https://github.com/oxcaml/opam-repository.git,default
 
-# 3c. Select the OxCaml switch for every subsequent layer and fail the build
+# 3b. Select the OxCaml switch for every subsequent layer and fail the build
 #     immediately if the resulting compiler is not OxCaml.
 ENV OPAMSWITCH=5.2.0+ox
 RUN eval $(opam env) \
     && opam list --installed --short | grep -qi 'oxcaml' \
     && ocamlopt -config-var version
+
+# 3c. Register the local patch overlay (see oxcaml-port/opam-overlay/README.md).
+#     Kept below the compiler layer so overlay edits only invalidate the
+#     dependency-install layer below, never the compiler build.
+#     dio-ox is given rank 2 and the OxCaml repo rank 1 via the switch repo
+#     selection, so dio-ox outranks the default repo: a `+dioN` patch then wins
+#     over the unpatched release of the same version, while `+ox` packages from
+#     the OxCaml repo still resolve.
+COPY --chown=opam:opam oxcaml-port/opam-overlay /app/oxcaml-port/opam-overlay
+RUN eval $(opam env) \
+    && opam repo add dio-ox file:///app/oxcaml-port/opam-overlay --rank=2 \
+    && opam repo list
 
 # 4. Copy project descriptors first (layer-cache friendly)
 COPY --chown=opam:opam dio.opam dune-project ./

@@ -575,7 +575,7 @@ let () =
   (* Force Conduit context initialization before domain spawning to prevent
      CamlinternalLazy.Undefined race conditions in concurrent Lazy.force calls. *)
   (try
-     let _ctx = Lazy.force Conduit_lwt_unix.default_ctx in
+     let _ctx = Ws_lwt.resolve_ctx () in
      Logging.debug ~section:"main" "Conduit context initialized successfully"
    with
    | exn ->

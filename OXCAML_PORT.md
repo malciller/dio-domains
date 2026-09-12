@@ -682,3 +682,45 @@ Newest last. Format: `### YYYY-MM-DD — <session/agent> — <task ids>` then wh
 - No `src/`/`test/` changes; no commit; `deploy.sh` not run.
 
 
+
+### 2026-09-12 — G2/G3/G4 achieved — OxCaml builds and passes tests
+- **Status: the port builds and tests green under OxCaml.** `linux/arm64` Docker
+  builder stage completed end-to-end:
+  - G1 compiler: OxCaml `5.2.0+ox` built (`ocamlopt -config-var version` =
+    `5.2.0+ox`).
+  - G2 dependency closure: all deps compile, including the three patched ones
+    via `oxcaml-port/opam-overlay` (`msgpck.1.7+dio1`,
+    `digestif.1.3.1+dio1`, `cohttp-lwt.4.0.0+dio1` + version-only
+    `cohttp`/`cohttp-lwt-unix` companions).
+  - G3 release binaries: `bin/main.exe` (42 MB) and `bin/dashboard.exe` (26 MB)
+    built with `--profile=release` under OxCaml.
+  - G4 tests: **69/69 suites pass** under OxCaml (`dune runtest --force`, run in
+    the builder container with `test/` bind-mounted, since `.dockerignore`
+    excludes it from the image).
+- Residual output is **alerts only** (non-fatal): `unsafe_multidomain`
+  (`Sys.set_signal`, `Domain.DLS.*`, `Unix.putenv`, `Printexc.register_printer`)
+  and `do_not_spawn_domains` (`Domain.spawn`). These are OxCaml safety warnings,
+  not errors; the engine intentionally uses `Domain.spawn` and per-domain DLS.
+  A follow-up may want to use `Sys.Safe.*` / `Domain.Safe.DLS.*` where practical.
+- **Conduit compatibility.** Conduit changed `default_ctx` from `ctx Lazy.t`
+  (Conduit >= 3, classic-flambda) to `ctx` (Conduit < 3, OxCaml bundle 2.2.2).
+  A conduit overlay patch was tried and **rejected**: forcing `ctx Lazy.t` breaks
+  `cohttp-lwt-unix 4.0.0`, which expects the direct type. Instead a source-level
+  shim was added: `src/external/ws_lwt/ctx_lazy.ml` vs `ctx_direct.ml`, selected
+  by a dune `rule` on `%{ocaml-config:flambda}`, exposed as
+  `Ws_lwt.resolve_ctx ()`. All `Lazy.force Conduit_lwt_unix.default_ctx` sites
+  now call it: `ws_lwt.ml`, `bin/main.ml`, `kraken_common_types.ml`,
+  `hyperliquid_ws.ml`, `alpaca_orderbook.ml`, `lighter_ws.ml`.
+- **Docker layer/caching fix.** The OxCaml switch-creation layer no longer
+  references the overlay: the overlay is copied and `opam repo add`-ed in a
+  later layer. Editing a patch now invalidates only the dependency-install layer,
+  not the (slow) compiler build. Repo ranks: `ox`=1, `dio-ox`=2, `default`=3, so
+  `+dioN` patches win over the unpatched release while `+ox` packages still
+  resolve. Verified `opam install msgpck --dry-run` selects `msgpck.1.7+dio1`.
+- Reproduce (full): `DOCKER_BUILDKIT=1 docker buildx build --progress=plain
+  --platform linux/arm64 --target builder -t dio-oxcaml-builder --load .`
+  (needs Docker >= 16 GB RAM). Logs: `/tmp/docker_oxcaml_build{6..11}.log`.
+- Not yet done: `linux/amd64` validation, G5 prod rollout/A-B/rollback, and
+  turning the branch Dockerfile into the real OxCaml image (currently the branch
+  Dockerfile has the OxCaml switch block applied; revisit before merge).
+- Next: WS9 (amd64 + full green) then WS10 (G5). Also commit this milestone.

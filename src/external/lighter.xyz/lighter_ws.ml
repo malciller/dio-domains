@@ -424,7 +424,7 @@ let rec connect_one
          | _ -> failwith (Printf.sprintf "Failed to resolve %s" connect_host)
        in
        let client = `TLS (`Hostname connect_host, `IP ip, `Port connect_port) in
-       let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
+       let ctx = Ws_lwt.resolve_ctx () in
        (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP
           connection during the handshake would otherwise block the
           reconnect (which runs on the main Lwt loop) indefinitely. *)

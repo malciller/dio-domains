@@ -560,7 +560,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
          | _ -> failwith (Printf.sprintf "Failed to resolve %s" hostname)
        in
        let client = `TLS (`Hostname hostname, `IP ip, `Port port) in
-       let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
+       let ctx = Ws_lwt.resolve_ctx () in
        Lwt_unix.with_timeout ws_connect_timeout_s (fun () ->
          Ws_lwt.connect ~ctx client uri)
        >>= fun conn ->
