@@ -85,16 +85,21 @@ jobs:
         run: opam exec --switch default -- dune runtest
 
   build-test-oxcaml:
-    # OxCaml (flambda2) build + tests. The Dockerfile creates the OxCaml switch
-    # and applies the patch overlay in oxcaml-port/opam-overlay. This is the
-    # toolchain the `oxcaml` branch targets; see OXCAML_PORT.md.
+    # OxCaml (flambda2) build + tests, using the split image process:
+    # Dockerfile.base builds the OxCaml compiler + all opam deps (slow, changes
+    # rarely), and Dockerfile builds the engine on top of it (fast). The base
+    # image is cached between CI runs so day-to-day builds never recompile the
+    # compiler. See OXCAML_PORT.md.
     #
-    # Requires a runner with Docker and >= 16 GB RAM (the OxCaml compiler
-    # bootstrap OOMs at 8 GB). On the self-hosted Gitea runner, `runs-on`
-    # must name a label whose runner has both; change it if needed.
+    # Requires a runner with Docker and >= 16 GB RAM for the first (uncached)
+    # base build: the OxCaml compiler bootstrap OOMs at 8 GB. On the
+    # self-hosted Gitea runner, `runs-on` must name a label whose runner has
+    # both; change it if needed.
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      DIO_BASE_IMAGE: dio-oxcaml-base:5.2.0minus40
 
     steps:
       - uses: actions/checkout@v4
@@ -103,28 +108,51 @@ jobs:
         if: github.server_url == 'https://github.com'
         uses: docker/setup-buildx-action@v3
 
-      - name: Build OxCaml image (deps + release binaries)
-        # On GitHub-hosted runners (ephemeral) use the GitHub Actions cache
-        # backend so the expensive OxCaml compiler layer is reused across runs.
-        # On a self-hosted Gitea runner the Docker daemon persists between runs,
-        # so the Dockerfile's own layer cache is reused without any extra flags.
+      # --- Base image (OxCaml compiler + opam deps) ---
+      # On GitHub-hosted runners (ephemeral) the GitHub Actions cache backend
+      # keeps the expensive compiler layer across runs. On the self-hosted Gitea
+      # runner the Docker daemon persists, so its own layer cache is reused and
+      # the `docker image inspect` guard skips a rebuild entirely.
+      - name: Build OxCaml base image (GitHub-hosted runners)
         if: github.server_url == 'https://github.com'
         uses: docker/build-push-action@v6
         with:
           context: .
-          target: builder
+          file: Dockerfile.base
           load: true
-          tags: dio-oxcaml-builder
+          tags: ${{ env.DIO_BASE_IMAGE }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Build OxCaml image (self-hosted runner)
+      - name: Build OxCaml base image (self-hosted runner)
         if: github.server_url != 'https://github.com'
+        run: |
+          if docker image inspect "$DIO_BASE_IMAGE" >/dev/null 2>&1; then
+            echo "Base image $DIO_BASE_IMAGE already present; skipping."
+          else
+            echo "Base image missing; building (slow, one-time) …"
+            DOCKER_BUILDKIT=1 docker buildx build \
+              --progress=plain \
+              -f Dockerfile.base \
+              -t "$DIO_BASE_IMAGE" \
+              --load .
+          fi
+
+      # --- Application image (engine only) ---
+      # Tag the builder stage for tests (it has opam + dune; the final runtime
+      # stage is a minimal Ubuntu without a toolchain), and the full image
+      # builds the release binaries.
+      - name: Build engine image
         run: |
           DOCKER_BUILDKIT=1 docker buildx build \
             --progress=plain \
+            --build-arg "DIO_BASE_IMAGE=$DIO_BASE_IMAGE" \
             --target builder \
-            -t dio-oxcaml-builder \
+            -t dio-oxcaml-test \
+            --load .
+          DOCKER_BUILDKIT=1 docker buildx build \
+            --build-arg "DIO_BASE_IMAGE=$DIO_BASE_IMAGE" \
+            -t dio-oxcaml-app \
             --load .
 
       - name: Run test suite under OxCaml
@@ -136,7 +164,7 @@ jobs:
           docker run --rm \
             -v "$PWD/test:/app/test:ro" \
             --entrypoint bash \
-            dio-oxcaml-builder -lc \
+            dio-oxcaml-test -lc \
             'eval $(opam env) && cd /app && cp -r test /tmp/test && dune runtest --force 2>&1' \
             | tee /tmp/oxcaml-test.log
           if grep -q "Alert " /tmp/oxcaml-test.log; then
