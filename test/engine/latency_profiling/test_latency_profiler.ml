@@ -152,6 +152,52 @@ let test_zero_ns_percentile () =
   Alcotest.(check (float 0.0001)) "snapshot p999 is 0" 0.0 snap.p999
 ;;
 
+let test_record_ns () =
+  let t = LP.create "ns_direct" in
+  (* record_ns bypasses Mtime.Span boxing: 500ns routes to the ns tier, 2.5us
+     to the coarse tier at bucket_us=1, and a backwards clock (negative) is
+     clamped to 0 rather than indexing below the histogram. *)
+  LP.record_ns t 500;
+  LP.record_ns t 2500;
+  LP.record_ns t 30000;
+  LP.record_ns t (-5);
+  Alcotest.(check int) "samples" 4 t.samples;
+  Alcotest.(check int) "sub-us samples" 2 t.sub_us_samples;
+  Alcotest.(check int) "max stays at 30us" 30000 t.max_latency_ns;
+  Alcotest.(check (float 0.0001)) "p50 is the 500ns sample" 0.5 (LP.percentile t 0.50);
+  Alcotest.(check (float 0.0001)) "p99 is 30us" 30.0 (LP.percentile t 0.99)
+;;
+
+let test_record_ns_matches_record () =
+  let a = LP.create "span" in
+  let b = LP.create "ns" in
+  for i = 1 to 100 do
+    let ns = i * 137 in
+    LP.record a (Mtime.Span.of_uint64_ns (Int64.of_int ns));
+    LP.record_ns b ns
+  done;
+  Alcotest.(check int) "same samples" a.samples b.samples;
+  Alcotest.(check int) "same max" a.max_latency_ns b.max_latency_ns;
+  Alcotest.(check (float 0.0001)) "same p99" (LP.percentile a 0.99) (LP.percentile b 0.99)
+;;
+
+let test_canary_clock_nonalloc () =
+  (* The canary's whole purpose depends on a clock that does not allocate:
+     an allocating clock would make the detector trigger its own minor GCs.
+     Read 1000 times and assert the minor-word counter does not move. *)
+  let before = Gc.minor_words () in
+  let last = ref 0 in
+  let backwards = ref false in
+  for _ = 1 to 1000 do
+    let t = Monotonic_clock.now_ns () in
+    if t < !last then backwards := true;
+    last := t
+  done;
+  let allocated = Gc.minor_words () -. before in
+  Alcotest.(check bool) "monotonic never goes backwards" false !backwards;
+  Alcotest.(check (float 0.001)) "clock allocates no minor words" 0.0 allocated
+;;
+
 let test_snapshot_sub_us () =
   let t = LP.create "snap" in
   (* 10 samples of 250ns + 5 samples of 4us: the published snapshot must
@@ -313,10 +359,17 @@ let test_snapshot_no_threshold () =
 
 (* Minimal snapshot builder for the spike-message tests: only the fields the
    formatter reads are interesting; the rest are fixed sentinels. *)
-let snap ?(samples = 0) ?(over_threshold = 0) ?(max_us = 0.0) ?(p99 = 0.0) ?max_cause name
+let snap
+      ?(samples = 0)
+      ?(over_threshold = 0)
+      ?(max_us = 0.0)
+      ?(p99 = 0.0)
+      ?(p50 = 0.0)
+      ?max_cause
+      name
   =
   ({ LP.name
-   ; p50 = 0.0
+   ; p50
    ; p90 = 0.0
    ; p95 = 0.0
    ; p99
@@ -350,21 +403,24 @@ let test_spike_message_silent_when_healthy () =
 
 let test_spike_message_reports_breaches () =
   let clean = snap ~samples:1000 "clean" in
-  let strategy = snap ~samples:980 ~over_threshold:3 ~max_us:310.0 ~p99:90.0 "STRAT" in
+  let strategy =
+    snap ~samples:980 ~over_threshold:3 ~max_us:310.0 ~p99:90.0 ~p50:12.0 "STRAT"
+  in
   let cycle =
     snap
       ~samples:980
       ~over_threshold:2
       ~max_us:1200.0
       ~p99:250.0
+      ~p50:40.0
       ~max_cause:"ob:true ex:3"
       "CYCLE"
   in
   Alcotest.(check (option string))
-    "breaches named with max, count, p99 and cause; clean stages omitted"
+    "breaches named with max, p99, p50, count and cause; clean stages omitted"
     (Some
-       "[kraken/BTC/USD] latency spikes >=10.0us over 5s: STRAT max=310.0us spikes=3/980 \
-        p99=90.0us  CYCLE max=1.20ms spikes=2/980 p99=250.0us\n\
+       "[kraken/BTC/USD] latency spikes >=10.0us over 5s: STRAT max=310.0us p99=90.0us \
+        p50=12.0us spikes=3/980  CYCLE max=1.20ms p99=250.0us p50=40.0us spikes=2/980\n\
        \ worst-cycle cause: ob:true ex:3")
     (LP.spike_message
        ~key:"kraken/BTC/USD"
@@ -405,6 +461,14 @@ let () =
         ; test_case "ns bucket routing" `Quick test_ns_bucket_routing
         ; test_case "zero-ns percentiles stay 0" `Quick test_zero_ns_percentile
         ; test_case "snapshot carries sub-us percentiles" `Quick test_snapshot_sub_us
+        ; test_case "direct nanosecond record" `Quick test_record_ns
+        ; test_case "record_ns matches record" `Quick test_record_ns_matches_record
+        ] )
+    ; ( "stop-the-world canary"
+      , [ test_case
+            "clock is monotonic and non-allocating"
+            `Quick
+            test_canary_clock_nonalloc
         ] )
     ; ( "fine tier for coarse-bucket profilers"
       , [ test_case

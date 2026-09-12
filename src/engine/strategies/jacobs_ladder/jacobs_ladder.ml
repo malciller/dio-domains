@@ -43,6 +43,15 @@ type trading_config = Jacobs_ladder_types.trading_config =
 
 type strategy_state = Jacobs_ladder_types.strategy_state
 
+type sell_commitment = Jacobs_ladder_types.sell_commitment =
+  { mutable sc_price : float
+  ; mutable sc_qty : float
+  ; mutable sc_seen : bool
+  ; mutable sc_acked : bool
+  ; mutable sc_listed : bool
+  ; sc_armed : float
+  }
+
 (* Re-exported Values & Functions *)
 let section = Jacobs_ladder_types.section
 let take = Jacobs_ladder_types.take

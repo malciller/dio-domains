@@ -500,6 +500,10 @@ module Hyperliquid_impl = struct
         f o.order_id limit_price o.remaining_qty side_str o.order_userref)
   ;;
 
+  let get_open_orders_generation ~symbol:_ =
+    Hyperliquid_executions_feed.get_orders_generation ()
+  ;;
+
   let get_execution_feed_position ~symbol =
     Hyperliquid_executions_feed.get_current_position symbol
   ;;

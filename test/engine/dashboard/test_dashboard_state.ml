@@ -94,8 +94,27 @@ let test_ladder_sell_count_uses_ledger () =
   let symbol = "DASH_SELLCOUNT/XMR/USD" in
   let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
   state.open_sell_orders <- [];
-  state.sell_commitments
-  <- [ "oid-a", 539.67, 0.3, false, false, 0.0; "oid-b", 540.10, 0.2, true, true, 0.0 ];
+  Hashtbl.clear state.sell_commitments;
+  Hashtbl.replace
+    state.sell_commitments
+    "oid-a"
+    { Dio_strategies.Jacobs_ladder.sc_price = 539.67
+    ; sc_qty = 0.3
+    ; sc_seen = false
+    ; sc_acked = false
+    ; sc_listed = false
+    ; sc_armed = 0.0
+    };
+  Hashtbl.replace
+    state.sell_commitments
+    "oid-b"
+    { Dio_strategies.Jacobs_ladder.sc_price = 540.10
+    ; sc_qty = 0.2
+    ; sc_seen = true
+    ; sc_acked = true
+    ; sc_listed = true
+    ; sc_armed = 0.0
+    };
   let j = Dio_dashboard.Dashboard_state.json_of_grid_strategy "kraken" symbol in
   (match field j "sell_count" with
    | Some (`Int n) -> Alcotest.(check int) "ledger sells counted" 2 n

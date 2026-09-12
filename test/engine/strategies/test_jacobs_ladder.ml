@@ -5,6 +5,25 @@ open Alcotest
    1e-9 fractional increment behind dust-level pruning). *)
 let () = ignore Alpaca.Module.Alpaca_impl.name
 
+(* Seed the id-keyed sell-commitment ledger from the legacy list form used
+   throughout these fixtures. *)
+let set_sell_commitments tbl entries =
+  Hashtbl.clear tbl;
+  List.iter
+    (fun (id, price, qty, seen, acked, armed) ->
+       Hashtbl.replace
+         tbl
+         id
+         { Dio_strategies.Jacobs_ladder.sc_price = price
+         ; sc_qty = qty
+         ; sc_seen = seen
+         ; sc_acked = acked
+         ; sc_listed = seen
+         ; sc_armed = armed
+         })
+    entries
+;;
+
 let test_initialization () =
   (* Test strategy initialization *)
   check unit "jacobs_ladder init" () (Dio_strategies.Jacobs_ladder.Strategy.init ())
@@ -1831,7 +1850,9 @@ let test_sell_never_offers_locked_inventory () =
   state.attributed_balance_increase <- 0.0;
   state.sell_holds_since_balance <- [];
   state.open_sell_orders <- [ "resting-sell", 537.78, 0.0388 ];
-  state.sell_commitments <- [ "resting-sell", 537.78, 0.0388, true, true, 0.0 ];
+  set_sell_commitments
+    state.sell_commitments
+    [ "resting-sell", 537.78, 0.0388, true, true, 0.0 ];
   state.feed_locked_sell_base <- 0.0;
   state.inflight_sell <- false;
   state.asset_low <- false;
@@ -1917,7 +1938,7 @@ let test_inflight_sell_commitment_survives_feed_gap () =
   state.exchange_id <- "kraken";
   state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "kraken";
   state.open_sell_orders <- [];
-  state.sell_commitments <- [];
+  Hashtbl.clear state.sell_commitments;
   state.pending_orders <- [];
   state.last_buy_order_id <- None;
   state.last_buy_order_price <- None;
@@ -1949,6 +1970,7 @@ let test_inflight_sell_commitment_survives_feed_gap () =
         ~bid_price:100.0
         ~lot_qty:0.2
         ~iter_open_orders
+        ~get_open_orders_generation:(fun () -> -1)
         ~ecfg
     in
     locked
@@ -2774,6 +2796,7 @@ let test_virtual_gtc_sell_grid_maintenance () =
       ~bid_price:100.0
       ~lot_qty:1.0
       ~iter_open_orders:iter_orders
+      ~get_open_orders_generation:(fun () -> -1)
       ~ecfg:ecfg_alpaca
   in
   check
@@ -2845,7 +2868,9 @@ let test_halted_ladders_second_sell_beside_resting_one () =
   state.cached_venue_min_qty <- 0.0;
   state.reserved_base <- 0.0;
   state.open_sell_orders <- [ "resting1", 462.13, 0.04 ];
-  state.sell_commitments <- [ "resting1", 462.13, 0.04, true, true, 0.0 ];
+  set_sell_commitments
+    state.sell_commitments
+    [ "resting1", 462.13, 0.04, true, true, 0.0 ];
   state.feed_locked_sell_base <- 0.04;
   state.just_filled_buy <- false;
   state.last_buy_fill_price <- None;
@@ -3472,7 +3497,7 @@ let test_accumulation_sells_non_accrued_inventory () =
   state.reserved_base <- 0.5;
   state.accumulated_profit <- 2.0;
   state.open_sell_orders <- [];
-  state.sell_commitments <- [ "resting", 62369.0, 0.4, true, true, 0.0 ];
+  set_sell_commitments state.sell_commitments [ "resting", 62369.0, 0.4, true, true, 0.0 ];
   state.feed_locked_sell_base <- 0.4;
   state.just_filled_buy <- true;
   state.last_buy_fill_price <- Some 62369.0;
@@ -4738,6 +4763,7 @@ let test_reconcile_cross_boundary_tolerance () =
       ~bid_price:100.0
       ~lot_qty:1.0
       ~iter_open_orders:iter_orders
+      ~get_open_orders_generation:(fun () -> -1)
       ~ecfg
   in
   (* The persisted level should have been matched (no adoption of a second
@@ -4791,6 +4817,7 @@ let test_sync_open_orders_price_keyed_index () =
       ~bid_price:100.0
       ~lot_qty:1.0
       ~iter_open_orders:iter_orders
+      ~get_open_orders_generation:(fun () -> -1)
       ~ecfg
   in
   check
@@ -4820,6 +4847,7 @@ let test_sync_open_orders_price_keyed_index () =
       ~bid_price:105.0
       ~lot_qty:1.0
       ~iter_open_orders:iter_orders2
+      ~get_open_orders_generation:(fun () -> -1)
       ~ecfg
   in
   (* One level matches; the second sell adopts a new level. *)
@@ -4871,6 +4899,7 @@ let test_sync_open_orders_reconcile_agreement () =
         ~bid_price:100.0
         ~lot_qty:1.0
         ~iter_open_orders:iter_orders
+        ~get_open_orders_generation:(fun () -> -1)
         ~ecfg
     in
     let ref_open, ref_missing = reconcile_persisted_sell_levels ~state in
@@ -4913,6 +4942,94 @@ let test_sync_open_orders_reconcile_agreement () =
     ~sells:[ "s1", 105.0, 1.0; "s2", 97.0, 1.0 ];
   (* Qty update on a matched level. *)
   assert_split_matches "qty-update" ~persisted:[ 100.0, 1.0 ] ~sells:[ "s1", 100.0, 1.5 ]
+;;
+
+let test_sync_open_orders_generation_skip () =
+  (* When the venue's open-orders generation is unchanged since the last scan,
+     [sync_open_orders] must skip the O(open-orders) scan and reuse the cached
+     derived state, while STILL running the ledger reconcile (so a lost
+     placement ages out). A generation bump forces a rescan. *)
+  let open Dio_strategies.Jacobs_ladder in
+  let symbol = "GEN_SKIP/USD" in
+  let state = get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.cached_ecfg <- get_exchange_config "kraken";
+  Hashtbl.clear state.sell_commitments;
+  state.open_sell_orders <- [];
+  state.open_orders_scan_valid <- false;
+  let asset =
+    { exchange = "kraken"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = false
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = get_exchange_config "kraken" in
+  let gen = ref 7 in
+  let scan_calls = ref 0 in
+  let iter_orders f =
+    incr scan_calls;
+    f "buy-1" 99.0 1.0 "buy" None;
+    f "sell-1" 101.0 2.0 "sell" None
+  in
+  let sync () =
+    sync_open_orders
+      ~state
+      ~now:100.0
+      ~asset
+      ~bid_price:100.0
+      ~lot_qty:1.0
+      ~iter_open_orders:iter_orders
+      ~get_open_orders_generation:(fun () -> !gen)
+      ~ecfg
+  in
+  let obc1, _hrab1, lib1, _lis1, _cs1, _op1, _mp1 = sync () in
+  check int "first sync scans once" 1 !scan_calls;
+  check int "open-buy count cached" 1 obc1;
+  check (float 1e-9) "locked-in buys from scan" 99.0 lib1;
+  check int "feed sells recorded" 1 (List.length state.open_sell_orders);
+  (* Same generation: the scan closure must not run. *)
+  let iter_orders_boom _ = failwith "scan must be skipped" in
+  let _obc2, _hrab2, lib2, _lis2, _cs2, _op2, _mp2 =
+    sync_open_orders
+      ~state
+      ~now:100.0
+      ~asset
+      ~bid_price:100.0
+      ~lot_qty:1.0
+      ~iter_open_orders:iter_orders_boom
+      ~get_open_orders_generation:(fun () -> !gen)
+      ~ecfg
+  in
+  check (float 1e-9) "locked-in buys reused on skip" 99.0 lib2;
+  check int "sell list reused on skip" 1 (List.length state.open_sell_orders);
+  (* A lost placement (armed, never listed/acked) still ages out on a skipped
+     cycle because the reconcile always runs. *)
+  arm_sell_commitment ~state ~id:"pending_sell_lost" ~price:95.0 ~qty:3.0;
+  (match Hashtbl.find_opt state.sell_commitments "pending_sell_lost" with
+   | Some c ->
+     Hashtbl.replace
+       state.sell_commitments
+       "pending_sell_lost"
+       { c with sc_armed = -100.0 }
+   | None -> ());
+  ignore (sync ());
+  check
+    bool
+    "lost placement aged out during a skipped cycle"
+    false
+    (Hashtbl.mem state.sell_commitments "pending_sell_lost");
+  (* A generation bump forces a rescan. *)
+  incr gen;
+  ignore (sync ());
+  check int "generation change rescans" 2 !scan_calls
 ;;
 
 (* ---- Buy-trailing: qty-only oracle re-sizes must honor the trailing rules - *)
@@ -5325,7 +5442,9 @@ let sell_matrix_feed_and_size
   state.reserved_base <- reserved;
   state.accumulated_profit <- 0.0;
   state.open_sell_orders <- [ "resting", 100.0, ledger ];
-  state.sell_commitments <- [ "resting", 100.0, ledger, true, true, 0.0 ];
+  set_sell_commitments
+    state.sell_commitments
+    [ "resting", 100.0, ledger, true, true, 0.0 ];
   state.feed_locked_sell_base <- (if feed_healthy then ledger else 0.0);
   state.sell_holds_since_balance <- [];
   state.buy_credits_since_balance <- [];
@@ -5441,7 +5560,7 @@ let test_sell_commitment_lifecycle_all_venues () =
        state.reserved_base <- 0.0;
        state.accumulated_profit <- 0.0;
        state.open_sell_orders <- [];
-       state.sell_commitments <- [];
+       Hashtbl.clear state.sell_commitments;
        state.feed_locked_sell_base <- 0.0;
        state.sell_holds_since_balance <- [];
        state.buy_credits_since_balance <- [];
@@ -5495,7 +5614,7 @@ let test_sell_commitment_lifecycle_all_venues () =
          bool
          (label "ack re-keys to the venue order id")
          true
-         (List.exists (fun (id, _, _, _, _, _) -> id = "life-oid") state.sell_commitments);
+         (Hashtbl.mem state.sell_commitments "life-oid");
        (* 3. Feed lists it; 4. feed drops it. *)
        let feed = ref [ "life-oid", 100.0, 0.2, "sell", None ] in
        let iter_open_orders f = List.iter (fun (a, b, c, d, e) -> f a b c d e) !feed in
@@ -5508,6 +5627,7 @@ let test_sell_commitment_lifecycle_all_venues () =
              ~bid_price:100.0
              ~lot_qty:0.2
              ~iter_open_orders
+             ~get_open_orders_generation:(fun () -> -1)
              ~ecfg
          in
          locked
@@ -5595,7 +5715,7 @@ let test_terminal_sell_fill_releases_full_commitment () =
   state.base_accumulation_enabled <- true;
   state.reserved_base <- 0.0;
   state.accumulated_profit <- 0.0;
-  state.sell_commitments <- [ "part-oid", 100.0, 0.2, true, true, 0.0 ];
+  set_sell_commitments state.sell_commitments [ "part-oid", 100.0, 0.2, true, true, 0.0 ];
   state.open_sell_orders <- [ "part-oid", 100.0, 0.2 ];
   state.feed_locked_sell_base <- 0.2;
   state.sell_holds_since_balance <- [];
@@ -5686,6 +5806,10 @@ let () =
             "sync_open_orders reconcile agrees with partition"
             `Quick
             test_sync_open_orders_reconcile_agreement
+        ; test_case
+            "sync_open_orders skips scan when generation unchanged"
+            `Quick
+            test_sync_open_orders_generation_skip
         ] )
     ; "balance", [ test_case "balance checking" `Quick test_balance_checking ]
     ; ( "placement guard"

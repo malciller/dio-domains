@@ -203,14 +203,22 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
               the venue order id. Matching by price is exact enough: only one
               sell placement is in flight at a time (the dedup key is released
               when this ack lands). *)
-          (match
-             List.find_opt
-               (fun (i, p, _q, _s, _a, _ts) ->
-                  String.starts_with ~prefix:"pending_sell_" i
-                  && abs_float (p -. price) < price *. 0.01)
-               state.sell_commitments
-           with
-           | Some (pid, _, _, _, _, _) ->
+          let pending_sell_id =
+            Hashtbl.fold
+              (fun i c acc ->
+                 match acc with
+                 | Some _ -> acc
+                 | None ->
+                   if
+                     String.starts_with ~prefix:"pending_sell_" i
+                     && abs_float (c.sc_price -. price) < price *. 0.01
+                   then Some i
+                   else None)
+              state.sell_commitments
+              None
+          in
+          (match pending_sell_id with
+           | Some pid ->
              rekey_sell_commitment
                ~state
                ~old_id:pid

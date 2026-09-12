@@ -135,14 +135,15 @@ let latency_json () =
 
 let test_latency_pages () =
   let open Dashboard_ui in
-  (* Default view is the CORE page; the section has room for the future
+  (* Default view is the INTERNAL page; the section has room for the future
      network metrics without widening the table. *)
-  Alcotest.(check int) "starts on CORE page" 0 (Latencies.current_page_index ());
+  Alcotest.(check int) "starts on INTERNAL page" 0 (Latencies.current_page_index ());
   Alcotest.(check int) "two latency pages" 2 (Latencies.page_count ());
-  (* CORE merges the pipeline stages AND the full cycle span. *)
+  (* INTERNAL lists the per-cycle segments in pipeline order, then the
+     whole-cycle total, then the separate oracle-pass metric. *)
   Alcotest.(check (list string))
-    "CORE columns"
-    [ "oracle"; "orderbook"; "prep"; "strategy"; "execution"; "cycle" ]
+    "INTERNAL columns"
+    [ "orderbook"; "execution"; "prep"; "strategy"; "cycle"; "oracle" ]
     (Latencies.page_metrics 0);
   let net = Latencies.page_metrics 1 in
   Alcotest.(check bool)
@@ -166,7 +167,7 @@ let test_latency_pages () =
   Latencies.next_page ();
   Alcotest.(check int) "next -> NETWORK" 1 (Latencies.current_page_index ());
   Latencies.next_page ();
-  Alcotest.(check int) "next wraps to CORE" 0 (Latencies.current_page_index ());
+  Alcotest.(check int) "next wraps to INTERNAL" 0 (Latencies.current_page_index ());
   Latencies.prev_page ();
   Alcotest.(check int) "prev wraps to NETWORK" 1 (Latencies.current_page_index ());
   Latencies.set_page 0
@@ -180,12 +181,12 @@ let test_latency_page_render () =
      of blanking out. *)
   Latencies.set_page 0;
   Alcotest.(check bool)
-    "CORE page renders"
+    "INTERNAL page renders"
     (Notty.I.height (Latencies.render_latencies 180 (Dashboard_ui.Snapshot.of_json json))
      > 0)
     true;
   Alcotest.(check bool)
-    "CORE page renders compact"
+    "INTERNAL page renders compact"
     (Notty.I.height (Latencies.render_latencies 100 (Dashboard_ui.Snapshot.of_json json))
      > 0)
     true;

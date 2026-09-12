@@ -415,6 +415,10 @@ module Alpaca_impl = struct
         f o.order_id limit_price o.remaining_qty side_str o.user_ref)
   ;;
 
+  (* Account-wide open-orders generation. The grid strategy still excludes
+     Alpaca from the rescan skip via [remaintain_expired_sells], which needs the
+     persisted GTC-level reconcile every cycle. *)
+  let get_open_orders_generation ~symbol:_ = Alpaca_executions.get_orders_generation ()
   let get_price_increment ~symbol:_ = Some 0.01
 
   let get_qty_increment ~symbol:_ =

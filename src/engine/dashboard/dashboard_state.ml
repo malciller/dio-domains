@@ -123,14 +123,18 @@ let json_of_grid_strategy exchange symbol =
         state.open_sell_orders
     in
     let from_ledger =
-      List.filter_map
-        (fun (oid, price, qty, _seen_in_feed, _acked, _armed_at) ->
+      Hashtbl.fold
+        (fun oid c acc ->
            if Hashtbl.mem seen oid
-           then None
+           then acc
            else (
              Hashtbl.replace seen oid ();
-             Some (oid, price, qty)))
+             ( oid
+             , c.Dio_strategies.Jacobs_ladder.sc_price
+             , c.Dio_strategies.Jacobs_ladder.sc_qty )
+             :: acc))
         state.sell_commitments
+        []
     in
     from_feed @ from_ledger
   in

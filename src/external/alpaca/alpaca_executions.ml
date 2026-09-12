@@ -16,6 +16,13 @@ let section = "alpaca_executions"
    inventory desync. *)
 let dropped_fill_events = Atomic.make 0
 
+(** Account-wide generation, bumped whenever any symbol's open-orders snapshot
+    is republished. Lets the grid strategy's [sync_open_orders] skip its
+    O(open-orders) rescan when nothing changed. *)
+let orders_generation = Atomic.make 0
+
+let[@inline] get_orders_generation () = Atomic.get orders_generation
+
 type open_order_internal =
   { order_id : string
   ; symbol : string
@@ -104,7 +111,8 @@ module SymbolExecStore = struct
 
   let[@inline] publish_open_orders_cache t =
     let snapshot = Hashtbl.fold (fun _ o acc -> o :: acc) t.open_orders [] in
-    Atomic.set t.open_orders_cache snapshot
+    Atomic.set t.open_orders_cache snapshot;
+    Atomic.incr orders_generation
   ;;
 
   let push_event t (e : execution_event_internal) =
