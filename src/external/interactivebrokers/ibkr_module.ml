@@ -543,6 +543,9 @@ module Ibkr_impl = struct
           None)
   ;;
 
+  (* Account-wide open-orders generation. *)
+  let get_open_orders_generation ~symbol:_ = Ibkr_executions_feed.get_orders_generation ()
+
   (* =========================================================== *)
   (* Instrument Precision Metadata and Tick Specification Access *)
   (* =========================================================== *)

@@ -112,18 +112,19 @@ type metric_group =
   }
 
 (** The latency pages.
-    - CORE: the per-domain pipeline measurements, namely the oracle pass,
-      orderbook update, per-cycle prep (oracle apply / halt+reclaim / gate /
-      balance + F&G reads), the strategy run, execution broadcast, and the
-      full cycle span (wake -> consume -> prep -> strategy -> exec), all in
-      one table. PREP separates the pre-execution bookkeeping that used to be
-      charged to STRAT.
+
+    - INTERNAL: the in-process work, in the order the engine runs it.
+      [orderbook] -> [execution] -> [prep] -> [strategy] are the four sequential
+      SEGMENTS of one cycle, and [cycle] is the WHOLE cycle (their sum). They
+      are all in-process work with the same sub-10us target. [oracle] is a
+      separate measurement: the capital-oracle's per-asset analysis pass, which
+      runs on its own (~5 min) cadence, not part of the per-cycle span.
     - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed
-      gap, REST round-trip, signer time). The engine does not publish these
-      yet, so the cells render "--" until it does. *)
+      gap, REST round-trip, signer time). These measure exchange round-trips
+      and socket lifetimes, not in-process work, and carry their own budgets. *)
 let metric_pages =
-  [ { page_label = "CORE"
-    ; metrics = [ "oracle"; "orderbook"; "prep"; "strategy"; "execution"; "cycle" ]
+  [ { page_label = "INTERNAL"
+    ; metrics = [ "orderbook"; "execution"; "prep"; "strategy"; "cycle"; "oracle" ]
     ; trend_metric = "oracle"
     ; trend_label = "(ORACLE P99)"
     ; trend_max_us = 10.0
@@ -166,13 +167,17 @@ let page_trend_label i =
 let trend_col_w = 12
 
 (** Short header label for a latency metric. *)
+
+(** Short display header for a latency metric. The INTERNAL pipeline labels read as
+    the cycle's segments and its total: BOOK -> EVENTS -> PREP -> STRATEGY, then
+    TOTAL (the whole cycle). ORACLE is the separate analysis-pass metric. *)
 let short_label = function
   | "oracle" -> "ORACLE"
-  | "orderbook" -> "OB"
+  | "orderbook" -> "BOOK"
+  | "execution" -> "EVENTS"
   | "prep" -> "PREP"
-  | "strategy" -> "STRAT"
-  | "execution" -> "EXEC"
-  | "cycle" -> "CYCLE"
+  | "strategy" -> "STRATEGY"
+  | "cycle" -> "TOTAL"
   | "ws_ping" -> "PING"
   | "ws_feed" -> "FEED"
   | "rest_request" -> "REST"
@@ -256,16 +261,21 @@ let render_latencies w (snapshot : Snapshot.t) =
   if active_lats = []
   then I.empty
   else (
-    (* Per-metric latency thresholds: (yellow_us, red_us). Every internal
-       pipeline stage on the CORE page shares one budget - green under 10us,
-       yellow 10-20us, red above 20us - because they are all in-process work
-       with the same sub-10us target. The NETWORK page metrics keep their own
-       much larger budgets: they measure exchange round-trips and socket
-       lifetimes, not in-process work. [f >= warn] makes exactly 10us yellow,
-       so the three bands read as <10 green / [10,20] yellow / >20 red. *)
+    (* Per-metric latency thresholds: (yellow_us, red_us). The four internal
+       pipeline SEGMENTS (orderbook, execution, prep, strategy) share one budget
+       - green under 10us, yellow 10-20us, red above 20us - because they are all
+       in-process work with the same sub-10us target. [cycle] (the TOTAL column)
+       is the whole-cycle sum and carries the wider end-to-end budget: green
+       under 50us, yellow 50-100us, red above 100us. [oracle] is the separate
+       analysis pass. The NETWORK page metrics keep their own much larger
+       budgets: they measure exchange round-trips and socket lifetimes, not
+       in-process work. [f > crit] red / [f >= warn] yellow makes the warn edge
+       the first yellow and the crit edge the last yellow, so the bands read as
+       <warn green / [warn,crit] yellow / >crit red. *)
     let latency_thresholds label =
       match label with
-      | "oracle" | "orderbook" | "prep" | "strategy" | "execution" | "cycle" -> 10.0, 20.0
+      | "cycle" -> 50.0, 100.0
+      | "oracle" | "orderbook" | "prep" | "strategy" | "execution" -> 10.0, 20.0
       | "ws_ping" -> 20_000.0, 100_000.0
       | "ws_feed" -> 50_000.0, 200_000.0
       | "rest_request" -> 100_000.0, 500_000.0

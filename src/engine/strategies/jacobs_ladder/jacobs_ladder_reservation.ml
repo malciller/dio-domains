@@ -164,37 +164,39 @@ let sell_commitment_in_flight_timeout_s = 120.0
 
 (** Inserts or updates a commitment, preserving the earliest arm time.
 
-    The fast path is what [sync_open_orders] hits: it calls this once for every
-    open sell on every execution with the feed's live price/qty and
-    seen=acked=true. Rebuilding the whole list (re-allocating every 6-tuple) per
-    call made one scan O(n^2) in allocations - ~16k words for a ~48-sell grid
-    (the logged HYPE STRAT pool) and ~6k for ~30 (ADA/SOL). [List.exists] is
-    allocation-free, so once every commitment already carries the feed's values
-    the steady state writes nothing. A genuine qty/price change or a first
-    sighting still rebuilds once. *)
+    Backed by an id-keyed hashtable: [sync_open_orders] calls this once for
+    every open sell on every execution with the feed's live price/qty and
+    seen=acked=true, and the lookup/update is O(1). The previous association
+    list made one scan O(n^2) (a full-list scan per open sell); on a wide grid
+    that scan was the dominant [strat[sync=]] cost. The steady-state no-op
+    writes nothing. *)
 let upsert_sell_commitment ~state ~id ~price ~qty ~seen ~acked =
-  let already_current =
-    List.exists
-      (fun (i, p, q, s, a, _) ->
-         i = id && p = price && q = qty && (s || not seen) && (a || not acked))
+  match Hashtbl.find_opt state.sell_commitments id with
+  | Some c ->
+    let changed =
+      c.sc_price <> price
+      || c.sc_qty <> qty
+      || (seen && not c.sc_seen)
+      || (acked && not c.sc_acked)
+    in
+    if changed
+    then (
+      c.sc_price <- price;
+      c.sc_qty <- qty;
+      c.sc_seen <- c.sc_seen || seen;
+      c.sc_acked <- c.sc_acked || acked);
+    if seen then c.sc_listed <- true
+  | None ->
+    Hashtbl.replace
       state.sell_commitments
-  in
-  if not already_current
-  then (
-    let found = ref false in
-    state.sell_commitments
-    <- List.map
-         (fun (i, p, q, s, a, ts) ->
-            if i = id
-            then (
-              found := true;
-              id, price, qty, s || seen, a || acked, ts)
-            else i, p, q, s, a, ts)
-         state.sell_commitments;
-    if not !found
-    then
-      state.sell_commitments
-      <- (id, price, qty, seen, acked, Unix.gettimeofday ()) :: state.sell_commitments)
+      id
+      { sc_price = price
+      ; sc_qty = qty
+      ; sc_seen = seen
+      ; sc_acked = acked
+      ; sc_listed = seen
+      ; sc_armed = Unix.gettimeofday ()
+      }
 ;;
 
 (** Records a just-dispatched sell (keyed by its temporary pending id). *)
@@ -210,44 +212,46 @@ let rekey_sell_commitment ~state ~old_id ~new_id ~price ~qty ~acked =
   let q = if qty > 0.0 then qty else 0.0 in
   if old_id = new_id
   then (
-    match List.find_opt (fun (i, _, _, _, _, _) -> i = old_id) state.sell_commitments with
-    | Some (_, _, old_q, seen, a, _) ->
+    match Hashtbl.find_opt state.sell_commitments old_id with
+    | Some c ->
       upsert_sell_commitment
         ~state
         ~id:new_id
         ~price
-        ~qty:(if q > 0.0 then q else old_q)
-        ~seen
-        ~acked:(a || acked)
+        ~qty:(if q > 0.0 then q else c.sc_qty)
+        ~seen:c.sc_seen
+        ~acked:(c.sc_acked || acked)
     | None -> upsert_sell_commitment ~state ~id:new_id ~price ~qty:q ~seen:false ~acked)
   else (
-    match List.find_opt (fun (i, _, _, _, _, _) -> i = old_id) state.sell_commitments with
-    | Some (_, _, old_q, seen, a, ts) ->
-      state.sell_commitments
-      <- (new_id, price, (if q > 0.0 then q else old_q), seen, a || acked, ts)
-         :: List.filter
-              (fun (i, _, _, _, _, _) -> i <> old_id && i <> new_id)
-              state.sell_commitments
+    match Hashtbl.find_opt state.sell_commitments old_id with
+    | Some c ->
+      Hashtbl.remove state.sell_commitments old_id;
+      Hashtbl.remove state.sell_commitments new_id;
+      c.sc_price <- price;
+      c.sc_qty <- (if q > 0.0 then q else c.sc_qty);
+      c.sc_acked <- c.sc_acked || acked;
+      Hashtbl.replace state.sell_commitments new_id c
     | None -> upsert_sell_commitment ~state ~id:new_id ~price ~qty:q ~seen:false ~acked)
 ;;
 
 (** Terminal event: the sell no longer holds base. *)
-let remove_sell_commitment ~state ~id =
-  state.sell_commitments
-  <- List.filter (fun (i, _, _, _, _, _) -> i <> id) state.sell_commitments
-;;
+let remove_sell_commitment ~state ~id = Hashtbl.remove state.sell_commitments id
 
 (** Terminal event for a placement that never got a venue id. *)
 let remove_pending_sell_commitments ~state =
-  state.sell_commitments
-  <- List.filter
-       (fun (i, _, _, _, _, _) -> not (String.starts_with ~prefix:"pending_sell_" i))
-       state.sell_commitments
+  let pending =
+    Hashtbl.fold
+      (fun id _ acc ->
+         if String.starts_with ~prefix:"pending_sell_" id then id :: acc else acc)
+      state.sell_commitments
+      []
+  in
+  List.iter (Hashtbl.remove state.sell_commitments) pending
 ;;
 
 (** Total base committed to live sells (the ledger). *)
 let committed_sell_base state =
-  List.fold_left (fun acc (_, _, q, _, _, _) -> acc +. q) 0.0 state.sell_commitments
+  Hashtbl.fold (fun _ c acc -> acc +. c.sc_qty) state.sell_commitments 0.0
 ;;
 
 (** The base to subtract from the venue's reported holding:

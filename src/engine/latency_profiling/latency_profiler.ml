@@ -108,15 +108,18 @@ let create ?(bucket_us = 1) ?(max_latency_us = 10_000) name =
   }
 ;;
 
-(** [record t span] converts [span] to nanoseconds, maps it to the
-    corresponding histogram bucket, and increments both the bucket count and
-    total sample count. Sub-microsecond samples are bucketed in the dedicated
-    nanosecond tier (1ns resolution); samples in [1us, bucket_us) use the
-    fine one-microsecond tier; samples at/above [bucket_us] use the coarse
-    buckets as before. Samples that exceed the histogram range are clamped to
-    the last coarse bucket and counted as overflow. *)
-let[@inline] record t span =
-  let ns = Int64.to_int (Span.to_uint64_ns span) in
+(** [record_ns t ns] records a latency already expressed in nanoseconds,
+    bypassing the [Mtime.Span] argument (and its [int64] boxing) of [record].
+    Used by callers that hold a non-allocating nanosecond timestamp, notably the
+    stop-the-world canary's C-stub clock. Negative values (a backwards clock)
+    are clamped to zero so they cannot index below the histogram. Sub-
+    microsecond samples are bucketed in the dedicated nanosecond tier (1ns
+    resolution); samples in [1us, bucket_us) use the fine one-microsecond tier;
+    samples at/above [bucket_us] use the coarse buckets. Samples that exceed the
+    histogram range are clamped to the last coarse bucket and counted as
+    overflow. *)
+let[@inline] record_ns t ns =
+  let ns = if ns < 0 then 0 else ns in
   if ns < 1000
   then (
     (* Sub-microsecond: capture at nanosecond level (bucket index = ns). *)
@@ -143,12 +146,16 @@ let[@inline] record t span =
     t.max_cause <- None)
 ;;
 
-(** [record_max t span] is [record] but returns [true] when [span] established
+(** [record t span] converts [span] to nanoseconds and records it via
+    [record_ns]. *)
+let[@inline] record t span = record_ns t (Int64.to_int (Span.to_uint64_ns span))
+
+(** [record_max_ns t ns] is [record_ns] but returns [true] when [ns] established
     a new window maximum, so the caller can build an expensive cause string
     only on that rare path instead of allocating a cause closure (and boxing
     its captured floats) on every recorded cycle. *)
-let[@inline] record_max t span =
-  let ns = Int64.to_int (Span.to_uint64_ns span) in
+let[@inline] record_max_ns t ns =
+  let ns = if ns < 0 then 0 else ns in
   if ns < 1000
   then (
     t.ns_buckets.(ns) <- t.ns_buckets.(ns) + 1;
@@ -172,6 +179,9 @@ let[@inline] record_max t span =
     true)
   else false
 ;;
+
+(** [record_max t span] is [record_max_ns] on a [Mtime.Span]. *)
+let[@inline] record_max t span = record_max_ns t (Int64.to_int (Span.to_uint64_ns span))
 
 (** [set_cause t cause] attaches a cause string to the current window's
     maximum sample. Only meaningful immediately after [record_max] returned
@@ -471,12 +481,13 @@ let spike_message ~key ~window_seconds ~threshold_us stages =
   else (
     let stage_str (label, (s : snapshot)) =
       Printf.sprintf
-        "%s max=%s spikes=%d/%d p99=%s"
+        "%s max=%s p99=%s p50=%s spikes=%d/%d"
         label
         (format_us s.max_us)
+        (format_us s.p99)
+        (format_us s.p50)
         s.over_threshold
         s.samples
-        (format_us s.p99)
     in
     let base =
       Printf.sprintf

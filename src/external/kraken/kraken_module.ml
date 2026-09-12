@@ -536,6 +536,12 @@ module Kraken_impl = struct
         f o.order_id limit_price o.remaining_qty side_str o.order_userref)
   ;;
 
+  (* Kraken's open-orders generation is account-wide (one executions feed), so
+     the symbol is irrelevant. *)
+  let get_open_orders_generation ~symbol:_ =
+    Kraken_executions_feed.get_orders_generation ()
+  ;;
+
   (* -- Instrument metadata accessors ----------------------------------- *)
 
   (** Returns the minimum price tick size for [symbol], or [None] if unknown. *)

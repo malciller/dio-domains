@@ -5,9 +5,9 @@
   "logging_width": 175,
   "cycle_mod": 10000,
   "fng_check_threshold": 2.5,
-  "latency_spike_threshold_us": 10,
+  "latency_spike_threshold_us": 100,
   "latency_spike_report": "internal",
-  "latency_spike_report_seconds": 30,
+  "latency_spike_report_seconds": 5,
   "latency_network_spike_threshold_us": 20000,
   "gc": {
     "minor_heap_size": 262144,

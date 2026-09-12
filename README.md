@@ -174,6 +174,9 @@ Credentials and one-off knobs live in the environment. The engine loads `.env` i
 | `DIO_BACKTRACE` | Engine | When set, pretty-prints OCaml backtraces on crashes |
 | `DIO_DATA_DIR` | Persistence | State directory override; defaults to `/app/data` when `/app` exists, else `data` |
 | `DIO_WATCHDOG_OFF` | Engine | When set, disables the main-loop watchdog |
+| `DIO_CANARY` | Engine | `0`/`false`/`off`/`no` disables the stop-the-world canary domain (busy-spins one core while enabled) |
+| `DIO_CANARY_THRESHOLD_US` | Engine | Canary spike threshold in microseconds (default `10`) |
+| `DIO_CANARY_WINDOW_S` | Engine | Canary report window in seconds (default `5`) |
 | `COLUMNS` | Engine | Fallback log width when stdout is not a TTY (default width `200`) |
 | `DIO_MOTION` | Dashboard | `off`/`0`/`false`/`no` disables animations |
 | `DIO_FPS` | Dashboard | Caps the animated frame rate (default `30.0`) |

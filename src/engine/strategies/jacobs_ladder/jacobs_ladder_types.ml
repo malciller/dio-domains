@@ -79,6 +79,19 @@ type trading_config =
   ; sell_levels_persistence : bool (** opt-in to pending-sell-level persistence *)
   }
 
+(** One in-flight sell's share of the committed-base ledger. Mutable so the
+    per-scan feed refresh ([upsert_sell_commitment]) updates price/qty/flags in
+    place instead of allocating a replacement tuple on every fill; only a first
+    sighting allocates. Guarded by [strategy_state.mutex]. *)
+type sell_commitment =
+  { mutable sc_price : float
+  ; mutable sc_qty : float
+  ; mutable sc_seen : bool
+  ; mutable sc_acked : bool
+  ; mutable sc_listed : bool
+  ; sc_armed : float
+  }
+
 (** Mutable per-symbol strategy state. *)
 type strategy_state =
   { mutable last_buy_order_price : float option
@@ -88,8 +101,8 @@ type strategy_state =
     (* (target_price, qty) stack for Alpaca GTC *)
   ; mutable recently_injected_sells : (string * float * float) list
     (* (order_id, price, timestamp) *)
-  ; mutable sell_commitments : (string * float * float * bool * bool * float) list
-    (* (order_id, price, qty, seen_in_feed, acked, armed_at) - the authoritative
+  ; sell_commitments : (string, sell_commitment) Hashtbl.t
+    (* (order_id -> committed-base entry) - the authoritative
        in-flight sell ledger. Every sell this strategy dispatches is recorded
        here the instant it is pushed (keyed by the temporary pending_sell_
        id), re-keyed to the venue id on ack/amend (acked := true), updated to
@@ -230,11 +243,40 @@ type strategy_state =
        [sync_open_orders] skip the O(m) index rebuild on the common cycle.
        Starts as [[]] (the empty immediate), so a non-empty loaded list always
        differs and is indexed on the first execution. *)
-  ; feed_sell_qty_scratch : (string, float * float) Hashtbl.t
-    (* Reused per-symbol scan buffer (order_id -> (price, remaining qty)).
-       [sync_open_orders] clears and refills it instead of allocating a fresh
-       Hashtbl every execution. Guarded by [mutex] (execute_strategy holds it),
-       so reuse is single-writer. *)
+  ; mutable alloc_cleanup_words : int
+  ; mutable alloc_sync_words : int
+  ; mutable alloc_buy_words : int
+  ; mutable alloc_sell_words : int
+  ; mutable time_preamble_ns : int
+  ; mutable time_cleanup_ns : int
+  ; mutable time_sync_ns : int
+  ; mutable time_sync_scan_ns : int
+  ; mutable time_sync_rec_ns : int
+  ; mutable sync_orders_seen : int
+  ; mutable time_buy_ns : int
+  ; mutable time_sell_ns : int
+    (* Per-execution attribution for the STRAT sub-phases (preamble, cleanup,
+       sync_open_orders, buy leg, sell leg), filled by [execute_strategy] at
+       each boundary: minor-word allocation (words) and wall time (ns). Read by
+       the domain on its max cycle to localize the [strat:] cost - allocation
+       and CPU are separately visible because a wide grid can be cheap to
+       allocate but expensive to scan (or vice versa). Plain ints, no
+       allocation; scratch only. *)
+  ; mutable open_orders_scan_generation : int
+  ; mutable open_orders_scan_valid : bool
+  ; mutable cached_feed_total : float
+  ; mutable cached_open_buy_count : int
+  ; mutable cached_has_recent_amend_buy : bool
+  ; mutable cached_locked_in_buys : float
+  ; mutable cached_closest_sell_order : (string * float) option
+  ; mutable cached_feed_sell_orders : (string * float * float) list
+    (* Last feed scan's derived outputs, reused by [sync_open_orders] when the
+       venue's open-orders generation is unchanged: the scan itself is
+       O(open orders) and dominated by string-keyed hashtable work, so skipping
+       it when nothing changed makes the common strategy cycle O(1). The cache
+       is split from the ledger reconcile, which still runs every cycle to age
+       out lost placements and re-add locally-armed commitments. The
+       feed-listed sell list is reused by pointer (never mutated in place). *)
   ; mutable last_fill_oid : string option
     (* OID of last profit-credited fill; replay resumption point *)
   ; mutable highest_startup_oid : string option
@@ -474,7 +516,7 @@ let rec get_strategy_state asset_symbol =
       ; open_sell_orders = []
       ; persisted_sell_levels
       ; recently_injected_sells = []
-      ; sell_commitments = []
+      ; sell_commitments = Hashtbl.create 64
       ; feed_locked_sell_base = 0.0
       ; pending_orders = []
       ; last_cycle = 0
@@ -516,7 +558,26 @@ let rec get_strategy_state asset_symbol =
       ; matched_level_counts = Hashtbl.create 16
       ; persisted_idx = Hashtbl.create 16
       ; persisted_idx_source = []
-      ; feed_sell_qty_scratch = Hashtbl.create 16
+      ; alloc_cleanup_words = 0
+      ; alloc_sync_words = 0
+      ; alloc_buy_words = 0
+      ; alloc_sell_words = 0
+      ; time_preamble_ns = 0
+      ; time_cleanup_ns = 0
+      ; time_sync_ns = 0
+      ; time_sync_scan_ns = 0
+      ; time_sync_rec_ns = 0
+      ; sync_orders_seen = 0
+      ; open_orders_scan_generation = -2
+      ; open_orders_scan_valid = false
+      ; cached_feed_total = 0.0
+      ; cached_open_buy_count = 0
+      ; cached_has_recent_amend_buy = false
+      ; cached_locked_in_buys = 0.0
+      ; cached_closest_sell_order = None
+      ; cached_feed_sell_orders = []
+      ; time_buy_ns = 0
+      ; time_sell_ns = 0
       ; last_fill_oid = persisted_last_fill_oid
       ; highest_startup_oid = None
       ; skipped_fill_streak = 0

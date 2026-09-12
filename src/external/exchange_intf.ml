@@ -434,6 +434,13 @@ module type S = sig
     -> (string -> float -> float -> string -> int option -> unit)
     -> unit
 
+  (** A counter that increments whenever this account's open-orders snapshot
+      changes (any new/fill/cancel/amend). [-1] for venues that expose no such
+      signal, in which case callers MUST treat the snapshot as changed on every
+      call. The grid strategy uses it to skip the O(open-orders)
+      [sync_open_orders] scan when nothing has changed since the last scan. *)
+  val get_open_orders_generation : symbol:string -> int
+
   (** Return a fast path closure for fetching the current orderbook position without lock acquisition/hash lookup overhead. *)
   val get_orderbook_position_fast : symbol:string -> unit -> int
 

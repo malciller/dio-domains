@@ -525,6 +525,12 @@ let () =
        ; Gc.major_heap_increment = gc_cfg.major_heap_increment
        }
    | None -> ());
+  (* Start the stop-the-world canary AFTER GC configuration is applied, so the
+      detector observes the same collector settings as the trading domains. Its
+      window cadence matches the per-domain latency windows, letting a global
+      pause be matched to the domain cycles that spiked. Disable with
+      DIO_CANARY=0. *)
+  Canary.start ();
   (* Periodic memory reporter using an Lwt timer (600s interval).
      Replaces the prior Gc.create_alarm approach which had two issues:
      1. GC alarm callbacks run in GC signal context; calling Mutex.lock from

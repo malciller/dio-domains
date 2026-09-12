@@ -465,6 +465,35 @@ let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
     List.iter (Hashtbl.remove state.evicted_orders) !to_remove)
 ;;
 
+(** Scratch matcher for [sync_open_orders]'s persisted-sell-level reconcile.
+    [scan_persisted_bucket] probes one [persisted_idx] bucket for a level within
+    tolerance of [price] that has not already been matched this scan, keeping
+    the lowest-index candidate (mirroring the original in-order scan).
+    [probe_persisted_bucket] is the top-level entry point. Both are top-level
+    (not per-order closures): the previous local [consider_bucket] plus its
+    [List.iter] callback were re-allocated for EVERY open sell on EVERY
+    execution, a large slice of the logged [strat[sync=]] allocation pool. *)
+let rec scan_persisted_bucket ~matched_persisted_indices ~price ~bk ~best = function
+  | [] -> ()
+  | (idx, p, q) :: rest ->
+    if
+      (not (Hashtbl.mem matched_persisted_indices idx))
+      && (abs_float (p -. price) <= price *. 0.0001 || abs_float (p -. price) <= 1e-4)
+    then (
+      match !best with
+      | None -> best := Some (bk, idx, p, q)
+      | Some (_, b_idx, _, _) when idx < b_idx -> best := Some (bk, idx, p, q)
+      | _ -> ());
+    scan_persisted_bucket ~matched_persisted_indices ~price ~bk ~best rest
+;;
+
+let probe_persisted_bucket bk ~matched_persisted_indices ~persisted_idx ~price ~best =
+  match Hashtbl.find_opt persisted_idx bk with
+  | None -> ()
+  | Some bucket ->
+    scan_persisted_bucket ~matched_persisted_indices ~price ~bk ~best bucket
+;;
+
 (** Scans open orders feed, updates local sell tracking, and debounces ghost buy orders. *)
 let sync_open_orders
       ~state
@@ -473,6 +502,7 @@ let sync_open_orders
       ~bid_price:_
       ~lot_qty
       ~iter_open_orders
+      ~get_open_orders_generation
       ~ecfg
   =
   let now_time = now in
@@ -490,117 +520,152 @@ let sync_open_orders
     <- List.filter (fun (_, _, ts) -> now_time -. ts < 10.0) state.recently_injected_sells;
     if List.length state.recently_injected_sells > 20
     then state.recently_injected_sells <- take 20 state.recently_injected_sells);
-  state.open_sell_orders <- [];
   let best_buy_price = ref 0.0 in
   let best_buy_id = ref None in
   let open_buy_count_from_scan = ref 0 in
   let has_recent_amend_buy = ref false in
   let locked_in_buys = ref 0.0 in
   let locked_in_sells = ref 0.0 in
-  (* (order_id -> (price, remaining qty)) for the sells the venue feed lists
-     this scan; consumed by the in-flight ledger reconcile below. Reused from
-     strategy state (cleared here) instead of allocating a fresh Hashtbl every
-     execution; [execute_strategy] holds [state.mutex], so this is the sole
-     writer. *)
-  let feed_sell_qty = state.feed_sell_qty_scratch in
-  Hashtbl.clear feed_sell_qty;
+  let feed_total = ref 0.0 in
   let closest_sell_order = ref None in
-  let matched_persisted_indices = state.matched_persisted_indices in
-  Hashtbl.clear matched_persisted_indices;
-  (* index the persisted sell levels by a rounded price key so each open
+  (* Alias into [state] used by the persisted-level tail split below. The scan
+     branch shadows it with its own alias for the index. *)
+  let matched_level_counts = state.matched_level_counts in
+  (* Rescan gate. The scan below is O(open orders) and dominated by
+     string-keyed hashtable work; when the venue exposes an open-orders
+     generation ([get_open_orders_generation]) that has not moved since the
+     last scan, and the venue keeps no persisted GTC levels (Alpaca), reuse the
+     last scan's outputs and skip the scan. The ledger reconcile further down
+     still runs every cycle, so a lost placement still ages out. *)
+  let generation = get_open_orders_generation () in
+  let can_skip =
+    (not ecfg.remaintain_expired_sells)
+    && state.open_orders_scan_valid
+    && generation >= 0
+    && state.open_orders_scan_generation = generation
+  in
+  if can_skip
+  then (
+    state.open_sell_orders <- state.cached_feed_sell_orders;
+    open_buy_count_from_scan := state.cached_open_buy_count;
+    has_recent_amend_buy := state.cached_has_recent_amend_buy;
+    locked_in_buys := state.cached_locked_in_buys;
+    closest_sell_order := state.cached_closest_sell_order;
+    feed_total := state.cached_feed_total)
+  else (
+    (* Mark every commitment "not listed" for this scan. The scan's
+       [upsert_sell_commitment ~seen:true] flips it back on, and the reconcile
+       below tests the flag instead of a separate [(string, unit)] membership
+       table. That removes a whole hashtable plus a string-hash mem+replace per
+       open sell and a string-hash lookup per ledger entry. [execute_strategy]
+       holds [state.mutex], so this is single-writer. O(ledger), no allocation. *)
+    Hashtbl.iter (fun _ c -> c.sc_listed <- false) state.sell_commitments;
+    state.open_sell_orders <- [];
+    state.sync_orders_seen <- 0;
+    let matched_persisted_indices = state.matched_persisted_indices in
+    Hashtbl.clear matched_persisted_indices;
+    (* index the persisted sell levels by a rounded price key so each open
      sell order's match lookup is O(1) instead of rescanning the whole list.
      The previous [List.iteri] scan was O(n·m) per strategy execution (n open
      sell orders x m persisted levels), the dominant cost for assets with
      large sell grids like SPCX's 42 open sells. Buckets store
      (index, price, qty) so a 1-to-1 match consumes the entry and the
      original tolerance check and qty-update semantics are preserved. *)
-  (* matched persisted levels keyed by their price key -> count. Built
+    (* matched persisted levels keyed by their price key -> count. Built
      during the scan (each open sell consumes exactly one persisted level, so
      a multiset of per-price counts accumulates), the open/missing split for
      the virtual-GTC reconcile falls out in O(m) at the end of the scan
      instead of re-partitioning the whole persisted-vs-open multiset
      ([partition_persisted_sell_levels]) a second time per execution. *)
-  let matched_level_counts = state.matched_level_counts in
-  Hashtbl.clear matched_level_counts;
-  let persisted_idx = state.persisted_idx in
-  let build_persisted_idx () =
-    (* Rebuild only when the levels list actually changed. The list is
+    let matched_level_counts = state.matched_level_counts in
+    Hashtbl.clear matched_level_counts;
+    let persisted_idx = state.persisted_idx in
+    let build_persisted_idx () =
+      (* Rebuild only when the levels list actually changed. The list is
        immutable and replaced wholesale on edit, so physical inequality is a
        sound "changed" test; this skips the O(m) index rebuild (and its bucket
        list allocations) on the common no-change execution. *)
-    if state.persisted_idx_source != state.persisted_sell_levels
-    then (
-      state.persisted_idx_source <- state.persisted_sell_levels;
-      Hashtbl.reset persisted_idx;
-      List.iteri
-        (fun idx (p, q) ->
-           let k = price_key p in
-           let bucket = Option.value (Hashtbl.find_opt persisted_idx k) ~default:[] in
-           Hashtbl.replace persisted_idx k ((idx, p, q) :: bucket))
-        state.persisted_sell_levels)
-  in
-  build_persisted_idx ();
-  (* Deferred persisted-level qty updates. Writing each update straight into
+      if state.persisted_idx_source != state.persisted_sell_levels
+      then (
+        state.persisted_idx_source <- state.persisted_sell_levels;
+        Hashtbl.reset persisted_idx;
+        List.iteri
+          (fun idx (p, q) ->
+             let k = price_key p in
+             let bucket = Option.value (Hashtbl.find_opt persisted_idx k) ~default:[] in
+             Hashtbl.replace persisted_idx k ((idx, p, q) :: bucket))
+          state.persisted_sell_levels)
+    in
+    build_persisted_idx ();
+    (* Deferred persisted-level qty updates. Writing each update straight into
      [state.persisted_sell_levels] via [List.mapi] inside the open-order scan
      made reconciliation O(k*m) (k changed levels x a full-list rebuild each).
      Collect them and apply once; matching only keys off prices, so deferring
      the qtys is behavior-preserving. Flushed before any adoption re-sorts the
      list (which invalidates indices) and once at the end of the scan. *)
-  let pending_level_updates = ref [] in
-  let apply_pending_level_updates () =
-    match !pending_level_updates with
-    | [] -> ()
-    | updates ->
-      pending_level_updates := [];
-      let tbl = Hashtbl.create (List.length updates) in
-      List.iter (fun (idx, p, q) -> Hashtbl.replace tbl idx (p, q)) updates;
-      state.persisted_sell_levels
-      <- List.mapi
-           (fun i item ->
-              match Hashtbl.find_opt tbl i with
-              | Some (p, q) -> p, q
-              | None -> item)
-           state.persisted_sell_levels
-  in
-  let record_matched pk =
-    Hashtbl.replace
-      matched_level_counts
-      pk
-      (1 + Option.value (Hashtbl.find_opt matched_level_counts pk) ~default:0)
-  in
-  iter_open_orders (fun oid price qty side_str userref_opt ->
-    let is_our_strategy =
-      match userref_opt with
-      | Some ref_val -> ref_val <> strategy_userref_mm
-      | None -> true
+    let pending_level_updates = ref [] in
+    let apply_pending_level_updates () =
+      match !pending_level_updates with
+      | [] -> ()
+      | updates ->
+        pending_level_updates := [];
+        let tbl = Hashtbl.create (List.length updates) in
+        List.iter (fun (idx, p, q) -> Hashtbl.replace tbl idx (p, q)) updates;
+        state.persisted_sell_levels
+        <- List.mapi
+             (fun i item ->
+                match Hashtbl.find_opt tbl i with
+                | Some (p, q) -> p, q
+                | None -> item)
+             state.persisted_sell_levels
     in
-    if qty > 0.0 && is_our_strategy && not (Hashtbl.mem state.evicted_orders oid)
-    then
-      if side_str = "buy"
-      then (
-        incr open_buy_count_from_scan;
-        locked_in_buys := !locked_in_buys +. (price *. qty);
-        if price > !best_buy_price && price > 0.0
+    let record_matched pk =
+      Hashtbl.replace
+        matched_level_counts
+        pk
+        (1 + Option.value (Hashtbl.find_opt matched_level_counts pk) ~default:0)
+    in
+    let t_scan_start = Monotonic_clock.now_ns () in
+    iter_open_orders (fun oid price qty side_str userref_opt ->
+      state.sync_orders_seen <- state.sync_orders_seen + 1;
+      let is_our_strategy =
+        match userref_opt with
+        | Some ref_val -> ref_val <> strategy_userref_mm
+        | None -> true
+      in
+      if
+        qty > 0.0
+        && is_our_strategy
+        && (Hashtbl.length state.evicted_orders = 0
+            || not (Hashtbl.mem state.evicted_orders oid))
+      then
+        if side_str = "buy"
         then (
-          best_buy_price := price;
-          best_buy_id := Some oid);
-        match Hashtbl.find_opt state.amend_cooldowns oid with
-        | Some expiry when now_time < expiry -> has_recent_amend_buy := true
-        | _ -> ())
-      else if side_str = "sell"
-      then (
-        add_tracked_order_id state oid;
-        state.open_sell_orders <- (oid, price, qty) :: state.open_sell_orders;
-        Hashtbl.replace feed_sell_qty oid (price, qty);
-        (* Refresh the in-flight ledger with the venue's live remaining qty;
+          incr open_buy_count_from_scan;
+          locked_in_buys := !locked_in_buys +. (price *. qty);
+          if price > !best_buy_price && price > 0.0
+          then (
+            best_buy_price := price;
+            best_buy_id := Some oid);
+          match Hashtbl.find_opt state.amend_cooldowns oid with
+          | Some expiry when now_time < expiry -> has_recent_amend_buy := true
+          | _ -> ())
+        else if side_str = "sell"
+        then (
+          add_tracked_order_id state oid;
+          state.open_sell_orders <- (oid, price, qty) :: state.open_sell_orders;
+          (* A snapshot lists each order id at most once, so accumulate directly;
+           [upsert_sell_commitment] flips [sc_listed] for the reconcile below. *)
+          feed_total := !feed_total +. qty;
+          (* Refresh the in-flight ledger with the venue's live remaining qty;
            a sell adopted straight from the feed (no prior local arm) is
            entered here so it is reserved from now on. *)
-        upsert_sell_commitment ~state ~id:oid ~price ~qty ~seen:true ~acked:true;
-        if ecfg.remaintain_expired_sells
-        then (
-          let k = price_key price in
-          let match_entry =
-            (* Probe the price's bucket and its immediate neighbors: the
+          upsert_sell_commitment ~state ~id:oid ~price ~qty ~seen:true ~acked:true;
+          if ecfg.remaintain_expired_sells
+          then (
+            let k = price_key price in
+            let match_entry =
+              (* Probe the price's bucket and its immediate neighbors: the
                original linear scan matched any persisted level within
                tolerance, but grid levels are 0.25%+ apart while the
                tolerance is 0.01% (price*0.0001) or 1e-4 absolute, so a
@@ -608,103 +673,107 @@ let sync_open_orders
                the neighbor probes only absorb float rounding at the
                4-decimal bucket boundary. Pick the lowest-index candidate,
                mirroring the original scan order. *)
-            let best = ref None in
-            let consider_bucket bk =
-              match Hashtbl.find_opt persisted_idx bk with
-              | None -> ()
-              | Some bucket ->
-                List.iter
-                  (fun (idx, p, _q) ->
-                     if
-                       (not (Hashtbl.mem matched_persisted_indices idx))
-                       && (abs_float (p -. price) <= price *. 0.0001
-                           || abs_float (p -. price) <= 1e-4)
-                     then (
-                       match !best with
-                       | None -> best := Some (bk, (idx, p, _q))
-                       | Some (_, (b_idx, _, _)) when idx < b_idx ->
-                         best := Some (bk, (idx, p, _q))
-                       | _ -> ()))
-                  bucket
+              let best = ref None in
+              probe_persisted_bucket
+                (k - 1)
+                ~matched_persisted_indices
+                ~persisted_idx
+                ~price
+                ~best;
+              probe_persisted_bucket
+                k
+                ~matched_persisted_indices
+                ~persisted_idx
+                ~price
+                ~best;
+              probe_persisted_bucket
+                (k + 1)
+                ~matched_persisted_indices
+                ~persisted_idx
+                ~price
+                ~best;
+              match !best with
+              | Some (bk, idx, _p, _q) ->
+                let remaining =
+                  match Hashtbl.find_opt persisted_idx bk with
+                  | Some b -> List.filter (fun (i, _, _) -> i <> idx) b
+                  | None -> []
+                in
+                Some (bk, idx, _p, _q, remaining)
+              | None -> None
             in
-            (* Direct calls instead of [List.iter] over a 3-element list: the
-               list (and its list-cell allocation) per open sell is pure
-               overhead on the hot path. *)
-            consider_bucket (k - 1);
-            consider_bucket k;
-            consider_bucket (k + 1);
-            match !best with
-            | Some (bk, (idx, _p, _q)) ->
-              let remaining =
-                match Hashtbl.find_opt persisted_idx bk with
-                | Some b -> List.filter (fun (i, _, _) -> i <> idx) b
-                | None -> []
+            match match_entry with
+            | Some (bk, idx, _existing_p, existing_q, remaining_bucket) ->
+              Hashtbl.add matched_persisted_indices idx ();
+              Hashtbl.replace persisted_idx bk remaining_bucket;
+              (* count the persisted level (keyed by ITS price) as matched. *)
+              record_matched (price_key _existing_p);
+              let min_order_size =
+                if state.cached_qty_increment > 0.0
+                then state.cached_qty_increment
+                else 1e-8
               in
-              Some (bk, idx, _p, _q, remaining)
-            | None -> None
-          in
-          match match_entry with
-          | Some (bk, idx, _existing_p, existing_q, remaining_bucket) ->
-            Hashtbl.add matched_persisted_indices idx ();
-            Hashtbl.replace persisted_idx bk remaining_bucket;
-            (* count the persisted level (keyed by ITS price) as matched. *)
-            record_matched (price_key _existing_p);
-            let min_order_size =
-              if state.cached_qty_increment > 0.0
-              then state.cached_qty_increment
-              else 1e-8
-            in
-            if
-              abs_float (existing_q -. qty) > 1e-6
-              && qty >= min_order_size -. 1e-9
-              && qty > 0.0
-            then (
-              pending_level_updates := (idx, price, qty) :: !pending_level_updates;
-              state.persistence_dirty <- true;
-              Logging.info_f
-                ~section
-                "Updated persisted sell level quantity for %s @ %.4f: %.8f -> %.8f"
-                asset.symbol
-                price
-                existing_q
-                qty)
-          | None ->
-            (* Flush deferred qty updates first: the sort/insert below shifts
+              if
+                abs_float (existing_q -. qty) > 1e-6
+                && qty >= min_order_size -. 1e-9
+                && qty > 0.0
+              then (
+                pending_level_updates := (idx, price, qty) :: !pending_level_updates;
+                state.persistence_dirty <- true;
+                Logging.info_f
+                  ~section
+                  "Updated persisted sell level quantity for %s @ %.4f: %.8f -> %.8f"
+                  asset.symbol
+                  price
+                  existing_q
+                  qty)
+            | None ->
+              (* Flush deferred qty updates first: the sort/insert below shifts
                persisted-level indices, so pending updates keyed by index must
                land before it. *)
-            apply_pending_level_updates ();
-            let min_order_size =
-              if state.cached_qty_increment > 0.0
-              then state.cached_qty_increment
-              else 1e-8
-            in
-            if qty >= min_order_size -. 1e-9 && qty > 0.0
-            then (
-              state.persisted_sell_levels
-              <- List.sort
-                   (fun (p1, _) (p2, _) -> Float.compare p2 p1)
-                   ((price, qty) :: state.persisted_sell_levels);
-              state.persistence_dirty <- true;
-              (* the adopted level was matched by this open sell by
+              apply_pending_level_updates ();
+              let min_order_size =
+                if state.cached_qty_increment > 0.0
+                then state.cached_qty_increment
+                else 1e-8
+              in
+              if qty >= min_order_size -. 1e-9 && qty > 0.0
+              then (
+                state.persisted_sell_levels
+                <- List.sort
+                     (fun (p1, _) (p2, _) -> Float.compare p2 p1)
+                     ((price, qty) :: state.persisted_sell_levels);
+                state.persistence_dirty <- true;
+                (* the adopted level was matched by this open sell by
                  construction - count it so the end-of-scan split keeps it on
                  the open side. *)
-              record_matched (price_key price);
-              (* The list was re-sorted with a new level: rebuild the price
+                record_matched (price_key price);
+                (* The list was re-sorted with a new level: rebuild the price
                  index so later orders in this scan match against the current
                  list (O(m), only on the rare adoption path). *)
-              build_persisted_idx ();
-              Logging.info_f
-                ~section
-                "Adopted open exchange sell order for %s @ %.4f (qty %.8f) into \
-                 persistent tracking"
-                asset.symbol
-                price
-                qty));
-        match !closest_sell_order with
-        | None -> closest_sell_order := Some (oid, price)
-        | Some (_, best_p) ->
-          if price < best_p then closest_sell_order := Some (oid, price)));
-  apply_pending_level_updates ();
+                build_persisted_idx ();
+                Logging.info_f
+                  ~section
+                  "Adopted open exchange sell order for %s @ %.4f (qty %.8f) into \
+                   persistent tracking"
+                  asset.symbol
+                  price
+                  qty));
+          match !closest_sell_order with
+          | None -> closest_sell_order := Some (oid, price)
+          | Some (_, best_p) ->
+            if price < best_p then closest_sell_order := Some (oid, price)));
+    state.time_sync_scan_ns <- Monotonic_clock.now_ns () - t_scan_start;
+    apply_pending_level_updates ();
+    state.cached_feed_total <- !feed_total;
+    state.cached_open_buy_count <- !open_buy_count_from_scan;
+    state.cached_has_recent_amend_buy <- !has_recent_amend_buy;
+    state.cached_locked_in_buys <- !locked_in_buys;
+    state.cached_closest_sell_order <- !closest_sell_order;
+    state.cached_feed_sell_orders <- state.open_sell_orders;
+    state.open_orders_scan_generation <- generation;
+    state.open_orders_scan_valid <- true);
+  let t_rec_start = Monotonic_clock.now_ns () in
   (* Reconcile the in-flight sell ledger with this scan's feed. The feed
      refreshes an order's remaining qty while it lists it. What an absence
      means is VENUE-SPECIFIC (see [hold_netted_from_venue_state]):
@@ -733,47 +802,52 @@ let sync_open_orders
      no-rebuild path still re-adds local-only commitments to
      [open_sell_orders] (feed-listed ones were consed during the scan). *)
   let commitment_needs_rebuild =
-    List.exists
-      (fun (id, _price, _qty, seen, acked, armed) ->
-         match Hashtbl.find_opt feed_sell_qty id with
-         | Some _ -> false
-         | None ->
-           if seen || acked
-           then trust_feed
-           else now_time -. armed > sell_commitment_in_flight_timeout_s)
+    Hashtbl.fold
+      (fun _id c acc ->
+         acc
+         ||
+         if c.sc_listed
+         then false
+         else if c.sc_seen || c.sc_acked
+         then trust_feed
+         else now_time -. c.sc_armed > sell_commitment_in_flight_timeout_s)
       state.sell_commitments
+      false
   in
   if commitment_needs_rebuild
-  then
-    state.sell_commitments
-    <- List.filter_map
-         (fun (id, price, qty, seen, acked, armed) ->
-            match Hashtbl.find_opt feed_sell_qty id with
-            | Some (feed_price, feed_qty) ->
-              Some (id, feed_price, feed_qty, true, true, armed)
-            | None ->
-              if seen || acked
-              then
-                if trust_feed
-                then None
-                else (
-                  state.open_sell_orders <- (id, price, qty) :: state.open_sell_orders;
-                  Some (id, price, qty, seen, acked, armed))
-              else if now_time -. armed <= sell_commitment_in_flight_timeout_s
-              then (
-                state.open_sell_orders <- (id, price, qty) :: state.open_sell_orders;
-                Some (id, price, qty, false, false, armed))
-              else None)
-         state.sell_commitments
-  else
-    List.iter
-      (fun (id, price, qty, _seen, _acked, _armed) ->
-         match Hashtbl.find_opt feed_sell_qty id with
-         | Some _ -> ()
-         | None -> state.open_sell_orders <- (id, price, qty) :: state.open_sell_orders)
+  then (
+    let to_remove = ref [] in
+    Hashtbl.iter
+      (fun id c ->
+         if c.sc_listed
+         then
+           (* [upsert_sell_commitment] already wrote the feed's live
+              price/qty onto this commitment during the scan, so the stored
+              values are the feed values. *)
+           ()
+         else if c.sc_seen || c.sc_acked
+         then
+           if trust_feed
+           then to_remove := id :: !to_remove
+           else
+             state.open_sell_orders
+             <- (id, c.sc_price, c.sc_qty) :: state.open_sell_orders
+         else if now_time -. c.sc_armed <= sell_commitment_in_flight_timeout_s
+         then
+           state.open_sell_orders <- (id, c.sc_price, c.sc_qty) :: state.open_sell_orders
+         else to_remove := id :: !to_remove)
       state.sell_commitments;
-  state.feed_locked_sell_base
-  <- Hashtbl.fold (fun _ (_p, q) acc -> acc +. q) feed_sell_qty 0.0;
+    List.iter (Hashtbl.remove state.sell_commitments) !to_remove)
+  else
+    Hashtbl.iter
+      (fun id c ->
+         if c.sc_listed
+         then ()
+         else
+           state.open_sell_orders <- (id, c.sc_price, c.sc_qty) :: state.open_sell_orders)
+      state.sell_commitments;
+  state.time_sync_rec_ns <- Monotonic_clock.now_ns () - t_rec_start;
+  state.feed_locked_sell_base <- !feed_total;
   locked_in_sells := committed_sell_base state;
   let is_amend_active =
     state.inflight_amend_buy
@@ -841,24 +915,34 @@ let sync_open_orders
      [evaluate_sell_leg]'s reconcile used to re-derive with a full O(n+m)
      partition over the open orders; here it is O(m) on data this scan already
      touched. *)
-  let open_levels_acc = ref [] in
-  let missing_levels_acc = ref [] in
-  List.iter
-    (fun ((p, _) as level) ->
-       let k = price_key p in
-       match Hashtbl.find_opt matched_level_counts k with
-       | Some n when n > 0 ->
-         Hashtbl.replace matched_level_counts k (n - 1);
-         open_levels_acc := level :: !open_levels_acc
-       | _ -> missing_levels_acc := level :: !missing_levels_acc)
-    state.persisted_sell_levels;
+  (* The persisted open/missing split is only consumed by the
+     [remaintain_expired_sells] (Alpaca GTC) reconcile
+     ([evaluate_sell_leg]); building it costs an O(m) list rebuild per
+     execution, so skip it entirely for the venues that never read it. *)
+  let open_persisted_levels, missing_persisted_levels =
+    if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> []
+    then (
+      let open_levels_acc = ref [] in
+      let missing_levels_acc = ref [] in
+      List.iter
+        (fun ((p, _) as level) ->
+           let k = price_key p in
+           match Hashtbl.find_opt matched_level_counts k with
+           | Some n when n > 0 ->
+             Hashtbl.replace matched_level_counts k (n - 1);
+             open_levels_acc := level :: !open_levels_acc
+           | _ -> missing_levels_acc := level :: !missing_levels_acc)
+        state.persisted_sell_levels;
+      List.rev !open_levels_acc, List.rev !missing_levels_acc)
+    else [], []
+  in
   ( !open_buy_count_from_scan
   , !has_recent_amend_buy
   , !locked_in_buys
   , !locked_in_sells
   , !closest_sell_order
-  , List.rev !open_levels_acc
-  , List.rev !missing_levels_acc )
+  , open_persisted_levels
+  , missing_persisted_levels )
 ;;
 
 let compute_buy_ref_price ~bid_price ~ask_price =
@@ -2199,6 +2283,7 @@ let execute_strategy
       ?cached_state
       ?(quote_balance_stale = false)
       ?(oracle_halted = false)
+      ?(get_open_orders_generation = fun () -> -1)
       ~base_balance_age
       ~now
       (asset : trading_config)
@@ -2257,6 +2342,17 @@ let execute_strategy
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
+       (* Reset phase attribution so a short-circuit return (NaN price, stale
+          balance) reports zeros rather than the previous execution's values. *)
+       state.time_preamble_ns <- 0;
+       state.time_cleanup_ns <- 0;
+       state.time_sync_ns <- 0;
+       state.time_sync_scan_ns <- 0;
+       state.time_sync_rec_ns <- 0;
+       state.sync_orders_seen <- 0;
+       state.time_buy_ns <- 0;
+       state.time_sell_ns <- 0;
+       let t_preamble_start = Monotonic_clock.now_ns () in
        let lot_qty = venue_lot_qty state.grid_qty asset.exchange state in
        let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age in
        evaluate_asset_low_recovery
@@ -2287,7 +2383,18 @@ let execute_strategy
            then top_bid, top_ask
            else current_price, current_price
          in
+         (* Per-sub-phase attribution: minor-word allocation (cheap
+             [Gc.minor_words] reads) and wall time ([Monotonic_clock], a
+             0-alloc immediate-int C stub). Read by the domain on its max cycle
+             to localize where a wide-grid STRAT burst is produced. *)
+         state.time_preamble_ns <- Monotonic_clock.now_ns () - t_preamble_start;
+         let a_cleanup_start = Gc.minor_words () in
+         let t_cleanup_start = Monotonic_clock.now_ns () in
          cleanup_pending_and_cooldowns ~state ~now ~asset;
+         state.alloc_cleanup_words <- int_of_float (Gc.minor_words () -. a_cleanup_start);
+         state.time_cleanup_ns <- Monotonic_clock.now_ns () - t_cleanup_start;
+         let a_sync_start = Gc.minor_words () in
+         let t_sync_start = Monotonic_clock.now_ns () in
          let ( open_buy_count_from_scan
              , has_recent_amend_buy
              , locked_in_buys
@@ -2296,8 +2403,18 @@ let execute_strategy
              , open_persisted_levels
              , missing_persisted_levels )
            =
-           sync_open_orders ~state ~now ~asset ~bid_price ~lot_qty ~iter_open_orders ~ecfg
+           sync_open_orders
+             ~state
+             ~now
+             ~asset
+             ~bid_price
+             ~lot_qty
+             ~iter_open_orders
+             ~get_open_orders_generation
+             ~ecfg
          in
+         state.alloc_sync_words <- int_of_float (Gc.minor_words () -. a_sync_start);
+         state.time_sync_ns <- Monotonic_clock.now_ns () - t_sync_start;
          if state.maker_fee <= 0.0 || cycle land 0x3ff = 0
          then
            state.maker_fee
@@ -2343,6 +2460,8 @@ let execute_strategy
            let tif_recovery_active =
              state.tif_recovery_pending && now -. state.tif_recovery_since < 900.0
            in
+           let a_buy_start = Gc.minor_words () in
+           let t_buy_start = Monotonic_clock.now_ns () in
            let buy_attempted =
              if oracle_halted && not tif_recovery_active
              then false
@@ -2363,6 +2482,10 @@ let execute_strategy
                  ~locked_in_buys
                  ~closest_sell_order_initial:closest_sell_order
            in
+           state.alloc_buy_words <- int_of_float (Gc.minor_words () -. a_buy_start);
+           state.time_buy_ns <- Monotonic_clock.now_ns () - t_buy_start;
+           let a_sell_start = Gc.minor_words () in
+           let t_sell_start = Monotonic_clock.now_ns () in
            evaluate_sell_leg
              ~persisted_reconcile:(open_persisted_levels, missing_persisted_levels)
              ~state
@@ -2375,5 +2498,7 @@ let execute_strategy
              ~oracle_halted
              ~ecfg
              ~locked_in_sells
-             ~base_balance_age)))
+             ~base_balance_age;
+           state.alloc_sell_words <- int_of_float (Gc.minor_words () -. a_sell_start);
+           state.time_sell_ns <- Monotonic_clock.now_ns () - t_sell_start)))
 ;;

@@ -12,6 +12,15 @@ module Types = Exchange.Types
 
 let section = "domain_spawner"
 
+(** [Gc.quick_stat] allocates ~24 words and costs ~0.3us. It used to be sampled
+    1-in-4 measured cycles to amortize that, but that meant the reported
+    window-max cycle usually had no GC suffix, hiding whether a spike was a
+    collection landing in the span (exactly the case a ~600-word phase timing at
+    ~200us points to). Now every measured cycle captures its GC delta: at
+    single-digit cycles/s per domain the added allocation is negligible, and the
+    max cycle always carries the cause. *)
+let gc_sample_mask = 0
+
 (** A quote-balance snapshot older than this is not authoritative: buy
     placement against an under-funded stale snapshot is still attempted (the
     exchange's verdict is the truth); a FRESH snapshot that cannot fund the
@@ -103,7 +112,7 @@ let log_latency_window ~key ~window_seconds ~threshold_us ~ob ~exec ~prep ~strat
       ~key
       ~window_seconds
       ~threshold_us
-      [ "OB", ob; "EXEC", exec; "PREP", prep; "STRAT", strategy; "CYCLE", cycle ]
+      [ "BOOK", ob; "EVENTS", exec; "PREP", prep; "STRATEGY", strategy; "TOTAL", cycle ]
   with
   | None -> ()
   | Some msg -> Logging.info_f ~section "%s" msg
@@ -598,18 +607,21 @@ let asset_domain_worker
       let wake_baseline = Concurrency.Exchange_wakeup.get_generation_fast wakeup_sync in
       let cycle_events = ref 0 in
       let lifecycle_events = ref 0 in
-      (* Per-cycle GC counters: captured at cycle start and at the cause site
-         so a spike can be attributed to a minor/major collection. Two
-         [Gc.quick_stat] reads cost ~0.3us each (measured), acceptable next to
-         the cycles being diagnosed - but [Gc.quick_stat] allocates its stat
-         record (~20 words), so the start capture is taken BEFORE the stage
-         markers below: it must not be charged to the ob bracket (it previously
-         made up a third of the logged [ob:] allocation). *)
-      let stats_start =
-        if latency_this_cycle then Gc_monitor.get_stats () else Gc_monitor.zero
+      (* Per-cycle GC counters: captured at cycle start and at the cause site so
+         a spike can be attributed to a minor/major collection. The start
+         capture is SAMPLED ([gc_sample_mask]) because [Gc.quick_stat] allocates
+         ~24 words and costs ~0.3us; unsampled cycles report no GC suffix. It is
+         taken BEFORE the stage markers below so it is never charged to the ob
+         bracket. *)
+      let gc_sampled = latency_this_cycle && !cycle_count land gc_sample_mask = 0 in
+      let stats_start = if gc_sampled then Gc_monitor.get_stats () else Gc_monitor.zero in
+      (* Stage timing uses the non-allocating [Monotonic_clock] (immediate int)
+         instead of [Mtime_clock.now_ns] (3 boxed words per read): the
+         profiler's own clock must not pollute the allocations it measures. *)
+      let t1 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
+      let alloc_start =
+        if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
       in
-      let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
-      let alloc_start = if latency_this_cycle then Gc.minor_words () else 0.0 in
       (* drain lifecycle events queued by the supervisor REST path. All
          handler invocations (REST- and WS-sourced) now execute on THIS domain
          thread at the top of the cycle, so the strategy mutex is never
@@ -647,10 +659,11 @@ let asset_domain_worker
           current_price := (bid_price +. ask_price) /. 2.0;
           if changed then should_execute_strategy := true
         | None -> ());
-      let t2 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
-      let alloc_at_t2 = if latency_this_cycle then Gc.minor_words () else 0.0 in
-      if did_ob && latency_this_cycle
-      then Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub t2 t1));
+      let t2 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
+      let alloc_at_t2 =
+        if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
+      in
+      if did_ob && latency_this_cycle then Latency_profiler.record_ns prof_ob (t2 - t1);
       let was_exec_ready = !exec_ready in
       let current_pos = get_exec_pos_fn () in
       let did_exec = current_pos <> !exec_read_pos in
@@ -855,21 +868,21 @@ let asset_domain_worker
               asset_with_fees.symbol);
         exec_read_pos := new_pos;
         exec_checked := true);
-      let t3 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
-      let alloc_at_t3 = if latency_this_cycle then Gc.minor_words () else 0.0 in
+      let t3 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
+      let alloc_at_t3 =
+        if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
+      in
       (* Defer the per-event exec histogram writes until after [t4] so they are
          not charged to the STRAT/CYCLE samples: with N events this loop ran N
          bucket updates inside the measured span, self-inflating exactly the
          exec-heavy cycles that define the tail. *)
+      (* [-1] means "no exec events this cycle" (sentinel, no option boxing). *)
       let exec_per_event_ns =
         if did_exec && latency_this_cycle && was_exec_ready && !event_count > 0
         then (
-          let elapsed_ns = Int64.sub t3 t2 in
-          Some
-            (if !event_count > 1
-             then Int64.div elapsed_ns (Int64.of_int !event_count)
-             else elapsed_ns))
-        else None
+          let elapsed_ns = t3 - t2 in
+          if !event_count > 1 then elapsed_ns / !event_count else elapsed_ns)
+        else -1
       in
       (* Fallback gate for domains with no open orders: if no exec events
            arrived and the execution data is ready (snapshot ingested), open
@@ -1345,9 +1358,11 @@ let asset_domain_worker
          [st:false] cycle still reports its true prep cost instead of folding
          it into CYCLE; the [should_execute] branch below re-stamps it after the
          balance/F&G block that only runs when the strategy will execute. *)
-      let t3_strategy = ref (if latency_this_cycle then Mtime_clock.now_ns () else t3) in
+      let t3_strategy =
+        ref (if latency_this_cycle then Monotonic_clock.now_ns () else t3)
+      in
       let alloc_at_t3s =
-        ref (if latency_this_cycle then Gc.minor_words () else alloc_at_t3)
+        ref (if latency_this_cycle then int_of_float (Gc.minor_words ()) else alloc_at_t3)
       in
       if should_execute
       then (
@@ -1520,14 +1535,16 @@ let asset_domain_worker
         (* PREP/STRATEGY split point: everything above this line (oracle
            apply, halt/reclaim, gate, balance + F&G prep) is charged to
            [prof_prep]; only the strategy call itself is STRAT. *)
-        t3_strategy := if latency_this_cycle then Mtime_clock.now_ns () else 0L;
-        alloc_at_t3s := if latency_this_cycle then Gc.minor_words () else 0.0;
+        t3_strategy := if latency_this_cycle then Monotonic_clock.now_ns () else 0;
+        alloc_at_t3s := if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0;
         (match !grid_strategy_asset_ref, cached_grid_state with
          | Some asset, Some cs ->
            Dio_strategies.Jacobs_ladder.Strategy.execute
              ~cached_state:cs
              ~quote_balance_stale
              ~oracle_halted
+             ~get_open_orders_generation:(fun () ->
+               Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol)
              ~base_balance_age:(base_balance_age_fn ())
              ~now
              asset
@@ -1563,30 +1580,25 @@ let asset_domain_worker
             iter_orders
             !cycle_count
         | _ -> ());
-      let t4 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
-      let alloc_at_t4 = if latency_this_cycle then Gc.minor_words () else 0.0 in
+      let t4 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
+      let alloc_at_t4 =
+        if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
+      in
       (* PREP is recorded for EVERY measured cycle, not only when the strategy
          runs: the oracle apply / halt / reclaim / gate work happens on idle
          [st:false] cycles too, and folding it into CYCLE made those cycles
          unattributable. STRAT is the strategy call alone. *)
       if latency_this_cycle
       then (
-        Latency_profiler.record
-          prof_prep
-          (Mtime.Span.of_uint64_ns (Int64.sub !t3_strategy t3));
-        if should_execute
-        then
-          Latency_profiler.record
-            prof_strategy
-            (Mtime.Span.of_uint64_ns (Int64.sub t4 !t3_strategy)));
+        Latency_profiler.record_ns prof_prep (!t3_strategy - t3);
+        if should_execute then Latency_profiler.record_ns prof_strategy (t4 - !t3_strategy));
       (* Exec histogram writes deferred from [t3] (see above): now outside both
          the STRAT and CYCLE measured spans. *)
-      (match exec_per_event_ns with
-       | Some ns ->
-         for _ = 1 to !event_count do
-           Latency_profiler.record prof_exec (Mtime.Span.of_uint64_ns ns)
-         done
-       | None -> ());
+      if exec_per_event_ns >= 0
+      then
+        for _ = 1 to !event_count do
+          Latency_profiler.record_ns prof_exec exec_per_event_ns
+        done;
       (* Flush deferred accumulation persistence outside the strategy hotloop.
            Only performs file I/O when the dirty flag was set during execute_strategy. *)
       if should_execute
@@ -1599,7 +1611,6 @@ let asset_domain_worker
            Only busy cycles (real book/exec/strategy work) are recorded: idle
            wakeups would otherwise pin cycle p50/p99 at 0us. *)
       let cycle_busy = did_ob || did_exec || should_execute in
-      let cycle_span = Mtime.Span.of_uint64_ns (Int64.sub t4 t1) in
       if latency_this_cycle && cycle_busy
       then
         if
@@ -1607,26 +1618,53 @@ let asset_domain_worker
            maximum. The previous version allocated a closure (and boxed
            [alloc_start]) on every measured cycle just to be told it was not
            a max. *)
-          Latency_profiler.record_max prof_cycle cycle_span
+          Latency_profiler.record_max_ns prof_cycle (t4 - t1)
         then (
-          let alloc_diff = Gc.minor_words () -. alloc_start in
-          let stats_end = Gc_monitor.get_stats () in
-          let gc_str = Gc_monitor.diff_to_string stats_start stats_end in
-          let words from_ to_ = int_of_float (to_ -. from_) in
+          let alloc_diff = int_of_float (Gc.minor_words ()) - alloc_start in
+          let gc_str =
+            if gc_sampled
+            then Gc_monitor.diff_to_string stats_start (Gc_monitor.get_stats ())
+            else ""
+          in
+          (* Grid STRAT sub-phase allocation attribution, filled by
+             [execute_strategy] (scratch fields on the strategy state). Only
+             meaningful when the grid strategy ran this cycle. *)
+          let phase_str =
+            match cached_grid_state with
+            | Some cs when should_execute ->
+              Printf.sprintf
+                " strat[pre=%dus sync=%dw/%dus(scan %dus rec %dus n %d) ledger=%d \
+                 buy=%dw/%dus sell=%dw/%dus cln=%dw/%dus]"
+                (cs.time_preamble_ns / 1000)
+                cs.alloc_sync_words
+                (cs.time_sync_ns / 1000)
+                (cs.time_sync_scan_ns / 1000)
+                (cs.time_sync_rec_ns / 1000)
+                cs.sync_orders_seen
+                (Hashtbl.length cs.sell_commitments)
+                cs.alloc_buy_words
+                (cs.time_buy_ns / 1000)
+                cs.alloc_sell_words
+                (cs.time_sell_ns / 1000)
+                cs.alloc_cleanup_words
+                (cs.time_cleanup_ns / 1000)
+            | _ -> ""
+          in
           Latency_profiler.set_cause
             prof_cycle
             (Printf.sprintf
-               "ob:%B ex:%d lev:%d st:%B al:%.0fw[ob:%d ex:%d prep:%d strat:%d]%s"
+               "ob:%B ex:%d lev:%d st:%B al:%dw[ob:%d ex:%d prep:%d strat:%d]%s%s"
                did_ob
                !cycle_events
                !lifecycle_events
                should_execute
                alloc_diff
-               (words alloc_start alloc_at_t2)
-               (words alloc_at_t2 alloc_at_t3)
-               (words alloc_at_t3 !alloc_at_t3s)
-               (words !alloc_at_t3s alloc_at_t4)
-               gc_str));
+               (alloc_at_t2 - alloc_start)
+               (alloc_at_t3 - alloc_at_t2)
+               (!alloc_at_t3s - alloc_at_t3)
+               (alloc_at_t4 - !alloc_at_t3s)
+               gc_str
+               phase_str));
       (* Roll the latency window on a fixed time cadence rather than a cycle
            count: at typical domain cycle rates the old cycle_mod gate (10000
            cycles) accumulated minutes of samples before an abrupt wipe. *)

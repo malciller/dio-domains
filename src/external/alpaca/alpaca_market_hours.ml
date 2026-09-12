@@ -98,10 +98,14 @@ let compute_eastern_offset () =
 (** Production cache for the computed Eastern offset. The offset changes only at
     the two yearly DST transitions, but every session evaluator calls this - the
     domain market-hours gate and the WS feed handler's per-message RTH check -
-    so the uncached [mktime] math surfaced as 300-560us Alpaca PREP spikes. A
-    60s TTL keeps session boundaries exact to the minute while reducing the
-    common call to a single atomic read. The [now_override] test seam always
-    bypasses the cache so simulated dates stay deterministic. *)
+    so the uncached [mktime] math surfaced as 300-560us Alpaca PREP spikes. The
+    offset is constant between transitions, so a 1h TTL is used: the only window
+    where it can be stale is around a transition, and both US transitions occur
+    Sunday 02:00 ET - inside the 24/5 weekend closure, when no session is
+    evaluated - so no live session can observe the stale value. This keeps the
+    [mktime] cost to ~once per hour per process instead of every ~60s. The
+    [now_override] test seam always bypasses the cache so simulated dates stay
+    deterministic. *)
 let eastern_offset_cache : (float * int) Atomic.t = Atomic.make (0.0, -5)
 
 let us_eastern_offset_hours () =
@@ -110,7 +114,7 @@ let us_eastern_offset_hours () =
   | None ->
     let t = Unix.gettimeofday () in
     let last_t, last_v = Atomic.get eastern_offset_cache in
-    if t >= last_t && t -. last_t < 60.0
+    if t >= last_t && t -. last_t < 3600.0
     then last_v
     else (
       let v = compute_eastern_offset () in

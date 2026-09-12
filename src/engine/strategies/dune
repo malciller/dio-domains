@@ -10,6 +10,7 @@
   dio.kraken
   dio.hyperliquid
   dio.lighter
+  dio.latency_profiling
   lwt
   lwt.unix
   unix)

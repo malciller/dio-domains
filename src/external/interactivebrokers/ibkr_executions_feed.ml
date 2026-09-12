@@ -80,11 +80,19 @@ let get_symbol_store symbol =
     store
 ;;
 
+(** Account-wide generation, bumped whenever any symbol's open-orders snapshot
+    is republished. Lets the grid strategy's [sync_open_orders] skip its
+    O(open-orders) rescan when nothing changed. *)
+let orders_generation = Atomic.make 0
+
+let[@inline] get_orders_generation () = Atomic.get orders_generation
+
 (** Publishes an immutable snapshot of open_orders to the atomic cache.
     Must be called by writers under store.orders_mutex. *)
 let[@inline] publish_open_orders_cache store =
   let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
-  Atomic.set store.open_orders_cache snapshot
+  Atomic.set store.open_orders_cache snapshot;
+  Atomic.incr orders_generation
 ;;
 
 let notify_ready store =
