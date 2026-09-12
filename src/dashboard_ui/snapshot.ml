@@ -104,6 +104,8 @@ type latency_metric =
   ; samples : int
   ; sub_us_samples : int
   ; overflow : int
+  ; max_us : float
+  ; over_threshold : int
   ; executions : int
   ; executions_per_sec : float
   ; last_exec_time : float
@@ -285,6 +287,8 @@ let parse_latency_metric j =
   ; samples = j |?> "samples" |> to_int_d 0
   ; sub_us_samples = j |?> "sub_us_samples" |> to_int_d 0
   ; overflow = j |?> "overflow" |> to_int_d 0
+  ; max_us = j |?> "max_us" |> to_float_d 0.0
+  ; over_threshold = j |?> "over_threshold" |> to_int_d 0
   ; executions = j |?> "executions" |> to_int_d 0
   ; executions_per_sec = j |?> "executions_per_sec" |> to_float_d 0.0
   ; last_exec_time = j |?> "last_exec_time" |> to_float_d 0.0

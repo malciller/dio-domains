@@ -256,15 +256,16 @@ let render_latencies w (snapshot : Snapshot.t) =
   if active_lats = []
   then I.empty
   else (
-    (* Per-metric latency thresholds: (yellow_us, red_us). *)
+    (* Per-metric latency thresholds: (yellow_us, red_us). Every internal
+       pipeline stage on the CORE page shares one budget - green under 10us,
+       yellow 10-20us, red above 20us - because they are all in-process work
+       with the same sub-10us target. The NETWORK page metrics keep their own
+       much larger budgets: they measure exchange round-trips and socket
+       lifetimes, not in-process work. [f >= warn] makes exactly 10us yellow,
+       so the three bands read as <10 green / [10,20] yellow / >20 red. *)
     let latency_thresholds label =
       match label with
-      | "orderbook" -> 10.0, 30.0
-      | "prep" -> 20.0, 50.0
-      | "strategy" -> 30.0, 75.0
-      | "execution" -> 50.0, 150.0
-      | "oracle" -> 10.0, 20.0
-      | "cycle" -> 100.0, 1_000.0
+      | "oracle" | "orderbook" | "prep" | "strategy" | "execution" | "cycle" -> 10.0, 20.0
       | "ws_ping" -> 20_000.0, 100_000.0
       | "ws_feed" -> 50_000.0, 200_000.0
       | "rest_request" -> 100_000.0, 500_000.0
@@ -278,7 +279,7 @@ let render_latencies w (snapshot : Snapshot.t) =
         let warn, crit = latency_thresholds label in
         if f > crit
         then 2 (* red *)
-        else if f > warn
+        else if f >= warn
         then 1 (* yellow *)
         else 0 (* green *))
     in

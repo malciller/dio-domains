@@ -1809,14 +1809,15 @@ let test_position_sell_hold_releases_fifo_on_netting () =
 
 let test_sell_never_offers_locked_inventory () =
   (* REGRESSION (the production XMR over-sell): base committed to a resting
-     sell must NEVER be offered again, on any venue, even when the reported
-     figure is gross and the open-order feed has dropped the order.
+     sell must NEVER be offered again when the venue's reported figure is gross
+     or the open-order feed has dropped the order. Kraken nets holds from the
+     SAME feed the ledger tracks, so a dropped feed frees that base there and
+     the ledger excess must compensate.
      reserved 0.0048 + resting sell 0.0388 + gross holding 0.0836 (incl. a
      just-filled 0.04 buy): only 0.04 is sellable - NOT 0.0788. *)
-  let symbol = "LEDGER19/HYPE/USDC" in
-  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let symbol = "LEDGER19/USD" in
   let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
-  state.exchange_id <- "hyperliquid";
+  state.exchange_id <- "kraken";
   state.grid_qty <- 0.04;
   state.maker_fee <- 0.0;
   state.cached_sell_mult <- 1.0;
@@ -1838,7 +1839,7 @@ let test_sell_never_offers_locked_inventory () =
   state.last_buy_fill_price <- Some 528.83;
   state.last_buy_fill_qty <- Some 0.04;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
     ; symbol
     ; qty = "0.04"
     ; grid_interval = 0.16
@@ -1851,7 +1852,7 @@ let test_sell_never_offers_locked_inventory () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
   let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
@@ -1903,16 +1904,18 @@ let test_sell_never_offers_locked_inventory () =
 ;;
 
 let test_inflight_sell_commitment_survives_feed_gap () =
-  (* The in-flight sell ledger keeps base committed across the venue feed: a
-     dispatched sell is reserved before the feed lists it; the feed refreshes
-     its qty while listed; and a feed that stops listing a LIVE order
-     (reconnect / truncated snapshot) does NOT free the base until the
-     terminal event. This is the Kraken/IBKR/Lighter failure made impossible. *)
-  let symbol = "LEDGER20/HYPE/USDC" in
-  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  (* The in-flight sell ledger keeps base committed across the venue feed on
+     venues that derive holds from that SAME feed (Kraken): a dispatched sell
+     is reserved before the feed lists it; the feed refreshes its qty while
+     listed; and a feed that stops listing a LIVE order (reconnect / truncated
+     snapshot) does NOT free the base until the terminal event. This is the
+     Kraken/IBKR/Lighter failure made impossible. (Hyperliquid nets holds from
+     its own state, so it trusts the feed and evicts instead - see
+     [test_sell_commitment_lifecycle_all_venues].) *)
+  let symbol = "LEDGER20/USD" in
   let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
-  state.exchange_id <- "hyperliquid";
-  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid";
+  state.exchange_id <- "kraken";
+  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "kraken";
   state.open_sell_orders <- [];
   state.sell_commitments <- [];
   state.pending_orders <- [];
@@ -1920,7 +1923,7 @@ let test_inflight_sell_commitment_survives_feed_gap () =
   state.last_buy_order_price <- None;
   state.inflight_sell <- false;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
     ; symbol
     ; qty = "0.2"
     ; grid_interval = 0.16
@@ -1933,7 +1936,7 @@ let test_inflight_sell_commitment_survives_feed_gap () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
   let now = Unix.gettimeofday () in
   let feed = ref [] in
   let iter_open_orders f = List.iter (fun (a, b, c, d, e) -> f a b c d e) !feed in
@@ -5375,20 +5378,20 @@ let test_sellable_base_matrix_all_venues () =
   let idx = ref 0 in
   List.iter
     (fun exchange ->
-       (* Mirrors exchange_config.balance_nets_open_order_holds. *)
-       let nets =
-         exchange = "kraken" || exchange = "hyperliquid" || exchange = "alpaca"
-       in
+       (* Hyperliquid/Alpaca net holds from the venue's OWN state, independent
+          of our executions feed, so their reported figure excludes the resting
+          hold whether or not our feed lists it. Kraken derives the hold from
+          the SAME feed, so a dropped feed leaves the locked base in its
+          reported figure (compensated by the ledger excess). IBKR/Lighter
+          report gross. *)
+       let trust_feed = exchange = "hyperliquid" || exchange = "alpaca" in
+       let nets_from_feed = exchange = "kraken" in
        List.iter
          (fun feed_healthy ->
             incr idx;
             let symbol = Printf.sprintf "SELLMATRIX%d/USD" !idx in
-            (* What the domain passes as the venue's reported base holding:
-               a net venue with a healthy feed already removed the resting
-               hold; a gross venue (or a net venue whose feed dropped the
-               order) still contains the locked 0.4. *)
             let reported =
-              if nets && feed_healthy
+              if trust_feed || (nets_from_feed && feed_healthy)
               then reserved +. free
               else reserved +. ledger +. free
             in
@@ -5517,16 +5520,26 @@ let test_sell_commitment_lifecycle_all_venues () =
          (Dio_strategies.Jacobs_ladder.committed_sell_base state);
        feed := [];
        ignore (sync ());
+       (* A feed absence is venue-specific: venues whose balance nets holds
+          from their own state (Hyperliquid/Alpaca) trust the feed, so a
+          dropped order is terminal and evicted; venues deriving holds from the
+          same feed (Kraken/IBKR/Lighter) keep the base committed. *)
+       let trust_feed = exchange = "hyperliquid" || exchange = "alpaca" in
        check
          (float 1e-9)
-         (label "a feed-dropped live sell stays committed")
-         0.2
+         (label
+            (if trust_feed
+             then "a feed-dropped sell is evicted (venue nets from own state)"
+             else "a feed-dropped live sell stays committed"))
+         (if trust_feed then 0.0 else 0.2)
          (Dio_strategies.Jacobs_ladder.committed_sell_base state);
-       (* The buy leg must still see it (wash-trade / 2*gi clamps). *)
        check
          bool
-         (label "an in-flight sell remains visible to the buy leg")
-         true
+         (label
+            (if trust_feed
+             then "an evicted sell leaves the open-order view"
+             else "an in-flight sell remains visible to the buy leg"))
+         (not trust_feed)
          (List.exists (fun (id, _, _) -> id = "life-oid") state.open_sell_orders);
        let effective =
          Dio_strategies.Jacobs_ladder.effective_committed_sell_base
@@ -5535,7 +5548,11 @@ let test_sell_commitment_lifecycle_all_venues () =
            ~feed_total:state.feed_locked_sell_base
            ~unnetted_hold:0.0
        in
-       check (float 1e-9) (label "dropped-feed base is subtracted in full") 0.2 effective;
+       check
+         (float 1e-9)
+         (label "dropped-feed base is subtracted only on feed-derived venues")
+         (if trust_feed then 0.0 else 0.2)
+         effective;
        (* 5. A full fill releases the commitment. *)
        Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
          ~now:(now +. 1.0)

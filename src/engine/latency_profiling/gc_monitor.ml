@@ -6,8 +6,13 @@ type gc_stats =
   ; compactions : int
   }
 
+(** Zero-initialized stats, used as the "not sampling" sentinel so a
+    per-cycle capture can be skipped without allocating an option. *)
+let zero = { minor_collections = 0; major_collections = 0; compactions = 0 }
+
 (** Returns a snapshot of current GC collection counts. 
-    Uses [Gc.quick_stat] for minimal overhead on the hot path. *)
+    [Gc.quick_stat] is ~0.3us (measured), cheap enough to take twice per
+    busy cycle for per-cycle GC attribution. *)
 let[@inline] get_stats () =
   let stat = Gc.quick_stat () in
   { minor_collections = stat.minor_collections

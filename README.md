@@ -57,6 +57,9 @@ The engine reads `config.json`. Top-level keys:
 | `logging_width` | autodetect | Message column width; autodetected from terminal or `COLUMNS` |
 | `cycle_mod` | `10000` | Legacy interval for periodic background work; unused by current strategies |
 | `latency_window_seconds` | `5.0` | Rolling window for network latency profiling stats |
+| `latency_spike_threshold_us` | `10.0` | Per-stage ceiling; a window that breaches it emits one INFO line naming the offending stages, their worst spike and breach count |
+| `latency_spike_report` | `internal` | Which latency families emit spike logs: `internal` (per-domain pipeline), `network` (ws_ping/ws_feed/rest_request/signer), `both`, or `none` |
+| `latency_network_spike_threshold_us` | `20000.0` | Ceiling for the network spike family, in microseconds (20ms); separate from the 10us internal-op target |
 | `gc` | see table | OCaml GC tunables applied before the engine starts |
 | `oracle` | see table | Capital oracle knobs (runtime and tuning CLI) |
 | `trading` | required | One entry per instrument to trade |
@@ -71,12 +74,23 @@ Applied at process start through `Gc.set`. Units for `minor_heap_size` and `majo
 
 | Key | Default | Repo config |
 | --- | --- | --- |
-| `minor_heap_size` | `33554432` | `2097152` |
-| `space_overhead` | `120` | `120` |
+| `minor_heap_size` | `33554432` | `262144` |
+| `space_overhead` | `120` | `80` |
 | `max_overhead` | `1000000` | `1000000` |
-| `window_size` | `10` | `10` |
+| `window_size` | `10` | `5` |
 | `allocation_policy` | `2` | `2` |
-| `major_heap_increment` | `100` | `8388608` |
+| `major_heap_increment` | `100` | `1048576` |
+
+The repo values are tuned for tail latency rather than throughput: a small
+minor heap (`262144` words = 2 MiB, OCaml's own default) makes minor
+collections short and frequent instead of one long pause, and the smaller
+major-heap increment keeps heap growth slices fine. Combined with the
+allocation cuts on the trading hot path, this targets a sub-10us internal
+pipeline p99. The per-window internal spike line's worst-cycle continuation
+reports per-stage allocation and GC deltas, e.g.
+`ob:true ex:0 lev:0 st:false al:293w[ob:12 ex:0 prep:281 strat:0] (GC: minor=1)`,
+so a regression can be attributed to allocation (per stage) or a minor/major
+collection without a profiler attached.
 
 ### Trading entries
 

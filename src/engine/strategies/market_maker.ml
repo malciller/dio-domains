@@ -1657,9 +1657,11 @@ let dispatch_event asset_symbol (ev : mm_lifecycle_event) =
     domain worker at the top of every cycle. *)
 let drain_events symbol =
   let q = get_event_queue symbol in
+  let n = ref 0 in
   let rec loop () =
     match Strategy_common.LockFreeQueue.read q with
     | Some ev ->
+      incr n;
       dispatch_event symbol ev;
       loop ()
     | None -> ()
@@ -1673,7 +1675,8 @@ let drain_events symbol =
        stale-pending cleanup"
       symbol
       dropped;
-  loop ()
+  loop ();
+  !n
 ;;
 
 (** Public strategy module interface. *)

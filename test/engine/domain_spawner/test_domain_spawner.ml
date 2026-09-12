@@ -52,6 +52,10 @@ let test_spawn_domains_basic () =
     ; oracle = None
     ; trading = assets
     ; latency_window_seconds = 5.0
+    ; latency_spike_threshold_us = 10.0
+    ; latency_spike_report = Dio_engine.Config.Spike_report_internal
+    ; latency_spike_report_seconds = 30.0
+    ; latency_network_spike_threshold_us = 20_000.0
     ; fng_check_threshold = 1.5
     ; theme = None
     }
@@ -81,6 +85,10 @@ let test_spawn_domains_empty () =
     ; oracle = None
     ; trading = []
     ; latency_window_seconds = 5.0
+    ; latency_spike_threshold_us = 10.0
+    ; latency_spike_report = Dio_engine.Config.Spike_report_internal
+    ; latency_spike_report_seconds = 30.0
+    ; latency_network_spike_threshold_us = 20_000.0
     ; fng_check_threshold = 1.5
     ; theme = None
     }
@@ -171,6 +179,10 @@ let test_domain_error_handling () =
     ; oracle = None
     ; trading = [ failing_asset ]
     ; latency_window_seconds = 5.0
+    ; latency_spike_threshold_us = 10.0
+    ; latency_spike_report = Dio_engine.Config.Spike_report_internal
+    ; latency_spike_report_seconds = 30.0
+    ; latency_network_spike_threshold_us = 20_000.0
     ; fng_check_threshold = 1.5
     ; theme = None
     }

@@ -5,13 +5,17 @@
   "logging_width": 175,
   "cycle_mod": 10000,
   "fng_check_threshold": 2.5,
+  "latency_spike_threshold_us": 10,
+  "latency_spike_report": "internal",
+  "latency_spike_report_seconds": 30,
+  "latency_network_spike_threshold_us": 20000,
   "gc": {
-    "minor_heap_size": 2097152,
-    "space_overhead": 120,
+    "minor_heap_size": 262144,
+    "space_overhead": 80,
     "max_overhead": 1000000,
-    "window_size": 10,
+    "window_size": 5,
     "allocation_policy": 2,
-    "major_heap_increment": 8388608
+    "major_heap_increment": 1048576
   },
   "oracle": {
     "qty_cap_mult": 1.5,

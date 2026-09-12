@@ -38,6 +38,16 @@ type gc_config =
   ; major_heap_increment : int
   }
 
+(** Which latency families emit spike logs. "internal" covers the per-domain
+    pipeline stages (OB/EXEC/PREP/STRAT/CYCLE); "network" covers the per-venue
+    ws_ping/ws_feed/rest_request/signer windows. Kept separate so the noisy
+    network tail can be silenced while chasing internal-op bottlenecks. *)
+type latency_spike_report =
+  | Spike_report_internal
+  | Spike_report_network
+  | Spike_report_both
+  | Spike_report_none
+
 type config =
   { cycle_mod : int
   ; logging : logging_config
@@ -52,12 +62,71 @@ type config =
     (** Duration of each per-domain latency accumulation window before the
         histogram is snapshotted and reset. Shorter windows make the dashboard
         percentiles move faster but reduce sample counts per window. *)
-  ; theme : string option
-    (** Optional UI theme name for the terminal dashboard. *)
+  ; latency_spike_threshold_us : float
+    (** Per-stage latency ceiling, in microseconds. Any window whose samples
+        exceed it emits one INFO line naming the offending stages, their worst
+        spike and how many samples breached, so bottlenecks are visible
+        without logging a baseline every window. Current target: 10us. *)
+  ; latency_spike_report : latency_spike_report
+    (** Which latency families emit the spike logs above. Defaults to
+        [Spike_report_internal]: internal pipeline ops only, network silenced. *)
+  ; latency_spike_report_seconds : float
+    (** Minimum wall-clock interval between per-domain internal spike log
+        lines. The percentile windows still publish on
+        [latency_window_seconds] for the dashboard; this only throttles the
+        INFO spam (a busy domain breached the 10us ceiling every 5s window).
+        Defaults to 30s; set to 0 to log every window. *)
+  ; latency_network_spike_threshold_us : float
+    (** Ceiling for the network family, in microseconds. Separate from
+        [latency_spike_threshold_us] because network metrics (ws ping/feed,
+        REST, signer) are millisecond-scale, so the internal 10us op target
+        would flag every window. *)
+  ; theme : string option (** Optional UI theme name for the terminal dashboard. *)
   }
 
 (** Logging section identifier for this module. *)
 let section = "config"
+
+(** Yojson's [to_float_option] raises on an integer JSON number, but integers
+    are natural in a hand-written config ("10", "20000"). Accept [Int] and
+    [Float]; everything else (including [Null]) is [None]. Without this a
+    single integer-valued float field aborts startup with an uncaught
+    [Type_error]. *)
+let to_float_opt = function
+  | `Int i -> Some (float_of_int i)
+  | `Float f -> Some f
+  | _ -> None
+;;
+
+(** Parses a [latency_spike_report] from its config string. Unknown values warn
+    and fall back to internal-only, so a typo cannot silence the internal spike
+    logs. *)
+let latency_spike_report_of_string s =
+  match String.lowercase_ascii (String.trim s) with
+  | "internal" -> Spike_report_internal
+  | "network" -> Spike_report_network
+  | "both" | "all" -> Spike_report_both
+  | "none" | "off" -> Spike_report_none
+  | other ->
+    Logging.warn_f
+      ~section
+      "Unknown latency_spike_report '%s'; defaulting to 'internal'"
+      other;
+    Spike_report_internal
+;;
+
+(** [reports_internal r] is true when internal pipeline spikes should be
+    logged. *)
+let reports_internal = function
+  | Spike_report_internal | Spike_report_both -> true
+  | Spike_report_network | Spike_report_none -> false
+;;
+
+(** [reports_network r] is true when network latency spikes should be logged. *)
+let reports_network = function
+  | Spike_report_network | Spike_report_both -> true
+  | Spike_report_internal | Spike_report_none -> false
+;;
 
 (** Permitted key sets used by [validate_keys] for strict schema enforcement at each nesting level. *)
 let known_top_level_keys =
@@ -66,6 +135,10 @@ let known_top_level_keys =
   ; "logging_width"
   ; "cycle_mod"
   ; "latency_window_seconds"
+  ; "latency_spike_threshold_us"
+  ; "latency_spike_report"
+  ; "latency_spike_report_seconds"
+  ; "latency_network_spike_threshold_us"
   ; "trading"
   ; "gc"
   ; "oracle"
@@ -319,8 +392,8 @@ let parse_config json =
   ; min_usd_balance = json |> member "min_usd_balance" |> to_string_option
   ; max_exposure = json |> member "max_exposure" |> to_string_option
   ; strategy
-  ; maker_fee = json |> member "maker_fee" |> to_option to_float
-  ; taker_fee = json |> member "taker_fee" |> to_option to_float
+  ; maker_fee = json |> member "maker_fee" |> to_float_opt
+  ; taker_fee = json |> member "taker_fee" |> to_float_opt
   ; testnet
   ; hedge
   ; accumulation_buffer = parse_accumulation_buffer json exchange symbol
@@ -417,7 +490,7 @@ let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
     if validate_keys ~context:"oracle" ~allowed:known_oracle_keys oracle_json then exit 1;
     let defaults = Dio_oracle.Oracle_runtime.default_config () in
     let opt_float key default =
-      oracle_json |> member key |> to_float_option |> Option.value ~default
+      oracle_json |> member key |> to_float_opt |> Option.value ~default
     in
     Some
       { target_survival = opt_float "target_survival" defaults.target_survival
@@ -437,7 +510,7 @@ let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
                    ~allowed:known_oracle_asset_keys
                    entry
                then exit 1;
-               let okey key = entry |> member key |> to_float_option in
+               let okey key = entry |> member key |> to_float_opt in
                ( symbol
                , ({ target_survival = okey "target_survival"
                   ; min_active_dsurv = okey "min_active_dsurv"
@@ -460,13 +533,35 @@ let read_config () : config =
     let oracle = parse_oracle_config json in
     let trading = json |> member "trading" |> to_list |> List.map parse_config in
     let fng_check_threshold =
-      json |> member "fng_check_threshold" |> to_float_option |> Option.value ~default:1.5
+      json |> member "fng_check_threshold" |> to_float_opt |> Option.value ~default:1.5
     in
     let latency_window_seconds =
+      json |> member "latency_window_seconds" |> to_float_opt |> Option.value ~default:5.0
+    in
+    let latency_spike_threshold_us =
       json
-      |> member "latency_window_seconds"
-      |> to_float_option
-      |> Option.value ~default:5.0
+      |> member "latency_spike_threshold_us"
+      |> to_float_opt
+      |> Option.value ~default:10.0
+    in
+    let latency_spike_report =
+      json
+      |> member "latency_spike_report"
+      |> to_string_option
+      |> Option.value ~default:"internal"
+      |> latency_spike_report_of_string
+    in
+    let latency_spike_report_seconds =
+      json
+      |> member "latency_spike_report_seconds"
+      |> to_float_opt
+      |> Option.value ~default:30.0
+    in
+    let latency_network_spike_threshold_us =
+      json
+      |> member "latency_network_spike_threshold_us"
+      |> to_float_opt
+      |> Option.value ~default:20_000.0
     in
     let theme = json |> member "theme" |> to_string_option in
     { cycle_mod
@@ -476,6 +571,10 @@ let read_config () : config =
     ; trading
     ; fng_check_threshold
     ; latency_window_seconds
+    ; latency_spike_threshold_us
+    ; latency_spike_report
+    ; latency_spike_report_seconds
+    ; latency_network_spike_threshold_us
     ; theme
     }
   with
@@ -491,6 +590,10 @@ let read_config () : config =
     ; trading = []
     ; fng_check_threshold = 1.5
     ; latency_window_seconds = 5.0
+    ; latency_spike_threshold_us = 10.0
+    ; latency_spike_report = Spike_report_internal
+    ; latency_spike_report_seconds = 30.0
+    ; latency_network_spike_threshold_us = 20_000.0
     ; theme = None
     }
 ;;

@@ -73,16 +73,13 @@ let get_domain_profilers symbol =
       let p =
         { prof_ob = Latency_profiler.create (symbol ^ ":ob")
         ; prof_exec =
-            Latency_profiler.create
-              ~bucket_us:10
-              ~max_latency_us:250_000
-              (symbol ^ ":exec")
+            Latency_profiler.create ~bucket_us:10 ~max_latency_us:20_000 (symbol ^ ":exec")
         ; prof_prep = Latency_profiler.create (symbol ^ ":prep")
         ; prof_strategy = Latency_profiler.create (symbol ^ ":strategy")
         ; prof_cycle =
             Latency_profiler.create
               ~bucket_us:10
-              ~max_latency_us:250_000
+              ~max_latency_us:20_000
               (symbol ^ ":cycle")
         }
       in
@@ -91,6 +88,25 @@ let get_domain_profilers symbol =
   in
   Mutex.unlock profiler_cache_mutex;
   profs
+;;
+
+(** Emit at most one INFO line per completed internal latency window, only
+    when a stage recorded a sample at or above [threshold_us]. Keeps the log
+    silent on healthy windows (no baseline every 5s) while pointing straight at
+    the stage that needs smoothing to reach the per-system latency ceiling.
+    [cycle]'s cause is appended to the shared [Latency_profiler.spike_message]
+    output as the worst-cycle continuation line. *)
+let log_latency_window ~key ~window_seconds ~threshold_us ~ob ~exec ~prep ~strategy ~cycle
+  =
+  match
+    Latency_profiler.spike_message
+      ~key
+      ~window_seconds
+      ~threshold_us
+      [ "OB", ob; "EXEC", exec; "PREP", prep; "STRAT", strategy; "CYCLE", cycle ]
+  with
+  | None -> ()
+  | Some msg -> Logging.info_f ~section "%s" msg
 ;;
 
 (** Core worker function executed by each OCaml domain for a trading asset.
@@ -468,18 +484,31 @@ let asset_domain_worker
        (F1/F4). Publishing swaps an immutable snapshot into an Atomic cell,
        so the dashboard never scans a histogram being mutated by this domain. *)
     let latency_window_seconds = config.latency_window_seconds in
+    let latency_spike_threshold_us = config.latency_spike_threshold_us in
+    let latency_spike_report_seconds = config.latency_spike_report_seconds in
     let last_window_time = ref (Unix.gettimeofday ()) in
-    (* GC stats are sampled once per latency window (inside
-       [publish_windows]) instead of twice per busy cycle. [Gc.quick_stat]
-       costs ~2µs; on the publish cadence it is negligible, per-cycle it
-       would tax every busy domain cycle once profiling warms up. *)
-    let gc_start =
-      ref { Gc_monitor.minor_collections = 0; major_collections = 0; compactions = 0 }
-    in
-    let gc_end = ref !gc_start in
+    (* Wall-clock throttle for the internal spike INFO lines. The percentile
+       windows still publish every [latency_window_seconds] for the dashboard;
+       this only stops a busy domain that breaches the 10us ceiling in every
+       window from spamming one line per window. The last window in the
+       interval is the one reported. *)
+    let last_spike_report_time = ref (Unix.gettimeofday ()) in
+    (* Per-cycle GC attribution is captured inline in the loop (two
+       [Gc.quick_stat] reads, ~0.3us each - see [gc_monitor]); the window
+       publisher below no longer owns GC sampling. The old window-scoped
+       [gc_start]/[gc_end] pair was always set to the same snapshot and so
+       reported an empty delta forever. *)
     let publish_windows () =
-      ignore (Latency_profiler.snapshot_and_reset prof_ob);
-      ignore (Latency_profiler.snapshot_and_reset prof_exec);
+      let ob =
+        Latency_profiler.snapshot_and_reset
+          ~spike_threshold_us:latency_spike_threshold_us
+          prof_ob
+      in
+      let exec =
+        Latency_profiler.snapshot_and_reset
+          ~spike_threshold_us:latency_spike_threshold_us
+          prof_exec
+      in
       (* snapshot+reset this symbol's place/amend/cancel operation
          profilers on the window cadence. Their per-op [report] calls were
          removed from the order hot path (they logged mid-cycle whenever 100
@@ -495,22 +524,50 @@ let asset_domain_worker
         prof_strategy
         (Dio_strategies.Strategy_common.Order_actions.snapshot_and_reset
            asset_with_fees.symbol);
-      ignore (Latency_profiler.snapshot_and_reset prof_prep);
-      ignore (Latency_profiler.snapshot_and_reset prof_strategy);
-      ignore (Latency_profiler.snapshot_and_reset prof_cycle);
-      (* Refresh the window-scoped GC sampling pair once per window. *)
-      gc_start := Gc_monitor.get_stats ();
-      gc_end := !gc_start
+      let prep =
+        Latency_profiler.snapshot_and_reset
+          ~spike_threshold_us:latency_spike_threshold_us
+          prof_prep
+      in
+      let strategy =
+        Latency_profiler.snapshot_and_reset
+          ~spike_threshold_us:latency_spike_threshold_us
+          prof_strategy
+      in
+      let cycle =
+        Latency_profiler.snapshot_and_reset
+          ~spike_threshold_us:latency_spike_threshold_us
+          prof_cycle
+      in
+      if reports_internal config.latency_spike_report
+      then (
+        let now = Unix.gettimeofday () in
+        if now -. !last_spike_report_time >= latency_spike_report_seconds
+        then (
+          last_spike_report_time := now;
+          log_latency_window
+            ~key
+            ~window_seconds:latency_window_seconds
+            ~threshold_us:latency_spike_threshold_us
+            ~ob
+            ~exec
+            ~prep
+            ~strategy
+            ~cycle))
     in
     (* Publish an initial empty window so the dashboard renders this domain as
        idle immediately rather than after the first window elapses, and clears
        any stale snapshot left by a previous domain incarnation. *)
     publish_windows ();
     last_window_time := Unix.gettimeofday ();
-    (* Cache the equity market-hours evaluation (~1s TTL). The underlying check
-       does gmtime+mktime+DST math per call (alpaca_market_hours.ml:11-105);
-       evaluating it on every hot ibkr/alpaca cycle inflated the cycle latency
-       profile. *)
+    (* Cache the equity market-hours evaluation. The underlying check does
+       gmtime+mktime+DST math per call (alpaca_market_hours.ml:11-105, 5
+       gmtime + 3 mktime); with a 1s TTL and equity domains cycling ~1/s the
+       cache almost always missed, adding 300-1200us to PREP every cycle (the
+       logged alpaca PREP tail). Session boundaries are minute-granular at
+       worst, so a 30s TTL is correct and turns that cost into one check per
+       half-minute. *)
+    let mh_cache_seconds = 30.0 in
     let mh_cache = ref (None : (float * bool) option) in
     (* Cache strategy state references to avoid repeated mutex acquisition
           on the hot path. References are stable while is_running is true. *)
@@ -540,24 +597,38 @@ let asset_domain_worker
          symbol's domain indefinitely). *)
       let wake_baseline = Concurrency.Exchange_wakeup.get_generation_fast wakeup_sync in
       let cycle_events = ref 0 in
+      let lifecycle_events = ref 0 in
+      (* Per-cycle GC counters: captured at cycle start and at the cause site
+         so a spike can be attributed to a minor/major collection. Two
+         [Gc.quick_stat] reads cost ~0.3us each (measured), acceptable next to
+         the cycles being diagnosed - but [Gc.quick_stat] allocates its stat
+         record (~20 words), so the start capture is taken BEFORE the stage
+         markers below: it must not be charged to the ob bracket (it previously
+         made up a third of the logged [ob:] allocation). *)
+      let stats_start =
+        if latency_this_cycle then Gc_monitor.get_stats () else Gc_monitor.zero
+      in
       let t1 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
       let alloc_start = if latency_this_cycle then Gc.minor_words () else 0.0 in
-      (* GC stats are window-scoped (sampled in [publish_windows]); the
-         per-cycle cause string reads the last window pair. No [Gc.quick_stat]
-         on the per-tick path. *)
       (* drain lifecycle events queued by the supervisor REST path. All
          handler invocations (REST- and WS-sourced) now execute on THIS domain
          thread at the top of the cycle, so the strategy mutex is never
          contended across threads. Runs unconditionally; the queue is empty
          on the common cycle and the read is a lock-free CAS. *)
       if is_grid_strategy
-      then Dio_strategies.Jacobs_ladder.Strategy.drain_events asset_with_fees.symbol;
+      then
+        lifecycle_events
+        := !lifecycle_events
+           + Dio_strategies.Jacobs_ladder.Strategy.drain_events asset_with_fees.symbol;
       (* drain MM lifecycle events queued by the supervisor REST path.
          Same discipline as the grid queue above: all handler execution
          happens on THIS domain thread, so MM state is never mutated
          cross-thread against execute_strategy. *)
       if is_mm_strategy
-      then Dio_strategies.Market_maker.Strategy.drain_events asset_with_fees.symbol;
+      then
+        lifecycle_events
+        := !lifecycle_events
+           + Dio_strategies.Market_maker.Strategy.drain_events asset_with_fees.symbol;
       (* === ORDERBOOK HOT PATH === *)
       let ob_pos = get_ob_pos_fn () in
       let did_ob =
@@ -577,6 +648,7 @@ let asset_domain_worker
           if changed then should_execute_strategy := true
         | None -> ());
       let t2 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
+      let alloc_at_t2 = if latency_this_cycle then Gc.minor_words () else 0.0 in
       if did_ob && latency_this_cycle
       then Latency_profiler.record prof_ob (Mtime.Span.of_uint64_ns (Int64.sub t2 t1));
       let was_exec_ready = !exec_ready in
@@ -784,6 +856,7 @@ let asset_domain_worker
         exec_read_pos := new_pos;
         exec_checked := true);
       let t3 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
+      let alloc_at_t3 = if latency_this_cycle then Gc.minor_words () else 0.0 in
       (* Defer the per-event exec histogram writes until after [t4] so they are
          not charged to the STRAT/CYCLE samples: with N events this loop ran N
          bucket updates inside the measured span, self-inflating exactly the
@@ -873,7 +946,7 @@ let asset_domain_worker
         | "ibkr" | "alpaca" ->
           let now_mh = Unix.gettimeofday () in
           (match !mh_cache with
-           | Some (t, closed) when now_mh -. t < 1.0 -> closed
+           | Some (t, closed) when now_mh -. t < mh_cache_seconds -> closed
            | _ ->
              let closed =
                (asset_with_fees.exchange = "ibkr"
@@ -911,14 +984,16 @@ let asset_domain_worker
         match oracle_decision with
         | Some d when d.cancel_resting_buys -> true
         | Some d when not d.active ->
-          let has_open_buy =
-            Ex.fold_open_orders
-              ~symbol:asset_with_fees.symbol
-              ~init:false
-              ~f:(fun acc (o : Types.open_order) ->
-                acc || (o.side = Types.Buy && o.remaining_qty > 0.0))
-          in
-          not has_open_buy
+          (* Allocation-free scan: [iter_open_orders_fast] yields primitives, so
+             this no longer materializes a [Types.open_order] record per order
+             on every idle cycle (the old [fold_open_orders] path allocated one
+             record + two closures per order per cycle). *)
+          let has_open_buy = ref false in
+          Ex.iter_open_orders_fast
+            ~symbol:asset_with_fees.symbol
+            (fun _oid _price qty side_str _userref ->
+               if qty > 0.0 && side_str = "buy" then has_open_buy := true);
+          not !has_open_buy
         | _ -> false
       in
       (match oracle_decision, !grid_strategy_asset_ref with
@@ -1092,19 +1167,19 @@ let asset_domain_worker
                  cancellable replacement on its own. *)
               let eligible = ref 0 in
               let any_buy = ref false in
-              Ex.fold_open_orders
+              (* Allocation-free: primitives only, no [Types.open_order] record
+                 per order on the reclaim path. *)
+              Ex.iter_open_orders_fast
                 ~symbol:asset_with_fees.symbol
-                ~init:()
-                ~f:(fun () (o : Types.open_order) ->
-                  if o.side = Types.Buy && o.remaining_qty > 0.0
-                  then (
-                    any_buy := true;
-                    if
-                      not
-                        (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight
-                           o.order_id)
-                    then incr eligible))
-              |> ignore;
+                (fun oid _price qty side_str _userref ->
+                   if qty > 0.0 && side_str = "buy"
+                   then (
+                     any_buy := true;
+                     if
+                       not
+                         (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight
+                            oid)
+                     then incr eligible));
               match
                 Dio_strategies.Jacobs_ladder.reclaim_step
                   ~now
@@ -1126,29 +1201,26 @@ let asset_domain_worker
                 Oracle_runtime.request_pass ()
               | Dio_strategies.Jacobs_ladder.Reclaim_cancel _ ->
                 let n = ref 0 in
-                Ex.fold_open_orders
+                Ex.iter_open_orders_fast
                   ~symbol:asset_with_fees.symbol
-                  ~init:0
-                  ~f:(fun acc (o : Types.open_order) ->
-                    if
-                      o.side = Types.Buy
-                      && o.remaining_qty > 0.0
-                      && not
-                           (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight
-                              o.order_id)
-                    then (
-                      let cancel =
-                        Dio_strategies.Jacobs_ladder.create_cancel_order
-                          o.order_id
-                          asset_with_fees.symbol
-                          Dio_strategies.Strategy_common.Ladder
-                          asset_with_fees.exchange
-                      in
-                      ignore (Dio_strategies.Jacobs_ladder.push_order ~now cancel);
-                      incr n;
-                      acc + 1)
-                    else acc)
-                |> ignore;
+                  (fun oid _price qty side_str _userref ->
+                     if
+                       qty > 0.0
+                       && side_str = "buy"
+                       && not
+                            (Dio_strategies.Strategy_common.InFlightAmendments
+                             .is_in_flight
+                               oid)
+                     then (
+                       let cancel =
+                         Dio_strategies.Jacobs_ladder.create_cancel_order
+                           oid
+                           asset_with_fees.symbol
+                           Dio_strategies.Strategy_common.Ladder
+                           asset_with_fees.exchange
+                       in
+                       ignore (Dio_strategies.Jacobs_ladder.push_order ~now cancel);
+                       incr n));
                 reclaim_cancel_issued := true;
                 reclaim_cancel_at := now;
                 (* Wake the capital oracle so it re-sizes against the released
@@ -1267,8 +1339,16 @@ let asset_domain_worker
          capital-oracle decision apply, halt/reclaim evaluation, startup gate,
          balance reads and F&G re-evaluation. It used to be charged to STRAT,
          which made STRAT read 100us+ on the oracle-heavy symbols; the prep
-         profiler isolates it so STRAT is the strategy call alone. *)
-      let t3_strategy = ref t3 in
+         profiler isolates it so STRAT is the strategy call alone.
+         [t3_strategy] is seeded HERE (after the oracle apply / halt / reclaim /
+         gate work that runs every cycle, before [should_execute]) so an idle
+         [st:false] cycle still reports its true prep cost instead of folding
+         it into CYCLE; the [should_execute] branch below re-stamps it after the
+         balance/F&G block that only runs when the strategy will execute. *)
+      let t3_strategy = ref (if latency_this_cycle then Mtime_clock.now_ns () else t3) in
+      let alloc_at_t3s =
+        ref (if latency_this_cycle then Gc.minor_words () else alloc_at_t3)
+      in
       if should_execute
       then (
         should_execute_strategy := false;
@@ -1441,6 +1521,7 @@ let asset_domain_worker
            apply, halt/reclaim, gate, balance + F&G prep) is charged to
            [prof_prep]; only the strategy call itself is STRAT. *)
         t3_strategy := if latency_this_cycle then Mtime_clock.now_ns () else 0L;
+        alloc_at_t3s := if latency_this_cycle then Gc.minor_words () else 0.0;
         (match !grid_strategy_asset_ref, cached_grid_state with
          | Some asset, Some cs ->
            Dio_strategies.Jacobs_ladder.Strategy.execute
@@ -1483,14 +1564,21 @@ let asset_domain_worker
             !cycle_count
         | _ -> ());
       let t4 = if latency_this_cycle then Mtime_clock.now_ns () else 0L in
-      if should_execute && latency_this_cycle
+      let alloc_at_t4 = if latency_this_cycle then Gc.minor_words () else 0.0 in
+      (* PREP is recorded for EVERY measured cycle, not only when the strategy
+         runs: the oracle apply / halt / reclaim / gate work happens on idle
+         [st:false] cycles too, and folding it into CYCLE made those cycles
+         unattributable. STRAT is the strategy call alone. *)
+      if latency_this_cycle
       then (
         Latency_profiler.record
           prof_prep
           (Mtime.Span.of_uint64_ns (Int64.sub !t3_strategy t3));
-        Latency_profiler.record
-          prof_strategy
-          (Mtime.Span.of_uint64_ns (Int64.sub t4 !t3_strategy)));
+        if should_execute
+        then
+          Latency_profiler.record
+            prof_strategy
+            (Mtime.Span.of_uint64_ns (Int64.sub t4 !t3_strategy)));
       (* Exec histogram writes deferred from [t3] (see above): now outside both
          the STRAT and CYCLE measured spans. *)
       (match exec_per_event_ns with
@@ -1522,15 +1610,22 @@ let asset_domain_worker
           Latency_profiler.record_max prof_cycle cycle_span
         then (
           let alloc_diff = Gc.minor_words () -. alloc_start in
-          let gc_str = Gc_monitor.diff_to_string !gc_start !gc_end in
+          let stats_end = Gc_monitor.get_stats () in
+          let gc_str = Gc_monitor.diff_to_string stats_start stats_end in
+          let words from_ to_ = int_of_float (to_ -. from_) in
           Latency_profiler.set_cause
             prof_cycle
             (Printf.sprintf
-               "ob:%B ex:%d st:%B al:%.0fw%s"
+               "ob:%B ex:%d lev:%d st:%B al:%.0fw[ob:%d ex:%d prep:%d strat:%d]%s"
                did_ob
                !cycle_events
+               !lifecycle_events
                should_execute
                alloc_diff
+               (words alloc_start alloc_at_t2)
+               (words alloc_at_t2 alloc_at_t3)
+               (words alloc_at_t3 !alloc_at_t3s)
+               (words !alloc_at_t3s alloc_at_t4)
                gc_str));
       (* Roll the latency window on a fixed time cadence rather than a cycle
            count: at typical domain cycle rates the old cycle_mod gate (10000
