@@ -86,9 +86,16 @@ RUN eval $(opam env) \
 # 4. Copy project descriptors first (layer-cache friendly)
 COPY --chown=opam:opam dio.opam dune-project ./
 
-# 5. Install OCaml dependencies in parallel with BuildKit cache
+# 5. Install OCaml dependencies in parallel with BuildKit cache.
+#    The OxCaml repo exposes both lwt_ppx 5.9.1+ox (built against an older ppxlib
+#    AST; fails with "Pexp_let expects 4 argument(s)") and 6.0.0+ox (matched to
+#    ppxlib 0.33.0+ox2). Pin it explicitly here rather than in dio.opam, because
+#    the same constraint on the classic-flambda toolchain forces ppxlib >= 0.36
+#    and conflicts with conduit-lwt-unix < 3 (see OXCAML_PORT.md WS2b).
 RUN --mount=type=cache,target=/home/opam/.opam/download-cache,uid=1000,gid=1000 \
-    eval $(opam env) && opam install -y -j $(nproc) . --deps-only --with-test --no-depexts
+    eval $(opam env) \
+    && opam pin add -y --no-action lwt_ppx 6.0.0+ox \
+    && opam install -y -j $(nproc) . --deps-only --with-test --no-depexts
 
 # 6. Copy the rest of the source tree
 COPY --chown=opam:opam . .
