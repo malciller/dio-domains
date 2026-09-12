@@ -74,7 +74,12 @@ jobs:
         run: opam install . --deps-only --with-test --assume-depexts -y --switch default
 
       - name: Build
-        run: opam exec --switch default -- dune build @all
+        # Clean first: the self-hosted Gitea runner reuses a workspace, and a
+        # `_build` left over from a previous job can contain absolute paths to a
+        # switch that no longer exists (e.g. after the switch is recreated).
+        run: |
+          opam exec --switch default -- dune clean
+          opam exec --switch default -- dune build @all
 
       - name: Run tests
         run: opam exec --switch default -- dune runtest
