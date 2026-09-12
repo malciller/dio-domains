@@ -14,14 +14,17 @@
 
 ; Compatibility shim for [Conduit_lwt_unix.default_ctx], whose type changed from
 ; [ctx Lazy.t] (Conduit >= 3) to [ctx] (Conduit < 3, used by the OxCaml bundle).
-; The classic-flambda toolchain reports [flambda = true]; the OxCaml compiler
-; does not. Generate ctx.ml from the matching source at build time.
+; The discriminator is NOT the compiler: both the GitHub default OCaml 5.2 switch
+; and the OxCaml switch report [flambda = false], but they ship different Conduit
+; majors. The OxCaml build runs inside the Docker image, which exports
+; DIO_OXCAML=1; every other toolchain (local flambda, GitHub default) uses Conduit
+; >= 3. Select the implementation from that explicit flag.
 (rule
  (targets ctx.ml)
- (enabled_if %{ocaml-config:flambda})
- (action (copy ctx_lazy.ml ctx.ml)))
+ (enabled_if (= %{env:DIO_OXCAML=0} "1"))
+ (action (copy ctx_direct.ml ctx.ml)))
 
 (rule
  (targets ctx.ml)
- (enabled_if (not %{ocaml-config:flambda}))
- (action (copy ctx_direct.ml ctx.ml)))
+ (enabled_if (<> %{env:DIO_OXCAML=0} "1"))
+ (action (copy ctx_lazy.ml ctx.ml)))

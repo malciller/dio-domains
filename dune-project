@@ -22,17 +22,19 @@
   ocaml
   dune
   (yojson
-   (>= 2.2.2))
+   (= 2.2.2))
   lwt
   lwt_ppx
   lwt_ssl
   mirage-crypto-rng
-  cohttp-lwt-unix
+  (cohttp-lwt-unix
+   (< 6.0.0))
   websocket
   base64
   digestif
   uri
-  conduit-lwt-unix
+  (conduit-lwt-unix
+   (< 8.0.0))
   ipaddr
   alcotest
   mtime

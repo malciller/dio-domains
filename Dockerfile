@@ -100,6 +100,14 @@ RUN --mount=type=cache,target=/home/opam/.opam/download-cache,uid=1000,gid=1000 
 # 6. Copy the rest of the source tree
 COPY --chown=opam:opam . .
 
+# 6a. Mark the toolchain as OxCaml for the build rules. src/external/ws_lwt and
+#     src/runtime_compat select their implementation from this flag, because the
+#     OxCaml bundle ships Conduit 2 (default_ctx : ctx) and lacks Sys.Safe, while
+#     every other toolchain has Conduit >= 3 (default_ctx : ctx Lazy.t) and no
+#     Safe module. [flambda] is not a usable discriminator: the default OCaml 5.2
+#     switch used by CI is also non-flambda.
+ENV DIO_OXCAML=1
+
 # 7. Build native executables in parallel with Dune cache
 RUN --mount=type=cache,target=/home/opam/.cache/dune,uid=1000,gid=1000 \
     eval $(opam env) && dune build -j $(nproc) --profile=release bin/main.exe bin/dashboard.exe
