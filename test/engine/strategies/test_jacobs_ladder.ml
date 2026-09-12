@@ -701,7 +701,9 @@ let test_unnetted_sell_hold_releases_on_newer_message () =
      for the whole grace and blocked the owed 1:1 sell, so inventory piled up
      until the next trigger dumped it as one oversized sell. A balance message
      generated AFTER the placement already contains the hold, so the overlay
-     must retire and the owed sell must place. *)
+     must retire and the owed sell must place. This is the net-FLAT masked-drop
+     case ([last_balance_delta] = 0); the buy-fill INCREASE case is covered by
+     [test_unnetted_sell_hold_ignores_buy_increase]. *)
   let symbol = "UNNET4/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
   let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
@@ -920,6 +922,222 @@ let test_unnetted_sell_hold_burst_downmove () =
     "cumulative sold base equals the burst's buy lots (no over-accumulation)"
     true
     (abs_float (List.fold_left (fun a (_, q) -> a +. q) 0.0 sold -. (5.0 *. lot)) < 1e-6)
+;;
+
+let test_unnetted_sell_hold_ignores_buy_increase () =
+  (* REGRESSION (rapid-fill oversell): a sell hold was armed, then a buy fill
+     raised the venue tradeable figure and bumped the same per-asset freshness
+     timestamp BEFORE the venue applied the sell's hold. The old release treated
+     any newer message as proof of netting and retired the guard, so the next
+     1:1 sell sized against base already committed to the resting sell and the
+     venue rejected it ("HL Order Rejected: Insufficient spot balance"). A
+     message whose move is an INCREASE cannot have applied a sell hold: the
+     guard must stay until a flat/down message or the grace retires it. *)
+  let symbol = "UNNET5/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.15;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.98;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.0;
+  state.accumulated_profit <- 0.0;
+  state.open_sell_orders <- [];
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 82.0;
+  state.last_buy_fill_qty <- Some 0.15;
+  state.position_base <- 0.05;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 99.0;
+  state.last_seen_asset_balance <- 0.05;
+  state.buy_credits_since_balance <- [];
+  state.attributed_balance_increase <- 0.0;
+  state.last_balance_delta <- 0.0;
+  (* The sell hold was armed at t=100 for one lot. *)
+  state.sell_holds_since_balance <- [ 100.0, 0.15 ];
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.15"
+    ; grid_interval = 0.16
+    ; sell_mult = "0.98"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.25
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  let sells_seen () =
+    List.exists
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+  in
+  drain ();
+  (* Message at t=110 (age 1.0): tradeable 0.05 -> 0.20, a +0.15 buy-fill
+     increase that does NOT yet carry the sell's hold. *)
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:110.0
+    ~base_balance_age:(Some 1.0)
+    ~asset_balance:0.20;
+  check
+    bool
+    "the increasing message leaves the sell hold armed"
+    true
+    (state.sell_holds_since_balance <> []);
+  check
+    bool
+    "the increasing message is recorded as positive for the guard"
+    true
+    (state.last_balance_delta > 0.0);
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:110.0
+    ~asset
+    ~bid_price:82.0
+    ~ask_price:82.01
+    ~asset_balance:0.20
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:(Some 1.0);
+  check
+    bool
+    "no second sell is offered against base committed to the resting sell"
+    true
+    (not (sells_seen ()));
+  drain ();
+  (* A subsequent FLAT message (hold now netted, no net move) retires the guard,
+     and the owed 1:1 sell becomes placeable. *)
+  state.just_filled_buy <- true;
+  state.inflight_sell <- false;
+  ignore
+    (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+       state.duplicate_key_sell);
+  Dio_strategies.Jacobs_ladder.reconcile_position
+    ~state
+    ~now:111.0
+    ~base_balance_age:(Some 1.0)
+    ~asset_balance:0.20;
+  check
+    bool
+    "the flat message is recorded as non-increasing"
+    true
+    (state.last_balance_delta <= 0.0);
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:111.0
+    ~asset
+    ~bid_price:82.0
+    ~ask_price:82.01
+    ~asset_balance:0.20
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:(Some 1.0);
+  check bool "the owed sell places once the hold is retired" true (sells_seen ());
+  drain ()
+;;
+
+let test_ghost_buy_suppressed_within_ack_grace () =
+  (* REGRESSION (rapid-fill churn): a just-acked buy is not yet listed by the
+     open-orders feed. The old scan saw zero open buys, no in-flight flag (the
+     ack cleared it) and no amend, and purged the live buy as
+     "GHOST_BUY_DETECTED", re-placing it into the rapid-fill cascade that
+     ultimately over-sized a sell. A buy acked within the grace must survive the
+     feed lag; after the grace a still-absent buy is a genuine ghost. *)
+  let symbol = "GHOST1/USD" in
+  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "kraken";
+  state.open_sell_orders <- [];
+  state.pending_orders <- [];
+  Hashtbl.clear state.sell_commitments;
+  Hashtbl.clear state.amend_cooldowns;
+  state.inflight_buy <- false;
+  state.inflight_cancel_buy <- false;
+  state.inflight_amend_buy <- false;
+  state.last_buy_order_id <- Some "ack-buy-1";
+  state.last_buy_order_price <- Some 100.0;
+  state.reserved_quote <- 5.0;
+  let asset =
+    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    ; symbol
+    ; qty = "0.1"
+    ; grid_interval = 0.5
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.001
+    ; taker_fee = Some 0.002
+    ; accumulation_buffer = 0.01
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
+  let now = Unix.gettimeofday () in
+  let feed = ref [] in
+  let iter_open_orders f = List.iter (fun (a, b, c, d, e) -> f a b c d e) !feed in
+  let run_scan () =
+    ignore
+      (Dio_strategies.Jacobs_ladder.sync_open_orders
+         ~state
+         ~now
+         ~asset
+         ~bid_price:100.0
+         ~lot_qty:0.1
+         ~iter_open_orders
+         ~get_open_orders_generation:(fun () -> -1)
+         ~ecfg)
+  in
+  (* Acked just now: the feed has not listed the buy yet. *)
+  state.last_buy_ack_ts <- now;
+  run_scan ();
+  check
+    bool
+    "a freshly acked buy is not purged as a ghost"
+    true
+    (state.last_buy_order_id = Some "ack-buy-1");
+  check
+    bool
+    "its quote reservation is retained within the grace"
+    true
+    (abs_float state.reserved_quote > 1.0);
+  (* Past the grace and still absent with no terminal event: recover it. *)
+  state.last_buy_ack_ts <- now -. 20.0;
+  run_scan ();
+  check
+    bool
+    "after the grace a still-absent buy is recovered"
+    true
+    (state.last_buy_order_id = None);
+  check
+    bool
+    "the stale quote reservation is released with the ghost"
+    true
+    (abs_float state.reserved_quote < 1e-9)
 ;;
 
 let test_position_ledger_bridges_unreflected_fill () =
@@ -5897,6 +6115,14 @@ let () =
             "down-move burst places every rung's sell (no hold pile-up)"
             `Quick
             test_unnetted_sell_hold_burst_downmove
+        ; test_case
+            "buy-fill increase does not release the unnetted sell hold"
+            `Quick
+            test_unnetted_sell_hold_ignores_buy_increase
+        ; test_case
+            "freshly acked buy is not purged as a ghost within the grace"
+            `Quick
+            test_ghost_buy_suppressed_within_ack_grace
         ; test_case
             "position ledger bridges an unreflected buy fill"
             `Quick

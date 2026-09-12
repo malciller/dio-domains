@@ -124,6 +124,15 @@ type strategy_state =
     (* (order_id, side, price, timestamp) *)
   ; mutable last_cycle : int
   ; mutable last_order_time : float (* Unix timestamp of most recent order submission *)
+  ; mutable last_buy_ack_ts : float
+    (* Unix timestamp of the most recent BUY placement acknowledgment. A freshly
+       acked buy is not listed by the venue's open-orders feed for a short
+       window; without this grace [sync_open_orders] mistook the lag for a
+       vanished order and purged the buy ("GHOST_BUY_DETECTED"), re-placing it
+       and churning the grid. Ghost recovery is suppressed only within
+       [buy_ack_ghost_grace_s] of this stamp, so a buy that genuinely leaves the
+       book later is still recovered promptly. Stays 0.0 for buys adopted
+       straight from the feed (never acked through us). *)
   ; mutable inflight_cancel_buy : bool
     (* true while buy cancel is pending confirmation via order channel *)
   ; mutable inflight_amend_buy : bool
@@ -322,6 +331,15 @@ type strategy_state =
     (* wall-clock time of the venue balance message last reconciled *)
   ; mutable last_seen_asset_balance : float
     (* previous asset_bal value; used to detect balance feed updates *)
+  ; mutable last_balance_delta : float
+    (* Signed change of the most recently adopted venue balance message
+       ([asset_balance] minus the prior adopted figure). Used by
+       [unnetted_sell_hold] to distinguish a message that NETS a sell hold
+       (flat or down) from one that merely carries a buy fill increase: a
+       buy fill raises the tradeable figure and bumps the same per-asset
+       freshness timestamp, so a positive delta must NOT be treated as
+       proof that an outstanding sell hold was applied. 0.0 until the first
+       message is adopted. *)
   ; mutable persistence_dirty : bool
     (* true when accumulation state changed; flushed by caller outside hotloop *)
   ; mutable persistence_key : string option
@@ -521,6 +539,7 @@ let rec get_strategy_state asset_symbol =
       ; pending_orders = []
       ; last_cycle = 0
       ; last_order_time = 0.0
+      ; last_buy_ack_ts = 0.0
       ; inflight_cancel_buy = false
       ; inflight_amend_buy = false
       ; amend_cooldowns = Hashtbl.create 16
@@ -588,6 +607,7 @@ let rec get_strategy_state asset_symbol =
       ; attributed_balance_increase = 0.0
       ; position_venue_ts = 0.0
       ; last_seen_asset_balance = 0.0
+      ; last_balance_delta = 0.0
       ; persistence_dirty = false
       ; persistence_key = None
       ; base_accumulation_enabled = true
