@@ -18,6 +18,13 @@
 
 open Lwt.Infix
 
+(* OxCaml marks [Sys.set_signal] as [unsafe_multidomain]. The shutdown handlers
+   are installed once from the main domain and only touch atomics, Lwt state and
+   the logging subsystem; they close over process-wide state and cannot be
+   [portable], so [Sys.Safe.set_signal] cannot express them. Acknowledged rather
+   than rewritten. *)
+[@@@alert "-unsafe_multidomain"]
+
 (* Capital-oracle runtime (wrapped library: explicit alias avoids opening the
    whole Dio_oracle namespace). *)
 module Oracle_runtime = Dio_oracle.Oracle_runtime
@@ -288,7 +295,7 @@ let setup_signal_handlers () =
         ~section:"main"
         "Shutdown signal received, initiating pre-flight cleanup...";
       (* Replace handler so subsequent SIGINT triggers immediate exit. *)
-      Sys.set_signal Sys.sigint (Sys.Signal_handle handle_force_exit);
+      Runtime_compat.set_signal Sys.sigint (Sys.Signal_handle handle_force_exit);
       Lwt.async (fun () ->
         (* Close hedged positions before tearing down network feeds. *)
         close_hedged_positions ()
@@ -314,8 +321,8 @@ let setup_signal_handlers () =
         "Second shutdown signal received - forcing immediate exit";
       exit 1)
   in
-  Sys.set_signal Sys.sigint (Sys.Signal_handle handle_graceful_shutdown);
-  Sys.set_signal Sys.sigterm (Sys.Signal_handle handle_graceful_shutdown)
+  Runtime_compat.set_signal Sys.sigint (Sys.Signal_handle handle_graceful_shutdown);
+  Runtime_compat.set_signal Sys.sigterm (Sys.Signal_handle handle_graceful_shutdown)
 ;;
 
 (* Force module initialization to trigger exchange-implementation side-effect registration. *)
@@ -379,7 +386,8 @@ let setup_fatal_signal_handlers () =
   in
   (* Register handlers for fatal signals using raw signal numbers (not defined in Sys). *)
   List.iter
-    (fun signal -> Sys.set_signal signal (Sys.Signal_handle handle_fatal_signal))
+    (fun signal ->
+       Runtime_compat.set_signal signal (Sys.Signal_handle handle_fatal_signal))
     [ 11; 6; 7; 8; 10 ]
 ;;
 

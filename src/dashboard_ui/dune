@@ -1,4 +1,4 @@
 (library
  (name dashboard_ui)
  (public_name dio.dashboard_ui)
- (libraries notty-community notty-community.unix yojson unix mtime mtime.clock.os))
+ (libraries notty-community notty-community.unix yojson unix mtime mtime.clock.os dio.runtime_compat))

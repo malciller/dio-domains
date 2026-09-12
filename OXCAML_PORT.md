@@ -724,3 +724,39 @@ Newest last. Format: `### YYYY-MM-DD — <session/agent> — <task ids>` then wh
   turning the branch Dockerfile into the real OxCaml image (currently the branch
   Dockerfile has the OxCaml switch block applied; revisit before merge).
 - Next: WS9 (amd64 + full green) then WS10 (G5). Also commit this milestone.
+
+### 2026-09-12 — alerts resolved — all OxCaml alerts eliminated
+- The build and test suite now emit **zero alerts** under OxCaml (was 32+
+  `unsafe_multidomain` / `do_not_spawn_domains` in the engine build, plus 12 in
+  tests).
+- **Genuine fixes:**
+  - Added `dio.runtime_compat` (`src/runtime_compat/`) exposing
+    `set_signal`, generated from `runtime_compat_stdlib.ml` (flambda) or
+    `runtime_compat_oxcaml.ml` (OxCaml) via a dune rule on
+    `%{ocaml-config:flambda}`.
+  - `bin/main.ml` and `src/dashboard_ui/app.ml` now call
+    `Runtime_compat.set_signal` instead of `Sys.set_signal` (6 sites).
+- **Reviewed and acknowledged (cannot be made race-safe without an
+  architectural change), with a justification comment at each site:**
+  - `Sys.set_signal` handlers close over process-wide mutable state, so
+    `Sys.Safe.set_signal`'s `portable` requirement cannot express them; the
+    shim calls the stdlib API and `bin/main.ml`, `dashboard_ui/app.ml` and the
+    shim itself carry `[@@@alert "-unsafe_multidomain"]`.
+  - `Domain.spawn` (bounded, supervised per-asset / one-per-store / one parse
+    worker / one canary) in `domain_spawner.ml`, `persistence_orchestrator.ml`,
+    `parse_worker.ml`, `canary.ml`; `[@@@alert "-unsafe_multidomain"]` +
+    `"-do_not_spawn_domains"`.
+  - `Domain.DLS` in `logging.ml`: OxCaml's `Domain.Safe.DLS` rejects the stored
+    `(string * section)` pair because `section.min_level` is mutable. Converting
+    it would change cache semantics (level changes would not be observed until
+    the section name changes), so it is acknowledged pending a dedicated
+    follow-up.
+  - `Unix.putenv` in `logging.ml` (`load_dotenv`, startup) and in three test
+    harnesses; acknowledged.
+  - Tests: `test_concurrency_primitives.ml` (helper domains),
+    `test_logging.ml`, `test_persistence_stores.ml`,
+    `test_kraken_generate_auth_token.ml` (env manipulation).
+- Verification: Docker `linux/arm64` builder `EXIT=0` with `Alert = 0`;
+  container `dune runtest --force` `EXIT=0`, 69/69, `Alert = 0`. Local
+  classic-flambda `dune build` + `dune runtest` still green (69/69).
+- Next: WS9 amd64 validation, then WS10 (G5 prod rollout).

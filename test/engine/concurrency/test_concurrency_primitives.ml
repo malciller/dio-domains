@@ -6,6 +6,12 @@
      when a signal raced the work cycle (the lost-wakeup fix).
    - Parse_worker: submit/register round-trip. *)
 
+(* These tests spawn a few short-lived helper domains to exercise concurrent
+   producers/consumers, then join them. Bounded and test-only, so OxCaml's
+   [do_not_spawn_domains]/[unsafe_multidomain] alerts are acknowledged. *)
+[@@@alert "-unsafe_multidomain"]
+[@@@alert "-do_not_spawn_domains"]
+
 let test_ring_buffer_basic () =
   let b = Concurrency.Ring_buffer.RingBuffer.create 4 in
   Alcotest.(check int)

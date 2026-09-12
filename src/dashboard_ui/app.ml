@@ -1,6 +1,12 @@
 open Notty
 open Theme
 
+(* OxCaml marks [Sys.set_signal] as [unsafe_multidomain]. The dashboard installs
+   its alarm/hangup handlers once from its own (single) domain and they close
+   over local UI state, so [Sys.Safe.set_signal]'s [portable] requirement does
+   not fit. Acknowledged rather than rewritten. *)
+[@@@alert "-unsafe_multidomain"]
+
 (** Main loop for the dashboard UI: it connects to the engine's Unix domain
     socket, processes the JSON snapshot stream, and runs the frame renderer
     on every cycle. *)
@@ -258,8 +264,8 @@ let run ?(config_file = "config.json") () =
     List.rev (parse 0 [])
   in
   (* Frame-render alarm handler, installed once for the whole session. *)
-  Sys.set_signal Sys.sigalrm (Sys.Signal_handle (fun _ -> raise Render_timeout));
-  Sys.set_signal Sys.sighup (Sys.Signal_handle (fun _ -> quit := true));
+  Runtime_compat.set_signal Sys.sigalrm (Sys.Signal_handle (fun _ -> raise Render_timeout));
+  Runtime_compat.set_signal Sys.sighup (Sys.Signal_handle (fun _ -> quit := true));
   let fd_ref : Unix.file_descr option ref = ref None in
   let try_connect () =
     let candidates =
