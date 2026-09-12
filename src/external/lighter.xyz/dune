@@ -9,7 +9,8 @@
   cohttp-lwt-unix
   uri
   threads
-  websocket-lwt-unix
+  websocket
+  dio.ws_lwt
   conduit-lwt-unix
   ipaddr.unix
   ctypes

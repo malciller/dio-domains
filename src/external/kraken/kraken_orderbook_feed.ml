@@ -10,7 +10,7 @@ open Lwt.Infix
 let section = "kraken_orderbook"
 
 type state_t =
-  { mutable active_conn : Websocket_lwt_unix.conn option
+  { mutable active_conn : Ws_lwt.conn option
   ; mutex : Lwt_mutex.t
   }
 
@@ -1263,12 +1263,12 @@ let start_message_handler conn symbols on_failure on_heartbeat =
       ]
   in
   let msg_str = Yojson.Safe.to_string subscribe_msg in
-  Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ())
+  Ws_lwt.write conn (Websocket.Frame.create ~content:msg_str ())
   >>= fun () ->
   let stream =
     Lwt_stream.from (fun () ->
       Lwt.catch
-        (fun () -> Websocket_lwt_unix.read conn >>= fun frame -> Lwt.return_some frame)
+        (fun () -> Ws_lwt.read conn >>= fun frame -> Lwt.return_some frame)
         (function
           | End_of_file -> Lwt.return_none
           | exn -> Lwt.fail exn))
@@ -1416,7 +1416,7 @@ let rec subscribe_symbols symbols =
       "Sending dynamic orderbook subscription for %d symbols: %s"
       (List.length symbols)
       (String.concat ", " symbols);
-    Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ())
+    Ws_lwt.write conn (Websocket.Frame.create ~content:msg_str ())
   | None ->
     Logging.warn_f
       ~section
@@ -1442,7 +1442,7 @@ and resubscribe_symbol symbol =
     in
     let msg_str = Yojson.Safe.to_string unsub_msg in
     Logging.info_f ~section "Unsubscribing %s before re-subscribing" symbol;
-    Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg_str ())
+    Ws_lwt.write conn (Websocket.Frame.create ~content:msg_str ())
     >>= fun () -> Lwt_unix.sleep 0.25 >>= fun () -> subscribe_symbols [ symbol ]
   | None ->
     (* Gap fix: a missing connection is a failure, not a silent success.
@@ -1510,7 +1510,7 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   let client = `TLS (`Hostname "ws.kraken.com", `IP ip, `Port 443) in
   let ctx = get_conduit_ctx () in
   Lwt_unix.with_timeout ws_connect_timeout_s (fun () ->
-    Websocket_lwt_unix.connect ~ctx client uri)
+    Ws_lwt.connect ~ctx client uri)
   >>= fun conn ->
   Lwt_mutex.with_lock state.mutex (fun () ->
     state.active_conn <- Some conn;

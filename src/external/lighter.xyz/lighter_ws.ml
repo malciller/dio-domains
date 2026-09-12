@@ -21,7 +21,7 @@ type subscription =
   }
 
 type connection_state =
-  { active_connection : Websocket_lwt_unix.conn option ref
+  { active_connection : Ws_lwt.conn option ref
   ; connection_mutex : Lwt_mutex.t
   ; is_connected_ref : bool Atomic.t
   ; connected_wakeup : unit Lwt_condition.t
@@ -165,7 +165,7 @@ let send_json_on state json label =
         "[%s] Sending WS message: %s"
         label
         (if String.length msg > 500 then String.sub msg 0 500 ^ "..." else msg);
-      Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg ())
+      Ws_lwt.write conn (Websocket.Frame.create ~content:msg ())
     | None ->
       Logging.warn_f ~section "[%s] Cannot send: WebSocket not connected" label;
       Lwt.return_unit)
@@ -428,7 +428,7 @@ let rec connect_one
        (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP
           connection during the handshake would otherwise block the
           reconnect (which runs on the main Lwt loop) indefinitely. *)
-       Lwt_unix.with_timeout 20.0 (fun () -> Websocket_lwt_unix.connect ~ctx client uri)
+       Lwt_unix.with_timeout 20.0 (fun () -> Ws_lwt.connect ~ctx client uri)
        >>= fun conn ->
        Lwt_mutex.with_lock state.connection_mutex (fun () ->
          state.active_connection := Some conn;
@@ -446,7 +446,7 @@ let rec connect_one
            else
              Lwt.catch
                (fun () ->
-                  Websocket_lwt_unix.read conn >>= fun frame -> Lwt.return_some frame)
+                  Ws_lwt.read conn >>= fun frame -> Lwt.return_some frame)
                (function
                  | End_of_file -> Lwt.return_none
                  | exn -> Lwt.fail exn))
@@ -479,7 +479,7 @@ let rec connect_one
                Lwt.return_unit)
              >>= fun () ->
              Lwt.catch
-               (fun () -> Websocket_lwt_unix.close_transport conn)
+               (fun () -> Ws_lwt.close_transport conn)
                (fun _ -> Lwt.return_unit)
              >>= fun () ->
              Lwt.fail_with ("[" ^ label ^ "] Connection closed unexpectedly (End_of_file)")
@@ -495,7 +495,7 @@ let rec connect_one
                Lwt.return_unit)
              >>= fun () ->
              Lwt.catch
-               (fun () -> Websocket_lwt_unix.close_transport conn)
+               (fun () -> Ws_lwt.close_transport conn)
                (fun _ -> Lwt.return_unit)
              >>= fun () -> Lwt.fail exn)
        >>= fun () ->
@@ -505,7 +505,7 @@ let rec connect_one
          Lwt.return_unit)
        >>= fun () ->
        Lwt.catch
-         (fun () -> Websocket_lwt_unix.close_transport conn)
+         (fun () -> Ws_lwt.close_transport conn)
          (fun _ -> Lwt.return_unit)
        >>= fun () -> Lwt.fail_with ("[" ^ label ^ "] WebSocket closed by server"))
     (fun exn ->
@@ -561,7 +561,7 @@ let close () : unit Lwt.t =
     | Some conn ->
       Logging.info_f ~section "Closing %s Lighter WebSocket connection" label;
       Lwt.catch
-        (fun () -> Websocket_lwt_unix.close_transport conn)
+        (fun () -> Ws_lwt.close_transport conn)
         (fun _ -> Lwt.return_unit)
   in
   close_all_subscribers ();
@@ -583,7 +583,7 @@ let close_public () : unit Lwt.t =
   | Some conn ->
     Logging.info ~section "Closing Public Lighter WebSocket connection";
     Lwt.catch
-      (fun () -> Websocket_lwt_unix.close_transport conn)
+      (fun () -> Ws_lwt.close_transport conn)
       (fun _ -> Lwt.return_unit)
 ;;
 
@@ -601,7 +601,7 @@ let close_private () : unit Lwt.t =
   | Some conn ->
     Logging.info ~section "Closing Private Lighter WebSocket connection";
     Lwt.catch
-      (fun () -> Websocket_lwt_unix.close_transport conn)
+      (fun () -> Ws_lwt.close_transport conn)
       (fun _ -> Lwt.return_unit)
 ;;
 
@@ -767,7 +767,7 @@ let send_ping ~req_id:_ ~timeout_ms =
          Lwt_mutex.with_lock state.connection_mutex (fun () ->
            match !(state.active_connection) with
            | Some conn ->
-             Websocket_lwt_unix.write
+             Ws_lwt.write
                conn
                (Websocket.Frame.create ~opcode:Websocket.Frame.Opcode.Ping ())
            | None -> Lwt.return_unit)
