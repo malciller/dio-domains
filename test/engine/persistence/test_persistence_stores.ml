@@ -2,6 +2,10 @@
    sell_levels_store (pure decision logic, JSON round-trips, corrupt-file
    handling, legacy migration). Hermetic via DIO_DATA_DIR. *)
 
+(* Test-only [Unix.putenv] to point stores at a temp dir; single-threaded test
+   process. OxCaml [unsafe_multidomain] alert acknowledged. *)
+[@@@alert "-unsafe_multidomain"]
+
 let temp_dir () =
   let dir =
     Filename.concat
