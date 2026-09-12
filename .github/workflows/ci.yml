@@ -35,13 +35,28 @@ jobs:
           sudo ldconfig
 
       - name: Set up opam and OCaml 5.2.0
+        # Must be idempotent: the self-hosted Gitea runner persists its opam
+        # root and `default` switch between jobs, unlike GitHub-hosted runners.
+        # `opam init` on an already-initialised root exits non-zero, so reinit
+        # instead. A `default` switch that is not on 5.2.0 is removed and
+        # recreated, so a stale switch cannot leak into the build.
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y opam
-          opam init --bare --disable-sandboxing -y --no-setup
+          if [ -d "$HOME/.opam" ]; then
+            opam init --bare --disable-sandboxing --reinit -y --no-setup
+          else
+            opam init --bare --disable-sandboxing -y --no-setup
+          fi
+          if opam switch list --short 2>/dev/null | grep -qx "default"; then
+            if ! opam exec --switch default -- ocamlc -version 2>/dev/null | grep -qx "5.2.0"; then
+              opam switch remove default -y
+            fi
+          fi
           if ! opam switch list --short 2>/dev/null | grep -qx "default"; then
-            opam switch create default ocaml-base-compiler.5.2.0
+            opam switch create default ocaml-base-compiler.5.2.0 -y
           fi
           eval "$(opam env --switch default)"
+          opam exec --switch default -- ocamlc -version
 
       # actions/cache is only available on github.com; the Gitea act_runner
       # does not implement it. The guard keeps the step to GitHub while the rest
