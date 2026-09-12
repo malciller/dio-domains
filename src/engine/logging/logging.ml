@@ -35,6 +35,19 @@
       allocations on the caller (timestamp, colored line, queue push),
       independent of how many lines are already buffered. *)
 
+(* OxCaml marks [Domain.DLS] and [Unix.putenv] as [unsafe_multidomain].
+   - [Domain.DLS] here caches the last section lookup per domain, storing a
+     shared [section] record whose [min_level] may be mutated via
+     [set_section_level]. OxCaml's [Domain.Safe.DLS] requires the stored value
+     to be portable (free of shared mutable state), which this record is not, so
+     the race-safe variant cannot express the existing design without changing
+     cache semantics. The record is only mutated during configuration changes.
+   - [Unix.putenv] is called once at startup by [load_dotenv], before any domain
+     is spawned.
+   Acknowledged rather than rewritten; a migration of the DLS cache to
+   [Domain.Safe.DLS] is tracked as a separate follow-up. *)
+[@@@alert "-unsafe_multidomain"]
+
 type level =
   | DEBUG
   | INFO

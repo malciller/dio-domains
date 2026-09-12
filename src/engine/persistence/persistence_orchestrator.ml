@@ -17,6 +17,13 @@
     symbol-keyed accumulated_state.json and fans each entry out to the
     registered hooks. *)
 
+(* OxCaml marks [Domain.spawn] as [do_not_spawn_domains]. This module spawns one
+   bounded background drain domain per store instance (a small fixed set), by
+   design, so persistence never blocks a trading domain. Acknowledged rather
+   than rewritten. *)
+[@@@alert "-unsafe_multidomain"]
+[@@@alert "-do_not_spawn_domains"]
+
 let section = "persistence_orchestrator"
 
 (* Cumulative count of failed disk writes, surfaced on every failure warn so a

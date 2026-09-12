@@ -29,6 +29,13 @@
     lock-free queue would add cross-library coupling for no measurable win.
 *)
 
+(* OxCaml marks [Domain.spawn] as [do_not_spawn_domains]. This module spawns ONE
+   bounded parse domain (gated by config), not an unbounded fan-out, so the GC
+   concern the alert describes does not apply. Acknowledged rather than
+   rewritten. *)
+[@@@alert "-unsafe_multidomain"]
+[@@@alert "-do_not_spawn_domains"]
+
 type handler = string -> unit
 
 module StringMap = Map.Make (String)

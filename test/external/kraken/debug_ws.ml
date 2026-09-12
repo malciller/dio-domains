@@ -248,7 +248,7 @@ let () =
          Ipaddr_unix.of_inet_addr addr
        | _ -> failwith "resolve failed"
      in
-     Websocket_lwt_unix.connect
+     Ws_lwt.connect
        ~ctx
        (`TLS (`Hostname "ws.kraken.com", `IP ip, `Port 443))
        uri
@@ -264,7 +264,7 @@ let () =
                ] )
          ]
      in
-     Websocket_lwt_unix.write
+     Ws_lwt.write
        conn
        (Websocket.Frame.create ~content:(Yojson.Safe.to_string sub) ())
      >>= fun () ->
@@ -274,7 +274,7 @@ let () =
        then Lwt.return_unit
        else
          Lwt.pick
-           [ (Websocket_lwt_unix.read conn
+           [ (Ws_lwt.read conn
               >>= fun frame ->
               (try
                  match Yojson.Safe.from_string frame.Websocket.Frame.content with

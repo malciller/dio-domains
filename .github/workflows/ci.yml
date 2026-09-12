@@ -3,7 +3,11 @@ on: [push, pull_request]
 
 jobs:
   build-test:
-    runs-on: ubuntu-22.04
+    # Classic-flambda OCaml 5.2 build + tests. This is the production toolchain
+    # for `main`. `ubuntu-latest` is understood by GitHub-hosted runners and by
+    # the standard act_runner label set used by Gitea; if the self-hosted Gitea
+    # runner uses a custom label, change this to that label.
+    runs-on: ubuntu-latest
     permissions:
       actions: write
       contents: read
@@ -31,14 +35,32 @@ jobs:
           sudo ldconfig
 
       - name: Set up opam and OCaml 5.2.0
+        # Must be idempotent: the self-hosted Gitea runner persists its opam
+        # root and `default` switch between jobs, unlike GitHub-hosted runners.
+        # `opam init` on an already-initialised root exits non-zero, so reinit
+        # instead. A `default` switch that is not on 5.2.0 is removed and
+        # recreated, so a stale switch cannot leak into the build.
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y opam
-          opam init --bare --disable-sandboxing -y --no-setup
+          if [ -d "$HOME/.opam" ]; then
+            opam init --bare --disable-sandboxing --reinit -y --no-setup
+          else
+            opam init --bare --disable-sandboxing -y --no-setup
+          fi
+          if opam switch list --short 2>/dev/null | grep -qx "default"; then
+            if ! opam exec --switch default -- ocamlc -version 2>/dev/null | grep -qx "5.2.0"; then
+              opam switch remove default -y
+            fi
+          fi
           if ! opam switch list --short 2>/dev/null | grep -qx "default"; then
-            opam switch create default ocaml-base-compiler.5.2.0
+            opam switch create default ocaml-base-compiler.5.2.0 -y
           fi
           eval "$(opam env --switch default)"
+          opam exec --switch default -- ocamlc -version
 
+      # actions/cache is only available on github.com; the Gitea act_runner
+      # does not implement it. The guard keeps the step to GitHub while the rest
+      # of the workflow runs unchanged on both.
       - name: Restore Dune cache
         if: github.server_url == 'https://github.com'
         uses: actions/cache@v4
@@ -49,10 +71,103 @@ jobs:
             ${{ runner.os }}-dune-cache-
 
       - name: Install opam deps
-        run: opam install . --deps-only --with-test --assume-depexts -y
+        run: opam install . --deps-only --with-test --assume-depexts -y --switch default
 
       - name: Build
-        run: opam exec -- dune build @all
+        # Clean first: the self-hosted Gitea runner reuses a workspace, and a
+        # `_build` left over from a previous job can contain absolute paths to a
+        # switch that no longer exists (e.g. after the switch is recreated).
+        run: |
+          opam exec --switch default -- dune clean
+          opam exec --switch default -- dune build @all
 
       - name: Run tests
-        run: opam exec -- dune runtest
+        run: opam exec --switch default -- dune runtest
+
+  build-test-oxcaml:
+    # OxCaml (flambda2) build + tests, using the split image process:
+    # Dockerfile.base builds the OxCaml compiler + all opam deps (slow, changes
+    # rarely), and Dockerfile builds the engine on top of it (fast). The base
+    # image is cached between CI runs so day-to-day builds never recompile the
+    # compiler. See OXCAML_PORT.md.
+    #
+    # Requires a runner with Docker and >= 16 GB RAM for the first (uncached)
+    # base build: the OxCaml compiler bootstrap OOMs at 8 GB. On the
+    # self-hosted Gitea runner, `runs-on` must name a label whose runner has
+    # both; change it if needed.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      DIO_BASE_IMAGE: dio-oxcaml-base:5.2.0minus40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx (GitHub-hosted runners)
+        if: github.server_url == 'https://github.com'
+        uses: docker/setup-buildx-action@v3
+
+      # --- Base image (OxCaml compiler + opam deps) ---
+      # On GitHub-hosted runners (ephemeral) the GitHub Actions cache backend
+      # keeps the expensive compiler layer across runs. On the self-hosted Gitea
+      # runner the Docker daemon persists, so its own layer cache is reused and
+      # the `docker image inspect` guard skips a rebuild entirely.
+      - name: Build OxCaml base image (GitHub-hosted runners)
+        if: github.server_url == 'https://github.com'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.base
+          load: true
+          tags: ${{ env.DIO_BASE_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build OxCaml base image (self-hosted runner)
+        if: github.server_url != 'https://github.com'
+        run: |
+          if docker image inspect "$DIO_BASE_IMAGE" >/dev/null 2>&1; then
+            echo "Base image $DIO_BASE_IMAGE already present; skipping."
+          else
+            echo "Base image missing; building (slow, one-time) …"
+            DOCKER_BUILDKIT=1 docker buildx build \
+              --progress=plain \
+              -f Dockerfile.base \
+              -t "$DIO_BASE_IMAGE" \
+              --load .
+          fi
+
+      # --- Application image (engine only) ---
+      # Tag the builder stage for tests (it has opam + dune; the final runtime
+      # stage is a minimal Ubuntu without a toolchain), and the full image
+      # builds the release binaries.
+      - name: Build engine image
+        run: |
+          DOCKER_BUILDKIT=1 docker buildx build \
+            --progress=plain \
+            --build-arg "DIO_BASE_IMAGE=$DIO_BASE_IMAGE" \
+            --target builder \
+            -t dio-oxcaml-test \
+            --load .
+          DOCKER_BUILDKIT=1 docker buildx build \
+            --build-arg "DIO_BASE_IMAGE=$DIO_BASE_IMAGE" \
+            -t dio-oxcaml-app \
+            --load .
+
+      - name: Run test suite under OxCaml
+        # `.dockerignore` excludes test/, so bind-mount it into the image for
+        # the test run. Treats `Alert` output as a failure so the zero-alert
+        # invariant from OXCAML_PORT.md is enforced by CI.
+        run: |
+          set -o pipefail
+          docker run --rm \
+            -v "$PWD/test:/app/test:ro" \
+            --entrypoint bash \
+            dio-oxcaml-test -lc \
+            'eval $(opam env) && cd /app && cp -r test /tmp/test && dune runtest --force 2>&1' \
+            | tee /tmp/oxcaml-test.log
+          if grep -q "Alert " /tmp/oxcaml-test.log; then
+            echo "::error::OxCaml build emitted compiler alerts; see log above"
+            exit 1
+          fi

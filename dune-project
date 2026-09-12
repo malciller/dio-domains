@@ -22,17 +22,21 @@
   ocaml
   dune
   (yojson
-   (>= 2.2.2))
+   (and
+    (>= 2.2.2)
+    (< 2.2.3)))
   lwt
   lwt_ppx
   lwt_ssl
   mirage-crypto-rng
-  cohttp-lwt-unix
-  websocket-lwt-unix
+  (cohttp-lwt-unix
+   (< 6.0.0))
+  websocket
   base64
   digestif
   uri
-  conduit-lwt-unix
+  (conduit-lwt-unix
+   (< 8.0.0))
   ipaddr
   alcotest
   mtime
@@ -40,7 +44,7 @@
   msgpck
   ctypes
   ctypes-foreign
-  notty)
+  notty-community)
  (tags
   ("trading" "finance" "multicore" "ocaml" "domains")))
 

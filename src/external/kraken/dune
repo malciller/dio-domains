@@ -10,7 +10,8 @@
   logging
   uri
   threads
-  websocket-lwt-unix
+  websocket
+  dio.ws_lwt
   mtime
   mtime.clock.os
   concurrency

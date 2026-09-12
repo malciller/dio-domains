@@ -1,0 +1,22 @@
+--- a/src/msgpck.ml
++++ b/src/msgpck.ml
+@@ -34,7 +34,8 @@ module SIBO = struct
+   include EndianString.BigEndian
+ 
+   let length = String.length
+-  let blit = Bytes.blit_string
++  let blit src src_pos dst dst_pos len =
++    Bytes.blit_string src src_pos dst dst_pos len
+   let sub = String.sub
+   let create_out = Bytes.create
+ end
+@@ -46,7 +47,8 @@ module BIBO = struct
+   include EndianBytes.BigEndian
+ 
+   let length = Bytes.length
+-  let blit = Bytes.blit_string
++  let blit src src_pos dst dst_pos len =
++    Bytes.blit_string src src_pos dst dst_pos len
+   let sub = Bytes.sub_string
+   let create_out = Bytes.create
+ end

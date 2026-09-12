@@ -1,0 +1,99 @@
+# ────────────────────────────────────────────────────────────────────────────────
+# Dio – OxCaml base image
+#
+# Builds the OxCaml (flambda2) toolchain and installs all opam dependencies.
+# This is the slow part of the build (compiling the OxCaml compiler alone takes
+# on the order of ten minutes). It changes rarely, so it is built and tagged
+# separately from the application image. Dockerfile (the app image) starts FROM
+# this and only compiles the engine, so day-to-day deploys never rebuild the
+# compiler.
+#
+# Build:
+#   docker build -f Dockerfile.base -t dio-oxcaml-base:5.2.0minus40 .
+#
+# Rebuild only when a dependency changes: dio.opam/dune-project, the patch
+# overlay in oxcaml-port/opam-overlay, or the compiler version below.
+# ────────────────────────────────────────────────────────────────────────────────
+FROM ocaml/opam:ubuntu-22.04-ocaml-5.2
+ENV QEMU_CPU=host
+
+USER root
+
+# 1. System dependencies (build-time C header libraries & tools)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    m4 \
+    g++ \
+    make \
+    libffi-dev \
+    libgmp-dev \
+    libpcre3-dev \
+    libssl-dev \
+    libpq-dev \
+    zlib1g-dev \
+    autoconf \
+    automake \
+    libtool \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Compile libsecp256k1 from source (pinned to v0.7.1, fast parallel build without test suite)
+RUN git clone --depth 1 --branch v0.7.1 \
+        https://github.com/bitcoin-core/secp256k1.git /tmp/secp256k1 \
+    && cd /tmp/secp256k1 \
+    && ./autogen.sh \
+    && ./configure --enable-module-schnorrsig --enable-module-recovery --disable-tests --disable-benchmark \
+    && make -j$(nproc) \
+    && make install \
+    && ldconfig \
+    && rm -rf /tmp/secp256k1
+
+# 3. Setup workdir owned by opam
+WORKDIR /app
+RUN chown opam:opam /app
+
+USER opam
+
+# 3a. Create the OxCaml switch from the OxCaml opam repository.
+#     The compiler version is pinned explicitly at switch creation. Without a
+#     floor the solver can backtrack to an older OxCaml (e.g. 5.2.0minus25)
+#     whose flambda2 register allocator fails on the large asset_domain_worker
+#     function ("register allocation was not successful after 50 rounds").
+#     Pinning it here (rather than upgrading after) means it is compiled once.
+RUN --mount=type=cache,target=/home/opam/.opam/download-cache,uid=1000,gid=1000 \
+    opam update -y \
+    && opam switch create 5.2.0+ox \
+         ocaml-variants.5.2.0+ox \
+         oxcaml-compiler.5.2.0minus40 \
+         --repos ox=git+https://github.com/oxcaml/opam-repository.git,default
+
+# 3b. Select the OxCaml switch for every subsequent layer and fail the build
+#     immediately if the resulting compiler is not OxCaml.
+ENV OPAMSWITCH=5.2.0+ox
+RUN eval $(opam env) \
+    && opam list --installed --short | grep -qi 'oxcaml' \
+    && ocamlopt -config-var version
+
+# 3c. Register the local patch overlay (see oxcaml-port/opam-overlay/README.md).
+#     dio-ox is given rank 2 and the OxCaml repo rank 1, so dio-ox outranks the
+#     default repo: a `+dioN` patch then wins over the unpatched release of the
+#     same version, while `+ox` packages from the OxCaml repo still resolve.
+COPY --chown=opam:opam oxcaml-port/opam-overlay /app/oxcaml-port/opam-overlay
+RUN eval $(opam env) \
+    && opam repo add dio-ox file:///app/oxcaml-port/opam-overlay --rank=2 \
+    && opam repo list
+
+# 4. Copy project descriptors (needed for dependency resolution)
+COPY --chown=opam:opam dio.opam dune-project ./
+
+# 5. Install OCaml dependencies.
+#    lwt_ppx must be pinned for this (OxCaml) build: the repo also has
+#    5.9.1+ox, built against an older ppxlib AST (fails with "Pexp_let expects
+#    4 argument(s)"); 6.0.0+ox is matched to ppxlib 0.33.0+ox. Pinned here rather
+#    than in dio.opam because the same constraint on the classic toolchain forces
+#    ppxlib >= 0.36, which conflicts with conduit-lwt-unix < 3 (see OXCAML_PORT.md
+#    WS2b). The compiler version is fixed at switch creation (3a), not here, so
+#    this layer never recompiles the compiler.
+RUN --mount=type=cache,target=/home/opam/.opam/download-cache,uid=1000,gid=1000 \
+    eval $(opam env) \
+    && opam pin add -y --no-action lwt_ppx 6.0.0+ox \
+    && opam install -y -j $(nproc) . --deps-only --with-test --no-depexts

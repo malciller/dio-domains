@@ -314,7 +314,7 @@ let subscribe json =
     | Some conn ->
       let msg = Yojson.Safe.to_string json in
       Logging.debug_f ~section "Sending subscription: %s" msg;
-      Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:msg ())
+      Ws_lwt.write conn (Websocket.Frame.create ~content:msg ())
     | None ->
       Logging.warn ~section "Cannot subscribe: WebSocket not connected";
       Lwt.return_unit)
@@ -560,9 +560,9 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
          | _ -> failwith (Printf.sprintf "Failed to resolve %s" hostname)
        in
        let client = `TLS (`Hostname hostname, `IP ip, `Port port) in
-       let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
+       let ctx = Ws_lwt.resolve_ctx () in
        Lwt_unix.with_timeout ws_connect_timeout_s (fun () ->
-         Websocket_lwt_unix.connect ~ctx client uri)
+         Ws_lwt.connect ~ctx client uri)
        >>= fun conn ->
        Lwt_mutex.with_lock connection_mutex (fun () ->
          active_connection := Some conn;
@@ -583,7 +583,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
            else
              Lwt.catch
                (fun () ->
-                  Websocket_lwt_unix.read conn >>= fun frame -> Lwt.return_some frame)
+                  Ws_lwt.read conn >>= fun frame -> Lwt.return_some frame)
                (function
                  | End_of_file -> Lwt.return_none
                  | exn -> Lwt.fail exn))
@@ -670,7 +670,7 @@ let close () : unit Lwt.t =
     close_all_subscribers ();
     signal_new_data ();
     Lwt.catch
-      (fun () -> Websocket_lwt_unix.close_transport conn)
+      (fun () -> Ws_lwt.close_transport conn)
       (fun _ -> Lwt.return_unit)
 ;;
 
