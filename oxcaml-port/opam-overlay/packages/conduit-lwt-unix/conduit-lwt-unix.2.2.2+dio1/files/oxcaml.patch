@@ -1,0 +1,24 @@
+--- a/lwt-unix/conduit_lwt_unix.ml
++++ b/lwt-unix/conduit_lwt_unix.ml
+@@ -154,8 +154,8 @@ let flow_of_fd fd sa =
+   | Unix.ADDR_UNIX path -> Domain_socket { fd; path }
+   | Unix.ADDR_INET (ip,port) -> TCP { fd; ip=Ipaddr_unix.of_inet_addr ip; port }
+ 
+-let default_ctx =
+-  { src=None; tls_own_key=`None }
++let default_ctx =
++  lazy { src=None; tls_own_key=`None }
+ 
+ let init ?src ?(tls_own_key=`None) ?(tls_server_key=`None) () =
+   let tls_own_key =
+--- a/lwt-unix/conduit_lwt_unix.mli
++++ b/lwt-unix/conduit_lwt_unix.mli
+@@ -156,7 +156,7 @@
+ 
+ (** Default context that listens on all source addresses with
+     no TLS certificate associated with the Conduit *)
+-val default_ctx : ctx
++val default_ctx : ctx Lazy.t
+ 
+ (** [init ?src ?tls_own_key ()] will initialize a Unix conduit
+     that binds to the [src] interface if specified.  If TLS server

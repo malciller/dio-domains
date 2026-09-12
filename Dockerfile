@@ -51,21 +51,27 @@ RUN chown opam:opam /app
 
 USER opam
 
-# 3a. Create a classic-flambda OCaml 5.2 switch. The stock switch in the base
-#     image is built without flambda, so the release-profile -O3 optimizations
-#     (see ./dune) would be ignored. This layer is cached and only rebuilt when
-#     the base image changes.
+# 3a. Copy the OxCaml patch overlay BEFORE the switch so it can be registered as
+#     an opam repository. It carries patched builds of libraries that do not
+#     compile under OxCaml (see oxcaml-port/opam-overlay/README.md).
+COPY --chown=opam:opam oxcaml-port/opam-overlay /app/oxcaml-port/opam-overlay
+
+# 3b. Create the OxCaml switch from the OxCaml opam repository, with the local
+#     overlay registered after it. This compiles the OxCaml (flambda2) compiler,
+#     so the layer is cached and only rebuilt when the base image or this
+#     command changes. autoconf/automake are already installed above (OxCaml's
+#     bootstrap needs them).
 RUN --mount=type=cache,target=/home/opam/.opam/download-cache,uid=1000,gid=1000 \
     opam update -y \
-    && opam switch create 5.2.0+flambda \
-         ocaml-variants.5.2.0+options \
-         ocaml-option-flambda
+    && opam switch create 5.2.0+ox ocaml-variants.5.2.0+ox \
+         --repos ox=git+https://github.com/oxcaml/opam-repository.git,\
+dio-ox=file:///app/oxcaml-port/opam-overlay,default
 
-# 3b. Select the flambda switch for every subsequent layer and fail the build
-#     immediately if the resulting compiler is not flambda-enabled.
-ENV OPAMSWITCH=5.2.0+flambda
+# 3c. Select the OxCaml switch for every subsequent layer and fail the build
+#     immediately if the resulting compiler is not OxCaml.
+ENV OPAMSWITCH=5.2.0+ox
 RUN eval $(opam env) \
-    && test "$(ocamlopt -config-var flambda)" = "true" \
+    && opam list --installed --short | grep -qi 'oxcaml' \
     && ocamlopt -config-var version
 
 # 4. Copy project descriptors first (layer-cache friendly)
