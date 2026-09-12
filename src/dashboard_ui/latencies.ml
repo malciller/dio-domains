@@ -282,16 +282,16 @@ let render_latencies w (snapshot : Snapshot.t) =
       | "signer" -> 1_000.0, 10_000.0
       | _ -> 50.0, 100.0
     in
+    let severity_of_value label f =
+      let warn, crit = latency_thresholds label in
+      if f > crit
+      then 2 (* red *)
+      else if f >= warn
+      then 1 (* yellow *)
+      else 0 (* green *)
+    in
     let severity label f samples =
-      if samples = 0
-      then 3 (* dim *)
-      else (
-        let warn, crit = latency_thresholds label in
-        if f > crit
-        then 2 (* red *)
-        else if f >= warn
-        then 1 (* yellow *)
-        else 0 (* green *))
+      if samples = 0 then 3 (* dim *) else severity_of_value label f
     in
     let page = List.nth metric_pages (current_page_index ()) in
     let n_metrics = List.length page.metrics in
@@ -403,7 +403,12 @@ let render_latencies w (snapshot : Snapshot.t) =
              List.fold_left
                (fun worst label ->
                   let _, p99, _, samples = find_metric label in
-                  if samples = 0 then worst else max worst (severity label p99 samples))
+                  if samples > 0
+                  then max worst (severity label p99 samples)
+                  else (
+                    match last_value symbol label with
+                    | Some (_, lp99, _) -> max worst (severity_of_value label lp99)
+                    | None -> worst))
                0
                page_cols
            in
@@ -437,10 +442,22 @@ let render_latencies w (snapshot : Snapshot.t) =
                     else (
                       match last_value symbol label with
                       | Some (lp50, lp99, lp999) ->
+                        let s50 = severity_of_value label lp50 in
+                        let s99 = max s50 (severity_of_value label lp99) in
+                        let s999 = max s99 (severity_of_value label lp999) in
                         I.hcat
-                          [ col_right metric_cell_w a_dim (format_latency_us lp50)
-                          ; col_right metric_cell_w a_dim (format_latency_us lp99)
-                          ; col_right metric_cell_w a_dim (format_latency_us lp999)
+                          [ col_right
+                              metric_cell_w
+                              (latency_cell_attr (attr_of_sev s50) lp50)
+                              (format_latency_us lp50)
+                          ; col_right
+                              metric_cell_w
+                              (latency_cell_attr (attr_of_sev s99) lp99)
+                              (format_latency_us lp99)
+                          ; col_right
+                              metric_cell_w
+                              (latency_cell_attr (attr_of_sev s999) lp999)
+                              (format_latency_us lp999)
                           ]
                       | None ->
                         let cell_w = 3 * metric_cell_w in
@@ -453,21 +470,10 @@ let render_latencies w (snapshot : Snapshot.t) =
                   if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
                page_cols
            in
-           let _, _, _, trend_samples = find_metric page.trend_metric in
-           let trend_stale =
-             if trend_samples > 0
-             then false
-             else (
-               match last_value symbol page.trend_metric with
-               | Some _ -> true
-               | None -> false)
-           in
            let t_smooth = ema_smooth (hist_of symbol page.trend_metric) ~alpha:0.5 in
            let trend_spark =
              render_sparkline_local trend_col_w t_smooth page.trend_max_us (fun v ->
-               if trend_stale
-               then a_dim
-               else latency_cell_attr (attr_of_sev (severity page.trend_metric v 1)) v)
+               latency_cell_attr (attr_of_sev (severity_of_value page.trend_metric v)) v)
            in
            let exch = exch_of_symbol symbol in
            let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
