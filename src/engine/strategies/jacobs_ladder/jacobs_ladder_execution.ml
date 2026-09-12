@@ -116,6 +116,22 @@ let unreflected_cutoff ~now ~base_balance_age =
   | None -> now -. sell_hold_netting_grace_s
 ;;
 
+(** Grace after a buy ack during which the open-orders feed may not yet list
+    the order. The venue's snapshot/stream lags the ack by up to seconds, and a
+    scan that ran in that window saw zero open buys and declared the freshly
+    acked buy a "ghost", purging it and re-placing - churning the grid and
+    stacking new sell obligations. A buy that genuinely left the book is
+    cleared by its terminal event (fill/cancel), or by this grace once the feed
+    has had time to list it. *)
+let buy_ack_ghost_grace_s = 15.0
+
+(** Tolerance for [last_balance_delta] direction tests. Balances are base
+    quantities accumulated by repeated float addition, so an unchanged venue
+    figure can land a few ULPs above or below the adopted value; without this a
+    spurious tiny positive delta would read as an "increase" and wedge an
+    outstanding sell hold. *)
+let balance_delta_epsilon = 1e-9
+
 (** The portion of placed-sell base that the balance feed may not yet be
     netting. Applies to EVERY accumulation venue (Hyperliquid, Kraken, IBKR,
     Lighter): all report a tradeable figure with open-order holds removed, and
@@ -129,11 +145,16 @@ let unreflected_cutoff ~now ~base_balance_age =
 
     A hold is outstanding only while the newest balance message for THIS asset
     still PREDATES its placement. The moment a message generated after the
-    placement arrives, the venue's hold is already in the adopted figure, so
-    the overlay must be retired even when a concurrent buy fill masked the
-    tradeable drop. Crucially, the freshness the caller supplies is PER-ASSET:
-    Hyperliquid pushes one whole-account spotState snapshot, and a fill on
-    another coin must not advance this asset's timestamp (see
+    placement arrives the overlay is retired - BUT only when that message did
+    not RAISE the tradeable figure ([state.last_balance_delta <= 0]). A buy fill
+    raises the figure and bumps the same per-asset freshness timestamp without
+    netting any sell hold (the venue's hold update trails the ack), so trusting
+    a positive-delta message as proof of netting re-offered committed base as
+    free and produced an oversized sell the venue rejected for insufficient
+    inventory. Positive-delta messages keep the hold until a flat/down message
+    or the grace retires it. Crucially, the freshness the caller supplies is
+    PER-ASSET: Hyperliquid pushes one whole-account spotState snapshot, and a
+    fill on another coin must not advance this asset's timestamp (see
     Hyperliquid_balances.BalanceStore.update_wallet) - otherwise another
     asset's activity would clear this asset's guard. The grace still bounds a
     dead feed. [consume_sell_hold_netting] additionally retires holds on an
@@ -142,12 +163,21 @@ let unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age =
   if ecfg.use_unnetted_sell_hold && state.sell_holds_since_balance <> []
   then (
     let cutoff = unreflected_cutoff ~now ~base_balance_age in
+    let grace_cutoff = now -. sell_hold_netting_grace_s in
+    (* A message may certify netting only if its move was flat or down. An
+       increase (buy fill) cannot have applied a sell hold. The tolerance
+       absorbs the float jitter between an adopted venue figure and the same
+       figure recomputed by the venue model, which otherwise reads as a tiny
+       positive "increase" and wedges the hold. *)
+    let message_may_certify = state.last_balance_delta <= balance_delta_epsilon in
     let rec go unnetted acc = function
       | [] ->
         state.sell_holds_since_balance <- List.rev acc;
         unnetted
       | (placed_at, qty) :: rest ->
-        if placed_at < cutoff
+        let grace_expired = placed_at < grace_cutoff in
+        let released_by_message = message_may_certify && placed_at < cutoff in
+        if grace_expired || released_by_message
         then go unnetted acc rest
         else go (unnetted +. qty) ((placed_at, qty) :: acc) rest
     in
@@ -249,6 +279,11 @@ let reconcile_position ~state ~now ~base_balance_age ~asset_balance =
            raise tradeable, so they never consume a hold. *)
         if delta < 0.0 then consume_sell_hold_netting ~state ~amount:(-.delta))
       else state.attributed_balance_increase <- 0.0;
+      (* Direction of this message, consumed by [unnetted_sell_hold]: only a
+         flat/down move can have applied an outstanding sell hold. A buy-fill
+         increase bumps the same per-asset freshness timestamp but nets no
+         hold, so it must not retire the guard. First adoption seeds 0.0. *)
+      state.last_balance_delta <- (if was_initialized then delta else 0.0);
       state.position_base <- asset_balance;
       state.position_initialized <- true;
       state.position_venue_ts <- venue_ts;
@@ -867,7 +902,11 @@ let sync_open_orders
     !open_buy_count_from_scan = 0
     && (not state.inflight_cancel_buy)
     && (not state.inflight_buy)
-    && not is_amend_active
+    && (not is_amend_active)
+    (* A freshly acked buy is not listed by the open-orders feed yet; do not
+       mistake that lag for a vanished order. After the grace, a buy still
+       absent with no terminal event is a genuine ghost and is recovered. *)
+    && now_time -. state.last_buy_ack_ts >= buy_ack_ghost_grace_s
   then (
     if Option.is_some state.last_buy_order_id || Option.is_some state.last_buy_order_price
     then (

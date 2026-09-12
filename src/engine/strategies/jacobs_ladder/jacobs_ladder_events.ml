@@ -180,6 +180,10 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
           state.inflight_buy <- false;
           state.inflight_amend_buy <- false;
           state.last_buy_attempted_insufficient <- false;
+          (* Start the open-orders feed-lag grace: the venue lists the acked buy
+             a moment later, and [sync_open_orders] must not purge it as a ghost
+             in that window. *)
+          state.last_buy_ack_ts <- now;
           (* The buy is resting again - any pending TIF-recovery re-attempt
              is satisfied. *)
           state.tif_recovery_pending <- false;
