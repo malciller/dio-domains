@@ -31,7 +31,7 @@ let get ?(headers = Cohttp.Header.init ()) (uri : Uri.t)
 ;;
 
 let load_dotenv () =
-  try Dotenv.export ~path:".env" () with
+  try Logging.load_dotenv ~path:".env" () with
   | _ -> ()
 ;;
 

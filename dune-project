@@ -22,14 +22,13 @@
   ocaml
   dune
   (yojson
-   (= 2.2.2))
+   (>= 2.2.2))
   lwt
   lwt_ppx
   lwt_ssl
   mirage-crypto-rng
   cohttp-lwt-unix
   websocket-lwt-unix
-  dotenv
   base64
   digestif
   uri

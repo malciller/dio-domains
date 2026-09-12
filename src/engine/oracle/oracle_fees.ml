@@ -56,7 +56,7 @@ let fetch_fees ~(exchange : string) ~(symbol : string) ~(testnet : bool)
 (** Load .env (KRAKEN/HYPERLIQUID/ALPACA credentials) into the process env, if
     present. Idempotent enough for CLI use. *)
 let load_dotenv () =
-  try Dotenv.export ~path:".env" () with
+  try Logging.load_dotenv ~path:".env" () with
   | _ -> ()
 ;;
 

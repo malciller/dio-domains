@@ -34,7 +34,7 @@ let symbol_to_kraken_pair = String.(fun s -> uppercase_ascii (trim s))
 let get_api_credentials_from_env () : (string * string) Lwt.t =
   Lwt.catch
     (fun () ->
-       Dotenv.export ~path:".env" ();
+       Logging.load_dotenv ~path:".env" ();
        Lwt.return_unit)
     (fun _ -> Lwt.return_unit)
   >>= fun () ->

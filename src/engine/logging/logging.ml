@@ -647,3 +647,51 @@ let get_section_level name = (get_section name).min_level
 
 (* Re-exported utility. *)
 let level_to_string = level_to_string
+
+(** Minimal [.env] loader, replacement for the [dotenv] package. If [path]
+    exists, every [KEY=VALUE] line is exported into the process environment.
+    Blank lines and lines starting with [#] are skipped, a leading [export ] is
+    ignored, and matching single/double quotes around a value are stripped.
+    Existing environment variables are never overwritten, matching the default
+    behaviour of [Dotenv.export]. A missing file is a no-op. *)
+let load_dotenv ?(path = ".env") () =
+  match
+    try Some (open_in path) with
+    | Sys_error _ -> None
+  with
+  | None -> ()
+  | Some ic ->
+    Fun.protect
+      ~finally:(fun () -> close_in_noerr ic)
+      (fun () ->
+         try
+           while true do
+             let line = String.trim (input_line ic) in
+             if line <> "" && line.[0] <> '#'
+             then (
+               let line =
+                 if String.starts_with ~prefix:"export " line
+                 then String.trim (String.sub line 7 (String.length line - 7))
+                 else line
+               in
+               match String.index_opt line '=' with
+               | None -> ()
+               | Some i ->
+                 let key = String.trim (String.sub line 0 i) in
+                 let value =
+                   String.trim (String.sub line (i + 1) (String.length line - i - 1))
+                 in
+                 let value =
+                   let n = String.length value in
+                   if
+                     n >= 2
+                     && ((value.[0] = '"' && value.[n - 1] = '"')
+                         || (value.[0] = '\'' && value.[n - 1] = '\''))
+                   then String.sub value 1 (n - 2)
+                   else value
+                 in
+                 if key <> "" && Sys.getenv_opt key = None then Unix.putenv key value)
+           done
+         with
+         | End_of_file -> ())
+;;
