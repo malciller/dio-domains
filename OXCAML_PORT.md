@@ -190,9 +190,9 @@ Owner column is free text (agent/session id). Keep one `IN_PROGRESS` at a time p
 | ID | Task | Depends on | Status | Owner |
 | --- | --- | --- | --- | --- |
 | WS0 | Build harness: reproducible Docker builder target + local Linux dev switch; capture baseline logs | — | TODO | |
-| WS1 | `notty` → `notty-community` (dep swap + code/API check) | WS0 | TODO | |
+| WS1 | `notty` → `notty-community` (dep swap + code/API check) | WS0 | **DONE (flambda)** | this session |
 | WS2 | Fix `lwt_ppx+ox` AST mismatch (pin compatible `ppxlib`/`ppxlib_ast`) | WS0 | **DONE (resolution)** | this session |
-| WS2b | Resolve `lwt 6` vs `lwt_log < 6` (pulled by `websocket-lwt-unix`); pin `alcotest = 1.9.0+ox` | WS2 | IN_PROGRESS | |
+| WS2b | Resolve `lwt 6` vs `lwt_log < 6` (pulled by `websocket-lwt-unix`); pin `alcotest = 1.9.0+ox` | WS2 | **DONE (flambda)** | this session |
 | WS3 | `digestif` — patch modes OR replace with `mirage-crypto` hashes | WS0 | TODO | |
 | WS4 | `msgpck` / `ocplib-endian` — patch or replace encoder | WS0 | TODO | |
 | WS5 | `cohttp-lwt(-unix)` — patch local/global mode errors | WS0 | TODO | |
@@ -283,14 +283,15 @@ Owner column is free text (agent/session id). Keep one `IN_PROGRESS` at a time p
 | --- | --- | --- | --- | --- | --- | --- |
 | `ocaml-variants` | compiler | `5.2.0+ox` | — | builds | repo pinned `bb455526` (2026-08-31) | |
 | `lwt_ppx` | `let%lwt` ppx | `>= 6.0.0` (dio) | yes | **fixed in resolution**: pin `>= 6.0.0` forces `6.0.0+ox`; `5.9.1+ox` was stale vs `ppxlib 0.33.0+ox2` | WS2 — pinned, re-verify in WS9 | this session |
-| `lwt` | runtime | (unpinned) | yes | `6.0.0+ox` required by `lwt_ppx 6`; conflicts with `lwt_log` (see below) | WS2b | |
-| `lwt_log` | pulled by `websocket-lwt-unix` | — | no | **blocks `lwt 6`** (`lwt < 6.0.0`) | WS2b: drop/replace `websocket-lwt-unix` or patch `lwt_log` | |
-| `alcotest` | tests | (unpinned) | yes | must resolve to `1.9.0+ox` | pin `alcotest = 1.9.0+ox` under OxCaml | |
-| `notty` | logging/TUI | 0.2.3 | no (`notty-community`) | **fails** | WS1 | |
+| `lwt` | runtime | (unpinned) | yes | `6.0.0+ox` required by `lwt_ppx 6`; conflict resolved in WS2b by dropping the lwt websocket wrapper | — | |
+| `lwt_log` | was pulled by `websocket-lwt-unix` | — | no | **no longer a dependency** (WS2b dropped `websocket-lwt-unix`) | — | |
+| `alcotest` | tests | (unpinned) | yes | must resolve to `1.9.0+ox` on OxCaml | project constraint left broad (classic-flambda unaffected); the OxCaml build must pass `--update-invariant` or explicitly resolve `alcotest` to `1.9.0+ox` (WS2b) | |
+| `notty-community` | logging/TUI | `0.2.4` (default) / `0.2.4+ox2` (ox repo) | yes | flambda green; OxCaml `+ox2` selects automatically | WS1 — API identical to notty 0.2.3 (`Notty`/`Notty_unix`); expose `notty-community{,.unix}` | this session |
 | `digestif` | hashing | 1.3.1 | no | **fails** | WS3 | |
 | `cohttp-lwt` | REST | 4.0.0 | no | **fails** | WS5 | |
 | `msgpck` | HL msgpack | 1.7 | no | **fails** | WS4 | |
-| `websocket-lwt-unix` | WS feeds | 2.17 | no | unknown | WS6 | |
+| `websocket-lwt-unix` | WS feeds | 2.17 | no | **DROPPED** (pulled `lwt_log`, capping `lwt < 6`) | WS2b: replaced by internal `dio.ws_lwt` over base `websocket` + `conduit-lwt-unix` | |
+| `websocket` | WS framing | 2.17 | no | kept; no `lwt_log` | base framing used by `dio.ws_lwt` (WS2b) | |
 | `conduit-lwt-unix` | transport | 7.0.0 | no | unknown | WS6 | |
 | `secp256k1` | signing | 0.5.0 | no | unknown | WS7 | |
 | `yojson` | JSON | `>=2.2.2` | yes | resolves (`2.2.2+ox`) | — | |
@@ -416,3 +417,87 @@ Newest last. Format: `### YYYY-MM-DD — <session/agent> — <task ids>` then wh
   `websocket`), then WS1 (`notty`), WS3 (`digestif`).
 
 <!-- Append new entries below. -->
+
+### 2026-09-12 — WSL session — WS1
+- Swapped `notty` → `notty-community` across `dune-project` + 4 dune files:
+  `src/engine/logging/dune`, `src/dashboard_ui/dune`, `bin/dune`,
+  `test/engine/dashboard/dune`. Dune regenerated `dio.opam`.
+- Exposed libraries: `notty-community` (module `Notty`) and
+  `notty-community.unix` (module `Notty_unix`) — same module/API surface as
+  `notty`/`notty.unix`, so no call-site changes were required.
+- Verified `notty-community` 0.2.4 is on the default opam repo and installs on
+  `5.2.0+flambda`; `ocamlfind list` shows `notty-community{,.unix,.lwt,.top}`.
+  Upstream `CHANGES` says the only difference from 0.2.3 is the library rename
+  (modules unchanged), plus Unicode 17 + OCaml 5.4 support.
+- OxCaml route: the pinned ox repo (`bb455526`) ships
+  `notty-community.0.2.4+ox2` and `oxcaml-notty-community-patches`, which carry
+  the mode fixes and the `unsafe_multidomain`/`Sys.Safe.signal` patch while
+  keeping the same `notty-community` / `notty-community.unix` public names. A
+  plain `notty-community` dependency hence resolves to `0.2.4+ox2` on an OxCaml
+  switch and `0.2.4` on flambda — one source of truth, no OxCaml-only deps.
+- Verification on `5.2.0+flambda`: `dune build` → exit 0 (builds
+  `bin/dashboard.exe`, `bin/main.exe`); `dune runtest --force` → exit 0 with 69
+  `Test Successful` lines (matches baseline).
+- Note/blocker for full OxCaml evidence only: the local `5.2.0+ox` switch's opam
+  repo cache is stale (lacks `notty-community`), and OxCaml cannot be built on
+  this macOS host, so OxCaml end-to-end remains a Docker (WS0) step.
+- Next: WS3 (`digestif`), WS2b choice, then WS9 re-verify under Docker.
+
+### 2026-09-12 — WS2b session — WS2b
+- Chose option 2: dropped `websocket-lwt-unix` (which pulled `lwt_log`, capping
+  `lwt < 6`) for a client-only internal library `dio.ws_lwt`
+  (`src/external/ws_lwt/`) built directly on base `websocket` and
+  `Websocket.Make (Cohttp_lwt_unix.IO)`, with no `Lwt_log` dependency.
+- API (`Ws_lwt`): `connect ?extra_headers ?random_string ?ctx ?buf client uri`,
+  `read`, `write`, `close_transport`, `type conn` — same surface as the subset of
+  `websocket-lwt-unix` in use. Reproduces the reference connect/read/write/close
+  semantics and calls `set_tcp_nodelay`; no server code; no wire-format change
+  (framing still from the `websocket` package).
+- Updated call sites `Websocket_lwt_unix` → `Ws_lwt` in `hyperliquid_ws.ml`,
+  `kraken_trading_client.ml`, `kraken_orderbook_feed.ml`, `alpaca_orderbook.ml`,
+  `lighter_ws.ml`, and `test/external/kraken/debug_ws.ml`; dune deps now
+  `websocket` + `dio.ws_lwt`.
+- Removed `websocket-lwt-unix` from `dune-project`; `dio.opam` regenerated with
+  `websocket`. `rg -n "websocket-lwt-unix" .` (excl. this doc and `_build`) is
+  empty.
+- `alcotest` left broad in `dune-project`/`dio.opam` so classic-flambda is
+  unaffected; under OxCaml the build must pass `--update-invariant` or resolve
+  `alcotest` to `1.9.0+ox` (see §7).
+- Verified on `5.2.0+flambda`: `dune build` → exit 0; `dune runtest --force` →
+  exit 0 with 69 `Test Successful` (matches baseline).
+- Note: a concurrent WS1 session also changed `notty` → `notty-community` in the
+  same working tree; those edits are present here but are not part of WS2b.
+
+### 2026-09-12 — WS1/WS2/WS2b Docker verification — WS1, WS2, WS2b
+- Dispatched four subagents (WS1 notty, WS2b websocket wrapper, WS3 digestif
+  analysis, WS4 msgpck analysis) in parallel; all returned.
+- **Dependency resolution is now fixed under OxCaml.** Docker `linux/arm64`
+  builder run (`/tmp/docker_oxcaml_build5.log`, arm64 native): the solver now
+  resolves the full closure with `+ox` variants and **no conflicts**:
+  `lwt 6.0.0+ox`, `lwt_ppx 6.0.0+ox`, `ppxlib 0.33.0+ox2`, `notty-community
+  0.2.4+ox2`, `alcotest 1.9.0+ox`, `conduit-lwt-unix 2.2.2`, `websocket 2.14`.
+  The `--update-invariant` note was not needed; `alcotest` resolved to `1.9.0+ox`
+  because the OxCaml patch package constrains it.
+- The build now fails only at **compilation**, on exactly the three predicted
+  packages: `msgpck.1.7`, `digestif.1.3.1`, `cohttp-lwt.4.0.0`. No
+  `websocket`/`conduit`/`secp256k1`/`lwt` failures — WS2b and WS1 held up.
+- `cohttp-lwt` error (new detail): `cohttp-lwt/src/body.ml:50: Error: This value
+  is "local" but is expected to be "global".` (mode annotation).
+- WS3/WS4 analyses delivered patch recipes (see §6 WS3/WS4 and the task outputs):
+  - **WS3:** replacing digestif with mirage-crypto is NOT viable (mirage-crypto
+    >= 1.0 removed its hash module and *depends on* digestif; digestif is also a
+    hard dep of mirage-crypto-rng). Patch digestif's 8 `baijiu_*.ml` files with
+    mode annotations; or disable the optional `digestif.ocaml` backend and keep
+    `digestif.c`. Small, byte-preserving.
+  - **WS4:** only `msgpck` fails (ocplib-endian is fine). Eta-expand
+    `SIBO.blit`/`BIBO.blit` in `msgpck.ml:37,49`; runtime path `StringBuf` is
+    untouched so bytes are preserved. ~0.5 day + overlay wiring, low risk.
+- Verified local `5.2.0+flambda`: combined tree `dune build` exit 0 and
+  `dune runtest --force` exit 0 with 69 `Test Successful` (the subagents' edits
+  are compatible).
+- Reverted the branch Dockerfile to flambda after the experiment (OxCaml block
+  remains in §8).
+- Next: implement the three dependency patches via the §5 overlay (WS3, WS4,
+  WS5), then re-run the Docker builder; expect G2 to pass.
+
+

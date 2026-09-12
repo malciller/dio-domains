@@ -29,7 +29,7 @@
   lwt_ssl
   mirage-crypto-rng
   cohttp-lwt-unix
-  websocket-lwt-unix
+  websocket
   base64
   digestif
   uri
@@ -41,7 +41,7 @@
   msgpck
   ctypes
   ctypes-foreign
-  notty)
+  notty-community)
  (tags
   ("trading" "finance" "multicore" "ocaml" "domains")))
 
