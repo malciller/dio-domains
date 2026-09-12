@@ -781,3 +781,22 @@ Newest last. Format: `### YYYY-MM-DD — <session/agent> — <task ids>` then wh
 - Note: `--cache-to type=local` is **not** used — the docker driver does not
   support cache export (verified), and `docker/build-push-action` handles
   ephemeral GitHub runners instead.
+
+### 2026-09-12 — Gitea runner + CI resolution fix
+- Gitea runner on `storage` (192.168.1.77) was registered with label
+  `ubuntu-22.04:host` only, so the workflow's `runs-on: ubuntu-latest` sat in
+  **waiting**. Fixed by setting labels in `/etc/gitea-runner/config.yaml` and
+  `/var/lib/gitea-runner/.runner` to `ubuntu-latest:host` + `ubuntu-22.04:host`,
+  then restarting `gitea-runner.service`.
+- `storage` had no Docker for the OxCaml job: installed `docker.io`, added
+  `gitea-runner` to the `docker` group, installed the `buildx` CLI plugin
+  (`v0.21.1`) to `/usr/local/lib/docker/cli-plugins/`, and added an 8 GB swap
+  file (total 11 GB swap + 15 GB RAM) to cover the memory-heavy OxCaml compiler.
+- **GitHub CI resolution fix:** the `lwt_ppx >= 6.0.0` constraint in
+  `dio.opam`/`dune-project` forced `ppxlib >= 0.36`, which conflicts with
+  `conduit-lwt-unix < 3` on the classic-flambda path and made opam backtrack to
+  OCaml-4-era `cohttp`. Removed the constraint from the shared manifest and moved
+  it into the OxCaml Docker build only (`opam pin add lwt_ppx 6.0.0+ox` before the
+  dependency install). Verified: a fresh OCaml 5.2 switch now resolves
+  `cohttp-lwt-unix 6.3.0` / `conduit-lwt-unix 8.0.0` cleanly; OxCaml build still
+  resolves `lwt_ppx 6.0.0+ox` and passes 69/69 with zero alerts.
