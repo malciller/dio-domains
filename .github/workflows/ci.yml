@@ -3,7 +3,11 @@ on: [push, pull_request]
 
 jobs:
   build-test:
-    runs-on: ubuntu-22.04
+    # Classic-flambda OCaml 5.2 build + tests. This is the production toolchain
+    # for `main`. `ubuntu-latest` is understood by GitHub-hosted runners and by
+    # the standard act_runner label set used by Gitea; if the self-hosted Gitea
+    # runner uses a custom label, change this to that label.
+    runs-on: ubuntu-latest
     permissions:
       actions: write
       contents: read
@@ -39,6 +43,9 @@ jobs:
           fi
           eval "$(opam env --switch default)"
 
+      # actions/cache is only available on github.com; the Gitea act_runner
+      # does not implement it. The guard keeps the step to GitHub while the rest
+      # of the workflow runs unchanged on both.
       - name: Restore Dune cache
         if: github.server_url == 'https://github.com'
         uses: actions/cache@v4
@@ -56,3 +63,63 @@ jobs:
 
       - name: Run tests
         run: opam exec -- dune runtest
+
+  build-test-oxcaml:
+    # OxCaml (flambda2) build + tests. The Dockerfile creates the OxCaml switch
+    # and applies the patch overlay in oxcaml-port/opam-overlay. This is the
+    # toolchain the `oxcaml` branch targets; see OXCAML_PORT.md.
+    #
+    # Requires a runner with Docker and >= 16 GB RAM (the OxCaml compiler
+    # bootstrap OOMs at 8 GB). On the self-hosted Gitea runner, `runs-on`
+    # must name a label whose runner has both; change it if needed.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx (GitHub-hosted runners)
+        if: github.server_url == 'https://github.com'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build OxCaml image (deps + release binaries)
+        # On GitHub-hosted runners (ephemeral) use the GitHub Actions cache
+        # backend so the expensive OxCaml compiler layer is reused across runs.
+        # On a self-hosted Gitea runner the Docker daemon persists between runs,
+        # so the Dockerfile's own layer cache is reused without any extra flags.
+        if: github.server_url == 'https://github.com'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          load: true
+          tags: dio-oxcaml-builder
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build OxCaml image (self-hosted runner)
+        if: github.server_url != 'https://github.com'
+        run: |
+          DOCKER_BUILDKIT=1 docker buildx build \
+            --progress=plain \
+            --target builder \
+            -t dio-oxcaml-builder \
+            --load .
+
+      - name: Run test suite under OxCaml
+        # `.dockerignore` excludes test/, so bind-mount it into the image for
+        # the test run. Treats `Alert` output as a failure so the zero-alert
+        # invariant from OXCAML_PORT.md is enforced by CI.
+        run: |
+          set -o pipefail
+          docker run --rm \
+            -v "$PWD/test:/app/test:ro" \
+            --entrypoint bash \
+            dio-oxcaml-builder -lc \
+            'eval $(opam env) && cd /app && cp -r test /tmp/test && dune runtest --force 2>&1' \
+            | tee /tmp/oxcaml-test.log
+          if grep -q "Alert " /tmp/oxcaml-test.log; then
+            echo "::error::OxCaml build emitted compiler alerts; see log above"
+            exit 1
+          fi
