@@ -507,7 +507,7 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
          | _ -> failwith ("Failed to resolve host " ^ host)
        in
        let client = `TLS (`Hostname host, `IP ip, `Port port) in
-       let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
+       let ctx = Ws_lwt.resolve_ctx () in
        (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP
           connection during the handshake would otherwise block the
           reconnect (which runs on the main Lwt loop) indefinitely. *)

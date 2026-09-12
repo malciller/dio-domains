@@ -94,11 +94,12 @@ type conn =
 let read { read_frame; _ } = read_frame ()
 let write { write_frame; _ } frame = write_frame frame
 let close_transport { oc; _ } = Lwt_io.close oc
+let resolve_ctx () = Ctx.resolve ()
 
 let connect
   ?(extra_headers = Cohttp.Header.init ())
   ?(random_string = Websocket.Rng.init ())
-  ?(ctx = Lazy.force Conduit_lwt_unix.default_ctx)
+  ?(ctx = Ctx.resolve ())
   ?buf
   client
   url

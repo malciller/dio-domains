@@ -9,6 +9,14 @@
 (** An established client connection. *)
 type conn
 
+(** Resolves the default Conduit context.
+
+    [Conduit_lwt_unix.default_ctx] changed type across Conduit releases: it is a
+    [ctx Lazy.t] on Conduit >= 3 (classic-flambda builds) and a plain [ctx] on
+    Conduit < 3 (the OxCaml bundle). This returns the context either way, so
+    call sites do not depend on which toolchain they are compiled under. *)
+val resolve_ctx : unit -> Conduit_lwt_unix.ctx
+
 val connect :
   ?extra_headers:Cohttp.Header.t ->
   ?random_string:(int -> string) ->
