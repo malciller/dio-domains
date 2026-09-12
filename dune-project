@@ -22,7 +22,9 @@
   ocaml
   dune
   (yojson
-   (= 2.2.2))
+   (and
+    (>= 2.2.2)
+    (< 2.2.3)))
   lwt
   lwt_ppx
   lwt_ssl
