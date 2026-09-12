@@ -71,13 +71,13 @@ jobs:
             ${{ runner.os }}-dune-cache-
 
       - name: Install opam deps
-        run: opam install . --deps-only --with-test --assume-depexts -y
+        run: opam install . --deps-only --with-test --assume-depexts -y --switch default
 
       - name: Build
-        run: opam exec -- dune build @all
+        run: opam exec --switch default -- dune build @all
 
       - name: Run tests
-        run: opam exec -- dune runtest
+        run: opam exec --switch default -- dune runtest
 
   build-test-oxcaml:
     # OxCaml (flambda2) build + tests. The Dockerfile creates the OxCaml switch
