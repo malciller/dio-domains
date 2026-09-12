@@ -604,7 +604,7 @@ let handle_message message on_heartbeat =
     Kraken wallet snapshots report TOTAL balances, so these holds must be
     subtracted to obtain the tradeable figure (Hyperliquid's store nets the
     hold at ingestion; here it is derived on read). *)
-let[@warning "-32"] get_pending_buy_quote_value quote_asset =
+let get_pending_buy_quote_value quote_asset =
   let suffix = "/" ^ quote_asset in
   let all_symbols = Kraken_executions_feed.get_all_symbols () in
   let matching = List.filter (fun sym -> String.ends_with ~suffix sym) all_symbols in

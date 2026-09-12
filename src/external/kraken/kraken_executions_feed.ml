@@ -183,6 +183,16 @@ type symbol_store =
 (** Global symbol-to-store mapping. *)
 let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 64
 
+(** Monotonic counter bumped on every open-orders snapshot publish. The balances
+    feed derives Kraken's open-order holds by scanning every symbol store on
+    each balance read (twice per executable cycle); keying a small cache on this
+    generation makes those reads allocation-free until an order actually
+    changes. Every mutation path republishes the store's cache, so bumping here
+    is the single choke point. *)
+let orders_generation : int Atomic.t = Atomic.make 0
+
+let[@inline] get_orders_generation () = Atomic.get orders_generation
+
 (** Global order ID to symbol mapping with adaptive cap and FIFO eviction. Requires global_orders_mutex. *)
 let order_to_symbol : (string, string * side) Hashtbl.t = Hashtbl.create 16
 
@@ -266,7 +276,8 @@ let get_symbol_store symbol =
     Must be called by writers under store.orders_mutex. *)
 let[@inline] publish_open_orders_cache store =
   let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
-  Atomic.set store.open_orders_cache snapshot
+  Atomic.set store.open_orders_cache snapshot;
+  Atomic.incr orders_generation
 ;;
 
 (** Marks the store as ready. Atomic flag only - the startup waiter

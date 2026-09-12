@@ -20,6 +20,7 @@ type exchange_config = Jacobs_ladder_types.exchange_config =
   ; use_reserved_base_guard : bool
   ; use_unnetted_sell_hold : bool
   ; balance_nets_open_order_holds : bool
+  ; hold_netted_from_venue_state : bool
   ; asset_low_requires_balance_change : bool
   ; merge_preserved_sells : bool
   ; check_stale_balance : bool

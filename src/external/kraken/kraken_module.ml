@@ -271,12 +271,26 @@ module Kraken_impl = struct
     Float.max 0.0 (Kraken_balances_feed.get_balance asset -. open_order_holds asset)
   ;;
 
+  (** Cached tradeable balance. The returned closure is owned by a single asset
+      domain, so its refs are never touched by another thread. [open_order_holds]
+      rebuilds symbol/order lists (~165 words) on every call and is evaluated
+      twice per executable cycle, so we recompute it only when the executions
+      feed actually publishes a new open-orders snapshot ([orders_generation]).
+      The common cycle then allocates nothing: the boxed cached hold is read
+      straight back out of the ref. *)
   let get_tradeable_balance_fast ~asset =
     let store = Kraken_balances_feed.get_balance_store asset in
+    let last_hold_gen = ref (-1) in
+    let last_hold = ref 0.0 in
     fun () ->
-      Float.max
-        0.0
-        (Kraken_balances_feed.BalanceStore.get_balance store -. open_order_holds asset)
+      let gen = Kraken_executions_feed.get_orders_generation () in
+      if gen <> !last_hold_gen
+      then (
+        last_hold_gen := gen;
+        last_hold
+        := Kraken_balances_feed.get_pending_sell_qty asset
+           +. Kraken_balances_feed.get_pending_buy_quote_value asset);
+      Float.max 0.0 (Kraken_balances_feed.BalanceStore.get_balance store -. !last_hold)
   ;;
 
   (* Kraken's tradeable figure is already hold-netted. *)

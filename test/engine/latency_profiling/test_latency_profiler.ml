@@ -244,6 +244,147 @@ let test_mixed_three_tiers () =
   Alcotest.(check int) "snap sub-us samples" 100 snap.sub_us_samples
 ;;
 
+let test_spike_tracking () =
+  let t = LP.create ~bucket_us:1 ~max_latency_us:10_000 "spikes" in
+  (* 90 samples at 5us (under), 8 at 20us and 2 at 50us (over a 10us ceiling). *)
+  for _ = 1 to 90 do
+    LP.record t (Mtime.Span.of_uint64_ns 5000L)
+  done;
+  for _ = 1 to 8 do
+    LP.record t (Mtime.Span.of_uint64_ns 20000L)
+  done;
+  for _ = 1 to 2 do
+    LP.record t (Mtime.Span.of_uint64_ns 50000L)
+  done;
+  Alcotest.(check int) "count at/above 10us is 10" 10 (LP.count_above t 10.0);
+  Alcotest.(check int) "count at/above 50us is 2" 2 (LP.count_above t 50.0);
+  Alcotest.(check int) "count at/above 51us is 0" 0 (LP.count_above t 51.0);
+  let snap = LP.snapshot_and_reset ~spike_threshold_us:10.0 t in
+  Alcotest.(check int) "snapshot spike count" 10 snap.over_threshold;
+  Alcotest.(check (float 0.001)) "snapshot max_us" 50.0 snap.max_us
+;;
+
+let test_spike_count_coarse_bucket () =
+  (* A coarse-bucket profiler (the cycle/exec shape) must still count
+     sub-bucket spikes via its fine microsecond tier. *)
+  let t = LP.create ~bucket_us:1000 ~max_latency_us:2_000_000 "coarse-spikes" in
+  LP.record t (Mtime.Span.of_uint64_ns 5000L);
+  (* 5us, fine tier *)
+  LP.record t (Mtime.Span.of_uint64_ns 500_000L);
+  (* 500us, fine tier *)
+  LP.record t (Mtime.Span.of_uint64_ns 1_500_000L);
+  (* 1.5ms, coarse *)
+  Alcotest.(check int) "three samples above 1us" 3 (LP.count_above t 1.0);
+  Alcotest.(check int) "two samples above 10us" 2 (LP.count_above t 10.0);
+  let snap = LP.snapshot_and_reset ~spike_threshold_us:1.0 t in
+  Alcotest.(check int) "snapshot coarse spike count" 3 snap.over_threshold;
+  Alcotest.(check (float 1.0)) "snapshot coarse max_us" 1500.0 snap.max_us
+;;
+
+let test_count_above_fine_and_coarse_split () =
+  (* bucket_us=10: 1-9us live in the fine microsecond tier, 10us+ in the coarse
+     tier. A threshold at the boundary must count only the coarse sample, and a
+     threshold inside the fine tier must count the fine samples at/above it -
+     this locks the start-index optimization in [count_above]. *)
+  let t = LP.create ~bucket_us:10 ~max_latency_us:1000 "split" in
+  LP.record t (Mtime.Span.of_uint64_ns 5_000L);
+  (* 5us -> fine bucket 4 *)
+  LP.record t (Mtime.Span.of_uint64_ns 9_000L);
+  (* 9us -> fine bucket 8 *)
+  LP.record t (Mtime.Span.of_uint64_ns 15_000L);
+  (* 15us -> coarse bucket 1 *)
+  Alcotest.(check int) "5us+ counts all three" 3 (LP.count_above t 5.0);
+  Alcotest.(check int) "6us+ excludes the 5us sample" 2 (LP.count_above t 6.0);
+  Alcotest.(check int)
+    "10us boundary counts only the coarse sample"
+    1
+    (LP.count_above t 10.0);
+  Alcotest.(check int) "16us counts nothing" 0 (LP.count_above t 16.0);
+  Alcotest.(check int) "non-finite threshold counts nothing" 0 (LP.count_above t infinity)
+;;
+
+let test_snapshot_no_threshold () =
+  let t = LP.create "no-threshold" in
+  LP.record t (Mtime.Span.of_uint64_ns 50_000L);
+  let snap = LP.snapshot_and_reset t in
+  Alcotest.(check int) "no threshold means no spike count" 0 snap.over_threshold;
+  Alcotest.(check (float 0.001)) "max still recorded" 50.0 snap.max_us
+;;
+
+(* Minimal snapshot builder for the spike-message tests: only the fields the
+   formatter reads are interesting; the rest are fixed sentinels. *)
+let snap ?(samples = 0) ?(over_threshold = 0) ?(max_us = 0.0) ?(p99 = 0.0) ?max_cause name
+  =
+  ({ LP.name
+   ; p50 = 0.0
+   ; p90 = 0.0
+   ; p95 = 0.0
+   ; p99
+   ; p999 = 0.0
+   ; samples
+   ; sub_us_samples = 0
+   ; overflow = 0
+   ; max_us
+   ; over_threshold
+   ; max_cause
+   ; executions = 0
+   ; last_exec_time = 0.0
+   ; window_start = 0.0
+   ; window_end = 5.0
+   }
+   : LP.snapshot)
+;;
+
+let test_spike_message_silent_when_healthy () =
+  let healthy = snap ~samples:1000 "healthy" in
+  Alcotest.(check bool)
+    "healthy window emits nothing"
+    true
+    (LP.spike_message
+       ~key:"k"
+       ~window_seconds:5.0
+       ~threshold_us:10.0
+       [ "STRAT", healthy; "CYCLE", healthy ]
+     = None)
+;;
+
+let test_spike_message_reports_breaches () =
+  let clean = snap ~samples:1000 "clean" in
+  let strategy = snap ~samples:980 ~over_threshold:3 ~max_us:310.0 ~p99:90.0 "STRAT" in
+  let cycle =
+    snap
+      ~samples:980
+      ~over_threshold:2
+      ~max_us:1200.0
+      ~p99:250.0
+      ~max_cause:"ob:true ex:3"
+      "CYCLE"
+  in
+  Alcotest.(check (option string))
+    "breaches named with max, count, p99 and cause; clean stages omitted"
+    (Some
+       "[kraken/BTC/USD] latency spikes >=10.0us over 5s: STRAT max=310.0us spikes=3/980 \
+        p99=90.0us  CYCLE max=1.20ms spikes=2/980 p99=250.0us\n\
+       \ worst-cycle cause: ob:true ex:3")
+    (LP.spike_message
+       ~key:"kraken/BTC/USD"
+       ~window_seconds:5.0
+       ~threshold_us:10.0
+       [ "OB", clean; "STRAT", strategy; "CYCLE", cycle ])
+;;
+
+let test_spike_message_without_cause () =
+  let cycle = snap ~samples:10 ~over_threshold:1 ~max_us:25.0 ~p99:25.0 "CYCLE" in
+  Alcotest.(check bool)
+    "no cause omits the continuation line"
+    true
+    (match
+       LP.spike_message ~key:"k" ~window_seconds:5.0 ~threshold_us:10.0 [ "CYCLE", cycle ]
+     with
+     | Some m -> not (String.contains m '\n')
+     | None -> false)
+;;
+
 let () =
   run
     "Latency Profiler"
@@ -272,6 +413,20 @@ let () =
             test_coarse_bucket_low_range
         ; test_case "fine tier routing" `Quick test_fine_tier_routing
         ; test_case "percentiles span all three tiers" `Quick test_mixed_three_tiers
+        ] )
+    ; ( "spike tracking"
+      , [ test_case "threshold spike count and max" `Quick test_spike_tracking
+        ; test_case "coarse-bucket spike count" `Quick test_spike_count_coarse_bucket
+        ; test_case
+            "fine/coarse threshold split"
+            `Quick
+            test_count_above_fine_and_coarse_split
+        ; test_case "no threshold leaves count at zero" `Quick test_snapshot_no_threshold
+        ] )
+    ; ( "spike messages"
+      , [ test_case "silent when healthy" `Quick test_spike_message_silent_when_healthy
+        ; test_case "reports breaching stages" `Quick test_spike_message_reports_breaches
+        ; test_case "omits cause line when absent" `Quick test_spike_message_without_cause
         ] )
     ]
 ;;

@@ -21,8 +21,11 @@ let now () =
   | None -> Unix.gettimeofday ()
 ;;
 
-(** Computes the current UTC offset for US Eastern Time, dynamically adjusting for Daylight Saving Time. *)
-let us_eastern_offset_hours () =
+(** Uncached computation of the current UTC offset for US Eastern Time,
+    dynamically adjusting for Daylight Saving Time. Does five [gmtime] and three
+    [mktime] calls and allocates three [tm] records; [mktime] alone can cost
+    ~100us, so this must not run on every session evaluation. *)
+let compute_eastern_offset () =
   let t = now () in
   let tm = Unix.gmtime t in
   let march_1 =
@@ -90,6 +93,29 @@ let us_eastern_offset_hours () =
          })
   in
   if t >= dst_start && t < dst_end then -4 else -5
+;;
+
+(** Production cache for the computed Eastern offset. The offset changes only at
+    the two yearly DST transitions, but every session evaluator calls this - the
+    domain market-hours gate and the WS feed handler's per-message RTH check -
+    so the uncached [mktime] math surfaced as 300-560us Alpaca PREP spikes. A
+    60s TTL keeps session boundaries exact to the minute while reducing the
+    common call to a single atomic read. The [now_override] test seam always
+    bypasses the cache so simulated dates stay deterministic. *)
+let eastern_offset_cache : (float * int) Atomic.t = Atomic.make (0.0, -5)
+
+let us_eastern_offset_hours () =
+  match !now_override with
+  | Some _ -> compute_eastern_offset ()
+  | None ->
+    let t = Unix.gettimeofday () in
+    let last_t, last_v = Atomic.get eastern_offset_cache in
+    if t >= last_t && t -. last_t < 60.0
+    then last_v
+    else (
+      let v = compute_eastern_offset () in
+      Atomic.set eastern_offset_cache (t, v);
+      v)
 ;;
 
 (** Calculates current day of week, hour, and minute localized to US Eastern Time. *)

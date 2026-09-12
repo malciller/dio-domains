@@ -45,6 +45,15 @@ type exchange_config =
         [max 0 (ledger_total - feed_total)] so a venue feed that drops a live
         order cannot silently free that base. false: the venue reports the
         GROSS holding, so the full ledger total is subtracted. *)
+  ; hold_netted_from_venue_state : bool
+    (** true: the venue nets open-order holds from its OWN state (e.g.
+        Hyperliquid's spotState [hold] field), independently of our executions
+        feed. The venue's tradeable figure is then authoritative even when our
+        feed drops a live order, so the ledger's [ledger_total - feed_total]
+        excess must NOT be subtracted again - only the short [unnetted_hold]
+        dispatch overlay is. false: holds are derived from the same open-order
+        feed the ledger tracks (e.g. Kraken), so the excess is the gap
+        compensation and IS subtracted. *)
   ; asset_low_requires_balance_change : bool
     (** true: clear asset_low only on balance increase *)
   ; merge_preserved_sells : bool
@@ -214,6 +223,18 @@ type strategy_state =
   ; matched_persisted_indices : (int, unit) Hashtbl.t
   ; matched_level_counts : (int, int) Hashtbl.t
   ; persisted_idx : (int, (int * float * float) list) Hashtbl.t
+  ; mutable persisted_idx_source : (float * float) list
+    (* The [persisted_sell_levels] list the last [persisted_idx] build indexed.
+       Because the levels list is immutable and only ever replaced wholesale, a
+       physical-equality check against it is a correct "unchanged" test, letting
+       [sync_open_orders] skip the O(m) index rebuild on the common cycle.
+       Starts as [[]] (the empty immediate), so a non-empty loaded list always
+       differs and is indexed on the first execution. *)
+  ; feed_sell_qty_scratch : (string, float * float) Hashtbl.t
+    (* Reused per-symbol scan buffer (order_id -> (price, remaining qty)).
+       [sync_open_orders] clears and refills it instead of allocating a fresh
+       Hashtbl every execution. Guarded by [mutex] (execute_strategy holds it),
+       so reuse is single-writer. *)
   ; mutable last_fill_oid : string option
     (* OID of last profit-credited fill; replay resumption point *)
   ; mutable highest_startup_oid : string option
@@ -320,6 +341,7 @@ let default_kraken_config =
   ; use_reserved_base_guard = true
   ; use_unnetted_sell_hold = true
   ; balance_nets_open_order_holds = true
+  ; hold_netted_from_venue_state = false
   ; asset_low_requires_balance_change = true
   ; merge_preserved_sells = true
   ; check_stale_balance = true
@@ -493,6 +515,8 @@ let rec get_strategy_state asset_symbol =
       ; matched_persisted_indices = Hashtbl.create 16
       ; matched_level_counts = Hashtbl.create 16
       ; persisted_idx = Hashtbl.create 16
+      ; persisted_idx_source = []
+      ; feed_sell_qty_scratch = Hashtbl.create 16
       ; last_fill_oid = persisted_last_fill_oid
       ; highest_startup_oid = None
       ; skipped_fill_streak = 0

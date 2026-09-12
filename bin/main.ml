@@ -596,8 +596,13 @@ let () =
     let start_time = Unix.gettimeofday () in
     Lwt.async (fun () -> Dio_dashboard.Dashboard_server.start ~start_time);
     (* Publish per-venue network latency windows (ws_ping / ws_feed /
-       rest_request / signer) for the dashboard's NETWORK page. *)
-    Network_latency.start_publisher ();
+       rest_request / signer) for the dashboard's NETWORK page. Network spike
+       logs are gated separately from the internal-op ones via
+       latency_spike_report. *)
+    Network_latency.start_publisher
+      ~log_spikes:(Dio_engine.Config.reports_network config.latency_spike_report)
+      ~threshold_us:config.latency_network_spike_threshold_us
+      ();
     (* Synchronous engine init: supervisor, domains, websocket feeds. *)
     Logging.info ~section:"main" "Initializing trading engine...";
     let _configs = init_trading_engine_sync config in

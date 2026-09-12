@@ -162,22 +162,39 @@ let has_active_sell state =
     kept until its terminal event. *)
 let sell_commitment_in_flight_timeout_s = 120.0
 
-(** Inserts or updates a commitment, preserving the earliest arm time. *)
+(** Inserts or updates a commitment, preserving the earliest arm time.
+
+    The fast path is what [sync_open_orders] hits: it calls this once for every
+    open sell on every execution with the feed's live price/qty and
+    seen=acked=true. Rebuilding the whole list (re-allocating every 6-tuple) per
+    call made one scan O(n^2) in allocations - ~16k words for a ~48-sell grid
+    (the logged HYPE STRAT pool) and ~6k for ~30 (ADA/SOL). [List.exists] is
+    allocation-free, so once every commitment already carries the feed's values
+    the steady state writes nothing. A genuine qty/price change or a first
+    sighting still rebuilds once. *)
 let upsert_sell_commitment ~state ~id ~price ~qty ~seen ~acked =
-  let found = ref false in
-  state.sell_commitments
-  <- List.map
-       (fun (i, p, q, s, a, ts) ->
-          if i = id
-          then (
-            found := true;
-            id, price, qty, s || seen, a || acked, ts)
-          else i, p, q, s, a, ts)
-       state.sell_commitments;
-  if not !found
-  then
+  let already_current =
+    List.exists
+      (fun (i, p, q, s, a, _) ->
+         i = id && p = price && q = qty && (s || not seen) && (a || not acked))
+      state.sell_commitments
+  in
+  if not already_current
+  then (
+    let found = ref false in
     state.sell_commitments
-    <- (id, price, qty, seen, acked, Unix.gettimeofday ()) :: state.sell_commitments
+    <- List.map
+         (fun (i, p, q, s, a, ts) ->
+            if i = id
+            then (
+              found := true;
+              id, price, qty, s || seen, a || acked, ts)
+            else i, p, q, s, a, ts)
+         state.sell_commitments;
+    if not !found
+    then
+      state.sell_commitments
+      <- (id, price, qty, seen, acked, Unix.gettimeofday ()) :: state.sell_commitments)
 ;;
 
 (** Records a just-dispatched sell (keyed by its temporary pending id). *)
@@ -237,19 +254,24 @@ let committed_sell_base state =
 
       spot_holding - reserved_base - committed_sell_base
 
-    - Net-balance venues ([balance_nets_open_order_holds]): the venue already
-      removed the open-order holds it knows about ([feed_total]), so the only
-      extra to remove is the ledger's EXCESS over the feed - in-flight orders
-      the feed has not listed, plus live orders the feed has dropped. The
-      time-based [unnetted_hold] overlay is kept as a floor for the window
-      where the feed lists a fresh order but the balance figure still trails
-      it. This makes a venue feed that drops a live order unable to free that
-      base: the ledger keeps it, the feed total falls, and the excess rises by
-      exactly the dropped qty.
+    - Net-balance venues ([balance_nets_open_order_holds]):
+      - [hold_netted_from_venue_state] (Hyperliquid): the venue's tradeable
+        figure nets holds from its OWN state (spotState [hold]), independent of
+        our executions feed. It is authoritative even when our feed drops a
+        live order, so subtracting the ledger's excess over the feed would
+        DOUBLE-count (the observed HYPE under-count after a fill). Only the
+        short [unnetted_hold] dispatch overlay is subtracted.
+      - otherwise (Kraken): the venue derives holds from the SAME open-order
+        feed the ledger tracks, so a feed that drops a live order frees that
+        base; the ledger's EXCESS over the feed is the compensation and IS
+        subtracted (never below [unnetted_hold]).
     - Gross-balance venues: the venue removed nothing, so the WHOLE ledger is
       subtracted. *)
 let effective_committed_sell_base ~ecfg ~ledger_total ~feed_total ~unnetted_hold =
   if ecfg.balance_nets_open_order_holds
-  then Float.max (Float.max 0.0 (ledger_total -. feed_total)) unnetted_hold
+  then
+    if ecfg.hold_netted_from_venue_state
+    then unnetted_hold
+    else Float.max (Float.max 0.0 (ledger_total -. feed_total)) unnetted_hold
   else ledger_total
 ;;

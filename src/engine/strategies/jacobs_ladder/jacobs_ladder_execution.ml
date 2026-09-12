@@ -498,8 +498,12 @@ let sync_open_orders
   let locked_in_buys = ref 0.0 in
   let locked_in_sells = ref 0.0 in
   (* (order_id -> (price, remaining qty)) for the sells the venue feed lists
-     this scan; consumed by the in-flight ledger reconcile below. *)
-  let feed_sell_qty : (string, float * float) Hashtbl.t = Hashtbl.create 16 in
+     this scan; consumed by the in-flight ledger reconcile below. Reused from
+     strategy state (cleared here) instead of allocating a fresh Hashtbl every
+     execution; [execute_strategy] holds [state.mutex], so this is the sole
+     writer. *)
+  let feed_sell_qty = state.feed_sell_qty_scratch in
+  Hashtbl.clear feed_sell_qty;
   let closest_sell_order = ref None in
   let matched_persisted_indices = state.matched_persisted_indices in
   Hashtbl.clear matched_persisted_indices;
@@ -520,13 +524,20 @@ let sync_open_orders
   Hashtbl.clear matched_level_counts;
   let persisted_idx = state.persisted_idx in
   let build_persisted_idx () =
-    Hashtbl.reset persisted_idx;
-    List.iteri
-      (fun idx (p, q) ->
-         let k = price_key p in
-         let bucket = Option.value (Hashtbl.find_opt persisted_idx k) ~default:[] in
-         Hashtbl.replace persisted_idx k ((idx, p, q) :: bucket))
-      state.persisted_sell_levels
+    (* Rebuild only when the levels list actually changed. The list is
+       immutable and replaced wholesale on edit, so physical inequality is a
+       sound "changed" test; this skips the O(m) index rebuild (and its bucket
+       list allocations) on the common no-change execution. *)
+    if state.persisted_idx_source != state.persisted_sell_levels
+    then (
+      state.persisted_idx_source <- state.persisted_sell_levels;
+      Hashtbl.reset persisted_idx;
+      List.iteri
+        (fun idx (p, q) ->
+           let k = price_key p in
+           let bucket = Option.value (Hashtbl.find_opt persisted_idx k) ~default:[] in
+           Hashtbl.replace persisted_idx k ((idx, p, q) :: bucket))
+        state.persisted_sell_levels)
   in
   build_persisted_idx ();
   (* Deferred persisted-level qty updates. Writing each update straight into
@@ -694,34 +705,73 @@ let sync_open_orders
         | Some (_, best_p) ->
           if price < best_p then closest_sell_order := Some (oid, price)));
   apply_pending_level_updates ();
-  (* Reconcile the in-flight sell ledger with this scan's feed. The ledger is
-     the authority for "base committed to a sell": the feed refreshes an
-     order's remaining qty while it lists it, but an order the feed has
-     stopped listing (reconnect / truncated snapshot / dropped hold) stays
-     reserved until its terminal event fires. An order that was never listed
-     AND never acked is kept only within the dispatch window (a lost
-     placement); an acked order is real base the venue holds and is kept
-     regardless. Local-only commitments are merged back into
+  (* Reconcile the in-flight sell ledger with this scan's feed. The feed
+     refreshes an order's remaining qty while it lists it. What an absence
+     means is VENUE-SPECIFIC (see [hold_netted_from_venue_state]):
+       - Venues whose balance nets holds from their OWN state (Hyperliquid):
+         the feed is authoritative and independent of the hold netting, so an
+         acked/seen order absent from the feed has truly left the book (fill /
+         cancel / amend-away) and is DROPPED. Keeping it would both strand a
+         phantom sell in tracking and double-subtract base the venue already
+         excludes. This is the durable eviction that does not depend on the
+         terminal event surviving a filtered/raced feed.
+       - Venues deriving holds from the SAME feed (Kraken): an acked/seen order
+         absent from the feed stays reserved until its terminal event, so a
+         truncated snapshot/reconnect cannot silently free live base.
+     An order never listed AND never acked is kept only within the dispatch
+     window (a lost placement). Local-only commitments are merged back into
      [open_sell_orders] so the buy leg's wash-trade and 2*gi clamps still see
-     them. [locked_in_sells] is then the ledger total - the ONE committed
-     amount that every venue's sellable-base formula subtracts. *)
-  state.sell_commitments
-  <- List.filter_map
-       (fun (id, price, qty, seen, acked, armed) ->
-          match Hashtbl.find_opt feed_sell_qty id with
-          | Some (feed_price, feed_qty) ->
-            Some (id, feed_price, feed_qty, true, true, armed)
-          | None ->
-            if seen || acked
-            then (
-              state.open_sell_orders <- (id, price, qty) :: state.open_sell_orders;
-              Some (id, price, qty, seen, acked, armed))
-            else if now_time -. armed <= sell_commitment_in_flight_timeout_s
-            then (
-              state.open_sell_orders <- (id, price, qty) :: state.open_sell_orders;
-              Some (id, price, qty, false, false, armed))
-            else None)
-       state.sell_commitments;
+     them. [locked_in_sells] is then the ledger total. *)
+  let trust_feed = ecfg.hold_netted_from_venue_state in
+  (* [upsert_sell_commitment] already refreshed every feed-listed commitment
+     during the scan, so the reconcile below only changes the ledger when a
+     commitment ABSENT from the feed must be dropped (trust_feed venue) or has
+     aged out of the dispatch window. Rebuilding the whole list otherwise just
+     re-allocates an identical set of 6-tuples on every execution - a large
+     slice of the logged [strat:] pool on wide grids. The no-alloc guard scan
+     decides; the rebuild path preserves the original side effects, while the
+     no-rebuild path still re-adds local-only commitments to
+     [open_sell_orders] (feed-listed ones were consed during the scan). *)
+  let commitment_needs_rebuild =
+    List.exists
+      (fun (id, _price, _qty, seen, acked, armed) ->
+         match Hashtbl.find_opt feed_sell_qty id with
+         | Some _ -> false
+         | None ->
+           if seen || acked
+           then trust_feed
+           else now_time -. armed > sell_commitment_in_flight_timeout_s)
+      state.sell_commitments
+  in
+  if commitment_needs_rebuild
+  then
+    state.sell_commitments
+    <- List.filter_map
+         (fun (id, price, qty, seen, acked, armed) ->
+            match Hashtbl.find_opt feed_sell_qty id with
+            | Some (feed_price, feed_qty) ->
+              Some (id, feed_price, feed_qty, true, true, armed)
+            | None ->
+              if seen || acked
+              then
+                if trust_feed
+                then None
+                else (
+                  state.open_sell_orders <- (id, price, qty) :: state.open_sell_orders;
+                  Some (id, price, qty, seen, acked, armed))
+              else if now_time -. armed <= sell_commitment_in_flight_timeout_s
+              then (
+                state.open_sell_orders <- (id, price, qty) :: state.open_sell_orders;
+                Some (id, price, qty, false, false, armed))
+              else None)
+         state.sell_commitments
+  else
+    List.iter
+      (fun (id, price, qty, _seen, _acked, _armed) ->
+         match Hashtbl.find_opt feed_sell_qty id with
+         | Some _ -> ()
+         | None -> state.open_sell_orders <- (id, price, qty) :: state.open_sell_orders)
+      state.sell_commitments;
   state.feed_locked_sell_base
   <- Hashtbl.fold (fun _ (_p, q) acc -> acc +. q) feed_sell_qty 0.0;
   locked_in_sells := committed_sell_base state;

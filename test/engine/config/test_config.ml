@@ -85,9 +85,6 @@ let test_read_config_defaults () =
   Alcotest.(check bool) "empty trading config" true (config.trading = [])
 ;;
 
-
-
-
 let test_parse_oracle_config_full () =
   let json_str =
     {|{"oracle": {"qty_cap_mult": 2.0, "target_survival": 0.9, "min_active_dsurv": 0.5, "refresh_seconds": 60.0}}|}
@@ -156,7 +153,10 @@ let test_parse_oracle_config_assets () =
       "HYPE target_survival"
       (Some 0.98)
       hype.target_survival;
-    Alcotest.(check (option (float 0.0001))) "HYPE qty_cap_mult" (Some 3.0) hype.qty_cap_mult;
+    Alcotest.(check (option (float 0.0001)))
+      "HYPE qty_cap_mult"
+      (Some 3.0)
+      hype.qty_cap_mult;
     Alcotest.(check (option (float 0.0001)))
       "HYPE min_active_dsurv absent"
       None
@@ -186,6 +186,52 @@ let test_oracle_asset_keys_validation () =
     "unknown knob rejected"
     true
     (Dio_engine.Config.validate_keys ~context:"t" ~allowed also_bad)
+;;
+
+let test_latency_spike_report_parse () =
+  let open Dio_engine.Config in
+  Alcotest.(check bool)
+    "internal"
+    true
+    (latency_spike_report_of_string "internal" = Spike_report_internal);
+  Alcotest.(check bool)
+    "network"
+    true
+    (latency_spike_report_of_string "network" = Spike_report_network);
+  Alcotest.(check bool)
+    "both"
+    true
+    (latency_spike_report_of_string "BOTH" = Spike_report_both);
+  Alcotest.(check bool)
+    "off"
+    true
+    (latency_spike_report_of_string "off" = Spike_report_none);
+  Alcotest.(check bool)
+    "unknown falls back to internal"
+    true
+    (latency_spike_report_of_string "bogus" = Spike_report_internal);
+  Alcotest.(check bool) "both reports internal" true (reports_internal Spike_report_both);
+  Alcotest.(check bool)
+    "internal does not report network"
+    false
+    (reports_network Spike_report_internal)
+;;
+
+let test_to_float_opt_accepts_int () =
+  (* Regression: integer JSON literals ("latency_spike_threshold_us": 10) are
+     natural in config.json and must not crash startup with an uncaught
+     Yojson Type_error from [to_float_option]. *)
+  let open Dio_engine.Config in
+  Alcotest.(check (option (float 1e-9)))
+    "int accepted"
+    (Some 10.0)
+    (to_float_opt (`Int 10));
+  Alcotest.(check (option (float 1e-9)))
+    "float accepted"
+    (Some 20000.0)
+    (to_float_opt (`Float 20000.0));
+  Alcotest.(check (option (float 1e-9))) "null absent" None (to_float_opt `Null);
+  Alcotest.(check (option (float 1e-9))) "string absent" None (to_float_opt (`String "x"))
 ;;
 
 let () =
@@ -233,6 +279,16 @@ let () =
             "asset override key validation"
             `Quick
             test_oracle_asset_keys_validation
+        ] )
+    ; ( "latency_spike_report"
+      , [ Alcotest.test_case
+            "parses and gates families"
+            `Quick
+            test_latency_spike_report_parse
+        ; Alcotest.test_case
+            "float config fields accept int JSON literals"
+            `Quick
+            test_to_float_opt_accepts_int
         ] )
     ; ( "file_handling"
       , [ Alcotest.test_case "config defaults" `Quick test_read_config_defaults ] )

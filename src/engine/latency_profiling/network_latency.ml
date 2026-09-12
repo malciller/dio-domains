@@ -119,27 +119,54 @@ let all_venue_snapshots () =
   Hashtbl.fold (fun venue _ acc -> (venue, snapshots venue) :: acc) profilers []
 ;;
 
+(** Cadence of network window publication, in seconds. Shared by the
+    background loop and the spike-log window label so the two cannot drift. *)
+let publish_interval_seconds = 10.0
+
 (** Advances the window of every venue profiler, publishing an immutable
     snapshot for the dashboard. Safe to call from any thread; profilers use
-    the internal mutex for the atomic publish. *)
-let publish_all () =
+    the internal mutex for the atomic publish. When [log_spikes] is set, each
+    venue emits at most one INFO line naming the network metrics that recorded
+    a sample at or above [threshold_us]. Gated by the caller so the noisy
+    network tail can be silenced while internal ops are profiled. *)
+let publish_all ?(log_spikes = false) ?(threshold_us = 10.0) () =
   Hashtbl.iter
-    (fun _ p ->
-       ignore (Latency_profiler.snapshot_and_reset p.ping);
-       ignore (Latency_profiler.snapshot_and_reset p.feed);
-       ignore (Latency_profiler.snapshot_and_reset p.rest);
-       ignore (Latency_profiler.snapshot_and_reset p.signer))
+    (fun venue p ->
+       let ping =
+         Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.ping
+       in
+       let feed =
+         Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.feed
+       in
+       let rest =
+         Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.rest
+       in
+       let signer =
+         Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.signer
+       in
+       if log_spikes
+       then (
+         match
+           Latency_profiler.spike_message
+             ~key:venue
+             ~window_seconds:publish_interval_seconds
+             ~threshold_us
+             [ "WS_PING", ping; "WS_FEED", feed; "REST", rest; "SIGNER", signer ]
+         with
+         | None -> ()
+         | Some msg -> Logging.info_f ~section "%s" msg))
     profilers
 ;;
 
-(** Background window publisher: advances all venue windows every 10s so the
-    dashboard always has a fresh NETWORK page. Runs as an Lwt fiber; call
-    once from engine startup. *)
-let start_publisher () =
+(** Background window publisher: advances all venue windows every
+    [publish_interval_seconds] so the dashboard always has a fresh NETWORK
+    page. Runs as an Lwt fiber; call once from engine startup. [log_spikes]
+    controls whether network windows also emit spike logs (see [publish_all]). *)
+let start_publisher ?(log_spikes = false) ?(threshold_us = 10.0) () =
   let rec loop () =
-    Lwt_unix.sleep 10.0
+    Lwt_unix.sleep publish_interval_seconds
     >>= fun () ->
-    publish_all ();
+    publish_all ~log_spikes ~threshold_us ();
     loop ()
   in
   Lwt.async loop

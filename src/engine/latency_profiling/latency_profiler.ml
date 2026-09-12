@@ -47,6 +47,10 @@ type snapshot =
   ; samples : int (* Total samples in this window. *)
   ; sub_us_samples : int (* Samples below 1us, captured at ns resolution. *)
   ; overflow : int (* Overflow count in this window. *)
+  ; max_us : float (* Largest recorded latency in this window, microseconds. *)
+  ; over_threshold : int
+    (* Samples at or above the threshold passed to [snapshot_and_reset];
+       0 when no threshold was supplied. *)
   ; max_cause : string option (* Cause of the max latency in this window. *)
   ; executions : int (* Activity ticks recorded in this window. *)
   ; last_exec_time : float (* Unix time of the last activity tick. *)
@@ -331,16 +335,64 @@ let reset t =
   t.last_exec_time <- 0.0
 ;;
 
-(** [snapshot_and_reset t] computes the percentile distribution of the
-    current window, publishes it as an immutable snapshot (replacing the
-    previous window's snapshot in the Atomic cell), zeroes the histogram,
-    and starts a new window. Always publishes a snapshot, even when the
-    window had zero samples, so consumers can distinguish "idle" from
-    "no data". Returns the published snapshot. *)
-let snapshot_and_reset t =
+(** [count_above t threshold_us] returns the number of samples in the live
+    histogram whose value is at or above [threshold_us]. The nanosecond tier is
+    exact; the fine-microsecond tier is exact to its microsecond bucket; a
+    coarse bucket is counted when its lower edge reaches the threshold. This
+    makes the count inclusive of a bucket that straddles the threshold, so a
+    spike at the ceiling is never missed to bucket rounding. Used to report
+    per-window latency spikes. *)
+let count_above t threshold_us =
+  if not (Float.is_finite threshold_us)
+  then 0
+  else (
+    let count = ref 0 in
+    (* Skip every bucket whose lower edge is below the threshold instead of
+     scanning the whole histogram: the nanosecond and fine-microsecond tiers
+     are fully below a multi-us threshold, and the coarse tier starts at the
+     first bucket edge >= threshold. This turns the per-window spike count on
+     a 20k-bucket cycle histogram from a full scan into a tail scan. *)
+    let start_ns =
+      if threshold_us <= 0.0
+      then 0
+      else max 0 (int_of_float (ceil (threshold_us *. 1000.0)))
+    in
+    for i = start_ns to ns_bucket_count - 1 do
+      count := !count + t.ns_buckets.(i)
+    done;
+    let start_us =
+      if threshold_us <= 1.0 then 0 else max 0 (int_of_float (ceil threshold_us) - 1)
+    in
+    for j = start_us to t.us_bucket_count - 1 do
+      count := !count + t.us_buckets.(j)
+    done;
+    let start_k =
+      if threshold_us <= 0.0
+      then 0
+      else max 0 (int_of_float (ceil (threshold_us /. float t.bucket_us)))
+    in
+    for k = start_k to t.bucket_count - 1 do
+      count := !count + t.buckets.(k)
+    done;
+    !count)
+;;
+
+(** [snapshot_and_reset ?spike_threshold_us t] computes the percentile
+    distribution of the current window, publishes it as an immutable snapshot
+    (replacing the previous window's snapshot in the Atomic cell), zeroes the
+    histogram, and starts a new window. Always publishes a snapshot, even when
+    the window had zero samples, so consumers can distinguish "idle" from
+    "no data". When [spike_threshold_us] is supplied, the snapshot's
+    [over_threshold] is the count of samples at or above it. Returns the
+    published snapshot. *)
+let snapshot_and_reset ?(spike_threshold_us = infinity) t =
   let now = Unix.gettimeofday () in
   Mutex.lock t.mutex;
   let window_start = t.window_start in
+  let over_threshold =
+    if Float.is_finite spike_threshold_us then count_above t spike_threshold_us else 0
+  in
+  let max_us = float t.max_latency_ns /. 1000.0 in
   let snap =
     if t.samples = 0
     then
@@ -353,6 +405,8 @@ let snapshot_and_reset t =
       ; samples = 0
       ; sub_us_samples = 0
       ; overflow = 0
+      ; max_us = 0.0
+      ; over_threshold = 0
       ; max_cause = None
       ; executions = t.executions
       ; last_exec_time = t.last_exec_time
@@ -370,6 +424,8 @@ let snapshot_and_reset t =
       ; samples = t.samples
       ; sub_us_samples = t.sub_us_samples
       ; overflow = t.overflow
+      ; max_us
+      ; over_threshold
       ; max_cause = t.max_cause
       ; executions = t.executions
       ; last_exec_time = t.last_exec_time
@@ -389,11 +445,59 @@ let snapshot_and_reset t =
     Atomic cell only, never the live histogram. *)
 let published_snapshot t = Atomic.get t.published
 
-(** [format_us f] renders a microsecond value, switching to nanoseconds when
-    the value is sub-microsecond so log output preserves nanosecond
-    resolution (e.g. 500ns instead of 0.5us). *)
+(** [format_us f] renders a microsecond value, switching to nanoseconds below
+    one microsecond (e.g. 500ns) and to milliseconds at or above one
+    millisecond (e.g. 1.20ms), so log output stays readable across the whole
+    tracked range. *)
 let format_us f =
-  if f < 1.0 then Printf.sprintf "%.0fns" (f *. 1000.0) else Printf.sprintf "%.1fus" f
+  if f < 1.0
+  then Printf.sprintf "%.0fns" (f *. 1000.0)
+  else if f < 1000.0
+  then Printf.sprintf "%.1fus" f
+  else Printf.sprintf "%.2fms" (f /. 1000.0)
+;;
+
+(** [spike_message ~key ~window_seconds ~threshold_us stages] renders a
+    one-line spike report for every stage in [stages] whose [over_threshold] is
+    non-zero, naming the stage, its worst spike, its breach count over the
+    sample total and its p99. Appends the first non-empty [max_cause] among the
+    stages (the internal pipeline's cycle profiler) as a continuation line.
+    Returns [None] when no stage breached, so callers can stay silent on healthy
+    windows. Pure, so the exact rendered line is unit-testable. *)
+let spike_message ~key ~window_seconds ~threshold_us stages =
+  let breached = List.filter (fun (_, (s : snapshot)) -> s.over_threshold > 0) stages in
+  if breached = []
+  then None
+  else (
+    let stage_str (label, (s : snapshot)) =
+      Printf.sprintf
+        "%s max=%s spikes=%d/%d p99=%s"
+        label
+        (format_us s.max_us)
+        s.over_threshold
+        s.samples
+        (format_us s.p99)
+    in
+    let base =
+      Printf.sprintf
+        "[%s] latency spikes >=%s over %.0fs: %s"
+        key
+        (format_us threshold_us)
+        window_seconds
+        (String.concat "  " (List.map stage_str breached))
+    in
+    let cause =
+      List.find_map
+        (fun (_, (s : snapshot)) ->
+           match s.max_cause with
+           | Some c when c <> "" -> Some c
+           | _ -> None)
+        stages
+    in
+    Some
+      (match cause with
+       | None -> base
+       | Some c -> base ^ "\n worst-cycle cause: " ^ c))
 ;;
 
 (** [report ?sample_threshold t] logs the current window's percentile
@@ -453,6 +557,8 @@ let snapshot (prof : t) : snapshot option =
       ; samples = prof.samples
       ; sub_us_samples = prof.sub_us_samples
       ; overflow = prof.overflow
+      ; max_us = float prof.max_latency_ns /. 1000.0
+      ; over_threshold = 0
       ; max_cause = prof.max_cause
       ; executions = prof.executions
       ; last_exec_time = prof.last_exec_time
