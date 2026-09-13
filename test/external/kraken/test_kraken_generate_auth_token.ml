@@ -1,3 +1,7 @@
+(* Test-only [Unix.putenv] to simulate missing credentials; single-threaded test
+   process. OxCaml [unsafe_multidomain] alert acknowledged. *)
+[@@@alert "-unsafe_multidomain"]
+
 let test_missing_env_variables () =
   (* Test error handling for missing environment variables *)
   (* First backup any existing env vars *)

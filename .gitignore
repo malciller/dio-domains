@@ -52,8 +52,16 @@ opencode.json
 # Local OPAM switch
 _opam/
 out/
-# env file
+# env / credential files
 .env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+id_rsa*
+id_ed25519*
+credentials*
 .DS_Store
 
 
