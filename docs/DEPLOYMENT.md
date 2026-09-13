@@ -1,6 +1,6 @@
 # Deployment
 
-The prebuilt image is private; request access per [ACCESS.md](ACCESS.md).
+The prebuilt image is public; see [RISK.md](RISK.md) for the terms of use.
 
 ## Run the prebuilt image
 
@@ -24,19 +24,16 @@ cd ~/dio
 where you run the commands from now on. Every time you open a new terminal,
 start with `cd ~/dio`.
 
-### 2. Log in and download the image
+### 2. Download the image
 
-Use the personal access token from your access-request issue (the classic token
-with the `read:packages` scope). Paste it when asked for a password:
+The image is public, so no login is needed:
 
 ```sh
-echo "$GHCR_PAT" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
 docker pull ghcr.io/malciller/dio-domains:latest
 ```
 
-You should see `Login Succeeded` and, after the download, a final line naming
-`ghcr.io/malciller/dio-domains:latest`. If login fails, the token is wrong,
-expired, or lacks the `read:packages` scope.
+You should see the download finish with a line naming
+`ghcr.io/malciller/dio-domains:latest`.
 
 ### 3. Copy the starter files out of the image
 

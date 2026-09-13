@@ -1,0 +1,64 @@
+name: Feature request
+description: Propose a new capability or an improvement.
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests are prioritised by how many people they unblock and how
+        well they fit dio's design: one domain per asset, a lock-free executor,
+        and capital-survival sizing.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched existing issues and this is not already requested.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: >-
+        What are you unable to do today? Describe the situation, not the
+        solution.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What you would like dio to do.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds or other approaches, and why they fall short.
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - New exchange / broker adapter
+        - New or changed strategy
+        - Capital oracle / sizing
+        - Dashboard
+        - Configuration / ergonomics
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I am willing to help test this once it exists.
+          required: false
+        - label: I am willing to submit a pull request for this.
+          required: false

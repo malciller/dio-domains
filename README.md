@@ -17,18 +17,16 @@ Unix domain socket.
 
 ## Quick start
 
-The container image is private; request access first
-([docs/ACCESS.md](docs/ACCESS.md)).
-
 New to this? [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) is a step-by-step
-walkthrough: make a folder, log in, pull the starter files out of the image, and
-fill in `config.json` and `.env`. The short version:
+walkthrough: make a folder, pull the image, extract the starter files, and fill
+in `config.json` and `.env`. The short version:
 
 The image ships the example config, env template, and compose file. Pull them
 out first (no repository clone needed):
 
 ```sh
 IMAGE=ghcr.io/malciller/dio-domains:latest
+docker pull $IMAGE
 docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE /usr/share/doc/dio/config.example.json /out/config.json
 docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE /usr/share/doc/dio/.env.example /out/.env
 docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE /usr/share/doc/dio/compose.yaml /out/compose.yaml
@@ -60,8 +58,14 @@ Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) and
 | [docs/SPEC.md](docs/SPEC.md) | The full software product specification (DIO-SPS-001). |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | `config.json` keys and environment variables. |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker, compose, building from source, and remote deployment. |
-| [docs/ACCESS.md](docs/ACCESS.md) | Requesting access to the prebuilt image. |
-| [docs/oracle.md](docs/oracle.md) | The capital-oracle mathematics. |
+| [docs/RISK.md](docs/RISK.md) | Risk, terms of use, and how to pull the image. |
+| [docs/ORACLE.md](docs/ORACLE.md) | The capital-oracle mathematics. |
+
+## Support
+
+Bug reports and feature requests go through GitHub issues:
+<https://github.com/malciller/dio-domains/issues>. There is no email or chat
+support. Never paste API keys or other secrets into an issue.
 
 ## License
 

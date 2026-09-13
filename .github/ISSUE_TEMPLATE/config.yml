@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Deployment and configuration docs
+    url: https://github.com/malciller/dio-domains/blob/main/docs/DEPLOYMENT.md
+    about: Step-by-step setup, config keys, and remote deployment.
+  - name: Risk and terms
+    url: https://github.com/malciller/dio-domains/blob/main/docs/RISK.md
+    about: Read this before trading with real money.

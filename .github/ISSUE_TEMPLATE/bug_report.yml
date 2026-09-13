@@ -1,0 +1,107 @@
+name: Bug report
+description: Report a defect in the engine, an exchange adapter, or the dashboard.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. dio trades real money, so please **redact API
+        keys, wallet addresses, account IDs, and anything else sensitive**
+        before pasting logs or config. Fill in as much as you can; incomplete
+        reports take longer to act on.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: >-
+            I removed API keys, secrets, wallet addresses, and account IDs from
+            everything below.
+          required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did dio do, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands and config needed to trigger it.
+      placeholder: |
+        1. config.json has ...
+        2. docker compose up -d
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Image tag or commit
+      description: >-
+        The ghcr.io/malciller/dio-domains tag you run, or the git commit if you
+        built from source.
+      placeholder: v0.1.4
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Engine / main loop
+        - Order executor
+        - Capital oracle
+        - Dashboard
+        - Exchange adapter
+        - Build / Docker
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: venue
+    attributes:
+      label: Venue
+      description: Set this if the bug involves a specific exchange or broker.
+      options:
+        - Not venue-specific
+        - Kraken
+        - Hyperliquid
+        - Lighter
+        - Interactive Brokers
+        - Alpaca
+    validations:
+      required: true
+  - type: input
+    id: strategy
+    attributes:
+      label: Strategy
+      description: The strategy running when it happened, if relevant.
+      placeholder: Ladder / MarketMaker / AutoHedge
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        Relevant output from `docker compose logs engine` or the dashboard.
+        Redact secrets.
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: >-
+        The relevant config.json entries (structure, not credentials). Redact
+        anything sensitive.
+      render: json
+    validations:
+      required: false
