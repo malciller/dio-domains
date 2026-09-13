@@ -24,6 +24,8 @@ other secrets into the issue.
 The invite is manual because GitHub's API only grants package access for
 organization-scoped packages, not personal-account ones.
 
+If the request is declined, the issue is closed with a short reply.
+
 ## Pull the image
 
 Create a **personal access token (classic)** with the `read:packages` scope,
