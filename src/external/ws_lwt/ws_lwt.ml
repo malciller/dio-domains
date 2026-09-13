@@ -1,7 +1,7 @@
 (* Internal, client-only replacement for the lwt websocket wrapper.
-   Derived from the websocket 2.17 lwt wrapper (ISC, Vincent Bernardoff); the framing
-   is delegated to [Websocket.Make (Cohttp_lwt_unix.IO)] so the wire format is
-   byte-identical. Differences from the reference:
+   Derived from the websocket 2.17 lwt wrapper (ISC, Vincent Bernardoff); framing is
+   delegated to [Websocket.Make] over a bounded [Cohttp_lwt_unix.IO], so the wire
+   format is byte-identical. Differences from the reference:
    - no [Lwt_log] dependency (removed the [lwt < 6] cap);
    - no server-side code (we only ever connect as a client).
    [set_tcp_nodelay] and [Conduit_lwt_unix.connect] are reproduced verbatim. *)
@@ -9,7 +9,32 @@
 open Websocket
 open Lwt.Infix
 
-module Impl = Websocket.Make (Cohttp_lwt_unix.IO)
+(* Cap the payload a single WebSocket frame may declare. The frame parser in
+   [websocket] allocates and reads the whole payload with no upper bound, so a
+   hostile endpoint could otherwise force a multi-gigabyte allocation. 64 MiB is
+   far above any message we receive from an exchange. *)
+let max_frame_bytes = 64 * 1024 * 1024
+
+(* [Cohttp_lwt_unix.IO] with a bounded [read]. [Websocket.Make] reads a frame
+   payload as a single [read ic payload_len], so refusing an over-sized read
+   rejects the frame before it is buffered. Handshake reads are small and
+   unaffected. *)
+module Bounded_io = struct
+  include Cohttp_lwt_unix.IO
+
+  let read ic count =
+    if count > max_frame_bytes then
+      Lwt.fail
+        (Failure
+           (Printf.sprintf
+              "websocket frame of %d bytes exceeds the %d byte cap"
+              count
+              max_frame_bytes))
+    else Cohttp_lwt_unix.IO.read ic count
+  ;;
+end
+
+module Impl = Websocket.Make (Bounded_io)
 
 exception HTTP_Error of string
 
@@ -25,6 +50,14 @@ let set_tcp_nodelay flow =
 
 let fail_unless eq f = if not eq then f () else Lwt.return_unit
 let fail_if eq f = if eq then f () else Lwt.return_unit
+
+(* Close both directions. Closing an already-closed channel is a no-op, and a
+   failure while closing must not mask the original error. *)
+let close_quietly ch =
+  Lwt.catch (fun () -> Lwt_io.close ch) (fun _ -> Lwt.return_unit)
+;;
+
+let close_both ic oc = Lwt.join [ close_quietly ic; close_quietly oc ]
 
 let drain_handshake req ic oc nonce =
   Impl.Request.write (fun _writer -> Lwt.return ()) req oc
@@ -79,8 +112,7 @@ let open_connection ctx client url nonce extra_headers =
   set_tcp_nodelay flow;
   Lwt.catch
     (fun () -> drain_handshake req ic oc nonce)
-    (fun exn ->
-       Lwt_io.close ic >>= fun () -> Lwt.fail exn)
+    (fun exn -> close_both ic oc >>= fun () -> Lwt.fail exn)
   >>= fun () ->
   Lwt.return (ic, oc)
 ;;
@@ -88,12 +120,13 @@ let open_connection ctx client url nonce extra_headers =
 type conn =
   { read_frame : unit -> Frame.t Lwt.t
   ; write_frame : Websocket.Frame.t -> unit Lwt.t
+  ; ic : Lwt_io.input_channel
   ; oc : Lwt_io.output_channel
   }
 
 let read { read_frame; _ } = read_frame ()
 let write { write_frame; _ } frame = write_frame frame
-let close_transport { oc; _ } = Lwt_io.close oc
+let close_transport { ic; oc; _ } = close_both ic oc
 let resolve_ctx () = Ctx.resolve ()
 
 let connect
@@ -110,7 +143,7 @@ let connect
   let read_frame = Impl.make_read_frame ?buf ~mode:(Impl.Client random_string) ic oc in
   let read_frame () =
     Lwt.catch read_frame (fun exn ->
-      Lwt.async (fun () -> Lwt_io.close ic);
+      Lwt.async (fun () -> close_both ic oc);
       Lwt.fail exn)
   in
   let buf = Buffer.create 128 in
@@ -123,8 +156,8 @@ let connect
          Lwt_io.write oc (Buffer.contents buf)
          >>= fun () -> Lwt_io.flush oc)
       (fun exn ->
-         Lwt.async (fun () -> Lwt_io.close oc);
+         Lwt.async (fun () -> close_both ic oc);
          Lwt.fail exn)
   in
-  { read_frame; write_frame; oc }
+  { read_frame; write_frame; ic; oc }
 ;;
