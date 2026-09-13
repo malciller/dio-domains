@@ -15,6 +15,8 @@ Unix domain socket.
 > **This trades real money.** It comes with no warranty. The auto-hedge strategy
 > is experimental — test on a testnet before risking capital.
 
+![dio terminal dashboard](assets/dio-dashboard.gif)
+
 ## Quick start
 
 New to this? The [deployment guide](https://diophantsolutions.com/dio/DEPLOYMENT/)
