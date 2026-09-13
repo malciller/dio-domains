@@ -244,6 +244,7 @@ module Alpaca_impl = struct
 
   let get_top_of_book ~symbol = Alpaca_orderbook.get_best_bid_ask symbol
   let get_top_of_book_fast ~symbol = Alpaca_orderbook.get_best_bid_ask_fast symbol
+  let has_orderbook_data ~symbol = Alpaca_orderbook.has_orderbook_data symbol
   let get_tradeable_balance ~asset = Alpaca_balances.get_balance asset
   let get_tradeable_balance_fast ~asset = fun () -> Alpaca_balances.get_balance asset
 

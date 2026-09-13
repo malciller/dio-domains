@@ -142,6 +142,7 @@ module SymbolStore = struct
   ;;
 
   let get_current_position t = (Atomic.get t.tob).pos
+  let has_data t = (Atomic.get t.tob).valid
 
   let read_events t start_pos =
     Mutex.lock t.mutex;
@@ -237,6 +238,14 @@ let get_current_position symbol =
 let get_current_position_fast symbol =
   let store = get_or_create_store symbol in
   fun () -> SymbolStore.get_current_position store
+;;
+
+(** [true] once a quote with a non-zero side has populated [symbol]. Ignores
+    freshness so an illiquid symbol remains present between ticks. *)
+let has_orderbook_data symbol =
+  match Hashtbl.find_opt stores symbol with
+  | Some store -> SymbolStore.has_data store
+  | None -> false
 ;;
 
 let read_orderbook_events symbol start_pos =

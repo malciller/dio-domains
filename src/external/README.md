@@ -120,6 +120,7 @@ There is no single `get_balance`. Balance access is split by intent:
 | --- | --- |
 | `subscribe_orderbook` | Subscribe the venue feed to order-book updates for a symbol list. |
 | `get_top_of_book` / `get_top_of_book_fast` | `(bid_price, bid_size, ask_price, ask_size) option` from the cached book. |
+| `has_orderbook_data` | Whether a usable book has been cached for a symbol since the last connection reset, ignoring freshness. |
 | `get_orderbook_position` / `get_orderbook_position_fast` | Current write position of the order-book ring buffer. |
 | `read_orderbook_events` / `iter_orderbook_events` | Read or iterate order-book events from a start position. |
 | `iter_top_of_book_events` | Iterate only top-of-book, callback `(bid_price, bid_size, ask_price, ask_size)`. |

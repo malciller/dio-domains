@@ -317,6 +317,13 @@ module type S = sig
       or [None] if orderbook data is unavailable. *)
   val get_top_of_book : symbol:string -> (float * float * float * float) option
 
+  (** Return [true] if a usable orderbook has been cached for [symbol] since
+      the last connection reset. Unlike [get_top_of_book], this ignores
+      freshness: a thin market that has not ticked recently still reports
+      [true]. Callers use it to decide whether a subscription needs
+      re-establishing, not whether a quote is currently tradeable. *)
+  val has_orderbook_data : symbol:string -> bool
+
   (** Return the current tradeable balance for [asset]. Returns [0.0] if unknown. *)
   val get_tradeable_balance : asset:string -> float
 

@@ -214,6 +214,7 @@ module Lighter_impl = struct
   let subscribe_orderbook ~symbols = Lighter_ws.subscribe_public_orderbook ~symbols
   let get_top_of_book ~symbol = Lighter_orderbook_feed.get_best_bid_ask symbol
   let get_top_of_book_fast ~symbol = Lighter_orderbook_feed.get_best_bid_ask_fast symbol
+  let has_orderbook_data ~symbol = Lighter_orderbook_feed.has_orderbook_data symbol
   let get_tradeable_balance ~asset = Lighter_balances.get_balance asset
 
   let get_tradeable_balance_fast ~asset =

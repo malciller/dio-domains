@@ -326,6 +326,15 @@ let[@inline always] get_current_position_fast symbol =
   fun () -> RingBuffer.get_position store.buffer
 ;;
 
+(** [true] once a market-depth or L1 tick has populated the book for
+    [symbol]. Ignores freshness, so an illiquid book that has not ticked
+    recently still reports present. *)
+let has_orderbook_data symbol =
+  match store_opt symbol with
+  | Some store -> Atomic.get store.ready
+  | None -> false
+;;
+
 (** Pre-creates stores for [symbols] and registers handlers. *)
 let initialize symbols =
   Logging.info_f

@@ -348,6 +348,8 @@ module Ibkr_impl = struct
       | _ -> None
   ;;
 
+  let has_orderbook_data ~symbol = Ibkr_orderbook_feed.has_orderbook_data symbol
+
   let get_tradeable_balance ~asset = Ibkr_balances.get_balance ~asset
   let get_tradeable_balance_fast ~asset = fun () -> Ibkr_balances.get_balance ~asset
 
