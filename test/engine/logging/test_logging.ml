@@ -1,3 +1,7 @@
+(* Test-only use of [Unix.putenv] to exercise COLUMNS handling; single-threaded
+   test process. OxCaml [unsafe_multidomain] alert acknowledged. *)
+[@@@alert "-unsafe_multidomain"]
+
 let test_log_levels () =
   (* Test logging at all levels - just ensure no exceptions are raised *)
   Logging.debug ~section:"test_logging" "Debug message";

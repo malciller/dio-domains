@@ -60,7 +60,7 @@ module Connection_bus = Event_bus.Make (struct
   end)
 
 type connection_with_generation =
-  { conn : Websocket_lwt_unix.conn
+  { conn : Ws_lwt.conn
   ; generation : int
   }
 
@@ -318,7 +318,7 @@ let reset_state conn ~notify_failure reason =
     ignore pending_count;
     (* Tear down the underlying TCP/TLS transport. *)
     Lwt.catch
-      (fun () -> Websocket_lwt_unix.close_transport conn)
+      (fun () -> Ws_lwt.close_transport conn)
       (fun _ -> Lwt.return_unit)
     >>= fun () ->
     (* Fail all pending request promises with the reset reason. *)
@@ -405,7 +405,7 @@ let start_reader conn generation =
       then Lwt.return_none
       else
         Lwt.catch
-          (fun () -> Websocket_lwt_unix.read conn >>= fun frame -> Lwt.return_some frame)
+          (fun () -> Ws_lwt.read conn >>= fun frame -> Lwt.return_some frame)
           (function
             | End_of_file -> Lwt.return_none
             | exn -> Lwt.fail exn))
@@ -469,7 +469,7 @@ let start_reader conn generation =
   ()
 ;;
 
-let connect _token : Websocket_lwt_unix.conn Lwt.t =
+let connect _token : Ws_lwt.conn Lwt.t =
   let uri = Uri.of_string "wss://ws-auth.kraken.com/v2" in
   Logging.debug ~section "Connecting to Kraken authenticated WebSocket for trading...";
   Lwt_unix.getaddrinfo "ws-auth.kraken.com" "443" [ Unix.AI_FAMILY Unix.PF_INET ]
@@ -484,7 +484,7 @@ let connect _token : Websocket_lwt_unix.conn Lwt.t =
   (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP connection
      during the handshake would otherwise block the reconnect (which runs on
      the main Lwt loop) indefinitely. *)
-  Lwt_unix.with_timeout 20.0 (fun () -> Websocket_lwt_unix.connect ~ctx client uri)
+  Lwt_unix.with_timeout 20.0 (fun () -> Ws_lwt.connect ~ctx client uri)
   >>= fun conn ->
   Logging.debug ~section "Trading WebSocket connection established";
   Lwt.return conn
@@ -565,7 +565,7 @@ let ensure_connection ?on_failure ?on_connected token =
        Lwt_list.iter_s
          (fun sub ->
             let content = Yojson.Safe.to_string sub in
-            Websocket_lwt_unix.write conn (Websocket.Frame.create ~content ()))
+            Ws_lwt.write conn (Websocket.Frame.create ~content ()))
          (List.rev subs)
        >>= fun () ->
        (* Invoke on_connected callback after subscription replay. *)
@@ -697,7 +697,7 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
             request_cleanup ());
           Lwt.catch
             (fun () ->
-               Websocket_lwt_unix.write
+               Ws_lwt.write
                  conn_with_gen.conn
                  (Websocket.Frame.create ~content:message_str ())
                >|= fun () -> Ok waiter)
@@ -771,7 +771,7 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
               waiter >|= fun response -> response))
 ;;
 
-let get_connection () : Websocket_lwt_unix.conn Lwt.t =
+let get_connection () : Ws_lwt.conn Lwt.t =
   Lwt_mutex.with_lock state.mutex (fun () ->
     match state.conn with
     | Some conn_with_gen -> Lwt.return (Ok conn_with_gen.conn)
@@ -844,7 +844,7 @@ let subscribe message =
     match state.conn with
     | Some conn_with_gen ->
       let content = Yojson.Safe.to_string message in
-      Websocket_lwt_unix.write conn_with_gen.conn (Websocket.Frame.create ~content ())
+      Ws_lwt.write conn_with_gen.conn (Websocket.Frame.create ~content ())
     | None ->
       Logging.info_f
         ~section
@@ -889,7 +889,7 @@ let close () : unit Lwt.t =
       pending;
     notify_connection (`Disconnected "client_closed");
     Lwt.catch
-      (fun () -> Websocket_lwt_unix.close_transport conn)
+      (fun () -> Ws_lwt.close_transport conn)
       (fun _ -> Lwt.return_unit)
 ;;
 

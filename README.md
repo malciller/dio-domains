@@ -54,6 +54,9 @@ Section 2 lists referenced documents. Section 3 defines abbreviations and acrony
 | `config.json` | Runtime configuration; see Section 5.0 |
 | `dio.opam` | OCaml package manifest and dependency declarations |
 | `dune-project` | Dune build-system project definition |
+| `Dockerfile.base` | OxCaml base image: compiler and all opam dependencies; see Section 10.5 |
+| `Dockerfile` | Application container image, built from the base image; see Section 10.5 |
+| `oxcaml-port/opam-overlay/` | Local opam repository overlay patching dependencies that do not build under OxCaml; see Section 10.5 |
 | `LICENSE` | Project license |
 | `THIRD_PARTY_LICENSES` | Third-party license notices |
 
@@ -187,6 +190,7 @@ The engine reads `config.json` from the working directory. Table 1 defines the t
 | `latency_window_seconds` | `5.0` | Rolling window for network latency profiling statistics |
 | `latency_spike_threshold_us` | `10.0` | Per-stage ceiling; a window that breaches it emits one INFO line naming the offending stages, their worst spike, and breach count |
 | `latency_spike_report` | `internal` | Which latency families emit spike logs: `internal` (per-domain pipeline), `network` (`ws_ping`/`ws_feed`/`rest_request`/`signer`), `both`, or `none` |
+| `latency_spike_report_seconds` | `30.0` | Minimum wall-clock seconds between per-domain internal spike log lines; `0` logs every window |
 | `latency_network_spike_threshold_us` | `20000.0` | Ceiling for the network spike family, in microseconds (20 ms); separate from the 10 us internal-operation target |
 | `gc` | see Table 2 | OCaml GC tunables applied before the engine starts |
 | `oracle` | see Table 4 | Capital oracle knobs (runtime and tuning CLI) |
@@ -422,7 +426,7 @@ The oracle configuration section of `config.json` drives both the runtime and th
 a. OCaml 5.2 (any distribution: opam, Nix, or Homebrew).
 b. `opam` and `dune`.
 c. Linux or macOS. WSL2 is supported.
-d. Release builds use a classic-flambda OCaml 5.2 compiler. The release profile adds `-O3` (see `./dune`); non-flambda compilers ignore it. The Docker image creates a `5.2.0+flambda` switch automatically, so this only matters for local release builds.
+d. The Docker (production) image compiles the engine with OxCaml, Jane Street's flambda2 compiler, pinned to `ocaml-variants.5.2.0+ox` and `oxcaml-compiler.5.2.0minus40` (see Section 10.5). The release profile adds `-O3` (see `./dune`); non-flambda compilers ignore it. Local release builds may use a classic-flambda `5.2.0+flambda` switch instead, since the engine compiles under either toolchain.
 
 ### 10.2 Build
 
@@ -431,7 +435,7 @@ opam install . --deps-only
 dune build
 ```
 
-Local development builds use the `dev` profile, so they do not need flambda. To build a release binary locally:
+Local development builds use the `dev` profile, so they do not need flambda. To build a release binary locally on the classic-flambda toolchain:
 
 ```sh
 opam switch create 5.2.0+flambda ocaml-variants.5.2.0+options ocaml-option-flambda
@@ -465,6 +469,17 @@ dune exec dio-dashboard
 dune exec dio-oracle -- --symbol BTC/USDC --quote 10000
 ```
 
+### 10.5 Docker
+
+The container build is split into two images. `Dockerfile.base` creates the OxCaml switch and installs every opam dependency; compiling the compiler is slow, so the base is tagged and rebuilt only when a dependency changes. `Dockerfile` starts from it, compiles only the engine, and copies the binaries into a minimal runtime stage.
+
+```sh
+docker build -f Dockerfile.base -t dio-oxcaml-base:5.2.0minus40 .
+docker build --build-arg DIO_BASE_IMAGE=dio-oxcaml-base:5.2.0minus40 -t dio .
+```
+
+The base image embeds `oxcaml-port/opam-overlay`, a local opam repository overlay carrying patched builds of the dependencies that do not compile under OxCaml as released (`msgpck.1.7+dio1`, `digestif.1.3.1+dio1`, and `cohttp-lwt.4.0.0+dio1` with its version-coupled `cohttp` and `cohttp-lwt-unix` companions).
+
 ---
 
 ## 11.0 CAUTIONS AND LIMITATIONS
@@ -474,3 +489,4 @@ b. **Restart boundaries.** Lighter order identifiers do not survive a restart bo
 c. **Startup strictness.** The configuration schema is strict. Unknown keys under `trading`, unknown keys in the oracle section, and venue-inapplicable keys shall cause the engine to exit at startup.
 d. **Fee lookup.** A failed live Kraken fee fetch at startup is fatal.
 e. **Canary cost.** The stop-the-world canary domain busy-spins one core while enabled. Disable it with `DIO_CANARY` when core utilization is constrained.
+f. **cohttp pin.** The OxCaml build pins `cohttp-lwt-unix < 6.0.0`, below the CVE-2026-82481 server-side path-traversal fix, because newer releases change the dependency closure away from the compiler's bundled Conduit. The engine uses cohttp as a client only and never serves files; a CI guard fails the build if server-side file serving is introduced.

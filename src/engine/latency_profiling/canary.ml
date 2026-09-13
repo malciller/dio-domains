@@ -15,6 +15,13 @@
     allocates, and a canary that allocates would trigger its own minor
     collections and end up measuring itself rather than the runtime. *)
 
+(* OxCaml marks [Domain.spawn] as [do_not_spawn_domains]. The canary runs at most
+   ONE dedicated diagnostic domain, gated by the [DIO_CANARY] kill switch, and
+   exists precisely to observe process-wide runtime pauses. Acknowledged rather
+   than rewritten. *)
+[@@@alert "-unsafe_multidomain"]
+[@@@alert "-do_not_spawn_domains"]
+
 let section = "canary"
 
 (** [enabled ()] honors the [DIO_CANARY] kill switch; the canary busy-spins a

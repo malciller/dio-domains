@@ -204,7 +204,7 @@ let get_or_create_store symbol =
 ;;
 
 let active_subscriptions : string list ref = ref []
-let active_conn : Websocket_lwt_unix.conn option ref = ref None
+let active_conn : Ws_lwt.conn option ref = ref None
 
 (* Ping/pong liveness tracking.
    The supervisor monitor loop calls [send_ping] on a 15s cadence and expects
@@ -447,7 +447,7 @@ let send_subscription symbols =
       "Sending Alpaca Market Data WS subscription for symbols: %s"
       (String.concat ", " symbols);
     let frame = Websocket.Frame.create ~content:payload () in
-    Websocket_lwt_unix.write conn frame
+    Ws_lwt.write conn frame
   | None -> Lwt.return_unit
 ;;
 
@@ -507,11 +507,11 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
          | _ -> failwith ("Failed to resolve host " ^ host)
        in
        let client = `TLS (`Hostname host, `IP ip, `Port port) in
-       let ctx = Lazy.force Conduit_lwt_unix.default_ctx in
+       let ctx = Ws_lwt.resolve_ctx () in
        (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP
           connection during the handshake would otherwise block the
           reconnect (which runs on the main Lwt loop) indefinitely. *)
-       Lwt_unix.with_timeout 20.0 (fun () -> Websocket_lwt_unix.connect ~ctx client uri)
+       Lwt_unix.with_timeout 20.0 (fun () -> Ws_lwt.connect ~ctx client uri)
        >>= fun conn ->
        active_conn := Some conn;
        Logging.info_f
@@ -529,7 +529,7 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
          |> Yojson.Safe.to_string
        in
        Logging.debug ~section "Sending Alpaca Market Data WS authentication...";
-       Websocket_lwt_unix.write conn (Websocket.Frame.create ~content:auth_msg ())
+       Ws_lwt.write conn (Websocket.Frame.create ~content:auth_msg ())
        >>= fun () ->
        let authenticated = ref false in
        let auth_failure_reason = ref None in
@@ -545,11 +545,11 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
          auth_failure_reason := Some reason;
          Lwt.async (fun () ->
            Lwt.catch
-             (fun () -> Websocket_lwt_unix.close_transport conn)
+             (fun () -> Ws_lwt.close_transport conn)
              (fun _exn -> Lwt.return_unit))
        in
        let rec read_loop () =
-         Websocket_lwt_unix.read conn
+         Ws_lwt.read conn
          >>= fun frame ->
          on_heartbeat ();
          (match !auth_failure_reason with
@@ -563,7 +563,7 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
                    ~content:frame.Websocket.Frame.content
                    ()
                in
-               Websocket_lwt_unix.write conn pong_frame
+               Ws_lwt.write conn pong_frame
              | Websocket.Frame.Opcode.Pong ->
                (* Reply to our active [send_ping]; resolves any pending waiter. *)
                last_pong_time := Unix.gettimeofday ();
@@ -611,7 +611,7 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
                   then "overnight (v1beta1/overnight)"
                   else "regular (v2/" ^ !Alpaca_types.Config.data_feed ^ ")");
                Lwt.catch
-                 (fun () -> Websocket_lwt_unix.close_transport conn)
+                 (fun () -> Ws_lwt.close_transport conn)
                  (fun _exn -> Lwt.return_unit))
              else session_watcher ()
            | _ -> Lwt.return_unit)
@@ -647,7 +647,7 @@ let send_ping ~req_id ~timeout_ms : bool Lwt.t =
     Lwt.catch
       (fun () ->
          let payload = Printf.sprintf "dio:%d:%.6f" req_id send_time in
-         Websocket_lwt_unix.write
+         Ws_lwt.write
            conn
            (Websocket.Frame.create
               ~opcode:Websocket.Frame.Opcode.Ping

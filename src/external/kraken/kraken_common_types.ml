@@ -59,7 +59,7 @@ let default_configured_currencies = [ "USD"; "EUR"; "USDT"; "USDC" ]
 (** Forces evaluation of the lazy Conduit TLS context.
     Raises [Failure] if the context has not been initialized prior to domain spawning. *)
 let get_conduit_ctx () =
-  try Lazy.force Conduit_lwt_unix.default_ctx with
+  try Ws_lwt.resolve_ctx () with
   | CamlinternalLazy.Undefined ->
     Logging.error
       ~section
