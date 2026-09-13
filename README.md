@@ -24,7 +24,10 @@ is a step-by-step walkthrough: make a folder, pull the image, extract the starte
 files, and fill in `config.json` and `.env`. The short version:
 
 The image ships the example config, env template, and compose file. Pull them
-out first (no repository clone needed):
+out first (no repository clone needed). It is published to both GitHub Container
+Registry (`ghcr.io/malciller/dio-domains`) and Docker Hub
+(`malciller/dio-domains`); the commands below use GHCR — substitute the Docker
+Hub name if you prefer:
 
 ```sh
 IMAGE=ghcr.io/malciller/dio-domains:latest

@@ -44,8 +44,8 @@ body:
     attributes:
       label: Image tag or commit
       description: >-
-        The ghcr.io/malciller/dio-domains tag you run, or the git commit if you
-        built from source.
+        The image tag you run (from ghcr.io or Docker Hub), or the git commit if
+        you built from source.
       placeholder: v0.1.4
     validations:
       required: true

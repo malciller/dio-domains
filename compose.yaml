@@ -1,9 +1,10 @@
-# docker compose file for the published dio image.
+# docker compose file for the published dio image. Also on Docker Hub as
+# malciller/dio-domains; swap the image names below if you pull from there.
 #
 # The image ships without a configuration. Extract the examples and edit them
 # for the venue(s) you trade:
 #
-#   IMAGE=ghcr.io/malciller/dio-domains:latest
+#   IMAGE=ghcr.io/malciller/dio-domains:latest   # or: malciller/dio-domains:latest
 #   docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE \
 #     /usr/share/doc/dio/config.example.json /out/config.json
 #   docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE \
