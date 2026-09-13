@@ -61,9 +61,10 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      # Base image (OxCaml compiler + all opam deps). Reuses the cache the
-      # ci.yml workflow populates for the same inputs, so this is normally a
-      # cache hit rather than a full compiler bootstrap.
+      # Base image (OxCaml compiler + all opam deps). Reads the shared cache
+      # scope that ci.yml writes from main, so a release does not pay the
+      # ~40 min compiler rebuild. No cache-to here: a tag-scoped write would
+      # duplicate ~3.4 GB and overflow the 10 GB repo limit.
       - name: Build OxCaml base image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
@@ -71,8 +72,7 @@ jobs:
           file: Dockerfile.base
           load: true
           tags: ${{ env.DIO_BASE_IMAGE }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=dio-oxcaml
 
       # Application image. Built with the default (daemon) builder so it can
       # see the base image that the previous step loaded into the daemon's

@@ -1,5 +1,8 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+    branches: ["**"]
+  pull_request:
 
 jobs:
   build-test:
@@ -151,8 +154,13 @@ jobs:
           file: Dockerfile.base
           load: true
           tags: ${{ env.DIO_BASE_IMAGE }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # One shared cache scope for the base image across branches and PRs.
+          # The GHA cache backend is limited to 10 GB/repo, so per-ref scopes
+          # (a separate ~3.4 GB copy for main, each PR, and each tag) overflow
+          # it, get evicted LRU, and force the ~40 min compiler rebuild. Only
+          # main writes; PRs and tags read. mode=min keeps the final layers.
+          cache-from: type=gha,scope=dio-oxcaml
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=min,scope=dio-oxcaml' || '' }}
 
       - name: Build OxCaml base image (self-hosted runner)
         if: github.server_url != 'https://github.com'
