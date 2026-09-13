@@ -5,6 +5,11 @@ name: grant-image-access
 # short maintainer mention carrying the direct package-access link, so the
 # approver gets the reminder (and the link) as a GitHub notification.
 #
+# The issue is deliberately left open and assigned to the maintainer. There is
+# no API or event for package access grants, so the workflow cannot tell when
+# the invite actually happened; the maintainer closes the issue once the account
+# has Read access.
+#
 # The package settings URL works only for the account that owns the package, so
 # exposing it on the issue is harmless. GitHub cannot attach custom text to an
 # assignment notification, which is why the link goes in a mention comment.
@@ -83,15 +88,15 @@ jobs:
              \`\`\`
 
           Then follow docs/DEPLOYMENT.md. If the pull is denied, your account has
-          not been added yet; wait a few minutes and try again.
+          not been added yet; wait a few minutes and try again. This issue stays
+          open until your access is granted.
           EOF
 
-      - name: Notify maintainer and close
+      - name: Notify maintainer
         env:
           REQ_USER: ${{ steps.who.outputs.username }}
         run: |
           username="$REQ_USER"
           gh issue comment "$ISSUE_NUMBER" --body \
-            "@$MAINTAINER grant Read for @$username: https://github.com/users/$MAINTAINER/packages/container/dio-domains/settings"
+            "@$MAINTAINER grant Read for @$username, then close this issue: https://github.com/users/$MAINTAINER/packages/container/dio-domains/settings"
           gh issue edit "$ISSUE_NUMBER" --add-assignee "$MAINTAINER"
-          gh issue close "$ISSUE_NUMBER" --reason completed
