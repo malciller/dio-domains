@@ -1,6 +1,9 @@
 name: publish
 
-# Builds the release image and pushes it to GitHub Container Registry.
+# Builds the release image and pushes it to GitHub Container Registry, then
+# mirrors it to Docker Hub when the DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
+# repository secrets are set. The mirror is skipped when they are absent, so
+# the release never depends on Docker Hub.
 #
 # The package must be public. If it is ever recreated private, set visibility
 # back to public in the repository's package settings (Package settings ->
@@ -9,6 +12,8 @@ name: publish
 # Tags published:
 #   ghcr.io/<owner>/<repo>:<tag>   (the pushed tag, or the workflow_dispatch input)
 #   ghcr.io/<owner>/<repo>:latest
+#   docker.io/<DOCKERHUB_USERNAME>/dio-domains:<tag>    (when secrets are set)
+#   docker.io/<DOCKERHUB_USERNAME>/dio-domains:latest
 
 on:
   push:
@@ -89,7 +94,31 @@ jobs:
             -t "$IMAGE:latest" \
             --push .
 
+      # Optional mirror to Docker Hub (public registry search). Runs only when
+      # the DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets are set.
+      # Create a Docker Hub access token with Read & Write scope.
+      - name: Mirror to Docker Hub
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DH_USER" ] || [ -z "$DH_TOKEN" ]; then
+            echo "Docker Hub secrets not set; skipping mirror."
+            exit 0
+          fi
+          echo "$DH_TOKEN" | docker login -u "$DH_USER" --password-stdin
+          tag="${{ steps.vars.outputs.tag }}"
+          repo="docker.io/$DH_USER/dio-domains"
+          docker image inspect "$IMAGE:$tag" >/dev/null 2>&1 || docker pull "$IMAGE:$tag"
+          docker tag "$IMAGE:$tag" "$repo:$tag"
+          docker tag "$IMAGE:$tag" "$repo:latest"
+          docker push "$repo:$tag"
+          docker push "$repo:latest"
+          echo "Mirrored to $repo:$tag and $repo:latest"
+
       - name: Summary
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           {
             echo "### Published image"
@@ -97,6 +126,10 @@ jobs:
             echo '```'
             echo "$IMAGE:${{ steps.vars.outputs.tag }}"
             echo "$IMAGE:latest"
+            if [ -n "$DH_USER" ]; then
+              echo "docker.io/$DH_USER/dio-domains:${{ steps.vars.outputs.tag }}"
+              echo "docker.io/$DH_USER/dio-domains:latest"
+            fi
             echo '```'
             echo
             echo "The package is public. If it is private, change visibility in"
