@@ -1,0 +1,71 @@
+# docker compose file for the published dio image.
+#
+# The image ships without a configuration. Before starting, copy the examples
+# and edit them for the venue(s) you trade:
+#
+#   cp config.example.json config.json
+#   cp .env.example .env
+#
+# Then:
+#
+#   docker compose up -d            # start the engine
+#   docker compose run --rm dashboard   # attach the TUI dashboard
+#
+# The dashboard is behind the "dashboard" profile so a plain `up` starts only
+# the engine. Both containers share the Unix domain socket volume that the
+# dashboard uses to talk to the engine.
+
+name: dio
+
+services:
+  engine:
+    image: ghcr.io/malciller/dio-domains:latest
+    platform: linux/amd64
+    container_name: dio_engine
+    restart: unless-stopped
+    command: ["dio"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./.env:/app/.env:ro
+      - dio-data:/app/data
+      - dio-sock:/var/run/dio
+    environment:
+      TERM: xterm-256color
+      DIO_CANARY: "0"
+    ports:
+      - "8080:8080"
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  dashboard:
+    image: ghcr.io/malciller/dio-domains:latest
+    platform: linux/amd64
+    profiles: ["dashboard"]
+    depends_on:
+      - engine
+    command: ["dio-dashboard"]
+    stdin_open: true
+    tty: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    volumes:
+      - dio-sock:/var/run/dio
+    environment:
+      TERM: xterm-256color
+      DIO_CANARY: "0"
+
+volumes:
+  dio-data:
+  dio-sock:

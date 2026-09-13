@@ -1,0 +1,104 @@
+name: publish
+
+# Builds the release image and pushes it to GitHub Container Registry.
+#
+# The package is created private. After the first successful run, confirm it in
+# the repository's package settings (Package settings -> Danger Zone -> change
+# visibility) and grant access to approved users; see docs/ACCESS.md.
+#
+# Tags published:
+#   ghcr.io/<owner>/<repo>:<tag>   (the pushed tag, or the workflow_dispatch input)
+#   ghcr.io/<owner>/<repo>:latest
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to publish (for example v0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    # The OxCaml base bootstrap needs >= 16 GB RAM; GitHub-hosted
+    # ubuntu-latest provides that. Same caveat as the CI workflow.
+    runs-on: ubuntu-latest
+    env:
+      DIO_BASE_IMAGE: dio-oxcaml-base:5.2.0minus40
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Resolve image tag
+        id: vars
+        run: |
+          tag="${{ github.event.inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "::error::invalid image tag: $tag"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Base image (OxCaml compiler + all opam deps). Reuses the cache the
+      # ci.yml workflow populates for the same inputs, so this is normally a
+      # cache hit rather than a full compiler bootstrap.
+      - name: Build OxCaml base image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile.base
+          load: true
+          tags: ${{ env.DIO_BASE_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Application image. Built with the default (daemon) builder so it can
+      # see the base image that the previous step loaded into the daemon's
+      # image store rather than the container builder's (see ci.yml for the
+      # full explanation of this split).
+      - name: Build and push application image
+        run: |
+          DOCKER_BUILDKIT=1 docker buildx build --builder default \
+            --progress=plain \
+            --build-arg "DIO_BASE_IMAGE=$DIO_BASE_IMAGE" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "$IMAGE:${{ steps.vars.outputs.tag }}" \
+            -t "$IMAGE:latest" \
+            --push .
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published image"
+            echo
+            echo '```'
+            echo "$IMAGE:${{ steps.vars.outputs.tag }}"
+            echo "$IMAGE:latest"
+            echo '```'
+            echo
+            echo "The package is private by default. Grant approved users access"
+            echo "in the package settings; see docs/ACCESS.md."
+          } >> "$GITHUB_STEP_SUMMARY"

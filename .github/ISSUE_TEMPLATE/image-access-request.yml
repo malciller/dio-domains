@@ -1,0 +1,53 @@
+name: Image access request
+description: Request pull access to the prebuilt dio container image.
+title: "[image access] "
+labels: ["access-request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Request access to the prebuilt dio container image. Access is granted at
+        the maintainer's discretion and is conditional on accepting the
+        liability and risk terms below. Do not paste API keys or any other
+        secrets into this issue.
+  - type: input
+    id: username
+    attributes:
+      label: GitHub username
+      description: The account that will pull from ghcr.io.
+      placeholder: octocat
+    validations:
+      required: true
+  - type: textarea
+    id: use
+    attributes:
+      label: Intended use
+      description: What you plan to run, and on what infrastructure.
+      placeholder: Running the ladder strategy against a testnet on a home server.
+    validations:
+      required: true
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Liability and risk (all required)
+      description: >-
+        Access is granted only if you accept every statement below. Your
+        selections are recorded in this issue as your acknowledgement.
+      options:
+        - label: >-
+            I understand dio places real orders with real money and can lose some
+            or all of my capital. It is provided "as is", with no warranty and no
+            guarantee of profit, correctness, or fitness for any purpose.
+          required: true
+        - label: >-
+            I take full responsibility and liability for my configuration, API
+            keys, funds, and any legal, tax, or regulatory obligations that apply
+            to me.
+          required: true
+        - label: >-
+            I use dio entirely at my own risk. The author is not liable for any
+            loss, damage, or cost arising from its use, including losses caused by
+            software defects, outages, or incorrect behaviour.
+          required: true
+        - label: I will not redistribute the image or my pull credentials.
+          required: true

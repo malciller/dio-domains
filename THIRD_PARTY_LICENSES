@@ -1,15 +1,51 @@
-This file lists the licenses for third-party binaries distributed with this
-project.
+THIRD PARTY LICENSES
+====================
+
+dio-domains is distributed as source (this repository) and as a container image.
+The image bundles third-party software. This file lists what is shipped, the
+license of each component, and where the full license text can be found.
+
+The image includes this file and the referenced texts under
+/usr/share/licenses/dio/, together with a manifest of every installed
+OCaml/opam package (name, version, license) at
+/usr/share/licenses/dio/opam-packages.txt, generated from the build switch.
+
 
 ================================================================================
-lighter-go (Lighter Transaction Signer)
+1. OCaml / OxCaml runtime
 ================================================================================
+
+The dio and dio-dashboard executables are compiled with, and statically link,
+the OCaml runtime (libasmrun) from OxCaml, Jane Street's fork of OCaml. The
+image is built with the 5.2.0+ox switch (ocaml-variants.5.2.0+ox,
+oxcaml-compiler.5.2.0minus40).
+
+License: the OCaml Core System (files marked "Copyright INRIA") is distributed
+under the GNU Lesser General Public License, version 2.1, with the standard
+OCaml linking exception. That exception permits linking the Core System into an
+executable and distributing the result under terms of your choice, without the
+additional requirements of LGPL clause 6. Files marked "Copyright Jane Street"
+and not "Copyright INRIA" are distributed under the MIT license.
+
+Full text: third_party/OCaml-LICENSE (the upstream OxCaml LICENSE, containing
+the linking exception and the complete LGPL-2.1 and MIT texts).
+
+Source: https://github.com/oxcaml/oxcaml
+
+
+================================================================================
+2. Bundled native libraries
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1 lighter-go (Lighter Transaction Signer)
+--------------------------------------------------------------------------------
 
 The following precompiled shared libraries are built from the lighter-go SDK
 and distributed in this repository:
 
   - lighter-signer-darwin-arm64.dylib  (macOS ARM64)
-  - lighter-signer-linux-amd64.so     (Linux x86_64)
+  - lighter-signer-linux-amd64.so      (Linux x86_64)
 
 Source:  https://github.com/elliottech/lighter-go
 License: Apache License, Version 2.0
@@ -28,13 +64,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
+--------------------------------------------------------------------------------
+2.2 libsecp256k1 (Bitcoin Core)
+--------------------------------------------------------------------------------
 
-================================================================================
-libsecp256k1 (Bitcoin Core)
-================================================================================
-
-This library is compiled from source and distributed inside the runtime Docker
-image for OCaml fast cryptographic operations.
+Compiled from source and distributed inside the runtime Docker image for OCaml
+fast cryptographic operations.
 
 Source:  https://github.com/bitcoin-core/secp256k1
 License: MIT License
@@ -59,3 +94,202 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+
+================================================================================
+3. Derived and patched third-party sources in this repository
+================================================================================
+
+--------------------------------------------------------------------------------
+3.1 websocket 2.17 (lwt wrapper)
+--------------------------------------------------------------------------------
+
+src/external/ws_lwt/ws_lwt.ml is a client-only replacement derived from the lwt
+wrapper of the websocket library, version 2.17. The wire framing is delegated to
+Websocket.Make, so the format is unchanged.
+
+Source:  https://github.com/vbmithr/ocaml-websocket
+License: ISC
+
+Copyright (c) Vincent Bernardoff and contributors
+
+--------------------------------------------------------------------------------
+3.2 opam overlay patches (oxcaml-port/opam-overlay)
+--------------------------------------------------------------------------------
+
+Patches that adapt these releases to the OxCaml compiler. The patched packages
+are built into the image.
+
+  cohttp 4.0.0, cohttp-lwt 4.0.0, cohttp-lwt-unix 4.0.0
+    Source:  https://github.com/mirage/ocaml-cohttp
+    License: ISC
+    Copyright (c) the ocaml-cohttp authors (Anil Madhavapeddy, David Sheets,
+      Thomas Gazagnaire, David Scott, and contributors)
+
+  digestif 1.3.1
+    Source:  https://github.com/mirage/digestif
+    License: MIT
+    Copyright (c) Eyyüb Sari, Romain Calascibetta
+
+  msgpck 1.7
+    Source:  https://github.com/vbmithr/ocaml-msgpck
+    License: ISC
+    Copyright (c) Vincent Bernardoff
+
+
+================================================================================
+4. OCaml libraries linked into the binaries
+================================================================================
+
+These are installed from opam and statically linked into dio and
+dio-dashboard. Transitive dependencies ship with them under the same set of
+licenses; the exact set installed at build time is listed in
+/usr/share/licenses/dio/opam-packages.txt.
+
+Component             License                                    Copyright
+--------------------- ------------------------------------------ --------------------------
+yojson                BSD-3-Clause                               Martin Jambon
+lwt                   MIT                                        Jérôme Vouillon, Jérémie Dimino
+lwt_ssl               LGPL-2.1 + OpenSSL exemption               Jérôme Vouillon, Jérémie Dimino
+mirage-crypto-rng     BSD-2-Clause                               David Kaloper, Hannes Mehnert
+cohttp-lwt-unix       ISC                                        Anil Madhavapeddy and contributors
+websocket             ISC                                        Vincent Bernardoff
+base64                ISC                                        Thomas Gazagnaire and contributors
+digestif              MIT                                        Eyyüb Sari, Romain Calascibetta
+uri                   ISC                                        Anil Madhavapeddy and contributors
+conduit-lwt-unix      ISC                                        Anil Madhavapeddy and contributors
+ipaddr                ISC                                        David Sheets and contributors
+mtime                 ISC                                        The mtime programmers
+secp256k1             MIT                                        Davide Gessa and contributors
+msgpck                ISC                                        Vincent Bernardoff
+ctypes                MIT                                        Jeremy Yallop
+ctypes-foreign        MIT                                        Jeremy Yallop
+notty-community        ISC                                        David Kaloper
+
+Build-, test-, and documentation-only dependencies that are not shipped:
+dune (MIT), lwt_ppx (MIT), alcotest (ISC), odoc (ISC).
+
+Full texts: MIT, ISC, BSD-2-Clause, and BSD-3-Clause are in section 6.
+lwt_ssl is LGPL-2.1 with the OpenSSL exemption; its full text is in
+third_party/lwt_ssl-COPYING (which also contains the complete LGPL-2.1).
+
+
+================================================================================
+5. Container base OS and runtime system libraries
+================================================================================
+
+Base image: Ubuntu 22.04 LTS (pinned by digest in Dockerfile).
+
+Runtime packages installed into the image: libffi8, libgmp10, libpcre3,
+libssl3, libpq5, zlib1g, libjemalloc2, ca-certificates, netbase.
+
+These are unmodified Ubuntu packages. Each package's copyright and license text
+is installed by the distribution at /usr/share/doc/<package>/copyright inside
+the image. Principal licenses:
+
+  libffi8          MIT
+  libgmp10         LGPL-3.0-or-later or GPL-2.0-or-later
+  libpcre3         BSD-3-Clause
+  libssl3          Apache-2.0
+  libpq5           PostgreSQL
+  zlib1g           Zlib
+  libjemalloc2     BSD-2-Clause
+  ca-certificates  MPL-2.0
+  netbase          GPL-2.0
+
+
+================================================================================
+6. Full license texts
+================================================================================
+
+--------------------------------------------------------------------------------
+MIT License
+--------------------------------------------------------------------------------
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+ISC License
+--------------------------------------------------------------------------------
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+
+--------------------------------------------------------------------------------
+BSD 2-Clause License
+--------------------------------------------------------------------------------
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+--------------------------------------------------------------------------------
+BSD 3-Clause License
+--------------------------------------------------------------------------------
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

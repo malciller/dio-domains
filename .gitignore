@@ -16,6 +16,7 @@ proxy/cloudflare/node_modules/
 *.log
 *.sh
 !dio-dash.sh
+!docker-entrypoint.sh
 *.csv
 *.txt
 *.html
@@ -55,6 +56,9 @@ out/
 # env / credential files
 .env
 .env.*
+!.env.example
+# Local runtime configuration (use config.example.json as the template)
+config.json
 *.pem
 *.key
 *.crt
