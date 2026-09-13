@@ -1,3 +1,11 @@
+(* OxCaml marks [Domain.spawn] as [do_not_spawn_domains] because an unbounded
+   number of domains degrades GC. This module deliberately spawns a bounded,
+   supervised set of long-lived per-asset domains (see [spawn_supervised_domains])
+   and tracks their count; it does not use [Multicore]. The alert is therefore
+   acknowledged here rather than forcing an architectural change. *)
+[@@@alert "-unsafe_multidomain"]
+[@@@alert "-do_not_spawn_domains"]
+
 open Config
 module Fear_and_greed = Cmc.Fear_and_greed
 

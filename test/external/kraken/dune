@@ -40,4 +40,4 @@
 
 (executable
  (name debug_ws)
- (libraries dio.kraken dio.logging lwt lwt.unix websocket-lwt-unix unix yojson mirage-crypto-rng.unix))
+  (libraries dio.kraken dio.logging lwt lwt.unix websocket dio.ws_lwt unix yojson mirage-crypto-rng.unix))

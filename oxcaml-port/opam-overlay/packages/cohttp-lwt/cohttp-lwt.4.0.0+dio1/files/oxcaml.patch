@@ -1,0 +1,60 @@
+diff --git a/cohttp-lwt/src/body.ml b/cohttp-lwt/src/body.ml
+--- a/cohttp-lwt/src/body.ml
++++ b/cohttp-lwt/src/body.ml
+@@ -47,8 +47,8 @@
+   match body with
+   | #Body.t as body -> return (Body.to_string body)
+   | `Stream s ->
+       let b = Buffer.create 1024 in
+-      Lwt_stream.iter (Buffer.add_string b) s >>= fun () ->
++      Lwt_stream.iter (fun x -> Buffer.add_string b x) s >>= fun () ->
+       return (Buffer.contents b)
+ 
+ let to_string_list (body : t) =
+diff --git a/cohttp-lwt/src/client.ml b/cohttp-lwt/src/client.ml
+--- a/cohttp-lwt/src/client.ml
++++ b/cohttp-lwt/src/client.ml
+@@ -51,7 +51,8 @@
+       | true ->
+           let req = Request.make_for_client ~headers ~chunked meth uri in
+           Request.write
+-            (fun writer -> Body.write_body (Request.write_body writer) body)
++            (fun writer ->
++              Body.write_body (fun x -> Request.write_body writer x) body)
+             req oc
+       | false ->
+           (* If chunked is not allowed, then obtain the body length and
+@@ -61,8 +62,9 @@
+           let req =
+             Request.make_for_client ~headers ~chunked ~body_length meth uri
+           in
+           Request.write
+-            (fun writer -> Body.write_body (Request.write_body writer) buf)
++            (fun writer ->
++              Body.write_body (fun x -> Request.write_body writer x) buf)
+             req oc
+     in
+     sent >>= fun () ->
+@@ -113,7 +115,8 @@
+       Lwt_stream.map_s
+         (fun (req, body) ->
+           Request.write
+-            (fun writer -> Body.write_body (Request.write_body writer) body)
++            (fun writer ->
++              Body.write_body (fun x -> Request.write_body writer x) body)
+             req oc
+           >>= fun () -> Lwt.return (Request.meth req))
+         reqs
+diff --git a/cohttp-lwt/src/server.ml b/cohttp-lwt/src/server.ml
+--- a/cohttp-lwt/src/server.ml
++++ b/cohttp-lwt/src/server.ml
+@@ -123,7 +123,8 @@
+         | `Response (res, body) ->
+             let flush = Response.flush res in
+             Response.write ~flush
+-              (fun writer -> Body.write_body (Response.write_body writer) body)
++              (fun writer ->
++                Body.write_body (fun x -> Response.write_body writer x) body)
+               res oc
+             >>= fun () ->
+             if Request.is_keep_alive req then handle_client ic oc conn callback

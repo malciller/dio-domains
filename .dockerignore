@@ -23,6 +23,14 @@ data
 
 # Credentials (mounted at runtime, never baked into image)
 .env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+id_rsa*
+id_ed25519*
+credentials*
 
 # Editor / OS junk
 *.swp
