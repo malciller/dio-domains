@@ -37,7 +37,7 @@ them out, edit them, then mount them:
     -v dio-data:/app/data \\
     ghcr.io/malciller/dio-domains:latest
 
-Without config.json the engine cannot start. See docs/DEPLOYMENT.md.
+Without config.json the engine cannot start. See https://diophantsolutions.com/dio/DEPLOYMENT/.
 EOF
       exit 1
     fi

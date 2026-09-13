@@ -17,9 +17,9 @@ Unix domain socket.
 
 ## Quick start
 
-New to this? [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) is a step-by-step
-walkthrough: make a folder, pull the image, extract the starter files, and fill
-in `config.json` and `.env`. The short version:
+New to this? The [deployment guide](https://diophantsolutions.com/dio/DEPLOYMENT/)
+is a step-by-step walkthrough: make a folder, pull the image, extract the starter
+files, and fill in `config.json` and `.env`. The short version:
 
 The image ships the example config, env template, and compose file. Pull them
 out first (no repository clone needed):
@@ -40,8 +40,8 @@ The published image is `linux/amd64`. On Apple Silicon it runs under emulation.
 The engine reads `config.json` and `.env` from the working directory and writes
 state to the `dio-data` volume.
 
-Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) and
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+Full reference: [configuration](https://diophantsolutions.com/dio/CONFIGURATION/)
+and [deployment](https://diophantsolutions.com/dio/DEPLOYMENT/).
 
 ## Executables
 
@@ -53,13 +53,12 @@ Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md) and
 
 ## Documentation
 
-| Document | Contents |
-| --- | --- |
-| [docs/SPEC.md](docs/SPEC.md) | The full software product specification (DIO-SPS-001). |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | `config.json` keys and environment variables. |
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker, compose, building from source, and remote deployment. |
-| [docs/RISK.md](docs/RISK.md) | Risk, terms of use, and how to pull the image. |
-| [docs/ORACLE.md](docs/ORACLE.md) | The capital-oracle mathematics. |
+All documentation lives at **<https://diophantsolutions.com/dio/>**:
+[deployment](https://diophantsolutions.com/dio/DEPLOYMENT/),
+[configuration](https://diophantsolutions.com/dio/CONFIGURATION/),
+[capital oracle](https://diophantsolutions.com/dio/ORACLE/),
+[risk and terms](https://diophantsolutions.com/dio/RISK/), and the
+[specification](https://diophantsolutions.com/dio/SPEC/).
 
 ## Support
 
