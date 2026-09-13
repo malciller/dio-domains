@@ -21,10 +21,16 @@ case "$1" in
       cat >&2 <<EOF
 dio: no configuration file at $config_path
 
-The image ships without a configuration on purpose. Copy the example and edit
-it, then mount it into the container:
+The image ships no configuration on purpose. The templates are inside it; pull
+them out, edit them, then mount them:
 
-  cp config.example.json config.json
+  docker run --rm -v "\$PWD:/out" --entrypoint cp \\
+    ghcr.io/malciller/dio-domains:latest \\
+    /usr/share/doc/dio/config.example.json /out/config.json
+  docker run --rm -v "\$PWD:/out" --entrypoint cp \\
+    ghcr.io/malciller/dio-domains:latest \\
+    /usr/share/doc/dio/.env.example /out/.env
+
   docker run --rm -it \\
     -v "\$PWD/config.json:$config_path:ro" \\
     -v "\$PWD/.env:/app/.env:ro" \\
