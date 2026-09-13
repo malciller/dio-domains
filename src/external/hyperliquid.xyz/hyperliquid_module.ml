@@ -365,6 +365,7 @@ module Hyperliquid_impl = struct
     Hyperliquid_orderbook_feed.get_best_bid_ask_fast symbol
   ;;
 
+  let has_orderbook_data ~symbol = Hyperliquid_orderbook_feed.has_orderbook_data symbol
   let get_tradeable_balance ~asset = Hyperliquid_balances.get_balance asset
 
   let get_tradeable_balance_fast ~asset =

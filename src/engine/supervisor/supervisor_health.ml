@@ -533,14 +533,16 @@ let monitor_non_active_assets () =
                         if (not is_configured) && not is_quote
                         then (
                           let target_key = exch_name ^ ":" ^ symbol in
-                          let has_valid_quote =
-                            match Ex.get_top_of_book ~symbol with
-                            | Some (bp, _, ap, _) -> bp > 0.0 || ap > 0.0
-                            | None -> false
-                          in
+                          (* Presence, not freshness: a thin book can go quiet
+                             for minutes, and treating staleness as
+                             "unsubscribed" re-subscribed every 15s, drawing
+                             Kraken's "Already subscribed" dedup reply in a
+                             loop. Resubscribe only when no book has arrived
+                             yet, or once per reconnect. *)
+                          let has_book = Ex.has_orderbook_data ~symbol in
                           let now = Unix.gettimeofday () in
                           let needs_sub =
-                            if not has_valid_quote
+                            if not has_book
                             then (
                               match Hashtbl.find_opt subscribed_symbols target_key with
                               | None -> true
