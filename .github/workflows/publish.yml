@@ -2,9 +2,9 @@ name: publish
 
 # Builds the release image and pushes it to GitHub Container Registry.
 #
-# The package is created private. After the first successful run, confirm it in
-# the repository's package settings (Package settings -> Danger Zone -> change
-# visibility) and grant access to approved users; see docs/ACCESS.md.
+# The package must be public. If it is ever recreated private, set visibility
+# back to public in the repository's package settings (Package settings ->
+# Danger Zone -> change visibility); see docs/RISK.md.
 #
 # Tags published:
 #   ghcr.io/<owner>/<repo>:<tag>   (the pushed tag, or the workflow_dispatch input)
@@ -99,6 +99,6 @@ jobs:
             echo "$IMAGE:latest"
             echo '```'
             echo
-            echo "The package is private by default. Grant approved users access"
-            echo "in the package settings; see docs/ACCESS.md."
+            echo "The package is public. If it is private, change visibility in"
+            echo "the package settings; see docs/RISK.md."
           } >> "$GITHUB_STEP_SUMMARY"
