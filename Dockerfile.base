@@ -14,7 +14,7 @@
 # Rebuild only when a dependency changes: dio.opam/dune-project, the patch
 # overlay in oxcaml-port/opam-overlay, or the compiler version below.
 # ────────────────────────────────────────────────────────────────────────────────
-FROM ocaml/opam:ubuntu-22.04-ocaml-5.2
+FROM ocaml/opam:ubuntu-22.04-ocaml-5.2@sha256:a7c27c2aace22d97190092a4c3810b665c9c6a9bc420f202e65ac706932f034d
 ENV QEMU_CPU=host
 
 USER root
@@ -40,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN git clone --depth 1 --branch v0.7.1 \
         https://github.com/bitcoin-core/secp256k1.git /tmp/secp256k1 \
     && cd /tmp/secp256k1 \
+    && test "$(git rev-parse HEAD)" = "1a53f4961f337b4d166c25fce72ef0dc88806618" \
     && ./autogen.sh \
     && ./configure --enable-module-schnorrsig --enable-module-recovery --disable-tests --disable-benchmark \
     && make -j$(nproc) \
@@ -59,12 +60,14 @@ USER opam
 #     whose flambda2 register allocator fails on the large asset_domain_worker
 #     function ("register allocation was not successful after 50 rounds").
 #     Pinning it here (rather than upgrading after) means it is compiled once.
+#     The OxCaml repository itself is pinned to a commit, so the package index
+#     cannot move under the build.
 RUN --mount=type=cache,target=/home/opam/.opam/download-cache,uid=1000,gid=1000 \
     opam update -y \
     && opam switch create 5.2.0+ox \
          ocaml-variants.5.2.0+ox \
          oxcaml-compiler.5.2.0minus40 \
-         --repos ox=git+https://github.com/oxcaml/opam-repository.git,default
+         --repos ox=git+https://github.com/oxcaml/opam-repository.git#bb4555262936283daf5cbc82423509d4e7069b15,default
 
 # 3b. Select the OxCaml switch for every subsequent layer and fail the build
 #     immediately if the resulting compiler is not OxCaml.
