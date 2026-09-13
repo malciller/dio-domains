@@ -7,7 +7,7 @@ license of each component, and where the full license text can be found.
 
 The image includes this file and the referenced texts under
 /usr/share/licenses/dio/, together with a manifest of every installed
-OCaml/opam package (name, version, license) at
+OCaml/opam package (name, version, license) at 
 /usr/share/licenses/dio/opam-packages.txt, generated from the build switch.
 
 
