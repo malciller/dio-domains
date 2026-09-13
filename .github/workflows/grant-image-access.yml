@@ -7,6 +7,8 @@ name: grant-image-access
 #                    settings link and assigns the issue. No requester output.
 #   access-granted   maintainer has actually invited the account; posts the pull
 #                    instructions for the requester and closes the issue.
+#   access-denied    maintainer declines; replies briefly to the requester and
+#                    closes the issue.
 #
 # The split exists because there is no API or event when package access is
 # granted, so the workflow cannot verify the invite itself; the maintainer
@@ -24,7 +26,8 @@ jobs:
   access:
     if: >-
       github.event.label.name == 'access-approved' ||
-      github.event.label.name == 'access-granted'
+      github.event.label.name == 'access-granted' ||
+      github.event.label.name == 'access-denied'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -92,3 +95,14 @@ jobs:
           message, wait a minute and try again.
           EOF
           gh issue close "$ISSUE_NUMBER" --reason completed
+
+      # access-denied: decline and close.
+      - name: Decline and close
+        if: github.event.label.name == 'access-denied'
+        env:
+          REQ_USER: ${{ steps.who.outputs.username }}
+        run: |
+          username="$REQ_USER"
+          gh issue comment "$ISSUE_NUMBER" --body \
+            "Thanks for the request, @$username. We're not granting access to the prebuilt image right now."
+          gh issue close "$ISSUE_NUMBER" --reason "not planned"
