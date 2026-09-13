@@ -489,3 +489,4 @@ b. **Restart boundaries.** Lighter order identifiers do not survive a restart bo
 c. **Startup strictness.** The configuration schema is strict. Unknown keys under `trading`, unknown keys in the oracle section, and venue-inapplicable keys shall cause the engine to exit at startup.
 d. **Fee lookup.** A failed live Kraken fee fetch at startup is fatal.
 e. **Canary cost.** The stop-the-world canary domain busy-spins one core while enabled. Disable it with `DIO_CANARY` when core utilization is constrained.
+f. **cohttp pin.** The OxCaml build pins `cohttp-lwt-unix < 6.0.0`, below the CVE-2026-82481 server-side path-traversal fix, because newer releases change the dependency closure away from the compiler's bundled Conduit. The engine uses cohttp as a client only and never serves files; a CI guard fails the build if server-side file serving is introduced.
