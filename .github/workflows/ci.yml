@@ -9,11 +9,23 @@ jobs:
     # runner uses a custom label, change this to that label.
     runs-on: ubuntu-latest
     permissions:
-      actions: write
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Guard against server-side cohttp use
+        # The OxCaml build pins cohttp below the CVE-2026-82481 server-side
+        # path-traversal fix so the dependency closure resolves against the
+        # OxCaml compiler. dio only uses cohttp as a client, so the vulnerable
+        # code is unreachable. This fails if server-side file serving appears,
+        # because then the pin would no longer be safe.
+        run: |
+          if grep -rEn 'Cohttp_lwt_unix\.Server|Cohttp_lwt\.Server|resolve_local_file|resolve_file' src bin; then
+            echo "::error::cohttp < 6.0.0 is below CVE-2026-82481; server-side cohttp file serving is not allowed"
+            exit 1
+          fi
+          echo "cohttp client-only guard passed"
 
       - name: Install system build dependencies
         run: |
@@ -24,9 +36,14 @@ jobs:
                libffi-dev libgmp-dev libpcre3-dev libssl-dev pkg-config
 
       - name: Build libsecp256k1 with schnorrsig support
+        # Pinned to the v0.7.1 commit: without this the step builds whatever
+        # upstream HEAD is at run time and installs it as root.
+        env:
+          SECP256K1_COMMIT: 1a53f4961f337b4d166c25fce72ef0dc88806618
         run: |
           rm -rf /tmp/secp256k1
           git clone https://github.com/bitcoin-core/secp256k1.git /tmp/secp256k1
+          git -C /tmp/secp256k1 checkout --detach "$SECP256K1_COMMIT"
           cd /tmp/secp256k1
           ./autogen.sh
           ./configure --enable-module-schnorrsig --enable-module-recovery
@@ -63,7 +80,7 @@ jobs:
       # of the workflow runs unchanged on both.
       - name: Restore Dune cache
         if: github.server_url == 'https://github.com'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/dune
           key: ${{ runner.os }}-dune-cache-${{ hashFiles('**/*.opam', 'dune-project', 'dune') }}
@@ -102,11 +119,11 @@ jobs:
       DIO_BASE_IMAGE: dio-oxcaml-base:5.2.0minus40
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Buildx (GitHub-hosted runners)
         if: github.server_url == 'https://github.com'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       # --- Base image (OxCaml compiler + opam deps) ---
       # On GitHub-hosted runners (ephemeral) the GitHub Actions cache backend
@@ -115,7 +132,7 @@ jobs:
       # the `docker image inspect` guard skips a rebuild entirely.
       - name: Build OxCaml base image (GitHub-hosted runners)
         if: github.server_url == 'https://github.com'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: Dockerfile.base
@@ -126,14 +143,27 @@ jobs:
 
       - name: Build OxCaml base image (self-hosted runner)
         if: github.server_url != 'https://github.com'
+        # The self-hosted runner persists images between runs, so a reused base
+        # image is only trusted when it carries a fingerprint of the inputs it
+        # was built from. A stale or differently-built image (including one a
+        # PR build left behind) fails the check and is rebuilt. This does not
+        # stop an actor who can run docker commands on the runner directly; for
+        # that, run untrusted pull requests on an ephemeral runner.
         run: |
-          if docker image inspect "$DIO_BASE_IMAGE" >/dev/null 2>&1; then
-            echo "Base image $DIO_BASE_IMAGE already present; skipping."
+          fingerprint=$( {
+            cat Dockerfile.base dio.opam dune-project
+            find oxcaml-port/opam-overlay -type f -print0 | sort -z | xargs -0 -r cat
+          } | sha256sum | awk '{print $1}' )
+          if docker image inspect "$DIO_BASE_IMAGE" \
+               --format '{{ index .Config.Labels "dio.base.fingerprint" }}' 2>/dev/null \
+             | grep -qx "$fingerprint"; then
+            echo "Base image $DIO_BASE_IMAGE matches current inputs; skipping."
           else
-            echo "Base image missing; building (slow, one-time) …"
+            echo "Base image missing or inputs changed; building (slow) …"
             DOCKER_BUILDKIT=1 docker buildx build \
               --progress=plain \
               -f Dockerfile.base \
+              --label "dio.base.fingerprint=$fingerprint" \
               -t "$DIO_BASE_IMAGE" \
               --load .
           fi
