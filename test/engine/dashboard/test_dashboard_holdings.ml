@@ -139,11 +139,11 @@ let test_latency_pages () =
      network metrics without widening the table. *)
   Alcotest.(check int) "starts on INTERNAL page" 0 (Latencies.current_page_index ());
   Alcotest.(check int) "two latency pages" 2 (Latencies.page_count ());
-  (* INTERNAL lists the per-cycle segments in pipeline order, then the
-     whole-cycle total, then the separate oracle-pass metric. *)
+  (* INTERNAL lists the separate oracle-pass metric first, then the per-cycle
+     segments in pipeline order, then the whole-cycle total. *)
   Alcotest.(check (list string))
     "INTERNAL columns"
-    [ "orderbook"; "execution"; "prep"; "strategy"; "cycle"; "oracle" ]
+    [ "oracle"; "orderbook"; "execution"; "prep"; "strategy"; "cycle" ]
     (Latencies.page_metrics 0);
   let net = Latencies.page_metrics 1 in
   Alcotest.(check bool)

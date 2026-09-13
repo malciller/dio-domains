@@ -113,18 +113,19 @@ type metric_group =
 
 (** The latency pages.
 
-    - INTERNAL: the in-process work, in the order the engine runs it.
+    - INTERNAL: the per-asset work, with the separate [oracle] measurement
+      first: the capital-oracle's per-asset analysis pass, which runs on its own
+      (~5 min) cadence and is not part of the per-cycle span. The remaining
+      columns are the in-process work in the order the engine runs it:
       [orderbook] -> [execution] -> [prep] -> [strategy] are the four sequential
       SEGMENTS of one cycle, and [cycle] is the WHOLE cycle (their sum). They
-      are all in-process work with the same sub-10us target. [oracle] is a
-      separate measurement: the capital-oracle's per-asset analysis pass, which
-      runs on its own (~5 min) cadence, not part of the per-cycle span.
+      are all in-process work with the same sub-10us target.
     - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed
       gap, REST round-trip, signer time). These measure exchange round-trips
       and socket lifetimes, not in-process work, and carry their own budgets. *)
 let metric_pages =
   [ { page_label = "INTERNAL"
-    ; metrics = [ "orderbook"; "execution"; "prep"; "strategy"; "cycle"; "oracle" ]
+    ; metrics = [ "oracle"; "orderbook"; "execution"; "prep"; "strategy"; "cycle" ]
     ; trend_metric = "oracle"
     ; trend_label = "(ORACLE P99)"
     ; trend_max_us = 10.0
@@ -168,9 +169,9 @@ let trend_col_w = 12
 
 (** Short header label for a latency metric. *)
 
-(** Short display header for a latency metric. The INTERNAL pipeline labels read as
-    the cycle's segments and its total: BOOK -> EVENTS -> PREP -> STRATEGY, then
-    TOTAL (the whole cycle). ORACLE is the separate analysis-pass metric. *)
+(** Short display header for a latency metric. The INTERNAL columns read ORACLE
+    (the separate analysis-pass metric) first, then the cycle's segments and its
+    total: BOOK -> EVENTS -> PREP -> STRATEGY, then TOTAL (the whole cycle). *)
 let short_label = function
   | "oracle" -> "ORACLE"
   | "orderbook" -> "BOOK"
