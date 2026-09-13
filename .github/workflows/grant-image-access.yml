@@ -1,22 +1,16 @@
 name: grant-image-access
 
-# When a maintainer applies the "access-approved" label to an image-access
-# request, this posts the pull instructions for the requester and then posts a
-# short maintainer mention carrying the direct package-access link, so the
-# approver gets the reminder (and the link) as a GitHub notification.
+# Two-step approval, driven by labels:
 #
-# The issue is deliberately left open and assigned to the maintainer. There is
-# no API or event for package access grants, so the workflow cannot tell when
-# the invite actually happened; the maintainer closes the issue once the account
-# has Read access.
+#   access-request   opened by the request form
+#   access-approved  maintainer approves; pings the maintainer with the package
+#                    settings link and assigns the issue. No requester output.
+#   access-granted   maintainer has actually invited the account; posts the pull
+#                    instructions for the requester and closes the issue.
 #
-# The package settings URL works only for the account that owns the package, so
-# exposing it on the issue is harmless. GitHub cannot attach custom text to an
-# assignment notification, which is why the link goes in a mention comment.
-#
-# GitHub has no API to grant access to a package scoped to a personal account
-# (only organization-scoped packages can be granted programmatically), so the
-# invite stays a manual click for the owner.
+# The split exists because there is no API or event when package access is
+# granted, so the workflow cannot verify the invite itself; the maintainer
+# asserts it with the second label.
 
 on:
   issues:
@@ -27,8 +21,10 @@ permissions:
   issues: write
 
 jobs:
-  grant:
-    if: github.event.label.name == 'access-approved'
+  access:
+    if: >-
+      github.event.label.name == 'access-approved' ||
+      github.event.label.name == 'access-granted'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -37,7 +33,7 @@ jobs:
       ISSUE_NUMBER: ${{ github.event.issue.number }}
       ISSUE_BODY: ${{ github.event.issue.body }}
     steps:
-      - name: Extract requested username
+      - name: Parse requested username
         id: who
         run: |
           username=$(python3 -c 'import os,re; b=os.environ.get("ISSUE_BODY",""); m=re.search(r"###\s*GitHub username\s*\n+([^\n]+)", b); print((m.group(1).strip() if m else "").lstrip("@"))')
@@ -53,25 +49,30 @@ jobs:
           esac
           echo "username=$username" >> "$GITHUB_OUTPUT"
 
-      - name: Post pull instructions for the requester
+      # access-approved: remind the maintainer, with the one-click link.
+      - name: Ping maintainer
+        if: github.event.label.name == 'access-approved'
         env:
           # Passed through the environment rather than interpolated into the
           # script, so a crafted username cannot inject shell syntax.
           REQ_USER: ${{ steps.who.outputs.username }}
         run: |
           username="$REQ_USER"
-          case "$username" in
-            *[!A-Za-z0-9-]*|'')
-              echo "::error::unexpected username: $username"
-              exit 1
-              ;;
-          esac
+          gh issue comment "$ISSUE_NUMBER" --body \
+            "@$MAINTAINER invite @$username (Read), then add the \`access-granted\` label: https://github.com/users/$MAINTAINER/packages/container/dio-domains/settings"
+          gh issue edit "$ISSUE_NUMBER" --add-assignee "$MAINTAINER"
 
+      # access-granted: the account is in, hand the requester the instructions.
+      - name: Post pull instructions and close
+        if: github.event.label.name == 'access-granted'
+        env:
+          REQ_USER: ${{ steps.who.outputs.username }}
+        run: |
+          username="$REQ_USER"
           gh issue comment "$ISSUE_NUMBER" --body-file - <<EOF
-          Approved for @$username. A maintainer is adding your account; the image
-          will pull once that is done.
+          Access granted for @$username.
 
-          To pull it:
+          To pull the image:
 
           1. Create a personal access token (classic) with the \`read:packages\` scope:
              https://github.com/settings/tokens/new?scopes=read:packages
@@ -87,16 +88,7 @@ jobs:
              docker pull ghcr.io/malciller/dio-domains:latest
              \`\`\`
 
-          Then follow docs/DEPLOYMENT.md. If the pull is denied, your account has
-          not been added yet; wait a few minutes and try again. This issue stays
-          open until your access is granted.
+          Then follow docs/DEPLOYMENT.md. If a pull is denied right after this
+          message, wait a minute and try again.
           EOF
-
-      - name: Notify maintainer
-        env:
-          REQ_USER: ${{ steps.who.outputs.username }}
-        run: |
-          username="$REQ_USER"
-          gh issue comment "$ISSUE_NUMBER" --body \
-            "@$MAINTAINER grant Read for @$username, then close this issue: https://github.com/users/$MAINTAINER/packages/container/dio-domains/settings"
-          gh issue edit "$ISSUE_NUMBER" --add-assignee "$MAINTAINER"
+          gh issue close "$ISSUE_NUMBER" --reason completed
