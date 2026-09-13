@@ -151,7 +151,7 @@ let test_null_order_book_field () =
       ; "order_book", `Null
       ]
   in
-  (* Should not crash *)
+  (* Null order_book field must not crash. *)
   Lighter.Orderbook_feed.process_orderbook_snapshot ~market_index:0 json;
   let result = Lighter.Orderbook_feed.get_best_bid_ask "OBNULL" in
   Alcotest.(check bool) "still None" true (Option.is_none result)

@@ -92,7 +92,6 @@ let read_message ic =
   if len <= 0 || len > 1_000_000
   then Lwt.fail_with (Printf.sprintf "Invalid message length: %d" len)
   else (
-    (* Grow the payload buffer if needed *)
     if Bytes.length !msg_buf < len then msg_buf := Bytes.create (len * 2);
     read_bytes_into ic !msg_buf len
     >|= fun () -> Ibkr_codec.decode_fields (Bytes.sub_string !msg_buf 0 len))
@@ -223,16 +222,15 @@ let disconnect t =
 
 (** Background reader loop. Decodes each frame and invokes [on_message]
     with the message id and remaining fields; handler exceptions are
-    logged, not fatal. On EOF, EBADF, or a closed channel the loop ends
-    quietly; on other errors it logs and ends. In both cases it clears
-    [t.connected] and invokes the caller-supplied [on_disconnect]; it
-    never calls [disconnect].
+    logged, not propagated.
 
-    Per-message handlers run under [Lwt.async] so they are not chained
-    onto the stream-consumption promise. Chaining them would make the
-    reader await every handler before pulling the next frame and retain
-    one pending promise per message for as long as the reader promise is
-    awaited. *)
+    Termination: EOF, [EBADF], or a closed channel ends the loop quietly;
+    any other error logs and ends. Both paths clear [t.connected] and
+    invoke [on_disconnect]; [disconnect] is never called.
+
+    Handlers run under [Lwt.async] so they are not chained onto the
+    stream-consumption promise. Chaining would block the reader on every
+    handler and retain one pending promise per message. *)
 let start_reader t ~on_message ~on_disconnect =
   match t.ic with
   | None -> Logging.error ~section "Cannot start reader: not connected"

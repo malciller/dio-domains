@@ -1,22 +1,19 @@
 (** Centralized fill event bus for cross-venue order fill notifications.
 
-    All exchange execution feeds publish fill events to a single shared
-    ring buffer when an order reaches Filled status. Downstream consumers
-    (e.g., Discord notifier) read from this buffer using position-based
-    iteration, identical to per-exchange execution ring buffers.
+    All exchange execution feeds publish a fill event to one shared ring buffer
+    when an order reaches Filled status. Consumers read it by position-based
+    iteration, as with per-exchange execution ring buffers.
 
-    Concurrency model:
-- Writers: exchange execution feed handlers - including code running
-      on the Parse_worker domain- serialized by [write_mutex] since
-      RingBuffer is single-writer.
-- Readers: Lwt fibers in the main domain, polling [generation].
+    Concurrency:
+    - Writers: exchange execution feed handlers, including code on the
+      Parse_worker domain, serialized by [write_mutex] (RingBuffer is
+      single-writer).
+    - Readers: Lwt fibers on the main domain, polling [generation].
 
-    Domain safety: publishing uses ONLY Mutex + Atomic primitives, so fills
-    may be published from any domain. Signalling is a monotonic generation
-    counter rather than an [Lwt_condition]: Lwt structures are single-
-    domain, so the previous broadcast was unsafe from non-Lwt contexts.
-    The consumer ([wait_for_fill]) polls the counter; its sole caller is
-    the Discord notifier, which is latency-insensitive. *)
+    Publishing uses only Mutex and Atomic primitives, so fills may be published
+    from any domain. Signalling uses a monotonic generation counter rather than
+    an [Lwt_condition], which is single-domain. [wait_for_fill] polls the
+    counter; its sole caller, the Discord notifier, is latency-insensitive. *)
 
 module RingBuffer = Ring_buffer.RingBuffer
 
@@ -34,31 +31,27 @@ type fill_event =
   ; trade_id : string (** Exchange trade/execution ID for deduplication. *)
   }
 
-(** Global fill event ring buffer. Sized for bursts: a volatile market or
-    mass take-profit trigger can produce more fills within one drain than
-    the Discord consumer keeps up with. 1024 slots x small records is
-    ~200KB. *)
+(** Global fill event ring buffer. 1024 slots, sized so a burst or mass
+    take-profit exceeds one drain without blocking; ~200 KB. *)
 let buffer : fill_event RingBuffer.t = RingBuffer.create 1024
 
 (** Mutex serializing writes from multiple domains. *)
 let write_mutex = Mutex.create ()
 
-(** Monotonic fill counter, bumped under [write_mutex] after each new
-    event. Replaces the former Lwt_condition broadcast. *)
+(** Monotonic fill counter, incremented under [write_mutex] after each new event. *)
 let generation = Atomic.make 0
 
-(** Bounded deduplication set for published fills.
-    Prevents WebSocket reconnect replays from re-publishing fills that
-    were already sent to Discord. Key: (order_id, trade_id). *)
+(** Bounded deduplication set for published fills, keyed by
+    [(order_id, trade_id)]; prevents WebSocket reconnect replays from
+    re-publishing. *)
 let dedup_cap = 512
 
 let dedup_set : (string * string, unit) Hashtbl.t = Hashtbl.create dedup_cap
 let dedup_queue : (string * string) Queue.t = Queue.create ()
 
-(** Publish a fill event to the centralized buffer.
-    Domain-safe: acquires [write_mutex] for the dedup + ring buffer write,
-    then bumps [generation] to release polling consumers.
-    Silently drops duplicate fills based on (order_id, trade_id). *)
+(** Publish a fill event to the shared buffer. Domain-safe: acquires
+    [write_mutex] for the dedup set and ring-buffer write, then increments
+    [generation]. Duplicate [(order_id, trade_id)] fills are dropped silently. *)
 let publish_fill (event : fill_event) =
   let key = event.order_id, event.trade_id in
   Mutex.lock write_mutex;
@@ -81,26 +74,24 @@ let publish_fill (event : fill_event) =
     Mutex.unlock write_mutex)
 ;;
 
-(** Return the current write position. Consumers use this as their
-    starting cursor for [iter_since]. *)
+(** Current write position; consumers use it as the starting cursor for
+    [iter_since]. *)
 let get_position () = RingBuffer.get_position buffer
 
-(** Iterate over fill events from [last_pos] to the current write position
-    without allocating an intermediate list. Returns the new read position. *)
+(** Iterate fill events from [last_pos] to the current write position without
+    allocating a list. Returns the new read position. *)
 let iter_since last_pos f = RingBuffer.iter_since buffer last_pos f
 
-(** Resolve once a fill newer than the caller's snapshot has been
-    published. Polls the generation counter at 50ms: the sole consumer is
-    the Discord notifier, so event-driven wakeup buys nothing and the poll
-    keeps publishers domain-safe. Returns immediately if a fill was
-    published since the caller captured its position.
+(** Resolve once a fill newer than the caller's snapshot is published.
+    Polls the generation counter every [poll_interval] seconds (default 0.05).
+    Polling is used because the sole consumer, the Discord notifier, is
+    latency-insensitive and polling keeps publishers domain-safe. Returns
+    immediately if a fill was published after the snapshot.
 
     The polling tail is spawned via [Lwt.async] rather than chaining the next
-    sleep with [Lwt.bind]: a raw [>>= fun () -> loop ()] accumulates an Lwt
-    [Forward] node per 50ms tick while idle, and the head promise retained by
-    the caller pins the whole chain. [waiter] is a cancellable [Lwt.task], so
-    if the caller cancels the wait the detached poll observes it at the next
-    tick and stops. *)
+    sleep with [Lwt.bind], which would accumulate one Lwt [Forward] node per
+    tick while idle. [waiter] is a cancellable [Lwt.task]; a caller cancel is
+    observed at the next tick. *)
 let wait_for_fill ?(poll_interval = 0.05) () =
   let g = Atomic.get generation in
   if Atomic.get generation <> g
@@ -123,7 +114,7 @@ let wait_for_fill ?(poll_interval = 0.05) () =
     waiter)
 ;;
 
-(** Read and sort the entire buffer returning the most recent fills first. *)
+(** Read the entire buffer, most recent fills first. *)
 let get_recent_fills () =
   let fills = RingBuffer.read_all buffer in
   List.sort (fun a b -> compare b.timestamp a.timestamp) fills

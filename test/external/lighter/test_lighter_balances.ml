@@ -9,7 +9,7 @@ let test_has_balance_data_initially_false () =
 ;;
 
 let test_process_asset_balances () =
-  (* Lighter account_all_assets format: assets is an assoc of asset_id -> balance_obj *)
+  (* account_all_assets format: assets maps asset_id -> balance object. *)
   let json =
     `Assoc
       [ "type", `String "update/account_all_assets"
@@ -31,7 +31,7 @@ let test_process_asset_balances () =
 ;;
 
 let test_usdc_from_asset_balances () =
-  (* USDC is sourced directly from account_all_assets like any other asset *)
+  (* USDC comes from account_all_assets like any other asset. *)
   let json =
     `Assoc
       [ "type", `String "update/account_all_assets"
@@ -50,17 +50,15 @@ let test_usdc_from_asset_balances () =
 ;;
 
 let test_get_all_balances () =
-  (* After the above tests, we should have at least ETH, WBTC, USDC *)
   let balances = Lighter.Balances.get_all_balances () in
   let has_eth = List.exists (fun (asset, _) -> asset = "ETH") balances in
   Alcotest.(check bool) "has ETH" true has_eth
 ;;
 
 let test_user_stats_null_stats () =
-  (* Should not crash when stats field is null *)
+  (* Null stats field must not crash. *)
   let json = `Assoc [ "type", `String "update/user_stats"; "stats", `Null ] in
   Lighter.Balances.process_market_data json;
-  (* No crash = pass *)
   Alcotest.(check bool) "no crash" true true
 ;;
 

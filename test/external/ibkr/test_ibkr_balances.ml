@@ -1,12 +1,12 @@
 let test_get_balance_unknown () =
-  (* Unknown asset should return 0.0 *)
+  (* Unknown asset returns 0.0. *)
   let balance = Ibkr.Balances.get_balance ~asset:"IBKR_UNKNOWN_ASSET" in
   Alcotest.(check (float 0.001)) "unknown asset balance is 0.0" 0.0 balance
 ;;
 
 let test_get_total_cash () =
   let cash = Ibkr.Balances.get_total_cash () in
-  (* No connection, should be 0.0 *)
+  (* No connection: 0.0. *)
   Alcotest.(check (float 0.001)) "total cash default" 0.0 cash
 ;;
 
@@ -36,7 +36,7 @@ let test_get_unrealized_pnl () =
 ;;
 
 let test_get_balance_usd () =
-  (* "USD" maps to AvailableFunds *)
+  (* "USD" maps to AvailableFunds. *)
   let balance = Ibkr.Balances.get_balance ~asset:"USD" in
   Alcotest.(check (float 0.001)) "USD balance" 0.0 balance
 ;;
@@ -63,7 +63,7 @@ let test_get_balance_buying_power () =
 
 let test_get_all_balances () =
   let balances = Ibkr.Balances.get_all_balances () in
-  (* Should be empty list when no updates received *)
+  (* Empty list before any update. *)
   Alcotest.(check int) "all balances empty" 0 (List.length balances)
 ;;
 

@@ -24,9 +24,8 @@ type logging_config =
   { level : Logging.level
   ; sections : string list
   ; width : int option
-    (** Optional fixed line width for log wrapping. None = auto: the terminal
-        width when output is a TTY, else the `COLUMNS` env var when set, else
-        a generous default (200). *)
+    (** Fixed log-wrap width. None = auto: TTY width, else `COLUMNS` env var,
+        else 200. *)
   }
 
 type gc_config =
@@ -38,10 +37,10 @@ type gc_config =
   ; major_heap_increment : int
   }
 
-(** Which latency families emit spike logs. "internal" covers the per-domain
-    pipeline stages (OB/EXEC/PREP/STRAT/CYCLE); "network" covers the per-venue
-    ws_ping/ws_feed/rest_request/signer windows. Kept separate so the noisy
-    network tail can be silenced while chasing internal-op bottlenecks. *)
+(** Latency families that emit spike logs. [Spike_report_internal] covers the
+    per-domain pipeline stages (OB/EXEC/PREP/STRAT/CYCLE); [Spike_report_network]
+    covers per-venue ws_ping/ws_feed/rest_request/signer windows. Separate so the
+    network tail can be silenced independently. *)
 type latency_spike_report =
   | Spike_report_internal
   | Spike_report_network
@@ -54,44 +53,37 @@ type config =
   ; gc : gc_config option
   ; trading : trading_config list
   ; oracle : Dio_oracle.Oracle_runtime.runtime_config option
-    (** Capital-oracle runtime knobs from the top-level "oracle" section;
-        [None] means the engine runs the oracle's built-in defaults (see
-        Oracle_runtime.default_config). *)
+    (** Capital-oracle runtime knobs from the top-level "oracle" section.
+        [None] = engine uses [Oracle_runtime.default_config]. *)
   ; fng_check_threshold : float
   ; latency_window_seconds : float
-    (** Duration of each per-domain latency accumulation window before the
-        histogram is snapshotted and reset. Shorter windows make the dashboard
-        percentiles move faster but reduce sample counts per window. *)
+    (** Per-domain latency accumulation window, in seconds: the histogram is
+        snapshotted and reset each window. Shorter = faster dashboard movement,
+        fewer samples per window. *)
   ; latency_spike_threshold_us : float
-    (** Per-stage latency ceiling, in microseconds. Any window whose samples
-        exceed it emits one INFO line naming the offending stages, their worst
-        spike and how many samples breached, so bottlenecks are visible
-        without logging a baseline every window. Current target: 10us. *)
+    (** Per-stage latency ceiling, in microseconds. A window with samples above
+        it emits one INFO line naming offending stages, worst spike, and breach
+        count. Target: 10us. *)
   ; latency_spike_report : latency_spike_report
-    (** Which latency families emit the spike logs above. Defaults to
-        [Spike_report_internal]: internal pipeline ops only, network silenced. *)
+    (** Latency families that emit the spike logs. Default
+        [Spike_report_internal]: internal ops only, network silenced. *)
   ; latency_spike_report_seconds : float
-    (** Minimum wall-clock interval between per-domain internal spike log
-        lines. The percentile windows still publish on
-        [latency_window_seconds] for the dashboard; this only throttles the
-        INFO spam (a busy domain breached the 10us ceiling every 5s window).
-        Defaults to 30s; set to 0 to log every window. *)
+    (** Minimum wall-clock interval between per-domain internal spike log lines,
+        in seconds. Percentile windows still publish on
+        [latency_window_seconds]. Default 30; 0 logs every window. *)
   ; latency_network_spike_threshold_us : float
-    (** Ceiling for the network family, in microseconds. Separate from
-        [latency_spike_threshold_us] because network metrics (ws ping/feed,
-        REST, signer) are millisecond-scale, so the internal 10us op target
-        would flag every window. *)
+    (** Network-family latency ceiling, in microseconds. Separate from
+        [latency_spike_threshold_us] because network metrics (ws ping/feed, REST,
+        signer) are millisecond-scale and would flag every window at 10us. *)
   ; theme : string option (** Optional UI theme name for the terminal dashboard. *)
   }
 
 (** Logging section identifier for this module. *)
 let section = "config"
 
-(** Yojson's [to_float_option] raises on an integer JSON number, but integers
-    are natural in a hand-written config ("10", "20000"). Accept [Int] and
-    [Float]; everything else (including [Null]) is [None]. Without this a
-    single integer-valued float field aborts startup with an uncaught
-    [Type_error]. *)
+(** Accepts [Int] and [Float] JSON numbers; all else (including [Null]) is
+    [None]. Yojson's [to_float_option] raises on [Int], which aborts startup
+    with an uncaught [Type_error]. *)
 let to_float_opt = function
   | `Int i -> Some (float_of_int i)
   | `Float f -> Some f
@@ -99,8 +91,7 @@ let to_float_opt = function
 ;;
 
 (** Parses a [latency_spike_report] from its config string. Unknown values warn
-    and fall back to internal-only, so a typo cannot silence the internal spike
-    logs. *)
+    and fall back to internal-only. *)
 let latency_spike_report_of_string s =
   match String.lowercase_ascii (String.trim s) with
   | "internal" -> Spike_report_internal
@@ -115,8 +106,7 @@ let latency_spike_report_of_string s =
     Spike_report_internal
 ;;
 
-(** [reports_internal r] is true when internal pipeline spikes should be
-    logged. *)
+(** [reports_internal r] is true when internal pipeline spikes are logged. *)
 let reports_internal = function
   | Spike_report_internal | Spike_report_both -> true
   | Spike_report_network | Spike_report_none -> false
@@ -157,15 +147,14 @@ let known_gc_keys =
   ]
 ;;
 
-(** Permitted keys of the optional top-level "oracle" section (capital-oracle
-    runtime knobs). Every key is optional; absent keys fall back to
-    Oracle_runtime.default_config. *)
+(** Permitted keys of the optional top-level "oracle" section. All optional;
+    absent keys fall back to [Oracle_runtime.default_config]. *)
 let known_oracle_keys =
   [ "qty_cap_mult"; "target_survival"; "min_active_dsurv"; "refresh_seconds"; "assets" ]
 ;;
 
-(** Keys accepted inside each "oracle" -> "assets" entry (the per-asset
-    override layer, keyed by symbol). *)
+(** Keys accepted inside each "oracle"."assets" entry (per-asset overrides,
+    keyed by symbol). *)
 let known_oracle_asset_keys = [ "target_survival"; "min_active_dsurv"; "qty_cap_mult" ]
 
 let known_trading_keys =
@@ -188,8 +177,8 @@ let known_trading_keys =
   ]
 ;;
 
-(** Validates that all keys in a JSON associative object belong to the [allowed] set.
-    Logs at CRITICAL level for each unknown key. Returns [true] if any unknown keys are present. *)
+(** Logs CRITICAL for each key of [json] not in [allowed]; returns [true] if any
+    unknown keys are present. *)
 let validate_keys ~context ~allowed json =
   let open Yojson.Basic.Util in
   let actual = json |> to_assoc |> List.map fst in
@@ -200,9 +189,8 @@ let validate_keys ~context ~allowed json =
   unknown <> []
 ;;
 
-(** Parses the "grid_interval" field from a trading entry JSON object.
-    Accepts a two-element list [min; max] or a single numeric/string scalar
-    (promoted to equal bounds for backward compatibility). Defaults to (1.0, 1.0). *)
+(** Parses "grid_interval": [min; max] list or a numeric/string scalar
+    (promoted to equal bounds). Default (1.0, 1.0). *)
 let parse_grid_interval json exchange symbol =
   let open Yojson.Basic.Util in
   let default = 1.0, 1.0 in
@@ -254,9 +242,8 @@ let parse_grid_interval json exchange symbol =
   | _ -> default
 ;;
 
-(** Parses the "accumulation_buffer" field from a trading entry JSON object.
-    Accepts a two-element list [min; max] or a single numeric/string scalar
-    (promoted to equal bounds for backward compatibility). Defaults to (0.01, 0.01). *)
+(** Parses "accumulation_buffer": [min; max] list or a numeric/string scalar
+    (promoted to equal bounds). Default (0.01, 0.01). *)
 let parse_accumulation_buffer json exchange symbol =
   let open Yojson.Basic.Util in
   let default = 0.01, 0.01 in
@@ -308,9 +295,8 @@ let parse_accumulation_buffer json exchange symbol =
   | _ -> default
 ;;
 
-(** Parses a single trading entry from the JSON "trading" array into a [trading_config].
-    Validates keys and enforces venue restrictions (testnet/hedge/data_feed are
-    venue-limited; accumulation_buffer is universal). Exits on schema violations. *)
+(** Parses one entry of the JSON "trading" array into a [trading_config].
+    Validates keys and venue restrictions; [exit 1] on schema violation. *)
 let parse_config json =
   if validate_keys ~context:"trading entry" ~allowed:known_trading_keys json then exit 1;
   let open Yojson.Basic.Util in
@@ -319,11 +305,9 @@ let parse_config json =
     json |> member "exchange" |> to_string_option |> Option.value ~default:"kraken"
   in
   let exch_id = Dio_exchange.Exchange_intf.Types.exchange_of_string exchange in
-  (* Enforce that testnet and hedge are only valid for supported entries.
-     accumulation_buffer is valid on EVERY venue: Kraken runs the same
-     persistence-layer reserved_base accrual as the other venues (see
-     jacobs_ladder_config.kraken_config), so its F&G-resolved reference
-     applies there too. *)
+  (* testnet/hedge are venue-limited; accumulation_buffer is valid on every venue
+     (Kraken runs the same reserved_base accrual; see
+     jacobs_ladder_config.kraken_config). *)
   (match exch_id with
    | Hyperliquid | Ibkr | Lighter | Alpaca | Kraken -> ()
    | Custom _ ->
@@ -375,9 +359,8 @@ let parse_config json =
          symbol;
        exit 1));
   let strategy = json |> member "strategy" |> to_string in
-  (* grid_interval carries the hardened search bounds (gi_min, gi_max) the
-     oracle's parameter search walks; every oracle-driven strategy entry
-     provides them. *)
+  (* grid_interval carries the hardened search bounds (gi_min, gi_max) walked by
+     the oracle's parameter search. *)
   let testnet =
     json |> member "testnet" |> to_bool_option |> Option.value ~default:false
   in
@@ -405,8 +388,8 @@ let parse_config json =
   }
 ;;
 
-(** Parses top-level "logging_level" and "logging_sections" fields into a [logging_config].
-    Defaults to INFO level and no section filters when fields are absent or invalid. *)
+(** Parses "logging_level"/"logging_sections"/"logging_width". Defaults to INFO
+    and no section filters when absent or invalid. *)
 let parse_logging_config json : logging_config =
   let open Yojson.Basic.Util in
   let level_str =
@@ -477,11 +460,9 @@ let parse_gc_config json : gc_config option =
       }
 ;;
 
-(** Parses the optional top-level "oracle" object into the capital-oracle
-    runtime knobs. Returns [None] when the key is absent (the engine then uses
-    Oracle_runtime.default_config). Exits on unknown sub-keys. Every value is
-    optional and falls back to the runtime defaults; "assets" entries are
-    keyed by symbol and override top-level defaults per field. *)
+(** Parses the optional top-level "oracle" object. [None] when absent (engine
+    uses [Oracle_runtime.default_config]). Exits on unknown sub-keys. All values
+    optional; "assets" entries, keyed by symbol, override per field. *)
 let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
   let open Yojson.Basic.Util in
   match json |> member "oracle" with
@@ -605,9 +586,8 @@ let cached_gc_config : gc_config option Lazy.t =
      config.gc)
 ;;
 
-(** Apply GC tuning parameters from the cached config. Must be called
-    once per OCaml 5 domain (each domain has its own minor heap).
-    No-op if [gc] is absent from config.json. *)
+(** Applies GC tuning from the cached config. Must be called once per OCaml 5
+    domain (each domain has its own minor heap). No-op if [gc] is absent. *)
 let apply_gc_config () =
   match Lazy.force cached_gc_config with
   | None -> ()

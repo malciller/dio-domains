@@ -39,20 +39,17 @@ module Config = struct
     if !is_paper then "https://paper-api.alpaca.markets" else "https://api.alpaca.markets"
   ;;
 
-  (** Trade events (fills, partial fills, cancels, replaces, rejects) are
-      delivered by Alpaca's Events API over Server-Sent Events. The legacy v1
-      [wss://.../stream] trade_updates WebSocket is deprecated by Alpaca and
-      currently answers the upgrade with HTTP 500 - do not reintroduce it. The
-      Events stream works against the retail host; auth is the same
-      [APCA-API-KEY-ID] / [APCA-API-SECRET-KEY] headers as REST. *)
+  (** Trade events (fills, partial fills, cancels, replaces, rejects) via the
+      Events API over Server-Sent Events. The legacy v1 [wss://.../stream]
+      trade_updates WebSocket is deprecated and answers with HTTP 500; do not
+      reintroduce it. Auth: [APCA-API-KEY-ID] / [APCA-API-SECRET-KEY], as REST. *)
   let trading_events_url () = rest_base_url () ^ "/v2/events/trades"
 
   let data_ws_url () = Printf.sprintf "wss://stream.data.alpaca.markets/v2/%s" !data_feed
 
-  (** The derived Alpaca overnight feed (8:00 PM - 4:00 AM ET sessions). The
-      regular v2 stream delivers nothing overnight, so the data connection
-      switches to this URL while [Alpaca_market_hours.is_overnight_hours ()]
-      is true. *)
+  (** Overnight feed (8:00 PM - 4:00 AM ET). The regular v2 stream delivers
+      nothing overnight; the data connection switches here while
+      [Alpaca_market_hours.is_overnight_hours ()] is true. *)
   let overnight_ws_url () = "wss://stream.data.alpaca.markets/v1beta1/overnight"
 
   let data_rest_url () = "https://data.alpaca.markets"
@@ -181,9 +178,8 @@ type position_record =
   ; qty : float
   ; qty_available : float
     (** Venue-authoritative immediately-sellable quantity: [qty] minus the base
-        held by resting open orders (Alpaca's [qty_available]). This is the only
-        ground truth for Alpaca's free inventory - the engine otherwise has to
-        reconstruct the hold from its eventually-consistent open-order cache. *)
+        held by resting open orders. Sole ground truth for free inventory;
+        otherwise reconstructed from the eventually-consistent open-order cache. *)
   ; market_value : float
   ; avg_entry_price : float
   ; current_price : float

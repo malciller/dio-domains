@@ -1,4 +1,4 @@
-(* Jacobs Ladder - Core Types & State Registry *)
+(* Jacobs Ladder: core types and state registry. *)
 
 let section = "jacobs_ladder"
 
@@ -34,26 +34,26 @@ type exchange_config =
     (** Check reserved_base + locked_in_sells before selling *)
   ; use_unnetted_sell_hold : bool
     (** Arm/consume the placed-sell hold overlay so a sell never sizes against
-        base still committed to a resting sell whose venue hold the balance
-        feed has not netted yet. Per-venue opt-in: only venues whose tradeable
-        figure (total - open-order hold) trails a placement need it. *)
+        base committed to a resting sell whose venue hold the balance feed has
+        not netted. Per-venue opt-in: only venues whose tradeable figure
+        (total - open-order hold) trails a placement need it. *)
   ; balance_nets_open_order_holds : bool
     (** true: the venue's reported holding already excludes base committed to
-        open sell orders (netted at ingestion or derived on read from the SAME
-        open-order source as the in-flight ledger). The sellable formula then
-        subtracts only the ledger's un-netted excess
-        [max 0 (ledger_total - feed_total)] so a venue feed that drops a live
-        order cannot silently free that base. false: the venue reports the
-        GROSS holding, so the full ledger total is subtracted. *)
+        open sell orders (netted at ingestion, or derived on read from the same
+        open-order source as the in-flight ledger). Sellable then subtracts
+        only the ledger's un-netted excess [max 0 (ledger_total - feed_total)],
+        so a feed that drops a live order cannot free that base. false: the
+        venue reports the gross holding and the full ledger total is
+        subtracted. *)
   ; hold_netted_from_venue_state : bool
-    (** true: the venue nets open-order holds from its OWN state (e.g.
-        Hyperliquid's spotState [hold] field), independently of our executions
-        feed. The venue's tradeable figure is then authoritative even when our
-        feed drops a live order, so the ledger's [ledger_total - feed_total]
-        excess must NOT be subtracted again - only the short [unnetted_hold]
-        dispatch overlay is. false: holds are derived from the same open-order
-        feed the ledger tracks (e.g. Kraken), so the excess is the gap
-        compensation and IS subtracted. *)
+    (** true: the venue nets open-order holds from its own state (e.g.
+        Hyperliquid's spotState [hold]), independent of our executions feed.
+        The venue's tradeable figure is then authoritative even when our feed
+        drops a live order, so the ledger's [ledger_total - feed_total] excess
+        must not be subtracted again; only the short [unnetted_hold] dispatch
+        overlay is. false: holds derive from the same open-order feed the
+        ledger tracks (e.g. Kraken), so the excess is the gap compensation and
+        is subtracted. *)
   ; asset_low_requires_balance_change : bool
     (** true: clear asset_low only on balance increase *)
   ; merge_preserved_sells : bool
@@ -81,8 +81,8 @@ type trading_config =
 
 (** One in-flight sell's share of the committed-base ledger. Mutable so the
     per-scan feed refresh ([upsert_sell_commitment]) updates price/qty/flags in
-    place instead of allocating a replacement tuple on every fill; only a first
-    sighting allocates. Guarded by [strategy_state.mutex]. *)
+    place instead of allocating on every fill; only a first sighting allocates.
+    Guarded by [strategy_state.mutex]. *)
 type sell_commitment =
   { mutable sc_price : float
   ; mutable sc_qty : float
@@ -102,22 +102,20 @@ type strategy_state =
   ; mutable recently_injected_sells : (string * float * float) list
     (* (order_id, price, timestamp) *)
   ; sell_commitments : (string, sell_commitment) Hashtbl.t
-    (* (order_id -> committed-base entry) - the authoritative
-       in-flight sell ledger. Every sell this strategy dispatches is recorded
-       here the instant it is pushed (keyed by the temporary pending_sell_
-       id), re-keyed to the venue id on ack/amend (acked := true), updated to
-       the venue's remaining qty while the open-order feed lists it
-       (seen_in_feed := true), and removed only on a terminal event
-       (fill/cancel/reject/fail). It is the ONE source of "base already
-       committed to a sell" that every venue's sellable-base formula
-       subtracts; a venue open-order feed that drops a live resting sell
-       (reconnect/truncation) can no longer make that base look free. An
-       order that was never seen in the feed is only expired by the dispatch
-       window if it was also never acked; an acked order is real base held by
-       the venue and is kept until its terminal event. *)
+    (* (order_id -> committed-base entry). Authoritative in-flight sell ledger:
+       every dispatched sell is recorded here the instant it is pushed (keyed by
+       the temporary pending_sell_ id), rekeyed to the venue id on ack/amend
+       (sc_acked := true), updated to the venue's remaining qty while the
+       open-order feed lists it (sc_seen := true), and removed only on a
+       terminal event (fill/cancel/reject/fail). The one source of "base
+       committed to a sell" subtracted by every venue's sellable-base formula;
+       a feed that drops a live resting sell (reconnect/truncation) cannot make
+       that base look free. An order never seen in the feed is expired by the
+       dispatch window only if also never acked; an acked order is real base
+       held by the venue and is kept until its terminal event. *)
   ; mutable feed_locked_sell_base : float
-    (* Total base the venue's OWN open-order feed reported as committed to
-       sells on the last [sync_open_orders] scan (0.0 before the first scan).
+    (* Total base the venue's own open-order feed reported committed to sells
+       on the last [sync_open_orders] scan (0.0 before the first scan).
        Compared against the ledger total to derive the un-netted excess on
        net-balance venues. *)
   ; mutable pending_orders : (string * order_side * float * float) list
@@ -128,11 +126,11 @@ type strategy_state =
     (* Unix timestamp of the most recent BUY placement acknowledgment. A freshly
        acked buy is not listed by the venue's open-orders feed for a short
        window; without this grace [sync_open_orders] mistook the lag for a
-       vanished order and purged the buy ("GHOST_BUY_DETECTED"), re-placing it
-       and churning the grid. Ghost recovery is suppressed only within
+       vanished order, purged the buy ("GHOST_BUY_DETECTED"), and re-placed it,
+       churning the grid. Ghost recovery is suppressed only within
        [buy_ack_ghost_grace_s] of this stamp, so a buy that genuinely leaves the
-       book later is still recovered promptly. Stays 0.0 for buys adopted
-       straight from the feed (never acked through us). *)
+       book later is still recovered promptly. Stays 0.0 for buys adopted from
+       the feed (never acked locally). *)
   ; mutable inflight_cancel_buy : bool
     (* true while buy cancel is pending confirmation via order channel *)
   ; mutable inflight_amend_buy : bool
@@ -147,7 +145,7 @@ type strategy_state =
   ; mutable asset_low : bool
     (* set when asset balance is insufficient for next sell; pauses sell and buy *)
   ; mutable last_sell_block_reason : string
-    (* last sell-placement blocker surfaced at warn level; dedup key for the
+    (* Last sell-placement blocker surfaced at warn level; dedup key for the
        repeat window so per-tick evaluations cannot spam the log *)
   ; mutable last_sell_block_log_at : float
     (* unix time of the last deduplicated sell-block log entry *)
@@ -156,70 +154,62 @@ type strategy_state =
   ; mutable capital_low_logged : bool (* suppresses repeated capital-low log warnings *)
   ; mutable capital_low_at_balance : float
     (* quote_bal snapshot when capital_low was set (log context only); -1.0 =
-       unstamped. Recovery is affordability-based: the flag clears as soon as
-       available quote covers the next buy (a price drop or a released
+       unstamped. Recovery is affordability-based: the flag clears once
+       available quote covers the next buy (a price drop or released
        reservation counts - no balance increase required). *)
   ; mutable last_buy_attempted_insufficient : bool
-    (* true for the one cycle where a buy was placed despite a KNOWN local
-       balance shortfall (balance snapshot stale): the resulting exchange
-       rejection is foreordained, so it must not latch capital_low again -
-       the fresh balance on the next store update governs. Cleared when a buy
-       is placed against sufficient balance or the order acks/fills. *)
+    (* true for the one cycle where a buy was placed despite a known local
+       balance shortfall (stale balance snapshot): the resulting rejection is
+       foreordained, so it must not latch capital_low again; the fresh balance
+       on the next store update governs. Cleared when a buy is placed against
+       sufficient balance or the order acks/fills. *)
   ; mutable sell_holds_since_balance : (float * float) list
-    (* (placed_at, qty) of sell placements whose venue-side hold may not yet
-       be reflected in the balance feed, oldest first. Applies to EVERY
+    (* (placed_at, qty) of sell placements whose venue-side hold may not yet be
+       reflected in the balance feed, oldest first. Applies to every
        accumulation venue: the tradeable figure (total - open-order hold) trails
-       a placement, so in that window [asset_balance] still counts the
-       just-sold base as free and a second trigger sizes its sell against an
-       overstated available and dips into reserved_base. Gating this on
-       [track_pending_sells = false] (Hyperliquid only) left Kraken/IBKR/Lighter
-       exposed to exactly that leak under volume bursts.
-
-       Release is by CONSUMPTION: each observed tradeable drop (the hold
-       reduces tradeable by exactly the held qty) retires the OLDEST hold(s)
-       FIFO. Per-hold baselines were gameable - an older hold netting dropped
-       tradeable below a newer hold's baseline and released the newer hold
-       early, over-offering a full lot. The grace still bounds a dead feed. *)
+       a placement, so [asset_balance] still counts just-sold base as free and a
+       second trigger could size its sell against an overstated available and
+       dip into reserved_base. Release is by consumption: each observed
+       tradeable drop retires the oldest hold(s) FIFO, so an older hold cannot
+       release a newer one early and over-offer a full lot. The grace bounds a
+       dead feed. *)
   ; mutable resuming_after_balance_flag : bool
     (* true for one cycle after asset_low/capital_low clears; re-gates new sells on accumulation_buffer *)
   ; mutable just_filled_buy : bool
-    (* true when a buy order has filled; the sell for the completed buy is
-       owed (retry-until-placed) until it is actually placed or verified
-       nothing-to-sell. Also armed on a buy placement whose sell could not be
-       placed, so the non-accrued inventory is sold as soon as the transient
-       blocker clears. *)
+    (* true when a buy has filled: the sell for the completed buy is owed
+       (retry-until-placed) until it is placed or verified nothing-to-sell.
+       Also armed on a buy placement whose sell could not be placed, so the
+       non-accrued inventory is sold once the transient blocker clears. *)
   ; mutable force_buy_reanchor : bool
     (* true when the sizing source (capital oracle) materialized the strategy
-        or published a changed grid_interval: the buy-trailing leg then
-        re-checks the resting buy against the ladder constraints. It amends
-        DOWN only when the resting price actually violates one - it sits
-        inside the restricted zone below the closest resting sell (above
-        sell - 2*gi of the SELL); a price already within one grid interval of
-        the reference is left alone (no sell within 2*gi = nothing to
-        correct). Upward movement is normal trailing. Set by the domain
-        worker on sizing change, cleared by the strategy once the resting
-        price satisfies the constraints. *)
+       or published a changed grid_interval: the buy-trailing leg rechecks the
+       resting buy against ladder constraints. It amends DOWN only when the
+       resting price violates one: it sits in the restricted zone below the
+       closest resting sell (above sell - 2*gi of the sell); a price within one
+       grid interval of the reference is left alone (no sell within 2*gi =
+       nothing to correct). Upward movement is normal trailing. Set by the
+       domain worker on sizing change; cleared by the strategy once the resting
+       price satisfies the constraints. *)
   ; mutable reserved_quote : float
     (* quote amount reserved by current open buy for this symbol *)
   ; mutable tif_recovery_pending : bool
     (* true when a TIF/ALO/post-only reject (or any terminal placement loss)
-       killed the strategy's buy while it had one approved and resting -
-       the buy leg must re-attempt (re-priced, after the normal 2s cooldown)
-       even while the capital oracle is INACTIVE. Rationale: the oracle halt
-       exists to block NEW capital commitments, but the killed buy was
-       already-approved sizing, and after a price DROP re-placing it at the
-       lower price strictly improves survival margin - leaving the asset
-       buyless while inactive (the [oracle_halted] "no open buy" rule) is
-       the failure mode this latch prevents. Set by the TIF terminal paths
-       in the event handlers (each failed re-attempt re-arms); cleared on
-       buy ack/adoption (a resting buy exists again) and on a buy fill. *)
+       killed the strategy's buy while it had one approved and resting. The buy
+       leg must re-attempt (repriced, after the normal 2s cooldown) even while
+       the capital oracle is INACTIVE: the oracle halt blocks new capital
+       commitments, but the killed buy was already-approved sizing, and after a
+       price drop re-placing it at the lower price strictly improves survival
+       margin. Leaving the asset buyless while inactive (the [oracle_halted]
+       "no open buy" rule) is the failure mode this latch prevents. Set by the
+       TIF terminal paths in the event handlers (each failed re-attempt
+       re-arms); cleared on buy ack/adoption (a resting buy exists again) and on
+       a buy fill. *)
   ; mutable tif_recovery_since : float
     (* unix time the latch was last armed; the window expires 900s after the
-       LAST armed kill (each failed re-attempt re-arms and refreshes the
-       window by design - during a violent move the recovery should keep
-       re-attempting while the venue keeps rejecting). The expiry exists so
-       a latch armed by a stray event cannot pin buys through a genuine,
-       persistent capital-survival halt once the kill events stop. *)
+       last armed kill (each failed re-attempt re-arms and refreshes it by
+       design, so a violent move keeps retrying while the venue rejects). The
+       expiry prevents a latch armed by a stray event from pinning buys through
+       a genuine, persistent capital-survival halt once the kill events stop. *)
   ; mutable accumulated_profit : float
     (* realized PnL from buy/sell cycles; gates accumulation sell placement *)
   ; mutable reserved_base : float
@@ -247,11 +237,11 @@ type strategy_state =
   ; persisted_idx : (int, (int * float * float) list) Hashtbl.t
   ; mutable persisted_idx_source : (float * float) list
     (* The [persisted_sell_levels] list the last [persisted_idx] build indexed.
-       Because the levels list is immutable and only ever replaced wholesale, a
+       The levels list is immutable and only ever replaced wholesale, so a
        physical-equality check against it is a correct "unchanged" test, letting
        [sync_open_orders] skip the O(m) index rebuild on the common cycle.
-       Starts as [[]] (the empty immediate), so a non-empty loaded list always
-       differs and is indexed on the first execution. *)
+       Starts as [[]], so a non-empty loaded list always differs and is indexed
+       on the first execution. *)
   ; mutable alloc_cleanup_words : int
   ; mutable alloc_sync_words : int
   ; mutable alloc_buy_words : int
@@ -267,10 +257,10 @@ type strategy_state =
     (* Per-execution attribution for the STRAT sub-phases (preamble, cleanup,
        sync_open_orders, buy leg, sell leg), filled by [execute_strategy] at
        each boundary: minor-word allocation (words) and wall time (ns). Read by
-       the domain on its max cycle to localize the [strat:] cost - allocation
-       and CPU are separately visible because a wide grid can be cheap to
-       allocate but expensive to scan (or vice versa). Plain ints, no
-       allocation; scratch only. *)
+       the domain on its max cycle to localize the [strat:] cost; allocation and
+       CPU are separately visible because a wide grid can be cheap to allocate
+       but expensive to scan (or vice versa). Plain ints, no allocation; scratch
+       only. *)
   ; mutable open_orders_scan_generation : int
   ; mutable open_orders_scan_valid : bool
   ; mutable cached_feed_total : float
@@ -280,36 +270,34 @@ type strategy_state =
   ; mutable cached_closest_sell_order : (string * float) option
   ; mutable cached_feed_sell_orders : (string * float * float) list
     (* Last feed scan's derived outputs, reused by [sync_open_orders] when the
-       venue's open-orders generation is unchanged: the scan itself is
-       O(open orders) and dominated by string-keyed hashtable work, so skipping
-       it when nothing changed makes the common strategy cycle O(1). The cache
-       is split from the ledger reconcile, which still runs every cycle to age
-       out lost placements and re-add locally-armed commitments. The
-       feed-listed sell list is reused by pointer (never mutated in place). *)
+       venue's open-orders generation is unchanged: the scan is O(open orders)
+       and dominated by string-keyed hashtable work, so skipping it when nothing
+       changed makes the common strategy cycle O(1). The cache is split from the
+       ledger reconcile, which still runs every cycle to age out lost placements
+       and re-add locally-armed commitments. The feed-listed sell list is reused
+       by pointer (never mutated in place). *)
   ; mutable last_fill_oid : string option
     (* OID of last profit-credited fill; replay resumption point *)
   ; mutable highest_startup_oid : string option
     (* highest fill OID observed during startup; bootstraps new strategies *)
   ; mutable skipped_fill_streak : int
     (* consecutive fills skipped by the replay guard; a non-trivial streak
-       (>= 50) outside startup replay signals the persisted high-water mark
-       is ahead of the venue's live id space and triggers a self-heal reset.
-       Reset to 0 when startup replay completes (replay skips are by design
-       and must not leak into live-mode counting) and on every processed
-       fill. *)
+       (>= 50) outside startup replay signals the persisted high-water mark is
+       ahead of the venue's live id space and triggers a self-heal reset. Reset
+       to 0 when startup replay completes (replay skips are by design and must
+       not leak into live-mode counting) and on every processed fill. *)
   ; mutable skipped_fills_total : int
     (* lifetime count of replay-guard skips; surfaced in WARN/CRITICAL logs *)
   ; mutable position_base : float
-    (* In-memory tracked base holdings: the sell-sizing source of truth.
-       Seeded from and reconciled to the venue's reported figure on every new
-       balance message, and overlaid by [buy_credits_since_balance] for fills
-       the feed has not netted yet - so a just-filled buy is immediately
-       sellable without waiting for the feed. The venue figure is never summed
-       with a drifting accumulator (the removed anticipated-credit overlay):
-       it is adopted outright, and the only addition is the timestamp-windowed
-       set of fills newer than the newest balance message. Same basis as the
-       venue's reported figure (tradeable for accumulation venues, gross for
-       Alpaca). *)
+    (* In-memory tracked base holdings: the sell-sizing source of truth. Seeded
+       from and reconciled to the venue's reported figure on every new balance
+       message, and overlaid by [buy_credits_since_balance] for fills the feed
+       has not netted yet, so a just-filled buy is immediately sellable without
+       waiting for the feed. The venue figure is adopted outright, never summed
+       with a drifting accumulator (the removed anticipated-credit overlay); the
+       only addition is the timestamp-windowed set of fills newer than the
+       newest balance message. Same basis as the venue's reported figure
+       (tradeable for accumulation venues, gross for Alpaca). *)
   ; mutable position_initialized : bool
     (* true once [position_base] has been seeded from a venue balance *)
   ; mutable buy_credits_since_balance : (float * float) list
@@ -321,31 +309,30 @@ type strategy_state =
   ; mutable attributed_balance_increase : float
     (* Venue balance increase already adopted into [position_base] but not yet
        matched to a buy fill. The executions and balance feeds are independent,
-       so a balance message that already contains a fill can be processed
-       BEFORE the fill event; without this, the fill would be counted twice
-       (once in the adopted figure, once in the overlay) and a sell could size
-       past the holdings. Each buy fill draws this down first; only the
-       unmatched remainder enters the overlay. Deposits that arrive before
-       their (nonexistent) fill merely under-credit - the safe direction. *)
+       so a balance message that already contains a fill can be processed before
+       the fill event; without this the fill would be counted twice (once in the
+       adopted figure, once in the overlay) and a sell could size past the
+       holdings. Each buy fill draws this down first; only the unmatched
+       remainder enters the overlay. Deposits that arrive before their
+       (nonexistent) fill merely under-credit - the safe direction. *)
   ; mutable position_venue_ts : float
     (* wall-clock time of the venue balance message last reconciled *)
   ; mutable last_seen_asset_balance : float
     (* previous asset_bal value; used to detect balance feed updates *)
   ; mutable last_balance_delta : float
     (* Signed change of the most recently adopted venue balance message
-       ([asset_balance] minus the prior adopted figure). Used by
-       [unnetted_sell_hold] to distinguish a message that NETS a sell hold
-       (flat or down) from one that merely carries a buy fill increase: a
-       buy fill raises the tradeable figure and bumps the same per-asset
-       freshness timestamp, so a positive delta must NOT be treated as
-       proof that an outstanding sell hold was applied. 0.0 until the first
-       message is adopted. *)
+       ([asset_balance] minus the prior adopted figure). [unnetted_sell_hold]
+       uses it to distinguish a message that NETS a sell hold (flat or down)
+       from one that merely carries a buy fill increase: a buy fill raises the
+       tradeable figure and bumps the same per-asset freshness timestamp, so a
+       positive delta must not be treated as proof an outstanding sell hold was
+       applied. 0.0 until the first message is adopted. *)
   ; mutable persistence_dirty : bool
     (* true when accumulation state changed; flushed by caller outside hotloop *)
   ; mutable persistence_key : string option
     (* "{strategy}:{symbol}:{venue}" store key, registered once the full
-       trading config (strategy name + venue) is known at strategy init.
-       None until then; hydration falls back to a symbol-segment scan. *)
+       trading config (strategy name + venue) is known at strategy init. None
+       until then; hydration falls back to a symbol-segment scan. *)
   ; mutable base_accumulation_enabled : bool
     (* per-strategy opt-in flag from config.json; disabled means zero I/O *)
   ; mutable sell_levels_enabled : bool
@@ -362,32 +349,31 @@ type strategy_state =
        execution cycle; used at sell-fill time for the spec's profit-window
        reserve trigger *)
   ; mutable cached_venue_min_qty : float
-    (* Venue MINIMUM accepted order quantity for [symbol] in base-asset units
-       (e.g. 0.0005 BTC on Hyperliquid). The floor every sell must clear. This
-       is the exchange's minimum - entirely separate from the grid's configured
-       order [qty]. Resolved from the live venue module at strategy init. *)
+    (* Venue minimum accepted order quantity for [symbol] in base-asset units
+       (e.g. 0.0005 BTC on Hyperliquid). The floor every sell must clear;
+       independent of the grid's configured [qty]. Resolved from the live venue
+       module at strategy init. *)
   ; mutable cached_venue_min_notional : float
-    (* Venue MINIMUM accepted order notional in QUOTE terms (0.0 = not
-        constrained). Some venues (Alpaca) express their minimum as an order
-        VALUE in the quote currency ($1 fractional minimum; Hyperliquid's 10
-        USDC spot floor); resolved from the venue's oracle adapter at strategy
-        init. The ONLY sell-placement floor: sells are not floored at
-        [cached_venue_min_qty] (accrual sells sell_mult x qty and residual
-        inventory size below it legitimately). *)
+    (* Venue minimum accepted order notional in quote terms (0.0 =
+       unconstrained). Some venues express their minimum as an order value in
+       the quote currency (Alpaca $1 fractional minimum; Hyperliquid's 10 USDC
+       spot floor); resolved from the venue's oracle adapter at strategy init.
+       The only sell-placement floor: sells are not floored at
+       [cached_venue_min_qty] (accrual sells sell_mult x qty and residual
+       inventory size below it legitimately). *)
   ; mutable exchange_reserved_atomic : float Atomic.t option
   ; processed_fills : (string, unit) Hashtbl.t
   ; processed_fills_queue : string Queue.t
   ; tracked_order_ids : (string, unit) Hashtbl.t
-    (* Bounded set of venue order ids this strategy has EVER tracked (acked,
-       adopted, or filled), FIFO-evicted at 1024. Distinguishes a late WS
-       cancel for a previously-tracked order (id present, no longer current
-       - must not purge placement tokens or clobber a concurrent placement's
-       guards) from a ghost cancel for a never-acked placement (id absent -
-       purge and reset are required for liveness). Degradation note: a late
-       cancel for an order evicted from this window (>1024 orders back)
-       falls back to the pre-fix ghost semantics - purge + full reset. That
-       matches the old behavior exactly, so the window bounds how far back
-       the protection reaches without ever behaving worse than before. *)
+    (* Bounded set of venue order ids this strategy has ever tracked (acked,
+       adopted, or filled), FIFO-evicted at 1024. Distinguishes a late WS cancel
+       for a previously-tracked order (id present, no longer current - must not
+       purge placement tokens or clobber a concurrent placement's guards) from
+       a ghost cancel for a never-acked placement (id absent - purge and reset
+       are required for liveness). A late cancel for an evicted order (>1024
+       orders back) falls back to the pre-fix ghost semantics - purge plus full
+       reset - so the window bounds how far back the protection reaches without
+       ever behaving worse than before. *)
   ; tracked_order_ids_queue : string Queue.t
   ; mutex : Mutex.t (* per-symbol mutex; prevents concurrent strategy execution *)
   }
@@ -453,13 +439,13 @@ let rec get_strategy_state asset_symbol =
   match Strategy_common.StringMap.find_opt state_key map with
   | Some state -> state
   | None ->
-    (* Hydrate from the split persistence stores. STRICT opt-out: when a
-       subsystem is disabled for this symbol (per-strategy config flag via
-       the configured-strategy registry), the corresponding store is never
-       touched - zero reads, zero writes. When the full strategy key is not
-       known yet at first access (strategy name + venue arrive with the
-       trading config), fall back to a unique symbol-segment scan of the
-       store keys ("{strategy}:{symbol}:{venue}"). *)
+    (* Hydrate from the split persistence stores. Strict opt-out: when a
+       subsystem is disabled for this symbol (per-strategy config via the
+       configured-strategy registry), the corresponding store is never touched -
+       zero reads, zero writes. When the full strategy key is not known at first
+       access (strategy name + venue arrive with the trading config), fall back
+       to a unique symbol-segment scan of the store keys
+       ("{strategy}:{symbol}:{venue}"). *)
     let base_accumulation_on =
       Dio_persistence.Persistence_orchestrator.base_accumulation_opted_in asset_symbol
     in
@@ -640,9 +626,9 @@ let rec get_strategy_state asset_symbol =
 ;;
 
 (** Records a venue order id in the strategy's bounded ever-tracked set.
-    Shared by the event handlers (ack/fill/amend) and the open-orders
-    adoption scan; see [strategy_state.tracked_order_ids]. Must be called
-    with the strategy mutex held. *)
+    Shared by the event handlers (ack/fill/amend) and the open-orders adoption
+    scan; see [strategy_state.tracked_order_ids]. Caller must hold the strategy
+    mutex. *)
 let add_tracked_order_id state order_id =
   if not (Hashtbl.mem state.tracked_order_ids order_id)
   then (

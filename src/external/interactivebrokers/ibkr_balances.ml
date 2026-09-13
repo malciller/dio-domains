@@ -49,8 +49,7 @@ let handle_account_value fields =
     Atomic.set ready true;
     try Lwt_condition.broadcast ready_condition () with
     | _ -> ());
-  (* Log every key at debug level; balances update frequently and are not
-     worth info-level noise. *)
+  (* Balances update frequently; log at debug only. *)
   match key with
   | "TotalCashBalance"
   | "AvailableFunds"
@@ -105,7 +104,6 @@ let handle_portfolio_value fields =
       realized_pnl
 ;;
 
-(** Registers account/portfolio handlers. *)
 let register_handlers () =
   Ibkr_dispatcher.register_handler
     ~msg_id:Ibkr_types.msg_in_account_value

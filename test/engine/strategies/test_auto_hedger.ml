@@ -2,7 +2,7 @@ open Dio_strategies
 open Dio_strategies.Strategy_common
 
 let setup () =
-  (* Clear the ring buffer and reset state *)
+  (* Reset hedger state and drain pending orders. *)
   ignore (Auto_hedger.get_pending_orders 1000);
   Auto_hedger.reset_state ()
 ;;
@@ -26,7 +26,7 @@ let test_hedge_buy_with_tob () =
   Alcotest.(check string) "Order symbol" "HYPE" order.symbol;
   Alcotest.(check string) "Order side" "sell" (string_of_order_side order.side);
   Alcotest.(check (float 0.0001)) "Order qty" 100.0 order.qty;
-  (* Sell hedge should use best BID as limit price *)
+  (* Sell hedge uses best BID as limit price. *)
   Alcotest.(check string) "Order type is limit" "limit" order.order_type;
   Alcotest.(check (option (float 0.0001)))
     "Limit price is best bid"
@@ -60,9 +60,9 @@ let test_sell_closes_full_short () =
   Alcotest.(check int) "One close order generated" 1 (List.length pending);
   let order = List.hd pending in
   Alcotest.(check string) "Order side" "buy" (string_of_order_side order.side);
-  (* Close qty should be the full hedge qty (100.0), NOT the sell qty (50.0) *)
+  (* Close qty is the full hedge qty (100.0), not the sell qty (50.0). *)
   Alcotest.(check (float 0.0001)) "Close qty is full hedge" 100.0 order.qty;
-  (* Buy hedge (close) should use best ASK as limit price *)
+  (* Buy hedge (close) uses best ASK as limit price. *)
   Alcotest.(check string) "Order type is limit" "limit" order.order_type;
   Alcotest.(check (option (float 0.0001)))
     "Limit price is best ask"

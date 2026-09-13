@@ -1,30 +1,28 @@
 (** Canary / stop-the-world detector.
 
-    A trading domain paused by another domain's major collection observes
-    neither a minor nor a major collection delta in its own [Gc.quick_stat]
-    counters, so the per-cycle [Gc_monitor] cause string stays blank while the
-    cycle latency balloons. This module runs a dedicated busy-spin domain that
-    reads a non-allocating monotonic clock and records the gap between
+    A trading domain paused by another domain's major collection observes no GC
+    delta in its own [Gc.quick_stat] counters, so the per-cycle [Gc_monitor]
+    cause string stays blank while cycle latency balloons. A dedicated busy-spin
+    domain reads a non-allocating monotonic clock and records the gap between
     consecutive reads. A gap far above the spin loop's natural iteration time is
     a process-wide runtime pause (major-GC stop-the-world) or a scheduler
-    descheduling, reported on the same window cadence as the per-domain latency
-    profiles so the two can be correlated by timestamp.
+    descheduling. Windows are reported on the same cadence as the per-domain
+    latency profiles for timestamp correlation.
 
-    The clock is {!Monotonic_clock.now_ns}, an immediate-[int] C stub: every
+    The clock is {!Monotonic_clock.now_ns}, an immediate-[int] C stub. Every
     stdlib clock ([Mtime_clock.now_ns], [Unix.gettimeofday], [Gc.quick_stat])
-    allocates, and a canary that allocates would trigger its own minor
-    collections and end up measuring itself rather than the runtime. *)
+    allocates, and an allocating canary would trigger its own minor collections
+    and measure itself rather than the runtime. *)
 
 (* OxCaml marks [Domain.spawn] as [do_not_spawn_domains]. The canary runs at most
-   ONE dedicated diagnostic domain, gated by the [DIO_CANARY] kill switch, and
-   exists precisely to observe process-wide runtime pauses. Acknowledged rather
-   than rewritten. *)
+   one dedicated diagnostic domain, gated by the [DIO_CANARY] kill switch, to
+   observe process-wide runtime pauses. *)
 [@@@alert "-unsafe_multidomain"]
 [@@@alert "-do_not_spawn_domains"]
 
 let section = "canary"
 
-(** [enabled ()] honors the [DIO_CANARY] kill switch; the canary busy-spins a
+(** [enabled ()] honors the [DIO_CANARY] kill switch. The canary busy-spins a
     full core, so it must be easy to disable outside a diagnostic window. *)
 let enabled () =
   match Sys.getenv_opt "DIO_CANARY" with
@@ -41,10 +39,10 @@ let env_float name default =
      | None -> default)
 ;;
 
-(** [run ~threshold_us ~window_seconds] never returns. It records the gap
-    between consecutive clock reads into a latency histogram and logs a summary
-    every [window_seconds]. Reporting on the same cadence as the per-domain
-    windows lets a global pause be matched to the domain cycles that spiked. *)
+(** [run ~threshold_us ~window_seconds] never returns. Records the gap between
+    consecutive clock reads into a latency histogram and logs a summary every
+    [window_seconds], on the same cadence as the per-domain windows so a global
+    pause can be matched to the domain cycles that spiked. *)
 let run ~threshold_us ~window_seconds =
   let prof = Latency_profiler.create ~bucket_us:1 ~max_latency_us:10_000 "canary" in
   let window_ns = int_of_float (window_seconds *. 1_000_000_000.) in
@@ -74,10 +72,9 @@ let run ~threshold_us ~window_seconds =
   done
 ;;
 
-(** [start ()] spawns the detector domain unless disabled by [DIO_CANARY].
-    [DIO_CANARY_THRESHOLD_US] (default 10) and [DIO_CANARY_WINDOW_S] (default 5)
-    tune the reported spike threshold and the log window. Detached: it runs for
-    the life of the process and is never joined. *)
+(** [start ()] spawns the detector domain unless [DIO_CANARY] disables it.
+    [DIO_CANARY_THRESHOLD_US] (default 10) sets the spike threshold and
+    [DIO_CANARY_WINDOW_S] (default 5) the log window. Detached; never joined. *)
 let start () =
   if enabled ()
   then (

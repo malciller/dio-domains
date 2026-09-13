@@ -1,15 +1,11 @@
 open Notty
 open Theme
 
-(** Ticker Feed Component.
-    Scrolls assets horizontally across the screen that are NOT:
-    - Active strategies
-    - Cash (quote currencies)
-    - Active balances
-    This primarily targets paused strategies or tracked tickers with zero balance.
-*)
+(** Ticker feed: horizontally scrolling assets, primarily paused strategies
+    and zero-balance tracked tickers. Excludes active strategies, cash (quote
+    currencies), and active balances. *)
 
-(** Reusable grouping table, cleared each render to avoid per-frame
+(** Grouping table keyed by base asset; cleared each render to avoid per-frame
     allocation. *)
 let group_tbl : (string, (Notty.attr * string * float * float * float) list) Hashtbl.t =
   Hashtbl.create 16
@@ -19,7 +15,6 @@ let render_ticker w (snapshot : Snapshot.t) =
   let t = Theme.current () in
   let strats = snapshot.strategies in
   let all_balances = snapshot.balances in
-  (* Gather all strategies that currently have a usable mid price. *)
   let all_strategies =
     List.filter_map
       (fun (symbol, (st : Snapshot.strategy)) ->
@@ -29,8 +24,6 @@ let render_ticker w (snapshot : Snapshot.t) =
          if mid <= 0.0 then None else Some (st.exchange, symbol, mid, bid, ask))
       strats
   in
-  (* Also gather non-quote balances from all_balances in case the engine
-     decides to push them in the future. *)
   let non_quote_bals =
     List.filter_map
       (fun (b : Snapshot.balance) ->
@@ -83,8 +76,8 @@ let render_ticker w (snapshot : Snapshot.t) =
         (fun g1 g2 -> String.compare (fst (List.hd g1)) (fst (List.hd g2)))
         combined_groups
     in
-    (* Build the ticker string chunks: each chunk groups the entries for one
-       asset, and single-entry groups are paired together to save space. *)
+    (* One chunk per asset group; single-entry groups are paired two per row
+       to save space. *)
     let chunks_list =
       List.map
         (fun group ->
@@ -173,13 +166,12 @@ let render_ticker w (snapshot : Snapshot.t) =
       done;
       !total_w <= max_w
     in
-    (* Find the maximum number of columns that fit, searching from n down
-       to 1. *)
+    (* Largest column count that fits, searching from [n] down to 1. *)
     let rec find_cols c = if c <= 1 then 1 else if fits c then c else find_cols (c - 1) in
     let cols = if n = 0 then 1 else find_cols n in
     let col_widths = get_col_widths cols in
-    (* Cycle the visible items on the wall clock so the feed rotates
-       independently of the render loop. *)
+    (* Rotate visible items on the wall clock (5s cycle), independent of the
+       render loop. *)
     let cycle_time = 5.0 in
     let page = int_of_float (Unix.gettimeofday () /. cycle_time) in
     let slot_images =
@@ -191,7 +183,8 @@ let render_ticker w (snapshot : Snapshot.t) =
         else (
           let len = List.length items in
           let item = List.nth items (page mod len) in
-          (* Pad strictly to col width so adjacent elements never bounce horizontally *)
+          (* Pad to exact column width so adjacent elements do not bounce
+             horizontally. *)
           I.hsnap ~align:`Left col_widths.(c) item))
     in
     let valid_slots = List.filter (fun img -> I.width img > 0) slot_images in

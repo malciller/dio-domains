@@ -1,9 +1,8 @@
-(** Account collateral and position tracking module for Alpaca.
+(** Account collateral and position tracking for Alpaca.
 
-    Lock-free reads (HFT_AUDIT.md H2): the background refresher fiber is the
-    single writer. It builds a fresh immutable balance table and publishes it
-    with one [Atomic.set]; readers grab the reference with [Atomic.get] and
-    look up without ever taking a mutex on the read path. *)
+    Concurrency: the background refresher fiber is the single writer; it builds
+    a fresh immutable table and publishes it with one [Atomic.set]. Readers use
+    [Atomic.get] and take no mutex on the read path. *)
 
 open Lwt.Infix
 
@@ -14,15 +13,13 @@ let balances : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 
 
 let total_balances : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
 
-(** Immediately-sellable balance per asset ([qty] minus open-order holds,
-    Alpaca's [qty_available]). Published from the same poll as [balances], so
-    the strategy can size sells against the venue's own free figure instead of
-    reconstructing holds from the eventually-consistent open-order cache. *)
+(** Immediately-sellable balance per asset: Alpaca [qty_available] ([qty] minus
+    open-order holds). Published by the same poll as [balances]. *)
 let available_balances : (string, float) Hashtbl.t Atomic.t =
   Atomic.make (Hashtbl.create 16)
 ;;
 
-(** Published position mark prices. Lock-free Atomic table for fallback TOB when WS quotes are quiet. *)
+(** Published position mark prices; lock-free fallback TOB when WS quotes are quiet. *)
 let position_marks : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
 
 let initial_data_received = Atomic.make false
@@ -53,9 +50,9 @@ let get_total_balance asset =
      | _ -> 0.0)
 ;;
 
-(** Venue-authoritative immediately-sellable quantity for [asset]. Returns NaN
-    when the poll did not report an entry for [asset], so callers fall back to
-    their local basis instead of treating "unknown" as "nothing sellable". *)
+(** Immediately-sellable quantity for [asset]; returns NaN when the poll
+    reported no entry, so callers fall back to their local basis rather than
+    treating unknown as zero. *)
 let get_available_balance asset =
   let t = Atomic.get available_balances in
   let key = if asset = "USDC" then "USD" else asset in
@@ -65,8 +62,7 @@ let get_available_balance asset =
      | _ -> Float.nan)
 ;;
 
-(** Test hook: publish one asset's available balance without a network poll, so
-    the venue-authoritative sell-sizing path can be exercised in unit tests. *)
+(** Test hook: publish one asset's available balance without a network poll. *)
 let set_available_balance_for_test asset v =
   let t = Atomic.get available_balances in
   let copy = Hashtbl.copy t in
@@ -96,8 +92,8 @@ let update_balances () =
   | Ok acc ->
     Alpaca_rest.get_positions ()
     >>= fun pos_res ->
-    (* Build the new snapshots entirely before publishing, so readers never
-       observe a half-updated table. *)
+    (* Build new snapshots entirely before publishing; readers never observe a
+       half-updated table. *)
     let new_balances = Hashtbl.create 16 in
     let new_total = Hashtbl.create 16 in
     let new_marks = Hashtbl.create 16 in
@@ -123,10 +119,9 @@ let update_balances () =
            ~section
            "Alpaca loaded %d active position(s)"
            (List.length positions);
-       (* Position mark prices are stored in [position_marks] as a fallback
-          price reference when the active WS quote stream is quiet (e.g. during
-          pre-market or after-hours on the free IEX feed when IEX is closed).
-          Live WS quotes in Alpaca_orderbook always take precedence when present. *)
+       (* Mark prices are a fallback reference when the WS quote stream is quiet
+          (e.g. IEX closed pre/after-market). Live WS quotes in
+          Alpaca_orderbook take precedence. *)
        List.iter
          (fun (p : Alpaca_types.position_record) ->
             Hashtbl.replace new_balances p.symbol p.qty;

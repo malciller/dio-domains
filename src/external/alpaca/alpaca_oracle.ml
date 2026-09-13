@@ -1,16 +1,13 @@
-(** Alpaca oracle data-venue adapter.
+(** Alpaca oracle data-venue adapter; implements [Exchange_intf.Oracle.S].
 
-    Implements [Exchange_intf.Oracle.S] for the capital oracle's data layer:
-    historical daily bars (/v2/stocks/{symbol}/bars, paginated on
-    next_page_token), the market calendar (/v2/calendar), account balances
-    (account + positions via [Alpaca_rest], commission-free fees) and
-    instrument metadata (static 0.01 tick / fractional lots - nothing to
-    fetch).
+    Endpoints: daily bars (/v2/stocks/{symbol}/bars, paginated on
+    next_page_token), market calendar (/v2/calendar), account balances
+    (account + positions via [Alpaca_rest]; commission-free fees), instrument
+    metadata (static 0.01 tick / fractional lots, nothing to fetch).
 
-    The pure [parse_*] functions are fixture-testable without network.
-    [fetch_bars] returns RAW bars; the oracle sorts, de-duplicates and
-    normalizes centrally. HTTP calls are timeout-bounded so a hung upstream
-    cannot freeze the oracle pass. *)
+    [parse_*] functions are fixture-testable without network. [fetch_bars]
+    returns RAW bars; the oracle sorts, de-duplicates, normalizes centrally.
+    HTTP calls are timeout-bounded. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
@@ -21,8 +18,8 @@ let trading_base_url = "https://paper-api.alpaca.markets"
 let max_pages = 30
 let default_timeout = 10.0
 
-(** Bounded GET: a hung upstream raises after [default_timeout] instead of
-    freezing the oracle pass. *)
+(** Bounded GET: a hung upstream raises after [default_timeout]; does not
+    freeze the oracle pass. *)
 let get ?(headers = Cohttp.Header.init ()) (uri : Uri.t)
   : (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
   =
@@ -125,10 +122,9 @@ let fetch_calendar ~start_date ~end_date : string list Lwt.t =
   else Lwt.return (parse_calendar (Yojson.Safe.from_string body_str))
 ;;
 
-(** Fetch daily bars for [symbol] starting at [from] (ISO date of the first
-    day; [None] = "2010-01-01"), paginating on next_page_token. [feed] is
-    "iex" or "sip"; [end_date] bounds the request window (defaults to
-    today). *)
+(** Daily bars for [symbol] from [from] (ISO date; [None] = "2010-01-01"),
+    paginating on next_page_token. [feed] is "iex" or "sip"; [end_date] bounds
+    the request window (default today). *)
 let fetch_bars ?(feed = "iex") ?end_date ~from ~symbol () : Exchange.Types.bar list Lwt.t =
   load_dotenv ();
   let start_date = Option.value from ~default:"2010-01-01" in
@@ -229,11 +225,10 @@ let fetch_balances ~testnet : ((string * float * float) list, string) result Lwt
     (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
 ;;
 
-(** Live websocket-fed balance snapshot: the engine supervisor's account feed
-    holds cash (available) / equity (total) plus per-symbol positions,
-    mirroring the REST account+positions fetch ([fetch_balances]). Returns
-    [Some] triples when the store holds data, [None] otherwise (the oracle
-    runtime then falls back to the REST one-shot). *)
+(** Live websocket-fed balance snapshot: cash (available), equity (total), and
+    per-symbol positions, mirroring [fetch_balances]. Returns [Some] triples
+    when the store holds data, [None] otherwise (the oracle runtime falls back
+    to the REST one-shot). *)
 let live_balances () : (string * float * float) list option =
   match Exchange.Registry.get "alpaca" with
   | None -> None
@@ -255,16 +250,14 @@ let live_balances () : (string * float * float) list option =
 
 let default_quote = "USD"
 
-(** Alpaca's venue floor is a DOLLAR order notional, not a base quantity: the
-    API requires at least $1 in order value (the minimum for fractional-share
-    orders). The live grid's sell-leg inventory gate and the replay floor both
-    consume this, so a sell is only attempted when the non-accrued inventory
-    is worth at least this floor. *)
+(** Venue floor is DOLLAR notional, not base quantity: Alpaca requires at least
+    $1 order value (minimum fractional-share order). The sell-leg inventory
+    gate attempts a sell only when non-accrued inventory is worth >= this. *)
 let min_notional ~symbol:_ = 1.0
 
 (* ---- Instrument metadata (static 0.01 tick, fractional lots) ---- *)
 
 let init_instruments ~testnet:_ ~symbols:_ : unit Lwt.t = Lwt.return_unit
 let name = "alpaca"
-(* Registration happens in [Alpaca_module] (a module cannot register itself:
-   the wrapped self-path would dangle). *)
+(* Registered in [Alpaca_module]; a module cannot register itself (the wrapped
+   self-path dangles). *)

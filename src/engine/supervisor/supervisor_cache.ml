@@ -1,14 +1,13 @@
-(** Supervisor cache: periodically snapshots connection state from
-    the supervisor registry for read-only consumption by monitoring
-    subsystems. Publishes updates via an event bus and an Lwt condition
-    variable, with exponential backoff on consecutive snapshot failures. *)
+(** Supervisor cache. Periodically snapshots connection state from the
+    supervisor registry for read-only consumption by monitoring subsystems.
+    Publishes updates via an event bus and an Lwt condition variable; applies
+    exponential backoff on consecutive snapshot failures. *)
 
 open Concurrency
 open Supervisor_types
 
-(** Immutable point-in-time snapshot of a single connection's state.
-    Derived from the mutable [Supervisor_types.connection] record under
-    its per-connection mutex. *)
+(** Immutable point-in-time snapshot of one connection's state, read from
+    the mutable connection record under its per-connection mutex. *)
 type connection_snapshot =
   { name : string
   ; state : Supervisor_types.connection_state
@@ -21,15 +20,14 @@ type connection_snapshot =
   ; last_updated : float
   }
 
-(** Typed event bus carrying the full list of connection snapshots
-    on each cache refresh cycle. *)
+(** Typed event bus carrying the full connection-snapshot list on each
+    cache refresh cycle. *)
 module ConnectionSnapshotEventBus = Event_bus.Make (struct
     type t = connection_snapshot list
   end)
 
-(** Mutable cache state. Holds the latest snapshot list, the event bus
-    for downstream subscribers, an Lwt condition for synchronous waiters,
-    and backoff bookkeeping for fault tolerance during snapshot failures. *)
+(** Mutable cache state: latest snapshot list, downstream event bus,
+    synchronous-waiter condition, and failure-backoff bookkeeping. *)
 type t =
   { mutable current_snapshots : connection_snapshot list
   ; snapshot_event_bus : ConnectionSnapshotEventBus.t
@@ -40,9 +38,9 @@ type t =
   ; mutable backoff_until : float
   }
 
-(** Broadcasts the update condition, suppressing [Invalid_argument]
-    from already-resolved promises that can arise under concurrent
-    broadcast races. Other exceptions are logged as warnings. *)
+(** Broadcasts the update condition, suppressing [Invalid_argument] from
+    already-resolved promises under concurrent broadcast races. Other
+    exceptions are logged as warnings. *)
 let safe_broadcast_update_condition cache =
   try Lwt_condition.broadcast cache.update_condition () with
   | Invalid_argument _ ->
@@ -55,8 +53,8 @@ let safe_broadcast_update_condition cache =
       (Printexc.to_string exn)
 ;;
 
-(** Module-level singleton cache instance. Initialized with empty snapshots,
-    a 5-second update interval, and zero backoff state. *)
+(** Module-level singleton cache: empty snapshots, 5s update interval,
+    zero backoff state. *)
 let cache =
   { current_snapshots = []
   ; snapshot_event_bus = ConnectionSnapshotEventBus.create "connection_snapshots"
@@ -70,15 +68,14 @@ let cache =
 
 let initialized = ref false
 
-(** Reads all connections from the supervisor registry and produces an
-    immutable snapshot list. Acquires [registry_mutex] briefly to copy
-    the connection list, then locks each connection's individual mutex
-    to read its fields. Uptime is computed only for connections in the
-    [Connected] state. Circuit breaker state is encoded as a float:
+(** Reads all registered connections and returns an immutable snapshot list.
+    Copies the connection list under [registry_mutex], then locks each
+    per-connection mutex to read its fields. Uptime is computed only for
+    [Connected] connections. Circuit breaker state is encoded as float:
     0.0 = Closed, 0.5 = HalfOpen, 1.0 = Open. *)
 let create_connection_snapshots () : connection_snapshot list =
   let now = Unix.time () in
-  (* Copy connection values under the registry mutex to minimize hold time. *)
+  (* Copy connection values under [registry_mutex] to minimize hold time. *)
   Mutex.lock Supervisor_types.registry_mutex;
   let conn_list = Hashtbl.to_seq_values Supervisor_types.connections |> List.of_seq in
   Mutex.unlock Supervisor_types.registry_mutex;
@@ -113,10 +110,10 @@ let create_connection_snapshots () : connection_snapshot list =
     conn_list
 ;;
 
-(** Forces an immediate cache refresh. On success, replaces the stored
-    snapshots, resets failure counters, publishes via the event bus, and
-    broadcasts the update condition. On failure, increments the consecutive
-    failure counter and sets an exponential backoff ceiling (capped at 60s). *)
+(** Forces an immediate cache refresh. On success: replaces the snapshots,
+    resets failure counters, publishes via the event bus, and broadcasts the
+    update condition. On failure: increments the consecutive-failure counter
+    and sets an exponential backoff ceiling capped at 60s. *)
 let force_update () =
   let now = Unix.time () in
   try
@@ -140,8 +137,8 @@ let force_update () =
       (Printexc.to_string exn)
 ;;
 
-(** Idempotent initialization guard. Performs the first cache refresh
-    and logs startup. Subsequent calls are no-ops. *)
+(** Idempotent initialization guard: runs the first cache refresh and logs
+    startup once; subsequent calls are no-ops. *)
 let init () =
   if !initialized
   then ()
@@ -151,6 +148,6 @@ let init () =
     Logging.info ~section:"supervisor_cache" "Supervisor cache initialized")
 ;;
 
-(** Returns the most recent snapshot list. Lock-free read of the
-    mutable field; safe for single-writer/multi-reader access patterns. *)
+(** Returns the most recent snapshot list. Lock-free read of the mutable
+    field; safe for single-writer/multi-reader access. *)
 let get_snapshots () = cache.current_snapshots

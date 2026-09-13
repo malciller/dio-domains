@@ -1,5 +1,5 @@
 let test_exec_type_conversions () =
-  (* Test exec_type string conversions *)
+  (* exec_type string conversions. *)
   let test_cases =
     [ Kraken.Kraken_executions_feed.PendingNew, "pending_new"
     ; Kraken.Kraken_executions_feed.New, "new"
@@ -30,7 +30,7 @@ let test_exec_type_conversions () =
 ;;
 
 let test_side_conversions () =
-  (* Test side string conversions *)
+  (* side string conversions. *)
   let buy_str =
     Kraken.Kraken_executions_feed.string_of_side Kraken.Kraken_executions_feed.Buy
   in
@@ -57,7 +57,7 @@ let test_side_conversions () =
 ;;
 
 let test_order_status_conversions () =
-  (* Test order_status string conversions *)
+  (* order_status string conversions. *)
   let test_cases =
     [ Kraken.Kraken_executions_feed.PendingNewStatus, "pending_new"
     ; Kraken.Kraken_executions_feed.NewStatus, "new"
@@ -85,12 +85,10 @@ let test_order_status_conversions () =
 ;;
 
 let test_ring_buffer_operations () =
-  (* Test RingBuffer create, write, and read operations *)
+  (* RingBuffer create/write/read. *)
   let buffer = Kraken.Kraken_executions_feed.RingBuffer.create 4 in
-  (* Initially should have no data *)
   let initial_data = Kraken.Kraken_executions_feed.RingBuffer.read_latest buffer in
   Alcotest.(check (option int)) "initial buffer state is empty" None initial_data;
-  (* Write some test data *)
   Kraken.Kraken_executions_feed.RingBuffer.write buffer 42;
   Kraken.Kraken_executions_feed.RingBuffer.write buffer 123;
   Kraken.Kraken_executions_feed.RingBuffer.write buffer 999;
@@ -99,10 +97,9 @@ let test_ring_buffer_operations () =
   Alcotest.(check bool) "buffer contains 42" true (List.mem 42 data_after_writes);
   Alcotest.(check bool) "buffer contains 123" true (List.mem 123 data_after_writes);
   Alcotest.(check bool) "buffer contains 999" true (List.mem 999 data_after_writes);
-  (* Test buffer wrap-around *)
+  (* Wrap-around overwrites oldest. *)
   Kraken.Kraken_executions_feed.RingBuffer.write buffer 555;
   Kraken.Kraken_executions_feed.RingBuffer.write buffer 777;
-  (* This should overwrite oldest data *)
   let data_after_wrap = Kraken.Kraken_executions_feed.RingBuffer.read_all buffer in
   Alcotest.(check int) "buffer length after wrap-around" 4 (List.length data_after_wrap);
   Alcotest.(check bool)
@@ -122,7 +119,7 @@ let test_ring_buffer_operations () =
 ;;
 
 let test_execution_event_structure () =
-  (* Test execution_event record structure *)
+  (* execution_event record. *)
   let test_event =
     { Kraken.Kraken_executions_feed.order_id = "order123"
     ; symbol = "BTC/USD"
@@ -189,7 +186,7 @@ let test_execution_event_structure () =
 ;;
 
 let test_open_order_structure () =
-  (* Test open_order record structure *)
+  (* open_order record. *)
   let test_order =
     { Kraken.Kraken_executions_feed.order_id = "open123"
     ; symbol = "ETH/USD"
@@ -236,16 +233,14 @@ let test_open_order_structure () =
 ;;
 
 let test_symbol_store_management () =
-  (* Test symbol store creation and basic operations *)
+  (* Symbol store creation and basic operations. *)
   let symbol = "TEST_SYMBOL" in
-  (* Initially should not have execution data *)
   Alcotest.(check bool)
     "initially no execution data"
     false
     (Kraken.Kraken_executions_feed.has_execution_data symbol);
-  (* Get symbol store (creates it if needed) *)
+  (* Store creation adds no data. *)
   let _store = Kraken.Kraken_executions_feed.get_symbol_store symbol in
-  (* Should still not have data since we haven't added any *)
   Alcotest.(check bool)
     "no data after store creation"
     false
@@ -253,31 +248,27 @@ let test_symbol_store_management () =
 ;;
 
 let test_wait_for_execution_data () =
-  (* Test waiting for execution data (with timeout) *)
+  (* wait_for_execution_data timeout behavior. *)
   let symbols = [ "EXEC_TEST1"; "EXEC_TEST2" ] in
-  (* Initially should not have data *)
   Alcotest.(check bool)
     "initially no execution data for symbols"
     false
     (List.for_all Kraken.Kraken_executions_feed.has_execution_data symbols);
-  (* Start waiting with very short timeout *)
   let result =
     Lwt_main.run (Kraken.Kraken_executions_feed.wait_for_execution_data symbols 0.001)
   in
-  (* Should timeout since no data is available *)
   Alcotest.(check bool) "wait times out with no data" false result
 ;;
 
 let test_ring_buffer_capacity () =
-  (* Test that ring buffer respects capacity limits *)
+  (* Ring buffer capacity limits. *)
   let buffer = Kraken.Kraken_executions_feed.RingBuffer.create 3 in
-  (* Fill buffer to capacity *)
   Kraken.Kraken_executions_feed.RingBuffer.write buffer 1;
   Kraken.Kraken_executions_feed.RingBuffer.write buffer 2;
   Kraken.Kraken_executions_feed.RingBuffer.write buffer 3;
   let data_at_capacity = Kraken.Kraken_executions_feed.RingBuffer.read_all buffer in
   Alcotest.(check int) "buffer length at capacity" 3 (List.length data_at_capacity);
-  (* Add one more - should maintain capacity *)
+  (* Overflow drops the oldest element. *)
   Kraken.Kraken_executions_feed.RingBuffer.write buffer 4;
   let data_after_overflow = Kraken.Kraken_executions_feed.RingBuffer.read_all buffer in
   Alcotest.(check int) "buffer length after overflow" 3 (List.length data_after_overflow);
@@ -313,9 +304,9 @@ let make_open_sell ~id ~symbol ~qty ~price =
 ;;
 
 let test_inject_pre_existing_open_sell () =
-  (* REGRESSION: orders that existed before this process started (or beyond
-     the WS snap_orders cap) must be adoptable. The REST /OpenOrders bootstrap
-     injects them into the same cache the strategy's open-order scan reads, so
+  (* Regression: orders existing before process start (or beyond the WS
+     snap_orders cap) must be adoptable. The REST /OpenOrders bootstrap injects
+     them into the same cache the strategy's open-order scan reads, so
      pre-existing sells are reserved inventory, not free. *)
   let symbol = "PREEXIST/USD" in
   Kraken.Kraken_executions_feed.inject_open_orders
@@ -334,10 +325,10 @@ let test_inject_pre_existing_open_sell () =
 ;;
 
 let test_snapshot_hook_fires () =
-  (* The supervisor wires the REST bootstrap to this hook. Every snapshot
-     (initial subscribe AND every reconnect) must fire it, because the
-     snapshot reconcile removes cached orders absent from the (capped)
-     snapshot - including the ones the bootstrap just restored. *)
+  (* Supervisor wires the REST bootstrap to this hook. Every snapshot (initial
+     subscribe and every reconnect) must fire it: snapshot reconcile removes
+     cached orders absent from the capped snapshot, including ones the
+     bootstrap restored. *)
   let calls = ref 0 in
   Kraken.Kraken_executions_feed.set_on_snapshot_hook (fun () -> incr calls);
   Kraken.Kraken_executions_feed.handle_snapshot
@@ -348,9 +339,9 @@ let test_snapshot_hook_fires () =
 ;;
 
 let test_resolve_rest_pair_to_symbol () =
-  (* REST /OpenOrders [descr.pair] arrives in the legacy pair form; it must be
-     mapped to the configured symbol or the injected order lands under a key
-     the strategy never scans. *)
+  (* REST /OpenOrders [descr.pair] arrives in legacy pair form; it must map to
+     the configured symbol or the injected order lands under a key the strategy
+     never scans. *)
   let symbols = [ "XMR/USD"; "BTC/USD"; "ETH/USD" ] in
   Alcotest.(check string)
     "altname maps to the configured symbol"

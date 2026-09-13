@@ -1,25 +1,21 @@
-(* Pooling, priority & cascades - the pure capital-allocation engine.
+(* Oracle_pools - pure capital-allocation engine: pooling, priority, cascade.
 
-   Pools are PER VENUE: one quote pool and one base pool shared by that
-   venue's strategies; pools never cross venues (two strategies may share a
-   symbol on a venue). Pool == exchange balance: quantities tied up in
-   resting orders are part of the pool but unavailable for new allocation;
-   placement/fill/cancel moves quantity in and out of availability. This
-   module owns only the arithmetic - the caller feeds balances minus tied
-   amounts and applies the returned actions to live orders.
+   Pools are per venue: one quote and one base pool per venue, never crossing
+   venues. Pool equals exchange balance; quantities tied in resting orders
+   remain in the pool but are unavailable for new allocation. This module
+   owns only the arithmetic; the caller feeds balances minus tied amounts and
+   applies the returned actions.
 
-   Allocation walks strategies in CONFIG PRESENTATION ORDER (first =
-   highest priority), per venue: each strategy is funded iff its need fits
-   the remaining availability; unfundable strategies are skipped and their
-   capacity passes down. A lower-priority strategy is never starved while
-   quote for it exists.
+   Allocation walks strategies in config presentation order (first = highest
+   priority): each is funded iff its need fits remaining availability;
+   skipped strategies pass their capacity down. A lower-priority strategy is
+   never starved while quote for it exists.
 
-   The cancellation cascade fires per event when a higher-priority need
-   cannot fit available quote: lower-priority RESTING BUYS are cancelled -
-   many lesser orders may be cancelled to satisfy one greater - until it
-   fits. If no combination fits, resolution proceeds to the next-highest
-   priority. Every cancelled strategy is re-evaluated on that event and
-   resumes iff quote covers its buy. *)
+   The cancellation cascade fires when a higher-priority need cannot fit
+   available quote: lower-priority resting buys are cancelled (many lesser
+   orders may satisfy one greater) until it fits; otherwise resolution
+   proceeds to the next-highest priority. Cancelled strategies re-evaluate on
+   the cancel event and resume iff quote covers their buy. *)
 
 (** A strategy's claim on its venue pools, in config presentation order. *)
 type claim =
@@ -63,13 +59,11 @@ let allocate (vq : venue_quote) : allocation =
   { funded_ids = List.rev funded; starved_ids = List.rev starved }
 ;;
 
-(** The cancellation cascade: which resting buys to cancel so [need] fits
-    [available]. [trigger_id] is the strategy whose need could not fit - its
-    own resting buys are NEVER cancelled (only lower-priority ones are).
-    Cancels walk from the LOWEST priority upward; stops as soon as the need
-    fits. Returns [] when nothing needs cancelling or no combination of
-    others' orders can satisfy the need (the caller then proceeds to the
-    next-highest priority). *)
+(** Resting buys to cancel so [need] fits [available]. [trigger_id]'s own
+    resting buys are never cancelled, only lower-priority ones. Cancels walk
+    from the lowest priority upward and stop as soon as the need fits.
+    Returns [] when nothing needs cancelling or no combination of others'
+    orders can satisfy the need. *)
 let cascade
       ~(available : float)
       ~(need : float)
@@ -101,10 +95,9 @@ let cascade
     | None -> [] (* No combination fits: give up this round. *))
 ;;
 
-(** Sell sizing from the venue base pool: base balance minus reserved_base
-    (the execution layer's available_trading_balance already excludes it)
-    minus base tied in resting sells. Only this value may drive sell
-    actions; it is never capital-gated. *)
+(** Sell size from the venue base pool: base balance minus reserved_base
+    (already excluded by the execution layer's available_trading_balance)
+    minus base tied in resting sells. Never capital-gated. *)
 let sell_qty_of
       ~(base_balance : float)
       ~(reserved_base : float)
@@ -124,19 +117,17 @@ type sim_strategy =
   ; maker_fee : float
   }
 
-(** One strategy's simulated outcome: the survived drawdown fraction of the
-    current price (clamped 0..1) and the price of the deepest rung the
-    strategy actually funded under shared capital - the spec's [P_funded],
-    i.e. the exhaustion point of its ladder. *)
+(** One strategy's simulated outcome: survived drawdown fraction of the
+    current price (clamped 0..1) and the price of the deepest rung it funded
+    under shared capital (spec [P_funded], its ladder's exhaustion point). *)
 type sim_outcome =
   { d_surv : float
   ; funded_price : float
   }
 
-(** Simulates a shared market drawdown across active strategies on a venue,
-    executing 1 order per strategy sequentially in configuration priority order
-    until venue quote capital is exhausted. Returns an association list of
-    (strategy_id, { d_surv; funded_price }). *)
+(** Simulate a shared market drawdown across a venue's active strategies:
+    one order per strategy sequentially in priority order until quote capital
+    is exhausted. Returns (strategy_id, { d_surv; funded_price }) pairs. *)
 let simulate_drawdown_survival ~(total_quote : float) (strategies : sim_strategy list)
   : (string * sim_outcome) list
   =

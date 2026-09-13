@@ -24,16 +24,13 @@ module Hyperliquid_impl = struct
   (* Per-process counter for unique client order ids. *)
   let cloid_nonce_counter = Atomic.make 0
 
-  (** Builds a UNIQUE client order id tagged with the strategy userref.
-      Layout: the trailing 16 hex digits (the low 64 bits of the 128-bit
-      cloid, which the executions feed's userref recovery reads) carry
-      bits 63..56 = strategy userref tag and bits 55..0 = nonce (unix time
-      in seconds, masked to 36 bits, << 20 | per-process counter, 20 bits).
-      Uniqueness across restarts comes from the time component, so a fresh
-      process cannot regenerate the cloid of an order still resting from a
-      previous run - which is what makes the placement retry loop
-      idempotent: every attempt of one logical order reuses the same cloid,
-      and two different orders never share one. *)
+  (** Builds a unique client order id tagged with the strategy userref.
+      Trailing 16 hex digits (low 64 bits, read by the executions feed's
+      userref recovery): bits 63..56 = userref tag, bits 55..0 = nonce
+      (unix seconds masked to 36 bits << 20 | per-process counter, 20 bits).
+      The time component makes the cloid unique across restarts, so the
+      placement retry loop is idempotent: every attempt of one logical order
+      reuses the same cloid, and two orders never share one. *)
   let next_unique_cloid (uref : int) : string =
     let counter =
       Int64.of_int (Atomic.fetch_and_add cloid_nonce_counter 1 land 0xF_FFFF)
@@ -160,11 +157,9 @@ module Hyperliquid_impl = struct
         (match cl_ord_id with
          | Some explicit -> Some explicit
          | None ->
-           (* Unique per-order cloid: makes the placement retry loop
-              idempotent (a timeout after venue acceptance replays the same
-              cloid instead of landing a second order) and keeps concurrent
-              orders distinguishable - the constant per-strategy cloid this
-              replaced shared one identity across every grid order. *)
+           (* Unique per-order cloid makes the placement retry loop idempotent
+              (a post-acceptance timeout replays the same cloid rather than
+              landing a second order) and keeps concurrent orders distinct. *)
            Some (next_unique_cloid uref))
       | None -> cl_ord_id
     in
@@ -183,10 +178,8 @@ module Hyperliquid_impl = struct
     >|= function
     | Ok res ->
       let order_id_str = Int64.to_string res.Hyperliquid_actions.order_id in
-      (* Proactively inject into open_orders so find_order_everywhere succeeds
-           for immediate post-placement amendments. Without this, the order is
-           invisible until the next webData2 push (~1.5s), and any amendment
-           in that window would fail with "Order not found". *)
+      (* Inject into open_orders so immediate amendments can resolve the order;
+           otherwise it is invisible until the next webData2 push (~1.5s). *)
       let hl_side =
         match side with
         | Types.Buy -> Hyperliquid_executions_feed.Buy
@@ -253,9 +246,7 @@ module Hyperliquid_impl = struct
              (match cl_ord_id with
               | Some explicit -> Some explicit
               | None ->
-                (* Same unique-cloid discipline as place_order: the
-                    cancel-replace's new leg must not inherit the degenerate
-                    constant strategy cloid. *)
+                 (* New cancel-replace leg gets its own unique cloid. *)
                 Some (next_unique_cloid uref))
            | None -> cl_ord_id
          in
@@ -271,13 +262,11 @@ module Hyperliquid_impl = struct
          >|= (function
           | Ok res ->
             let new_order_id_str = Int64.to_string res.amend_id in
-            (* Do NOT inject the new OID into open_orders. Previous attempts
-               created phantom duplicates: the new OID was added while the old
-               OID persisted (WS cancel not yet received), causing get_open_orders
-               to return two entries and triggering spurious cancel-all logic.
-               The inflight_amend counter now bridges the REST-to-WS gap.
-               Only the old OID is removed (on ID change) to prevent a late
-               WS "open" event from re-adding it as a ghost order. *)
+             (* Do NOT inject the new OID: the old OID persists until the WS
+                cancel arrives, so adding it would show duplicate open orders
+                and trigger spurious cancel-all logic. The inflight_amend
+                counter bridges the REST-to-WS gap. Remove only the old OID on
+                ID change, to block a late WS "open" event from re-adding it. *)
             if new_order_id_str <> order_id
             then Hyperliquid_executions_feed.remove_open_order ~symbol:sym ~order_id;
             Ok
@@ -386,13 +375,11 @@ module Hyperliquid_impl = struct
   (* Hyperliquid's tradeable figure is already hold-netted. *)
   let get_available_balance_fast = get_tradeable_balance_fast
 
-  (** Age of the balance-store snapshot for [asset], or [None] before the
-      first update. Keyed on the SPENDABLE wallets' timestamp: the store-wide
-      timestamp is bumped by the staking poller (every ~10s) even though
-      staking wallets contribute nothing to the tradeable figure - keying on
-      it would certify a stale spot figure as fresh, which the sell-hold
-      netting guard relies on never happening. Falls back to the store-wide
-      timestamp when no spendable wallet record exists yet. *)
+  (** Age in seconds of the balance snapshot for [asset], or [None] before the
+      first update. Keyed on spendable wallets: the store-wide timestamp is
+      also bumped by the ~10s staking poller, which cannot change the tradeable
+      figure. Falls back to the store-wide timestamp when no spendable record
+      exists. *)
   let get_balance_age_fast ~asset =
     let store = Hyperliquid_balances.get_balance_store asset in
     fun () ->
@@ -803,9 +790,8 @@ let poll_staking_balance () =
       (try
          let json = Yojson.Safe.from_string body_str in
          let open Yojson.Safe.Util in
-         (* delegatorSummary schema (see info-endpoint docs):
-             { "delegated": "...", "undelegated": "...",
-               "totalPendingWithdrawal": "...", "nPendingWithdrawals": 0 } *)
+         (* delegatorSummary: {delegated, undelegated, totalPendingWithdrawal,
+              nPendingWithdrawals} (info-endpoint docs). *)
          let delegated = parse_json_float (member "delegated" json) in
          let undelegated = parse_json_float (member "undelegated" json) in
          let pending_withdrawal =

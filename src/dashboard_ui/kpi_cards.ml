@@ -1,8 +1,7 @@
 open Notty
 open Theme
 
-(** KPI Cards Component.
-    Renders top-row summary cards in a unified Btop/Terminal panel container. *)
+(** KPI summary cards: top-row cards in a single panel container. *)
 
 let render_card_row w cards =
   let t = Theme.current () in
@@ -19,8 +18,7 @@ let render_card_row w cards =
     (fun i (title, r1, r2) ->
        let iw = card_inner_w i in
        let is_last = i = n - 1 in
-       (* Build the top bar piece for this card, spanning the title and
-          the remaining dashes. *)
+       (* Top bar: title plus fill dashes. *)
        let title_str = "── " ^ title ^ " " in
        let title_img = I.string A.(fg t.c_title ++ bg t.c_bg ++ st bold) title_str in
        let title_len = I.width title_img in
@@ -30,7 +28,7 @@ let render_card_row w cards =
          I.string A.(fg t.c_border ++ bg t.c_bg) (if is_last then "╮" else "┬")
        in
        top_imgs := !top_imgs @ [ title_img; dashes; div_top ];
-       (* Build the two body rows for this card. *)
+       (* Two body rows for this card. *)
        let div_mid = I.string A.(fg t.c_border ++ bg t.c_bg) "│" in
        let c_r1 =
          I.hcat [ I.string A.(bg t.c_bg) " "; I.hsnap ~align:`Left iw r1; div_mid ]
@@ -40,7 +38,7 @@ let render_card_row w cards =
        in
        body_row1_imgs := !body_row1_imgs @ [ c_r1 ];
        body_row2_imgs := !body_row2_imgs @ [ c_r2 ];
-       (* Build the bottom bar piece for this card. *)
+       (* Bottom bar for this card. *)
        let bot_dashes =
          I.string A.(fg t.c_border ++ bg t.c_bg) (repeat_str "─" (iw + 1))
        in
@@ -77,16 +75,16 @@ let render_kpi_cards w (s : Snapshot.t) =
   in
   let total_hold_val = total_hold_strats +. total_hold_bals in
   let net_worth = total_hold_val +. total_quote_val in
-  (* Animate headline money so updates roll rather than snap. Cheap now that
-     the renderer transmits only changed rows. *)
+  (* Tween headline money so updates roll rather than snap; changed-row
+     diffing makes this cheap. *)
   let net_worth_t = Anim.tween ~key:"kpi.networth" ~target:net_worth ~tau:0.35 in
   let cash_t = Anim.tween ~key:"kpi.cash" ~target:total_quote_val ~tau:0.35 in
   let c1_row1 =
     I.hcat
       [ col 10 t.a_dim "NET WORTH"; col_right 12 t.a_bright (format_usd net_worth_t) ]
   in
-  (* The PORTFOLIO card shows cash on the second line: accumulated value
-     already has its own slot in the HOLDINGS & STRATEGY summary bar. *)
+  (* PORTFOLIO card shows cash on the second line; accumulated value has its
+     own slot in the HOLDINGS & STRATEGY summary bar. *)
   let c1_row2 =
     I.hcat [ col 10 t.a_dim "CASH"; col_right 12 t.a_cyan (format_usd cash_t) ]
   in
@@ -95,9 +93,8 @@ let render_kpi_cards w (s : Snapshot.t) =
   let recent_fills = s.fills in
   let lats = s.latencies in
   let snapshot_ts = s.timestamp in
-  (* Classify strategy activity from consistent windows: a strategy is
-     active when it ran this window and idle when it is running with a
-     fresh cycle window but executed nothing (the S1/S2 states). *)
+  (* Classify strategy activity over fresh windows (< 15s old): active when
+     executions > 0, idle when running with zero executions (S1/S2 states). *)
   let strat_active, strat_idle, exec_per_sec =
     List.fold_left
       (fun (a, i, e) (_sym, (metrics : (string * Snapshot.latency_metric) list)) ->
@@ -138,11 +135,9 @@ let render_kpi_cards w (s : Snapshot.t) =
       ]
   in
   let card2 = "SYSTEM ENGINE", c2_row1, c2_row2 in
-  (* Capital-oracle engine latency, taken from the oracle runtime's per-pass
-     window, replaces the old per-domain cycle column: it shows the p50/p99
-     of the most recently completed oracle pass. The reading is fresh when a
-     pass window exists within the refresh horizon, since the oracle
-     re-analyzes roughly every 5 minutes. *)
+  (* Oracle engine latency from the runtime's per-pass window (p50/p99 of the
+     last completed pass); fresh when the window ended within 600s (the oracle
+     re-analyzes roughly every 5 minutes). *)
   let oracle_lat = List.assoc_opt "pass" s.oracle_latency in
   let oracle_p50, oracle_p99, oracle_fresh =
     match oracle_lat with
@@ -153,8 +148,8 @@ let render_kpi_cards w (s : Snapshot.t) =
       m.p50, m.p99, fresh && m.samples > 0
     | None -> 0.0, 0.0, false
   in
-  (* Oracle pass thresholds: a pass normally completes in a few seconds
-     (history fetches dominate); 5s+ warrants yellow, 30s+ red. *)
+  (* Oracle pass thresholds: yellow > 5s, red > 30s. A pass normally completes
+     in a few seconds; history fetches dominate. *)
   let lat_attr p =
     if not oracle_fresh
     then t.a_dim
@@ -164,8 +159,8 @@ let render_kpi_cards w (s : Snapshot.t) =
     then t.a_yellow
     else t.a_green
   in
-  (* Sub-microsecond readings render dark green (nanosecond-resolution);
-     everything else keeps the severity color. *)
+  (* Sub-microsecond readings render dark green (nanosecond resolution); all
+     others use the severity color. *)
   let latency_cell_attr p = if is_sub_us p then t.a_green_dark else lat_attr p in
   let c3_row1 =
     I.hcat

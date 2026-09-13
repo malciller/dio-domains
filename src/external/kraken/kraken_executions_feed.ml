@@ -7,9 +7,8 @@ let section = "kraken_executions"
 let ring_buffer_size = Kraken_common_types.default_ring_buffer_size_executions
 
 (* Cumulative count of execution frames dropped (parse failure or unknown/
-   evicted order id). A dropped fill is a silent inventory desync; the
-   cumulative count makes it visible in the warn lines instead of folding
-   into nothing. *)
+   evicted order id). A dropped fill is a silent inventory desync; the count
+   surfaces it in the warn lines. *)
 let dropped_execution_frames = Atomic.make 0
 let cleanup_handlers_started = Atomic.make false
 
@@ -183,12 +182,11 @@ type symbol_store =
 (** Global symbol-to-store mapping. *)
 let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 64
 
-(** Monotonic counter bumped on every open-orders snapshot publish. The balances
-    feed derives Kraken's open-order holds by scanning every symbol store on
-    each balance read (twice per executable cycle); keying a small cache on this
-    generation makes those reads allocation-free until an order actually
-    changes. Every mutation path republishes the store's cache, so bumping here
-    is the single choke point. *)
+(** Monotonic counter bumped on every open-orders snapshot publish. The
+    balances feed scans every symbol store on each balance read (twice per
+    executable cycle); keying a cache on this generation makes those reads
+    allocation-free until an order changes. Every mutation path republishes
+    the cache, so this is the single choke point. *)
 let orders_generation : int Atomic.t = Atomic.make 0
 
 let[@inline] get_orders_generation () = Atomic.get orders_generation
@@ -240,10 +238,9 @@ let global_orders_mutex = Mutex.create ()
 
 (** Mutex for symbol_stores table initialization. *)
 let initialization_mutex = Mutex.create ()
-(* frame dispatch runs on the Parse_worker domain, so the dispatch path
-   must not touch Lwt primitives. The former [ready_condition]
-   (Lwt_condition) was removed: readiness is published via store.ready
-   Atomics from the parse domain and consumed by polling. *)
+(* Frame dispatch runs on the Parse_worker domain; the dispatch path must not
+   touch Lwt primitives. Readiness is published via store.ready Atomics from
+   the parse domain and consumed by polling. *)
 
 (** Retrieves or lazily creates a per-symbol store. Wait-free on the hot path after initial creation. *)
 let get_symbol_store symbol =
@@ -280,9 +277,8 @@ let[@inline] publish_open_orders_cache store =
   Atomic.incr orders_generation
 ;;
 
-(** Marks the store as ready. Atomic flag only - the startup waiter
-    polls it, so this is safe from the Parse_worker domain (the former
-    Lwt_condition broadcast was not). *)
+(** Marks the store ready. Atomic flag only; safe from the Parse_worker
+    domain, and the startup waiter polls it. *)
 let notify_ready store = if not (Atomic.get store.ready) then Atomic.set store.ready true
 
 let has_execution_data symbol =
@@ -298,11 +294,10 @@ let has_execution_data_fast symbol =
   fun () -> Atomic.get store.ready
 ;;
 
-(** Blocks until execution data is available for all specified symbols or timeout elapses.
-    polls the per-store ready Atomics instead of waiting on a condition
-    variable - readiness is published from the Parse_worker domain, which
-    must not touch Lwt primitives. The poll only runs during startup
-    gating (bounded by the timeout), never on a hot path. *)
+(** Blocks until all specified symbols have execution data, or [timeout_seconds]
+    elapses. Polls per-store ready Atomics; readiness is published from the
+    Parse_worker domain, which must not touch Lwt primitives. The poll runs
+    only during startup gating (bounded by the timeout). *)
 let wait_for_execution_data_lwt symbols timeout_seconds =
   let deadline = Unix.gettimeofday () +. timeout_seconds in
   let rec loop () =
@@ -520,10 +515,10 @@ let update_open_orders store (event : execution_event) =
     let abs_order_qty = abs_float event.order_qty in
     if abs_order_qty = 0.0 then 1e-12 else abs_order_qty *. 1e-6
   in
-  (* Guard: when order_qty is 0.0 (fallback default from a minimal WS event
-     with missing quantity fields) and the status is non-terminal, this is NOT
-     a real fill. Treating it as effectively filled removes valid orders from
-     the open_orders table, breaking strategy reference price tracking. *)
+  (* Guard: order_qty = 0.0 (fallback default from a minimal WS event with
+     missing quantity fields) and a non-terminal status is not a real fill.
+     Treating it as filled would remove valid orders from open_orders, breaking
+     strategy reference-price tracking. *)
   let is_effectively_filled =
     if event.order_qty = 0.0 && not is_terminal_status
     then false
@@ -548,12 +543,11 @@ let update_open_orders store (event : execution_event) =
       was_tracked
     then Hashtbl.remove store.open_orders event.order_id)
   else (
-    (* Non-terminal: upsert into open orders.
-       Note: Kraken's execution feed snapshot replays all open orders as
-       exec_type=new/status=new but with minimal data; limit_price is often
-       absent (None) and quantity fields may be zero. When a cached entry with
-       valid data already exists, preserve those fields rather than blindly
-       overwriting them with empty or zero values. *)
+    (* Non-terminal: upsert. Kraken's execution snapshot replays all open
+       orders as exec_type=new/status=new with minimal data: limit_price is
+       often absent and quantity fields may be zero. When a cached entry has
+       valid data, preserve those fields instead of overwriting with empty or
+       zero values. *)
     let ( merged_limit_price
         , merged_order_qty
         , merged_remaining_qty
@@ -562,8 +556,8 @@ let update_open_orders store (event : execution_event) =
       =
       match Hashtbl.find_opt store.open_orders event.order_id with
       | Some prev ->
-        (* Preserve the cached price if the incoming value is None or zero;
-             Kraken snapshot events arrive with limit_price = Some 0.0 *)
+        (* Preserve the cached price when the incoming value is None or zero;
+             snapshot events arrive with limit_price = Some 0.0. *)
         let lp =
           match event.limit_price with
           | Some p when p > 1e-12 -> event.limit_price
@@ -737,7 +731,6 @@ let update_open_orders store (event : execution_event) =
         event.order_qty
         (Option.value event.limit_price ~default:0.0)
         (string_of_order_status event.order_status);
-    (* Log trade fills at info level for real-time monitoring. *)
     if event.exec_type = Trade
     then
       Logging.debug_f
@@ -804,10 +797,10 @@ let parse_execution_event json =
         (match s with
          | Some (sym, side) -> Some (sym, Some side)
          | None ->
-           (* Skip events with no symbol attribution, typical of pre-startup
-              orders. Throttle to a warn once the count grows, since a
-              persistent flood here means order ids are being evicted from
-              the index while fills still arrive - a silent fill loss. *)
+           (* Skip events with no symbol attribution (typical of pre-startup
+              orders). Warn is throttled as the count grows; a persistent flood
+              means order ids are evicted from the index while fills still
+              arrive, a silent fill loss. *)
            let n = Atomic.fetch_and_add dropped_execution_frames 1 + 1 in
            if n <= 10 || n land (n - 1) = 0
            then
@@ -995,12 +988,12 @@ let parse_execution_event json =
     None
 ;;
 
-(** Hook invoked after every execution snapshot has been ingested and
-    reconciled. The supervisor wires this to the REST /OpenOrders bootstrap:
-    Kraken caps the WS [snap_orders] payload, so resting orders placed before
-    this process started (or beyond the cap) are absent from the snapshot and
-    the reconcile below would prunes them. Kept as a hook to avoid a module
-    cycle - the REST fetcher already depends on this module. *)
+(** Hook invoked after every execution snapshot is ingested and reconciled.
+    The supervisor wires this to the REST /OpenOrders bootstrap: Kraken caps
+    the WS [snap_orders] payload, so resting orders placed before startup (or
+    beyond the cap) are absent from the snapshot and would be pruned by the
+    reconcile. A hook avoids a module cycle (the REST fetcher already depends
+    on this module). *)
 let on_snapshot_hook : (unit -> unit) ref = ref (fun () -> ())
 
 let set_on_snapshot_hook f = on_snapshot_hook := f
@@ -1035,9 +1028,9 @@ let handle_snapshot json on_heartbeat =
          match parse_execution_event item with
          | Some event ->
            let store = get_symbol_store event.symbol in
-           (* Do not write snapshot items to events_buffer or trigger per-item Exchange_wakeup.
-             Snapshot events reflect initial/reconnection state for open order tracking.
-             Live execution updates continue to be processed via handle_update. *)
+           (* Snapshot items are not written to events_buffer and do not trigger
+             per-item Exchange_wakeup; they reflect initial/reconnection state
+             for open-order tracking. Live updates go through handle_update. *)
            update_open_orders store event;
            Atomic.set store.last_event_time event.timestamp;
            notify_ready store;
@@ -1129,13 +1122,11 @@ let handle_update json on_heartbeat =
            Atomic.set store.last_event_time event.timestamp;
            notify_ready store;
            Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
-           (* Publish to the order update event bus. this bus is backed
-              by Lwt streams (single-domain structures), so publishing from
-              the Parse_worker domain is only safe when nobody is
-              subscribed. It currently has zero subscribers anywhere in the
-              codebase; the guard skips it in that case and logs once if a
-              subscriber ever appears (at which point the consumer must be
-              migrated off the Lwt stream before relying on it here). *)
+           (* The order update event bus is backed by Lwt streams
+              (single-domain), so publishing from the Parse_worker domain is
+              safe only with zero subscribers. The guard skips the publish in
+              that case and warns once if a subscriber appears; that consumer
+              must be migrated off the Lwt stream before relying on it here. *)
            (match Atomic.get order_update_event_bus.subscribers with
             | [] -> ()
             | _ ->
@@ -1239,16 +1230,16 @@ let handle_message message on_heartbeat =
       message
 ;;
 
-(* per-connection heartbeat closure, published so the Parse_worker
-   handler can invoke it from the parse domain (domain-safe: mutex +
-   timestamp update). One authenticated connection exists at a time. *)
+(* Per-connection heartbeat closure, published so the Parse_worker handler
+   can invoke it from the parse domain (domain-safe: mutex + timestamp
+   update). One authenticated connection exists at a time. *)
 let current_on_heartbeat : (unit -> unit) option Atomic.t = Atomic.make None
 
-(** parse-worker entry point. Executions pushes are intercepted in
-    Kraken_trading_client.handle_frame by a raw-string prefix check BEFORE
-    the central Yojson parse, so this handler owns both the parse and the
-    dispatch for the channel. [handle_message_json] is domain-safe: stores
-    under per-symbol mutexes, ring writes, Atomics, logging, wakeups. *)
+(** Parse-worker entry point. Executions pushes are intercepted in
+    Kraken_trading_client.handle_frame by a raw-string prefix check before the
+    central Yojson parse, so this handler owns both parse and dispatch for the
+    channel. [handle_message_json] is domain-safe: per-symbol mutexes, ring
+    writes, Atomics, logging, wakeups. *)
 let () =
   Concurrency.Parse_worker.register "kraken_exec" (fun message ->
     let heartbeat =
@@ -1276,9 +1267,9 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
   Logging.debug
     ~section
     "Registering executions subscription on unified authenticated connection";
-  (* publish the heartbeat closure for the parse-domain handler; frames
-     now bypass this module's buffer-drain loop entirely (they are
-     intercepted in Kraken_trading_client before reaching the buffer). *)
+  (* Publish the heartbeat closure for the parse-domain handler. Frames bypass
+     this module's buffer-drain loop and are intercepted in
+     Kraken_trading_client before reaching the buffer. *)
   Atomic.set current_on_heartbeat (Some on_heartbeat);
   let subscribe_msg =
     `Assoc

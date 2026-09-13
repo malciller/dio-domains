@@ -67,7 +67,7 @@ let test_open_order_no_limit () =
 let test_get_symbol_store () =
   let symbol = "IBKR_EXEC_TEST" in
   let _store = Ibkr.Executions_feed.get_symbol_store symbol in
-  (* Second call should return same store *)
+  (* Second call returns the same store. *)
   let _store2 = Ibkr.Executions_feed.get_symbol_store symbol in
   Alcotest.(check bool) "get_symbol_store creates store" true true
 ;;

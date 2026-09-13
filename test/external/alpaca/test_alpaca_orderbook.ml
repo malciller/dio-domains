@@ -47,8 +47,8 @@ let check_book symbol expected =
 (* ---- Trade prints never publish TOB ------------------------------------- *)
 
 let test_trade_before_any_quote_publishes_nothing () =
-  (* No real quote has ever arrived: the trade must NOT seed a single price.
-     The store simply has no valid TOB until a real quote (WS or REST) lands. *)
+  (* No quote has arrived: a trade must not seed a single price, so the store
+     has no valid TOB until a real quote lands. *)
   let sym = "T_NOSEED" in
   handle (trade_msg sym 138.5 "2026-01-02T15:00:01Z");
   check_book sym None
@@ -58,26 +58,24 @@ let test_trade_after_quote_never_moves_book () =
   let sym = "T_NOMOVE" in
   handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
   check_book sym (Some (140.0, 10.0, 141.0, 10.0));
-  (* A print ABOVE the ask (would have "lifted the ask" before): the book must
-     not move - a single print is not a two-sided quote. *)
+  (* A print above the ask must not move the book: one print is not a quote. *)
   handle (trade_msg sym 142.0 "2026-01-02T15:00:01Z");
   check_book sym (Some (140.0, 10.0, 141.0, 10.0));
-  (* A print BELOW the bid: still no movement. *)
+  (* A print below the bid: no movement. *)
   handle (trade_msg sym 138.0 "2026-01-02T15:00:02Z");
   check_book sym (Some (140.0, 10.0, 141.0, 10.0));
   (* A print inside the spread: no movement. *)
   handle (trade_msg sym 140.5 "2026-01-02T15:00:03Z");
   check_book sym (Some (140.0, 10.0, 141.0, 10.0));
-  (* An out-of-order print from a previous session: no movement. *)
+  (* Out-of-order print from a previous session: no movement. *)
   handle (trade_msg sym 130.0 "2026-01-02T14:59:00Z");
   check_book sym (Some (140.0, 10.0, 141.0, 10.0))
 ;;
 
 let test_trade_after_stale_quote_never_publishes_fallback () =
-  (* Even with no fresh quote for a long stretch, trade prints must never
-     fabricate a bid = ask = last trade. The book holds the last real quote
-     while the REST snapshot poll refreshes it. We prove the invariant
-     directly: a trade with a NEWER event time than the quote cannot change
+  (* With no fresh quote for a long stretch, trade prints must never fabricate
+     bid = ask = last trade; the book holds the last real quote until the REST
+     snapshot poll refreshes it. A trade newer than the quote must not change
      the published TOB. *)
   let sym = "T_NOSTALE" in
   handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");

@@ -1,5 +1,5 @@
 let test_process_market_data () =
-  (* Ensure symbol is registered so we can test the data processing *)
+  (* Register the symbol so market-data processing accepts it. *)
   Hyperliquid.Instruments_feed.initialize [ "HYPE" ];
   Hyperliquid.Orderbook_feed.initialize [ "HYPE" ];
   let raw_json_str =

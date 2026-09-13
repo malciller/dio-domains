@@ -77,8 +77,7 @@ let test_parse_logging_config_empty_sections () =
 ;;
 
 let test_read_config_defaults () =
-  (* Test default config when no config file exists *)
-  (* We'll assume config.json doesn't exist for this test *)
+  (* Precondition: config.json absent. *)
   let config = Dio_engine.Config.read_config () in
   Alcotest.(check bool) "default logging level" true (config.logging.level = Logging.INFO);
   Alcotest.(check (list string)) "default logging sections" [] config.logging.sections;
@@ -218,9 +217,9 @@ let test_latency_spike_report_parse () =
 ;;
 
 let test_to_float_opt_accepts_int () =
-  (* Regression: integer JSON literals ("latency_spike_threshold_us": 10) are
-     natural in config.json and must not crash startup with an uncaught
-     Yojson Type_error from [to_float_option]. *)
+  (* Regression: integer JSON literals ("latency_spike_threshold_us": 10) must
+     not crash startup via an uncaught Yojson Type_error from
+     [to_float_option]. *)
   let open Dio_engine.Config in
   Alcotest.(check (option (float 1e-9)))
     "int accepted"

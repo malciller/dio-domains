@@ -1,5 +1,5 @@
 let test_string_contains () =
-  (* Test string substring matching *)
+  (* Substring containment. *)
   Alcotest.(check bool)
     "contains 'world'"
     true
@@ -27,22 +27,22 @@ let test_string_contains () =
 ;;
 
 let test_json_to_string_precise () =
-  (* Test JSON encoding without symbol precision (should use default 8) *)
+  (* JSON encoding uses default precision (8) when no symbol precision given. *)
   let json = `Assoc [ "key", `Float 1.23456789 ] in
   let result = Kraken.Kraken_actions.json_to_string_precise None json in
   Alcotest.(check string) "basic JSON encoding" "{\"key\":1.23456789}" result;
-  (* Test with string escaping *)
+  (* JSON string escaping. *)
   let json_with_strings = `Assoc [ "msg", `String "hello\"world\\test" ] in
   let result2 = Kraken.Kraken_actions.json_to_string_precise None json_with_strings in
   Alcotest.(check string) "string escaping" "{\"msg\":\"hello\\\"world\\\\test\"}" result2;
-  (* Test nested structures *)
+  (* Nested list encoding. *)
   let nested = `Assoc [ "data", `List [ `Int 1; `Int 2; `Int 3 ] ] in
   let result3 = Kraken.Kraken_actions.json_to_string_precise None nested in
   Alcotest.(check string) "nested structures" "{\"data\":[1,2,3]}" result3
 ;;
 
 let test_next_req_id () =
-  (* Test request ID generation *)
+  (* Request IDs increment monotonically. *)
   let id1 = Kraken.Kraken_actions.next_req_id () in
   let id2 = Kraken.Kraken_actions.next_req_id () in
   let id3 = Kraken.Kraken_actions.next_req_id () in
@@ -50,7 +50,7 @@ let test_next_req_id () =
 ;;
 
 let test_is_retriable_error () =
-  (* Test error classification for retry logic *)
+  (* Retriable-vs-terminal error classification. *)
   Alcotest.(check bool)
     "Connection timeout is retriable"
     true
@@ -74,7 +74,7 @@ let test_is_retriable_error () =
 ;;
 
 let test_retry_config_defaults () =
-  (* Test default retry configuration *)
+  (* Default retry configuration. *)
   let config = Kraken.Kraken_actions.default_retry_config in
   Alcotest.(check int) "max_attempts default" 3 config.max_attempts;
   Alcotest.(check (float 0.001)) "base_delay_ms default" 1000.0 config.base_delay_ms;
@@ -83,7 +83,7 @@ let test_retry_config_defaults () =
 ;;
 
 let test_add_to_assoc () =
-  (* Test adding key-value pairs to JSON assoc *)
+  (* add_to_assoc appends a key/value pair. *)
   let json = `Assoc [ "existing", `String "value" ] in
   let result = Kraken.Kraken_actions.add_to_assoc json ("new_key", `Int 42) in
   match result with
@@ -98,15 +98,14 @@ let test_add_to_assoc () =
 ;;
 
 let test_truncate_price_to_precision () =
-  (* Test price truncation - this depends on Kraken_instruments_feed.get_precision_info *)
-  (* Since we can't easily mock that, we'll test the case where no precision info is available *)
+  (* With no cached precision info, truncation returns the original price. *)
   let price = 123.456789 in
   let result = Kraken.Kraken_actions.truncate_price_to_precision price "UNKNOWN_SYMBOL" in
   Alcotest.(check (float 0.000001)) "unknown symbol returns original price" price result
 ;;
 
 let test_retry_with_backoff_logic () =
-  (* Test retry logic without actually calling external functions *)
+  (* Retry with backoff succeeds on the third attempt. *)
   let call_count = ref 0 in
   let test_function () =
     incr call_count;
@@ -137,7 +136,7 @@ let test_retry_with_backoff_logic () =
 ;;
 
 let test_max_retry_attempts () =
-  (* Test that retry stops after max attempts *)
+  (* Retry stops after max_attempts. *)
   let call_count = ref 0 in
   let failing_function () =
     incr call_count;

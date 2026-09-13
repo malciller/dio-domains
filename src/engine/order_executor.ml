@@ -88,12 +88,9 @@ let get_profiler symbol operation =
     p
 ;;
 
-(* window-cadence snapshot+reset for this symbol's operation profilers.
-   Previously [report] ran INLINE after every place/amend/cancel once 100
-   samples accumulated - a sorting/logging spike attributed to trading
-   latency exactly when activity was highest. The domain worker now calls
-   this from its rolling-window publish (every latency_window_seconds), so
-   percentiles still reach the logs without ever running mid-hot-path. *)
+(* Window-cadence snapshot+reset of this symbol's place/amend/cancel profilers.
+   Called by the domain worker's rolling-window publish; keeps the
+   snapshot/sort/log work out of the order hot path. *)
 let snapshot_symbol_profilers symbol =
   List.iter
     (fun op ->
@@ -112,7 +109,6 @@ let snapshot_symbol_profilers symbol =
     [ "place"; "amend"; "cancel" ]
 ;;
 
-(* Exchange interface module and type aliases. *)
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
@@ -231,11 +227,10 @@ let is_connection_error exn_str =
   | _ -> false
 ;;
 
-(** Wraps [f] with exception handling, converting raised exceptions into
-    [Error] results. Retries are NOT applied here (single retry policy):
-    the executor already passes [retry_config] down to the exchange modules,
-    which own retries via [Error_handling.retry_with_backoff]. A second retry
-    layer here would double the sleep-on-error path (1s+2s twice). *)
+(** Converts exceptions raised by [f] into [Error] results. Does not retry: the
+    executor passes [retry_config] to the exchange modules, which own retries
+    via [Error_handling.retry_with_backoff]; a second layer here would double the
+    sleep-on-error path. *)
 let with_error_handling ~operation_name ?(max_retries = 1) ?(retry_delay = 1.0) f =
   Error_handling.retry_with_backoff
     ~section
@@ -289,8 +284,8 @@ let parse_time_in_force = function
   | _ -> Types.GTC
 ;;
 
-(* NOTE: All return types use [Exchange.Types]. Strategies must depend on
-   [Exchange.Types], not exchange-specific types (OCaml nominal typing). *)
+(* Return types use [Exchange.Types]. Strategies must depend on [Exchange.Types],
+   not exchange-specific types (nominal typing). *)
 
 (** Places a new order on the target exchange.
 
@@ -348,8 +343,8 @@ let place_order ~token ?retry_config ?(check_duplicate = true) (request : order_
             Lwt.return (Error e)
           | Ok (module Ex) ->
             let ex_retry_config = retry_config in
-            (* Token semantics are exchange-dependent. Each module
-                 interprets the value per its authentication mechanism. *)
+            (* Token semantics are exchange-dependent; each module interprets the
+               value per its authentication mechanism. *)
             let profiler = get_profiler request.symbol "place" in
             let start_time = Mtime_clock.now_ns () in
             Lwt.catch
@@ -426,13 +421,11 @@ let amend_order ~token ?retry_config (request : amend_request) =
                        Ex.round_price ~symbol ~price:current_price
                      in
                      let diff = abs_float (rounded_new_price -. rounded_current_price) in
-                     (* Quantity must ALSO be checked: a qty-only amendment
-                        (e.g. grid re-sizing at an unchanged price) must not be
-                        suppressed here, or the qty change is silently dropped
-                        while the strategy keeps re-pushing it every cycle,
-                        visible as an amend that "hangs" with no log output.
-                        Compare against the order's original qty; an amend that
-                        only differs in remaining/partial fill is still a change. *)
+                      (* A qty-only amendment (e.g. grid re-sizing at unchanged
+                         price) must not be suppressed: the change would be
+                         dropped while the strategy re-pushes it every cycle.
+                         Compare against the order's original qty; a difference
+                         only in remaining/partial fill is still a change. *)
                      let qty_matches =
                        match request.new_quantity with
                        | Some nq -> abs_float (nq -. current_order.qty) < 1e-9
@@ -442,13 +435,11 @@ let amend_order ~token ?retry_config (request : amend_request) =
                      diff < 0.000000001 && qty_matches
                    | None -> false)
                 | None ->
-                  (* Order absent from local WS cache. This does not imply
-                          the order is invalid: WS lag or cache churn during a
-                          prior amend can cause temporary absence. Proceed and
-                          let the exchange reject if the order no longer exists.
-                          Skipping here caused Kraken buy orders to fail trailing
-                          upward. Hyperliquid avoids this via cancel-replace,
-                          keeping the old ID in cache until the amend completes. *)
+                  (* Order absent from the local WS cache does not imply invalid:
+                          WS lag or cache churn during a prior amend can cause
+                          temporary absence. Proceed; the exchange rejects if the
+                          order no longer exists. Skipping here caused Kraken buy
+                          orders to fail trailing upward. *)
                   Logging.debug_f
                     ~section
                     "Order %s not found in open orders cache, proceeding with amendment \

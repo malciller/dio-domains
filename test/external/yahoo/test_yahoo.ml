@@ -1,14 +1,13 @@
-(* Yahoo deep-history client tests: symbol whitelist, chart parsing, and
-   pre-listing window classification.
+(* Yahoo deep-history: symbol whitelist, chart parsing, pre-listing window
+   classification.
 
-   The whitelist is the safety-critical part: Yahoo's crypto symbol space
-   carries dead-token collisions (HYPE-USD still serves a dead 2021 token's
-   prices), so only known-continuous pairs may be deepened. Equities are
-   unambiguous and map by identity. *)
+   The whitelist is safety-critical: Yahoo's crypto symbol space carries
+   dead-token collisions (HYPE-USD serves a dead 2021 token's prices), so only
+   known-continuous pairs may be deepened. Equities map by identity. *)
 
 module Exchange = Dio_exchange.Exchange_intf
 
-(* The library [dio.yahoo] wraps its module under the library name [Yahoo]. *)
+(* Library [dio.yahoo] namespaces its module under [Yahoo]. *)
 module Yahoo_deep_history = Yahoo.Yahoo_deep_history
 
 let check_symbol ~calendar_kind symbol expected =
@@ -30,15 +29,15 @@ let test_symbol_whitelist () =
   check_symbol ~calendar_kind:Exchange.Types.Crypto "LINK/USD" (Some "LINK-USD");
   check_symbol ~calendar_kind:Exchange.Types.Crypto "AVAX/USD" (Some "AVAX-USD");
   check_symbol ~calendar_kind:Exchange.Types.Crypto "DOT/USD" (Some "DOT-USD");
-  (* The dead-token trap: HYPE/USDC must never be deepened from Yahoo. *)
+  (* Dead-token trap: HYPE/USDC must not resolve. *)
   check_symbol ~calendar_kind:Exchange.Types.Crypto "HYPE/USDC" None;
-  (* Equities map by identity (Yahoo QQQ is QQQ). *)
+  (* Equities map by identity. *)
   check_symbol ~calendar_kind:Exchange.Types.Equity "QQQ" (Some "QQQ");
   check_symbol ~calendar_kind:Exchange.Types.Equity "SPCX" (Some "SPCX");
   check_symbol ~calendar_kind:Exchange.Types.Equity "NVDA" (Some "NVDA")
 ;;
 
-(** Minimal chart fixture: two days of data with one null row dropped. *)
+(** Chart fixture: three rows, middle null; two bars after parse. *)
 let fixture_json =
   `Assoc
     [ ( "chart"
@@ -83,10 +82,10 @@ let test_parse_daily () =
 ;;
 
 let test_classify_error () =
-  (* Yahoo's pre-listing answer (HTTP 400, "Data doesn't exist for
-     startDate = ...") is an EMPTY RANGE, not a failure: the walk skips it
-     instead of aborting (the SPCX spam fix - a recently-listed asset must
-     not re-request the same doomed range on every pass). *)
+  (* Yahoo's pre-listing answer (HTTP 400, "Data doesn't exist for startDate")
+     is an empty range, not a failure: the walk skips it instead of aborting
+     (SPCX regression - a recently-listed asset must not re-request the same
+     doomed range every pass). *)
   Alcotest.(check bool)
     "400 + data-doesn't-exist = missing data"
     (Yahoo_deep_history.classify_error
@@ -96,7 +95,7 @@ let test_classify_error () =
         endDate = 1781150400\"}}}"
      = `Missing_data)
     true;
-  (* Case-insensitive match. *)
+  (* Match is case-insensitive. *)
   Alcotest.(check bool)
     "lowercase body matches"
     (Yahoo_deep_history.classify_error
@@ -104,7 +103,7 @@ let test_classify_error () =
        "{\"chart\":{\"result\":null,\"error\":{\"description\":\"data doesn't exist\"}}}"
      = `Missing_data)
     true;
-  (* Any other error is fatal. *)
+  (* Any other status is fatal. *)
   Alcotest.(check bool)
     "401 = fatal"
     (Yahoo_deep_history.classify_error 401 "{\"error\":\"Unauthorized\"}" = `Fatal)
@@ -120,17 +119,16 @@ let test_classify_error () =
 ;;
 
 let test_empty_prefix_cache () =
-  (* The confirmed-empty prefix is cached per symbol: a fetch whose whole
-     requested range sits before the known listing is answered locally with
-     zero bars and zero HTTP requests (the pre-listing dates are never
-     re-requested). *)
+  (* Confirmed-empty prefix is cached per symbol: a fetch whose whole requested
+     range sits before the known listing is answered locally with zero bars and
+     zero HTTP requests. *)
   let symbol = "SPCX" in
-  (* Simulate the first pass: the walk recorded "no data before 2026-06-15". *)
+  (* First pass recorded floor "no data before 2026-06-15". *)
   Yahoo_deep_history.remember_empty ~symbol "2026-06-15";
   (match Yahoo_deep_history.known_empty_before ~symbol with
    | Some d -> Alcotest.(check string) "floor cached" "2026-06-15" d
    | None -> Alcotest.fail "expected the cached empty prefix");
-  (* The prefix only grows forward: a later, deeper empty answer is kept. *)
+  (* Floor is monotonic: an earlier empty answer does not shrink it. *)
   Yahoo_deep_history.remember_empty ~symbol "2026-06-01";
   (match Yahoo_deep_history.known_empty_before ~symbol with
    | Some d -> Alcotest.(check string) "floor does not shrink" "2026-06-15" d
@@ -147,8 +145,8 @@ let test_empty_prefix_cache () =
 ;;
 
 let test_classify_exn () =
-  (* The fetch wraps failures as "Yahoo: HTTP <status> for <symbol> (<body>)";
-     classification must dig the status and body out. *)
+  (* Fetch wraps failures as "Yahoo: HTTP <status> for <symbol> (<body>)";
+     classification extracts status and body. *)
   Alcotest.(check bool)
     "missing-data failure classified from the message"
     (Yahoo_deep_history.classify_exn

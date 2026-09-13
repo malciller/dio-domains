@@ -1,33 +1,28 @@
 let test_balance_store_operations () =
-  (* Test BalanceStore create, update, and read operations *)
+  (* BalanceStore create/update/read. *)
   let store = Kraken.Kraken_balances_feed.BalanceStore.create () in
-  (* Check initial values *)
   let initial_balance = Kraken.Kraken_balances_feed.BalanceStore.get_balance store in
   Alcotest.(check (float 0.001)) "initial balance is zero" 0.0 initial_balance;
-  (* Update balance data for first wallet *)
   Kraken.Kraken_balances_feed.BalanceStore.update_wallet
     store
     123.45
     "margin"
     "wallet123"
     "BTC";
-  (* Check updated balance *)
   let updated_balance = Kraken.Kraken_balances_feed.BalanceStore.get_balance store in
   Alcotest.(check (float 0.001)) "updated balance" 123.45 updated_balance;
-  (* Update balance for second wallet *)
   Kraken.Kraken_balances_feed.BalanceStore.update_wallet
     store
     67.89
     "earn"
     "wallet456"
     "BTC.HOLD";
-  (* Check aggregated trading balance (earn should be excluded) *)
+  (* Earn wallets are excluded from the trading balance. *)
   let aggregated_balance = Kraken.Kraken_balances_feed.BalanceStore.get_balance store in
   Alcotest.(check (float 0.001)) "aggregated balance" 123.45 aggregated_balance;
-  (* Check aggregated total balance *)
+  (* Total balance includes earn wallets. *)
   let total_balance = Kraken.Kraken_balances_feed.BalanceStore.get_total_balance store in
   Alcotest.(check (float 0.001)) "aggregated total balance" 191.34 total_balance;
-  (* Get full balance data *)
   let data = Kraken.Kraken_balances_feed.BalanceStore.get_all store in
   Alcotest.(check (float 0.001)) "full data balance" 191.34 data.balance;
   Alcotest.(check string) "full data wallet_type" "aggregated" data.wallet_type;
@@ -36,26 +31,20 @@ let test_balance_store_operations () =
 ;;
 
 let test_balance_management () =
-  (* Test balance store management functions *)
+  (* has_balance_data / get_balance / get_balance_data. *)
   let asset = "BTC_TEST" in
-  (* Initially should not have balance data *)
   Alcotest.(check bool)
     "initially no balance data"
     false
     (Kraken.Kraken_balances_feed.has_balance_data asset);
-  (* Get balance store (creates it if needed) *)
   let store = Kraken.Kraken_balances_feed.get_balance_store asset in
-  (* Update the store *)
   Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 1.5 "spot" "main" asset;
-  (* Now should have balance data *)
   Alcotest.(check bool)
     "has balance data after update"
     true
     (Kraken.Kraken_balances_feed.has_balance_data asset);
-  (* Test get_balance function *)
   let balance = Kraken.Kraken_balances_feed.get_balance asset in
   Alcotest.(check (float 0.001)) "get_balance returns correct value" 1.5 balance;
-  (* Test get_balance_data function *)
   let data = Kraken.Kraken_balances_feed.get_balance_data asset in
   Alcotest.(check string) "balance data asset" asset data.asset;
   Alcotest.(check (float 0.001)) "balance data balance" 1.5 data.balance;
@@ -64,21 +53,19 @@ let test_balance_management () =
 ;;
 
 let test_balance_staleness () =
-  (* Test balance staleness detection *)
+  (* Balance staleness. *)
   let asset = "ETH_TEST" in
-  (* Initially should be stale (no updates ever) *)
+  (* Never-updated asset is stale. *)
   Alcotest.(check bool)
     "initially stale"
     true
     (Kraken.Kraken_balances_feed.is_balance_stale asset 60.0);
-  (* Update balance timestamp *)
   Kraken.Kraken_balances_feed.update_balance_timestamp asset;
-  (* Now should not be stale *)
   Alcotest.(check bool)
     "not stale after update"
     false
     (Kraken.Kraken_balances_feed.is_balance_stale asset 60.0);
-  (* Test with short threshold - should still be fresh *)
+  (* Fresh after a timestamp update, even at a short threshold. *)
   Alcotest.(check bool)
     "fresh with short threshold"
     false
@@ -86,20 +73,16 @@ let test_balance_staleness () =
 ;;
 
 let test_wait_for_balance_data () =
-  (* Test waiting for balance data (with timeout) *)
+  (* wait_for_balance_data timeout behavior. *)
   let assets = [ "ADA_TEST"; "DOT_TEST" ] in
-  (* Initially should not have data *)
   Alcotest.(check bool)
     "initially no data"
     false
     (List.for_all Kraken.Kraken_balances_feed.has_balance_data assets);
-  (* Start waiting with very short timeout *)
   let result =
     Lwt_main.run (Kraken.Kraken_balances_feed.wait_for_balance_data assets 0.001)
   in
-  (* Should timeout since no data is available *)
   Alcotest.(check bool) "times out with no data" false result;
-  (* Now add data for one asset *)
   let store = Kraken.Kraken_balances_feed.get_balance_store "ADA_TEST" in
   Kraken.Kraken_balances_feed.BalanceStore.update_wallet
     store
@@ -107,12 +90,11 @@ let test_wait_for_balance_data () =
     "spot"
     "test"
     "ADA_TEST";
-  (* Wait again - should still timeout since not all assets have data *)
+  (* Partial data still times out: all requested assets are required. *)
   let result2 =
     Lwt_main.run (Kraken.Kraken_balances_feed.wait_for_balance_data assets 0.001)
   in
   Alcotest.(check bool) "times out with partial data" false result2;
-  (* Add data for second asset *)
   let store2 = Kraken.Kraken_balances_feed.get_balance_store "DOT_TEST" in
   Kraken.Kraken_balances_feed.BalanceStore.update_wallet
     store2
@@ -120,7 +102,6 @@ let test_wait_for_balance_data () =
     "margin"
     "test"
     "DOT_TEST";
-  (* Wait again - should succeed now *)
   let result3 =
     Lwt_main.run (Kraken.Kraken_balances_feed.wait_for_balance_data assets 1.0)
   in
@@ -129,13 +110,12 @@ let test_wait_for_balance_data () =
 
 
 let test_tradeable_balance_nets_open_order_holds () =
-  (* Kraken wallet snapshots report TOTAL balances; the tradeable figure the
-     strategies see must net out what is already locked in resting orders -
-     exactly like Hyperliquid's store (total - hold). Without this, sell
-     sizing reads inventory committed to a resting sell and the exchange
-     rejects with EOrder:Insufficient funds. Mirrors the XMR startup case:
-     0.08004 total, a resting sell of 0.04 -> tradeable 0.04004; and for a
-     quote asset, resting buys lock quote value. *)
+  (* Kraken snapshots report TOTAL balances; the tradeable figure must net out
+     what is locked in resting orders (total - hold), as Hyperliquid's store
+     does. Otherwise sell sizing counts inventory committed to a resting sell
+     and the exchange rejects with EOrder:Insufficient funds. XMR startup case:
+     0.08004 total - 0.04 resting sell = 0.04004 tradeable; for a quote asset,
+     resting buys lock quote value. *)
   let base = "XMR_HOLD_TEST" in
   let quote = "USD_HOLD_TEST" in
   let pair = base ^ "/" ^ quote in
@@ -200,7 +180,7 @@ let test_tradeable_balance_nets_open_order_holds () =
     "resting buy hold nets from tradeable quote"
     91.6
     (Kraken.Kraken_module.Kraken_impl.get_tradeable_balance ~asset:quote);
-  (* Holds never drive tradeable negative. *)
+  (* Holds clamp tradeable at zero. *)
   Kraken.Kraken_executions_feed.update_open_orders
     (Kraken.Kraken_executions_feed.get_symbol_store pair)
     (mk_event "sell" 5.0 462.13);
@@ -211,7 +191,7 @@ let test_tradeable_balance_nets_open_order_holds () =
 ;;
 
 let test_balance_data_structure () =
-  (* Test balance_data record structure *)
+  (* balance_data record fields. *)
   let test_data =
     { Kraken.Kraken_balances_feed.asset = "SOL"
     ; balance = 50.5
@@ -234,10 +214,9 @@ let test_balance_data_structure () =
 ;;
 
 let test_concurrent_balance_updates () =
-  (* Test that balance updates work correctly under concurrent access *)
+  (* Concurrent updates: final value is one of the written values. *)
   let asset = "CONCURRENT_TEST" in
   let store = Kraken.Kraken_balances_feed.get_balance_store asset in
-  (* Start multiple threads updating the same balance *)
   let update_thread balance_value delay =
     Thread.create
       (fun () ->
@@ -253,11 +232,9 @@ let test_concurrent_balance_updates () =
   let thread1 = update_thread 100.0 0.01 in
   let thread2 = update_thread 200.0 0.02 in
   let thread3 = update_thread 300.0 0.03 in
-  (* Wait for all threads to complete *)
   Thread.join thread1;
   Thread.join thread2;
   Thread.join thread3;
-  (* Check that final balance is one of the updated values *)
   let final_balance = Kraken.Kraken_balances_feed.get_balance asset in
   let valid_values = [ 100.0; 200.0; 300.0 ] in
   Alcotest.(check bool)

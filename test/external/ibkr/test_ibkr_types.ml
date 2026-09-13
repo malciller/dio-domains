@@ -160,7 +160,7 @@ let test_unknown_exchange_status () =
 ;;
 
 let test_message_id_constants () =
-  (* Verify outbound message IDs *)
+  (* Outbound message IDs. *)
   Alcotest.(check int) "msg_req_mkt_data" 1 Ibkr.Types.msg_req_mkt_data;
   Alcotest.(check int) "msg_cancel_mkt_data" 2 Ibkr.Types.msg_cancel_mkt_data;
   Alcotest.(check int) "msg_place_order" 3 Ibkr.Types.msg_place_order;
@@ -189,7 +189,7 @@ let test_inbound_message_id_constants () =
 ;;
 
 let test_tick_type_constants () =
-  (* Live tick types *)
+  (* Live tick types. *)
   Alcotest.(check int) "tick_bid" 1 Ibkr.Types.tick_bid;
   Alcotest.(check int) "tick_ask" 2 Ibkr.Types.tick_ask;
   Alcotest.(check int) "tick_last" 4 Ibkr.Types.tick_last;
@@ -198,7 +198,7 @@ let test_tick_type_constants () =
   Alcotest.(check int) "tick_last_size" 5 Ibkr.Types.tick_last_size;
   Alcotest.(check int) "tick_volume" 8 Ibkr.Types.tick_volume;
   Alcotest.(check int) "tick_close" 9 Ibkr.Types.tick_close;
-  (* Delayed tick types: offset +65 from live *)
+  (* Delayed ticks: live + 65. *)
   Alcotest.(check int) "tick_delayed_bid" 66 Ibkr.Types.tick_delayed_bid;
   Alcotest.(check int) "tick_delayed_ask" 67 Ibkr.Types.tick_delayed_ask;
   Alcotest.(check int) "tick_delayed_last" 68 Ibkr.Types.tick_delayed_last;

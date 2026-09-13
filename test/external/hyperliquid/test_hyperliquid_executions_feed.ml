@@ -1,8 +1,6 @@
 let test_find_registered_symbol () =
-  (* Initialize instruments feed so resolve_symbol works (mocking it via initialize or just testing the fallback) *)
-  (* For testing the fallback, we can inject a store directly *)
+  (* No instruments feed is loaded; registration feeds the fallback matcher. *)
   Hyperliquid.Executions_feed.initialize [ "HYPE"; "BTC" ];
-  (* In the test environment, without actual instruments feed populated, it will rely on the fallback matching *)
   let result1 = Hyperliquid.Executions_feed.find_registered_symbol "HYPE" in
   Alcotest.(check (option string)) "Direct match" (Some "HYPE") result1;
   let result2 = Hyperliquid.Executions_feed.find_registered_symbol "BTC" in
@@ -100,7 +98,6 @@ let test_get_open_orders () =
 
 let test_process_order_terminal_status () =
   Hyperliquid.Executions_feed.initialize [ "TESTTERM" ];
-  (* Create an order first *)
   let json_open =
     `List
       [ `Assoc
@@ -121,7 +118,6 @@ let test_process_order_terminal_status () =
   Hyperliquid.Executions_feed.process_order_updates json_open;
   let order_open = Hyperliquid.Executions_feed.get_open_order "TESTTERM" "5555" in
   Alcotest.(check bool) "order exists" true (Option.is_some order_open);
-  (* Cancel it *)
   let json_cancel =
     `List
       [ `Assoc

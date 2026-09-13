@@ -1,4 +1,4 @@
-(* Jacobs Ladder - Strategy Execution Engine *)
+(* Jacobs Ladder: strategy execution engine. *)
 
 open Strategy_common
 open Jacobs_ladder_types
@@ -6,36 +6,27 @@ open Jacobs_ladder_config
 open Jacobs_ladder_reservation
 open Jacobs_ladder_orders
 
-(** price-key helper (rounded price*10000 as int) shared by the
-    persisted-sell matching in [sync_open_orders] and the reconcile threading
-    into [evaluate_sell_leg]. The int key keeps two within-tolerance prices in
-    the same (or an adjacent) bucket without allocating a string per lookup. *)
+(** Price key: [price * 10000] rounded to int. Shared by the persisted-sell
+    matching in [sync_open_orders] and the reconcile in [evaluate_sell_leg].
+    An int key keeps within-tolerance prices in the same (or an adjacent)
+    bucket without allocating a string per lookup. *)
 let price_key p = int_of_float (Float.round (p *. 10000.0))
 
-(** Performs 1-to-1 multiset matching between persisted sell levels and open sell orders.
+(** 1-to-1 multiset match between persisted sell levels and open sell orders.
     Returns (open_levels, missing_levels).
-    the previous implementation was O(n·m); for each persisted level it
-    linearly rescanned the open-order list and allocated a match array. This
-    version buckets open orders by a tolerance-rounded price key (Hashtbl) and
-    verifies the original tolerance before consuming a candidate, so matching
-    is ~O(n+m) with identical semantics.
 
-    The bucket key is an int (price scaled to 4 decimals and rounded), NOT a
-    [Printf.sprintf "%.4f"] string: the string key allocated a fresh string
-    for every open order and every persisted level on every strategy
-    execution, which dominated the Alpaca persisted-sell hotpath for assets
-    with large sell grids (e.g. SPCX's 42 open sells). The rounded int keeps
-    the same tolerance bucket (2 prices within the 1e-4 tolerance never span
-    more than one rounded-decimal bucket), and the per-candidate tolerance
-    check below preserves the original matching semantics exactly.
+    Buckets open orders by tolerance-rounded price key (Hashtbl) and verifies
+    the original tolerance before consuming a candidate: ~O(n+m) instead of the
+    prior O(n*m) rescan-per-level. Buckets are keyed by an int (price scaled to
+    4 decimals, rounded), not a [Printf.sprintf "%.4f"] string, which allocated
+    per open order and persisted level on every execution.
 
-    this partition is now only the fallback for direct [evaluate_sell_leg]
-    callers; the strategy hot path builds the same open/missing split during
-    [sync_open_orders]' scan and threads it through, so the per-tick reconcile
-    is O(m) instead of this O(n+m) re-partition. *)
+    Fallback for direct [evaluate_sell_leg] callers; the strategy hot path
+    builds the same split during [sync_open_orders]' scan and threads it
+    through, so the per-tick reconcile is O(m). *)
 let partition_persisted_sell_levels persisted open_orders =
-  (* Index open orders by rounded price key -> list of (price, remaining
-     count). The tolerance check is preserved per candidate. *)
+  (* Rounded price key -> (price, remaining count) list. Tolerance is checked
+     per candidate. *)
   let by_price : (int, (float * int) list) Hashtbl.t =
     Hashtbl.create (List.length open_orders)
   in
@@ -55,11 +46,9 @@ let partition_persisted_sell_levels persisted open_orders =
   List.iter
     (fun ((target_p, _target_q) as level) ->
        let k = price_key target_p in
-       (* Probe the bucket and its neighbors: the old string key used
-          printf's %.4f rounding (half-even) while the int key uses
-          [Float.round] (half-away), so a price sitting exactly on a
-          4-decimal boundary can land in either adjacent bucket. The
-          per-candidate tolerance check below is the authoritative gate. *)
+       (* Probe the bucket and its neighbors: [Float.round] (half-away) can
+          place a price exactly on a 4-decimal boundary in either adjacent
+          bucket. The per-candidate tolerance check below is authoritative. *)
        let matched =
          let rec try_buckets = function
            | [] -> None
@@ -97,12 +86,11 @@ let reconcile_persisted_sell_levels ~state =
   partition_persisted_sell_levels state.persisted_sell_levels state.open_sell_orders
 ;;
 
-(** Grace window after a sell placement during which its venue-side hold is
-    treated as NOT yet reflected in the balance feed, when the feed provides
-    no freshness signal. Hyperliquid's spotState hold update trails the
-    placement ack by up to seconds; sizing against the un-netted figure in
-    that window is what lets a sell dip into reserved_base under
-    volatility. *)
+(** Seconds after a sell placement during which its venue-side hold is treated
+    as not yet reflected in the balance feed when the feed provides no
+    freshness signal. Hyperliquid's spotState hold update trails the placement
+    ack by up to seconds; sizing against the un-netted figure in that window
+    lets a sell dip into reserved_base. *)
 let sell_hold_netting_grace_s = 15.0
 
 (** Freshness cutoff shared by the two feed-lag overlays (un-netted sell holds
@@ -116,13 +104,12 @@ let unreflected_cutoff ~now ~base_balance_age =
   | None -> now -. sell_hold_netting_grace_s
 ;;
 
-(** Grace after a buy ack during which the open-orders feed may not yet list
-    the order. The venue's snapshot/stream lags the ack by up to seconds, and a
-    scan that ran in that window saw zero open buys and declared the freshly
-    acked buy a "ghost", purging it and re-placing - churning the grid and
-    stacking new sell obligations. A buy that genuinely left the book is
-    cleared by its terminal event (fill/cancel), or by this grace once the feed
-    has had time to list it. *)
+(** Seconds after a buy ack during which the open-orders feed may not yet list
+    the order. The venue's snapshot/stream lags the ack by up to seconds; a scan
+    in that window sees zero open buys and would declare the acked buy a ghost,
+    purging and re-placing it (grid churn plus stacked sell obligations). A buy
+    that genuinely left the book is cleared by its terminal event (fill/cancel)
+    or by this grace once the feed has listed it. *)
 let buy_ack_ghost_grace_s = 15.0
 
 (** Tolerance for [last_balance_delta] direction tests. Balances are base
@@ -132,33 +119,27 @@ let buy_ack_ghost_grace_s = 15.0
     outstanding sell hold. *)
 let balance_delta_epsilon = 1e-9
 
-(** The portion of placed-sell base that the balance feed may not yet be
-    netting. Applies to EVERY accumulation venue (Hyperliquid, Kraken, IBKR,
-    Lighter): all report a tradeable figure with open-order holds removed, and
-    in all of them that figure trails a placement (or the balance message that
-    adopts it trails the order feed), so sizing against it in the window can
-    dip into reserved_base. Gating this on [track_pending_sells = false] (only
-    Hyperliquid) left Kraken/IBKR/Lighter exposed: under a volume burst several
-    sells ack before the balance adopts the hold, and each sizes against a
-    stale-high tradeable - the observed reserved_base dump that then bought
-    back the full amount on the next buy fill.
+(** Portion of placed-sell base the balance feed may not yet be netting.
+    Applies to every accumulation venue (Hyperliquid, Kraken, IBKR, Lighter):
+    all report a tradeable figure with open-order holds removed, and that figure
+    trails a placement (or the adopting balance message trails the order feed),
+    so sizing against it can dip into reserved_base. Gating on
+    [track_pending_sells = false] (Hyperliquid only) left the others exposed:
+    under a burst several sells ack before the balance adopts the hold and each
+    sizes against a stale-high tradeable.
 
-    A hold is outstanding only while the newest balance message for THIS asset
-    still PREDATES its placement. The moment a message generated after the
-    placement arrives the overlay is retired - BUT only when that message did
-    not RAISE the tradeable figure ([state.last_balance_delta <= 0]). A buy fill
-    raises the figure and bumps the same per-asset freshness timestamp without
-    netting any sell hold (the venue's hold update trails the ack), so trusting
-    a positive-delta message as proof of netting re-offered committed base as
-    free and produced an oversized sell the venue rejected for insufficient
-    inventory. Positive-delta messages keep the hold until a flat/down message
-    or the grace retires it. Crucially, the freshness the caller supplies is
-    PER-ASSET: Hyperliquid pushes one whole-account spotState snapshot, and a
-    fill on another coin must not advance this asset's timestamp (see
-    Hyperliquid_balances.BalanceStore.update_wallet) - otherwise another
-    asset's activity would clear this asset's guard. The grace still bounds a
-    dead feed. [consume_sell_hold_netting] additionally retires holds on an
-    observed drop. *)
+    A hold is outstanding only while the newest balance message for this asset
+    still predates its placement. A message generated after the placement
+    retires it only when it did not raise the tradeable figure
+    ([state.last_balance_delta <= 0]): a buy fill raises the figure and bumps
+    the same per-asset freshness timestamp without netting a sell hold, so
+    trusting a positive delta re-offered committed base as free and produced an
+    oversized sell the venue rejected. Positive-delta messages keep the hold
+    until a flat/down message or the grace retires it. The caller supplies
+    per-asset freshness: a fill on another coin must not advance this asset's
+    timestamp (see Hyperliquid_balances.BalanceStore.update_wallet). The grace
+    bounds a dead feed; [consume_sell_hold_netting] additionally retires holds
+    on an observed drop. *)
 let unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age =
   if ecfg.use_unnetted_sell_hold && state.sell_holds_since_balance <> []
   then (
@@ -214,16 +195,13 @@ let arm_sell_hold ~state ~qty ~now =
   state.sell_holds_since_balance <- state.sell_holds_since_balance @ [ now, qty ]
 ;;
 
-(** Surfaces a sell-placement blocker at warn level. The same blocker
-    re-fires on every strategy tick (a dust-sized persisted sell level below
-    the venue's notional floor, a wiped position snapshot, a latched
-    flag), and the previous debug-only or absent logging let sell
-    placement stay wedged for entire sessions with zero visible signal
-    while the buy leg kept flowing. Deduplicated per reason with a repeat
-    window; a reason change always logs immediately. [~kind] overrides the
-    dedup key for reasons that interpolate tick-varying figures (a live ref
-    price, a moving balance): the key stays stable so the repeat window
-    holds, while the logged text keeps the full detail. *)
+(** Surfaces a sell-placement blocker at warn level. The same blocker re-fires
+    every strategy tick (dust persisted level below the venue notional floor, a
+    wiped position snapshot, a latched flag); deduplicated per reason with a 60s
+    repeat window, and a reason change always logs immediately. [~kind]
+    overrides the dedup key for reasons that interpolate tick-varying figures (a
+    live ref price, a moving balance) so the window holds while the logged text
+    keeps full detail. *)
 let log_sell_block ?(kind = "") ~state ~now ~symbol reason =
   let key = if kind = "" then reason else kind in
   if key <> state.last_sell_block_reason || now -. state.last_sell_block_log_at >= 60.0
@@ -236,12 +214,12 @@ let log_sell_block ?(kind = "") ~state ~now ~symbol reason =
 (** Reconciles the in-memory position ledger to the venue balance feed.
 
     A new venue balance message is authoritative for the base it reports, so
-    [position_base] is adopted outright (replacement, never a sum of running
-    totals - the failure mode of the removed anticipated-credit overlay, which
-    added fills on top of the venue figure and could size a sell past
-    [reserved_base]). Any buy credit the message's generation time already
-    covers is dropped from the overlay; credits newer than the message stay,
-    so a just-filled buy remains sellable until the feed nets it. *)
+    [position_base] is adopted outright (replacement, never a running sum - the
+    failure mode of the removed anticipated-credit overlay, which added fills on
+    top of the venue figure and could size a sell past [reserved_base]). Any buy
+    credit the message's generation time already covers is dropped from the
+    overlay; newer credits stay, so a just-filled buy remains sellable until the
+    feed nets it. *)
 let reconcile_position ~state ~now ~base_balance_age ~asset_balance =
   if not (Float.is_nan asset_balance)
   then (
@@ -433,14 +411,11 @@ let evaluate_capital_low_recovery
     let available_quote = quote_bal -. total_reserved in
     if state.capital_low && state.capital_low_at_balance < 0.0
     then state.capital_low_at_balance <- quote_bal;
-    (* recovery is AFFORDABILITY-based, matching the replay model
-        (Grid_core clears as soon as the quote can fund the next buy) and
-        market_maker's flag handling. Gating the clear on a balance INCREASE
-        latched the pause forever when a falling price made the same balance
-        sufficient again ("capital regained the price needed" but no new
-        quote arrived) or when another asset's reclaim released reserved
-        quote - the strategy stayed paused on spendable capital. The stamp
-        below is for the log line only. *)
+    (* Recovery is affordability-based, matching the replay model (Grid_core
+       clears once the quote can fund the next buy). Gating the clear on a
+       balance increase latched the pause forever when a falling price made the
+       same balance sufficient again, or when another asset's reclaim released
+       reserved quote. The stamp below is for the log line only. *)
     if state.capital_low && available_quote < quote_needed_fast
     then ()
     else if state.capital_low
@@ -466,16 +441,15 @@ let evaluate_capital_low_recovery
 
 (** Expires rate-limit cooldowns and ghost-order markers.
 
-    Pending order/amendment tokens are deliberately NOT swept here. Their
-    lifecycle is purely event-driven: every dispatched place/amend produces
-    exactly one guaranteed terminal event (Ack/Failed, Amended/
-    Amendment_skipped/Amendment_failed, or a recognized cancel), and each of
-    those handlers removes the token, the in-flight flag, and the registry
-    entry. The old 5s age-based sweep resolved state while the exchange
-    could still be executing the request (Alpaca amends exceed 5s under SSL
-    degradation), so a mid-flight cancel event was no longer recognized as
-    the amend's side effect and wrongly reset buy tracking - dropping the
-    sweep removes that race instead of tuning around it. *)
+    Pending order/amendment tokens are deliberately not swept here. Their
+    lifecycle is purely event-driven: every dispatched place/amend produces one
+    guaranteed terminal event (Ack/Failed, Amended/Amendment_skipped/
+    Amendment_failed, or a recognized cancel), and each handler removes the
+    token, the in-flight flag, and the registry entry. An age-based sweep
+    resolved state while the exchange could still be executing the request
+    (Alpaca amends exceed 5s under SSL degradation), so a mid-flight cancel
+    event was no longer recognized as the amend's side effect and wrongly reset
+    buy tracking. *)
 let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
   if Hashtbl.length state.amend_cooldowns > 0
   then (
@@ -502,12 +476,10 @@ let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
 
 (** Scratch matcher for [sync_open_orders]'s persisted-sell-level reconcile.
     [scan_persisted_bucket] probes one [persisted_idx] bucket for a level within
-    tolerance of [price] that has not already been matched this scan, keeping
-    the lowest-index candidate (mirroring the original in-order scan).
-    [probe_persisted_bucket] is the top-level entry point. Both are top-level
-    (not per-order closures): the previous local [consider_bucket] plus its
-    [List.iter] callback were re-allocated for EVERY open sell on EVERY
-    execution, a large slice of the logged [strat[sync=]] allocation pool. *)
+    tolerance of [price] not yet matched this scan, keeping the lowest-index
+    candidate (mirroring the original in-order scan). [probe_persisted_bucket]
+    is the top-level entry. Both are top-level (not per-order closures) to avoid
+    re-allocating a callback per open sell per execution. *)
 let rec scan_persisted_bucket ~matched_persisted_indices ~price ~bk ~best = function
   | [] -> ()
   | (idx, p, q) :: rest ->
@@ -599,19 +571,15 @@ let sync_open_orders
     state.sync_orders_seen <- 0;
     let matched_persisted_indices = state.matched_persisted_indices in
     Hashtbl.clear matched_persisted_indices;
-    (* index the persisted sell levels by a rounded price key so each open
-     sell order's match lookup is O(1) instead of rescanning the whole list.
-     The previous [List.iteri] scan was O(n·m) per strategy execution (n open
-     sell orders x m persisted levels), the dominant cost for assets with
-     large sell grids like SPCX's 42 open sells. Buckets store
-     (index, price, qty) so a 1-to-1 match consumes the entry and the
-     original tolerance check and qty-update semantics are preserved. *)
-    (* matched persisted levels keyed by their price key -> count. Built
-     during the scan (each open sell consumes exactly one persisted level, so
-     a multiset of per-price counts accumulates), the open/missing split for
-     the virtual-GTC reconcile falls out in O(m) at the end of the scan
-     instead of re-partitioning the whole persisted-vs-open multiset
-     ([partition_persisted_sell_levels]) a second time per execution. *)
+    (* Index persisted sell levels by rounded price key so each open sell's
+     match lookup is O(1) instead of rescanning the whole list. Buckets store
+     (index, price, qty) so a 1-to-1 match consumes the entry, preserving the
+     original tolerance check and qty-update semantics. *)
+    (* Matched persisted levels keyed by price key -> count. Built during the
+     scan (each open sell consumes one persisted level, accumulating a
+     multiset of per-price counts), so the open/missing split for the
+     virtual-GTC reconcile falls out in O(m) instead of re-partitioning the
+     persisted-vs-open multiset a second time. *)
     let matched_level_counts = state.matched_level_counts in
     Hashtbl.clear matched_level_counts;
     let persisted_idx = state.persisted_idx in
@@ -700,14 +668,11 @@ let sync_open_orders
           then (
             let k = price_key price in
             let match_entry =
-              (* Probe the price's bucket and its immediate neighbors: the
-               original linear scan matched any persisted level within
-               tolerance, but grid levels are 0.25%+ apart while the
-               tolerance is 0.01% (price*0.0001) or 1e-4 absolute, so a
-               within-tolerance candidate is always the SAME grid level -
-               the neighbor probes only absorb float rounding at the
-               4-decimal bucket boundary. Pick the lowest-index candidate,
-               mirroring the original scan order. *)
+              (* Probe the bucket and its neighbors: grid levels are 0.25%+
+                 apart while the tolerance is 0.01% (price*0.0001) or 1e-4
+                 absolute, so a within-tolerance candidate is always the same
+                 grid level; neighbor probes only absorb float rounding at the
+                 4-decimal bucket boundary. Pick the lowest-index candidate. *)
               let best = ref None in
               probe_persisted_bucket
                 (k - 1)
@@ -811,30 +776,27 @@ let sync_open_orders
   let t_rec_start = Monotonic_clock.now_ns () in
   (* Reconcile the in-flight sell ledger with this scan's feed. The feed
      refreshes an order's remaining qty while it lists it. What an absence
-     means is VENUE-SPECIFIC (see [hold_netted_from_venue_state]):
-       - Venues whose balance nets holds from their OWN state (Hyperliquid):
-         the feed is authoritative and independent of the hold netting, so an
+     means is venue-specific (see [hold_netted_from_venue_state]):
+       - Venues whose balance nets holds from their own state (Hyperliquid):
+         the feed is authoritative and independent of hold netting, so an
          acked/seen order absent from the feed has truly left the book (fill /
-         cancel / amend-away) and is DROPPED. Keeping it would both strand a
-         phantom sell in tracking and double-subtract base the venue already
-         excludes. This is the durable eviction that does not depend on the
-         terminal event surviving a filtered/raced feed.
-       - Venues deriving holds from the SAME feed (Kraken): an acked/seen order
+         cancel / amend-away) and is dropped. Keeping it would strand a phantom
+         sell and double-subtract base the venue already excludes.
+       - Venues deriving holds from the same feed (Kraken): an acked/seen order
          absent from the feed stays reserved until its terminal event, so a
          truncated snapshot/reconnect cannot silently free live base.
-     An order never listed AND never acked is kept only within the dispatch
+     An order never listed and never acked is kept only within the dispatch
      window (a lost placement). Local-only commitments are merged back into
      [open_sell_orders] so the buy leg's wash-trade and 2*gi clamps still see
      them. [locked_in_sells] is then the ledger total. *)
   let trust_feed = ecfg.hold_netted_from_venue_state in
   (* [upsert_sell_commitment] already refreshed every feed-listed commitment
      during the scan, so the reconcile below only changes the ledger when a
-     commitment ABSENT from the feed must be dropped (trust_feed venue) or has
+     commitment absent from the feed must be dropped (trust_feed venue) or has
      aged out of the dispatch window. Rebuilding the whole list otherwise just
-     re-allocates an identical set of 6-tuples on every execution - a large
-     slice of the logged [strat:] pool on wide grids. The no-alloc guard scan
-     decides; the rebuild path preserves the original side effects, while the
-     no-rebuild path still re-adds local-only commitments to
+     re-allocates an identical set of 6-tuples on every execution. The no-alloc
+     guard scan decides; the rebuild path preserves the original side effects,
+     while the no-rebuild path still re-adds local-only commitments to
      [open_sell_orders] (feed-listed ones were consed during the scan). *)
   let commitment_needs_rebuild =
     Hashtbl.fold
@@ -943,17 +905,11 @@ let sync_open_orders
         state.tif_recovery_pending <- false;
         set_asset_reserved_quote state (best_price *. lot_qty))
     | None -> ());
-  (* NOTE: the former [merge_preserved_sells] loop here computed an
-     [already_present] membership test and then did nothing with it (its body
-     was a no-op [if ... then ()]); it was pure O(p*n) work per execution on
-     every exchange config. Removed. *)
-  (* split the final persisted list into open/missing by draining the
-     per-price-key match counts (multiset semantics - duplicate levels at the
-     same price each consume one count, exactly mirroring
-     [partition_persisted_sell_levels]' 1-to-1 matching). The result is what
-     [evaluate_sell_leg]'s reconcile used to re-derive with a full O(n+m)
-     partition over the open orders; here it is O(m) on data this scan already
-     touched. *)
+  (* Split the final persisted list into open/missing by draining the
+     per-price-key match counts (multiset semantics: duplicate levels at the
+     same price each consume one count, mirroring
+     [partition_persisted_sell_levels]' 1-to-1 matching). This is O(m) on data
+     the scan already touched. *)
   (* The persisted open/missing split is only consumed by the
      [remaintain_expired_sells] (Alpaca GTC) reconcile
      ([evaluate_sell_leg]); building it costs an O(m) list rebuild per
@@ -988,22 +944,20 @@ let compute_buy_ref_price ~bid_price ~ask_price =
   if bid_price > 0.0 then bid_price else ask_price
 ;;
 
-(** Price a newly-OWED sell would be placed at, given the current book. This is
+(** Price at which a newly-owed sell would be placed, given the current book;
     the single source of truth shared by [evaluate_sell_leg] (which places the
     sell) and [evaluate_buy_leg] (which pre-clamps a fresh buy against the
-    companion sell's restricted zone in the SAME tick).
+    companion sell's restricted zone in the same tick).
 
-    Why the buy leg needs it: the buy leg runs before the sell leg, so the
-    companion sell is not yet in the open-order feed when the fresh buy is
-    clamped. On a tick where a buy just filled, the sell leg then places a
-    fresh sell one rung LOWER than the closest sell the buy was clamped
-    against; the buy therefore lands inside the new sell's [2*gi] zone and is
-    amended back down on the next tick (the observed place-then-amend churn).
-    Clamping against this prospective price up front makes the placed buy equal
-    to what the amend would have produced - without the round trip.
+    The buy leg runs first, so the companion sell is not yet in the open-order
+    feed when the fresh buy is clamped. On a fill tick the sell leg then places
+    a sell one rung lower than the closest sell the buy was clamped against, so
+    the buy lands inside the new sell's [2*gi] zone and is amended back down the
+    next tick. Clamping against this prospective price up front makes the placed
+    buy equal to what the amend would have produced, without the round trip.
 
-    A change here MUST keep [evaluate_sell_leg]'s placement and this
-    anticipation in lockstep; the two callers pass identical inputs. *)
+    Changes here must keep [evaluate_sell_leg]'s placement and this anticipation
+    in lockstep; both callers pass identical inputs. *)
 let owed_sell_price
       ~(state : strategy_state)
       ~(asset : trading_config)
@@ -1133,23 +1087,18 @@ let evaluate_buy_leg
     let buy_price =
       if bid_price > 0.0 then min raw_buy_price bid_price else raw_buy_price
     in
-    (* A fresh buy must respect the same 2x-grid-interval spacing below the
-       closest resting sell that the trailing leg enforces via [exact_target]
-       (sell_price - 2*gi of the SELL): without it a buy placed after a fill
-       can sit too close to the lowest sell (a ~1x rung the grid never allows
-       when it amends). As in the trailing leg the clamp is PRICE-INDEPENDENT:
-       while a sell is tracked by order management the fresh buy is kept at
-       least 2*gi below it; the clamp is released only when the sell is
-       removed from tracking.
+    (* A fresh buy must respect the same 2*gi spacing below the closest resting
+       sell that the trailing leg enforces via [exact_target]
+       (sell_price - 2*gi of the sell): otherwise a buy placed after a fill can
+       sit too close to the lowest sell. As in the trailing leg the clamp is
+       price-independent while a sell is tracked.
 
-       The buys already in the feed are not the only sells that matter: the
-       companion sell the sell leg will place LATER in this same tick is not
+       The companion sell the sell leg will place later in this same tick is not
        yet visible here, and in a falling market it lands a rung below the
-       closest existing sell. Clamping only against the existing feed made the
-       fresh buy pass, then the companion sell's zone caught it and the next
-       tick amended it down. The prospective sell is therefore computed with
-       the shared [owed_sell_price] and folded into the same clamp, so the
-       placed buy already equals the amend target. *)
+       closest existing sell. Clamping only against the feed let the fresh buy
+       pass, then the companion sell's zone caught it and the next tick amended
+       it down. The prospective sell is computed with the shared
+       [owed_sell_price] and folded into the same clamp. *)
     let floor_for_sell sell_price =
       sell_price -. (sell_price *. (2.0 *. grid_interval /. 100.0))
     in
@@ -1282,8 +1231,7 @@ let evaluate_buy_leg
             else (
               (* Fresh balance, genuinely insufficient: do not send an order
                  that is guaranteed to be rejected. Pause buying via
-                 capital_low until the quote balance recovers (the recovery
-                 path clears it on a balance increase). *)
+                 capital_low until available quote covers the next buy. *)
               if not state.capital_low
               then (
                 state.capital_low <- true;
@@ -1321,17 +1269,15 @@ let evaluate_buy_leg
         closest_sell_order_val, state.last_buy_order_price, state.last_buy_order_id
       with
       | Some (_sell_order_id, sell_price), Some current_buy_price, Some buy_order_id ->
-        (* The 2*gi separation from the closest sell is anchored on the SELL
-           order and is PRICE-INDEPENDENT: while a sell is tracked by order
-           management, the buy never trails above sell - 2*gi (it never enters
-           the restricted zone below that sell), no matter where the perceived
-           top of book sits. The price can dislocate randomly above a resting
-           sell without filling it - the ladder must not let the buy cross a
-           sell that still exists. The clamp is released only when the sell is
-           removed from tracking (an order-management fill/cancel/expiry);
-           only then does the buy trail the top of book at the grid interval.
-           ([sell_price] is always a positive resting-order price, so there is
-           no zero-reference hazard.) *)
+        (* The 2*gi separation from the closest sell is anchored on the sell
+           order and is price-independent: while a sell is tracked by order
+           management, the buy never trails above sell - 2*gi, no matter where
+           the perceived top of book sits. Price can dislocate above a resting
+           sell without filling it; the ladder must not let the buy cross a sell
+           that still exists. The clamp is released only when the sell is
+           removed from tracking (fill/cancel/expiry); only then does the buy
+           trail the top of book at the grid interval. [sell_price] is always a
+           positive resting-order price, so there is no zero-reference hazard. *)
         let double_grid_interval = sell_price *. (2.0 *. grid_interval /. 100.0) in
         let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
         let grid_buy_from_ref =
@@ -1348,17 +1294,16 @@ let evaluate_buy_leg
         let current_buy_price_rounded = state.cached_round_price current_buy_price in
         let min_move_threshold = get_min_move_threshold state.cached_price_increment in
         (* A sizing re-anchor (the capital oracle published a changed grid
-            interval - flagged by the domain worker on [force_buy_reanchor])
-            used to amend the resting buy to the new spacing in BOTH
-            directions. a downwards amendment is warranted ONLY by a
-            sell-spacing violation (see below); a widened grid interval no
-            longer snaps an otherwise-valid resting buy down to the market
-            rung - the ladder spacing is enforced where it matters (fresh
-            placements clamp below the closest sell; this leg corrects real
-            intrusions into a sell's restricted zone). A qty-only oracle
-            change does NOT re-anchor the price: the grid adopts the new size
-            (Alpaca qty mismatch amend) or on the next placement, and the
-            resting price only trails up. *)
+           interval - flagged by the domain worker on [force_buy_reanchor]) used
+           to amend the resting buy in both directions. A downward amendment is
+           warranted only by a sell-spacing violation (see below); a widened
+           grid interval no longer snaps a valid resting buy down to the market
+           rung. The ladder spacing is enforced where it matters: fresh
+           placements clamp below the closest sell, and this leg corrects real
+           intrusions into a sell's restricted zone. A qty-only oracle change
+           does not re-anchor the price: the grid adopts the new size (Alpaca
+           qty mismatch amend) or on the next placement, and the resting price
+           only trails up. *)
         let reanchor_buy = state.force_buy_reanchor in
         (* Downward movement of the buy is initiated to correct an actual violation
            of the 2x grid_interval restricted zone below the closest sell (above
@@ -1392,14 +1337,13 @@ let evaluate_buy_leg
           if allow
           then (
             let quote_bal = quote_balance in
-            (* An amend REPLACES the resting buy (cancel+create on Alpaca):
-               the capital already committed to that buy is released and
-               re-committed at the new price, so the affordability check
-               must add the committed notional (locked_in_buys, the sum of
-               price*qty over the open buys) back to the available balance.
-               Without this the grid falsely reports "Insufficient quote
-               balance" when trailing a funded buy up on committed capital
-               (e.g. HYPE pool $13.75 + committed $18.90 vs need $20.38). *)
+            (* An amend replaces the resting buy (cancel+create on Alpaca): the
+               capital committed to that buy is released and re-committed at the
+               new price, so the affordability check must add the committed
+               notional ([locked_in_buys], sum of price*qty over open buys) back
+               to the available balance. Without this the grid falsely reports
+               "Insufficient quote balance" when trailing a funded buy up on
+               committed capital. *)
             let available_for_amend = quote_bal +. locked_in_buys in
             if
               (not (Float.is_nan quote_balance))
@@ -1521,20 +1465,17 @@ let evaluate_buy_leg
 (** Alpaca excess-inventory sweep.
 
     The persisted sell-level file is the ladder of record: missing rungs are
-    restored at their recorded price/qty first. Only once the ladder is
-    COMPLETE (the caller gates on no missing rungs, no owed sell, nothing
-    in-flight) is the remaining sellable base EXCESS. Rather than leaving it
-    idle (the SMH/REMX/LIT accumulate-only failure) or dumping the whole
-    balance into a single order (why the non-Alpaca surplus sweep was disabled
-    here), the excess is routed to the TOP of the ladder: the highest-priced
-    rung in the tracker absorbs it, so the surplus is only offered back at the
-    best price.
+    restored at their recorded price/qty first. Only once the ladder is complete
+    (caller gates on no missing rungs, no owed sell, nothing in flight) is the
+    remaining sellable base excess. Rather than leaving it idle or dumping the
+    whole balance into one order, the excess routes to the top of the ladder:
+    the highest-priced rung absorbs it, so surplus is offered only at the best
+    price.
 
-    [reserved_base] is never part of the sweep: [available] already excludes it
-    (it is not sellable), so the excess is computed from that reduced figure.
+    [reserved_base] is never part of the sweep: [available] already excludes it.
 
-    The top rung is amended to a larger quantity (a qty-only amend at the same
-    price, so its fill anchor is unchanged). *)
+    The top rung is amended to a larger quantity (qty-only at the same price, so
+    its fill anchor is unchanged). *)
 let evaluate_excess_sweep
       ~state
       ~now
@@ -1606,49 +1547,41 @@ let evaluate_excess_sweep
   | _ -> ()
 ;;
 
-(** Evaluates buy-triggered and Alpaca-exclusive inventory-maintenance sell
-    placement leg.
-    [persisted_reconcile] is the (open_levels, missing_levels) split that
-    [sync_open_orders] computed during its open-order scan , so the
-    Alpaca virtual-GTC reconcile never re-partitions the persisted-vs-open
-    multiset a second time per execution.
+(** Buy-triggered and Alpaca-exclusive inventory-maintenance sell placement
+    leg. [persisted_reconcile] is the (open_levels, missing_levels) split that
+    [sync_open_orders] computed during its scan, so the Alpaca virtual-GTC
+    reconcile never re-partitions the persisted-vs-open multiset.
 
-    Sell trigger semantics: a sell is attempted when a buy is placed
-    ([buy_attempted]) or filled ([just_filled_buy] - the 1-buy x multi-sell
-    ladder), and the trigger is OWED until the sell is actually placed. Only a
-    placed sell or a verified nothing-to-sell (known balance below the venue
-    floor) consumes the trigger - transient blockers (cooldown, asset_low, a
-    NaN balance snapshot, an in-flight sell placement) do not, so the sell
-    retries every tick even when there is no capital to replace the buy
-    (capital exhausted / oracle-halted) and even when the buy placement tick
-    itself was blocked. For remaintain venues (Alpaca) the placement block
-    can never consume on a below-floor balance ([missing_alpaca_sell_grid]
-    requires [inventory_ok]), so the verified nothing-to-sell consumption is
-    applied explicitly at the end of the leg - without it the latch stays
-    dead-armed forever and the block logging re-fires every tick (the LIT
-    dust-balance spam).
+    Sell trigger: a sell is attempted when a buy is placed ([buy_attempted]) or
+    filled ([just_filled_buy] - the 1-buy x multi-sell ladder), and the trigger
+    is owed until the sell is actually placed. Only a placed sell or a verified
+    nothing-to-sell (known balance below the venue floor) consumes it - transient
+    blockers (cooldown, asset_low, NaN balance, in-flight sell) do not, so the
+    sell retries every tick even with no capital to replace the buy (exhausted /
+    oracle-halted) or when the buy tick itself was blocked. For remaintain
+    venues (Alpaca) the placement block can never consume on a below-floor
+    balance, so the verified nothing-to-sell consumption is applied explicitly
+    at the end of the leg.
 
-    Sell sizing: base already committed to a resting or in-flight sell is
-    NEVER sellable on ANY venue. The single formula is
+    Sell sizing: base committed to a resting or in-flight sell is never sellable
+    on any venue. The formula is
 
       available = spot_holding - reserved_base - committed_sell_base
 
     where [committed_sell_base] is the base the venue has not already removed
-    from its reported figure for us (see [effective_committed_sell_base]):
-    the ledger's excess over the venue feed on net-balance venues (never
-    below the short [unnetted_hold] feed-lag overlay), and the whole in-flight
-    sell ledger on gross-balance venues. Venue differences live ONLY in how
-    the spot holding is obtained: accumulation venues use the venue's reported
-    figure (tradeable on Hyperliquid, gross on Kraken/IBKR/Lighter); Alpaca
-    uses the venue's own [qty_available] (already free of resting holds). The
-    ledger is what makes this correct even when a venue's open-order feed
-    drops a live order. The result must clear the venue's QUOTE-NOTIONAL
-    minimum ([cached_venue_min_notional]; Alpaca's minimum is a dollar
-    notional, Hyperliquid's a 10 USDC spot floor). Sells are deliberately
-    NOT floored at [cached_venue_min_qty]: accrual sells (sell_mult x qty)
-    and residual inventory legitimately size below the lot minimum. The
-    notional minimum is the exchange's real reject threshold - entirely
-    separate from the grid's configured order [qty]. *)
+    from its reported figure (see [effective_committed_sell_base]): the ledger's
+    excess over the venue feed on net-balance venues (never below the short
+    [unnetted_hold] overlay), and the whole in-flight ledger on gross-balance
+    venues. Venue differences live only in how the spot holding is obtained:
+    accumulation venues use the reported figure (tradeable on Hyperliquid, gross
+    on Kraken/IBKR/Lighter); Alpaca uses the venue's [qty_available] (free of
+    resting holds). The ledger keeps this correct when a venue's open-order feed
+    drops a live order. The result must clear the venue's quote-notional minimum
+    ([cached_venue_min_notional]; Alpaca dollar notional, Hyperliquid 10 USDC
+    spot floor). Sells are deliberately not floored at [cached_venue_min_qty]:
+    accrual sells (sell_mult x qty) and residual inventory size below the lot
+    minimum. The notional minimum is the exchange's reject threshold, separate
+    from the grid's [qty]. *)
 let evaluate_sell_leg
       ~persisted_reconcile
       ~state
@@ -1712,22 +1645,16 @@ let evaluate_sell_leg
     then alpaca_available
     else ledger_balance -. state.reserved_base -. committed_sell
   in
-  (* the persisted-sell grid is reconciled ONCE per execution and the
-     result is reused by the three persisted-sell branches below. The
-     previous code ran [reconcile_persisted_sell_levels] three times per
-     strategy tick, each an O(n+m) price-keyed partition with string-key
-     allocation, which dominated the Alpaca hotpath for assets with large
-     sell grids (e.g. SPCX's 42 open sells -> 292us STRAT p50 vs QQQ's 16us).
-     After the pruning below rebuilds [persisted_sell_levels] to
-     [open_levels @ kept_missing], a re-partition against the same open
-     orders yields exactly [kept_missing] as the missing set, so the later
-     branches reuse it instead of re-partitioning.
+  (* The persisted-sell grid is reconciled once per execution and the result is
+     reused by the three persisted-sell branches below. After the pruning below
+     rebuilds [persisted_sell_levels] to [open_levels @ kept_missing], a
+     re-partition against the same open orders yields exactly [kept_missing] as
+     the missing set, so later branches reuse it.
 
-     [sync_open_orders] (the strategy hot path) already computed this
-     exact (open_levels, missing_levels) split during its scan - each open
-     sell consumed one persisted level, so the missing set falls out in O(m)
-     instead of this O(n+m) partition. Only direct [evaluate_sell_leg]
-     callers (tests) fall back to the partition. *)
+     [sync_open_orders] already computed this exact (open_levels,
+     missing_levels) split during its scan (each open sell consumes one
+     persisted level), so the missing set falls out in O(m). Only direct
+     [evaluate_sell_leg] callers (tests) fall back to the partition. *)
   let missing_after_reconcile = ref [] in
   let pruned_missing = ref [] in
   if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> []
@@ -1871,21 +1798,18 @@ let evaluate_sell_leg
     else state.just_filled_buy || buy_attempted || halt_inventory_check
   in
   let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Sell" in
-  (* Surface every path that ends a triggered sell leg without placing.
-     These previously produced either no log at all or a debug-only line,
-     which is how sell placement stayed silently wedged (dust persisted
-     levels, wiped position snapshots) while buys kept flowing.
+  (* Surface every path that ends a triggered sell leg without placing, so sell
+     placement cannot stay silently wedged (dust persisted levels, wiped
+     position snapshots) while buys keep flowing.
 
-     NOT surfaced: the verified nothing-to-sell resting state (remaintain
-     trigger armed, fresh balance below the venue floor). That state is not
-     a wedge - the owed sell can never place until inventory recovers, and
-     the recovery paths (buy-fill event, the persistent grid-maintenance
-     clause) re-trigger on their own - so it is handled by consuming the
-     latch at the end of the leg with a one-time info line instead of
-     re-firing a warn on every tick. The old per-tick "inventory gate
-     failed" warn interpolated the live ref price into the reason string,
-     which defeated the dedup window and spammed the log for the whole
-     life of a dust balance. *)
+     Not surfaced: the verified nothing-to-sell resting state (remaintain
+     trigger armed, fresh balance below the venue floor). That state is not a
+     wedge - the owed sell cannot place until inventory recovers, and the
+     recovery paths (buy-fill event, the persistent grid-maintenance clause)
+     re-trigger on their own - so the latch is consumed at the end of the leg
+     with a one-time info line instead of a per-tick warn. A per-tick warn
+     interpolating the live ref price would defeat the dedup window and spam the
+     log for the life of a dust balance. *)
   let skip_reason =
     if should_trigger_sell
     then
@@ -1923,20 +1847,18 @@ let evaluate_sell_leg
       | Some q when q > 0.0 -> q
       | _ -> venue_lot_qty state.grid_qty asset.exchange state
     in
-    (* Sell sizing ownership. An OWED sell (a buy fill's 1:1 sell, a buy
+    (* Sell sizing ownership. An owed sell (a buy fill's 1:1 sell, a buy
        placement companion, inventory recovery after a balance/oracle event,
-       the uncommitted-inventory fallback) is STRATEGY-SIZED like every other
-       venue: price anchored on the last buy fill + grid interval, qty 1:1
-       with the fill, clamped to sellable inventory. The persisted level file
-       NEVER dictates the price or sizing of a new sell. Its only role is
-       restoration: re-placing a rung the venue dropped (Alpaca fractional
-       orders are forced to day TIF, so resting rungs die at the session
-       boundary) at its recorded price/qty, so the historical ladder is
-       respected until price recovers. Restoration is selected only when no
-       new sell is owed, so the two obligations cannot hijack each other; a
-       restoration level below the venue's real minimum can never be placed
-       and is pruned at the venue-minimum gate below instead of wedging the
-       maintenance path forever. *)
+       the uncommitted-inventory fallback) is strategy-sized on every venue:
+       price anchored on the last buy fill + grid interval, qty 1:1 with the
+       fill, clamped to sellable inventory. The persisted level file never
+       dictates the price or sizing of a new sell. Its only role is restoration:
+       re-placing a rung the venue dropped (Alpaca fractional orders are forced
+       to day TIF, so resting rungs die at the session boundary) at its recorded
+       price/qty. Restoration is selected only when no new sell is owed, so the
+       two obligations cannot hijack each other; a restoration level below the
+       venue's real minimum is pruned at the venue-minimum gate below instead of
+       wedging the maintenance path. *)
     let new_sell_owed =
       state.just_filled_buy
       || buy_attempted
@@ -2228,20 +2150,16 @@ let evaluate_sell_leg
        immediately, even if the same blocker kind logged inside the dedup
        window for a previous obligation. *)
     state.last_sell_block_reason <- "");
-  (* Verified nothing-to-sell (remaintain venues - Alpaca): the trigger is
-     armed but the FRESH balance figure is below the venue's order floor, so
-     the owed sell can never place in this state. Consume the latch here -
-     the documented "verified nothing-to-sell" consumption, which the
-     placement block above can never reach for remaintain venues because
+  (* Verified nothing-to-sell (remaintain venues - Alpaca): the trigger is armed
+     but the fresh balance figure is below the venue's order floor, so the owed
+     sell cannot place in this state. Consume the latch here - the placement
+     block above can never reach it for remaintain venues because
      [missing_alpaca_sell_grid] itself requires [inventory_ok]. Leaving the
-     latch armed kept the inventory-gate branch re-firing its warn on every
-     strategy tick for the whole life of a dust balance (the LIT wedge:
-     balance 3e-9, latch armed by a ghost-buy re-placement, warn per book
-     tick). Recovery paths re-arm placement on their own: a buy-fill event
-     re-arms this latch, and the persistent
-     (open_sell_orders = [] /\ last_buy_fill_price) grid-maintenance clause
-     re-places the fill-anchored sell the moment inventory clears the
-     floor - so no owed sell is lost. *)
+     latch armed re-fires the inventory-gate warn every tick for the life of a
+     dust balance. Recovery paths re-arm placement on their own: a buy-fill
+     event re-arms this latch, and the persistent (open_sell_orders = [] /\
+     last_buy_fill_price) grid-maintenance clause re-places the fill-anchored
+     sell once inventory clears the floor. *)
   if
     ecfg.remaintain_expired_sells
     && state.just_filled_buy
@@ -2289,35 +2207,28 @@ let evaluate_sell_leg
 ;;
 
 (** Main strategy execution loop. [quote_balance_stale] is set by the caller
-    (domain worker) when the quote-balance snapshot is older than the
-    staleness threshold: a stale snapshot is not authoritative, so an
-    under-funded buy is still attempted (the exchange's verdict is the
-    truth); a fresh snapshot that cannot fund the buy is skipped outright
-    instead of being sent to be rejected.
+    (domain worker) when the quote-balance snapshot is older than the staleness
+    threshold: a stale snapshot is not authoritative, so an under-funded buy is
+    still attempted (the exchange's verdict is the truth); a fresh snapshot that
+    cannot fund the buy is skipped instead of sent to be rejected.
 
     [oracle_halted] (the capital oracle published this asset INACTIVE) gates
-    ONLY the buy leg - no new buy placement, no buy trailing/amending (a
-    halted asset must not commit more quote capital). The SELL leg always
-    runs: a sell needs only inventory, not quote, so the sell for a
+    only the buy leg - no new buy placement, no buy trailing/amending. The sell
+    leg always runs: a sell needs only inventory, not quote, so the sell for a
     just-filled buy is placed even when capital is exhausted and the asset is
-    halted - the account's capital-recovery path. Without this the last
-    fill's inventory would sit unreclaimable.
+    halted - the account's capital-recovery path.
 
-    EXCEPTION - TIF recovery ([state.tif_recovery_pending]): a TIF/ALO/
-    post-only reject or a transient placement failure that killed a
-    previously-approved resting buy arms a recovery window during which the
-    buy leg re-attempts through the halt. The window expires 900s after the
-    LAST armed kill - each failed re-attempt re-arms and refreshes it by
-    design, so the recovery keeps re-attempting (2s-cooldown cadence) while
-    the venue keeps rejecting, and the latch decays once the kill events
-    stop. Without the recovery, the halt's "no open buy" rule turns a
-    transient reject into an indefinite buyless gap: the reject removes the
-    resting buy, the halt then sees no open buy, and nothing ever
-    re-attempts until a fill happens to re-anchor. Re-placing the
-    already-approved buy at the fresh price is a restoration of prior
-    commitment (strictly safer after a price drop), not new sizing - the
-    halt still blocks genuinely new commitments, and capital_low still
-    gates every attempt. *)
+    Exception - TIF recovery ([state.tif_recovery_pending]): a TIF/ALO/
+    post-only reject or transient placement failure that killed a
+    previously-approved resting buy arms a recovery window during which the buy
+    leg re-attempts through the halt. The window expires 900s after the last
+    armed kill - each failed re-attempt re-arms and refreshes it by design, so
+    recovery keeps re-attempting (2s cooldown) while the venue rejects, and the
+    latch decays once kill events stop. Without it, the halt's "no open buy" rule
+    turns a transient reject into an indefinite buyless gap. Re-placing the
+    already-approved buy at the fresh price restores prior commitment (safer
+    after a price drop), not new sizing: the halt still blocks new commitments
+    and capital_low still gates every attempt. *)
 let execute_strategy
       ?cached_state
       ?(quote_balance_stale = false)
@@ -2474,18 +2385,16 @@ let execute_strategy
            state.last_cycle <- cycle;
            ())
          else (
-           (* Oracle-halted: no buy placement, no buy trailing/amending - a
-                halted asset must not commit more quote capital. The sell leg
-                still runs (see the [oracle_halted] doc on execute_strategy).
-                EXCEPTION - TIF recovery: a TIF/ALO/post-only reject (or a
-                transient placement failure) killed a previously-approved
-                resting buy. Re-attempting it at the fresh price is not a new
-                capital commitment (after a price drop it strictly improves
-                survival margin), and without it the asset sits buyless for
-                the entire oracle-inactive window - the halt's "no open buy"
-                rule turns a transient reject into an indefinite liveness
-                gap. The latch expires (900s) so it cannot pin buys through
-                a genuine, persistent capital halt. *)
+            (* Oracle-halted: no buy placement, no buy trailing/amending - a
+                 halted asset must not commit more quote capital. The sell leg
+                 still runs (see the [oracle_halted] doc on execute_strategy).
+                 Exception - TIF recovery: a TIF/ALO/post-only reject (or a
+                 transient placement failure) killed a previously-approved
+                 resting buy. Re-attempting it at the fresh price is not a new
+                 capital commitment (after a price drop it improves survival
+                 margin), and without it the asset sits buyless for the entire
+                 oracle-inactive window. The latch expires (900s) so it cannot
+                 pin buys through a genuine, persistent capital halt. *)
            let recovery_expired =
              state.tif_recovery_pending && now -. state.tif_recovery_since >= 900.0
            in

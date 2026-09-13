@@ -2,7 +2,7 @@ let test_encode_fields_single () =
   let result = Ibkr.Codec.encode_fields [ "hello" ] in
   (* payload = "hello\x00" = 6 bytes, total = 4 + 6 = 10 *)
   Alcotest.(check int) "encoded length" 10 (Bytes.length result);
-  (* Check length prefix is big-endian 6 *)
+  (* 4-byte big-endian length prefix = 6. *)
   Alcotest.(check int) "length byte 0" 0 (Bytes.get_uint8 result 0);
   Alcotest.(check int) "length byte 1" 0 (Bytes.get_uint8 result 1);
   Alcotest.(check int) "length byte 2" 0 (Bytes.get_uint8 result 2);
@@ -15,7 +15,7 @@ let test_encode_fields_multiple () =
   let expected_payload = "a\x00bb\x00ccc\x00" in
   let payload = Bytes.sub_string result 4 (Bytes.length result - 4) in
   Alcotest.(check string) "payload content" expected_payload payload;
-  (* Length prefix should be 9 *)
+  (* Length prefix = 9. *)
   let len =
     (Bytes.get_uint8 result 0 lsl 24)
     lor (Bytes.get_uint8 result 1 lsl 16)
@@ -65,7 +65,7 @@ let test_decode_fields_empty_fields () =
 let test_encode_decode_roundtrip () =
   let original = [ "71"; "2"; "0"; "" ] in
   let encoded = Ibkr.Codec.encode_fields original in
-  (* Skip 4-byte length prefix, decode payload *)
+  (* Decode payload after the 4-byte length prefix. *)
   let payload = Bytes.sub_string encoded 4 (Bytes.length encoded - 4) in
   let decoded = Ibkr.Codec.decode_fields payload in
   Alcotest.(check (list string)) "roundtrip" original decoded
@@ -73,12 +73,12 @@ let test_encode_decode_roundtrip () =
 
 let test_encode_handshake () =
   let result = Ibkr.Codec.encode_handshake ~min_ver:100 ~max_ver:176 in
-  (* Should start with "API\x00" *)
+  (* Starts with "API\x00". *)
   Alcotest.(check char) "API byte 0" 'A' (Bytes.get result 0);
   Alcotest.(check char) "API byte 1" 'P' (Bytes.get result 1);
   Alcotest.(check char) "API byte 2" 'I' (Bytes.get result 2);
   Alcotest.(check int) "API null byte" 0 (Bytes.get_uint8 result 3);
-  (* After "API\x00" (4 bytes) comes 4-byte length prefix then "v100..176" *)
+  (* After "API\x00": 4-byte length prefix, then "v100..176". *)
   let version_str = "v100..176" in
   let version_len = String.length version_str in
   let len_from_prefix =
@@ -129,7 +129,7 @@ let test_read_float () =
 ;;
 
 let test_read_float_max_value () =
-  (* TWS Double.MAX_VALUE sentinel *)
+  (* TWS Double.MAX_VALUE sentinel. *)
   let v, _ = Ibkr.Codec.read_float [ "1.7976931348623157E308" ] in
   Alcotest.(check (float 0.001)) "read_float MAX_VALUE becomes 0.0" 0.0 v
 ;;
@@ -219,7 +219,7 @@ let test_encode_contract () =
     }
   in
   let fields = Ibkr.Codec.encode_contract contract in
-  (* Should be 13 fields *)
+  (* 13 fields. *)
   Alcotest.(check int) "encode_contract field count" 13 (List.length fields);
   Alcotest.(check string) "encode_contract con_id" "265598" (List.nth fields 0);
   Alcotest.(check string) "encode_contract symbol" "AAPL" (List.nth fields 1);
@@ -232,7 +232,7 @@ let test_encode_contract () =
 let test_encode_contract_short () =
   let contract = Ibkr.Types.make_stk_contract ~symbol:"SPY" in
   let fields = Ibkr.Codec.encode_contract_short contract in
-  (* Should be 12 fields (no includeExpired) *)
+  (* 12 fields (no includeExpired). *)
   Alcotest.(check int) "encode_contract_short field count" 12 (List.length fields);
   Alcotest.(check string) "encode_contract_short symbol" "SPY" (List.nth fields 1);
   Alcotest.(check string) "encode_contract_short sec_type" "STK" (List.nth fields 2)
@@ -243,7 +243,7 @@ let test_encode_order () =
     Ibkr.Types.make_limit_order ~order_id:1 ~action:"BUY" ~qty:10.0 ~price:150.0
   in
   let fields = Ibkr.Codec.encode_order order in
-  (* Should be 19 fields *)
+  (* 19 fields. *)
   Alcotest.(check int) "encode_order field count" 19 (List.length fields);
   Alcotest.(check string) "encode_order action" "BUY" (List.nth fields 0);
   Alcotest.(check string) "encode_order order_type" "LMT" (List.nth fields 2);
@@ -255,13 +255,13 @@ let test_encode_order_market () =
   let fields = Ibkr.Codec.encode_order order in
   Alcotest.(check string) "encode_order market action" "SELL" (List.nth fields 0);
   Alcotest.(check string) "encode_order market type" "MKT" (List.nth fields 2);
-  (* lmt_price should be empty for market orders *)
+  (* Market orders leave lmt_price empty. *)
   Alcotest.(check string) "encode_order market lmt_price" "" (List.nth fields 3)
 ;;
 
 let test_encode_order_tail () =
   let fields = Ibkr.Codec.encode_order_tail () in
-  (* Should be a long list of defaults *)
+  (* Long default tail (>50 fields). *)
   Alcotest.(check bool) "encode_order_tail has many fields" true (List.length fields > 50)
 ;;
 

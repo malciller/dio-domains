@@ -19,9 +19,9 @@ let get_conduit_ctx = Kraken_common_types.get_conduit_ctx
 let orderbook_depth = Kraken_common_types.default_orderbook_depth
 let ring_buffer_size = Kraken_common_types.default_ring_buffer_size_orderbook
 
-(** Bound on the TLS + WebSocket upgrade handshake: a half-open TCP
-    connection during the handshake would otherwise block the reconnect
-    (which runs on the main Lwt loop) indefinitely. *)
+(** TLS + WebSocket upgrade handshake timeout, seconds. Bounds a half-open TCP
+    connection that would otherwise block the main-Lwt-loop reconnect
+    indefinitely. *)
 let ws_connect_timeout_s = 20.0
 
 (** Atomic flag indicating whether cleanup handlers have been initialized. *)
@@ -80,10 +80,10 @@ let add_normalized_to_crc crc s =
 type level =
   { price : string (** Canonical fixed-decimals rendering; used as the map key. *)
   ; price_wire : string
-    (** Price exactly as received on the wire. Kraken's CRC32 checksum is
-        computed over wire strings (dots removed, leading zeros stripped,
-        trailing zeros preserved), NOT over a re-formatted value - padding or
-        rounding here changes the CRC and invalidates every check. *)
+    (** Price exactly as received on the wire. Kraken's CRC32 is computed over
+        wire strings (dots removed, leading zeros stripped, trailing zeros
+        preserved), not over a re-formatted value; padding or rounding here
+        changes the CRC and invalidates every check. *)
   ; size : string
   ; price_float : float
   ; size_float : float
@@ -126,7 +126,6 @@ let to_decimal_str ?(trim_trailing = true) ?dec json =
       | [ whole; frac ] ->
         if trim_trailing
         then (
-          (* Trim trailing zeros from fractional part. *)
           let len = String.length frac in
           let rec rtrim i =
             if i <= 0
@@ -151,8 +150,8 @@ let parse_checksum_level price_json qty_json =
   price_str, qty_str
 ;;
 
-(** Compute CRC32 checksum from raw JSON bid/ask arrays using the top 10 levels per side.
-    Operates directly on JSON to preserve original string precision. *)
+(** CRC32 over the top 10 levels per side, computed from raw JSON values so
+    original string precision is preserved. *)
 let calculate_checksum_from_json symbol bids_json asks_json : int32 =
   let parse_checksum_levels json =
     match json with
@@ -176,7 +175,6 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
   in
   let bids_levels = parse_checksum_levels bids_json in
   let asks_levels = parse_checksum_levels asks_json in
-  (* Check if quantity string represents zero by scanning for any non-zero, non-decimal digit. *)
   let is_effectively_zero qty_str =
     let rec has_non_zero s i =
       if i >= String.length s
@@ -187,14 +185,12 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
     in
     not (has_non_zero qty_str 0)
   in
-  (* Exclude levels with zero quantity. *)
   let valid_bids =
     List.filter (fun (_, qty_str) -> not (is_effectively_zero qty_str)) bids_levels
   in
   let valid_asks =
     List.filter (fun (_, qty_str) -> not (is_effectively_zero qty_str)) asks_levels
   in
-  (* Sort bids descending by price, asks ascending by price. *)
   let sorted_bids =
     List.sort
       (fun (p1, _) (p2, _) -> Float.compare (float_of_string p2) (float_of_string p1))
@@ -205,7 +201,7 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
       (fun (p1, _) (p2, _) -> Float.compare (float_of_string p1) (float_of_string p2))
       valid_asks
   in
-  (* Select up to 10 levels per side. No padding per Kraken specification. *)
+  (* Top 10 levels per side; no padding per Kraken specification. *)
   let top_bids = take (min 10 (List.length sorted_bids)) sorted_bids in
   let top_asks = take (min 10 (List.length sorted_asks)) sorted_asks in
   Logging.debug_f
@@ -253,12 +249,11 @@ type store =
     (** Last processed sequence number. Used for gap and rollback detection. *)
   ; last_update_ns : int64 Atomic.t
     (** Mtime_clock monotonic nanoseconds of the most recent data write.
-        Atomic because written by the parse domain and read by trading domains;
-        monotonic so staleness is immune to wall-clock (NTP) steps. *)
+        Atomic: written by the parse domain, read by trading domains.
+        Monotonic: staleness is immune to wall-clock (NTP) steps. *)
   ; mutable checksum_tick : int
-    (** Increments per book update; the per-tick checksum recompute (2 extra
-        fold+sort+array passes) runs only every [checksum_every_n] ticks;
-        see M2. *)
+    (** Increments per book update. The checksum recompute (2 extra
+        fold+sort+array passes) runs only every [checksum_every_n] ticks. *)
   }
 
 (** (pair_decimals, lot_decimals) precision tuple from AssetPairs API. *)
@@ -267,9 +262,8 @@ type decimals = int * int
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let decimals_tbl : (string, decimals) Hashtbl.t = Hashtbl.create 16
 
-(** Persistent registry of all subscribed symbols (configured + dynamic).
-    Preserved across disconnects and resets so that dynamic subscriptions
-    re-subscribe automatically on connection restart. *)
+(** All subscribed symbols (configured + dynamic), preserved across disconnects
+    and resets so dynamic subscriptions survive connection restart. *)
 let all_subscribed_symbols : string list ref = ref []
 
 let subscribed_mutex = Mutex.create ()
@@ -292,11 +286,10 @@ let add_subscribed_symbols symbols =
   total
 ;;
 
-(* frame parsing/dispatch runs on the Parse_worker domain, so nothing in
-   the dispatch path may touch Lwt primitives. The old [Lwt_condition]
-   ready signal became an Atomic flag polled by the startup waiter, and the
-   sequence-gap resubscribe trigger became a pending-queue drained by a
-   small Lwt watcher on the main domain. *)
+(* Frame parse/dispatch runs on the Parse_worker domain; the dispatch path
+   must not touch Lwt primitives. Readiness is an Atomic flag polled by the
+   startup waiter; sequence-gap resubscribes go through [pending_resubscribes],
+   drained by an Lwt watcher on the main domain. *)
 let resubscribe_symbol_ref : (string -> unit Lwt.t) option ref = ref None
 
 (** Symbols awaiting a resubscribe after a sequence gap/rollback. Appended
@@ -322,10 +315,9 @@ let[@inline] request_resubscribe symbol =
   loop ()
 ;;
 
-(** recompute the book checksum at most once per this many updates per
-    symbol. The checksum rebuild does 2 extra fold+sort+array passes per tick;
-    every 10th update still validates constantly-changing books far more often
-    than the exchange's drift window needs. *)
+(** Checksum recompute interval, in updates per symbol. The rebuild costs 2
+    extra fold+sort+array passes per tick; once per 10 updates is sufficient
+    for the exchange's drift window. *)
 let checksum_every_n = 10
 
 (** Retrieves price and quantity precision from the instruments feed cache. Returns None on failure. *)
@@ -416,15 +408,13 @@ let store_opt symbol = Hashtbl.find_opt stores symbol
 let notify_ready ~symbol store =
   if not (Atomic.get store.ready)
   then
-    (* Atomic flag only - the startup waiter polls it, so this is safe
-       from the Parse_worker domain (the old Lwt_condition.broadcast was
-       not). *)
+    (* Atomic flag only: safe from the Parse_worker domain; the startup
+       waiter polls it. *)
     Atomic.set store.ready true;
   Concurrency.Exchange_wakeup.signal ~symbol
 ;;
 
 let is_effectively_zero size =
-  (* Returns true if the string contains no non-zero, non-decimal, non-sign digits. *)
   let rec has_non_zero s i =
     if i >= String.length s
     then false
@@ -473,13 +463,12 @@ let parse_level symbol price_json size_json =
       (try Hashtbl.find decimals_tbl symbol with
        | Not_found -> 8, 8)
   in
-  (* NO trailing-zero trimming: the checksum input must be the exchange's
-     fixed-decimal representation. The live v2 feed sends NUMBERS (not the
+  (* No trailing-zero trimming: checksum input must be the exchange's
+     fixed-decimal representation. The live v2 feed sends numbers (not the
      documented strings), so numeric fields are re-rendered at full pair/lot
-     precision - e.g. qty 5.1e-05 at lot_decimals=8 becomes "0.00005100",
-     whose normalization ("5100") matches Kraken's server-side CRC input.
-     Trimming would yield "51" and invalidate every checksum. String inputs
-     pass through verbatim either way. *)
+     precision (qty 5.1e-05 at lot_decimals=8 -> "0.00005100", normalized
+     "5100"); trimming would yield "51" and invalidate every checksum.
+     String inputs pass through verbatim. *)
   let price_str_raw = to_decimal_str ~trim_trailing:false ~dec:pd price_json in
   let qty_str = to_decimal_str ~trim_trailing:false ~dec:ld size_json in
   let price_float =
@@ -589,7 +578,6 @@ let build_orderbook store symbol entry =
       | _ -> None)
     else None
   in
-  (* Constructs arrays directly from the Hashtbl by sorting. *)
   let bids = levels_to_array ~sort_desc:true store.bids orderbook_depth in
   let asks = levels_to_array ~sort_desc:false store.asks orderbook_depth in
   { symbol; bids; asks; sequence; checksum; timestamp = Unix.time () }
@@ -752,25 +740,22 @@ let process_orderbook_message ~reset json on_heartbeat =
            parse_and_apply_levels symbol store.bids bids_json;
            parse_and_apply_levels symbol store.asks asks_json;
            Atomic.set store.last_update_ns (Mtime_clock.now_ns ());
-           (* Kraken v2 book contract: levels falling out of the subscribed
-               scope NEVER receive a qty:0 removal. Retaining anything beyond
-               [orderbook_depth] therefore accumulates stale ghosts that slide
-               back into the computed top-10 during removal cascades and
-               permanently desync checksum validation - verified live: 2x-depth
-               retention drifted BTC/ADA within ~20 updates while strict
-               depth truncation ran 14k+ validations with zero mismatches.
-               Truncate to the subscribed depth after every message. *)
+            (* Kraken v2 book contract: levels that fall out of the subscribed
+                scope never receive a qty:0 removal. Retaining entries beyond
+                [orderbook_depth] accumulates stale levels that re-enter the
+                computed top-10 during removal cascades and desync checksum
+                validation. Truncate to the subscribed depth after every
+                message. *)
            if Hashtbl.length store.bids > orderbook_depth
            then truncate_hashtbl store.bids true orderbook_depth;
            if Hashtbl.length store.asks > orderbook_depth
            then truncate_hashtbl store.asks false orderbook_depth;
            let orderbook = build_orderbook store symbol entry in
-           (* Compute and verify CRC32 from current state using top 10 levels per side.
-            If the configured depth is < 10, checksum validation is bypassed because
-            the stored map lacks the requisite levels to evaluate the CRC.
-            the checksum recompute (2 extra fold+sort+array passes) is throttled
-            to every [checksum_every_n] updates per symbol; the book is still built
-            and written per tick, only the redundant CRC pass is slowed down. *)
+            (* CRC32 from current state over the top 10 levels per side. If
+             [orderbook_depth] < 10, validation is bypassed (the map lacks the
+             requisite levels). The recompute is throttled to every
+             [checksum_every_n] updates; the book is still built and written
+             per tick, only the redundant CRC pass is slowed. *)
            store.checksum_tick <- store.checksum_tick + 1;
            let checksum_valid =
              if orderbook_depth >= 10 && store.checksum_tick mod checksum_every_n = 0
@@ -785,10 +770,9 @@ let process_orderbook_message ~reset json on_heartbeat =
                | Some received_checksum ->
                  if Int32.compare calculated_checksum received_checksum <> 0
                  then (
-                   (* Cooldown: a persistently failing validator must degrade
-                       to periodic heals, not hot-loop unsub/resub (observed as
-                       a storm when the checksum math itself was wrong). Only
-                       touched from the parse domain - no locking needed. *)
+                    (* Cooldown: a persistently failing validator must degrade
+                        to periodic heals, not hot-loop unsub/resub. Touched
+                        only from the parse domain; no locking needed. *)
                    let now = Unix.gettimeofday () in
                    let last =
                      match Hashtbl.find_opt resubscribe_cooldown symbol with
@@ -982,11 +966,10 @@ let prune_stale_data () =
        if Int64.compare age stale_threshold_ns > 0
        then (
          (* Never prune a store whose symbol is still subscribed: the
-            exchange-side subscription survives the prune, so removing only
-            the local state strands the symbol snapshot-less forever - the
-            health monitor then re-subscribes every 15s and Kraken answers
-            "Already subscribed" in a loop. Store count stays bounded by the
-            subscribed symbol list. *)
+            exchange-side subscription survives the prune, stranding the
+            symbol snapshot-less; the health monitor then re-subscribes every
+            15s and Kraken answers "Already subscribed" in a loop. Store count
+            stays bounded by the subscribed symbol list. *)
          let still_subscribed =
            Mutex.lock subscribed_mutex;
            let sub = List.mem symbol !all_subscribed_symbols in
@@ -1051,9 +1034,9 @@ let trigger_orderbook_cleanup ~reason () =
     stalled book feed). *)
 let last_book_time = ref 0.0
 
-(* the per-connection heartbeat closure, published so the Parse_worker
-   handler can invoke it from the parse domain (it is domain-safe: a mutex
-   and a timestamp update). One orderbook connection exists at a time. *)
+(* Per-connection heartbeat closure, published so the Parse_worker handler
+   can invoke it from the parse domain (domain-safe: mutex + timestamp
+   update). One orderbook connection exists at a time. *)
 let current_on_heartbeat : (unit -> unit) option Atomic.t = Atomic.make None
 
 let extract_symbol_opt json =
@@ -1075,10 +1058,9 @@ let extract_symbol_opt json =
         | _ -> None))
 ;;
 
-(** synchronous dispatch of an already-parsed frame. DOMAIN-SAFE: no
-    Lwt primitives here - this runs on the Parse_worker domain. Sequence-gap
-    resubscribes go through the pending queue; readiness through Atomics;
-    logging/profiling/wakeups are all domain-safe. *)
+(** Dispatch of an already-parsed frame on the Parse_worker domain; no Lwt
+    primitives. Sequence-gap resubscribes go through the pending queue;
+    readiness through Atomics; logging/profiling/wakeups are domain-safe. *)
 let handle_dispatch json on_heartbeat =
   let open Yojson.Safe.Util in
   let channel = member "channel" json |> to_string_option in
@@ -1125,22 +1107,20 @@ let handle_dispatch json on_heartbeat =
           err_msg;
       if is_already_subscribed
       then (
-        (* Kraken dedups per connection: the subscription IS active, but the
-           local store may be missing (pruned after 30min without updates) or
-           snapshot-less. In both cases no snapshot ever arrives on its own,
-           deltas keep being discarded, and the health monitor re-subscribes
-           every 15s - repeating this error forever. Recover event-driven:
-           recreate the store if needed and drive one unsubscribe+resubscribe
-           cycle, which forces a fresh snapshot. *)
+        (* Kraken dedups per connection: the subscription is active but the
+           local store may be missing (pruned after 30 min) or snapshot-less.
+           No snapshot arrives on its own, deltas are discarded, and the health
+           monitor re-subscribes every 15s in a loop. Recover event-driven:
+           recreate the store if needed and force one unsubscribe+resubscribe
+           cycle to obtain a fresh snapshot. *)
         match symbol_opt with
         | Some sym ->
           (match store_opt sym with
            | Some store
              when (not (Atomic.get store.has_snapshot))
                   || (Hashtbl.length store.bids = 0 && Hashtbl.length store.asks = 0) ->
-             (* Snapshot-less, or a snapshot arrived but left an empty book:
-               either way top-of-book stays invalid and the health monitor
-               re-subscribes every 15s. *)
+             (* Snapshot-less, or a snapshot left an empty book: top-of-book
+                stays invalid and the health monitor re-subscribes every 15s. *)
              Logging.warn_f
                ~section
                "Kraken is already subscribed to %s but local store has no usable book; \
@@ -1214,11 +1194,11 @@ let handle_message message on_heartbeat =
       message
 ;;
 
-(** asynchronous path used by the WS read loop. Tick accounting and the
-    heartbeat stay on the Lwt fiber; the JSON parse and dispatch move to the
-    Parse_worker domain. Falls back to the synchronous path when the worker
-    queue is full - Kraken book updates are deltas, so frames must never be
-    dropped (a lost delta desyncs the book until the next snapshot). *)
+(** Async path for the WS read loop: tick accounting and heartbeat stay on
+    the Lwt fiber; JSON parse and dispatch run on the Parse_worker domain.
+    Falls back to the synchronous path when the worker queue is full. Book
+    updates are deltas, so frames must never be dropped (a lost delta desyncs
+    the book until the next snapshot). *)
 let handle_message_async message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
   Atomic.set current_on_heartbeat (Some on_heartbeat);
@@ -1236,11 +1216,10 @@ let wait_for_orderbook_data_lwt symbols timeout_seconds =
       if elapsed >= timeout_seconds
       then
         Lwt.return_false
-        (* poll the per-store ready flags instead of blocking on a
-           condition variable - readiness is now published from the
-           Parse_worker domain, which must not touch Lwt primitives. The
-           25ms poll only runs during startup gating (bounded by the
-           timeout), never on a hot path. *)
+        (* Poll per-store ready flags; readiness is published from the
+           Parse_worker domain, which must not touch Lwt primitives. The 25ms
+           poll runs only during startup gating (bounded by the timeout),
+           never on a hot path. *)
       else Lwt_unix.sleep 0.025 >>= fun () -> wait_loop ())
   in
   wait_loop ()
@@ -1279,11 +1258,10 @@ let start_message_handler conn symbols on_failure on_heartbeat =
     then (
       failed := true;
       Lwt_mutex.with_lock state.mutex (fun () ->
-        (* Physical equality: [conn] is a record holding closures
+        (* Physical equality: [conn] holds closures
            ([read_frame]/[write_frame]), so structural [=] raises
-           Invalid_argument("compare: functional value") and would abort
-           [notify_failure] - leaving [active_conn] pointing at the dead
-           socket and skipping [on_failure]. *)
+           Invalid_argument("compare: functional value"), aborting
+           [notify_failure] and leaving [active_conn] on the dead socket. *)
         if
           match state.active_conn with
           | Some c -> c == conn
@@ -1352,10 +1330,9 @@ let resubscribe_backoff_delay_s attempt =
 let rec subscribe_symbols symbols =
   resubscribe_symbol_ref := Some (fun s -> resubscribe_symbol s);
   let _ = add_subscribed_symbols symbols in
-  (* drain sequence-gap resubscribe requests raised on the Parse_worker
-     domain. The watcher runs on the Lwt main domain, where the Lwt-based
-     [resubscribe_symbol] is safe. Started once; 50ms poll on a path that
-     only fires when a feed degrades. *)
+  (* Drain sequence-gap resubscribe requests raised on the Parse_worker
+     domain. The watcher runs on the Lwt main domain, where [resubscribe_symbol]
+     is safe. Started once; 50ms poll. *)
   if not (Atomic.get resubscribe_watcher_started)
   then (
     Atomic.set resubscribe_watcher_started true;
@@ -1445,10 +1422,10 @@ and resubscribe_symbol symbol =
     Ws_lwt.write conn (Websocket.Frame.create ~content:msg_str ())
     >>= fun () -> Lwt_unix.sleep 0.25 >>= fun () -> subscribe_symbols [ symbol ]
   | None ->
-    (* Gap fix: a missing connection is a failure, not a silent success.
-       Raising routes into [resubscribe_with_retry]'s backoff loop; if the
-       socket is truly dead the supervisor's reconnect path owns recovery
-       (it clears all stores and resubscribes every symbol). *)
+    (* A missing connection is a failure, not a silent success. Raising routes
+       into [resubscribe_with_retry]'s backoff loop; if the socket is dead, the
+       supervisor reconnect path owns recovery (clears stores, resubscribes all
+       symbols). *)
     failwith "orderbook WS not connected"
 
 (** Drives one resubscribe to completion with exponential backoff + jitter,

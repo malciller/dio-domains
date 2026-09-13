@@ -86,7 +86,7 @@ let test_validate_cancel_request () =
 
 let test_duplicate_detection () =
   let key = "TEST_DUP|buy|0.1|1000." in
-  (* Ensure clean slate *)
+  (* Reset in-flight state. *)
   ignore (Dio_engine.Order_executor.InFlightOrders.remove_in_flight_order key);
   let added = Dio_engine.Order_executor.InFlightOrders.add_in_flight_order key in
   check bool "first add returns true" true added;

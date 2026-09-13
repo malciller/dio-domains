@@ -1,35 +1,27 @@
-(** Bounded ring buffer with FIFO eviction semantics.
+(** Bounded ring buffer with FIFO eviction.
 
-    Provides a fixed-capacity circular buffer backed by atomic variables.
-    Designed for single-writer, multi-reader market data feeds (ticker,
-    orderbook, executions) where bounded memory usage is required.
-    Overwrites the oldest entry when the buffer is full.
+    Fixed-capacity circular buffer over atomic variables, for single-writer,
+    multi-reader market-data feeds (ticker, orderbook, executions) with bounded
+    memory. A full buffer overwrites the oldest entry.
 
-    Positions are ABSOLUTE and monotonic: [write_pos] counts total writes
-    and never wraps. Consumer cursors returned by [get_position] /
-    [iter_since] / [read_since] stay valid for the lifetime of the buffer,
-    including across laps and [clear].
+    Positions are absolute and monotonic: [write_pos] counts total writes and
+    never wraps. Cursors from [get_position] / [iter_since] / [read_since] stay
+    valid for the buffer's lifetime, across laps and [clear].
 
-    Lap policy: a reader starting behind [write_pos - size] resumes at the
-    oldest surviving entry; evicted entries are skipped deterministically.
-    During iteration, a slot whose stored sequence number does not match
-    the expected position was overwritten mid-iteration (the reader is being
-    lapped live) and is skipped rather than mis-delivered.
+    Lap policy: a reader behind [write_pos - size] resumes at the oldest
+    surviving entry; evicted entries are skipped. During iteration a slot whose
+    stored sequence number does not match the expected position was overwritten
+    mid-iteration (the reader was lapped) and is skipped, not mis-delivered.
 
-    Cross-domain safety (seqlock discipline): the writer publishes each slot
-    under a sentinel protocol - [seq] is set to a reserved "writing" value
-    before the payload is stored and only set to the slot's absolute position
-    once the payload is complete. Readers validate [seq] both BEFORE and
-    AFTER reading the payload; a payload is delivered only when both checks
-    match. Because [seq] can never equal a valid position while the payload
-    is mid-update, a reader can neither observe a torn payload nor a newer
-    payload mis-delivered at an older cursor, and the [Obj.magic 0] empty
-    marker can never escape [clear].
+    Cross-domain safety (seqlock): the writer sets [seq] to a reserved "writing"
+    sentinel before storing the payload and to the slot's absolute position only
+    once the payload is complete. Readers validate [seq] before and after reading
+    the payload and deliver only when both match; [seq] can never equal a valid
+    position mid-update, so no torn payload or mis-delivered newer payload is
+    observable, and the [Obj.magic 0] empty marker cannot escape [clear].
 
-    Performance: Slots are pre-allocated mutable records, making [write]
-    completely allocation-free (zero minor heap allocation). Power-of-two
-    capacities bypass integer division with bitwise masking.
-*)
+    Slots are pre-allocated mutable records, so [write] performs zero minor-heap
+    allocation. Power-of-two capacities use bitwise masking instead of division. *)
 
 (** Fixed-capacity circular buffer parameterized over element type. *)
 module RingBuffer = struct
@@ -63,12 +55,12 @@ module RingBuffer = struct
     if buffer.mask >= 0 then pos land buffer.mask else pos mod buffer.size
   ;;
 
-  (** [write buffer value] stores [value] at the current write position
-      and advances the (absolute) index. Single-writer only; concurrent
-      writers require external synchronization.
-      Zero allocation on the hot path. The sentinel protocol guarantees a
-      concurrent reader can never observe a half-written slot: [seq] equals
-      a valid position only while [value] holds the complete payload. *)
+  (** [write buffer value] stores [value] at the current write position and
+      advances the absolute index. Single-writer only; concurrent writers require
+      external synchronization. Zero allocation on the hot path. The sentinel
+      protocol ensures [seq] equals a valid position only while [value] holds the
+      complete payload, so a concurrent reader cannot observe a half-written
+      slot. *)
   let[@inline always] write buffer value =
     let pos = Atomic.get buffer.write_pos in
     let idx = index_of buffer pos in
@@ -81,13 +73,10 @@ module RingBuffer = struct
     Atomic.set buffer.write_pos (pos + 1)
   ;;
 
-  (** [read_slot buffer pos] reads the slot for absolute position [pos]
-      under seqlock discipline. Returns [Some value] only when [seq] matched
-      [pos] both before and after the payload read - the value is then the
-      complete event written at [pos], not a mid-update or lapped payload.
-      Returns [None] when the slot is empty/cleared or is being overwritten
-      live (the reader is being lapped); the entry is skipped, per the lap
-      policy, rather than mis-delivered. *)
+  (** [read_slot buffer pos] reads the slot at absolute position [pos] under
+      seqlock discipline. Returns [Some value] only when [seq] matched [pos]
+      both before and after the payload read; [None] when the slot is
+      empty/cleared or being overwritten live (reader lapped). *)
   let[@inline] read_slot buffer pos =
     let idx = index_of buffer pos in
     let slot = buffer.slots.(idx) in
@@ -98,9 +87,9 @@ module RingBuffer = struct
     else None
   ;;
 
-  (** [read_latest buffer] returns the most recently written element,
-      or [None] if the buffer is empty. Walks back over at most [size]
-      slots so a writer racing the reader cannot produce a missed read. *)
+  (** [read_latest buffer] returns the most recently written element, or [None]
+      if empty. Walks back at most [size] slots so a racing writer cannot cause
+      a missed read. *)
   let read_latest buffer =
     let current = Atomic.get buffer.write_pos in
     if current = 0
@@ -118,16 +107,15 @@ module RingBuffer = struct
       go (current - 1))
   ;;
 
-  (** Clamp a consumer cursor to the oldest surviving entry. Entries below
-      the clamp were evicted by the writer lapping the consumer. *)
+  (** Clamp a consumer cursor to the oldest surviving entry; entries below were
+      evicted by the writer lapping the consumer. *)
   let[@inline always] clamp_start buffer last_pos current =
     let oldest = current - buffer.size in
     if last_pos < oldest then oldest else if last_pos < 0 then 0 else last_pos
   ;;
 
-  (** [read_since buffer last_pos] collects all elements written since
-      [last_pos] up to the current write position. Returns an empty list
-      if no new elements exist. *)
+  (** [read_since buffer last_pos] collects all elements written since [last_pos]
+      up to the current write position; empty when no new elements exist. *)
   let read_since buffer last_pos =
     let current_pos = Atomic.get buffer.write_pos in
     if last_pos >= current_pos
@@ -148,10 +136,10 @@ module RingBuffer = struct
       collect [] start)
   ;;
 
-  (** [iter_since buffer last_pos f] applies [f] to each element from
-      [last_pos] to the current write position without allocating a list.
-      Returns the new ABSOLUTE position for the caller to track
-      consumption. Inlined to reduce closure overhead on the hot path. *)
+  (** [iter_since buffer last_pos f] applies [f] to each element from [last_pos]
+      to the current write position without allocating a list. Returns the new
+      absolute position for the caller to track consumption. Inlined to reduce
+      closure overhead on the hot path. *)
   let[@inline always] iter_since buffer last_pos f =
     let current_pos = Atomic.get buffer.write_pos in
     if last_pos >= current_pos
@@ -167,11 +155,11 @@ module RingBuffer = struct
       current_pos)
   ;;
 
-  (** [read_all buffer] returns every currently-stored element ordered by
-      write sequence (oldest first). Safe against concurrent writers:
-      entries carry their sequence numbers and are only delivered after a
-      double validation, so the result is always a consistent ordering of
-      complete entries even if the writer advances during the scan. *)
+  (** [read_all buffer] returns every stored element ordered by write sequence
+      (oldest first). Safe against concurrent writers: entries carry sequence
+      numbers and are delivered only after double validation, so the result is a
+      consistent ordering of complete entries even if the writer advances during
+      the scan. *)
   let read_all buffer =
     let current = Atomic.get buffer.write_pos in
     let oldest = max 0 (current - buffer.size) in
@@ -188,21 +176,17 @@ module RingBuffer = struct
     List.sort (fun (a, _) (b, _) -> compare a b) !acc |> List.map snd
   ;;
 
-  (** [get_position buffer] returns the current ABSOLUTE write index.
-      Consumers use this value as the [last_pos] argument to [read_since]
-      or [iter_since]. Unlike the previous modulo-based positions, the
-      returned cursor remains comparable across laps and clears. *)
+  (** [get_position buffer] returns the current absolute write index, usable as
+      the [last_pos] argument to [read_since] or [iter_since]; the cursor remains
+      comparable across laps and clears. *)
   let[@inline always] get_position buffer = Atomic.get buffer.write_pos
 
-  (** [clear buffer] drops all stored entries. The write position is NOT
-      reset: consumer cursors stay valid (entries written after the clear
-      get higher positions than anything before it), so a reader that held
-      a pre-clear cursor observes "no new data" until the next write
-      instead of stalling or re-reading stale slots. Not safe to call
-      concurrently with writers. Safe against concurrent readers: [seq] is
-      invalidated FIRST, so no reader can validate-then-read a slot whose
-      payload is about to be clobbered, and the [Obj.magic 0] marker can
-      never be delivered (readers double-validate). *)
+  (** [clear buffer] drops all stored entries without resetting the write
+      position, so cursors held across the clear observe no new data until the
+      next write rather than stalling or re-reading stale slots. Not safe with
+      concurrent writers. Safe against concurrent readers: [seq] is invalidated
+      first, so no reader can validate-then-read a slot about to be clobbered and
+      the [Obj.magic 0] marker cannot be delivered (readers double-validate). *)
   let clear buffer =
     Array.iter
       (fun slot ->

@@ -2,14 +2,13 @@ open Notty
 open Theme
 
 (* OxCaml marks [Sys.set_signal] as [unsafe_multidomain]. The dashboard installs
-   its alarm/hangup handlers once from its own (single) domain and they close
+   its alarm/hangup handlers once from its own (single) domain, and they close
    over local UI state, so [Sys.Safe.set_signal]'s [portable] requirement does
-   not fit. Acknowledged rather than rewritten. *)
+   not fit. *)
 [@@@alert "-unsafe_multidomain"]
 
-(** Main loop for the dashboard UI: it connects to the engine's Unix domain
-    socket, processes the JSON snapshot stream, and runs the frame renderer
-    on every cycle. *)
+(** Dashboard UI main loop: connects to the engine's Unix domain socket,
+    processes the JSON snapshot stream, and runs the frame renderer each cycle. *)
 
 let socket_path = ref ""
 
@@ -42,10 +41,9 @@ let connect_and_watch path =
   let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
   try
     Unix.connect fd (Unix.ADDR_UNIX path);
-    (* The socket is set to non-blocking so the render loop never stalls
-       mid-payload: a blocked read delays renders, which causes missed
-       heartbeats, which in turn makes the server prune the client and
-       leaves the dashboard blank on every engine cycle. *)
+    (* The socket is non-blocking so the render loop never stalls mid-payload:
+       a blocked read delays renders, causes missed heartbeats, and the server
+       prunes the client, leaving the dashboard blank on every engine cycle. *)
     Unix.set_nonblock fd;
     let _ = Unix.write_substring fd "W" 0 1 in
     fd
@@ -56,8 +54,8 @@ let connect_and_watch path =
     raise exn
 ;;
 
-(** Reusable frame buffer that avoids per-frame allocation.
-    It is cleared and refilled on each render cycle. *)
+(** Frame buffer reused across render cycles to avoid per-frame allocation;
+    cleared and refilled on each cycle. *)
 let frame_buf = Buffer.create 65536
 
 let render_to_stdout_buf (draw : Buffer.t -> unit) =
@@ -74,9 +72,9 @@ let stdout_alive () =
 
 exception Render_timeout
 
-(** The SIGALRM handler is installed once in [run] rather than being saved and
-    restored on every frame. [Unix.alarm] is armed only around a render and
-    cleared immediately after, so a single handler is sufficient. *)
+(** [SIGALRM] handler is installed once in [run], not saved/restored per frame.
+    [Unix.alarm] is armed only around a render and cleared immediately after,
+    so one handler suffices. *)
 let render_to_stdout_safe ~timeout_s draw =
   let completed = ref false in
   (try
@@ -108,12 +106,13 @@ let render_wait_screen w h msg =
 ;;
 
 (** Incremental, non-blocking frame assembler for the UDS stream.
-    The engine pushes a full state snapshot every ~500 ms; those frames can
-    be large, and a blocking [read_exact] mid-payload would stall the render
-    loop (no pongs -> the server prunes the client -> blank dashboard +
-    reconnect flicker). The fd is non-blocking: whatever is available is
-    drained into [buf], complete length-prefixed frames are extracted, and
-    the loop never blocks on the socket. *)
+
+    The engine pushes a full state snapshot every ~500 ms; those frames can be
+    large, and a blocking read mid-payload would stall the render loop (no
+    pongs -> the server prunes the client -> blank dashboard + reconnect
+    flicker). The fd is non-blocking: whatever is available is drained into
+    [buf], complete length-prefixed frames are extracted, and the loop never
+    blocks on the socket. *)
 type frame_assembler = { buf : Buffer.t }
 
 let assem_create () = { buf = Buffer.create 65536 }
@@ -148,8 +147,8 @@ let assem_extract (assem : frame_assembler) : string option =
     in
     if frame_len > 10_000_000
     then (
-      (* A corrupt or oversized frame: drop the whole buffer so the stream
-         can resynchronize at the next frame boundary. *)
+      (* Oversized frame (> 10 MB): drop the whole buffer so the stream can
+         resynchronize at the next frame boundary. *)
       Buffer.clear buf;
       None)
     else if len < 4 + frame_len
@@ -164,9 +163,9 @@ let assem_extract (assem : frame_assembler) : string option =
 ;;
 
 let run ?(config_file = "config.json") () =
-  (* Load user's theme from config.json or disk if present *)
+  (* Load the saved theme from config.json or ~/.dio_theme. *)
   Theme.load_saved_theme ~config_file ();
-  (* Motion controls: DIO_MOTION=off honours reduced-motion; DIO_FPS caps the
+  (* DIO_MOTION=off|0|false|no enables reduced motion; DIO_FPS (> 0) caps the
      animated frame rate (default 30). *)
   (match Sys.getenv_opt "DIO_MOTION" with
    | Some s ->
@@ -180,10 +179,9 @@ let run ?(config_file = "config.json") () =
       | Some f when f > 0.0 -> Anim.target_fps := f
       | _ -> ())
    | None -> ());
-  (* GC tuning for a lightweight single-domain render loop.
-     Small minor heap enables frequent collections of short-lived
-     frame data. Moderate compaction keeps the heap from fragmenting
-     over multi-hour runs. *)
+  (* GC tuning for the single-domain render loop. A small minor heap enables
+     frequent collection of short-lived frame data; moderate compaction keeps
+     the heap from fragmenting over multi-hour runs. *)
   Gc.set
     { (Gc.get ()) with
       minor_heap_size = 4_194_304
@@ -292,9 +290,9 @@ let run ?(config_file = "config.json") () =
   in
   let disconnect fd =
     fd_ref := None;
-    (* Cache the last known state so the dashboard never blanks on a dropped
-       connection: it keeps rendering the cached snapshot, with the engine
-       status frozen, until a reconnect delivers fresh data. *)
+    (* Retain the last known state so a dropped connection does not blank the
+       dashboard: cached snapshot renders with frozen engine status until a
+       reconnect delivers fresh data. *)
     (try
        let _ = Unix.write_substring fd "Q" 0 1 in
        ()
@@ -303,14 +301,12 @@ let run ?(config_file = "config.json") () =
     try Unix.close fd with
     | _ -> ()
   in
-  (* Line-level frame diffing. We render the whole frame each cycle (cheap:
-     ~1ms), split the ANSI stream into per-row strings, and re-emit only the
-     rows whose bytes changed, addressed absolutely. Because every row is
-     cropped to the terminal height and written with an explicit cursor
-     position, content taller than the screen can never scroll the terminal
-     (the old section-level approach wrote past the bottom edge and caused the
-     seizure). It also makes localized animation cheap over SSH: only the rows
-     that actually move are transmitted. *)
+  (* Line-level frame diffing: render the whole frame each cycle (~1 ms), split
+     the ANSI stream into per-row strings, and re-emit only rows whose bytes
+     changed, addressed absolutely. Every row is cropped to the terminal height
+     and written with an explicit cursor position, so content taller than the
+     screen never scrolls the terminal. Only changed rows are transmitted,
+     making localized animation cheap over SSH. *)
   let split_nel s =
     let parts = ref [] in
     let buf = Buffer.create 128 in
@@ -333,8 +329,8 @@ let run ?(config_file = "config.json") () =
     List.rev !parts
   in
   let prev_lines : string array option ref = ref None in
-  (* Escape hatch: DIO_DAMAGE=off forces full-frame redraws if a terminal ever
-     renders the incremental updates wrong. *)
+  (* DIO_DAMAGE=off|0|false|no forces full-frame redraws if a terminal renders
+     the incremental updates incorrectly. *)
   let damage_enabled =
     match Sys.getenv_opt "DIO_DAMAGE" with
     | Some s ->
@@ -411,11 +407,9 @@ let run ?(config_file = "config.json") () =
     in
     render_to_stdout_safe ~timeout_s:2 draw
   in
-  (* Render throttling: full frames are drawn on changes, about two per
-     second, plus a keep-alive frame every two seconds when idle. A frame
-     that exceeds the alarm timeout is skipped rather than treated as fatal;
-     the loop continues and the next frame retries. The old behavior killed
-     the whole UI on a slow frame. *)
+  (* Render throttle: draw on change at up to [Anim.target_fps], else every
+     [Anim.idle_interval] as a keep-alive. A frame exceeding the 2s alarm is
+     skipped, not fatal; the loop retries. *)
   let render_if_due ~(now : float) ~(last_render : float ref) ~(interval : float) =
     if now -. !last_render < interval
     then `Not_due
@@ -443,9 +437,8 @@ let run ?(config_file = "config.json") () =
           | Some (w, h) -> w, h
           | None -> 80, 24
         in
-        (* With cached state, keep the last dashboard visible, stale but
-           real, while reconnecting; only a true first run shows the wait
-           screen. *)
+        (* With cached state, keep the last dashboard visible (stale but real)
+           while reconnecting; only a true first run shows the wait screen. *)
         if !has_cached_data
         then ignore (draw_frame w h)
         else render_wait_screen w h "Waiting for engine...  (q to quit)";
@@ -478,10 +471,9 @@ let run ?(config_file = "config.json") () =
     let assem = assem_create () in
     while (not !quit) && not !lost_connection do
       let now = Unix.gettimeofday () in
-      (* The heartbeat runs on a fixed cadence, decoupled from rendering:
-         the server prunes clients that miss pongs for about three seconds,
-         so a slow frame or a large snapshot parse must never cost the
-         connection, and with it the whole dashboard state. *)
+      (* Heartbeat runs on a fixed 1s cadence, decoupled from rendering: the
+         server prunes clients that miss pongs for about three seconds, so a
+         slow frame or a large snapshot parse must never cost the connection. *)
       if now -. !last_pong_time >= 1.0
       then (
         last_pong_time := now;
@@ -533,7 +525,7 @@ let run ?(config_file = "config.json") () =
                    Theme.save_theme (Theme.current ()).id;
                    theme_modal_open := false
                  | `Key_theme | `Key_back ->
-                   (* Cancel and revert to original theme *)
+                    (* Cancel: revert to the original theme. *)
                    if !original_theme_id <> ""
                    then ignore (Theme.set_theme_by_id !original_theme_id);
                    theme_modal_open := false
@@ -609,9 +601,9 @@ let run ?(config_file = "config.json") () =
           dirty := true));
       if List.mem fd ready && not !quit
       then (
-        (* Non-blocking drain: complete frames are parsed immediately,
-           partial payloads wait in the assembler, and the loop is never
-           blocked on the socket. *)
+        (* Non-blocking drain: complete frames are parsed immediately; partial
+           payloads wait in the assembler, and the loop never blocks on the
+           socket. *)
         match assem_drain fd assem with
         | `Eof ->
           disconnect fd;

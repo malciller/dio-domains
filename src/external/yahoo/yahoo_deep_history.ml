@@ -1,33 +1,27 @@
-(* Yahoo - deep-history daily OHLC via the Yahoo Finance chart API (no auth,
-   browser-ish User-Agent).
+(* Yahoo Finance chart API deep-history daily OHLC client. No auth; uses a
+   browser-like User-Agent.
 
-   Some venue feeds cannot supply deep history: Kraken's public OHLC is
-   hard-capped at the most recent ~720 daily candles, and Alpaca's IEX feed
-   starts 2020-07-27. For the same underlying asset the Yahoo chart API
-   serves full daily history back to listing (BTC 2014+, ETH/XMR/ADA/DOGE
-   2017+, SOL 2020+, QQQ/SPY 1999+), so those histories are used to EXTEND
-   the venue series backward - the asset's own real price history, not
-   fabricated data (the no-forward-fill rule still holds; nothing is
-   synthesized).
+   Rationale: venue feeds cannot supply deep history - Kraken public OHLC is
+   hard-capped at the most recent ~720 daily candles, Alpaca IEX starts
+   2020-07-27. Yahoo serves full daily history back to listing for the same
+   asset (BTC 2014+, ETH/XMR/ADA/DOGE 2017+, SOL 2020+, QQQ/SPY 1999+), so it
+   EXTENDS the venue series backward with real price history. No synthesis, no
+   forward-fill.
 
-   Safety: the Yahoo crypto symbol space is not authoritative. A token that
-   died can leave a stale "FOO-USD" feed that Yahoo keeps serving (HYPE-USD
-   still shows a dead 2021 token's prices), so crypto symbols are only mapped
-   through an explicit whitelist of known-continuous pairs (LTC/XRP/LINK/AVAX
-   /DOT included: continuous price charts with no forks or dead-token
-   collisions). Equities are unambiguous (Yahoo QQQ is QQQ), so any equity
-   symbol maps by identity.
+   Safety: the Yahoo crypto symbol space is not authoritative. A dead token can
+   leave a stale "FOO-USD" feed Yahoo keeps serving (HYPE-USD serves a dead 2021
+   token's prices), so crypto symbols map only through a whitelist of
+   known-continuous pairs (LTC/XRP/LINK/AVAX/DOT included: continuous charts
+   with no forks or dead-token collisions). Equity symbols map by identity.
 
-   The history is walked forward in [window_seconds] strides from the
-   requested start. The stride is sized to cover a full listing-to-now
-   span in one request; the loop remains as a fallback for longer spans.
-   Pure [parse_*] functions
-   are fixture-testable without network.
+   The walk advances in [window_seconds] strides from the requested start,
+   sized to cover a full listing-to-now span in one request; the loop is a
+   fallback for longer spans. Pure [parse_*] functions are fixture-testable
+   without network.
 
-   This library lives in [dio.yahoo] (src/external/yahoo/): it is a leaf
-   data client (shared bar/date helpers come from [Exchange_intf.Types]),
-   consumed by the capital oracle's deep-history pipeline in
-   [oracle_fetch.ml]. *)
+   Unit: [dio.yahoo] (src/external/yahoo/), a leaf data client (bar/date
+   helpers from [Exchange_intf.Types]) consumed by the capital oracle's
+   deep-history pipeline in [oracle_fetch.ml]. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
@@ -36,13 +30,11 @@ let section = "yahoo"
 let window_seconds = 1_100_000_000L (* ~35y: full listing-to-now span per request *)
 let day_seconds = 86_400L
 
-(* Yahoo throttles sustained bursts (and the crumbless chart API degrades to
-   empty 200s when hammered - the "unexpected ... (no bars)" symptom). The
-   oracle pass now analyzes assets concurrently, so the deep/class fetches
-   would fire many at once. Two guards: [yahoo_mutex] serializes the walks
-   (one at a time), and [pace] keeps a global minimum gap between individual
-   requests (~2/s - the pre-cache sequential engine stayed below Yahoo's
-   tolerance and never hit this). *)
+(* Yahoo throttles sustained bursts; the crumbless chart API degrades to empty
+   200s when hammered (the "unexpected ... (no bars)" symptom). Oracle fetches
+   run concurrently, so two guards apply: [yahoo_mutex] serializes the walks
+   (one at a time), and [pace] enforces a global minimum gap between individual
+   requests (~2/s). *)
 let yahoo_mutex = Lwt_mutex.create ()
 let last_request_at : float ref = ref 0.0
 let min_request_gap = 0.5
@@ -57,12 +49,11 @@ let pace () =
     Lwt.return_unit)
 ;;
 
-(* Yahoo soft-blocks hammered IPs by serving empty 200s ("result": null) for
-   a while instead of a 429. Without a memory of it, a blocked walk returns
-   [] every pass and the oracle re-attempts the whole history each refresh -
-   wasted work, and it is what keeps the block alive. On the all-empty
-   signature the symbol is remembered for [soft_block_backoff] seconds and
-   its requests are skipped entirely during that window. *)
+(* Yahoo soft-blocks hammered IPs by serving empty 200s ("result": null) for a
+   while instead of a 429. Without memory of the block, the walk returns []
+   every pass and the oracle re-attempts the whole history each refresh, which
+   keeps the block alive. On the all-empty signature the symbol is remembered
+   for [soft_block_backoff] seconds and its requests are skipped entirely. *)
 let soft_blocked_until : (string, float) Hashtbl.t = Hashtbl.create 64
 let soft_block_backoff = 300.0
 
@@ -78,18 +69,15 @@ let remember_block ~(symbol : string) ~(windows : int) =
     (int_of_float soft_block_backoff)
 ;;
 
-(* ------------------------------------------------------------------ *)
-(* Pre-listing window handling: Yahoo answers a request whose range sits
-   entirely before the symbol's listing with HTTP 400 and
-   "Data doesn't exist for startDate = ...". Assets that listed recently
-   (e.g. a stock that IPO'd this year) would otherwise re-request the same
-   doomed range on every deep-history fetch - the SPCX spam in the engine
-   log. The walk skips those windows instead of failing, and the confirmed
-   empty prefix is cached per symbol so later fetches clamp their start date
-   past it (zero requests for the empty range). *)
 
-(** Classify a failed window request: a Yahoo "data doesn't exist" answer is
-    an empty range (skip it), anything else is a real failure (stop). *)
+(* Pre-listing window handling: a request whose range lies entirely before the
+   symbol's listing is answered with HTTP 400 and "Data doesn't exist for
+   startDate = ...". The walk skips such windows instead of failing and caches
+   the confirmed empty prefix per symbol, so later fetches clamp their start
+   date past it (zero requests for the empty range). *)
+
+(** Classify a failed window request: a Yahoo "data doesn't exist" answer is an
+    empty range (skip it); anything else is a real failure (stop). *)
 let classify_error (status : int) (body : string) : [ `Missing_data | `Fatal ] =
   if
     status = 400
@@ -104,10 +92,9 @@ let classify_error (status : int) (body : string) : [ `Missing_data | `Fatal ] =
   else `Fatal
 ;;
 
-(** Classify a fetch failure exception: the [Failure] message carries the
-    "HTTP <status> for <symbol> (<body>)" envelope from the fetch; dig out
-    the status and the response body to tell a pre-listing empty range from
-    a real failure. *)
+(** Classify a fetch exception: the [Failure] message carries the
+    "HTTP <status> for <symbol> (<body>)" envelope; extract the status and
+    response body to tell a pre-listing empty range from a real failure. *)
 let classify_exn (exn : exn) : [ `Missing_data | `Fatal ] =
   match exn with
   | Failure msg ->
@@ -141,10 +128,9 @@ let classify_exn (exn : exn) : [ `Missing_data | `Fatal ] =
 ;;
 
 (** Per-symbol cache of the confirmed-empty history prefix: the latest end
-    date for which Yahoo has answered "no data in [requested start, end]".
-    Fetches clamp their start date past it, so a pre-listing range is never
-    re-requested (process-lifetime; the engine's oracle re-fetches deep
-    history every pass). *)
+    date for which Yahoo answered "no data in [requested start, end]". Fetches
+    clamp their start past it. Process-lifetime; the oracle re-fetches deep
+    history every pass. *)
 let no_data_before : (string, string) Hashtbl.t = Hashtbl.create 16
 
 let known_empty_before ~(symbol : string) : string option =
@@ -188,10 +174,10 @@ let epoch_of_iso date =
   Int64.of_float (fst t)
 ;;
 
-(** Yahoo symbol for an asset, or None when the symbol is not trusted for
-    deep history (see the module header: dead-token collisions). Equity
-    assets map by identity (Yahoo QQQ is QQQ); crypto symbols only through
-    the whitelist of known-continuous pairs. *)
+(** Yahoo symbol for an asset, or [None] when the symbol is not trusted for
+    deep history (see the module header: dead-token collisions). Equity maps by
+    identity (Yahoo QQQ is QQQ); crypto only through the whitelist of
+    known-continuous pairs. *)
 let symbol_of ~(calendar_kind : Exchange.Types.calendar_kind) (symbol : string)
   : string option
   =
@@ -276,9 +262,8 @@ let parse_daily ~(symbol : string) (json : Yojson.Safe.t) : Exchange.Types.bar l
     []
 ;;
 
-(** HTTP GET with a timeout (mirrors the oracle's own timeout wrapper): a
-    request that the upstream blackholes must not freeze a fetch forever.
-    Raises on timeout/transport errors like Cohttp does. *)
+(** HTTP GET with [default_timeout]; a request the upstream blackholes must not
+    freeze a fetch forever. Raises on timeout/transport errors like Cohttp. *)
 let default_timeout = 10.0
 
 let get ?(headers = Cohttp.Header.init ()) (uri : Uri.t)
@@ -290,20 +275,18 @@ let get ?(headers = Cohttp.Header.init ()) (uri : Uri.t)
 
 (** Fetch daily bars for the Yahoo [symbol] from [start_date] to [end_date]
     (ISO), walking forward in fixed windows (the API caps a request at ~2000
-    points). Windows that Yahoo reports as pre-listing ("Data doesn't exist")
-    are SKIPPED rather than aborting the walk - an asset that listed recently
-    contributes the empty prefix only once, and the confirmed-empty prefix is
-    cached per symbol so the next fetch clamps its start past it (no
-    re-requesting dates that do not exist). Returns what was fetched; a real
-    (non-empty-range) failure logs a warning and stops the walk with what it
-    has. *)
+    points). Windows Yahoo reports pre-listing ("Data doesn't exist") are
+    SKIPPED rather than aborting the walk; the confirmed-empty prefix is cached
+    per symbol so the next fetch clamps its start past it (no re-requesting
+    dates that do not exist). Returns what was fetched; a real (non-empty-range)
+    failure logs a warning and stops the walk with what it has. *)
 let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : string) ()
   : Exchange.Types.bar list Lwt.t
   =
   let start_epoch = epoch_of_iso start_date in
   let end_epoch = epoch_of_iso end_date in
-  (* Clamp the start past the confirmed-empty prefix: no data exists before
-     it, so requesting it again would only reproduce the same 400. *)
+  (* Clamp past the confirmed-empty prefix: no data exists before it, so a
+     repeat request reproduces the same 400. *)
   let start_epoch =
     match known_empty_before ~symbol with
     | Some floor when epoch_of_iso floor >= start_epoch ->
@@ -313,7 +296,7 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
   in
   if Int64.compare start_epoch end_epoch > 0
   then (
-    (* The whole requested range is known empty: nothing to ask for. *)
+    (* Whole requested range known empty: no request. *)
     Logging.debug_f
       ~section
       "Yahoo daily fetch for %s: whole range [%s, %s] before the known listing (no data \
@@ -324,10 +307,8 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
       0;
     Lwt.return [])
   else (
-    (* Soft-block memory (see [remember_block]): while the symbol is backed
-       off, do not even attempt its requests - the pass must not keep the
-       block alive, and an asset whose deep history is blocked keeps the
-       (empty) cached state instead of re-paying a doomed walk every pass. *)
+    (* Soft-block memory (see [remember_block]): while backed off, do not even
+       attempt the requests, so the pass does not keep the block alive. *)
     match Hashtbl.find_opt soft_blocked_until symbol with
     | Some until when Unix.gettimeofday () < until ->
       Logging.debug_f
@@ -381,18 +362,15 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
                  fetch
                  >|= fun bars ->
                  (* An empty 200 is the soft-block signature (Yahoo serves
-                    "result": null for blocked IPs instead of a 429). Count
-                    it; a walk that is ALL empty-200 (no pre-listing skips)
-                    records the block. *)
+                    "result": null instead of a 429). Count it; an all-empty-200
+                    walk records the block. *)
                  bars, skipped, empty_200 + if bars = [] then 1 else 0)
               (fun exn ->
                  match classify_exn exn with
                  | `Missing_data ->
-                   (* The window sits entirely before the symbol's listing: no
-                      data exists in [from_ms, to_ms]. Record the confirmed
-                      empty prefix and skip the window instead of failing the
-                      whole walk (a recently-listed asset would otherwise spam
-                      the same doomed request on every pass). *)
+                   (* Window lies entirely before the symbol's listing: record
+                      the confirmed empty prefix and skip it rather than fail
+                      the whole walk. *)
                    remember_empty ~symbol (unix_to_iso to_ms);
                    Logging.debug_f
                      ~section
@@ -415,9 +393,8 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
                      (List.length acc);
                    Lwt.return (List.rev acc, skipped, empty_200))
             >>= fun (bars, skipped, empty_200) ->
-            (* A successful window ends the empty prefix: from here on the
-                 symbol has data, so a later fetch can start at this window's
-                 beginning (the walk re-checks nothing before it). *)
+            (* A successful window ends the empty prefix: a later fetch may
+                 start at this window's beginning. *)
             if bars <> []
             then
               remember_empty ~symbol (Exchange.Types.add_days (unix_to_iso from_ms) (-1));
@@ -431,12 +408,11 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
       Lwt_mutex.with_lock yahoo_mutex (fun () ->
         go start_epoch [] ~skipped:0 ~empty_200:0)
       >|= fun (bars, skipped, empty_200) ->
-      (* An all-empty-200 walk is the soft-block signature - BUT only when
-         the requested range spans more than a few days: a weekend/holiday
-         sliver at the deep-history boundary legitimately holds zero trading
-         days (equity venue_first - 1 often lands on a Sunday) and must not
-         be classified as a block. A blocked IP comes back empty over the
-         whole multi-month/year range. *)
+      (* An all-empty-200 walk is the soft-block signature only when the
+         requested range spans more than a few days: a weekend/holiday sliver
+         at the deep-history boundary (equity venue_first - 1 often lands on a
+         Sunday) legitimately has zero trading days and must not be classified
+         as a block. A blocked IP comes back empty over the whole long range. *)
       let span_days = Int64.div (Int64.sub end_epoch start_epoch) day_seconds in
       if bars = [] && empty_200 > 0 && skipped = 0 && span_days > 7L
       then remember_block ~symbol ~windows:empty_200;

@@ -58,7 +58,7 @@ let test_process_webData2 () =
   in
   Hyperliquid.Balances.process_market_data json;
   let usdc_bal = Hyperliquid.Balances.get_balance "USDC" in
-  (* withdrawable is preferred over accountValue when > 0 *)
+  (* Prefer withdrawable over accountValue when withdrawable > 0. *)
   Alcotest.(check bool) "USDC updated from webData2" true (usdc_bal > 0.0)
 ;;
 
@@ -121,23 +121,21 @@ let test_staked_zero_without_staking () =
 ;;
 
 let test_staking_poll_does_not_refresh_spendable_freshness () =
-  (* The staking poller updates an EXCLUDED wallet on the same store every
-     ~10s. The store-wide timestamp is bumped, but the tradeable figure is
-     unchanged - freshness consumers (the sell-hold netting guard) must key
-     on the spendable wallets' own timestamp, or a staking poll would
-     certify a stale spot figure as current and release placed-sell holds
-     before the spotState netting actually arrives. *)
+  (* The staking poller updates an excluded wallet every ~10s and bumps the
+     store-wide timestamp without changing the tradeable figure. Freshness
+     consumers (the sell-hold netting guard) must key on the spendable
+     wallets' own timestamp, or a staking poll certifies a stale spot figure
+     as current and releases placed-sell holds before spotState netting
+     arrives. *)
   let asset = "STAKEFRESH/USDC" in
   let now = Unix.gettimeofday () in
   let store = Hyperliquid.Balances.get_balance_store asset in
-  (* Spot wallet lands first. *)
   Hyperliquid.Balances.BalanceStore.update_wallet
     store
     ~available:3.0
     ~total:3.0
     "spot"
     asset;
-  (* Simulate the spot message being 60s old. *)
   let spot_ts = now -. 60.0 in
   let open Hyperliquid.Balances.BalanceStore in
   Mutex.lock store.mutex;
@@ -151,8 +149,7 @@ let test_staking_poll_does_not_refresh_spendable_freshness () =
     ; last_updated = spot_ts
     };
   Mutex.unlock store.mutex;
-  (* The staking poller bumps the store-wide timestamp NOW, but contributes
-     nothing to the tradeable figure. *)
+  (* The staking poll bumps the store-wide timestamp but not the tradeable figure. *)
   Hyperliquid.Balances.BalanceStore.update_wallet
     store
     ~available:5.0
@@ -175,10 +172,10 @@ let test_staking_poll_does_not_refresh_spendable_freshness () =
 ;;
 
 let test_unchanged_resend_does_not_refresh_freshness () =
-  (* Hyperliquid pushes one spotState snapshot for the WHOLE account, so a
-     fill on another coin re-sends this asset's unchanged entry. Freshness for
-     THIS asset must not advance on that - otherwise another asset's activity
-     clears this asset's sell-hold guard and the strategy sells committed
+  (* Hyperliquid pushes one spotState snapshot for the whole account, so a
+     fill on another coin re-sends this asset's unchanged entry. This asset's
+     freshness must not advance on that, or another asset's activity clears
+     this asset's sell-hold guard and the strategy sells committed
      reserved_base. *)
   let asset = "XFILL/USDC" in
   let now = Unix.gettimeofday () in
@@ -197,14 +194,12 @@ let test_unchanged_resend_does_not_refresh_freshness () =
     ; last_updated = spot_ts
     };
   Mutex.unlock store.mutex;
-  (* Another coin's fill triggers a whole-account snapshot: this asset's entry
-     is re-sent with the SAME value. *)
+  (* Another coin's fill re-sends this asset's entry with the same value. *)
   update_wallet store ~available:0.5 ~total:0.5 "spot" asset;
   Alcotest.(check (float 0.001))
     "an unchanged re-send does NOT advance this asset's freshness"
     spot_ts
     (get_spendable_last_updated store);
-  (* A real move in THIS asset's balance DOES advance it. *)
   update_wallet store ~available:0.4 ~total:0.4 "spot" asset;
   Alcotest.(check bool)
     "a real change advances this asset's freshness"

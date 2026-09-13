@@ -166,7 +166,6 @@ module Kraken_impl = struct
         (if sym <> "" then Printf.sprintf " [%s]" sym else "");
       Lwt.return (Error (Printf.sprintf "Order not found for amendment: %s" order_id))
     | Some existing ->
-      (* Default to the cached order_qty when caller omits qty. *)
       let effective_qty =
         match qty with
         | Some q -> q
@@ -218,7 +217,6 @@ module Kraken_impl = struct
         ()
     =
     let actual_retry_config = convert_retry_config retry_config in
-    (* Delegate directly; Kraken_actions accepts optional list parameters. *)
     Kraken_actions.cancel_orders
       ~token
       ?order_ids
@@ -254,12 +252,11 @@ module Kraken_impl = struct
 
   let get_top_of_book_fast ~symbol = Kraken_orderbook_feed.get_best_bid_ask_fast symbol
 
-  (** Open-order holds for [asset]: base locked in resting sells plus quote
-      locked in resting buys. Kraken wallet snapshots report TOTAL balances
-      (unlike Hyperliquid's store, which nets the hold at ingestion), so the
-      tradeable figure is total minus these holds - without this, sell
-      sizing reads inventory that is already committed to a resting sell and
-      the exchange rejects with EOrder:Insufficient funds. *)
+  (** Open-order holds for [asset]: base held in resting sells plus quote held
+      in resting buys. Kraken wallet snapshots report TOTAL balances, so the
+      tradeable figure is total minus these holds; otherwise sell sizing reads
+      inventory committed to a resting sell and the exchange rejects with
+      EOrder:Insufficient funds. *)
   let open_order_holds asset =
     Kraken_balances_feed.get_pending_sell_qty asset
     +. Kraken_balances_feed.get_pending_buy_quote_value asset
@@ -272,12 +269,11 @@ module Kraken_impl = struct
   ;;
 
   (** Cached tradeable balance. The returned closure is owned by a single asset
-      domain, so its refs are never touched by another thread. [open_order_holds]
-      rebuilds symbol/order lists (~165 words) on every call and is evaluated
-      twice per executable cycle, so we recompute it only when the executions
-      feed actually publishes a new open-orders snapshot ([orders_generation]).
-      The common cycle then allocates nothing: the boxed cached hold is read
-      straight back out of the ref. *)
+      domain; its refs are never touched by another thread. [open_order_holds]
+      rebuilds symbol/order lists (~165 words) per call and runs twice per
+      executable cycle, so the hold is recomputed only when the executions feed
+      publishes a new open-orders snapshot ([orders_generation]). The common
+      cycle then allocates nothing: the cached hold is read from the ref. *)
   let get_tradeable_balance_fast ~asset =
     let store = Kraken_balances_feed.get_balance_store asset in
     let last_hold_gen = ref (-1) in

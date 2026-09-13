@@ -1,14 +1,12 @@
-(* Oracle_tasks - resolve a CLI SYMBOL / --exchange into the list of analysis
-   tasks to run: a single task for an explicit symbol, or one task per
-   config.json "trading" entry when no symbol is given. Also maps an exchange
-   name to its calendar kind. Pure, so it is unit-testable without network.
+(* Oracle_tasks - resolve a CLI SYMBOL / --exchange into the analysis tasks
+   to run: one task for an explicit symbol, else one task per config.json
+   "trading" entry. Maps exchange names to calendar kinds. Pure; no network.
 
-   Venue recognition is REGISTRY-FIRST: an exchange participates in oracle
-   modeling by registering its [Exchange_intf.Oracle.S] adapter (see
-   Oracle_fetch / Oracle_venues). The static fallback below keeps the three
-   built-in venues recognizable in pure/offline/test contexts where the
-   venue libraries are not linked (and thus not registered); it is never the
-   authoritative source in a running binary. *)
+   Venue recognition is registry-first: an exchange participates by
+   registering its [Exchange_intf.Oracle.S] adapter. The static fallback
+   keeps the three built-in venues recognizable in pure/offline/test contexts
+   where venue libraries are not linked (and thus not registered); it is
+   never authoritative in a running binary. *)
 
 module Exchange = Dio_exchange.Exchange_intf
 
@@ -40,7 +38,7 @@ let default_trading_config (exchange : string) (symbol : string)
   }
 ;;
 
-(* Static fallback for the built-in venues (see the module doc). *)
+(* Static fallback for the built-in venues. *)
 let static_known_exchange = function
   | "kraken" | "hyperliquid" | "alpaca" -> true
   | _ -> false
@@ -74,11 +72,10 @@ let calendar_kind_of_exchange exchange =
       Oracle_types.Crypto)
 ;;
 
-(** Resolve the tasks for this run. When [symbol] is empty (all-assets mode)
-    every trading entry becomes a task, each on its own configured exchange.
-    With a symbol, the matching config entry wins unless --exchange was given
-    explicitly; unknown symbols fall back to defaults. Offline mode still
-    requires a symbol for the report header. *)
+(** Resolve this run's tasks. Empty [symbol] (all-assets mode): one task per
+    trading entry on its configured exchange. With a symbol: the matching
+    config entry wins unless --exchange was explicit; unknown symbols use
+    defaults. Offline mode requires a symbol. *)
 let resolve_tasks
       ~(symbol : string)
       ~(exchange : string)
@@ -87,8 +84,8 @@ let resolve_tasks
       ~(offline : bool)
   : task list * (string * string) list
   =
-  (* (tasks, unsupported) - [unsupported] is the list of (symbol, exchange)
-     entries whose exchange cannot be used for capital survival modeling. *)
+  (* Returns (tasks, unsupported); [unsupported] lists (symbol, exchange)
+     entries whose exchange cannot model capital survival. *)
   if symbol = ""
   then
     if offline

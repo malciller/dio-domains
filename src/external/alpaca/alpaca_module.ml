@@ -6,8 +6,8 @@ module Types = Exchange.Types
 
 module Config = struct
   include Alpaca_types.Config
-  (* Market hours no longer branch on account mode: live and paper follow the
-     same 24/5 calendar (see Alpaca_market_hours.is_market_open). *)
+  (* Live and paper follow the same 24/5 calendar; market hours do not branch
+     on account mode (see Alpaca_market_hours.is_market_open). *)
 end
 
 module Alpaca_impl = struct
@@ -15,12 +15,10 @@ module Alpaca_impl = struct
   let section = "alpaca_module"
   let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16
 
-  (* Monotonic placement nonce so every logical placement gets a globally
-     unique [client_order_id]. A placement is retried (inside
-     [Alpaca_rest.place_order]) with the SAME id, and Alpaca enforces
-     client_order_id uniqueness - so an ambiguous timeout/connection failure
-     that landed at the venue is rejected on retry instead of silently
-     placing a duplicate order. *)
+  (* Monotonic placement nonce; each logical placement gets a globally unique
+     [client_order_id]. Retries inside [Alpaca_rest.place_order] reuse the id,
+     and Alpaca enforces uniqueness, so an ambiguous failure that reached the
+     venue is rejected on retry instead of double-placing. *)
   let placement_counter = Atomic.make 0
   let sanitize_symbol symbol = String.concat "_" (String.split_on_char '/' symbol)
 
@@ -77,10 +75,8 @@ module Alpaca_impl = struct
       | Types.Sell -> "sell"
     in
     let tif_str = Option.map string_of_time_in_force time_in_force in
-    (* When the caller (supervisor dispatcher) does not supply a client id,
-       generate a stable one here - BEFORE the retry loop inside
-       [Alpaca_rest.place_order] - so every retry attempt carries the same
-       id and an ambiguous failure cannot double-place. *)
+    (* When the caller supplies no client id, generate a stable one before the
+       retry loop in [Alpaca_rest.place_order] so every attempt reuses it. *)
     let cl_ord_id =
       match cl_ord_id with
       | Some id -> Some id
@@ -251,10 +247,9 @@ module Alpaca_impl = struct
   let get_tradeable_balance ~asset = Alpaca_balances.get_balance asset
   let get_tradeable_balance_fast ~asset = fun () -> Alpaca_balances.get_balance asset
 
-  (* Venue-authoritative free quantity: [qty_available] from the positions
-     poll. The gross [get_balance] above is retained for the ledger and the
-     oracle; sell sizing uses this so it never reconstructs the open-order hold
-     from the eventually-consistent order cache. *)
+  (* Venue-authoritative free quantity from the positions poll [qty_available];
+     sell sizing uses this. Gross [get_balance] is retained for the ledger and
+     oracle. *)
   let get_available_balance_fast ~asset =
     fun () -> Alpaca_balances.get_available_balance asset
   ;;
@@ -415,8 +410,8 @@ module Alpaca_impl = struct
         f o.order_id limit_price o.remaining_qty side_str o.user_ref)
   ;;
 
-  (* Account-wide open-orders generation. The grid strategy still excludes
-     Alpaca from the rescan skip via [remaintain_expired_sells], which needs the
+  (* Account-wide open-orders generation. The grid strategy excludes Alpaca
+     from the rescan skip via [remaintain_expired_sells], which needs the
      persisted GTC-level reconcile every cycle. *)
   let get_open_orders_generation ~symbol:_ = Alpaca_executions.get_orders_generation ()
   let get_price_increment ~symbol:_ = Some 0.01
@@ -433,6 +428,5 @@ end
 
 let () = Exchange.Registry.register (module Alpaca_impl)
 
-(* Register the oracle data-venue adapter (historical bars, market calendar,
-   balances, fees for the capital oracle) at load time. *)
+(* Register the oracle data-venue adapter at load time. *)
 let () = Exchange.Oracle.Registry.register (module Alpaca_oracle)

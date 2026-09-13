@@ -60,23 +60,19 @@ let apply_delta levels price size ~is_bid =
   if size = 0.0
   then List.filter (fun (p, _) -> p <> price) levels
   else (
-    (* Single-pass upsert-or-insert over sorted list.
-       [cmp] encodes sort direction: bids descending, asks ascending. *)
+    (* Single-pass upsert-or-insert over sorted list. [cmp] orders bids
+       descending, asks ascending. *)
     let cmp =
-      if is_bid then fun a b -> compare b a (* descending *) else fun a b -> compare a b
-      (* ascending  *)
+      if is_bid then fun a b -> compare b a else fun a b -> compare a b
     in
     let rec go acc = function
       | [] ->
-        (* Price not found; append at end (worst level). *)
         List.rev_append acc [ price, size ]
       | (p, _) :: tl when p = price ->
-        (* Update existing level, share the tail. *)
         List.rev_append acc ((p, size) :: tl)
       | ((p, _) as hd) :: tl ->
         if cmp price p < 0
         then
-          (* Insert before this element (better level). *)
           List.rev_append acc ((price, size) :: hd :: tl)
         else go (hd :: acc) tl
     in

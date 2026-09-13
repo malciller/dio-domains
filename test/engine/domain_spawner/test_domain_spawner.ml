@@ -1,4 +1,4 @@
-(* Mock fee fetcher for testing - just returns the asset with some fees set *)
+(* Fee fetcher stub: returns the asset with maker/taker fees set. *)
 let mock_fee_fetcher (asset : Dio_engine.Config.trading_config)
   : Dio_engine.Config.trading_config
   =
@@ -6,7 +6,6 @@ let mock_fee_fetcher (asset : Dio_engine.Config.trading_config)
 ;;
 
 let test_spawn_domains_basic () =
-  (* Test spawning domains for basic asset configs *)
   let assets =
     [ { Dio_engine.Config.exchange = "kraken"
       ; symbol = "BTC/USD"
@@ -44,7 +43,6 @@ let test_spawn_domains_basic () =
       }
     ]
   in
-  (* Spawn domains for the assets *)
   let config =
     { Dio_engine.Config.cycle_mod = 10000
     ; logging = { level = Logging.INFO; sections = []; width = None }
@@ -67,7 +65,6 @@ let test_spawn_domains_basic () =
       assets
   in
   let status = Dio_engine.Domain_spawner.get_domain_status () in
-  (* Verify correct number of domains created *)
   Alcotest.(check int)
     "correct number of domains"
     (List.length assets)
@@ -75,8 +72,7 @@ let test_spawn_domains_basic () =
 ;;
 
 let test_spawn_domains_empty () =
-  (* Test spawning domains with empty asset list *)
-  (* Clear any existing domain registry state from previous tests *)
+  (* Reset registry state from prior tests. *)
   Dio_engine.Domain_spawner.clear_domain_registry ();
   let config =
     { Dio_engine.Config.cycle_mod = 10000
@@ -104,7 +100,6 @@ let test_spawn_domains_empty () =
 ;;
 
 let test_fee_fetcher_integration () =
-  (* Test that fee fetcher is called and integrated properly *)
   let asset =
     { Dio_engine.Config.exchange = "kraken"
     ; symbol = "LTC/USD"
@@ -124,7 +119,6 @@ let test_fee_fetcher_integration () =
     ; sell_levels = true
     }
   in
-  (* Verify fee fetcher adds fees correctly *)
   let asset_with_fees = mock_fee_fetcher asset in
   Alcotest.(check (option (float 0.001)))
     "maker_fee added"
@@ -137,7 +131,6 @@ let test_fee_fetcher_integration () =
 ;;
 
 let test_strategy_initialization () =
-  (* Test that strategy modules are initialized without errors *)
   Alcotest.(check unit)
     "jacobs_ladder init"
     ()
@@ -149,9 +142,8 @@ let test_strategy_initialization () =
 ;;
 
 let test_domain_error_handling () =
-  (* Clear any existing domain registry state from previous tests *)
+  (* Reset registry state from prior tests. *)
   Dio_engine.Domain_spawner.clear_domain_registry ();
-  (* Test that domain errors are handled properly - create a failing asset config *)
   let failing_asset =
     { Dio_engine.Config.exchange = "invalid_exchange"
     ; symbol = "TEST/USD"
@@ -171,7 +163,7 @@ let test_domain_error_handling () =
     ; sell_levels = true
     }
   in
-  (* This should not crash the test runner, domains should handle errors internally *)
+  (* Domains handle errors internally; the runner must not crash. *)
   let config =
     { Dio_engine.Config.cycle_mod = 10000
     ; logging = { level = Logging.INFO; sections = []; width = None }
@@ -193,10 +185,9 @@ let test_domain_error_handling () =
       mock_fee_fetcher
       [ failing_asset ]
   in
-  (* Give domains a moment to potentially fail *)
+  (* Allow domains time to fail. *)
   Unix.sleepf 0.1;
   let status = Dio_engine.Domain_spawner.get_domain_status () in
-  (* If we get here, domains were created successfully (even if they fail internally) *)
   Alcotest.(check int) "domain created for failing asset" 1 (List.length status)
 ;;
 

@@ -1,7 +1,7 @@
-(** Dashboard Unix Domain Socket Server
+(** Dashboard Unix Domain Socket server.
 
-    Runs as an Lwt fiber within the engine process. Exposes engine state
-    to the standalone dashboard binary over a UDS at /tmp/dio-{pid}.sock.
+    Runs as an Lwt fiber in the engine process, exposing engine state to the
+    standalone dashboard binary over a UDS (see {!socket_path}).
 
     Wire protocol (length-prefixed JSON):
       Client to Server: 1-byte ASCII command
@@ -16,9 +16,8 @@ open Lwt.Infix
 
 let section = "dashboard_server"
 
-(** Fixed UDS path for the dashboard socket.
-    Lives under /var/run/dio/ so it can be volume-mounted and accessed
-    from outside the engine container (e.g. via docker run --rm -it). *)
+(** UDS directory for the dashboard socket. /var/run/dio is volume-mountable for
+    access from outside the engine container; falls back to /tmp/dio. *)
 let socket_dir =
   let preferred = "/var/run/dio" in
   try
@@ -31,9 +30,9 @@ let socket_dir =
 
 let socket_path () = Printf.sprintf "%s/dashboard.sock" socket_dir
 
-(** Writes a length-prefixed JSON frame to [oc].
-    Encodes [json_str] length as a 4-byte big-endian header.
-    Propagates write errors; callers must handle client disconnects. *)
+(** Write a length-prefixed JSON frame to [oc]: [json_str] length as a 4-byte
+    big-endian header, then the payload. Propagates write errors; callers handle
+    client disconnects. *)
 let send_response oc json_str =
   let len = String.length json_str in
   let header = Bytes.create 4 in
@@ -49,10 +48,9 @@ let send_response oc json_str =
 (** Count of currently connected dashboard clients. *)
 let active_clients = ref 0
 
-(** Each watch client tracks its output channel, the underlying fd
-    (for explicit close), a cancel resolver to unblock the reader
-    when the broadcaster detects a dead write, and a heartbeat
-    timestamp updated by client pong messages. *)
+(** Watch client state: output channel, fd for explicit close, a cancel resolver
+    to unblock the reader when the broadcaster detects a dead write, and a
+    heartbeat timestamp updated by pong messages. *)
 type watch_entry =
   { oc : Lwt_io.output_channel
   ; fd : Lwt_unix.file_descr
@@ -63,30 +61,28 @@ type watch_entry =
 (** Mutable list of watch-mode client entries. *)
 let watch_clients : watch_entry list ref = ref []
 
-(** Cached serialized snapshot string and its generation timestamp.
-    Reused across 500 ms broadcast ticks to avoid repeated Yojson
-    serialization. Invalidated after [snapshot_cache_max_age] seconds
-    so displayed data remains within ~1 s of real-time. *)
+(** Cached serialized snapshot and its generation timestamp. Reused across 500 ms
+    broadcast ticks to avoid repeated Yojson serialization; invalidated after
+    [snapshot_cache_max_age] seconds so displayed data stays within ~1s of
+    real-time. *)
 let snapshot_cache_str = ref ""
 
 let snapshot_cache_time = ref 0.0
 let snapshot_cache_max_age = 0.9
 
-(* A dashboard client is a render loop, not a health probe: its pong now
-   runs on a fixed 1s cadence independent of frame rendering, but a slow
-   frame, a big snapshot parse or a GC pause can still stretch a gap - 8s
-   gives the client generous margin before the server drops it (and with
-   it the whole dashboard state). *)
+(* The client is a render loop, not a health probe: pongs run on a fixed 1s
+   cadence, but a slow frame, large snapshot parse, or GC pause can stretch a gap.
+   8s gives generous margin before the server drops the client. *)
 let heartbeat_timeout = 8.0 (* seconds without pong before pruning *)
 let idle_read_timeout = 10.0 (* seconds waiting for a command before dropping client *)
 
 (** Close a client fd, ignoring errors if already closed. *)
 let close_fd fd = Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit)
 
-(** Periodic broadcaster that pushes state to all watch-mode clients
-    every 500 ms. Uses the snapshot cache when valid; rebuilds otherwise.
-    When a write fails, the client's cancel resolver is woken to unblock
-    its reader, and its fd is closed. *)
+(** Periodic broadcaster: push state to all watch-mode clients every 500 ms,
+    using the snapshot cache when valid and rebuilding otherwise. On write
+    failure, wake the client's cancel resolver to unblock its reader and close
+    its fd. *)
 let rec state_broadcaster () =
   let%lwt () = Lwt_unix.sleep 0.5 in
   let current_clients = !watch_clients in
@@ -159,8 +155,8 @@ let rec state_broadcaster () =
   Lwt.return_unit
 ;;
 
-(** Read with a timeout.  Returns 0 (simulating EOF) if [timeout_s]
-    elapses before any data arrives. *)
+(** Read with a timeout. Returns 0 (simulating EOF) if [timeout_s] elapses before
+    any data arrives. *)
 let read_with_timeout ic buf off len timeout_s =
   Lwt.pick
     [ Lwt_io.read_into ic buf off len
@@ -169,12 +165,11 @@ let read_with_timeout ic buf off len timeout_s =
     ]
 ;;
 
-(** Handles a single client connection over [ic]/[oc]/[fd].
-    Reads 1-byte commands in a loop until disconnect or 'Q'.
-    [cancel_promise] resolves when the broadcaster detects a dead write,
-    allowing blocked reads to be interrupted.
-    The initial command read uses [idle_read_timeout] so zombie connections
-    that never send a command byte are cleaned up. *)
+(** Handle one client connection over [ic]/[oc]/[fd], reading 1-byte commands
+    until disconnect or 'Q'. [cancel_promise] resolves when the broadcaster
+    detects a dead write, interrupting blocked reads. The initial command read
+    uses [idle_read_timeout] so zombie connections that send no command byte are
+    cleaned up. *)
 let handle_client ~fd ~cancel_promise (ic, oc) =
   let buf = Bytes.create 1 in
   let rec loop () =
@@ -247,10 +242,9 @@ let handle_client ~fd ~cancel_promise (ic, oc) =
   loop ()
 ;;
 
-(** Starts the UDS server as an Lwt fiber.
-    Binds to [/var/run/dio/dashboard.sock], spawns the state broadcaster,
-    and enters an accept loop. Limits concurrent clients to 5.
-    Call after engine initialization. *)
+(** Start the UDS server as an Lwt fiber: bind, spawn the state broadcaster, and
+    enter an accept loop. Limits concurrent clients to 5. Call after engine
+    initialization. *)
 let start ~start_time =
   Dashboard_state.set_start_time start_time;
   let path = socket_path () in

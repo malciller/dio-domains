@@ -1,6 +1,6 @@
-(** Health monitoring for supervised connections. Implements the tick-driven
-    monitor loop (ping/pong, heartbeat, backoff reconnection) and the
-    non-active asset subscription monitor. *)
+(** Health monitoring for supervised connections: the tick-driven monitor
+    loop (ping/pong, heartbeat, backoff reconnection) and the non-active
+    asset subscription monitor. *)
 
 open Lwt.Infix
 open Supervisor_types
@@ -10,12 +10,12 @@ let section = "supervisor"
 
 (** Tick-driven health monitor. Subscribes to the tick event bus and checks
     all registered connections at most once per second. Implements:
-    - Exponential backoff reconnection for Failed connections (0s..30s,
-       up to 300s for IBKR and Lighter)
-    - Stale disconnect detection (60s idle in Disconnected state)
+    - Exponential backoff reconnection for [Failed] connections (0s..30s,
+      up to 300s for IBKR and Lighter)
+    - Stale disconnect detection (60s idle in [Disconnected] state)
     - Stuck-connecting timeout (120s)
     - Active ping/pong liveness for authenticated WebSockets
-    - Passive data heartbeat timeout for market data feeds *)
+    - Passive data-heartbeat timeout for market data feeds *)
 let monitor_loop () =
   let cycle_count = ref 0 in
   let last_market_open = ref (Ibkr.Market_hours.is_market_open ()) in
@@ -33,9 +33,9 @@ let monitor_loop () =
           incr cycle_count;
           let current_open = Ibkr.Market_hours.is_market_open () in
           let current_status = Ibkr.Market_hours.market_status_string () in
-          (* Only force IBKR reconnect on closed→open transitions.
-             Transitions between closed sub-states (weekend, pre-market,
-             after-hours-ended) should NOT trigger reconnection spam. *)
+          (* Force IBKR reconnect only on closed→open transitions; moves
+             between closed sub-states (weekend, pre-market, after-hours)
+             must not trigger reconnect spam. *)
           if (not !last_market_open) && current_open
           then (
             try
@@ -43,8 +43,8 @@ let monitor_loop () =
               let ibkr_state = get_state ibkr_conn in
               match ibkr_state with
               | Connected ->
-                (* Connection was live during pre-market; tear down and
-                       reconnect to get fresh market-data streams. *)
+                (* Live during pre-market: tear down and reconnect for fresh
+                   market-data streams. *)
                 Logging.info_f
                   ~section
                   "Market status transitioned: %s. Forcing IBKR gateway reconnect to \
@@ -52,12 +52,12 @@ let monitor_loop () =
                   current_status;
                 ignore (restart ibkr_conn)
               | _ ->
-                (* connect_fn is already handling reconnection (e.g. waking
-                       from market-closed sleep) or the monitor loop's Failed
-                       handler will pick it up.  A forced restart here would
-                       spawn a duplicate connect_fn, causing two concurrent TCP
-                       connections to race against the gateway on the same
-                       clientId, resulting in interleaved End_of_file errors. *)
+                (* connect_fn is already reconnecting (e.g. waking from
+                       market-closed sleep), or the monitor's Failed handler
+                       will pick it up. A forced restart here would spawn a
+                       duplicate connect_fn: two concurrent TCP connections
+                       racing on the same clientId cause interleaved
+                       End_of_file errors. *)
                 Logging.info_f
                   ~section
                   "Market status transitioned: %s. IBKR gateway is %s; existing \
@@ -78,13 +78,11 @@ let monitor_loop () =
           Mutex.lock registry_mutex;
           let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in
           Mutex.unlock registry_mutex;
-          (* Iterate connections and apply health checks *)
           List.iter
             (fun conn ->
                if Atomic.get shutdown_requested
                then ()
                else
-                 (* Snapshot state fields under mutex *)
                  Mutex.lock conn.mutex;
                let state = conn.state in
                let attempts = conn.reconnect_attempts in
@@ -93,19 +91,18 @@ let monitor_loop () =
                let last_data_received = conn.last_data_received in
                let has_connect_fn = Option.is_some conn.connect_fn in
                Mutex.unlock conn.mutex;
-               (* Health check and backup reconnection logic *)
                match state, has_connect_fn with
                | Failed reason, true ->
-                 (* Re-read state under lock to prevent TOCTOU race *)
+                 (* Re-read state under lock to prevent a TOCTOU race *)
                  Mutex.lock conn.mutex;
                  let current_state = conn.state in
                  Mutex.unlock conn.mutex;
                  if current_state <> Connecting
                  then
-                   (* IBKR market hours gate: skip reconnection attempts
-                           outside US equity extended hours (4 AM - 8 PM ET).
-                           The connect_fn itself will sleep until the next
-                           open window, so there's nothing for the monitor to do. *)
+                   (* IBKR market-hours gate: skip reconnection outside US
+                          equity extended hours (4 AM - 8 PM ET). The
+                          connect_fn sleeps until the next open window, so
+                          there is nothing for the monitor to do. *)
                    if
                      (String.equal conn.name "ibkr_gateway"
                       && not (Ibkr.Market_hours.is_market_open ()))
@@ -131,7 +128,6 @@ let monitor_loop () =
                          else 0.0)
                        else min max_delay (2.0 ** Float.of_int (attempts - 1))
                      in
-                     (* Only reconnect after backoff elapses *)
                      let should_reconnect =
                        match last_disconnected with
                        | Some t -> current_time -. t >= delay
@@ -148,9 +144,9 @@ let monitor_loop () =
                          reason;
                        start_async conn))
                | Disconnected, true ->
-                 (* Disconnected without failure may be intentional.
-                         Only restart after 60s idle to avoid interfering with
-                         graceful shutdown or manual disconnect. *)
+                 (* A failure-free disconnect may be intentional. Restart
+                        only after 60s idle so graceful shutdown and manual
+                        disconnect are not disturbed. *)
                  let should_reconnect =
                    match last_disconnected with
                    | Some t -> current_time -. t >= 60.0
@@ -164,7 +160,6 @@ let monitor_loop () =
                      conn.name;
                    start_async conn)
                | Connecting, _ ->
-                 (* Detect stuck Connecting state *)
                  let stuck_time =
                    match last_connecting with
                    | Some t -> current_time -. t
@@ -172,7 +167,6 @@ let monitor_loop () =
                  in
                  if stuck_time > 120.0
                  then (
-                   (* 2 min timeout *)
                    Logging.error_f
                      ~section
                      "[%s] Connection stuck in 'Connecting' state for %.0fs, \
@@ -186,9 +180,9 @@ let monitor_loop () =
                    if current_state = Connecting
                    then (
                      set_state conn Disconnected;
-                     (* IBKR market hours gate: don't restart against a
-                             closed gateway; let the monitor's Failed handler
-                             defer reconnection to the next market open. *)
+                     (* IBKR market-hours gate: do not restart against a
+                             closed gateway; the monitor's Failed handler
+                             defers reconnection to the next market open. *)
                      if
                        (String.equal conn.name "ibkr_gateway"
                         && not (Ibkr.Market_hours.is_market_open ()))
@@ -203,22 +197,22 @@ let monitor_loop () =
                        set_state conn (Failed "Market closed"))
                      else start_async conn))
                | Connected, _ ->
-                 (* Whether the connection is demonstrably alive: it has
-                     produced data (feed frames / app heartbeats) or a
-                     successful ping within the silence threshold. A feed whose
-                     ping probe is broken (e.g. Kraken's public orderbook feed
-                     not echoing pongs) but which is still streaming data is
-                     HEALTHY and must not be torn down on ping failures alone -
-                     the passive data-heartbeat backstop below governs. *)
+                 (* Liveness: data (feed frames / app heartbeats) or a
+                    successful ping within the 60s silence threshold. A feed
+                    whose ping probe is broken (e.g. Kraken's public
+                    orderbook feed not echoing pongs) but that still streams
+                    data is healthy and must not be torn down on ping
+                    failures alone; the passive data-heartbeat backstop
+                    governs. *)
                  let data_fresh =
                    match last_data_received with
                    | Some t -> current_time -. t <= 60.0
                    | None -> false
                  in
                  (* Active ping/pong liveness for authenticated connections.
-                     The Kraken public orderbook feed does NOT respond to
-                     application-level pings: its liveness is governed
-                     exclusively by the passive data-heartbeat backstop. *)
+                    The Kraken public orderbook feed does not answer
+                    application-level pings; its liveness is governed solely
+                    by the passive data-heartbeat backstop. *)
                  if
                    String.equal conn.name "kraken_auth_ws"
                    || String.equal conn.name "hyperliquid_ws"
@@ -235,7 +229,6 @@ let monitor_loop () =
                    in
                    if should_ping
                    then (
-                     (* Dispatch ping asynchronously *)
                      conn.last_ping_sent <- Some current_time;
                      Lwt.async (fun () ->
                        let req_id = next_ping_req_id () in
@@ -386,14 +379,12 @@ let monitor_loop () =
                    then
                      if data_fresh
                      then (
-                       (* Ping probe is broken but the connection is
-                           demonstrably alive (recent data / heartbeats):
-                           tolerate the failed pings and keep the feed - tearing
-                           it down would churn a healthy connection (e.g. the
-                           Kraken public orderbook feed not echoing pongs while
-                           still streaming orderbook data). Reset the counter so
-                           the failure only re-asserts if the feed goes quiet
-                           too. *)
+                        (* Ping probe broken but data is flowing: tolerate the
+                           failed pings and keep the feed. Tearing it down
+                           would churn a healthy connection (e.g. the Kraken
+                           public orderbook feed not echoing pongs while still
+                           streaming). Reset the counter so the failure
+                           re-asserts only if the feed also goes quiet. *)
                        Atomic.set conn.ping_failures 0;
                        Logging.debug_f
                          ~section
@@ -409,13 +400,13 @@ let monitor_loop () =
                          conn.name
                          ping_failures;
                        set_state conn (Failed "ping timeout")));
-                 (* Passive data-heartbeat backstop for ALL connected
-                      connections: a feed that stops producing data (regardless
-                      of ping-probe health) is failed after the silence
-                      threshold. For ping-healthy feeds the successful pings keep
-                      [last_data_received] fresh; for feeds without active ping
-                      probes (e.g. Kraken public orderbook) this is the sole
-                      liveness signal that catches a genuinely dead connection. *)
+                  (* Passive data-heartbeat backstop for all connected
+                       connections: a feed that stops producing data is failed
+                       after the 60s silence threshold, regardless of
+                       ping-probe health. Successful pings keep
+                       [last_data_received] fresh; for feeds without active
+                       ping probes (e.g. Kraken public orderbook) this is the
+                       sole liveness signal. *)
                  (match last_data_received with
                   | Some last_data when current_time -. last_data > 60.0 ->
                     if not (String.equal conn.name "ibkr_gateway")
@@ -445,9 +436,9 @@ let monitor_loop () =
   Lwt.async loop
 ;;
 
-(** Periodically scans all exchanges for non-configured assets that have
-    a positive balance and subscribes their orderbook feeds. Runs every 10s.
-    Enables portfolio valuation for assets that are held but not actively traded. *)
+(** Scans all exchanges every 10s for non-configured assets with a positive
+    balance and subscribes their orderbook feeds, enabling portfolio
+    valuation for held-but-not-traded assets. *)
 let monitor_non_active_assets () =
   let subscribed_symbols : (string, float) Hashtbl.t = Hashtbl.create 16 in
   let rec loop () =

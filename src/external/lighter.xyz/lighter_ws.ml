@@ -1,7 +1,7 @@
 (** Lighter WebSocket client: dual persistent connections (public market data,
     private authenticated), routed through a Cloudflare Durable Object proxy.
-    Each side reconnects independently, so one failure no longer tears down
-    the other side or forces full order book rebuilds. *)
+    Each side reconnects independently; one side's failure does not tear down
+    the other or force a full order book rebuild. *)
 
 open Lwt.Infix
 
@@ -238,8 +238,8 @@ let subscribe_to_feeds ~symbols ~account_index ~auth_token =
   Lwt.return_unit
 ;;
 
-(** Sends a signed tx over the private WS ([jsonapi/sendtx]). Currently
-    unused; orders go through REST in [lighter_actions.ml]. *)
+(** Sends a signed tx over the private WS ([jsonapi/sendtx]). Unused; orders
+    go through REST in [lighter_actions.ml]. *)
 let send_tx_ws ~tx_type ~tx_info =
   let json =
     `Assoc

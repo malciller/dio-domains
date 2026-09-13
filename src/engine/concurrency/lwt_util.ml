@@ -1,21 +1,16 @@
 (** Memory-safe alternatives to standard Lwt combinators.
 
-    [Lwt_stream.iter] and recursive [>>= fun () -> loop ()] patterns
-    accumulate Lwt [Forward] nodes because [>>=] chains each iteration's
-    promise to its successor. [Lwt.pause ()] does not mitigate this; it
-    appends an additional [Forward] node.
-
-    The solution is to resolve the current promise immediately via
-    [Lwt.return_unit] and spawn the next iteration as an independent
-    task via [Lwt.async]. This severs the [Forward] chain so prior
-    promise nodes become unreachable and eligible for collection. *)
+    [Lwt_stream.iter] and recursive [>>= fun () -> loop ()] patterns accumulate
+    Lwt [Forward] nodes: [>>=] chains each iteration's promise to its successor,
+    and [Lwt.pause ()] appends another. These combinators resolve the current
+    promise immediately with [Lwt.return_unit] and spawn the next iteration via
+    [Lwt.async], severing the [Forward] chain so prior nodes become collectable. *)
 
 open Lwt.Infix
 
-(** Synchronously applies [f] to each element of [stream] without
-    accumulating Lwt [Forward] nodes. Each iteration is spawned via
-    [Lwt.async] to sever the promise chain. Returns a promise that
-    resolves when the stream is closed ([None]). *)
+(** Apply [f] synchronously to each element of [stream] without accumulating
+    Lwt [Forward] nodes. Each iteration is spawned via [Lwt.async].
+    @return a promise resolved when the stream closes ([None]). *)
 let consume_stream f stream =
   let done_p, done_u = Lwt.wait () in
   let rec loop () =
@@ -28,8 +23,7 @@ let consume_stream f stream =
            Lwt.return_unit
          | Some x ->
            f x;
-           (* Spawn next iteration independently to sever the Forward chain.
-               The current promise resolves immediately with unit. *)
+           (* Spawn the next iteration independently to sever the Forward chain. *)
            Lwt.async loop;
            Lwt.return_unit)
       (fun exn ->
@@ -40,10 +34,10 @@ let consume_stream f stream =
   done_p
 ;;
 
-(** Sequentially applies async [f] to each element of [stream] without
-    accumulating [Forward] nodes. Unlike [consume_stream], this awaits [f x]
-    before scheduling the next iteration, which provides backpressure for
-    hot paths such as WebSocket frame processing. *)
+(** Apply async [f] sequentially to each element of [stream] without
+    accumulating [Forward] nodes. Unlike [consume_stream], awaits [f x] before
+    scheduling the next iteration, providing backpressure for hot paths such as
+    WebSocket frame processing. *)
 let consume_stream_s f stream =
   let done_p, done_u = Lwt.wait () in
   let rec loop () =
@@ -67,15 +61,10 @@ let consume_stream_s f stream =
   done_p
 ;;
 
-(** Runs [f ()] every [interval] seconds until [stop ()] returns [true].
-    Each iteration is spawned via [Lwt.async] to sever the promise chain,
-    identical to the pattern used in [consume_stream].
-
-    If [initial_delay] is provided, waits that many seconds before the
-    first iteration.
-
-    Returns a promise that resolves when the loop exits (i.e. [stop ()]
-    returns [true]). *)
+(** Run [f ()] every [interval] seconds until [stop ()] returns [true]. Each
+    iteration is spawned via [Lwt.async] to sever the promise chain.
+    @param initial_delay Seconds to wait before the first iteration (default 0.0).
+    @return a promise resolved when the loop exits. *)
 let run_periodic ?(initial_delay = 0.0) ~interval ~stop f =
   let done_p, done_u = Lwt.wait () in
   let rec loop () =
@@ -107,14 +96,11 @@ let run_periodic ?(initial_delay = 0.0) ~interval ~stop f =
   done_p
 ;;
 
-(** Polls [check ()] on each wakeup until it returns [true] or the
-    [timeout] expires.  [wait_signal] should return a promise that
-    resolves whenever downstream data may have changed (e.g. an
-    [Lwt_condition.wait]).
-
-    Unlike a raw [>>= fun () -> loop ()], each iteration is spawned via
-    [Lwt.async] so the forward chain is severed.  Returns a promise that
-    resolves to [true] if [check ()] passed, [false] on timeout. *)
+(** Poll [check ()] on each wakeup until it returns [true] or [timeout]
+    expires. [wait_signal] must return a promise that resolves whenever
+    downstream data may have changed (e.g. an [Lwt_condition.wait]). Each
+    iteration is spawned via [Lwt.async] to sever the forward chain.
+    @return [true] if [check ()] passed, [false] on timeout. *)
 let poll_until ~timeout ~wait_signal ~check =
   let done_p, done_u = Lwt.wait () in
   let deadline = Unix.gettimeofday () +. timeout in

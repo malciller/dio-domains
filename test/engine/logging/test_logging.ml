@@ -3,7 +3,6 @@
 [@@@alert "-unsafe_multidomain"]
 
 let test_log_levels () =
-  (* Test logging at all levels - just ensure no exceptions are raised *)
   Logging.debug ~section:"test_logging" "Debug message";
   Logging.info ~section:"test_logging" "Info message";
   Logging.warn ~section:"test_logging" "Warning message";
@@ -13,7 +12,6 @@ let test_log_levels () =
 ;;
 
 let test_formatted_logging () =
-  (* Test formatted logging functions - just ensure no exceptions are raised *)
   Logging.debug_f ~section:"test_logging" "Debug: %d + %d = %d" 1 2 3;
   Logging.info_f ~section:"test_logging" "Info: %s" "formatted";
   Logging.warn_f ~section:"test_logging" "Warning: %.2f" 3.14159;
@@ -23,7 +21,6 @@ let test_formatted_logging () =
 ;;
 
 let test_level_conversions () =
-  (* Test level to string and string to level conversions *)
   Alcotest.(check string)
     "DEBUG to string"
     "DEBUG"
@@ -77,91 +74,77 @@ let test_level_conversions () =
 ;;
 
 let test_global_level_filtering () =
-  (* Test global level filtering - just ensure no exceptions are raised *)
+  (* ERROR global level admits only ERROR and CRITICAL. *)
   Logging.set_level Logging.ERROR;
-  (* Only ERROR and CRITICAL should log *)
 
-  (* These should be filtered out *)
   Logging.debug ~section:"test_logging" "Filtered debug";
   Logging.info ~section:"test_logging" "Filtered info";
   Logging.warn ~section:"test_logging" "Filtered warn";
-  (* These should appear *)
   Logging.error ~section:"test_logging" "Visible error";
   Logging.critical ~section:"test_logging" "Visible critical";
-  (* Reset to INFO for other tests *)
+  (* Restore INFO for subsequent tests. *)
   Logging.set_level Logging.INFO;
   Alcotest.(check bool) "global level filtering works" true true
 ;;
 
 let test_section_level_filtering () =
-  (* Test per-section level filtering - just ensure no exceptions are raised *)
+  (* Global DEBUG; section override to ERROR. *)
   Logging.set_level Logging.DEBUG;
-  (* Allow all globally *)
   Logging.set_section_level "strict_section" Logging.ERROR;
-  (* But strict for this section *)
 
-  (* Global section should log all *)
   Logging.debug ~section:"test_logging" "Global debug";
   Logging.info ~section:"test_logging" "Global info";
   Logging.warn ~section:"test_logging" "Global warn";
   Logging.error ~section:"test_logging" "Global error";
-  (* Strict section should only log ERROR and CRITICAL *)
+  (* strict_section admits only ERROR and CRITICAL. *)
   Logging.debug ~section:"strict_section" "Filtered debug";
   Logging.info ~section:"strict_section" "Filtered info";
   Logging.warn ~section:"strict_section" "Filtered warn";
   Logging.error ~section:"strict_section" "Visible error";
   Logging.critical ~section:"strict_section" "Visible critical";
-  (* Reset *)
   Logging.set_level Logging.INFO;
   Alcotest.(check bool) "section level filtering works" true true
 ;;
 
 let test_section_enable_filtering () =
-  (* Test section enable/disable filtering - just ensure no exceptions are raised *)
+  (* Only test_logging section enabled. *)
   Logging.set_enabled_sections [ "test_logging" ];
-  (* Only allow test_logging section *)
   Logging.info ~section:"test_logging" "Visible message";
   Logging.info ~section:"other_section" "Filtered message";
-  (* Reset *)
   Logging.set_enabled_sections [];
   Alcotest.(check bool) "section enable filtering works" true true
 ;;
 
 let test_colors () =
-  (* Test color enable/disable - just ensure no exceptions are raised *)
   Logging.set_colors true;
   Logging.info ~section:"test_logging" "Message with colors";
   Logging.set_colors false;
   Logging.info ~section:"test_logging" "Message without colors";
-  (* Reset *)
   Logging.set_colors true;
   Alcotest.(check bool) "colors work" true true
 ;;
 
 let test_output_redirection () =
-  (* Test output redirection - basic functionality test *)
-  (* Since we can't easily capture output, just test that set_output doesn't crash *)
+  (* Output not captured; assert set_output does not raise. *)
   let temp_channel = open_out "/dev/null" in
   Logging.set_output temp_channel;
   Logging.info ~section:"test_logging" "Redirected message";
   close_out temp_channel;
   Logging.set_output stderr;
-  (* Reset to stderr *)
   Alcotest.(check bool) "output redirection works" true true
 ;;
 
 let test_section_management () =
-  (* Test section creation and management *)
   let section1 = Logging.get_section_level "new_section" in
   let section2 = Logging.get_section_level "new_section" in
   Alcotest.(check bool) "section levels are consistent" true (section1 = section2)
 ;;
 
-(* ---- New format-line behavior ----
-   [Logging.format_line] is pure (no I/O, no queue), so we can assert on the
-   exact rendered output. The section column is FIXED at 20 chars, so the
-   message column is always 40 (12 timestamp + 1 + 5 level + 1 + 20 section
-   + 1). The stability of that column is the whole point of the layout. *)
+(* ---- format_line behavior ----
+   [Logging.format_line] is pure (no I/O, no queue), so its rendered output is
+   assertable. The section column is fixed at 20 chars; the message column is
+   always 40 (12 timestamp + 1 + 5 level + 1 + 20 section + 1). That column
+   stability is the layout invariant. *)
 
 let msg_col = 40
 
@@ -360,8 +343,7 @@ let test_format_line_colors () =
   Alcotest.(check bool) "level color present" true (String.contains line '\027')
 ;;
 
-(* Visual demo of the rendered layout (colors on), so the format can be
-   eyeballed during development. Not an assertion. *)
+(* Renders sample lines for visual inspection; not an assertion. *)
 let demo_format () =
   Logging.set_colors true;
   let samples =

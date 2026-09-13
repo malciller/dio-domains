@@ -1,14 +1,12 @@
 (** Proxy routing for Lighter API and WebSocket traffic through Cloudflare
     Workers, bypassing geographic access restrictions at the exchange ingress.
 
-    Deployment:
-      cd proxy/cloudflare && npx wrangler deploy
-      export LIGHTER_PROXY_URL=https://lighter-proxy.<subdomain>.workers.dev
+    [LIGHTER_PROXY_URL] is a comma-separated pool; when set, all traffic goes
+    through workers in permitted jurisdictions. When unset, traffic connects
+    directly and the public WebSocket appends [readonly=true] to its query
+    params to bypass the geo block.
 
-    With [LIGHTER_PROXY_URL] set (comma separated pool), all traffic goes
-    through workers running in permitted jurisdictions. Without it, traffic
-    connects directly; in direct mode the public WebSocket appends
-    [readonly=true] to its query params to get past the geo block. *)
+    Deploy: [cd proxy/cloudflare && npx wrangler deploy]. *)
 
 let section = "lighter_proxy"
 let consecutive_proxy_failures = Atomic.make 0

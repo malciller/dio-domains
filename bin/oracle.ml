@@ -1,14 +1,12 @@
-(* dio-oracle.exe - the configuration-tuning entrypoint.
+(* dio-oracle.exe -- configuration-tuning entrypoint.
 
-   Runs the exact oracle decision pipeline offline against the configured
-   assets and prints the decision surface: the four contract values
-   (active / grid_interval / buy_qty / sell_qty) plus internal diagnostics.
-   It never touches live balances: pools are synthetic, sized with --quote
-   per asset (and --base for sell sizing), so tuning is reproducible.
+   Runs the oracle decision pipeline offline against configured assets and prints
+   the decision surface: active / grid_interval / buy_qty / sell_qty plus internal
+   diagnostics. Pools are synthetic, sized with --quote per asset (and --base for
+   sell sizing), so tuning is reproducible and live balances are never touched.
 
-   History comes from the same all-time merged pipeline as the live runtime
-   (venue bars + Yahoo deep history). With --cache-only no network is used:
-   only what the disk cache already holds. *)
+   History uses the same all-time merged pipeline as the live runtime (venue bars
+   + Yahoo deep history). With --cache-only, only disk-cached history is used. *)
 
 let usage =
   {|dio-oracle [options]
@@ -324,8 +322,8 @@ let () =
      if tcs = []
      then Lwt.fail_with (Printf.sprintf "no trading entries match '%s'" args.symbol)
      else
-       (* Warm real fees where the venue adapter provides them and we may use
-          the network; explicit config fees always win and stay untouched. *)
+       (* Warm real fees where the venue adapter provides them and the network is
+          available; explicit config fees always win and stay untouched. *)
        (if offline
         then Lwt.return ()
         else

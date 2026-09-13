@@ -1,20 +1,20 @@
 (** Internal, client-only WebSocket client over Conduit + Cohttp-Lwt-Unix.
 
-    Drop-in replacement for the subset of the lwt websocket wrapper that the
-    engine uses, without the deprecated [lwt_log] dependency. Framing is
-    provided by [Websocket.Make] over a bounded [Cohttp_lwt_unix.IO], so bytes on
-    the wire are identical to the reference implementation. [TCP_NODELAY] is set on
-    the underlying socket when connecting. *)
+    Drop-in replacement for the subset of the lwt websocket wrapper the engine
+    uses, without the deprecated [lwt_log] dependency. Framing is provided by
+    [Websocket.Make] over a bounded [Cohttp_lwt_unix.IO], so bytes on the wire
+    are identical to the reference implementation. [TCP_NODELAY] is set on the
+    underlying socket when connecting. *)
 
 (** An established client connection. *)
 type conn
 
 (** Resolves the default Conduit context.
 
-    [Conduit_lwt_unix.default_ctx] changed type across Conduit releases: it is a
+    [Conduit_lwt_unix.default_ctx] changed type across Conduit releases: a
     [ctx Lazy.t] on Conduit >= 3 (classic-flambda builds) and a plain [ctx] on
-    Conduit < 3 (the OxCaml bundle). This returns the context either way, so
-    call sites do not depend on which toolchain they are compiled under. *)
+    Conduit < 3 (the OxCaml bundle). This returns the context either way,
+    keeping call sites toolchain-independent. *)
 val resolve_ctx : unit -> Conduit_lwt_unix.ctx
 
 val connect :

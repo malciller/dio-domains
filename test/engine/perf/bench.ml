@@ -232,8 +232,8 @@ let bench_duplicate_key_gen () =
 
 let () =
   Random.self_init ();
-  (* Save real stderr so we can print bench results through it.
-     Then mute the library's instrument-feed WARN spam during benchmarks. *)
+  (* Preserve real stderr for results; mute instrument-feed WARN spam during
+     benchmarks. *)
   let real_err = Unix.dup Unix.stderr in
   let devnull = Unix.openfile "/dev/null" [ Unix.O_WRONLY ] 0 in
   Unix.dup2 devnull Unix.stderr;
@@ -253,10 +253,9 @@ let () =
     ; bench_duplicate_key_gen ()
     ]
   in
-  (* Restore stderr so our output is always visible, even under dune runtest *)
+  (* Restore stderr so benchmark output is not suppressed by the test runner. *)
   Unix.dup2 real_err Unix.stderr;
   Unix.close real_err;
   Printf.eprintf "Running performance benchmarks...\n%!";
   print_results results
 ;;
-(* Sleep 1s so Dune finishes all parallel tests before flushing this output last Unix.sleep 1 *)

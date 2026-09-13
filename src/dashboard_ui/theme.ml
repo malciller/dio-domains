@@ -220,13 +220,13 @@ let format_latency_us f =
   add_commas raw
 ;;
 
-(** True for a sub-microsecond latency value (a fraction of a microsecond,
-    rendered as nanoseconds) so callers can style nanosecond cells
-    distinctly from microsecond cells. *)
+(** [true] for a sub-microsecond latency value (< 1us, rendered as
+    nanoseconds), so callers can style nanosecond cells distinctly from
+    microsecond cells. *)
 let is_sub_us f = f > 0.0 && f < 1.0
 
-(** Display width of a string as Notty renders it. Pure ASCII is the fast
-    path; anything else defers to Notty's Uucp-backed grapheme width so wide
+(** Display width of a string as Notty renders it. Pure ASCII uses the byte
+    length; anything else defers to Notty's Uucp-backed grapheme width, so wide
     glyphs and emoji align with the renderer instead of drifting. *)
 let display_width s =
   let n = String.length s in
@@ -1247,7 +1247,7 @@ let save_theme id =
 
 let load_saved_theme ?(config_file = "config.json") () =
   let loaded_from_config = ref false in
-  (* 1. Check config.json paths (including /app/config.json in Docker) for "theme" *)
+  (* 1. Check config.json paths (including /app/config.json in Docker) for a "theme" key. *)
   let config_candidates =
     [ config_file; "./config.json"; "/app/config.json"; "../config.json" ]
   in
@@ -1267,7 +1267,7 @@ let load_saved_theme ?(config_file = "config.json") () =
       else try_configs rest
   in
   try_configs config_candidates;
-  (* 2. Fall back to ~/.dio_theme if config.json didn't specify a theme *)
+  (* 2. Fall back to ~/.dio_theme when config.json specifies no theme. *)
   if not !loaded_from_config
   then (
     let rec try_paths = function
@@ -1440,7 +1440,7 @@ let render_sparkline w data max_val attr_fn =
   I.hcat (I.string t.a_dim (String.make empty_w ' ') :: blocks)
 ;;
 
-(* Gradient utilities for 3D/shaded aesthetics *)
+(* Gradient utilities *)
 
 let blend_rgb (r1, g1, b1) (r2, g2, b2) ratio =
   let clamp x = max 0 (min 255 x) in
@@ -1469,7 +1469,7 @@ let section_title ?title_attr w label =
   let gradient_lines =
     List.init pad_count (fun i ->
       let ratio = float i /. float (max 1 (pad_count - 1)) in
-      (* Ease out the gradient for a smoother fade effect using x^2 *)
+      (* x^2 easing for a smoother fade. *)
       let fade = ratio *. ratio in
       let c = color_blend left_rgb right_rgb fade in
       I.string A.(fg c ++ bg t.c_bg) "─")
@@ -1578,7 +1578,7 @@ let render_theme_modal ~target_w ~target_h ~cursor_idx =
   let total_themes = List.length themes in
   let modal_w = min (target_w - 4) 68 in
   let inner_w = modal_w - 4 in
-  (* Compute maximum number of themes visible on screen to fit vertically *)
+  (* Max themes visible, bounded by terminal height. *)
   let max_visible = max 5 (min total_themes (target_h - 7)) in
   let start_idx =
     if total_themes <= max_visible
@@ -1591,7 +1591,7 @@ let render_theme_modal ~target_w ~target_h ~cursor_idx =
   let visible_themes =
     List.filteri (fun i _ -> i >= start_idx && i < start_idx + max_visible) themes
   in
-  (* Title top with indicator *)
+  (* Title bar with cursor/total indicator. *)
   let title_str =
     Printf.sprintf " ╭── 🎨 SELECT THEME (%d/%d) " (cursor_idx + 1) total_themes
   in

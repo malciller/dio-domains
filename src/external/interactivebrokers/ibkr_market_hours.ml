@@ -22,8 +22,7 @@ let us_eastern_offset_hours () =
   let t = Unix.gettimeofday () in
   let tm = Unix.gmtime t in
   let year = tm.Unix.tm_year + 1900 in
-  (* Second Sunday in March: find day-of-week of March 1,
-     then compute the date of the second Sunday. *)
+  (* Second Sunday in March from the March 1 weekday. *)
   let march_1 =
     fst
       (Unix.mktime
@@ -167,7 +166,7 @@ let seconds_until_next_open () =
       if !paper_mode then 9, 30 else extended_open_hour, extended_open_min
     in
     let open_mins = (target_open_hour * 60) + target_open_min in
-    (* How many days until the next weekday open? *)
+    (* Days until the next weekday open. *)
     let days_ahead =
       if wday >= 1 && wday <= 5
       then

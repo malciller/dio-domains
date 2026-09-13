@@ -1,16 +1,15 @@
 /**
  * Lighter API Proxy — Cloudflare Worker + Durable Object
  *
- * Routes all Lighter traffic through a Durable Object pinned to Asia-East
+ * Routes Lighter traffic through a Durable Object pinned to Asia-East
  * (locationHint: "apac") to bypass CloudFront geo-restrictions.
  *
- * HTTP requests are forwarded to the DO which fetches from Lighter with an
- * appropriate regional IP.
- * WebSocket requests are handled at the entrypoint (where CF recognises the
- * upgrade) and the DO establishes the upstream connection and manages
- * keepalive + transparent reconnection.
+ * HTTP: forwarded to the DO, which fetches from Lighter with a regional IP.
+ * WebSocket: handled at the entrypoint (where CF recognises the upgrade); the DO
+ * establishes the upstream connection and manages keepalive and transparent
+ * reconnection.
  *
- * Deploy:  cd proxy/cloudflare && npx wrangler deploy
+ * Deploy: cd proxy/cloudflare && npx wrangler deploy
  */
 
 const LIGHTER_ORIGIN = "https://mainnet.zklighter.elliot.ai";
@@ -101,10 +100,9 @@ export default {
 };
 
 // ─── WebSocket handling ──────────────────────────────────────────────────────
-// WebSocket upgrade must be returned from the entrypoint (where CF recognises
-// the client upgrade). We create the client-facing pair here, then ask the DO
-// (running in Asia-East) to establish the upstream connection and relay
-// messages back through a simple message-passing protocol over an internal DO
+// The WebSocket upgrade must be returned from the entrypoint (where CF recognises
+// the client upgrade). The client-facing pair is created here; the DO (Asia-East)
+// establishes the upstream connection and relays messages over an internal DO
 // WebSocket.
 
 async function handleWebSocket(url: URL, env: Env): Promise<Response> {
@@ -275,10 +273,10 @@ export class LighterProxy implements DurableObject {
   }
 
   // ── Upstream WebSocket relay ─────────────────────────────────────────────
-  // Called internally by the worker entrypoint. Establishes the upstream
-  // WebSocket to Lighter from this DO, relays messages over an internal
-  // WebSocket pair back to the entrypoint. Manages upstream keepalive and
-  // transparent reconnection so the client never sees upstream drops.
+  // Called internally by the worker entrypoint. Establishes the upstream WebSocket
+  // to Lighter from this DO and relays messages over an internal WebSocket pair to
+  // the entrypoint. Manages upstream keepalive and transparent reconnection so the
+  // client never observes upstream drops.
 
   private async handleUpstreamRelay(url: URL): Promise<Response> {
     const sessionId = url.searchParams.get("sessionId") || "default-" + Math.random().toString(36).slice(2);
@@ -334,7 +332,6 @@ export class LighterProxy implements DurableObject {
     };
     this.sessions.set(sessionId, session);
 
-    // ── Wire up the new session ──
     const upstream = await this.connectUpstream(url, session);
     if (!upstream) {
       this.cleanupSession(session);
@@ -419,7 +416,7 @@ export class LighterProxy implements DurableObject {
           }
           session.client.send(event.data);
         } else {
-          // Client is disconnected. Buffer the message!
+          // Client disconnected: buffer the message.
           session.buffer.push(String(event.data));
           if (session.buffer.length > 5000) {
             session.buffer.shift(); // Drop oldest to avoid OOM
@@ -431,7 +428,7 @@ export class LighterProxy implements DurableObject {
     ws.addEventListener("close", (event) => {
       console.log(`[DO] Upstream closed: code=${event.code} reason="${event.reason}"`);
       
-      // If we are already terminating the session, or reconnecting
+      // Already terminating or reconnecting: ignore this close.
       if (session.expiryTimer === null && session.clientClosed) {
         return; // normal disconnect after expiry
       }
@@ -451,7 +448,7 @@ export class LighterProxy implements DurableObject {
           return;
         }
 
-        // Reconnet failed
+        // Reconnect failed.
         session.reconnecting = false;
         console.error(`[DO] Upstream reconnect failed for ${session.id}`);
         try {

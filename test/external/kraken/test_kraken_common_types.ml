@@ -1,18 +1,17 @@
 let test_nonce_generation () =
-  (* Test nonce generation *)
+  (* Nonce generation. *)
   let nonce1 = Kraken.Kraken_common_types.nonce () in
   let nonce2 = Kraken.Kraken_common_types.nonce () in
-  (* Nonces should be numeric strings and increasing *)
+  (* Nonces are numeric strings and non-decreasing. *)
   Alcotest.(check bool) "nonce1 not empty" true (nonce1 <> "");
   Alcotest.(check bool) "nonce2 not empty" true (nonce2 <> "");
-  (* Check they are numeric *)
   let n1 = Int64.of_string nonce1 in
   let n2 = Int64.of_string nonce2 in
   Alcotest.(check bool) "nonces are non-decreasing" true (n2 >= n1)
 ;;
 
 let test_normalize_base64_secret () =
-  (* Test base64 secret normalization *)
+  (* Base64 secret normalization. *)
   let test_cases =
     [ "SGVsbG8gV29ybGQ=", "SGVsbG8gV29ybGQ="
     ; (* Already valid *)
@@ -35,7 +34,7 @@ let test_normalize_base64_secret () =
 ;;
 
 let test_decode_secret_base64 () =
-  (* Test base64 secret decoding *)
+  (* Base64 secret decoding. *)
   let secret = "SGVsbG8gV29ybGQ=" in
   (* "Hello World" *)
   let decoded = Kraken.Kraken_common_types.decode_secret_base64 secret in
@@ -43,7 +42,7 @@ let test_decode_secret_base64 () =
 ;;
 
 let test_invalid_secret_handling () =
-  (* Test handling of invalid secrets *)
+  (* Invalid secret handling. *)
   let test_case secret expected_prefix =
     try
       ignore (Kraken.Kraken_common_types.decode_secret_base64 secret);
@@ -51,7 +50,7 @@ let test_invalid_secret_handling () =
     with
     | Failure msg ->
       if String.starts_with ~prefix:expected_prefix msg
-      then () (* Success *)
+      then ()
       else
         Alcotest.fail
           (Printf.sprintf
@@ -66,23 +65,22 @@ let test_invalid_secret_handling () =
 ;;
 
 let test_sign_function () =
-  (* Test HMAC-SHA512 signing *)
+  (* HMAC-SHA512 signing. *)
   let secret = "SGVsbG8gV29ybGQ=" in
   (* "Hello World" *)
   let path = "/api/test" in
   let body = "test=data" in
   let nonce = "1234567890" in
   let signature = Kraken.Kraken_common_types.sign ~secret ~path ~body ~nonce in
-  (* Signature should be a non-empty base64 string *)
+  (* Signature is non-empty base64. *)
   Alcotest.(check bool) "signature not empty" true (signature <> "");
-  (* Try to decode it to ensure it's valid base64 *)
   match Base64.decode signature with
   | Ok decoded -> Alcotest.(check int) "signature length" 64 (String.length decoded)
   | Error _ -> Alcotest.fail "signature should be valid base64"
 ;;
 
 let test_ws_response_structure () =
-  (* Test ws_response record structure *)
+  (* ws_response record. *)
   let test_response =
     { Kraken.Kraken_common_types.method_ = "test_method"
     ; success = true
@@ -108,7 +106,7 @@ let test_ws_response_structure () =
 ;;
 
 let test_order_result_structures () =
-  (* Test order result record structures *)
+  (* Order result records. *)
   let add_result =
     { Kraken.Kraken_common_types.order_id = "order123"
     ; cl_ord_id = Some "client123"
@@ -141,7 +139,7 @@ let test_order_result_structures () =
 ;;
 
 let test_sign_consistency () =
-  (* Test that signing the same data produces the same result *)
+  (* Signing is deterministic for identical inputs. *)
   let secret = "dGVzdCBzZWNyZXQ=" in
   (* "test secret" *)
   let path = "/api/v1/test" in

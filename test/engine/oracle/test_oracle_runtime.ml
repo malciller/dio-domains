@@ -61,14 +61,14 @@ let test_effective_knobs_asset_override () =
         ]
     }
   in
-  (* Overridden asset gets its own knobs... *)
+  (* Overridden asset uses its own knobs. *)
   let ts, mad, qcm =
     Dio_oracle.Oracle_runtime.effective_knobs ~config:c ~symbol:"BTC/USDC"
   in
   near "asset target_survival" ts 0.99;
   near "asset inherits default min_active_dsurv" mad 0.0;
   near "asset qty_cap_mult" qcm 3.0;
-  (* ...another asset keeps the globals. *)
+  (* Untouched asset keeps the globals. *)
   let ts2, _, _ = Dio_oracle.Oracle_runtime.effective_knobs ~config:c ~symbol:"ETH/USD" in
   near "other asset keeps global ts" ts2 0.95
 ;;
@@ -109,12 +109,9 @@ let test_sell_qty_of () =
 let test_publish_and_decision_for () =
   let d1 = make_decision ~active:true () in
   let d2 = make_decision ~active:false ~buy_qty:2.0 ~symbol:"Y/USD" () in
-  (* Publish through run-pass-independent path: publish is internal, but
-     decision_for reads the published map - drive it via a pass-less publish
-     by calling the runtime's public decisions() after publishing both. *)
+  (* publish is pass-internal; drive the public read API directly. *)
   let before = Dio_oracle.Oracle_runtime.decisions () in
-  (* The runtime publishes atomically inside passes; here we only assert the
-     read API is stable and total on an empty engine. *)
+  (* Read API must be stable and total on an empty engine. *)
   Alcotest.(check bool) "decisions list is a list" true (List.length before >= 0);
   Alcotest.(check bool)
     "untracked asset is not tracked"

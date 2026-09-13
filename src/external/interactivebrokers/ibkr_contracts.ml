@@ -18,7 +18,6 @@ let next_req_id = Atomic.make 9000
     response. Caches the result on success. The returned contract
     includes conId, minTick, and trading attributes. *)
 let resolve conn ~symbol =
-  (* Check cache before hitting the wire. *)
   Mutex.lock cache_mutex;
   let cached = Hashtbl.find_opt cache symbol in
   Mutex.unlock cache_mutex;
@@ -30,7 +29,6 @@ let resolve conn ~symbol =
     let req_id = Atomic.fetch_and_add next_req_id 1 in
     Logging.info_f ~section "Resolving contract for %s (reqId=%d)" symbol req_id;
     let result = ref None in
-    (* Register a reqId-correlated handler for the response. *)
     let condition =
       Ibkr_dispatcher.register_req_handler
         ~req_id
@@ -91,7 +89,6 @@ let resolve conn ~symbol =
     in
     Ibkr_connection.send conn msg_fields
     >>= fun () ->
-    (* Wait for the response condition, with a 10s timeout. *)
     Lwt.pick
       [ (Lwt_condition.wait condition >|= fun () -> `Done)
       ; (Lwt_unix.sleep 10.0 >|= fun () -> `Timeout)

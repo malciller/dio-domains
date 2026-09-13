@@ -1,23 +1,18 @@
-(* Oracle calendar - session-consistent views over raw bars.
+(* Oracle_calendar - session-consistent views over raw bars.
 
-   - Sorts bars by ISO date, de-duplicates.
-   - Detects missing sessions (gaps): for Crypto a session is a calendar day;
-     for Equity an expected-session predicate (US weekdays minus holidays, from
-     Oracle_sessions) drives gap detection.
-   - The user's review rule: never forward-fill missing bars; gaps are surfaced
-     as metadata and the analysis fails when max_gap > tolerance (checked by
-     the caller / CLI). *)
+   Sorts bars by ISO date and de-duplicates. Detects missing sessions: for
+   Crypto a session is any calendar day; for Equity an expected-session
+   predicate (US weekdays minus holidays, from Oracle_sessions) drives
+   detection. Missing bars are never forward-filled; gaps are metadata and
+   the caller fails the analysis when max_gap exceeds tolerance. *)
 
 open Oracle_types
 
 (* ---- ISO date helpers (YYYY-MM-DD) ----
-   All arithmetic is pure civil-date math (days from the 1970-01-01 epoch, via
-   Howard Hinnant's algorithms). The previous mktime/gmtime implementation was
-   local-timezone dependent: in any positive-UTC-offset timezone the reconstructed
-   weekday and day+1 were off by one day, which corrupted equity gap detection
-   and could non-terminate the gap-bounding walks in [gaps_of_missing].
-   The shared definitions live in [Exchange_intf.Types] so external data
-   clients (Yahoo deep history) can use them without depending on this library. *)
+   Pure civil-date math (days from the 1970-01-01 epoch, via Howard
+   Hinnant's algorithms); no local-timezone dependence. The shared
+   definitions live in [Exchange_intf.Types] so external data clients (Yahoo
+   deep history) can use them without depending on this library. *)
 
 let iso_ymd = Dio_exchange.Exchange_intf.Types.iso_ymd
 let days_from_civil = Dio_exchange.Exchange_intf.Types.days_from_civil
@@ -46,40 +41,26 @@ let dates_between ~(from_date : string) ~(to_date : string) =
   if n < 0 then [] else List.init (n + 1) (fun i -> add_days from_date i)
 ;;
 
-(* ---- Series normalization (one clean series for every consumer) ----
-   Venue feeds can return rows that are not real market prints; both corrupt
-   the peak-to-valley drawdown and the ATH/floor references:
-   - placeholder candles (e.g. Hyperliquid's fabricated pre-listing rows for
-     wrapped spot pairs - constant dummy OHLC like 6,969,696 / 7,979,573
-     with zero or dust volume - which read as a phantom 99.3% drawdown);
-   - rows whose extreme prints never traded (e.g. open/high 240,000 on a day
-     whose close was 97,578 - they fabricate an ATH/floor).
-   [normalize_bars] drops the first and folds the second into the row's
-   close. It is applied at every fetch source AND on every history-cache
-   read, so the runtime, the CLI and the replay always share one clean
-   series and never contradict each other. The judge is deliberately LOCAL
-   (each row vs its nearest real-trading neighbor), never a global median:
-   a series that genuinely 100x'd (BTC ~$1k in 2017 vs ~$40k now) must keep
-   its early cheap-era rows - only rows that deviate ~100x from the market
-   AROUND THEM (fabricated placeholder levels) are dropped. *)
+(* ---- Series normalization ----
+   Venue feeds can return non-market rows that corrupt peak-to-valley
+   drawdown and ATH/floor references: fabricated placeholder candles
+   (constant dummy OHLC, zero/dust volume) and rows whose extreme prints
+   never traded. [normalize_bars] drops the former and folds the latter into
+   the row's close. Applied at every fetch source and every history-cache
+   read, so runtime, CLI and replay share one clean series. Outlier judgment
+   is local (each row against its nearest real-trading neighbor, volume >=
+   0.01), never a global median, so genuinely cheap historical rows survive
+   while ~100x-off placeholder levels are dropped. *)
 
 (** Normalize a candle list into the canonical clean series: ascending,
     de-duplicated, fabricated rows dropped, absurd intra-row extremes folded
-    into the row's close. Returns the clean bars plus the counts of dropped
-    and clamped rows (for the once-per-symbol log).
-    - Pass 1 drops rows with non-finite/non-positive fields or an impossible
-      single-candle range (>10x between the row's extreme prints).
-    - Pass 2 folds rows whose extreme prints sit >2x away from the row's own
-      close into a flat close (a daily candle never trades a >2x span for
-      the oracle's assets; the close is the day's real level and is kept).
-    - Pass 3 drops rows whose close deviates >8x from the nearest REAL
-      trading neighbor (left first, else right; real = volume >= 0.01). A
-      fabricated placeholder level (zero/dust volume, ~100x off the market)
-      fails this; a genuine cheap-era row sits next to its own era's rows
-      and passes; a zero-volume carried price near the market also passes.
-      Rows with no real-trading neighbor at all are kept (cannot judge).
-    - A series with no real trading at all (not one surviving row with
-      volume >= 0.01) is entirely fabricated and normalizes to empty. *)
+    into the close. Returns (clean bars, dropped count, clamped count).
+    Pass 1 drops rows with non-finite/non-positive fields or >10x
+    intra-candle range. Pass 2 folds rows whose extreme prints sit >2x from
+    the row's close into a flat close (the close is kept). Pass 3 drops rows
+    whose close deviates >8x from the nearest real-trading neighbor (left
+    first, else right; real = volume >= 0.01); rows with no real neighbor
+    are kept. A series with no row at volume >= 0.01 normalizes to empty. *)
 let normalize_bars (bars : bar list) : bar array * int * int =
   let arr = bars |> Array.of_list |> sort_bars |> dedup in
   let n = Array.length arr in
@@ -115,11 +96,9 @@ let normalize_bars (bars : bar list) : bar array * int * int =
         arr.(i) <- { b with open_ = b.close; high = b.close; low = b.close };
         incr clamped))
   done;
-  (* Pass 3: local, volume-aware outlier guard (see the module doc). A
-     fabricated placeholder level (zero/dust volume, ~100x off the market
-     around it) is dropped; a genuine cheap-era row sits next to its own
-     era's rows and survives; a zero-volume carried price near the market
-     survives. *)
+  (* Pass 3: local, volume-aware outlier guard (see module doc). Drops
+     fabricated placeholder levels ~100x off the surrounding real market;
+     genuine cheap-era rows survive. *)
   let is_real (b : bar) = b.volume >= 0.01 in
   for i = 0 to n - 1 do
     if good.(i)
@@ -152,9 +131,9 @@ let normalize_bars (bars : bar list) : bar array * int * int =
           incr dropped)
       | _ -> ())
   done;
-  (* A series with no real trading at all (not one surviving row with volume
-     >= 0.01) is entirely fabricated: empty it rather than feed placeholder
-     candles into the drawdown/floor math. *)
+  (* No surviving row at volume >= 0.01 means the series is entirely
+     fabricated: empty it rather than feed placeholders into drawdown/floor
+     math. *)
   let any_real = ref false in
   for i = 0 to n - 1 do
     if good.(i) && arr.(i).volume >= 0.01 then any_real := true
@@ -209,9 +188,6 @@ let gaps_of_missing ~(bars : bar array) (missing : string list) =
   let runs = runs [] [] missing |> List.filter (fun r -> r <> []) in
   List.map
     (fun run ->
-       (* Walk backward from the run head to the last present session before
-          it; walk forward from the run tail to the first present session
-          after it. *)
        let after =
          let rec back d =
            let prev = add_days d (-1) in

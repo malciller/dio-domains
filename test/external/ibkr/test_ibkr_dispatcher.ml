@@ -1,8 +1,7 @@
 let test_handler_registration () =
-  (* Register and dispatch a test handler *)
+  (* Register then dispatch msg_id 9999. *)
   let received = ref false in
   Ibkr.Dispatcher.register_handler ~msg_id:9999 ~handler:(fun _fields -> received := true);
-  (* Dispatch to the registered handler *)
   Ibkr.Dispatcher.dispatch ~msg_id:9999 ~fields:[ "test" ];
   Alcotest.(check bool) "handler was invoked" true !received
 ;;
@@ -16,7 +15,7 @@ let test_handler_overwrite () =
 ;;
 
 let test_unhandled_message () =
-  (* Dispatching an unregistered msg_id should not crash *)
+  (* Unregistered msg_id is a no-op. *)
   Ibkr.Dispatcher.dispatch ~msg_id:8888 ~fields:[ "some"; "data" ];
   Alcotest.(check bool) "unhandled message doesn't crash" true true
 ;;
@@ -31,7 +30,7 @@ let test_req_handler_registration () =
       ~on_end:(fun () -> end_received := true)
   in
   Alcotest.(check bool) "req handler registered" true true;
-  (* Clean up *)
+  (* Remove to avoid cross-test state. *)
   Ibkr.Dispatcher.remove_req_handler ~req_id:7777
 ;;
 
@@ -43,13 +42,13 @@ let test_remove_req_handler () =
       ~on_end:(fun () -> ())
   in
   Ibkr.Dispatcher.remove_req_handler ~req_id:6666;
-  (* Dispatching to removed handler should not crash *)
+  (* Dispatch to a removed req handler is a no-op. *)
   Ibkr.Dispatcher.dispatch ~msg_id:55555 ~fields:[ "6666"; "data" ];
   Alcotest.(check bool) "removed req handler doesn't crash" true true
 ;;
 
 let test_dispatch_empty_fields () =
-  (* Dispatching with empty fields should not crash *)
+  (* Empty-field dispatch is a no-op. *)
   Ibkr.Dispatcher.dispatch ~msg_id:7654 ~fields:[];
   Alcotest.(check bool) "empty fields dispatch ok" true true
 ;;
@@ -66,7 +65,7 @@ let test_handler_receives_correct_fields () =
 ;;
 
 let test_handler_exception_recovery () =
-  (* A handler that throws should not crash the dispatcher *)
+  (* Handler exceptions are caught. *)
   Ibkr.Dispatcher.register_handler ~msg_id:9996 ~handler:(fun _fields ->
     failwith "test exception");
   Ibkr.Dispatcher.dispatch ~msg_id:9996 ~fields:[ "test" ];

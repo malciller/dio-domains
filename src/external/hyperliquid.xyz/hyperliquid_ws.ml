@@ -21,10 +21,9 @@ type raw_subscription =
 let is_connected_ref = Atomic.make false
 let is_connected () = Atomic.get is_connected_ref
 
-(** Bound on the TLS + WebSocket upgrade handshake. A half-open TCP
-    connection during the handshake would otherwise block the reconnect
-    (which runs on the main Lwt loop) indefinitely. [Lwt_unix.with_timeout]
-    cancels the in-flight connect, closing its underlying fd. *)
+(** TLS + WebSocket upgrade handshake timeout. Without it a half-open TCP
+    connection blocks the reconnect (on the main Lwt loop) indefinitely;
+    [Lwt_unix.with_timeout] cancels the in-flight connect and closes its fd. *)
 let ws_connect_timeout_s = 20.0
 
 (** Mvar signaled each time a new connection is established.
@@ -67,20 +66,17 @@ let responses_mutex = Lwt_mutex.create ()
 (** Counter of consecutive ping failures, read by the supervisor. *)
 let ping_failures = Atomic.make 0
 
-(* Cumulative count of WebSocket messages dropped because a subscriber's
-   bounded stream (capacity 16) was full. A dropped EXECUTIONS/FILL frame is
-   a silent inventory desync; this counter + throttled warn makes it visible
-   instead of vanishing. *)
+(* Cumulative count of messages dropped because a subscriber's bounded stream
+   (capacity 16) was full. A dropped fill frame is a silent inventory desync;
+   this counter and the throttled warn make it visible. *)
 let dropped_subscriber_messages = Atomic.make 0
 let reset_ping_failures () = Atomic.set ping_failures 0
 let get_ping_failures () = Atomic.get ping_failures
 let incr_ping_failures () = Atomic.incr ping_failures
 
-(** Pong tracking state.
-    Hyperliquid pong responses carry no id field, so the generic
-    [send_request] ID-matching mechanism cannot be used. Instead,
-    [send_ping] waits on [pong_condition], which is broadcast when
-    a frame with channel "pong" arrives. *)
+(** Pong tracking. Hyperliquid pongs carry no id, so [send_request]'s
+    ID matching cannot be used; [send_ping] waits on [pong_condition], broadcast
+    when a channel "pong" frame arrives. *)
 let last_pong_time = ref 0.0
 
 let pong_condition = Lwt_condition.create ()
@@ -433,7 +429,7 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
            try member "channel" json |> to_string with
            | _ -> ""
          in
-         (* Update pong tracking on pong responses. *)
+         (* Update pong tracking. *)
          if channel = "pong"
          then (
            last_pong_time := Unix.gettimeofday ();
@@ -451,8 +447,8 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
            if channel = "webData2"
            then Logging.debug_f ~section "webData2 received: %s" log_msg
            else Logging.debug_f ~section "Raw WS message: %s" log_msg);
-         (* Attempt to extract an integer ID from the JSON payload.
-           Searches top-level, then inside "data" and "response" keys. *)
+         (* Extract an integer ID, searching top-level then inside "data"
+            and "response". *)
          let is_response =
            let id_opt =
              let rec find_id node =
@@ -732,7 +728,6 @@ let send_ping ~req_id:_ ~timeout_ms =
             Lwt.return true)
          ; (Lwt_unix.sleep timeout
             >>= fun () ->
-            (* Check timestamp in case the condition was signaled before we waited. *)
             if !last_pong_time > send_time
             then (
               reset_ping_failures ();

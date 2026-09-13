@@ -1,5 +1,5 @@
 let test_pair_status_conversions () =
-  (* Test pair status string conversions *)
+  (* Pair status string conversions. *)
   let test_cases =
     [ Kraken.Kraken_instruments_feed.Online, "online"
     ; Kraken.Kraken_instruments_feed.CancelOnly, "cancel_only"
@@ -25,7 +25,7 @@ let test_pair_status_conversions () =
 ;;
 
 let test_is_tradeable () =
-  (* Test tradeability checking *)
+  (* Tradeability. *)
   Alcotest.(check bool)
     "Online is tradeable"
     true
@@ -69,7 +69,7 @@ let test_is_tradeable () =
 ;;
 
 let test_parse_pair_info () =
-  (* Test parsing pair info from JSON *)
+  (* parse_pair_info from JSON. *)
   let json_str =
     {|
     {
@@ -119,7 +119,7 @@ let test_parse_pair_info () =
 ;;
 
 let test_parse_pair_info_invalid () =
-  (* Test parsing with invalid JSON *)
+  (* parse_pair_info rejects invalid JSON. *)
   let invalid_json_str =
     {|
     {
@@ -138,7 +138,7 @@ let test_parse_pair_info_invalid () =
 ;;
 
 let test_round_to_increment () =
-  (* Test rounding to increment *)
+  (* round_to_increment. *)
   let check_rounding value increment expected desc =
     let result = Kraken.Kraken_instruments_feed.round_to_increment value increment in
     Alcotest.(check (float 0.000001)) desc expected result
@@ -151,19 +151,17 @@ let test_round_to_increment () =
 ;;
 
 let test_get_precision_info () =
-  (* Test precision info retrieval *)
-  (* This function depends on the cache being populated, so we'll test the interface *)
+  (* get_precision_info with an empty cache. *)
   let symbol = "TEST_SYMBOL" in
-  (* Initially should return None since cache is empty *)
+  (* Empty cache returns None. *)
   match Kraken.Kraken_instruments_feed.get_precision_info symbol with
   | None -> Alcotest.(check bool) "get_precision_info returns None initially" true true
   | Some _ -> Alcotest.fail "should return None initially"
 ;;
 
 let test_cache_operations () =
-  (* Test basic cache operations *)
+  (* get_pair_info with an empty cache. *)
   let test_symbol = "CACHE_TEST" in
-  (* Initially should not have info *)
   let result = Lwt_main.run (Kraken.Kraken_instruments_feed.get_pair_info test_symbol) in
   match result with
   | None -> Alcotest.(check bool) "cache initially empty" true true
@@ -171,9 +169,8 @@ let test_cache_operations () =
 ;;
 
 let test_is_pair_tradeable () =
-  (* Test pair tradeability checking *)
+  (* is_pair_tradeable with no cached data. *)
   let test_symbol = "TRADEABLE_TEST" in
-  (* Initially should not be tradeable since no data *)
   let result =
     Lwt_main.run (Kraken.Kraken_instruments_feed.is_pair_tradeable test_symbol)
   in
@@ -181,7 +178,7 @@ let test_is_pair_tradeable () =
 ;;
 
 let test_pair_info_structure () =
-  (* Test pair_info record structure *)
+  (* pair_info record. *)
   let test_info =
     { Kraken.Kraken_instruments_feed.symbol = "TEST/USD"
     ; base = "TEST"

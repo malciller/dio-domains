@@ -1,9 +1,9 @@
-(* Oracle pipeline: one asset, one pass.
+(* Oracle_pipeline - one asset, one pass.
 
-   Wires the all-time merged price history into the pure core:
-   references -> runway -> parameter search -> decision record. This is the
-   ONLY path from market data to a [decision]; everything downstream
-   (pools, execution) consumes the four-field record as-is. *)
+   Runs the pure core on all-time merged price history: references -> runway
+   -> parameter search -> decision record. The only path from market data to
+   a [decision]; downstream consumers (pools, execution) take the record
+   as-is. *)
 
 (** Inputs for one decision pass on one asset on one venue. *)
 type inputs =
@@ -36,11 +36,10 @@ let current_price_of_series (s : Oracle_types.series) : float option =
   if n = 0 then None else Some s.bars.(n - 1).close
 ;;
 
-(** All-time merged history for one asset: the venue's registry-backed
-    daily series delta-fetched against the disk cache, extended BACKWARDS
-    with Yahoo deep history (venue bars win on overlap; nothing is ever
-    synthesized). No gap tolerance, no minimum length: what the sources
-    provide is what the references see. *)
+(** All-time merged history for one asset: registry-backed venue series
+    delta-fetched against the disk cache, extended backwards with Yahoo deep
+    history. Venue bars win on overlap; nothing is synthesized. No gap
+    tolerance, no minimum length. *)
 let history_of ~(offline : bool) ~(exchange : string) ~(symbol : string)
   : Oracle_types.series Lwt.t
   =
@@ -52,9 +51,8 @@ let history_of ~(offline : bool) ~(exchange : string) ~(symbol : string)
   else Oracle_fetch.deepen_series ~no_deep_history:false ~offline:false venue >|= fst
 ;;
 
-(** One pure pass given already-computed [refs]: history references in,
-    decision out. The runtime caches [refs] per history version, so the
-    O(history_len) reference scan does not run on every pass. *)
+(** Decision pass from already-computed [refs]. Caching [refs] per history
+    version keeps the O(history_len) reference scan off the per-pass path. *)
 let decide_from_refs ~(refs : Oracle_core.references) ~(inputs : inputs) : outcome option =
   let runway =
     Oracle_core.runway_of
@@ -87,8 +85,8 @@ let decide_from_refs ~(refs : Oracle_core.references) ~(inputs : inputs) : outco
   Some { refs; runway; resolution; decision }
 ;;
 
-(** One pure pass: history in, decision out. [None] when there is no usable
-    history (empty or all-invalid bars) - no decision can be made. *)
+(** One pure pass: history in, decision out. [None] on empty or all-invalid
+    bars (no usable history). *)
 let decide ~(inputs : inputs) : outcome option =
   match Oracle_core.references_of ~bars:inputs.bars with
   | None -> None

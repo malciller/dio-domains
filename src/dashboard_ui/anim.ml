@@ -1,12 +1,11 @@
-(** Frame-clock animation toolkit.
+(** Frame-clock animation toolkit: monotonic clock, easing, per-key tweening,
+    and decaying event flashes.
 
-    Provides a monotonic clock, easing functions, per-key numeric tweening,
-    and decaying event flashes. The render loop uses [motion_pending] to decide
-    whether another high-rate frame is worth drawing: setters mark motion while
-    a value is still moving, and the loop resets the flag at the start of each
-    frame. *)
+    [motion_pending] tells the render loop whether another high-rate frame is
+    worth drawing: setters mark motion while a value is still moving, and the
+    loop resets the flag at the start of each frame. *)
 
-(** Monotonic seconds since program start. Never jumps backwards on NTP
+(** Monotonic seconds since program start; does not jump backwards on NTP
     adjustment, unlike [Unix.gettimeofday]. *)
 let now () = Int64.to_float (Mtime_clock.elapsed_ns ()) /. 1_000_000_000.0
 
@@ -16,7 +15,7 @@ let reduced_motion = ref false
 let target_fps = ref 30.0
 let idle_interval = ref 2.0
 
-(** Set by [tween]/[flash] while anything is still moving; reset by the loop
+(** Set by [tween]/[flash] while a value is still moving; the loop resets it
     before each draw so it reflects that frame's remaining motion. *)
 let motion_pending = ref false
 
@@ -40,8 +39,8 @@ let approach ~tau v target dt =
 (** Per-key smoothed values, indexed by a caller-chosen key. *)
 let tweens : (string, float) Hashtbl.t = Hashtbl.create 64
 
-(** Seconds since the previous frame, clamped to a sane range. Set by
-    [reset_frame] so every [tween] in a frame shares one delta time. *)
+(** Seconds since the previous frame, clamped to [0, 0.1]. Set by
+    [reset_frame]; every [tween] in a frame shares one delta time. *)
 let current_dt = ref (1.0 /. 30.0)
 
 let last_tick = ref 0.0
@@ -65,7 +64,7 @@ let tween ~key ~target ~tau =
 ;;
 
 (** Decaying event flash: [1.0] while [active], then exponential decay with
-    time constant [tau] once it goes inactive. *)
+    time constant [tau]. *)
 let flashes : (string, float) Hashtbl.t = Hashtbl.create 64
 
 let flash ~key ~active ~tau =
@@ -86,11 +85,11 @@ let flash ~key ~active ~tau =
         v))
 ;;
 
-(** Zero-argument convenience: is anything animating this frame? *)
+(** [true] if anything is animating this frame. *)
 let pending () = !motion_pending
 
-(** Called once at the start of each frame: clears the motion flag used by the
-    loop and advances the shared delta time. *)
+(** Called once at the start of each frame: clears [motion_pending] and
+    advances [current_dt]. *)
 let reset_frame () =
   motion_pending := false;
   let t = now () in
@@ -101,9 +100,9 @@ let reset_frame () =
   last_tick := t
 ;;
 
-(** Last time fresh data arrived. Ambient motion (breathing fills, live
-    badges) runs only for a short window after a snapshot, so the UI does not
-    animate forever while the stream is idle or the session is detached. *)
+(** Time of the last fresh data. Ambient motion (breathing fills, live badges)
+    runs only for a short window after a snapshot, so the UI does not animate
+    while the stream is idle or the session is detached. *)
 let last_activity = ref 0.0
 
 let note_activity () = last_activity := now ()
@@ -112,11 +111,10 @@ let active ?(window = 1.5) () = now () -. !last_activity < window
 (** Smooth 0..1 breathing value for ambient effects. *)
 let pulse () = 0.5 +. (0.5 *. sin (now () *. 3.0))
 
-(** Square-wave blink: [true] for the [duty] fraction of each [hz] cycle.
-    Steady-on under [reduced_motion]. This is the near-fill proximity cue - a
-    solid tint reads as "highlighted but static", so the highlight must blink.
-    Callers mark [motion_pending] while the condition holds so the render loop
-    keeps redrawing. *)
+(** Square-wave blink: [true] for the [duty] fraction of each [hz] cycle;
+    steady-on under [reduced_motion]. The near-fill proximity cue: a solid tint
+    reads as "highlighted but static", so the highlight must blink. Callers set
+    [motion_pending] while the condition holds so the loop keeps redrawing. *)
 let blink ?(hz = 1.5) ?(duty = 0.5) () =
   if !reduced_motion then true else fst (Float.modf (now () *. hz)) < duty
 ;;

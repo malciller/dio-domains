@@ -1,7 +1,7 @@
-(* Live repro harness: replays Kraken's real book feed through the same
-   code paths production uses (parse_and_apply_levels, levels_to_array,
-   calculate_checksum) and validates the CRC32 on EVERY message to bisect
-   whether snapshots validate immediately or drift begins with deltas. *)
+(* Live repro harness: replays Kraken's real book feed through production code
+   paths (parse_and_apply_levels, levels_to_array, calculate_checksum) and
+   validates CRC32 on every message to bisect whether snapshots validate
+   immediately or drift begins with deltas. *)
 
 let _section = "debug_ws"
 
@@ -14,7 +14,7 @@ type state =
   ; mutable mismatched : int
   ; mutable snapshot_ok : bool
   ; recent_deltas : string Queue.t
-    (* Raw JSON of the last deltas, dumped on first mismatch. *)
+    (* Raw JSON of recent deltas; dumped on first mismatch. *)
   ; mutable first_mismatch_dumped : bool
   }
 
@@ -64,8 +64,8 @@ let validate symbol st checksum_received =
   let ask_arr =
     Kraken.Kraken_orderbook_feed.levels_to_array ~sort_desc:false st.asks depth
   in
-  (* Same argument order as production: bids (desc) then asks (asc); the
-     function itself hashes asks first per Kraken's spec. *)
+  (* Production argument order: bids (desc) then asks (asc); the function hashes
+     asks first per Kraken's spec. *)
   let calc = Kraken.Kraken_orderbook_feed.calculate_checksum symbol bid_arr ask_arr in
   st.validated <- st.validated + 1;
   if Int32.compare calc checksum_received <> 0
@@ -77,8 +77,8 @@ let validate symbol st checksum_received =
       st.updates_since_snapshot
       checksum_received
       calc;
-    (* Independent recomputation straight from the wire strings, bypassing
-       calculate_checksum entirely - isolates math vs state. *)
+    (* Independent recomputation from wire strings, bypassing
+       calculate_checksum: isolates math vs state. *)
     let crc = ref 0xFFFFFFFFl in
     let feed s =
       crc
@@ -112,7 +112,7 @@ let validate symbol st checksum_received =
       bid_arr;
     let manual_crc = Kraken.Kraken_orderbook_feed.crc32_zlib (Buffer.contents manual) in
     Printf.printf "  independent-wire-crc=%ld manual-stream-crc=%ld\n%!" !crc manual_crc;
-    (* First mismatch since snapshot: replay the recent raw deltas. *)
+    (* Replay recent raw deltas on first mismatch since snapshot. *)
     if (not st.first_mismatch_dumped) && st.updates_since_snapshot > 0
     then (
       st.first_mismatch_dumped <- true;
@@ -179,7 +179,7 @@ let handle_message json =
               st.updates_since_snapshot <- 0;
               Queue.clear st.recent_deltas;
               st.first_mismatch_dumped <- false;
-              (* One-time raw wire dump: reveals string vs number encoding. *)
+              (* One-time raw wire dump; reveals string vs number encoding. *)
               if (not st.snapshot_ok) && st.validated = 0
               then
                 Printf.printf
@@ -191,7 +191,7 @@ let handle_message json =
               Queue.add (Yojson.Safe.to_string entry) st.recent_deltas;
               if Queue.length st.recent_deltas > 40
               then Queue.pop st.recent_deltas |> ignore;
-              (* Sequence gap check like prod *)
+              (* Sequence-gap check as in production. *)
               let seq_opt =
                 Kraken.Kraken_orderbook_feed.int64_of_json (member "sequence" entry)
               in
@@ -207,9 +207,9 @@ let handle_message json =
            let asks_json = member "asks" entry in
            Kraken.Kraken_orderbook_feed.parse_and_apply_levels symbol st.bids bids_json;
            Kraken.Kraken_orderbook_feed.parse_and_apply_levels symbol st.asks asks_json;
-           (* HYPOTHESIS TEST: spec says truncate to subscribed depth after
-               EVERY update - out-of-scope levels are never removed via qty:0,
-               so retained ghosts corrupt the computed top-10 on removals. *)
+           (* Spec truncates to subscribed depth after every update:
+               out-of-scope levels are never removed via qty:0, so retained
+               ghosts corrupt the computed top-10 on removals. *)
            if Hashtbl.length st.bids > 10
            then Kraken.Kraken_orderbook_feed.truncate_hashtbl st.bids true 10;
            if Hashtbl.length st.asks > 10
@@ -234,7 +234,7 @@ let () =
   Random.self_init ();
   Logging.set_level Logging.INFO;
   Mirage_crypto_rng_unix.use_default ();
-  (* Mirror production: fetch real pair precision before any book processing. *)
+  (* Production setup: fetch real pair precision before book processing. *)
   Lwt_main.run (Kraken.Kraken_orderbook_feed.initialize symbols);
   Lwt_main.run
     (let open Lwt.Infix in

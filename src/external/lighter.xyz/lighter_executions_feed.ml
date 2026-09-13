@@ -165,7 +165,7 @@ let get_symbol_store symbol =
          | None ->
            let store =
              { events_buffer =
-                 (* exec bursts previously dropped events at 128 slots. *)
+                 (* Capacity sized for execution bursts. *)
                  RingBuffer.create 512
              ; open_orders = Hashtbl.create 32
              ; open_orders_cache = Atomic.make []
@@ -422,7 +422,7 @@ let process_account_orders_update json =
       try member "type" json |> to_string with
       | _ -> "unknown"
     in
-    (* Dump the raw payload at DEBUG for protocol debugging. *)
+    (* Protocol-debug dump of the raw payload. *)
     if Logging.will_log Logging.DEBUG section
     then (
       let json_str = Yojson.Safe.to_string json in
@@ -470,9 +470,9 @@ let process_account_orders_update json =
           List.concat_map
             (fun (_key, v) ->
                match v with
-               | `Assoc _ -> [ v ] (* Parse isolated object graph *)
-               | `List items -> items (* Parse standardized sequential array *)
-               | _ -> [] (* Prune unmatched unstructured variables *))
+               | `Assoc _ -> [ v ]
+               | `List items -> items
+               | _ -> [])
             pairs
         | `List items -> items
         | _ ->
@@ -668,9 +668,9 @@ let process_account_orders_update json =
                  | _ -> false
                in
                let now = Unix.gettimeofday () in
-               (* When the exchange assigns an order_index differing from our
-            client-id key, drop the stale client-id-keyed entry so tracking
-            does not diverge or double-report. *)
+               (* When the exchange order_index differs from the client-id
+            key, drop the stale client-id-keyed entry so tracking does not
+            diverge or double-report. *)
                let client_order_id =
                  try member "client_order_id" order_json |> to_string with
                  | _ -> ""
@@ -736,9 +736,8 @@ let process_account_orders_update json =
                     order_id
                     symbol
                     base_amount
-                    price;
-                  (* Publish the fill to the global event bus. *)
-                  let fill_value = filled_base_amount *. avg_price in
+                     price;
+                   let fill_value = filled_base_amount *. avg_price in
                   let maker_fee_rate =
                     match Dio_exchange.Exchange_intf.Registry.get "lighter" with
                     | Some (module Ex : Dio_exchange.Exchange_intf.S) ->

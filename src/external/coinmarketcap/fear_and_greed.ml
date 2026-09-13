@@ -1,15 +1,15 @@
 (** CoinMarketCap Fear and Greed Index client.
 
-    Fetches the latest index value via the CMC Pro API, caches it atomically
-    for process lifetime, and provides a linear interpolation utility for
-    mapping the index to configurable grid intervals.
+    Fetches the latest index value via the CMC Pro API and caches it atomically
+    for process lifetime; provides linear interpolation for mapping the index
+    to configurable grid intervals.
 
     Availability semantics: the cache holds ONLY genuinely fetched index
     values. Fallback values (missing API key, timeout, HTTP error, parse
     failure) are returned to the caller but never cached, so
-    [get_cached () = None] means "no live F&G signal" - never a neutral 50.
-    Callers that must not trade without a signal (the grid domains) use this
-    to withhold orders when neither the capital oracle nor F&G can size them. *)
+    [get_cached () = None] means "no live F&G signal", never a neutral 50.
+    Callers that must not trade without a signal (the grid domains) use this to
+    withhold orders when neither the capital oracle nor F&G can size them. *)
 
 open Lwt.Infix
 open Cohttp_lwt_unix
@@ -106,10 +106,9 @@ let fetch_and_cache_sync ?(fallback = 50.0) () =
           (Printexc.to_string exn);
         fallback
     in
-    (* Only a genuinely fetched index is cached: the fetch paths above cache
-       on success only, so an empty cache here means the fetch failed and the
-       caller received the fallback - it must not masquerade as a live
-       reading. *)
+    (* Only a genuinely fetched index is cached: the fetch paths above cache on
+       success only, so an empty cache here means the fetch failed and the
+       caller received the fallback; it must not masquerade as a live reading. *)
     if Atomic.get cached_value = None then fallback else value
 ;;
 
@@ -127,7 +126,7 @@ let worker_started = Atomic.make false
 let force_fetch_async ?(fallback = 50.0) () =
   if not (Atomic.get worker_started)
   then
-    (* Atomically ensure only one thread starts *)
+    (* Atomically ensure only one thread starts. *)
     if Atomic.compare_and_set worker_started false true
     then
       ignore
@@ -151,8 +150,8 @@ let force_fetch_async ?(fallback = 50.0) () =
   Atomic.set fetch_requested true
 ;;
 
-(** Linearly interpolates a grid value within [min_val, max_val] based on
-    the fear-and-greed index clamped to [0, 100]. *)
+(** Linearly interpolate a grid value in [min_val, max_val] from the
+    fear-and-greed index clamped to [0, 100]. *)
 let grid_value_for_fng ~grid_interval:(min_val, max_val) ~fear_and_greed =
   let fng = max 0.0 (min 100.0 fear_and_greed) in
   min_val +. (fng *. (max_val -. min_val) /. 100.0)

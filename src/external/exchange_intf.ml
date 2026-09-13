@@ -1,8 +1,8 @@
 (** Exchange interface definition.
 
-    Defines the canonical module signature [S] that all exchange backends must
-    implement, a shared [Types] module for order lifecycle and market data
-    records, and a [Registry] for dynamic exchange lookup at runtime. *)
+    Defines the canonical module signature [S] all exchange backends implement,
+    a shared [Types] module for order lifecycle and market data records, and a
+    [Registry] for dynamic exchange lookup at runtime. *)
 
 (** Shared types for order management, market data events, and retry
     configuration. Used uniformly across all exchange implementations. *)
@@ -126,19 +126,19 @@ module Types = struct
     ; avg_price : float (** Volume-weighted average fill price. *)
     ; timestamp : float (** Unix timestamp of the execution report. *)
     ; is_amended : bool
-      (** True when this event is an in-place amendment
-                                       confirmation (Kraken exec_type=amended), not a
-                                       genuine new-order acknowledgment. Domain workers
-                                       must skip handle_order_acknowledged for these. *)
+      (** True when this event is an in-place amendment confirmation
+                                       (Kraken exec_type=amended), not a genuine new-order
+                                       acknowledgment. Domain workers must skip
+                                       handle_order_acknowledged for these. *)
     ; cl_ord_id : string option
       (** Client order id when the venue provides one
                                        (Hyperliquid cloid, Lighter client_order_id). *)
     }
 
   (** Parameters controlling exponential backoff retry behavior.
-      Canonical definition lives in [Error_handling]; re-exported here
-      so exchange module signatures can reference [Types.retry_config]
-      without depending on [Error_handling] directly. *)
+      Canonical definition lives in [Error_handling]; re-exported here so
+      exchange module signatures can reference [Types.retry_config] without
+      depending on [Error_handling] directly. *)
   type retry_config = Error_handling.retry_config =
     { max_attempts : int (** Maximum number of attempts (including the initial). *)
     ; base_delay_ms : float (** Initial delay between retries, in milliseconds. *)
@@ -150,7 +150,7 @@ module Types = struct
   (* ---- Oracle data-layer types ----
      Shared with the capital oracle via [Oracle]; defined here so venue
      libraries can implement [Oracle.S] without depending on the oracle
-     library. [Oracle_types] aliases these (see oracle_types.ml). *)
+     library. [Oracle_types] aliases these. *)
 
   (** Historical daily OHLC bar (the oracle's data layer). One bar per
       session/date. *)
@@ -171,9 +171,9 @@ module Types = struct
     | Equity
 
   (* ---- Bar/date helpers ----
-     Shared with the oracle and external data clients (e.g. the Yahoo deep
-     history library) that must not depend on the oracle library. The oracle's
-     [Oracle_calendar] re-exports these, so its call sites are unchanged. *)
+     Shared with the oracle and external data clients (e.g. Yahoo) that must
+     not depend on the oracle library. The oracle's [Oracle_calendar]
+     re-exports these. *)
 
   (** Parse an ISO date (YYYY-MM-DD) into (year, month, day). *)
   let iso_ymd s =
@@ -184,9 +184,9 @@ module Types = struct
     y, m, d
   ;;
 
-  (** Days since 1970-01-01 of a civil (y, m, d) date. Exact integer arithmetic;
-      independent of timezone, DST and Unix.mktime. Valid for the proleptic
-      Gregorian calendar (all dates in use here are >= 1970). *)
+  (** Days since 1970-01-01 of a civil (y, m, d) date. Exact integer
+      arithmetic; independent of timezone, DST and Unix.mktime. Valid for the
+      proleptic Gregorian calendar (all dates here are >= 1970). *)
   let days_from_civil y m d =
     let y = if m <= 2 then y - 1 else y in
     let era = (if y >= 0 then y else y - 399) / 400 in
@@ -244,7 +244,7 @@ module Types = struct
   ;;
 end
 
-(** Module signature that every exchange backend must satisfy.
+(** Module signature every exchange backend satisfies.
 
     Covers order lifecycle operations (place, amend, cancel), synchronous
     market data accessors backed by ring buffers, position-based event feed
@@ -320,7 +320,8 @@ module type S = sig
   (** Return the current tradeable balance for [asset]. Returns [0.0] if unknown. *)
   val get_tradeable_balance : asset:string -> float
 
-  (** Return a fast path closure for fetching live tradeable balance of [asset] without lock acquisition overhead. *)
+  (** Return a fast path closure for fetching live tradeable balance of
+      [asset] without lock acquisition/hash lookup overhead. *)
   val get_tradeable_balance_fast : asset:string -> unit -> float
 
   (** Return a fast path closure for fetching the venue-authoritative
@@ -360,14 +361,15 @@ module type S = sig
 
   (** Return all open orders across all symbol stores whose symbol
       starts with [asset ^ "/"]. Used by the dashboard to surface orders
-      for non-strategy balance assets that may be stored under a different
-      symbol key than the one the dashboard constructs. *)
+      for non-strategy balance assets stored under a different symbol key
+      than the dashboard constructs. *)
   val get_all_orders_for_asset : asset:string -> Types.open_order list
 
   (* ---- Dynamic Subscription ---- *)
 
-  (** Dynamically subscribe additional symbols to the real-time orderbook feed.
-      Used to pipe top-of-book data into the central feed for non-active balance assets. *)
+  (** Dynamically subscribe additional symbols to the real-time orderbook
+      feed. Pipes top-of-book data into the central feed for non-active
+      balance assets. *)
   val subscribe_orderbook : symbols:string list -> unit Lwt.t
 
   (* ---- Ring buffer event feed consumption ---- *)
@@ -427,8 +429,8 @@ module type S = sig
     -> f:('a -> Types.open_order -> 'a)
     -> 'a
 
-  (** Fast path iterator that avoids creating Types.open_order intermediate records.
-      Yields primitive order values to the provided closure callback directly. *)
+  (** Fast path iterator that avoids creating Types.open_order intermediate
+      records. Yields primitive order values directly to the callback. *)
   val iter_open_orders_fast
     :  symbol:string
     -> (string -> float -> float -> string -> int option -> unit)
@@ -441,19 +443,23 @@ module type S = sig
       [sync_open_orders] scan when nothing has changed since the last scan. *)
   val get_open_orders_generation : symbol:string -> int
 
-  (** Return a fast path closure for fetching the current orderbook position without lock acquisition/hash lookup overhead. *)
+  (** Return a fast path closure for fetching the current orderbook position
+      without lock acquisition/hash lookup overhead. *)
   val get_orderbook_position_fast : symbol:string -> unit -> int
 
-  (** Return a fast path closure for fetching top-of-book data without hash lookup overhead. *)
+  (** Return a fast path closure for fetching top-of-book data without hash
+      lookup overhead. *)
   val get_top_of_book_fast
     :  symbol:string
     -> unit
     -> (float * float * float * float) option
 
-  (** Return a fast path closure for fetching the current execution feed position without hash lookup overhead. *)
+  (** Return a fast path closure for fetching the current execution feed
+      position without hash lookup overhead. *)
   val get_execution_feed_position_fast : symbol:string -> unit -> int
 
-  (** Return a fast path closure for checking if the execution feed has initial data without hash lookup overhead. *)
+  (** Return a fast path closure for checking if the execution feed has initial
+      data without hash lookup overhead. *)
   val has_execution_data_fast : symbol:string -> unit -> bool
 
   (* ---- Instrument metadata ---- *)
@@ -497,30 +503,30 @@ module Registry = struct
       no module has been registered under that name. *)
   let get name = Hashtbl.find_opt _exchanges name
 
-  (** Return all registered exchange names. Used by the dashboard to
-      enumerate balances across all exchanges, not just those with
-      configured trading strategies. *)
+  (** Return all registered exchange names. Used by the dashboard to enumerate
+      balances across all exchanges, not just those with configured trading
+      strategies. *)
   let get_all_names () =
     Hashtbl.fold (fun name _ acc -> name :: acc) _exchanges []
     |> List.sort_uniq String.compare
   ;;
 end
 
-(** Oracle data-venue interface: the contract the capital oracle needs from
-    an exchange beyond live trading - historical daily bars, session
-    calendars, fees, account balances and instrument metadata.
+(** Oracle data-venue interface: the contract the capital oracle needs from an
+    exchange beyond live trading - historical daily bars, session calendars,
+    fees, account balances and instrument metadata.
 
     Independent of the live-trading signature [S] above (which has no
-    historical-bars or calendar concept); a venue implements BOTH, or only
-    [S] if it does not participate in oracle modeling. The runtime registry
-    lives in [Oracle.Registry], mirroring [Registry] above.
+    historical-bars or calendar concept); a venue implements BOTH, or only [S]
+    if it does not participate in oracle modeling. The runtime registry lives
+    in [Oracle.Registry], mirroring [Registry] above.
 
-    Raw-bar contract: implementations return RAW source rows (any order);
-    the oracle sorts, de-duplicates and normalizes centrally
+    Raw-bar contract: implementations return RAW source rows (any order); the
+    oracle sorts, de-duplicates and normalizes centrally
     ([Oracle_calendar.normalize_bars] on every read, cache and direct fetch
-    alike), so a corrected normalization rule self-heals without a refetch
-    (same philosophy as the v2 history cache). Implementations may still
-    pre-clean (normalize is idempotent) when they need source-level logging. *)
+    alike), so a corrected normalization rule self-heals without a refetch.
+    Implementations may still pre-clean (normalize is idempotent) when they
+    need source-level logging. *)
 module Oracle = struct
   module type S = sig
     (** Human-readable venue name used as the registry key (e.g. "kraken"). *)
@@ -568,16 +574,16 @@ module Oracle = struct
     val init_instruments : testnet:bool -> symbols:string list -> unit Lwt.t
 
     (** One-shot snapshot from the venue's LIVE websocket-fed balance store as
-        (asset, available, total) triples, or [None] when the venue has no
-        live store or its store semantics do not match the oracle's REST
-        balance view. The oracle runtime prefers this (in-process websocket
-        data, no standalone HTTP round-trip) and falls back to
-        [fetch_balances] when it returns [None].
+        (asset, available, total) triples, or [None] when the venue has no live
+        store or its store semantics do not match the oracle's REST balance
+        view. The oracle runtime prefers this (in-process websocket data, no
+        standalone HTTP round-trip) and falls back to [fetch_balances] on
+        [None].
 
         Hyperliquid deliberately returns [None]: its live "USDC" store
-        aggregates the perp clearinghouse USDC with the spot wallet, while the
-        oracle pool counts spot capital only (perp margin is not grid
-        capital). REST spotClearinghouseState stays authoritative there. *)
+        aggregates perp clearinghouse USDC with the spot wallet, while the
+        oracle pool counts spot capital only (perp margin is not grid capital).
+        REST spotClearinghouseState stays authoritative there. *)
     val live_balances : unit -> (string * float * float) list option
 
     (** Default quote asset for symbols written without an explicit quote
@@ -594,10 +600,9 @@ module Oracle = struct
 
   (** Dynamic registry mapping venue names to their [(module S)]
       implementations, mirroring [Registry] above. A venue registers here
-      (typically from its own library at module load, see the
-      force-registration pattern in the oracle's [Oracle_venues]) to
-      participate in oracle modeling. [Hashtbl.replace] semantics: a later
-      registration overrides an earlier one under the same name. *)
+      (typically from its own library at module load) to participate in oracle
+      modeling. [Hashtbl.replace] semantics: a later registration overrides an
+      earlier one under the same name. *)
   module Registry = struct
     (** Internal hash table storing registered oracle-venue modules, keyed by
         [Oracle.S.name]. *)

@@ -1,18 +1,15 @@
 open Notty
 open Theme
 
-(** Recent Fills Feed Component.
-    Scrolls recent filled orders horizontally across the screen below the holdings.
-*)
+(** Recent fills feed: horizontally scrolling filled orders below the holdings. *)
 
 let local_fills : Snapshot.fill list ref = ref []
 let capacity = 10
 let initialized = ref false
 
-(** Merge engine fills into [local_fills]. On startup the engine seeds
-    historical fills into its ring buffer, so the list is non-empty from the
-    first snapshot. New live fills are detected by timestamp comparison and
-    prepended. *)
+(** Merge engine fills into [local_fills]. The first call seeds the single
+    most recent engine fill; later calls prepend fills newer than the newest
+    local timestamp, capped at [capacity]. *)
 let merge_engine_fills (engine_fills : Snapshot.fill list) =
   if not !initialized
   then (
@@ -49,7 +46,7 @@ let render_fills w (snapshot : Snapshot.t) =
   let fills = !local_fills in
   if fills = []
   then I.empty
-  else (* Build the ticker string chunks, one per fill. *)
+  else
     (
     let chunks =
       List.map
@@ -60,8 +57,7 @@ let render_fills w (snapshot : Snapshot.t) =
            let amount = f.amount in
            let price = f.fill_price in
            let timestamp = f.timestamp in
-           (* Format the time elapsed since the fill as a compact
-              duration. *)
+           (* Age buckets: < 60s -> seconds, < 1h -> minutes, else hours. *)
            let now = Unix.gettimeofday () in
            let diff = max 0.0 (now -. timestamp) in
            let time_str =

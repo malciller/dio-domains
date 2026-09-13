@@ -1,51 +1,39 @@
 (** Main-loop watchdog.
 
-    The engine's responsiveness lives and dies with the main domain's Lwt
-    event loop: every supervised WebSocket read loop, the order-processing
-    loop, the supervisor health monitor, the dashboard UDS server and the
-    memory reporter all run there, and every per-asset domain parks on an
-    [Exchange_wakeup] condition that only the main loop signals. A main
-    loop that wedges inside an unbounded blocking operation therefore
-    freezes the entire process - orders, prices, dashboard reconnect -
-    silently, because the health monitor itself lives on the frozen loop.
+    The main domain's Lwt event loop runs every supervised WebSocket read loop,
+    the order-processing loop, the supervisor health monitor, the dashboard UDS
+    server and the memory reporter, and is the only signaler of the
+    [Exchange_wakeup] conditions per-asset domains park on. A main loop wedged
+    in an unbounded blocking operation therefore freezes the whole process, and
+    the health monitor with it.
 
-    The watchdog is a native thread reading a beat timestamp that a
-    main-loop fiber refreshes every [beat_interval_s]. When no beat
-    arrives within [stall_threshold_s], the loop is presumed wedged:
+    A native thread reads a beat timestamp refreshed every [beat_interval_s] by a
+    main-loop fiber. If no beat arrives within [stall_threshold_s]:
 
-    1. A CRITICAL report is logged (the async writer thread still runs).
-    2. SIGABRT is raised to the process itself: the installed
-       fatal-signal handler prints heap diagnostics and a backtrace IF the
-       wedge is at the OCaml level. A wedge inside a blocking syscall
-       defers the handler on OCaml 5, so this is best-effort.
-    3. After [abort_grace_s] the process is force-exited (exit 2) so the
-       process supervisor restarts a live engine instead of a frozen one
-       holding resting orders it can no longer amend or cancel.
+    1. Log CRITICAL (the async writer thread still runs).
+    2. Raise SIGABRT: the fatal-signal handler prints heap diagnostics and a
+       backtrace only if the wedge is at the OCaml level; a wedge inside a
+       blocking syscall defers the handler on OCaml 5. Best-effort.
+    3. After [abort_grace_s], force-exit (status 2) so the process supervisor
+       restarts a live engine rather than one holding unamendable orders.
 
-    The threshold is deliberately generous (twelve missed beats): a healthy
-    loop beats every [beat_interval_s] with no observable jitter, major GC
-    pauses are sub-second, and several sequential bounded TLS operations
-    (each now capped at ~30s) still stay under it. The point is to convert
-    an indefinite silent freeze into a bounded, visible, restartable one.
-
-    Set [DIO_WATCHDOG_OFF] to disable the thread entirely (e.g. when
-    attaching a debugger to a suspect process for repeated inspection). *)
+    The threshold is generous (twelve missed beats): major GC pauses are
+    sub-second and several sequential bounded TLS operations stay under it.
+    [DIO_WATCHDOG_OFF] disables the thread (e.g. for debugger attachment). *)
 
 let section = "watchdog"
 
-(** Main-loop beat cadence and the staleness threshold that triggers the
-    stall response. *)
+(** Beat cadence and staleness threshold (both seconds). *)
 let beat_interval_s = 5.0
 
 let stall_threshold_s = 60.0
 
-(** Grace period between raising SIGABRT and the force-exit, giving the
-    fatal-signal handler time to flush its diagnostics. *)
+(** Seconds between SIGABRT and force-exit, allowing the fatal-signal handler
+    to flush diagnostics. *)
 let abort_grace_s = 3.0
 
-(** Last main-loop beat, as a Unix timestamp. Only the beat fiber writes;
-    the watchdog thread only reads. Seeded at [start] so the counter starts
-    from process launch. *)
+(** Last main-loop beat as a Unix timestamp. Written only by the beat fiber,
+    read only by the watchdog thread. Seeded at [start]. *)
 let last_beat = Atomic.make 0.0
 
 (** Latched once per stall so a wedged loop produces exactly one abort. *)
@@ -63,11 +51,10 @@ let is_stalled ~(last_beat : float) ~(now : float) : bool =
   now -. last_beat > stall_threshold_s
 ;;
 
-(** The main-loop side: refresh the beat every [beat_interval_s]. Must run
-    on the main domain's Lwt scheduler (schedule with [Lwt.async]); if that
-    scheduler wedges, beats stop - which is exactly the signal the
-    watchdog thread waits for. The nested [Lwt_main.run] calls during
-    engine startup pump this fiber too, so startup cannot false-trigger. *)
+(** Main-loop side: refresh the beat every [beat_interval_s]. MUST run on the
+    main domain's Lwt scheduler ([Lwt.async]); if it wedges, beats stop, which
+    is the signal the watchdog waits for. Nested [Lwt_main.run] calls during
+    startup pump this fiber, so startup cannot false-trigger. *)
 let beat_loop () : unit Lwt.t =
   let open Lwt.Infix in
   let rec loop () =
@@ -98,9 +85,9 @@ let watchdog_loop () =
         (now -. last)
         stall_threshold_s;
       Thread.delay 0.5;
-      (* Best effort: the fatal-signal handler prints diagnostics only if
-         the wedge is at the OCaml level; a wedge inside a blocking syscall
-         defers the handler. The force-exit below is the guaranteed action. *)
+      (* Best effort: the fatal-signal handler prints diagnostics only for an
+         OCaml-level wedge; a blocking syscall defers it. The force-exit below
+         is the guaranteed action. *)
       (try Unix.kill (Unix.getpid ()) Sys.sigabrt with
        | _ -> ());
       Thread.delay abort_grace_s;
@@ -111,8 +98,8 @@ let watchdog_loop () =
   done
 ;;
 
-(** Idempotent: seeds the beat and spawns the watchdog thread unless
-    disabled via [DIO_WATCHDOG_OFF]. *)
+(** Idempotent: seed the beat and spawn the watchdog thread unless
+    [DIO_WATCHDOG_OFF] is set. *)
 let start () : unit =
   if Atomic.compare_and_set started false true
   then (

@@ -1,13 +1,11 @@
-(* Jacobs Ladder Strategy
+(* Jacobs Ladder strategy.
 
-   Grid trading system with a single-buy, multi-sell order model.
-   Delegates to modular sub-components in jacobs_ladder/ for:
-   - Types & state management (Jacobs_ladder_types)
-   - Exchange configuration & precision helpers (Jacobs_ladder_config)
-   - Reservation & accumulation (Jacobs_ladder_reservation)
-   - Order construction & buffer dispatch (Jacobs_ladder_orders)
-   - Strategy execution loop (Jacobs_ladder_execution)
-   - Lifecycle event handlers (Jacobs_ladder_events) *)
+   Grid trading with a single-buy, multi-sell order model. Sub-components
+   under jacobs_ladder/: types and state (Jacobs_ladder_types), exchange
+   configuration and precision (Jacobs_ladder_config), reservation and
+   accumulation (Jacobs_ladder_reservation), order construction and dispatch
+   (Jacobs_ladder_orders), execution loop (Jacobs_ladder_execution), lifecycle
+   event handlers (Jacobs_ladder_events). *)
 
 open Strategy_common
 
@@ -125,34 +123,28 @@ let execute_strategy = Jacobs_ladder_execution.execute_strategy
 (* Priority-reclamation step (pure decision).                          *)
 (*                                                                     *)
 (* The capital oracle's reclamation pass asks a domain to cancel its    *)
-(* resting buy(s) (decision.reclaim_capital) so the committed capital  *)
-(* returns to the account pool for a higher-priority asset. The domain *)
-(* issues the cancel through the normal order pipeline. A cancel is a  *)
-(* one-shot network op that can fail silently (dispatch dropped while  *)
-(* the exchange connection flapped, the exchange rejected it, the ring *)
-(* buffer was full): the cancellation is latched here so it is NOT     *)
-(* re-issued every cycle, but it MUST be retried while the reclaim     *)
-(* decision persists and eligible buys still sit in the store -        *)
-(* otherwise a single failed attempt leaves the account permanently    *)
-(* stuck: the reclaimed asset stays paused (the decision only clears   *)
-(* once the store's committed value drops to zero) and the priority    *)
-(* asset never resumes on capital that was never actually released.    *)
+(* resting buys (decision.reclaim_capital) so committed capital returns *)
+(* to the account pool. A cancel is a one-shot network op that can fail *)
+(* silently (dropped dispatch, exchange reject, full ring buffer), so   *)
+(* the cancellation is latched to avoid re-issuing it every cycle, but   *)
+(* it must be retried while the reclaim decision persists and eligible   *)
+(* buys remain in the store - otherwise one failed attempt leaves the    *)
+(* asset paused permanently and the priority asset never resumes on      *)
+(* capital that was never released.                                     *)
 (* ------------------------------------------------------------------ *)
 
-(** The domain's per-cycle reclaim action, decided purely from the latch
-    state and the exchange store's buy orders:
-    - [Reclaim_rearm]: no buy at all remains in the store - the cancel landed
-      (or never needed). The domain re-arms its latch so a later reclaim
-      decision re-triggers cleanly, and the capital oracle is woken to
-      re-size with the released capital.
-    - [Reclaim_cancel n]: [n] cancellable buys remain and the cancel may be
-      issued (none is in flight, or the retry interval elapsed after a failed
+(** Per-cycle reclaim action, decided from the latch state and the exchange
+    store's buy orders:
+    - [Reclaim_rearm]: no buy remains in the store; the cancel landed (or was
+      unnecessary). The domain re-arms its latch and wakes the capital oracle
+      to re-size on the released capital.
+    - [Reclaim_cancel n]: [n] cancellable buys remain and a cancel may be
+      issued (none in flight, or the retry interval elapsed after a failed
       attempt). The domain pushes cancels for every eligible buy and re-arms
       the latch.
     - [Reclaim_deferred]: a cancel is already in flight (issued within the
-      retry interval) or the only remaining buys are mid-amendment (the
-      exchange rejects canceling an order being amended) - wait, do not spam
-      the exchange. *)
+      retry interval) or only mid-amendment buys remain (the exchange rejects
+      canceling an order being amended). Wait; do not spam the exchange. *)
 type reclaim_step =
   | Reclaim_rearm
   | Reclaim_cancel of int
@@ -190,10 +182,10 @@ let cleanup_pending_cancellation = Jacobs_ladder_events.cleanup_pending_cancella
 let enqueue_event = Jacobs_ladder_events.enqueue_event
 let drain_events = Jacobs_ladder_events.drain_events
 
-(** Reads up to [max_orders] orders from the ringbuffer for processing. *)
+(** Reads up to [max_orders] orders from the ringbuffer. *)
 let get_pending_orders max_orders = LockFreeQueue.read_batch order_buffer max_orders
 
-(** Initializes the strategy module. *)
+(** Seeds the process RNG. *)
 let init () = Random.self_init ()
 
 (** Strategy module interface. *)
@@ -273,12 +265,12 @@ module Strategy = struct
     if state.startup_replay
     then (
       state.startup_replay <- false;
-      (* Startup replay skips history fills BY DESIGN, and every skip bumps
-         skipped_fill_streak. Without this reset the replayed count leaks
-         into live trading: a strategy that replayed >= 50 historical fills
-         boots with the streak already at the self-heal threshold, so the
-         first ordinary post-replay duplicate would trip the CRITICAL
-         self-heal and wipe a perfectly valid last_fill_oid high-water mark. *)
+      (* Startup replay skips history fills by design, and every skip bumps
+         skipped_fill_streak. Reset it so the replayed count does not leak into
+         live trading: a strategy that replayed >= 50 historical fills would
+         otherwise boot with the streak at the self-heal threshold, and the
+         first post-replay duplicate would trip the CRITICAL self-heal and wipe
+         the last_fill_oid high-water mark. *)
       state.skipped_fill_streak <- 0;
       Logging.debug_f
         ~section
@@ -293,9 +285,9 @@ module Strategy = struct
       then (
         (* last_fill_oid was None (fresh strategy or absent state file): the
            first-batch fills were all treated as pre-restart history and are
-           NOT accounted. Surface this loudly - a fill that genuinely
-           happened after restart (order placed pre-restart, filled during
-           the down window) is silently excluded from inventory/P&L. *)
+           not accounted. Surface this loudly - a fill that genuinely happened
+           after restart (order placed pre-restart, filled in the down window)
+           is silently excluded from inventory/P&L. *)
         Logging.warn_f
           ~section
           "Startup replay for %s had no persisted last_fill_oid; bootstrapping to \

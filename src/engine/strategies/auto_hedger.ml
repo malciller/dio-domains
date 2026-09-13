@@ -1,18 +1,17 @@
 (**
    Single-short-per-cycle auto-hedging module.
 
-   Intercepts spot fills on Hyperliquid and manages one perp short per grid cycle:
+   Intercepts Hyperliquid spot fills and manages one perp short per grid cycle:
 
-   - Spot buy -> open a perp short only if no hedge is currently open.
-   - Spot sell -> close the entire open hedge short.
+   - Spot buy: open a perp short only if no hedge is open.
+   - Spot sell: close the entire open hedge short.
 
-   During drawdowns the single short (opened at the first buy price) rides the
-   full move, accumulating unrealized profit. Additional buys do not stack more
-   shorts. On grid recovery sell, the short is closed, realizing the hedge
-   profit and freeing the slot for the next cycle.
+   Additional buys do not stack shorts; the single short rides the full move
+   during drawdowns. On a grid recovery sell the short is closed, realizing the
+   hedge profit and freeing the slot for the next cycle.
 
    Places IOC limit orders at perp top-of-book (best bid for sells, best ask
-   for buys) to minimize slippage. Falls back to market orders when orderbook
+   for buys) to minimize slippage; falls back to market orders when orderbook
    data is unavailable.
 *)
 
@@ -224,7 +223,7 @@ let handle_order_filled testnet exchange hedge_symbol side filled_qty fill_price
           fill_price)
 ;;
 
-(** Reset hedge state. Retained for test compatibility. *)
+(** Reset internal hedge state to closed. *)
 let reset_state () =
   Mutex.lock hedge_mutex;
   hedge_open := false;

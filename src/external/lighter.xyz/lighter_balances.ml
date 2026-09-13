@@ -312,8 +312,7 @@ let process_asset_balances json =
 
 (** Processes user_stats to maintain USDC balance for unified accounts.
     In unified/cross-margin mode, USDC collateral lives at the account level
-    (reported via user_stats), not in the assets array (account_all_assets).
-    This handler writes collateral to the USDC balance store to keep it current. *)
+    (reported via user_stats), not in the assets array (account_all_assets). *)
 let process_user_stats json =
   let open Yojson.Safe.Util in
   let stats =
@@ -357,7 +356,7 @@ let process_user_stats json =
         a;
       notify_ready ())
     else (
-      (* Don't overwrite a known positive balance with zero *)
+      (* Do not overwrite a known positive balance with zero. *)
       let existing = get_balance "USDC" in
       if existing <= 0.0
       then (
@@ -432,8 +431,9 @@ let process_market_data json =
 let last_refresh_request = Atomic.make 0.0
 
 (** Triggers an asynchronous REST balance fetch to recover stale USDC values.
-    Debounced to max once per 2 seconds to avoid API rate limits.
-    Called when sell fills are detected but the WS balance feed hasn't updated. *)
+    Debounced to at most once per 2 seconds to avoid API rate limits.
+    Called when sell fills are detected but the WS balance feed has not
+    updated. *)
 let request_balance_refresh () =
   let now = Unix.gettimeofday () in
   let last = Atomic.get last_refresh_request in

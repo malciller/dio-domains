@@ -1,6 +1,5 @@
-(** Connection supervisor. Thin orchestrator that wires together the
-    submodules and re-exports the public API consumed by main.ml and
-    the dashboard.
+(** Connection supervisor. Thin orchestrator wiring the submodules and
+    re-exporting the public API consumed by main.ml and the dashboard.
 
     Submodules:
     - Supervisor_connection: lifecycle, circuit breaker, shutdown
@@ -10,8 +9,8 @@
 
 open Lwt.Infix
 
-(* Re-export public API from Supervisor_connection so callers
-   (main.ml, dashboard) can continue using Supervisor.X directly. *)
+(* Re-export the public API from Supervisor_connection so callers (main.ml,
+   dashboard) can use Supervisor.X directly. *)
 
 let shutdown_requested = Supervisor_connection.shutdown_requested
 let interruptible_sleep = Supervisor_connection.interruptible_sleep
@@ -42,26 +41,21 @@ let section = "supervisor"
 
 (** Entry point: starts the monitor loop, non-active asset monitor, and
     order processing loop, then runs [initialize_feeds] synchronously.
-    Returns enriched trading configs with fee data. *)
+    Returns trading configs enriched with fee data. *)
 let start_monitoring () =
   Logging.info ~section "Starting connection supervisor";
-  (* Launch health monitor on tick event bus *)
   Supervisor_health.monitor_loop ();
-  (* Launch non-active asset ticker subscription loop *)
   Supervisor_health.monitor_non_active_assets ();
-  (* Launch order processing loop *)
   Supervisor_orders.order_processing_loop ();
-  (* Run feed initialization synchronously via Lwt_main.run *)
   let configs_with_fees, _auth_token =
     Lwt_main.run (Supervisor_feeds.initialize_feeds ())
   in
   configs_with_fees
 ;;
 
-(** Initializes the Order_executor module. Retrieves the stored auth
-    token or generates a fresh one if absent. *)
+(** Initializes [Order_executor]. Retrieves the stored auth token, or
+    generates and stores a fresh one if absent. *)
 let start_order_executor () : unit Lwt.t =
-  (* Retrieve or regenerate auth token *)
   let _auth_token =
     match Token_store.get () with
     | Some token -> token
@@ -78,28 +72,26 @@ let start_order_executor () : unit Lwt.t =
 (* Capital-oracle as a supervised module.                             *)
 (* ------------------------------------------------------------------ *)
 
-(** Capital-oracle runtime (wrapped library: explicit alias avoids opening the
-    whole Dio_oracle namespace). *)
+(** Capital-oracle runtime (explicit alias so the whole [Dio_oracle]
+    namespace is not opened). *)
 module Oracle_runtime = Dio_oracle.Oracle_runtime
 
-(** Heartbeat interval for the oracle connection's liveness ticker: well under
-    the health monitor's 60s passive-data timeout so a healthy loop (which can
-    legitimately sleep the full refresh cadence between passes) never reads as
-    dead, while a truly wedged loop is still flagged and restarted. *)
+(** Heartbeat interval for the oracle connection's liveness ticker. Kept well
+    under the health monitor's 60s passive-data timeout so a healthy loop
+    (which may sleep a full refresh cadence between passes) is not flagged as
+    dead, while a truly wedged loop is still restarted. *)
 let oracle_heartbeat_interval = 10.0
 
-(** The oracle's supervised connect_fn, run through the standard supervisor
+(** The oracle's supervised [connect_fn], run through the standard supervisor
     machinery ([start_async], circuit breaker, health monitor, auto-restart):
 
-    - Transitions the connection to Connected as soon as the loop is
-      scheduled (the loop itself can take minutes on a slow first pass; the
-      meaningful liveness is "the loop is running", not "a pass finished").
-    - Keeps the connection heartbeat alive while the loop runs: a liveness
-      ticker every [oracle_heartbeat_interval] seconds, plus a heartbeat on
-      every published pass (via the composed [on_publish]).
-    - Resolves when the oracle loop ends - normally on engine shutdown
-      (graceful), or as a failure that the health monitor picks up and
-      restarts with exponential backoff. *)
+    - Sets state [Connected] as soon as the loop is scheduled: liveness means
+      "loop running", not "pass finished".
+    - Keeps the heartbeat alive while the loop runs: a liveness ticker every
+      [oracle_heartbeat_interval] seconds and a heartbeat on every published
+      pass (via the composed [on_publish]).
+    - Resolves when the oracle loop ends: normally on engine shutdown, or as a
+      failure the health monitor restarts with exponential backoff. *)
 let oracle_connect_fn
       (conn : Supervisor_types.supervised_connection)
       ~(config : Oracle_runtime.runtime_config)
@@ -111,11 +103,10 @@ let oracle_connect_fn
   set_state conn Connected;
   update_data_heartbeat conn;
   (* Heartbeat alongside the oracle loop. The periodic tail is spawned via
-     [Lwt.async] to sever the [Forward] chain (a raw recursive [>>=] adds a
-     node per interval for the loop's whole lifetime), while [liveness] stays
-     a cancellable task so [Lwt.pick] stops it as soon as the oracle loop
-     ends. Behaviour matches the previous chained version: sleep first, then
-     update; resolve on shutdown or cancellation. *)
+     [Lwt.async] to sever the [Forward] chain (a raw recursive [>>=] adds one
+     node per interval over the loop's lifetime); [liveness] stays a
+     cancellable task so [Lwt.pick] stops it when the oracle loop ends. Sleep
+     first, then update; resolve on shutdown or cancellation. *)
   let heartbeat_stopped = Atomic.make false in
   let liveness, liveness_wakener = Lwt.task () in
   Lwt.on_cancel liveness (fun () -> Atomic.set heartbeat_stopped true);
@@ -146,20 +137,19 @@ let oracle_connect_fn
   Lwt.async heartbeat;
   Lwt.pick [ Oracle_runtime.run_loop ~config ~trading ~on_publish (); liveness ]
   >>= fun () ->
-  (* The loop ended: normal when either shutdown flag is set (the engine's
-     supervisor shutdown sets both); abnormal otherwise - surface it as a
-     connection failure so the health monitor restarts the oracle. *)
+  (* Loop ended: normal when either shutdown flag is set (engine shutdown
+     sets both); otherwise surface a failure so the health monitor restarts
+     the oracle. *)
   if Atomic.get shutdown_requested || Oracle_runtime.is_stopped ()
   then Lwt.return_unit
   else Lwt.fail (Failure "capital-oracle loop ended unexpectedly")
 ;;
 
-(** Start the capital oracle as a supervised module: registered in the
-    connection registry like every other module ("oracle"), started through
-    the standard supervisor machinery, heartbeated on liveness ticks and
-    published passes, and auto-restarted by the health monitor if the loop
-    ever dies. [on_publish] is composed with the oracle's own pass hook - the
-    engine uses it to wake trading domains; the supervisor adds the
+(** Starts the capital oracle as a supervised module: registered as "oracle",
+    started through the standard supervisor machinery, heartbeated on liveness
+    ticks and published passes, and auto-restarted by the health monitor if
+    the loop dies. [on_publish] is composed with the oracle's own pass hook:
+    the engine uses it to wake trading domains; the supervisor adds the
     connection heartbeat. *)
 let start_oracle
       ~(config : Oracle_runtime.runtime_config)

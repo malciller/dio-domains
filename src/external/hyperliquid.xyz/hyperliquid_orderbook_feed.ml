@@ -5,8 +5,8 @@ open Lwt.Infix
 
 let section = "hyperliquid_orderbook"
 
-(* Raw l2Book frames are large, and 16 slots let a burst lap the dashboard
-   reader in one tick; 64 absorbs typical bursts. *)
+(* Raw l2Book frames are large; 64 slots absorb bursts that would otherwise
+   lap the dashboard reader in one tick. *)
 let ring_buffer_size = 64
 
 type level =
@@ -24,16 +24,11 @@ type orderbook =
 (** Lock-free SPSC ring buffer for orderbook snapshots. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Mutable top-of-book cache. Updated atomically (single writer from the WS
-    processing thread) and read lock-free from domain workers. Avoids the
-    full ring-buffer read + array bounds check + record field extraction
-    pipeline on the latency-critical path.
-
-    L4: the cache is an IMMUTABLE snapshot record held in an [Atomic.t]. The
-    WS thread publishes a fresh record with one [Atomic.set] (all four fields
-    + validity travel together); readers do one [Atomic.get]. This eliminates
-    the torn-read data race that existed when the fields were written
-    separately under the OCaml 5 memory model. *)
+(** Top-of-book cache. Single WS-thread writer publishes an immutable snapshot
+    record with one [Atomic.set]; domain workers read it with one [Atomic.get].
+    Avoids the ring-buffer read + bounds-check + field-extraction pipeline on
+    the latency-critical path and prevents torn reads under the OCaml 5 memory
+    model. *)
 type tob_cache =
   { bid_px : float
   ; bid_sz : float
@@ -52,10 +47,9 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Cached coin-to-symbol resolution table. Populated during `initialize` to
-    avoid `Hyperliquid_instruments_feed.resolve_symbol` + `Hashtbl.mem` scanning
-    on every incoming tick. Only the WS processing thread writes (at init);
-    domain workers never access this table. *)
+(** Coin-to-symbol resolution cache, populated at [initialize] to avoid
+    [resolve_symbol] + [Hashtbl.mem] per tick. Only the WS thread writes (at
+    init); domain workers never access it. *)
 let coin_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 32
 
 (** Returns the store for [symbol], creating one if absent. Uses double-checked
@@ -247,13 +241,10 @@ let get_bids_asks msg =
   search 0
 ;;
 
-(** Zero-allocation depth-1 top-of-book parser. Extracts exactly the first
-    bid and first ask {px, sz} directly from the raw JSON string without
-    building any intermediate list or array. Returns (bid_px, bid_sz,
-    ask_px, ask_sz, true) on success or (0, 0, 0, 0, false) on failure.
-
-    Layout: "levels":[[{bid levels}],[{ask levels}]]
-    We find the first {px, sz} in each sub-array. *)
+(** Zero-allocation depth-1 top-of-book parser: extracts the first bid and ask
+    {px, sz} from the raw JSON without intermediate collections. Returns
+    [(bid_px, bid_sz, ask_px, ask_sz, true)] on success, [(0, 0, 0, 0, false)]
+    on failure. Layout: "levels":[[bids],[asks]]. *)
 let parse_tob_fast msg =
   let px_key = "\"px\":\"" in
   let sz_key = "\"sz\":\"" in
