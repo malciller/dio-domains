@@ -1,13 +1,16 @@
 name: grant-image-access
 
 # When a maintainer applies the "access-approved" label to an image-access
-# request, this records the grant, posts the pull instructions, and closes the
-# issue.
+# request, this posts the pull instructions for the requester, assigns the
+# issue to the maintainer as a reminder to grant access, and closes it.
 #
-# GitHub does not expose an API to grant access to a package scoped to a
-# personal account (only organization-scoped packages can be granted
-# programmatically), so the actual invite is a one-click manual step in the
-# package settings. Everything around it is automated here.
+# GitHub issues have no private notes, so the maintainer-only steps are kept
+# out of the issue comment and go to the workflow run summary plus the
+# assignment notification instead.
+#
+# GitHub has no API to grant access to a package scoped to a personal account
+# (only organization-scoped packages can be granted programmatically), so the
+# invite is a one-click manual step in the package settings.
 
 on:
   issues:
@@ -24,16 +27,10 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
+      MAINTAINER: ${{ github.repository_owner }}
       ISSUE_NUMBER: ${{ github.event.issue.number }}
       ISSUE_BODY: ${{ github.event.issue.body }}
     steps:
-      - name: Ensure result label exists
-        run: |
-          gh label create access-granted \
-            --color 0E8A16 \
-            --description "Image access approved and instructions posted" \
-            --force >/dev/null 2>&1 || true
-
       - name: Extract requested username
         id: who
         run: |
@@ -65,14 +62,13 @@ jobs:
           esac
 
           gh issue comment "$ISSUE_NUMBER" --body-file - <<EOF
-          Approved for: @$username
+          Approved for @$username. A maintainer is adding your account; the image
+          will pull once that is done.
 
-          Maintainer step (one click, required):
-          1. Open the package: https://github.com/users/malciller/packages/container/dio-domains/settings
-          2. Under "Manage access", click "Invite people", enter \`$username\`, and grant the **Read** role.
+          To pull it:
 
-          User step:
-          1. Create a personal access token (classic) with the \`read:packages\` scope.
+          1. Create a personal access token (classic) with the \`read:packages\` scope:
+             https://github.com/settings/tokens/new?scopes=read:packages
           2. Log in to the registry:
 
              \`\`\`sh
@@ -85,8 +81,22 @@ jobs:
              docker pull ghcr.io/malciller/dio-domains:latest
              \`\`\`
 
-          Full instructions: docs/ACCESS.md
+          Then follow docs/DEPLOYMENT.md. If the pull is denied, your account has
+          not been added yet; wait a few minutes and try again.
           EOF
 
-          gh issue edit "$ISSUE_NUMBER" --add-label "access-granted"
+          gh issue edit "$ISSUE_NUMBER" --add-assignee "$MAINTAINER"
           gh issue close "$ISSUE_NUMBER" --reason completed
+
+      - name: Maintainer reminder
+        env:
+          REQ_USER: ${{ steps.who.outputs.username }}
+        run: |
+          {
+            echo "### Maintainer: grant package access"
+            echo
+            echo "Approved request from \`$REQ_USER\` (issue #$ISSUE_NUMBER)."
+            echo
+            echo "1. Open https://github.com/users/malciller/packages/container/dio-domains/settings"
+            echo "2. Manage access -> Invite people -> \`$REQ_USER\` -> Read"
+          } >> "$GITHUB_STEP_SUMMARY"
