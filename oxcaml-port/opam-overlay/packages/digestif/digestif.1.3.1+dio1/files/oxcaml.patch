@@ -1,0 +1,64 @@
+--- a/src-ocaml/dune
++++ b/src-ocaml/dune
+@@ -1,13 +1,5 @@
+-(library
+- (name digestif_ocaml)
+- (public_name digestif.ocaml)
+- (implements digestif)
+- (libraries eqaf)
+- (private_modules xor digestif_eq digestif_conv digestif_by digestif_bi
+-   baijiu_whirlpool baijiu_sha1 baijiu_sha256 baijiu_sha384 baijiu_sha224
+-   baijiu_sha512 baijiu_sha3_224 baijiu_sha256 baijiu_sha3_384
+-   baijiu_sha3_512 baijiu_rmd160 baijiu_md5 baijiu_blake2s baijiu_blake2b)
+- (flags
+-  (:standard -no-keep-locs)))
+-
+-(copy_files# ../src/*.ml)
++; OxCaml overlay: the optional pure-OCaml backend (digestif.ocaml, implemented
++; by the baijiu_*.ml modules) does not compile under OxCaml's mode system.
++; The default C backend (digestif.c, selected by src/dune's
++; default_implementation) is used instead and builds under OxCaml. Consumers
++; request the virtual library "digestif", so no API or output changes.
+--- a/test/ocaml/dune
++++ b/test/ocaml/dune
+@@ -1,7 +1,9 @@
++; OxCaml overlay: digestif.ocaml (pure-OCaml backend) is not built; exercise
++; the default digestif.c backend instead.
+ (executable
+  (name test)
+  (modules test)
+- (libraries fmt alcotest digestif.ocaml))
++ (libraries fmt alcotest digestif.c))
+ 
+ (rule
+  (alias runtest)
+@@ -24,7 +26,7 @@
+   (or
+    (= %{architecture} "arm64")
+    (= %{architecture} "amd64")))
+- (libraries fmt alcotest digestif.ocaml))
++ (libraries fmt alcotest digestif.c))
+ 
+ (rule
+  (alias runtest)
+--- a/fuzz/dune
++++ b/fuzz/dune
+@@ -12,7 +12,7 @@
+ (executable
+  (name fuzz_ocaml)
+  (modules fuzz_ocaml)
+- (libraries digestif.ocaml crowbar))
++ (libraries digestif.c crowbar))
+ 
+ (rule
+  (alias runtest)
+--- a/fuzz/ocaml/dune
++++ b/fuzz/ocaml/dune
+@@ -1,6 +1,6 @@
+ (executable
+  (name fuzz)
+- (libraries digestif.ocaml crowbar))
++ (libraries digestif.c crowbar))
+ 
+ (rule
+  (copy# ../fuzz.ml fuzz.ml))

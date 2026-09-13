@@ -1,0 +1,22 @@
+(library
+ (name runtime_compat)
+ (public_name dio.runtime_compat)
+ (modules runtime_compat)
+ (libraries unix))
+
+; OxCaml provides race-safe replacements under [Sys.Safe]/[Domain.Safe] and
+; emits [unsafe_multidomain] alerts for the stdlib originals. Plain OCaml has
+; neither the alerts nor the Safe modules, so we generate runtime_compat.ml from
+; the matching source at build time.
+; The discriminator is the OxCaml toolchain, which exports DIO_OXCAML=1 from the
+; Docker build — NOT [flambda], because the default OCaml 5.2 switch (used by
+; GitHub CI) is also non-flambda but has no Sys.Safe.
+(rule
+ (targets runtime_compat.ml)
+ (enabled_if (= %{env:DIO_OXCAML=0} "1"))
+ (action (copy runtime_compat_oxcaml.ml runtime_compat.ml)))
+
+(rule
+ (targets runtime_compat.ml)
+ (enabled_if (<> %{env:DIO_OXCAML=0} "1"))
+ (action (copy runtime_compat_stdlib.ml runtime_compat.ml)))
