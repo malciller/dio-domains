@@ -20,6 +20,10 @@ Unix domain socket.
 The container image is private; request access first
 ([docs/ACCESS.md](docs/ACCESS.md)).
 
+New to this? [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) is a step-by-step
+walkthrough: make a folder, log in, pull the starter files out of the image, and
+fill in `config.json` and `.env`. The short version:
+
 The image ships the example config, env template, and compose file. Pull them
 out first (no repository clone needed):
 

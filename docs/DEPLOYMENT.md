@@ -4,37 +4,185 @@ The prebuilt image is private; request access per [ACCESS.md](ACCESS.md).
 
 ## Run the prebuilt image
 
-The image contains only the compiled binaries and their runtime libraries. It
-**ships without a configuration**, so the engine refuses to start until you
-mount one. The example config, the env template, and `compose.yaml` are inside
-the image; you do not need the repository.
+The image contains only the compiled programs. It **ships without a
+configuration**, so it will not start until you give it two files: `config.json`
+(what to trade) and `.env` (your exchange keys). Both templates, plus the
+`compose.yaml` used to run it, are inside the image, so you do not need the
+repository.
 
-1. Request access and log in ([ACCESS.md](ACCESS.md)).
-2. Extract the templates and edit them:
+You need Docker installed and a terminal. Run each block below and read the note
+after it; if something does not look right, stop and check.
 
-   ```sh
-   IMAGE=ghcr.io/malciller/dio-domains:latest
-   docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE \
-     /usr/share/doc/dio/config.example.json /out/config.json
-   docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE \
-     /usr/share/doc/dio/.env.example /out/.env
-   docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE \
-     /usr/share/doc/dio/compose.yaml /out/compose.yaml
-   # edit config.json and .env for your venues and instruments
-   ```
+### 1. Make a folder to keep everything in
 
-3. Start the engine and attach the dashboard:
+```sh
+mkdir -p ~/dio
+cd ~/dio
+```
 
-   ```sh
-   docker compose up -d
-   docker compose run --rm dashboard
-   ```
+`~` means your home folder. All the files for dio live in `~/dio`, and this is
+where you run the commands from now on. Every time you open a new terminal,
+start with `cd ~/dio`.
+
+### 2. Log in and download the image
+
+Use the personal access token from your access-request issue (the classic token
+with the `read:packages` scope). Paste it when asked for a password:
+
+```sh
+echo "$GHCR_PAT" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+docker pull ghcr.io/malciller/dio-domains:latest
+```
+
+You should see `Login Succeeded` and, after the download, a final line naming
+`ghcr.io/malciller/dio-domains:latest`. If login fails, the token is wrong,
+expired, or lacks the `read:packages` scope.
+
+### 3. Copy the starter files out of the image
+
+These three commands write `config.json`, `.env`, and `compose.yaml` into the
+folder you are in:
+
+```sh
+IMAGE=ghcr.io/malciller/dio-domains:latest
+docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE \
+  /usr/share/doc/dio/config.example.json /out/config.json
+docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE \
+  /usr/share/doc/dio/.env.example /out/.env
+docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE \
+  /usr/share/doc/dio/compose.yaml /out/compose.yaml
+```
+
+Check they are there with `ls -a`; you should see `config.json`, `.env`,
+`compose.yaml` (the leading dot on `.env` is normal).
+
+### 4. Fill in `.env` with your exchange keys
+
+`.env` is a plain text file of `NAME=value` lines. Rules: one per line, no
+spaces around the `=`, no quotation marks, and you only fill in the exchange(s)
+you actually use. Leave the others blank.
+
+Open it in a simple editor:
+
+```sh
+nano .env
+```
+
+Arrow down to the matching lines and type your keys after the `=`. For example,
+to trade on Hyperliquid, fill in:
+
+```
+HYPERLIQUID_WALLET_ADDRESS=0xYourAccountAddress
+HYPERLIQUID_PRIVATE_KEY=0xYourSigningKey
+```
+
+Alpaca uses `ALPACA_API_KEY` / `ALPACA_API_SECRET`; Kraken uses
+`KRAKEN_API_KEY` / `KRAKEN_API_SECRET`. The full list with what each one is for
+is in [CONFIGURATION.md](CONFIGURATION.md#environment-variables).
+
+In `nano`: type your value, then save with **Ctrl-O**, press **Enter**, and exit
+with **Ctrl-X**. (Any text editor works; `nano` is just the easiest in a
+terminal.) Your keys are private — never paste this file into an issue or chat.
+
+### 5. Edit `config.json` to say what to trade
+
+`config.json` is JSON. The engine is strict: a misspelled or unknown key stops
+it from starting, which is deliberate. Open it:
+
+```sh
+nano config.json
+```
+
+The safest first run is a testnet. Replace the whole file with this, which
+trades a tiny amount on Hyperliquid's testnet:
+
+```json
+{
+  "trading": [
+    {
+      "symbol": "BTC/USDC",
+      "exchange": "hyperliquid",
+      "qty": "0.0001",
+      "grid_interval": [0.1, 0.5],
+      "strategy": "Ladder",
+      "testnet": true
+    }
+  ]
+}
+```
+
+What the fields mean:
+
+- `symbol` — the instrument, in that exchange's format (`BTC/USDC` on
+  Hyperliquid, `BTC/USD` on Kraken, `AAPL` on Alpaca/IBKR).
+- `exchange` — `kraken`, `hyperliquid`, `lighter`, `ibkr`, or `alpaca`. It must
+  match the keys you filled in `.env`.
+- `qty` — order size, in the base asset, written as a string.
+- `grid_interval` — two numbers, the smallest and largest gap (in percent)
+  between orders. The oracle picks within this range.
+- `strategy` — `Ladder` or `MM` (market maker).
+- `testnet` — `true` routes to the venue's sandbox/paper account. **Kraken has
+  no testnet**, so a Kraken entry is always live.
+
+Every other option (`sell_mult`, `accumulation_buffer`, `data_feed`, fees,
+oracle tuning) is documented in [CONFIGURATION.md](CONFIGURATION.md). For Alpaca
+paper trading instead, swap in:
+
+```json
+{ "symbol": "SPY", "exchange": "alpaca", "qty": "0.01",
+  "grid_interval": [0.1, 0.5], "strategy": "Ladder",
+  "testnet": true, "data_feed": "iex" }
+```
+
+JSON gotchas: strings need double quotes, entries are separated by commas, there
+is no comma after the last entry, and comments are not allowed.
+
+### 6. Start it
+
+```sh
+docker compose up -d
+```
+
+The `-d` means "in the background". Watch it start up:
+
+```sh
+docker compose logs -f engine
+```
+
+You want to see it connect to the exchange and begin working. Press **Ctrl-C**
+to stop watching (this does *not* stop the engine). A denied API key or a
+config error shows up here. To attach the dashboard, in a second terminal:
+
+```sh
+cd ~/dio
+docker compose run --rm dashboard
+```
+
+Detach from the dashboard with **Ctrl-p** then **Ctrl-q** (it keeps running).
+
+### 7. Stop
+
+```sh
+docker compose down
+```
+
+This stops the containers. Your state (accumulated position bookkeeping) stays
+in the `dio-data` volume; add `-v` to delete that too.
 
 `compose.yaml` mounts `config.json` and `.env` read-only, keeps state in the
 `dio-data` volume, shares the `dio-sock` volume for the dashboard's Unix domain
 socket, and applies the same hardening as a manual run: read-only root
 filesystem, all capabilities dropped, `no-new-privileges`, and a `noexec` tmpfs
 at `/tmp`. The engine exposes metrics on port `8080`.
+
+### If it does not start
+
+- It exits immediately and the log names a config key — that key is misspelled,
+  wrongly nested, or not valid for that exchange. Fix `config.json`.
+- `docker compose up` fails with a name or port conflict — another `dio_engine`
+  container is running, or port 8080 is taken. Stop the other container.
+- The log shows an authentication error — the keys in `.env` are wrong, belong to
+  a different account, or you set `testnet` differently from the keys you pasted.
 
 ### Manual `docker run`
 
