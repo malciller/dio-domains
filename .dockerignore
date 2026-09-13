@@ -2,10 +2,14 @@
 _build
 _opam
 
-# Dev tooling / analytics (not needed for production)
+# Dev tooling / analytics / docs (not needed for production)
 utils
 reference
 test
+docs
+README.md
+compose.yaml
+config.example.json
 
 # Python artifacts
 __pycache__

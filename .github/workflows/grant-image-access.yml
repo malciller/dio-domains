@@ -1,0 +1,92 @@
+name: grant-image-access
+
+# When a maintainer applies the "access-approved" label to an image-access
+# request, this records the grant, posts the pull instructions, and closes the
+# issue.
+#
+# GitHub does not expose an API to grant access to a package scoped to a
+# personal account (only organization-scoped packages can be granted
+# programmatically), so the actual invite is a one-click manual step in the
+# package settings. Everything around it is automated here.
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  grant:
+    if: github.event.label.name == 'access-approved'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_BODY: ${{ github.event.issue.body }}
+    steps:
+      - name: Ensure result label exists
+        run: |
+          gh label create access-granted \
+            --color 0E8A16 \
+            --description "Image access approved and instructions posted" \
+            --force >/dev/null 2>&1 || true
+
+      - name: Extract requested username
+        id: who
+        run: |
+          username=$(python3 -c 'import os,re; b=os.environ.get("ISSUE_BODY",""); m=re.search(r"###\s*GitHub username\s*\n+([^\n]+)", b); print((m.group(1).strip() if m else "").lstrip("@"))')
+          if [ -z "$username" ]; then
+            echo "::error::could not parse a GitHub username from the issue body"
+            exit 1
+          fi
+          case "$username" in
+            *[!A-Za-z0-9-]*)
+              echo "::error::unexpected username: $username"
+              exit 1
+              ;;
+          esac
+          echo "username=$username" >> "$GITHUB_OUTPUT"
+
+      - name: Post instructions and close
+        env:
+          # Passed through the environment rather than interpolated into the
+          # script, so a crafted username cannot inject shell syntax.
+          REQ_USER: ${{ steps.who.outputs.username }}
+        run: |
+          username="$REQ_USER"
+          case "$username" in
+            *[!A-Za-z0-9-]*|'')
+              echo "::error::unexpected username: $username"
+              exit 1
+              ;;
+          esac
+
+          gh issue comment "$ISSUE_NUMBER" --body-file - <<EOF
+          Approved for: @$username
+
+          Maintainer step (one click, required):
+          1. Open the package: https://github.com/users/malciller/packages/container/dio-domains/settings
+          2. Under "Manage access", click "Invite people", enter \`$username\`, and grant the **Read** role.
+
+          User step:
+          1. Create a personal access token (classic) with the \`read:packages\` scope.
+          2. Log in to the registry:
+
+             \`\`\`sh
+             echo "\$GHCR_PAT" | docker login ghcr.io -u $username --password-stdin
+             \`\`\`
+
+          3. Pull the image:
+
+             \`\`\`sh
+             docker pull ghcr.io/malciller/dio-domains:latest
+             \`\`\`
+
+          Full instructions: docs/ACCESS.md
+          EOF
+
+          gh issue edit "$ISSUE_NUMBER" --add-label "access-granted"
+          gh issue close "$ISSUE_NUMBER" --reason completed

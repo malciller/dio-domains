@@ -41,6 +41,13 @@ ENV DIO_OXCAML=1
 RUN --mount=type=cache,target=/home/opam/.cache/dune,uid=1000,gid=1000 \
     eval $(opam env) && dune build -j $(nproc) --profile=release bin/main.exe bin/dashboard.exe
 
+# 2a. Record the exact installed opam package set (name, version, license) so the
+#     released image carries a manifest of every OCaml library it links. Copied
+#     into the runtime stage below.
+RUN eval $(opam env) \
+    && opam list --installed --columns=name,version,license: 2>/dev/null \
+       | sort -f > /app/opam-packages.txt
+
 # ==============================================================================
 # STAGE 2 — Runtime (minimal)
 # ==============================================================================
@@ -70,6 +77,16 @@ COPY --from=builder /app/_build/default/bin/dashboard.exe /usr/local/bin/dio-das
 # 5a. Copy Lighter signer shared library (Go-compiled .so for linux/amd64)
 COPY --from=builder /app/lighter-signer-linux-amd64.so /app/lighter-signer-linux-amd64.so
 
+# 5b. Entrypoint guard. Refuses to start the engine when no config is mounted,
+#     instead of failing later inside the config parser.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+
+# 5c. Third-party license notices. Required by the licenses of the bundled
+#     libraries; the opam manifest is generated from the exact build switch.
+COPY THIRD_PARTY_LICENSES third_party/ /usr/share/licenses/dio/
+COPY --from=builder /app/opam-packages.txt /usr/share/licenses/dio/opam-packages.txt
+
 # 6. Setup non-root system user and runtime directories
 RUN groupadd -g 1000 dio && useradd -u 1000 -g dio -s /bin/false dio \
     && mkdir -p /var/run/dio /app/data \
@@ -95,5 +112,6 @@ EXPOSE 8080
 # 11. Run as non-root user
 USER dio
 
-# 12. Default command
+# 12. Entrypoint guard + default command
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["dio"]
