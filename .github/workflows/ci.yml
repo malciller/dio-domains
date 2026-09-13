@@ -142,15 +142,26 @@ jobs:
       # Tag the builder stage for tests (it has opam + dune; the final runtime
       # stage is a minimal Ubuntu without a toolchain), and the full image
       # builds the release binaries.
+      #
+      # These run on the `default` (Docker daemon) builder on purpose. On
+      # GitHub-hosted runners `setup-buildx-action` makes a docker-container
+      # builder current, and `build-push-action`'s `load: true` exports the base
+      # image into the Docker daemon's image store — not the container builder's
+      # own store. Building here with the container builder cannot see the base
+      # image, so `FROM dio-oxcaml-base:5.2.0minus40` fails to resolve locally,
+      # BuildKit falls back to a registry reference (`docker.io/library/...`)
+      # and the pull is denied. `--builder default` shares the daemon's image
+      # store (this is also the builder the self-hosted Gitea runner uses, where
+      # `setup-buildx-action` is skipped), so the base image resolves on both.
       - name: Build engine image
         run: |
-          DOCKER_BUILDKIT=1 docker buildx build \
+          DOCKER_BUILDKIT=1 docker buildx build --builder default \
             --progress=plain \
             --build-arg "DIO_BASE_IMAGE=$DIO_BASE_IMAGE" \
             --target builder \
             -t dio-oxcaml-test \
             --load .
-          DOCKER_BUILDKIT=1 docker buildx build \
+          DOCKER_BUILDKIT=1 docker buildx build --builder default \
             --build-arg "DIO_BASE_IMAGE=$DIO_BASE_IMAGE" \
             -t dio-oxcaml-app \
             --load .
