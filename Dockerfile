@@ -44,7 +44,7 @@ RUN --mount=type=cache,target=/home/opam/.cache/dune,uid=1000,gid=1000 \
 # ==============================================================================
 # STAGE 2 — Runtime (minimal)
 # ==============================================================================
-FROM ubuntu:22.04 AS runtime
+FROM ubuntu:22.04@sha256:829f6df217bcbae2b371026e81711d1a787c61b2967ad09d015063663ebafbf7 AS runtime
 
 # 3. Runtime shared libraries only (no compilers, no opam, no git)
 RUN apt-get update && apt-get install -y --no-install-recommends \
