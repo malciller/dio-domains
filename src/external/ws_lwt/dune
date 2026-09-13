@@ -13,18 +13,18 @@
   ipaddr.unix))
 
 ; Compatibility shim for [Conduit_lwt_unix.default_ctx], whose type changed from
-; [ctx Lazy.t] (Conduit >= 3) to [ctx] (Conduit < 3, used by the OxCaml bundle).
-; The discriminator is NOT the compiler: both the GitHub default OCaml 5.2 switch
-; and the OxCaml switch report [flambda = false], but they ship different Conduit
-; majors. The OxCaml build runs inside the Docker image, which exports
-; DIO_OXCAML=1; every other toolchain (local flambda, GitHub default) uses Conduit
-; >= 3. Select the implementation from that explicit flag.
+; [ctx Lazy.t] (Conduit >= 3) to [ctx] (Conduit < 3, as bundled with the OxCaml
+; toolchain). The discriminator is the compiler variant, not an environment
+; variable: OxCaml identifies itself in [%{ocaml_version}] (e.g. "5.2.0+ox",
+; the version pinned in Dockerfile.base) while classic OCaml reports a plain
+; version (e.g. "5.2.0"). If the pinned OxCaml compiler version is bumped,
+; update the string here to match.
 (rule
  (targets ctx.ml)
- (enabled_if (= %{env:DIO_OXCAML=0} "1"))
+ (enabled_if (= %{ocaml_version} "5.2.0+ox"))
  (action (copy ctx_direct.ml ctx.ml)))
 
 (rule
  (targets ctx.ml)
- (enabled_if (<> %{env:DIO_OXCAML=0} "1"))
+ (enabled_if (<> %{ocaml_version} "5.2.0+ox"))
  (action (copy ctx_lazy.ml ctx.ml)))
