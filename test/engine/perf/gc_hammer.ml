@@ -1,3 +1,14 @@
+(* OxCaml marks [Domain.spawn] as [do_not_spawn_domains] (unbounded domains
+   degrade GC) and [unsafe_multidomain] (use [Domain.Safe.spawn]). This is a
+   standalone GC latency benchmark: it deliberately runs a fixed, small set of
+   short-lived worker domains, each with its own heap, to measure the
+   stop-the-world effect of concurrent allocation. That is the behaviour under
+   test, and [Multicore] (the recommended replacement) does not exist on the
+   classic toolchain this benchmark also builds under, so the alerts are
+   acknowledged rather than rewriting the test. *)
+[@@@alert "-unsafe_multidomain"]
+[@@@alert "-do_not_spawn_domains"]
+
 module LP = Latency_profiler
 
 let setup_huge_heap id =

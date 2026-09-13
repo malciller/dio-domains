@@ -4,7 +4,7 @@
  (libraries
   yojson
   base64
-  digestif
+  digestif.c
   lwt
   lwt.unix
   logging
