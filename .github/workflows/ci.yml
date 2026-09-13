@@ -89,7 +89,7 @@ jobs:
     # Dockerfile.base builds the OxCaml compiler + all opam deps (slow, changes
     # rarely), and Dockerfile builds the engine on top of it (fast). The base
     # image is cached between CI runs so day-to-day builds never recompile the
-    # compiler. See OXCAML_PORT.md.
+    # compiler.
     #
     # Requires a runner with Docker and >= 16 GB RAM for the first (uncached)
     # base build: the OxCaml compiler bootstrap OOMs at 8 GB. On the
@@ -169,7 +169,7 @@ jobs:
       - name: Run test suite under OxCaml
         # `.dockerignore` excludes test/, so bind-mount it into the image for
         # the test run. Treats `Alert` output as a failure so the zero-alert
-        # invariant from OXCAML_PORT.md is enforced by CI.
+        # invariant is enforced by CI.
         run: |
           set -o pipefail
           docker run --rm \

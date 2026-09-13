@@ -73,7 +73,7 @@ RUN eval $(opam env) \
     && opam list --installed --short | grep -qi 'oxcaml' \
     && ocamlopt -config-var version
 
-# 3c. Register the local patch overlay (see oxcaml-port/opam-overlay/README.md).
+# 3c. Register the local patch overlay.
 #     dio-ox is given rank 2 and the OxCaml repo rank 1, so dio-ox outranks the
 #     default repo: a `+dioN` patch then wins over the unpatched release of the
 #     same version, while `+ox` packages from the OxCaml repo still resolve.
@@ -90,8 +90,8 @@ COPY --chown=opam:opam dio.opam dune-project ./
 #    5.9.1+ox, built against an older ppxlib AST (fails with "Pexp_let expects
 #    4 argument(s)"); 6.0.0+ox is matched to ppxlib 0.33.0+ox. Pinned here rather
 #    than in dio.opam because the same constraint on the classic toolchain forces
-#    ppxlib >= 0.36, which conflicts with conduit-lwt-unix < 3 (see OXCAML_PORT.md
-#    WS2b). The compiler version is fixed at switch creation (3a), not here, so
+#    ppxlib >= 0.36, which conflicts with conduit-lwt-unix < 3. The compiler
+#    version is fixed at switch creation (3a), not here, so
 #    this layer never recompiles the compiler.
 RUN --mount=type=cache,target=/home/opam/.opam/download-cache,uid=1000,gid=1000 \
     eval $(opam env) \
