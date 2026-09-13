@@ -5,11 +5,9 @@ open Alpaca_types
 
 let section = "alpaca_rest"
 
-(** Alpaca has no retry layer of its own (the executor now delegates all
-    retries to the exchange modules, a single policy). Connection-level HTTP
-    exceptions are retried here with a short backoff so transient network
-    failures don't fail the order; exchange-level rejections (HTTP 4xx) are
-    returned to the caller untouched. *)
+(** Retry policy: connection-class HTTP exceptions are retried with a short
+    backoff; HTTP 4xx venue rejections return to the caller untouched. The
+    executor delegates all retries to the exchange modules. *)
 let retry_http_exceptions ~f =
   Error_handling.retry_with_backoff
     ~section
@@ -36,15 +34,12 @@ let make_headers () =
 (** Records an Alpaca REST round trip in the "alpaca" venue profiler. *)
 let record_rest_span span = Network_latency.record_rest "alpaca" span
 
-(** Deadline for every REST round trip (connect + request + response).
-
-    Alpaca's TLS transport occasionally dies without a TCP-level close (the
-    "SSL connection() error: error:00:000000" family); without a deadline the
-    in-flight request hangs inside the kernel read until the venue's side of
-    the socket gives up - observed at 16+ minutes. [Lwt_unix.with_timeout]
-    cancels the request on expiry, which closes the underlying connection fd
-    and unblocks the wedged read; the raised [Lwt_unix.Timeout] classifies
-    as [Timeout] and is retried by [retry_http_exceptions]. *)
+(** Deadline for every REST round trip (connect + request + response), 30s.
+    Alpaca's TLS transport occasionally dies without a TCP close, leaving the
+    in-flight read wedged until the venue times out (observed 16+ min).
+    [Lwt_unix.with_timeout] cancels on expiry and closes the fd; the raised
+    [Lwt_unix.Timeout] is classified [Timeout] and retried by
+    [retry_http_exceptions]. *)
 let rest_timeout_s = 30.0
 
 let json_to_float = function
@@ -102,20 +97,17 @@ let parse_order_json json =
   }
 ;;
 
-(** Compute the effective time-in-force and extended-hours eligibility for an
-    order. Returns (tif_str, mark_extended).
+(** Effective time-in-force and extended-hours eligibility. Returns
+    [(tif_str, mark_extended)].
 
-    The requested time-in-force passes through HONESTLY - there is no
-    virtual-GTC downgrade. Fractional equity orders are forced to [day]
-    (a hard Alpaca constraint); everything else keeps the requested TIF,
-    defaulting to [gtc]. In extended sessions a [gtc] limit order requires
-    GTC-for-extended enablement on the Alpaca account - if it is not
-    enabled, the exchange rejects the request and that surfaces as an order
-    error instead of a silent 8:00 PM ET cancellation masquerading as GTC.
+    Fractional equity orders are forced to [day] (Alpaca constraint); others
+    keep the requested TIF, defaulting to [gtc]. A [gtc] limit order in an
+    extended session requires GTC-for-extended enablement, else the venue
+    rejects.
 
-    [mark_extended] only attaches the [extended_hours] flag: non-crypto
-    limit orders when extended trading is both configured and the market is
-    in an extended session. Crypto (24/7) is never marked eligible. *)
+    [mark_extended] attaches [extended_hours] for non-crypto limit orders when
+    extended trading is configured and the session is extended. Crypto never
+    eligible. *)
 let effective_tif_and_extended
       ~is_crypto
       ~is_fractional
@@ -146,14 +138,9 @@ let effective_tif_and_extended
   tif_str, mark_extended
 ;;
 
-(* Alpaca equity tick rules: prices at or above $1.00 trade on penny
-   increments; sub-penny ($0.0001) precision is only valid below $1.00.
-   Out-of-band limit prices are rejected with HTTP 422 ("sub-penny increment
-   does not fulfill minimum pricing criteria"), so round to the venue-valid
-   tick at this submission boundary - grid ladders computed from finer price
-   increments then land within half a cent of the intended level instead of
-   failing outright. Alpaca accepts penny-precision prices on its crypto
-   pairs too, so one rule serves both. *)
+(* Alpaca tick rule: >= $1.00 quotes in $0.01 increments; $0.0001 precision
+   only below $1.00. Out-of-band limits are rejected HTTP 422, so round to the
+   venue tick at submission. Applies to crypto too. *)
 let round_limit_price (price : float) =
   if Float.is_nan price || Float.is_infinite price
   then price
@@ -184,9 +171,9 @@ let place_order
     | Some b -> b
     | None -> !Config.extended_hours
   in
-  (* Session-aware: outside the regular session (pre/after-market, overnight, or
-     closed) orders must be day + extended_hours to execute in the current
-     session; during regular hours the requested TIF is preserved. *)
+  (* Session-aware: outside regular hours (pre/after-market, overnight, closed)
+     orders use day + extended_hours; during regular hours the requested TIF is
+     preserved. *)
   let in_extended_session =
     (not is_crypto) && not (Alpaca_market_hours.is_regular_market_open ())
   in
@@ -295,8 +282,8 @@ let place_order
            Logging.error_f ~section "Place order failed HTTP %d: %s" status_code body_str;
            Lwt.return (Error (Printf.sprintf "HTTP %d: %s" status_code body_str))))
       (fun exn ->
-         (* Connection-class exceptions are re-raised so the retry layer
-              above handles them; anything else converts to an Error. *)
+         (* Connection/timeout exceptions re-raise for the retry layer; others
+              become an Error. *)
          let exn_str = Printexc.to_string exn in
          match Error_handling.classify exn_str with
          | Error_handling.Connection | Error_handling.Timeout -> Lwt.fail exn

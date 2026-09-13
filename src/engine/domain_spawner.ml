@@ -1,46 +1,37 @@
-(* OxCaml marks [Domain.spawn] as [do_not_spawn_domains] because an unbounded
-   number of domains degrades GC. This module deliberately spawns a bounded,
-   supervised set of long-lived per-asset domains (see [spawn_supervised_domains])
-   and tracks their count; it does not use [Multicore]. The alert is therefore
-   acknowledged here rather than forcing an architectural change. *)
+(* [Domain.spawn] is marked [do_not_spawn_domains] because unbounded domains
+   degrade GC. This module spawns a bounded, supervised set of long-lived
+   per-asset domains; the alert is acknowledged here. *)
 [@@@alert "-unsafe_multidomain"]
 [@@@alert "-do_not_spawn_domains"]
 
 open Config
 module Fear_and_greed = Cmc.Fear_and_greed
 
-(* Capital-oracle runtime (wrapped library: explicit alias avoids opening the
-   whole Dio_oracle namespace). *)
+(* Capital-oracle runtime; explicit alias avoids opening Dio_oracle. *)
 module Oracle_runtime = Dio_oracle.Oracle_runtime
 module Oracle_types = Dio_oracle.Oracle_types
 
-(* Exchange interface and types *)
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
 let section = "domain_spawner"
 
-(** [Gc.quick_stat] allocates ~24 words and costs ~0.3us. It used to be sampled
-    1-in-4 measured cycles to amortize that, but that meant the reported
-    window-max cycle usually had no GC suffix, hiding whether a spike was a
-    collection landing in the span (exactly the case a ~600-word phase timing at
-    ~200us points to). Now every measured cycle captures its GC delta: at
-    single-digit cycles/s per domain the added allocation is negligible, and the
-    max cycle always carries the cause. *)
+(** Sampling mask for the per-cycle [Gc.quick_stat] capture, which allocates
+    ~24 words and costs ~0.3us. [0] samples every measured cycle so the
+    window-max cycle always carries its GC cause; at single-digit cycles/s per
+    domain the added allocation is negligible. *)
 let gc_sample_mask = 0
 
-(** A quote-balance snapshot older than this is not authoritative: buy
-    placement against an under-funded stale snapshot is still attempted (the
-    exchange's verdict is the truth); a FRESH snapshot that cannot fund the
-    buy is skipped outright. Exchanges without freshness tracking report
-    unknown age, which is treated as stale (previous behavior). *)
+(** Quote-balance age, in seconds, above which a snapshot is not authoritative.
+    Stale snapshot: an under-funded buy is still attempted (the exchange's
+    verdict rules). Fresh snapshot: an unfunded buy is skipped. Unknown age
+    (no freshness tracking) is treated as stale. *)
 let stale_balance_age_seconds = 60.0
 
-(** Crypto vs equity for F&G blending, mirroring the capital oracle's own
-    rule (Oracle_tasks.calendar_kind_of_exchange): crypto assets blend the
-    Fear & Greed signal into their sizing; equities are sized by the capital
-    oracle alone (pure oracle) and never take F&G values - neither for the
-    grid interval/qty nor as a startup signal. *)
+(** True for crypto exchanges, mirroring the capital oracle's rule
+    (Oracle_tasks.calendar_kind_of_exchange). Crypto assets blend Fear & Greed
+    into sizing; equities are sized by the oracle alone and never consume F&G
+    values. *)
 let is_crypto_exchange = function
   | "hyperliquid" | "kraken" -> true
   | _ -> false
@@ -68,8 +59,8 @@ let registry_mutex = Mutex.create ()
 let shutdown_requested = Atomic.make false
 
 (** Per-symbol latency profiler cache. Persists across domain restarts so
-    profiler objects (each ~800KB) are allocated once per symbol rather than
-    on every asset_domain_worker invocation. *)
+    ~800KB profiler objects are allocated once per symbol, not per
+    asset_domain_worker invocation. *)
 type domain_profilers =
   { prof_ob : Latency_profiler.t
   ; prof_exec : Latency_profiler.t
@@ -107,12 +98,10 @@ let get_domain_profilers symbol =
   profs
 ;;
 
-(** Emit at most one INFO line per completed internal latency window, only
-    when a stage recorded a sample at or above [threshold_us]. Keeps the log
-    silent on healthy windows (no baseline every 5s) while pointing straight at
-    the stage that needs smoothing to reach the per-system latency ceiling.
-    [cycle]'s cause is appended to the shared [Latency_profiler.spike_message]
-    output as the worst-cycle continuation line. *)
+(** Emits at most one INFO line per completed internal latency window, and only
+    when a stage recorded a sample at or above [threshold_us]. [cycle]'s cause is
+    appended to the [Latency_profiler.spike_message] output as the worst-cycle
+    continuation line. *)
 let log_latency_window ~key ~window_seconds ~threshold_us ~ob ~exec ~prep ~strategy ~cycle
   =
   match
@@ -137,11 +126,9 @@ let asset_domain_worker
   Random.self_init ();
   (* Fetch exchange fee schedule at domain startup *)
   let asset_with_fees = fee_fetcher asset in
-  (* Resolve accumulation_buffer via Fear & Greed - every venue: Kraken runs
-     the same persistence-layer reserved_base accrual as the rest (see
-     jacobs_ladder_config.kraken_config). Same no-default rule: only a live
-     F&G reading resolves it; without one the grid does not place orders
-     anyway. *)
+  (* Resolves accumulation_buffer from Fear & Greed on every venue (Kraken runs
+     the same reserved_base accrual; see jacobs_ladder_config.kraken_config).
+     Only a live F&G reading resolves it; without one the grid places no orders. *)
   let fng_accumulation_buffer () =
     let exch_id =
       Dio_exchange.Exchange_intf.Types.exchange_of_string asset_with_fees.exchange
@@ -196,72 +183,65 @@ let asset_domain_worker
     let tob_asize = ref nan in
     (* Event-driven flag: true when new data warrants a strategy execution *)
     let should_execute_strategy = ref true in
-    (* Startup gate: blocks strategy execution until execution events from
-         the initial snapshot have been consumed via the ring buffer, ensuring
-         handle_order_acknowledged restores order state (last_buy_order_id, etc.)
-         before any new orders are placed. Applies to ALL exchanges. *)
+    (* Startup gate: blocks strategy execution until the initial snapshot's
+         execution events have been consumed, so handle_order_acknowledged
+         restores order state (last_buy_order_id, etc.) before new placements.
+         Applies to all exchanges. *)
     let exec_ready = ref false in
-    (* Set after the first exec position check. Acts as a fallback to open the
+    (* Set after the first exec position check; fallback that opens the
          exec_ready gate for assets with no open orders (empty snapshot). *)
     let exec_checked = ref false in
     let latency_active = ref false in
     let exec_ready_cycle = ref 0 in
     let open_orders_dirty = ref true in
-    (* the per-cycle oracle decision lookup is cached against the publish
-       generation, so idle cycles (no new pass) do zero decision work. *)
+    (* Per-cycle oracle decision lookup is cached against the publish
+       generation, so idle cycles do no decision work. *)
     let oracle_gen_cached = ref (-1) in
     let oracle_decision_cached = ref None in
-    (* Initialize strategy configuration refs based on strategy type.
-       The capital-oracle runtime publishes a per-asset decision (qty, the
-       blended grid_interval, active) to a lock-free snapshot; while a
-       decision exists the oracle's blended qty/gi win - F&G enters that blend
-       inside the oracle (parameter_components), it is never re-derived as a
-       competing value here. *)
+    (* Strategy config refs are initialized per strategy type. The capital-oracle
+       runtime publishes a per-asset decision (qty, blended grid_interval,
+       active) to a lock-free snapshot; while a decision exists, the oracle's
+       blended qty/gi win. F&G enters that blend inside the oracle
+       (parameter_components), never re-derived here. *)
     let baseline_price = ref None in
-    (* None until a real F&G value is seen: a missing index means "no live F&G
-       signal" and the per-cycle re-evaluation is skipped, not neutralized. *)
+    (* [None] until a real F&G value is seen: a missing index means no live F&G
+       signal; the per-cycle re-evaluation is skipped, not neutralized. *)
     let last_known_fng = ref None in
     let oracle_decision_at_startup =
       Oracle_runtime.decision_for
         ~exchange:asset_with_fees.exchange
         ~symbol:asset_with_fees.symbol
     in
-    (* Tracks the last applied oracle halt state so the per-cycle block only
-         logs on active<->inactive transitions. Initialized from the startup
-         decision (an asset born inactive starts quiet). *)
+    (* Last applied oracle halt state, so the per-cycle block logs only on
+         active<->inactive transitions. Initialized from the startup decision. *)
     let oracle_halted_prev =
       ref
         (match oracle_decision_at_startup with
          | Some d -> not d.active
          | None -> false)
     in
-    (* Cascade cancel state (cancellation cascade): a decision with
-       [cancel_resting_buys] asks this domain to cancel its resting buy(s)
-       so the committed capital returns to the venue pool for a
-       higher-priority strategy. The cancel is a network op that can fail
-       silently (dispatch dropped on a connection flap, exchange rejection,
-       ring-buffer full), so it is NOT issued every cycle -
-       [reclaim_cancel_issued] latches it with the timestamp
-       [reclaim_cancel_at] - but it MUST be retried while the cascade
-       decision persists and eligible buys still sit in the store. The latch
-       re-arms the moment the store no longer shows an eligible buy (the
-       cancel landed) OR the decision stops being a cascade; see
-       [Dio_strategies.Jacobs_ladder.reclaim_step]. Without the retry, a
-       single failed cancel leaves the pool permanently short: the starved
-       strategy stays paused and never resumes on capital that was never
-       actually released. *)
+    (* Cascade cancel state: a decision with [cancel_resting_buys] asks this
+       domain to cancel its resting buys so committed capital returns to the
+       venue pool for a higher-priority strategy. The cancel is a network op
+       that can fail silently (dropped dispatch, exchange rejection, full ring
+       buffer), so it is latched by [reclaim_cancel_issued]/[reclaim_cancel_at]
+       rather than issued every cycle, and retried while the decision persists
+       and eligible buys remain. The latch re-arms when the store shows no
+       eligible buy (cancel landed) or the decision stops being a cascade; see
+       [Dio_strategies.Jacobs_ladder.reclaim_step]. Without the retry a single
+       failed cancel leaves the pool permanently short. *)
     let reclaim_cancel_issued = ref false in
     let reclaim_cancel_at = ref 0.0 in
     let reclaim_retry_seconds = 15.0 in
-    (* One-shot warning: the startup-window-elapsed withhold causes fire at
-       most once per domain (see the closed-gate branch below). *)
+    (* One-shot warning: startup-window-elapsed withhold messages fire at most
+       once per domain (see the closed-gate branch below). *)
     let no_signal_warned = ref false in
-    (* At startup the grid strategy asset is pre-materialized from an ACTIVE
-       capital-oracle decision only. With none (no decision yet, or an
-       INACTIVE one) the ref starts None and the startup gate below stays
-       closed: there is no fallback sizing path, so the BUY leg places nothing
-       until the oracle publishes. The decision handler in the loop
-       materializes an INACTIVE asset too, so its sell leg runs under halt. *)
+    (* At startup the grid asset is pre-materialized only from an ACTIVE
+       capital-oracle decision. With none (no decision or an INACTIVE one) the
+       ref starts [None] and the startup gate stays closed: no fallback sizing
+       exists, so the BUY leg places nothing until the oracle publishes. The
+       loop's decision handler materializes an INACTIVE asset too, so its sell
+       leg runs under halt. *)
     let grid_asset_of
           ?(qty = asset_with_fees.qty)
           ?(accumulation_buffer = resolved_accumulation_buffer)
@@ -282,10 +262,9 @@ let asset_domain_worker
       }
     in
     (* The strategy materializes from the FIRST capital-oracle decision, ACTIVE
-       or INACTIVE: there is no Fear & Greed and no configuration fallback
-       sizing path, so an ACTIVE startup decision sizes it here, while an
-       INACTIVE one is materialized by the decision handler below so the sell
-       leg can run under halt. *)
+       or INACTIVE. No F&G or config fallback sizing exists: an ACTIVE startup
+       decision sizes it here; an INACTIVE one is materialized by the decision
+       handler below so the sell leg can run under halt. *)
     let grid_strategy_asset_ref =
       if asset_with_fees.strategy = "jacobs_ladder" || asset_with_fees.strategy = "Ladder"
       then (
@@ -300,26 +279,14 @@ let asset_domain_worker
         | _ -> ref None)
       else ref None
     in
-    (* Oracle/signal startup gate: grid strategies withhold strategy
-       execution until the startup window has given BOTH sizing sources their
-       chance - the capital-oracle's first pass attempt (event-driven: its
-       on_publish hook wakes the changed domains via Exchange_wakeup.signal
-       ~symbol) and
-       the Fear & Greed fetch (startup fetch in main.ml, retried on every
-       oracle pass, plus async refresh on price moves). The gate opens on the
-       oracle's first decision for this asset at any time; otherwise, once
-       the first pass attempt has finished or the startup deadline elapsed,
-       a live F&G reading alone is enough to proceed (one real signal
-       suffices after both had their chance). It never opens on fabricated
-       config defaults: with neither signal the grid cannot profitably and
-       accurately create orders, so it does not (orders are withheld, and a
-       one-shot warning fires once the grace period elapses). When only one
-       source is active and the other failed, a one-shot warning names the
-       failed one. While gated the domain clears its execute flag and blocks
-       on the normal per-symbol [Exchange_wakeup.wait_since].
-       [oracle_gate_deadline] is the startup window: how long both signals
-       get before the gate proceeds on whichever single one is live; it is
-       checked on wakeups, never polled. *)
+    (* Oracle startup gate: grid strategies withhold execution until the capital
+       oracle publishes its first decision for this asset. The gate opens on
+       any decision, ACTIVE or INACTIVE. There is no F&G or config fallback
+       sizing path; with no decision, orders are withheld and a one-shot warning
+       fires once the grace period elapses. While gated the domain clears its
+       execute flag and blocks on [Exchange_wakeup.wait_since].
+       [oracle_gate_deadline] bounds when the warning may fire; it is checked on
+       wakeups, never polled. *)
     let is_grid_strategy =
       asset_with_fees.strategy = "jacobs_ladder" || asset_with_fees.strategy = "Ladder"
     in
@@ -328,8 +295,8 @@ let asset_domain_worker
         ~exchange:asset_with_fees.exchange
         ~symbol:asset_with_fees.symbol
     in
-    (* Startup gate window: gives the oracle's first history refresh + pass
-       a chance to publish before this domain starts trading. *)
+    (* Startup gate window: lets the oracle's first history refresh and pass
+       publish before this domain starts trading. *)
     let oracle_startup_wait = 120.0 in
     let oracle_gate_open = ref (not is_grid_strategy) in
     let oracle_gate_deadline = ref (Unix.gettimeofday () +. oracle_startup_wait) in
@@ -339,10 +306,10 @@ let asset_domain_worker
     let mm_strategy_asset_ref =
       if is_mm_strategy then ref (Some asset_with_fees) else ref None
     in
-    (* Pre-populate strategy state fields (exchange_id, grid_qty, maker_fee)
-         so that fill handlers invoked during exec event consumption have
-         correct values before the first execute_strategy call. Without this,
-         profit calculations and persistence writes use zero defaults. *)
+    (* Pre-populate strategy state (exchange_id, grid_qty, maker_fee) so fill
+         handlers invoked during exec-event consumption see correct values
+         before the first execute_strategy call; otherwise profit calculations
+         and persistence writes use zero defaults. *)
     if is_grid_strategy
     then (
       let st = Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol in
@@ -395,21 +362,16 @@ let asset_domain_worker
              | Some cached -> cached
              | None -> 0.0));
       ());
-    (* Initialize exec read position: ALL exchanges start from position 0
-         to replay snapshot events through handle_order_acknowledged, restoring
-         last_buy_order_id and open sell tracking. This unifies the startup
-         path across Kraken, Hyperliquid, and IBKR; previously only
-         Hyperliquid replayed from 0, causing a race condition where Kraken
-         domains could execute their first strategy cycle before the snapshot
-         populated the open_orders Hashtbl. *)
+    (* Exec read position starts at 0 for all exchanges so snapshot events
+         replay through handle_order_acknowledged, restoring last_buy_order_id
+         and open sell tracking before the first strategy cycle. *)
     Logging.debug_f
       ~section
       "About to get execution feed position for %s"
       asset_with_fees.symbol;
     exec_read_pos := 0;
-    (* Wait for execution snapshot to be ingested before entering the loop.
-         Without this, the first cycle may see zero open orders and place
-         duplicates. Timeout after 15s to avoid blocking indefinitely. *)
+    (* Waits for the execution snapshot before entering the loop; otherwise the
+         first cycle can see zero open orders and place duplicates. 15s timeout. *)
     let deadline = Unix.gettimeofday () +. 15.0 in
     while
       (not (Ex.has_execution_data ~symbol:asset_with_fees.symbol))
@@ -435,9 +397,9 @@ let asset_domain_worker
       "Domain for %s/%s starting consumption from exec position 0 (full replay)"
       asset_with_fees.exchange
       asset_with_fees.symbol;
-    (* Set orderbook positions to current write position, skipping
-         stale ring buffer data. Starting at 0 would replay up to 128 historical
-         entries per symbol on every restart, causing excessive allocations. *)
+    (* Orderbook position starts at the current write position, skipping stale
+         ring-buffer data. Starting at 0 would replay up to 128 historical
+         entries per symbol on each restart. *)
     orderbook_read_pos := Ex.get_orderbook_position ~symbol:asset_with_fees.symbol;
     (* Seed current_price and top_of_book from the exchange live cache so
          the first cycle can execute immediately rather than waiting for the
@@ -476,13 +438,12 @@ let asset_domain_worker
         List.nth parts 0, List.nth parts 1)
       else asset_with_fees.symbol, "USD"
     in
-    (* Cached closures for highly efficient, allocation-free balance reporting *)
+    (* Allocation-free cached balance closures. *)
     let base_balance_fn = Ex.get_tradeable_balance_fast ~asset:base_asset in
     let quote_balance_fn = Ex.get_tradeable_balance_fast ~asset:quote_currency in
-    (* Freshness of the base balance snapshot: the sell-hold guard uses it to
-       release placed-sell holds the moment a balance message newer than the
-       placement arrives (the venue's hold-netting is then already in the
-       figure). *)
+    (* Base-balance snapshot age. The sell-hold guard releases placed-sell holds
+       once a balance message newer than the placement arrives (venue
+       hold-netting is then included). *)
     let base_balance_age_fn = Ex.get_balance_age_fast ~asset:base_asset in
     (* Cached closures for latency-sensitive feed access in the hot loop *)
     let get_ob_pos_fn = Ex.get_orderbook_position_fast ~symbol:asset_with_fees.symbol in
@@ -495,26 +456,21 @@ let asset_domain_worker
     let { prof_ob; prof_exec; prof_prep; prof_strategy; prof_cycle } =
       get_domain_profilers asset_with_fees.symbol
     in
-    (* Rolling latency window: publish + reset each profiler every
-       [latency_window_seconds] so the dashboard reads fresh, moving
-       percentiles instead of multi-minute accumulations with abrupt wipes
-       (F1/F4). Publishing swaps an immutable snapshot into an Atomic cell,
-       so the dashboard never scans a histogram being mutated by this domain. *)
+    (* Rolling latency window: publish and reset each profiler every
+       [latency_window_seconds] so the dashboard reads fresh percentiles.
+       Publishing swaps an immutable snapshot into an Atomic cell, so the
+       dashboard never scans a histogram being mutated by this domain. *)
     let latency_window_seconds = config.latency_window_seconds in
     let latency_spike_threshold_us = config.latency_spike_threshold_us in
     let latency_spike_report_seconds = config.latency_spike_report_seconds in
     let last_window_time = ref (Unix.gettimeofday ()) in
-    (* Wall-clock throttle for the internal spike INFO lines. The percentile
-       windows still publish every [latency_window_seconds] for the dashboard;
-       this only stops a busy domain that breaches the 10us ceiling in every
-       window from spamming one line per window. The last window in the
-       interval is the one reported. *)
+    (* Wall-clock throttle for internal spike INFO lines. Percentile windows
+       still publish every [latency_window_seconds]; this only limits a busy
+       domain to one reported window per interval. *)
     let last_spike_report_time = ref (Unix.gettimeofday ()) in
     (* Per-cycle GC attribution is captured inline in the loop (two
-       [Gc.quick_stat] reads, ~0.3us each - see [gc_monitor]); the window
-       publisher below no longer owns GC sampling. The old window-scoped
-       [gc_start]/[gc_end] pair was always set to the same snapshot and so
-       reported an empty delta forever. *)
+       [Gc.quick_stat] reads, ~0.3us each; see [gc_monitor]); the window
+       publisher below does not sample GC. *)
     let publish_windows () =
       let ob =
         Latency_profiler.snapshot_and_reset
@@ -526,17 +482,12 @@ let asset_domain_worker
           ~spike_threshold_us:latency_spike_threshold_us
           prof_exec
       in
-      (* snapshot+reset this symbol's place/amend/cancel operation
-         profilers on the window cadence. Their per-op [report] calls were
-         removed from the order hot path (they logged mid-cycle whenever 100
-         samples had accumulated); the percentiles now surface here instead,
-         never inside a trading cycle. *)
+      (* Snapshot+reset this symbol's place/amend/cancel profilers on the window
+         cadence; their per-op [report] calls no longer run on the order hot path. *)
       Order_executor.snapshot_symbol_profilers asset_with_fees.symbol;
-      (* The strategy window's execution count is set to the number of order
-         actions this domain's strategy actually pushed in the window (place/
-         amend/cancel), so the dashboard's STRAT/S column reports real
-         executions per second instead of raw strategy-invocation cycles
-         (which for a fast feed are far higher than actual order activity). *)
+      (* The strategy window's execution count is the number of order actions
+         pushed in the window (place/amend/cancel), so the dashboard's STRAT/S
+         reports real order activity, not strategy-invocation cycles. *)
       Latency_profiler.set_executions
         prof_strategy
         (Dio_strategies.Strategy_common.Order_actions.snapshot_and_reset
@@ -573,21 +524,16 @@ let asset_domain_worker
             ~cycle))
     in
     (* Publish an initial empty window so the dashboard renders this domain as
-       idle immediately rather than after the first window elapses, and clears
-       any stale snapshot left by a previous domain incarnation. *)
+       idle immediately, and clear any stale snapshot from a previous incarnation. *)
     publish_windows ();
     last_window_time := Unix.gettimeofday ();
-    (* Cache the equity market-hours evaluation. The underlying check does
-       gmtime+mktime+DST math per call (alpaca_market_hours.ml:11-105, 5
-       gmtime + 3 mktime); with a 1s TTL and equity domains cycling ~1/s the
-       cache almost always missed, adding 300-1200us to PREP every cycle (the
-       logged alpaca PREP tail). Session boundaries are minute-granular at
-       worst, so a 30s TTL is correct and turns that cost into one check per
-       half-minute. *)
+    (* Caches the equity market-hours evaluation, which does gmtime+mktime+DST
+       math per call (alpaca_market_hours.ml:11-105). Session boundaries are
+       minute-granular, so a 30s TTL is correct. *)
     let mh_cache_seconds = 30.0 in
     let mh_cache = ref (None : (float * bool) option) in
-    (* Cache strategy state references to avoid repeated mutex acquisition
-          on the hot path. References are stable while is_running is true. *)
+    (* Cached strategy state refs, avoiding repeated mutex acquisition on the
+          hot path. References are stable while is_running is true. *)
     let cached_grid_state =
       if is_grid_strategy
       then Some (Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol)
@@ -606,62 +552,48 @@ let asset_domain_worker
       let latency_this_cycle = !latency_active in
       if !cycle_count = 0 then Logging.debug_f ~section "First cycle for %s" key;
       incr cycle_count;
-      (* capture the wakeup generation BEFORE reading any producer
-         state. Any signal that arrives from here until the [wait_since] at
-         the bottom of the loop bumps the generation past this baseline, so
-         the wait returns immediately instead of parking through data that
-         landed mid-cycle (the lost-wakeup race that could stall a quiet
-         symbol's domain indefinitely). *)
+      (* Capture the wakeup generation before reading producer state. Any signal
+         from here to the [wait_since] at the loop bottom bumps the generation
+         past this baseline, so the wait returns immediately instead of parking
+         through data that landed mid-cycle. *)
       let wake_baseline = Concurrency.Exchange_wakeup.get_generation_fast wakeup_sync in
       let cycle_events = ref 0 in
       let lifecycle_events = ref 0 in
-      (* Latency safepoint. When execution events are pending, the EVENTS drain
-         below runs synchronously on THIS domain thread and allocates (list
-         rebuilds in the strategy handlers, oracle pool events). A minor
-         collection triggered by those allocations is stop-the-world for this
-         domain, so one unlucky collection inside a multi-event batch is
-         recorded against every event in it (the [elapsed / event_count]
-         average), which is what produced the 100us per-event EVENTS spikes.
-         Forcing the domain's pending minor collection HERE - before any
-         measured span - means the drain starts with the full minor heap free
-         and cannot trigger a collection of its own for any realistic burst
-         (hundreds of events per batch is <100KB against a 2MiB heap). The
-         collection is moved, not added: it is the same work the runtime would
-         otherwise do on the next allocation, just paid outside the windows.
-         The exec position is sampled once here and reused by the drain so the
-         gate and the iteration observe the same producer position. *)
+      (* Latency safepoint. The EVENTS drain below runs synchronously on this
+         domain thread and allocates; a minor collection triggered inside a
+         multi-event batch would be charged to every event in it. Forcing the
+         domain's pending minor collection here, before any measured span,
+         starts the drain with a free minor heap. The exec position is sampled
+         once and reused by the drain so gate and iteration see the same producer
+         position. *)
       let current_pos = get_exec_pos_fn () in
       let did_exec = current_pos <> !exec_read_pos in
       if did_exec then Gc.minor ();
-      (* Per-cycle GC counters: captured at cycle start and at the cause site so
-         a spike can be attributed to a minor/major collection. The start
-         capture is SAMPLED ([gc_sample_mask]) because [Gc.quick_stat] allocates
-         ~24 words and costs ~0.3us; unsampled cycles report no GC suffix. It is
-         taken BEFORE the stage markers below so it is never charged to the ob
-         bracket. *)
+      (* Per-cycle GC counters, captured at cycle start and at the cause site to
+         attribute spikes to minor/major collections. The start capture is
+         sampled per [gc_sample_mask]; taken before the stage markers so it is
+         not charged to the ob bracket. *)
       let gc_sampled = latency_this_cycle && !cycle_count land gc_sample_mask = 0 in
       let stats_start = if gc_sampled then Gc_monitor.get_stats () else Gc_monitor.zero in
-      (* Stage timing uses the non-allocating [Monotonic_clock] (immediate int)
-         instead of [Mtime_clock.now_ns] (3 boxed words per read): the
-         profiler's own clock must not pollute the allocations it measures. *)
+      (* Stage timing uses non-allocating [Monotonic_clock] rather than
+         [Mtime_clock.now_ns] (3 boxed words per read), so the profiler's clock
+         does not pollute the allocation counts it measures. *)
       let t1 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
       let alloc_start =
         if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
       in
-      (* drain lifecycle events queued by the supervisor REST path. All
-         handler invocations (REST- and WS-sourced) now execute on THIS domain
-         thread at the top of the cycle, so the strategy mutex is never
-         contended across threads. Runs unconditionally; the queue is empty
-         on the common cycle and the read is a lock-free CAS. *)
+      (* Drain lifecycle events queued by the supervisor REST path. All handlers
+         (REST- and WS-sourced) run on THIS domain thread at cycle top, so the
+         strategy mutex is never contended across threads. Runs unconditionally;
+         the queue is empty on the common cycle. *)
       if is_grid_strategy
       then
         lifecycle_events
         := !lifecycle_events
            + Dio_strategies.Jacobs_ladder.Strategy.drain_events asset_with_fees.symbol;
-      (* drain MM lifecycle events queued by the supervisor REST path.
-         Same discipline as the grid queue above: all handler execution
-         happens on THIS domain thread, so MM state is never mutated
-         cross-thread against execute_strategy. *)
+      (* Drain MM lifecycle events queued by the supervisor REST path. Same
+         discipline as the grid queue: handlers run on THIS domain thread, so MM
+         state is never mutated cross-thread against execute_strategy. *)
       if is_mm_strategy
       then
         lifecycle_events
@@ -706,11 +638,10 @@ let asset_domain_worker
                match event.order_status with
                | Types.Canceled | Types.Rejected | Types.Expired ->
                  should_execute_strategy := true;
-                 (* A canceled/rejected/expired order changes the live pool and
-                    the strategy's open-order state: notify the capital oracle
-                    with the released committed capital (a canceled BUY returns
-                    remaining_qty x limit price) so it re-sizes immediately -
-                    the delta is applied in-process, no network wait. *)
+                 (* A canceled/rejected/expired order changes the live pool:
+                    notify the capital oracle with released committed capital
+                    (a canceled BUY returns remaining_qty x limit price) so it
+                    re-sizes in-process without a network wait. *)
                  Oracle_runtime.notify_order_cancel
                    ~exchange:asset_with_fees.exchange
                    ~symbol:asset_with_fees.symbol
@@ -741,11 +672,10 @@ let asset_domain_worker
                      event.cl_ord_id
                | Types.Filled ->
                  should_execute_strategy := true;
-                 (* A fill returns/consumes quote: notify the capital oracle
-                    with the pool delta so it re-sizes the asset (and the rest
-                    of the account's priority order) immediately - the delta
-                    is applied in-process, so the decision never waits on a
-                    network balance refresh (lock-free, microsecond wake). *)
+                 (* A fill consumes/returns quote: notify the capital oracle with
+                    the pool delta so it re-sizes the asset and the account's
+                    priority order in-process, without a network balance
+                    refresh (lock-free, microsecond wake). *)
                  Oracle_runtime.notify_fill
                    ~exchange:asset_with_fees.exchange
                    ~symbol:asset_with_fees.symbol
@@ -799,12 +729,12 @@ let asset_domain_worker
                      perp_tob)
                | Types.New | Types.PartiallyFilled ->
                  should_execute_strategy := true;
-                 (* Guard: skip handle_order_acknowledged for in-place amendment
-                     confirmations (Kraken exec_type=amended with status=new).
-                     The amendment lifecycle is handled by the supervisor's
-                     handle_order_amended callback on the REST response path.
-                     Routing these through handle_order_acknowledged causes a
-                     dual-update race that corrupts open_sell_orders tracking. *)
+                 (* Skip handle_order_acknowledged for in-place amendment
+                     confirmations (Kraken exec_type=amended, status=new). The
+                     amendment lifecycle runs through the supervisor's
+                     handle_order_amended callback on the REST path; routing
+                     these here causes a dual-update race that corrupts
+                     open_sell_orders tracking. *)
                  if event.is_amended
                  then (
                    Logging.debug_f
@@ -896,10 +826,9 @@ let asset_domain_worker
       let alloc_at_t3 =
         if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
       in
-      (* Defer the per-event exec histogram writes until after [t4] so they are
-         not charged to the STRAT/CYCLE samples: with N events this loop ran N
-         bucket updates inside the measured span, self-inflating exactly the
-         exec-heavy cycles that define the tail. *)
+      (* Per-event exec histogram writes are deferred until after [t4] so they
+         are not charged to STRAT/CYCLE; with N events they would self-inflate
+         the exec-heavy cycles that define the tail. *)
       (* [-1] means "no exec events this cycle" (sentinel, no option boxing). *)
       let exec_per_event_ns =
         if did_exec && latency_this_cycle && was_exec_ready && !event_count > 0
@@ -909,18 +838,18 @@ let asset_domain_worker
         else -1
       in
       (* Fallback gate for domains with no open orders: if no exec events
-           arrived and the execution data is ready (snapshot ingested), open
-           the gate so the strategy can place its initial order. *)
+           arrived and the snapshot is ingested, open the gate so the strategy
+           can place its initial order. *)
       if (not !exec_ready) && (not !exec_checked) && has_exec_fn ()
       then (
         let current_pos_now = get_exec_pos_fn () in
         if current_pos_now = !exec_read_pos
         then (
           exec_checked := true;
-          (* No exec events arrived and feed is ready: fetch snapshot orders 
-               and inject them into the strategies to restore tracking state. *)
-          (* Hoist timestamp outside the per-order callback: eliminates
-               one gettimeofday syscall per open order during injection. *)
+          (* No exec events and feed ready: fetch snapshot orders and inject them
+               to restore strategy tracking state. *)
+          (* Timestamp hoisted outside the per-order callback: one fewer
+               gettimeofday syscall per open order. *)
           let now_inject = Unix.gettimeofday () in
           Ex.iter_open_orders_fast
             ~symbol:asset_with_fees.symbol
@@ -973,11 +902,11 @@ let asset_domain_worker
             asset_with_fees.exchange
             asset_with_fees.symbol));
       (* Execute strategy if new events have been consumed and feed is ready (event-driven gate) *)
-      (* IBKR market hours gate: suppress strategy execution entirely when
-           the US equity market is closed. Without this, the strategy emits
-           amendments against stale delayed data, the gateway rejects with
-           error 354 (no market data), but our in-memory state already recorded
-           the amend as successful, causing an infinite amend spam loop. *)
+      (* Equity market-hours gate: suppress strategy execution when the US equity
+           market is closed. Otherwise the strategy amends against stale delayed
+           data; the gateway rejects with error 354 (no market data) while
+           in-memory state records the amend as successful, causing an infinite
+           amend loop. *)
       let equity_market_closed =
         match asset_with_fees.exchange with
         | "ibkr" | "alpaca" ->
@@ -995,17 +924,13 @@ let asset_domain_worker
              closed)
         | _ -> false
       in
-      (* Capital-oracle decision application. Read every cycle (a lock-free
-            Atomic.get of an immutable snapshot), so a halted asset can be
-            re-activated and a changed qty/gi adopted as soon as the runtime
-            publishes - not only when market events trigger a cycle. Runs
-            OUTSIDE the should_execute gate on purpose: an inactive asset
-            never enters the execution block, so its re-activation must not
-            depend on it. The oracle's qty/gi win over the F&G re-evaluation
-            above (the oracle owns the sizing while it has a decision).
-            the lookup is cached per generation; [decision_for] is only
-            re-invoked (with its lowercase+hashtable cost) when the runtime
-            published a new pass, so idle cycles do zero decision work. *)
+      (* Capital-oracle decision application. Read every cycle (lock-free
+            Atomic.get of an immutable snapshot) so a halted asset can
+            re-activate as soon as the runtime publishes, not only on market
+            events. Runs OUTSIDE the should_execute gate: an inactive asset never
+            enters the execution block, so its re-activation must not depend on
+            it. The lookup is cached per publish generation; [decision_for] is
+            re-invoked only when a new pass is published. *)
       let oracle_decision =
         if !oracle_gen_cached <> Oracle_runtime.get_publish_generation ()
         then (
@@ -1021,10 +946,8 @@ let asset_domain_worker
         match oracle_decision with
         | Some d when d.cancel_resting_buys -> true
         | Some d when not d.active ->
-          (* Allocation-free scan: [iter_open_orders_fast] yields primitives, so
-             this no longer materializes a [Types.open_order] record per order
-             on every idle cycle (the old [fold_open_orders] path allocated one
-             record + two closures per order per cycle). *)
+          (* Allocation-free scan: [iter_open_orders_fast] yields primitives, no
+             [Types.open_order] record per order per idle cycle. *)
           let has_open_buy = ref false in
           Ex.iter_open_orders_fast
             ~symbol:asset_with_fees.symbol
@@ -1036,15 +959,11 @@ let asset_domain_worker
       (match oracle_decision, !grid_strategy_asset_ref with
        | Some d, None ->
          (* Materialize the grid strategy on the FIRST oracle decision, ACTIVE
-            OR INACTIVE. A halted asset must still run its sell leg: it needs to
-            adopt pre-existing resting inventory, track fills/cancels, and place
-            inventory sells - buys are withheld by the [oracle_halted] flag
-            inside execute_strategy, not by skipping execution entirely.
-            Materializing only on ACTIVE decisions left every startup-inactive
-            asset with no strategy loop at all, so its open-order/ledger sell
-            state stayed empty and the dashboard sell count read 0. An INACTIVE
-            decision may carry a zero/placeholder buy size, so fall back to the
-            configured qty for the grid size in that case. *)
+            or INACTIVE. A halted asset must still run its sell leg (adopt
+            resting inventory, track fills/cancels, place inventory sells); buys
+            are withheld by [oracle_halted] inside execute_strategy, not by
+            skipping execution. An INACTIVE decision may carry a zero/placeholder
+            buy size, so fall back to the configured qty. *)
          let qty_str =
            if d.buy_qty > 0.0
            then Printf.sprintf "%.8g" d.buy_qty
@@ -1057,13 +976,11 @@ let asset_domain_worker
          in
          (try st.grid_qty <- float_of_string qty_str with
           | Failure _ -> ());
-         (* Re-check any already-resting buy against the decision's spacing:
-              the re-anchor amends DOWN only when the resting price actually
-              violates a ladder constraint (it sits inside a sell's 2*gi
-              restricted zone); an order already within one grid interval of
-              the market is left alone - it trails up as usual. Only an ACTIVE
-              decision arms it: under halt the buy leg places/re-anchors
-              nothing. *)
+         (* Re-check any resting buy against the decision's spacing: it amends
+              DOWN only when the resting price violates a ladder constraint
+              (inside a sell's 2*gi restricted zone); an order within one grid
+              interval of market is left to trail up. Armed only by an ACTIVE
+              decision; under halt the buy leg places/re-anchors nothing. *)
          if d.active then st.force_buy_reanchor <- true;
          should_execute_strategy := true;
          Logging.debug_f
@@ -1077,16 +994,12 @@ let asset_domain_worker
            d.grid_interval
            (d.d_surv *. 100.0)
        | Some d, Some asset when d.active ->
-         (* The oracle re-derives the qty from the live pool every pass,
-             and the pool drifts with every balance/price update, so
-             successive passes publish micro-different qtys (e.g. QQQ
-             0.03877239 -> 0.03877509 -> 0.03876709). An exact string
-             comparison trips [qty_changed] on EVERY pass, which forces a
-             buy re-anchor -> an Alpaca amend (cancel+create) on every
-             pass -> the infinite amend loop (the grid and oracle fight
-             over the resting order's size). Judge the change numerically
-             with a relative deadband (0.1%) so only a material re-size
-             re-anchors; micro pool drift leaves the book untouched. *)
+         (* The oracle re-derives qty from the live pool every pass, so
+             successive passes publish micro-different values (e.g. QQQ
+             0.03877239 -> 0.03877509). Exact string comparison would trip
+             [qty_changed] every pass, forcing a buy re-anchor and an Alpaca
+             amend (cancel+create) loop. Judge numerically with a 0.1% relative
+             deadband so only a material re-size re-anchors. *)
          let qty_changed =
            let current_qty =
              try float_of_string asset.qty with
@@ -1105,16 +1018,13 @@ let asset_domain_worker
            let st = Dio_strategies.Jacobs_ladder.get_strategy_state asset.symbol in
            (try st.grid_qty <- float_of_string qty_str with
             | Failure _ -> ());
-           (* A qty-only change (the pool churned) is adopted as the new size
-                WITHOUT forcing the resting buy to re-anchor: the grid's qty
-                mismatch amend (Alpaca) fixes the size while keeping the price
-                (the buy only ever trails up), and other venues take the new
-                size on the next placement. Forcing a price re-anchor on qty
-                drift is what made the grid and oracle fight over the resting
-                order every pass (cancel+create churn on Alpaca). Only a real
-                grid-interval change - a different ladder spacing - re-checks
-                the resting buy; the amend-down itself stays gated on a real
-                sell-spacing violation in the strategy. *)
+            (* A qty-only change is adopted without forcing a buy re-anchor: the
+                 grid's qty-mismatch amend (Alpaca) fixes size at the same price
+                 (buys only trail up), and other venues take the new size on the
+                 next placement. Forcing a price re-anchor on qty drift caused
+                 grid/oracle cancel+create churn. Only a grid-interval change
+                 re-checks the resting buy; the amend-down itself stays gated on
+                 a sell-spacing violation. *)
            if gi_changed then st.force_buy_reanchor <- true;
            should_execute_strategy := true;
            Logging.debug_f
@@ -1165,28 +1075,21 @@ let asset_domain_worker
              (orders withheld if no live F&G reading exists)"
             asset_with_fees.exchange
             asset_with_fees.symbol);
-      (* Priority reclamation: an INACTIVE-with-reclaim decision asks this
-         domain to cancel its own resting buy(s) so the committed capital
-         returns to the account pool for a higher-priority asset. Runs OUTSIDE
-         the execution gate on purpose: a halted asset must still release
-         capital. The cancel is a first-class Grid strategy order pushed
-         through the grid's order buffer into the established supervisor
-         pipeline (supervisor_orders dispatch_cancel -> Order_executor ->
-         dashboard/order tracking), guarded like the grid's own excess-buy
-         cancel (strategy mutex held, mid-amendment buys skipped - Hyperliquid
-         rejects canceling an order being amended). SELF-HEALING: the cancel
-         is latched (not re-issued every cycle) but it is RETRIED while the
-         reclaim decision persists and eligible buys still sit in the store,
-         and the latch re-arms the moment the store shows no eligible buy (the
-         cancel landed) or the decision stops being a reclaim. Without the
-         retry, a single failed cancel (dispatch dropped on a connection flap,
-         exchange rejection, ring-buffer full) would leave the account
-         permanently stuck: the reclaimed asset stays paused (the oracle's
-         plan only clears once the store's committed value drops to zero), the
-         priority asset never resumes on capital that was never released, and
-         the dashboard keeps showing the resting buy. Wakes the capital oracle
-         ([request_pass]) so released capital is recognized promptly even if
-         the exchange's WS cancel event is missed. *)
+      (* Priority reclamation: an INACTIVE-with-reclaim decision asks this domain
+         to cancel its resting buys so committed capital returns to the account
+         pool for a higher-priority asset. Runs OUTSIDE the execution gate: a
+         halted asset must still release capital. The cancel is pushed through
+         the grid's order buffer into the supervisor pipeline
+         (supervisor_orders dispatch_cancel -> Order_executor -> dashboard/order
+         tracking), guarded like the grid's own excess-buy cancel (strategy mutex
+         held, mid-amendment buys skipped because Hyperliquid rejects canceling
+         an order being amended). SELF-HEALING: the cancel is latched, not
+         re-issued every cycle, but retried while the decision persists and
+         eligible buys remain; the latch re-arms when the store shows no eligible
+         buy or the decision stops being a reclaim. Without the retry, a single
+         failed cancel leaves the asset paused permanently. Wakes the oracle
+         ([request_pass]) so released capital is recognized even if the exchange
+         WS cancel event is missed. *)
       (match oracle_decision with
        | Some d when d.cancel_resting_buys ->
          let now = Unix.gettimeofday () in
@@ -1197,15 +1100,13 @@ let asset_domain_worker
          Fun.protect
            ~finally:(fun () -> Mutex.unlock st.mutex)
            (fun () ->
-              (* Eligible = cancellable resting buys (not mid-amendment);
-                 [any_buy] distinguishes "store is clean" from "only buys
-                 stuck mid-amendment" - a mid-amend buy cannot be cancelled
-                 (the exchange rejects it) and is expected to resolve into a
-                 cancellable replacement on its own. *)
+               (* Eligible = cancellable resting buys (not mid-amendment).
+                  [any_buy] distinguishes "store clean" from "only buys stuck
+                  mid-amendment": a mid-amend buy cannot be cancelled and is
+                  expected to resolve into a cancellable replacement. *)
               let eligible = ref 0 in
               let any_buy = ref false in
-              (* Allocation-free: primitives only, no [Types.open_order] record
-                 per order on the reclaim path. *)
+               (* Allocation-free: primitives only, no [Types.open_order] record. *)
               Ex.iter_open_orders_fast
                 ~symbol:asset_with_fees.symbol
                 (fun oid _price qty side_str _userref ->
@@ -1227,12 +1128,9 @@ let asset_domain_worker
                   ~any_buy:!any_buy
               with
               | Dio_strategies.Jacobs_ladder.Reclaim_rearm ->
-                (* The store no longer holds any buy: the cancel(s) landed (or
-                   never needed). Re-arm the latch so a later reclaim decision
-                   re-triggers cleanly, and wake the capital oracle so it
-                   re-sizes with the released capital - a release the oracle
-                   does not yet know about is exactly the stall that leaves
-                   the priority asset parked. *)
+                 (* No buy remains: the cancel(s) landed or were never needed.
+                    Re-arm the latch so a later reclaim re-triggers cleanly, and
+                    wake the oracle so it re-sizes with the released capital. *)
                 reclaim_cancel_issued := false;
                 reclaim_cancel_at := 0.0;
                 Oracle_runtime.request_pass ()
@@ -1260,10 +1158,9 @@ let asset_domain_worker
                        incr n));
                 reclaim_cancel_issued := true;
                 reclaim_cancel_at := now;
-                (* Wake the capital oracle so it re-sizes against the released
-                   capital as soon as it lands - the reclaim cycle is
-                   self-driving and does not depend on the exchange's WS
-                   cancel event reaching this domain. *)
+                 (* Wake the capital oracle so it re-sizes as soon as the release
+                    lands; the reclaim cycle does not depend on the exchange WS
+                    cancel event. *)
                 Oracle_runtime.request_pass ();
                 Logging.warn_f
                   ~section
@@ -1276,32 +1173,20 @@ let asset_domain_worker
        | _ ->
          reclaim_cancel_issued := false;
          reclaim_cancel_at := 0.0);
-      (* Oracle/signal startup gate (see the gate state initialized above).
-         Opens - once, monotonically - when the startup window has given BOTH
-         signals their chance: the first capital-oracle decision for this
-         asset (active or INACTIVE: an INACTIVE one halts new orders through
-         oracle_halted above) opens it at any time; otherwise a live Fear &
-         Greed reading opens it once the oracle's first pass attempt has
-         finished or the startup deadline has elapsed (one real signal
-         suffices after both had their chance). It never opens on fabricated
-         config defaults - with neither signal the grid cannot profitably and
-         accurately create orders, so it does not (the execute flag stays
-         cleared and a one-shot warning fires once the grace period elapses).
-         When only one source is active, a one-shot warning names the failed
-         one. While closed, the execute flag is cleared so the domain falls
-         through to the per-symbol wakeup wait below instead of busy-
-         spinning. *)
+      (* Oracle startup gate. Opens once, monotonically, on the first
+         capital-oracle decision for this asset (ACTIVE or INACTIVE; an INACTIVE
+         decision halts new orders through oracle_halted above). There is no
+         F&G or config fallback sizing path: with no decision the execute flag
+         stays cleared, the domain falls through to the per-symbol wakeup wait,
+         and a one-shot warning fires once the grace period elapses. *)
       if not !oracle_gate_open
       then (
-        (* The gate opens ONLY on a capital-oracle decision. There is no
-           Fear & Greed and no configuration fallback sizing path anywhere
-           in the engine: until a real decision arrives for this asset, the
-           strategy places nothing and this block simply re-checks each
-           cycle. Warnings fire once, distinguishing the causes:
-           - cold start: the first history refresh is still running;
-           - analysis failed: a pass finished without a decision here;
-           - startup elapsed: no pass ever completed;
-           - unmodeled: the venue has no capital-survival adapter. *)
+         (* Gate opens ONLY on a capital-oracle decision; no F&G/config fallback
+            sizing exists. Until a decision arrives the strategy places nothing.
+            One-shot warnings distinguish: cold start (first history refresh
+            running), analysis failed (pass finished with no decision),
+            startup elapsed (no pass completed), unmodeled (no capital-survival
+            adapter). *)
         match oracle_decision with
         | Some d ->
           oracle_gate_open := true;
@@ -1355,14 +1240,11 @@ let asset_domain_worker
                   asset_with_fees.exchange
                   asset_with_fees.symbol)))
       else ();
-      (* The oracle-halt no longer gates the whole execution block: an
-         INACTIVE decision halts BUY placement inside the strategy (the
-         [~oracle_halted] flag passed to execute_strategy) but the SELL leg
-         still runs - a sell is the account's capital-recovery path (it needs
-         only inventory, not quote), so the sell for a just-filled buy is
-         placed even when capital is exhausted and the asset is halted.
-         Without this the last fill's inventory sits unreclaimable and the
-         pool never recovers. *)
+      (* The oracle halt gates only BUY placement (the [~oracle_halted] flag to
+         execute_strategy); the SELL leg still runs. A sell is the capital-
+         recovery path (needs inventory, not quote), so the sell for a
+         just-filled buy is placed even under halt; otherwise the last fill's
+         inventory stays unreclaimable. *)
       let should_execute =
         !exec_ready
         && !should_execute_strategy
@@ -1370,18 +1252,12 @@ let asset_domain_worker
         && (not equity_market_closed)
         && !oracle_gate_open
       in
-      (* Boundary between the per-cycle PREP work (exec-drain end -> just
-         before the strategy call) and the STRATEGY work. [t3] is the end of
-         the exec phase; the whole block below until the strategy call is the
-         capital-oracle decision apply, halt/reclaim evaluation, startup gate,
-         balance reads and F&G re-evaluation. It used to be charged to STRAT,
-         which made STRAT read 100us+ on the oracle-heavy symbols; the prep
-         profiler isolates it so STRAT is the strategy call alone.
-         [t3_strategy] is seeded HERE (after the oracle apply / halt / reclaim /
-         gate work that runs every cycle, before [should_execute]) so an idle
-         [st:false] cycle still reports its true prep cost instead of folding
-         it into CYCLE; the [should_execute] branch below re-stamps it after the
-         balance/F&G block that only runs when the strategy will execute. *)
+      (* PREP/STRATEGY boundary. [t3] ends the exec phase; the block below up to
+         the strategy call (oracle apply, halt/reclaim, startup gate, balance
+         reads, F&G re-evaluation) is PREP. [t3_strategy] is seeded here so idle
+         cycles still report true prep cost. The [should_execute] branch below
+         re-stamps it after the balance/F&G block, so STRAT is the strategy call
+         alone. *)
       let t3_strategy =
         ref (if latency_this_cycle then Monotonic_clock.now_ns () else t3)
       in
@@ -1391,13 +1267,13 @@ let asset_domain_worker
       if should_execute
       then (
         should_execute_strategy := false;
-        (* Single-pass open order scan: count by strategy AND collect
-             grid buy/sell order lists. Eliminates a second iter_open_orders
-             + orders_mutex acquisition inside the grid strategy. *)
+        (* Single-pass open-order scan: counts by strategy and collects grid
+             buy/sell lists, eliminating a second iter_open_orders plus
+             orders_mutex acquisition inside the grid strategy. *)
         let iter_orders f = Ex.iter_open_orders_fast ~symbol:asset_with_fees.symbol f in
-        (* Pass iter_orders closure directly down. This removes the 2-3ms STW GC pause 
-             caused by allocating intermediate Order tracking lists exactly on the event hotpath. *)
-        (* Fast-path tick perfect balance access without hashtable locks *)
+        (* Pass the iter_orders closure down directly, avoiding intermediate
+             order-tracking list allocations (2-3ms STW pause) on the event path. *)
+        (* Fast-path balance access without hashtable locks. *)
         let asset_bal_val =
           match base_balance_fn () with
           | bal -> bal
@@ -1408,12 +1284,10 @@ let asset_domain_worker
           | bal -> bal
           | exception _ -> nan
         in
-        (* Balance snapshot staleness: a fresh quote balance is authoritative
-           for the placement guard (an under-funded buy is skipped, not sent
-           to be rejected); a stale snapshot may be wrong, so the grid still
-           attempts and lets the exchange decide. Exchanges without
-           freshness tracking report None -> unknown -> treated as stale
-           (previous behavior). *)
+        (* Balance-snapshot staleness: a fresh quote balance is authoritative, so
+           an under-funded buy is skipped; a stale snapshot may be wrong, so the
+           grid attempts and lets the exchange decide. Unknown age (None) is
+           treated as stale. *)
         let quote_balance_stale =
           match Ex.get_balance_age_fast ~asset:quote_currency () with
           | Some age -> age > stale_balance_age_seconds
@@ -1440,10 +1314,9 @@ let asset_domain_worker
                 cp;
               baseline_price := Some cp;
               Fear_and_greed.force_fetch_async ()));
-        (* Apply updated Fear & Greed value to strategy config if changed. A
-           missing index (get_cached () = None) means no live F&G signal: the
-           re-evaluation is skipped entirely - never neutralized to 50 - and a
-           domain still waiting on the gate keeps withholding orders. *)
+        (* Applies an updated Fear & Greed value if changed. A missing index
+           (get_cached () = None) means no live signal: re-evaluation is skipped,
+           never neutralized to 50. *)
         let current_fng_opt = Fear_and_greed.get_cached () in
         if current_fng_opt <> !last_known_fng
         then (
@@ -1451,10 +1324,9 @@ let asset_domain_worker
           match current_fng_opt with
           | None -> ()
           | Some current_fng when not (is_crypto_exchange asset_with_fees.exchange) ->
-            (* Equities are pure oracle: F&G never enters the sizing (the
-               capital oracle owns the equity grid entirely). Log once so the
-               operator knows the signal was deliberately ignored, then keep
-               last_known_fng bookkeeping so a later change re-checks. *)
+            (* Equities are pure oracle: F&G never enters sizing. Log so the
+               ignored signal is visible; last_known_fng bookkeeping still
+               updates so a later change re-checks. *)
             Logging.debug_f
               ~section
               "[%s/%s] Fear & Greed updated to %.2f but ignored: equity asset sizes from \
@@ -1463,14 +1335,11 @@ let asset_domain_worker
               asset_with_fees.symbol
               current_fng
           | Some current_fng ->
-            (* One blend, one owner. The capital oracle computes the crypto
-               grid interval as a weighted blend of the F&G side, the
-               per-asset range side and the survival-constrained parameter,
-               and publishes the composition in the decision's
-               F&G no longer sizes grid_interval anywhere: the oracle's
-               decision is the sole sizing source and there is NO fallback
-               path. F&G still manages accumulation_buffer, which the oracle
-               does not size. *)
+            (* The capital oracle computes the crypto grid interval as a weighted
+               blend of the F&G side, the per-asset range side, and the
+               survival-constrained parameter. The decision is the sole sizing
+               source; F&G does not size grid_interval. F&G still manages
+               accumulation_buffer, which the oracle does not size. *)
             let update_accumulation_buffer () =
               let exch_id =
                 Dio_exchange.Exchange_intf.Types.exchange_of_string
@@ -1509,11 +1378,8 @@ let asset_domain_worker
             in
             (match oracle_decision with
              | Some d when d.active ->
-               (* Oracle owns the sizing: log the sizing it actually published
-                  (how the gi/qty were chosen - the survival-driven reasons
-                  carried by the decision - and the replayed D_surv) instead
-                  of an F&G-only value, and touch only the accumulation
-                  buffer. *)
+               (* Oracle owns sizing: log its published gi/qty/D_surv and touch
+                  only the accumulation buffer. *)
                Logging.info_f
                  ~section
                  "[%s/%s] Fear & Greed updated to %.2f: oracle sizing gi %.4f%% · qty \
@@ -1526,10 +1392,8 @@ let asset_domain_worker
                  (d.d_surv *. 100.0);
                update_accumulation_buffer ()
              | Some _ ->
-               (* Oracle decision exists but INACTIVE: the oracle owns the
-                  sizing and orders are withheld; no competing F&G value is
-                  applied (it would be adopted on re-activation only to be
-                  immediately replaced by the oracle's own gi). *)
+               (* Oracle decision exists but is INACTIVE: it owns sizing and
+                  orders are withheld; no competing F&G value is applied. *)
                Logging.debug_f
                  ~section
                  "[%s/%s] F&G gi re-evaluation skipped: capital-oracle decision INACTIVE \
@@ -1538,10 +1402,9 @@ let asset_domain_worker
                  asset_with_fees.symbol;
                update_accumulation_buffer ()
              | None ->
-               (* No capital-oracle decision yet: the strategy places
-                  NOTHING - there is no config/F&G fallback sizing path. The
-                  startup gate above already keeps orders quiet; this only
-                  refreshes the F&G-resolved accumulation buffer reference. *)
+               (* No oracle decision yet: no config/F&G fallback sizing, so the
+                  strategy places nothing. This only refreshes the F&G-resolved
+                  accumulation buffer reference. *)
                Logging.debug_f
                  ~section
                  "[%s/%s] No capital-oracle decision yet; no fallback sizing (strategy \
@@ -1549,16 +1412,14 @@ let asset_domain_worker
                  asset_with_fees.exchange
                  asset_with_fees.symbol;
                update_accumulation_buffer ()));
-        (* Compute wall-clock timestamp once per cycle for strategy use,
-             eliminating Unix.time/gettimeofday syscalls inside the strategy. *)
+        (* Wall-clock timestamp computed once per cycle for strategy use,
+             eliminating gettimeofday syscalls inside the strategy. *)
         let now = Unix.gettimeofday () in
-        (* Count this strategy invocation as an activity tick so the dashboard
-             can report executions/sec and last-execution time even when the
-             window's latency sample count is zero. *)
+        (* Activity tick so the dashboard reports executions/sec and
+             last-execution time even with zero latency samples this window. *)
         Latency_profiler.tick_exec prof_strategy ~now;
-        (* PREP/STRATEGY split point: everything above this line (oracle
-           apply, halt/reclaim, gate, balance + F&G prep) is charged to
-           [prof_prep]; only the strategy call itself is STRAT. *)
+        (* PREP/STRATEGY split: work above is charged to [prof_prep]; only the
+           strategy call is STRAT. *)
         t3_strategy := if latency_this_cycle then Monotonic_clock.now_ns () else 0;
         alloc_at_t3s := if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0;
         (match !grid_strategy_asset_ref, cached_grid_state with
@@ -1608,10 +1469,9 @@ let asset_domain_worker
       let alloc_at_t4 =
         if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
       in
-      (* PREP is recorded for EVERY measured cycle, not only when the strategy
-         runs: the oracle apply / halt / reclaim / gate work happens on idle
-         [st:false] cycles too, and folding it into CYCLE made those cycles
-         unattributable. STRAT is the strategy call alone. *)
+      (* PREP is recorded on every measured cycle: oracle apply / halt / reclaim
+         / gate work runs on idle cycles too, and folding it into CYCLE made
+         those cycles unattributable. STRAT is the strategy call alone. *)
       if latency_this_cycle
       then (
         Latency_profiler.record_ns prof_prep (!t3_strategy - t3);
@@ -1623,25 +1483,22 @@ let asset_domain_worker
         for _ = 1 to !event_count do
           Latency_profiler.record_ns prof_exec exec_per_event_ns
         done;
-      (* Flush deferred accumulation persistence outside the strategy hotloop.
-           Only performs file I/O when the dirty flag was set during execute_strategy. *)
+      (* Flush deferred accumulation persistence outside the strategy hot path;
+           file I/O only when the dirty flag was set during execute_strategy. *)
       if should_execute
       then
         if is_grid_strategy
         then
           Dio_strategies.Jacobs_ladder.Strategy.flush_persistence asset_with_fees.symbol;
-      (* Record cycle work time before blocking. Captures active processing
-           latency only, excluding sleep time in Exchange_wakeup.wait_since.
-           Only busy cycles (real book/exec/strategy work) are recorded: idle
-           wakeups would otherwise pin cycle p50/p99 at 0us. *)
+      (* Records active cycle work time before blocking, excluding
+           Exchange_wakeup.wait_since sleep. Only busy cycles are recorded; idle
+           wakeups would pin cycle p50/p99 at 0us. *)
       let cycle_busy = did_ob || did_exec || should_execute in
       if latency_this_cycle && cycle_busy
       then
         if
-          (* Build the cause string only when this cycle is a new window
-           maximum. The previous version allocated a closure (and boxed
-           [alloc_start]) on every measured cycle just to be told it was not
-           a max. *)
+          (* Cause string is built only for a new window maximum, avoiding a
+           per-cycle closure and [alloc_start] box. *)
           Latency_profiler.record_max_ns prof_cycle (t4 - t1)
         then (
           let alloc_diff = int_of_float (Gc.minor_words ()) - alloc_start in
@@ -1650,9 +1507,8 @@ let asset_domain_worker
             then Gc_monitor.diff_to_string stats_start (Gc_monitor.get_stats ())
             else ""
           in
-          (* Grid STRAT sub-phase allocation attribution, filled by
-             [execute_strategy] (scratch fields on the strategy state). Only
-             meaningful when the grid strategy ran this cycle. *)
+          (* Grid STRAT sub-phase attribution, filled by [execute_strategy] via
+             strategy-state scratch fields; meaningful only when the grid ran. *)
           let phase_str =
             match cached_grid_state with
             | Some cs when should_execute ->
@@ -1689,28 +1545,21 @@ let asset_domain_worker
                (alloc_at_t4 - !alloc_at_t3s)
                gc_str
                phase_str));
-      (* Roll the latency window on a fixed time cadence rather than a cycle
-           count: at typical domain cycle rates the old cycle_mod gate (10000
-           cycles) accumulated minutes of samples before an abrupt wipe. *)
+      (* Roll the latency window on a fixed time cadence, not a cycle count: the
+           old cycle_mod gate (10000 cycles) accumulated minutes before a wipe. *)
       let now_flush = Unix.gettimeofday () in
       if now_flush -. !last_window_time >= latency_window_seconds
       then (
         last_window_time := now_flush;
         publish_windows ());
-      (* Block until the next websocket frame signals new data or until data is ready.
-            Use cached has_exec_fn closure instead of Ex.has_execution_data to
-            avoid Hashtbl lookup on the hot blocking path.
-            [wait_since] returns immediately if any producer signalled
-            while this cycle ran (generation > baseline), so a signal racing
-            the cycle can no longer be lost to the park. *)
-      (* Park whenever this cycle produced no executable work. The old gate
-         only checked [should_execute_strategy] and [has_exec_fn], so a latched
-         execute flag whose execution was blocked (notably the equity session
-         being closed) skipped the wait and spun at 100% CPU. The flag stays
-         set, so the next wake re-evaluates and executes as soon as conditions
-         allow - and every condition that can unblock it is event-driven: a new
-         book/exec frame, an oracle publish, or the first data at the session
-         open. No polling sleep. *)
+      (* Blocks until a producer signals new data or data is ready. Uses the
+            cached has_exec_fn closure to avoid a Hashtbl lookup. [wait_since]
+            returns immediately if a producer signalled while this cycle ran, so
+            a racing signal is not lost to the park. *)
+      (* Parks whenever this cycle produced no executable work. The execute flag
+         stays set, so the next event-driven wake re-evaluates it; every
+         condition that can unblock it (new book/exec frame, oracle publish,
+         first data at session open) is a signal. No polling sleep. *)
       if not should_execute
       then Concurrency.Exchange_wakeup.wait_since_fast wakeup_sync ~since:wake_baseline;
       if !exec_ready && (not !latency_active) && !cycle_count - !exec_ready_cycle >= 10
@@ -1786,10 +1635,9 @@ let start_domain config state fee_fetcher =
      | None -> ());
     let domain_handle =
       Domain.spawn (fun () ->
-        (* Catch ALL exceptions including those from apply_gc_config.
-         Previously apply_gc_config was outside the try/with, so a
-         CamlinternalLazy.Undefined from concurrent Lazy.force on the
-         shared cached_gc_config would silently kill the domain. *)
+        (* Catch all exceptions including from apply_gc_config: a
+         CamlinternalLazy.Undefined from concurrent Lazy.force on the shared
+         cached_gc_config would otherwise silently kill the domain. *)
         try
           Config.apply_gc_config ();
           Logging.debug_f
@@ -1812,8 +1660,8 @@ let start_domain config state fee_fetcher =
             asset.exchange
             asset.symbol
             (Printexc.to_string exn);
-          (* Mark domain as stopped; notify supervisor for potential restart.
-           domain_handle is preserved for join on next start_domain call. *)
+          (* Mark stopped and notify the supervisor; domain_handle is preserved
+           for join on the next start_domain call. *)
           Atomic.set state.is_running false;
           notify_domain_died ();
           ())
@@ -1869,7 +1717,7 @@ let domain_needs_restart state =
 
 (** Persistent waker thread: signals domain_died_cond every 5s so the
     supervisor loop wakes on a regular cadence even when no domain crashes.
-    Allocated once at module load to avoid per-iteration thread leaks. *)
+    Allocated once at module load. *)
 let _supervisor_waker_thread : Thread.t =
   Thread.create
     (fun () ->
@@ -1946,12 +1794,10 @@ let spawn_supervised_domains_for_assets
   Dio_strategies.Market_maker.Strategy.init ();
   (* Register each asset in the domain registry *)
   List.iter (fun asset -> ignore (register_domain asset)) assets;
-  (* Pre-force the shared cached_gc_config Lazy before spawning domains.
-     OCaml 5 domains that concurrently Lazy.force the same value race:
-     the first domain computes while others block, but if the computing
-     domain fails, blocked domains get CamlinternalLazy.Undefined.
-     Forcing here in the main domain eliminates the race entirely.
-     (Same pattern as the Conduit context pre-force in main.ml.) *)
+  (* Pre-force the shared cached_gc_config Lazy before spawning domains: OCaml 5
+     domains concurrently forcing the same value race, and if the computing
+     domain fails the others get CamlinternalLazy.Undefined. Forcing in the main
+     domain eliminates the race. *)
   Config.apply_gc_config ();
   (* Spawn the initial domain for each registered asset *)
   Mutex.lock registry_mutex;
@@ -1988,16 +1834,12 @@ let clear_domain_registry () =
   Mutex.unlock registry_mutex
 ;;
 
-(** Return latency profiler snapshots for all domains from their most
-    recently completed windows.
-    Result type: (symbol, [(label, snapshot option)]) list.
-    Safe to call from the dashboard; does not touch live profiler state.
+(** Returns latency profiler snapshots for all domains from their most recently
+    completed windows. Result type: (symbol, [(label, snapshot option)]) list.
 
-    Reads the immutable snapshots published by each domain's rolling window
-    via [Latency_profiler.published_snapshot], a lock-free [Atomic.get].
-    No percentile scan runs against a histogram that the domain thread is
-    concurrently mutating, which eliminates the torn-read race between the
-    dashboard and the domain writer. *)
+    Reads immutable snapshots published via [Latency_profiler.published_snapshot]
+    (lock-free [Atomic.get]); no percentile scan touches a histogram being
+    mutated by a domain thread. Safe to call from the dashboard. *)
 let get_domain_profiler_snapshots () =
   Mutex.lock profiler_cache_mutex;
   let profiler_refs =
@@ -2043,12 +1885,11 @@ let stop_all_domains () =
         wait_for_stop (max_wait -. 0.1)))
   in
   wait_for_stop 10.0;
-  (* Final persistence flush: [flush_persistence] only runs inside the
-     domain cycle, so any strategy state that became dirty in the last
-     cycles before shutdown (accumulation P&L, last_fill_oid, sell levels)
-     would otherwise never reach the save queue - the at_exit [flush_all]
-     drains only what is already queued. Domains are stopped, so this runs
-     after the last mutation of each state and cannot race a cycle. *)
+  (* Final persistence flush. [flush_persistence] only runs inside the domain
+     cycle, so state dirtied in the last cycles before shutdown (accumulation
+     P&L, last_fill_oid, sell levels) would never reach the save queue; at_exit
+     [flush_all] drains only what is queued. Domains are stopped, so this cannot
+     race a cycle. *)
   List.iter
     (fun state ->
        let strategy = state.asset.strategy in

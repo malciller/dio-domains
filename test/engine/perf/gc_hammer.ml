@@ -1,11 +1,9 @@
-(* OxCaml marks [Domain.spawn] as [do_not_spawn_domains] (unbounded domains
-   degrade GC) and [unsafe_multidomain] (use [Domain.Safe.spawn]). This is a
-   standalone GC latency benchmark: it deliberately runs a fixed, small set of
-   short-lived worker domains, each with its own heap, to measure the
-   stop-the-world effect of concurrent allocation. That is the behaviour under
-   test, and [Multicore] (the recommended replacement) does not exist on the
-   classic toolchain this benchmark also builds under, so the alerts are
-   acknowledged rather than rewriting the test. *)
+(* OxCaml flags [Domain.spawn] as [do_not_spawn_domains] (unbounded domains
+   degrade GC) and [unsafe_multidomain]. This standalone benchmark runs a
+   fixed, small set of short-lived worker domains with private heaps to measure
+   the stop-the-world effect of concurrent allocation - the behaviour under
+   test. [Multicore] is absent on the classic toolchain this also builds under,
+   so the alerts are acknowledged. *)
 [@@@alert "-unsafe_multidomain"]
 [@@@alert "-do_not_spawn_domains"]
 
@@ -25,7 +23,7 @@ let setup_huge_heap id =
 
 let simulate_tick local_cache profiler tick_id =
   let span_start = Mtime_clock.now_ns () in
-  (* 1. High Velocity Minor Allocation *)
+  (* Phase 1: minor allocation churn. *)
   let msgs =
     List.init 250 (fun i ->
       let price = 50000.0 +. float_of_int (i mod 100) in
@@ -38,8 +36,8 @@ let simulate_tick local_cache profiler tick_id =
   in
   let parsed = List.map String.length msgs in
   let _sum = List.fold_left ( + ) 0 parsed in
-  (* 2. Write Barrier Trigger *)
-  (* Mutate old generation with new generation pointers continuously *)
+  (* Phase 2: write-barrier trigger; mutate the old generation with
+     new-generation pointers. *)
   let target_index = tick_id mod 50_000 in
   let key = Printf.sprintf "order-%d" target_index in
   let new_dynamic_str = Printf.sprintf "updated-value-%Ld" span_start in
@@ -84,7 +82,7 @@ let () =
   Printf.printf "AVG P99 Latency:  %10.2f us\n" avg_p99;
   Printf.printf "AVG P999 Latency: %10.2f us\n" avg_p999;
   Printf.printf "MAX P999 Latency: %10.2f us\n" max_p999;
-  (* We output a machine-readable line line MAX_P999: value so the bash script can grep it *)
+  (* Machine-readable metric lines consumed by the sweep script. *)
   Printf.printf "SWEEP_METRIC_P99: %10.2f\n" avg_p99;
   Printf.printf "SWEEP_METRIC_MAX_P999: %10.2f\n" max_p999;
   Printf.printf "=============================================\n%!"

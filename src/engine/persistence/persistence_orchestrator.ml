@@ -1,44 +1,41 @@
 (** Shared persistence infrastructure for the split persistence stores.
 
-    One [t] instance owns ONE data file. It provides:
+    One [t] instance owns one data file. It provides:
     - directory resolution (/app/data in Docker, ./data locally)
-    - lazy disk read + in-memory JSON tree mirror (saves re-serialize the
-      cached tree instead of re-reading the disk - the same pattern that
-      keeps the background writer's allocations from triggering major-GC
-      stop-the-world pauses in strategy domains)
-    - per-store mutex, O(1) cached reads, latest-wins coalescing async saves
-      drained by a dedicated background domain
-    - hardened atomic writes: temp file -> flush -> fsync -> rename
+    - lazy disk read plus an in-memory JSON tree mirror; saves re-serialize the
+      cached tree instead of re-reading disk, keeping the background writer's
+      allocations from triggering major-GC stop-the-world pauses in strategy
+      domains
+    - a per-store mutex, O(1) cached reads, and latest-wins coalescing async
+      saves drained by a dedicated background domain
+    - atomic writes: temp file -> flush -> fsync -> rename
     - corrupt-file backup (<name>.corrupt.<ts>) instead of silent discard
 
-    No domain logic lives here: stores supply [parse]/[serialize] for their
-    own value type and register a migration hook for legacy entries via
-    [register_migrate_hook]; [migrate_if_legacy] detects the legacy flat
-    symbol-keyed accumulated_state.json and fans each entry out to the
-    registered hooks. *)
+    No domain logic lives here: stores supply [parse]/[serialize] for their own
+    value type and register a migration hook via [register_migrate_hook].
+    [migrate_if_legacy] detects the legacy flat symbol-keyed
+    accumulated_state.json and fans each entry out to the registered hooks. *)
 
 (* OxCaml marks [Domain.spawn] as [do_not_spawn_domains]. This module spawns one
-   bounded background drain domain per store instance (a small fixed set), by
-   design, so persistence never blocks a trading domain. Acknowledged rather
-   than rewritten. *)
+   bounded background drain domain per store instance (a small fixed set) so
+   persistence never blocks a trading domain. *)
 [@@@alert "-unsafe_multidomain"]
 [@@@alert "-do_not_spawn_domains"]
 
 let section = "persistence_orchestrator"
 
-(* Cumulative count of failed disk writes, surfaced on every failure warn so a
-   persistent condition (ENOSPC, EACCES) is visible at a glance rather than
-   buried in repeating lines. *)
+(* Cumulative failed disk writes, surfaced on every failure warn so a persistent
+   condition (ENOSPC, EACCES) is visible instead of buried in repeating lines. *)
 let save_failures = Atomic.make 0
 
-(* Drain closures registered at creation so [flush_all] can synchronously
-   flush every store at shutdown. A closure hides the per-store ['a] so the
-   registry stays homogeneous. *)
+(* Drain closures registered at creation so [flush_all] can synchronously flush
+   every store at shutdown. A closure hides the per-store ['a], keeping the
+   registry homogeneous. *)
 let drainers : (unit -> unit) list ref = ref []
 
-(** Base directory for state files. Resolves to /app/data in Docker, ./data
-    locally; DIO_DATA_DIR overrides (used by tests for hermetic fixtures).
-    Computed per call so tests can redirect before touching a store. *)
+(** Base directory for state files: /app/data in Docker, ./data locally;
+    [DIO_DATA_DIR] overrides (tests use it for hermetic fixtures). Computed per
+    call so tests can redirect before touching a store. *)
 let state_dir () =
   match Sys.getenv_opt "DIO_DATA_DIR" with
   | Some dir -> dir
@@ -68,9 +65,9 @@ type 'a t =
 
 let file_path t = Filename.concat (state_dir ()) t.filename
 
-(** Atomic write: temp file -> flush -> fsync -> rename. Keeps the in-memory
-    tree mirror in sync so the next save serializes directly without re-reading
-    the disk. Must be called under [t.file_mutex]. *)
+(** Atomic write: temp file -> flush -> fsync -> rename. Keeps the in-memory tree
+    mirror in sync so the next save serializes without re-reading disk. MUST be
+    called under [t.file_mutex]. *)
 let write_file_unsafe t tree =
   ensure_dir ();
   let path = file_path t in
@@ -82,21 +79,20 @@ let write_file_unsafe t tree =
        output_string oc (Yojson.Basic.pretty_to_string tree);
        output_char oc '\n';
        flush oc;
-       (* fsync the temp file before rename so a crash after rename cannot
-         leave a truncated/empty target (power-loss durability). *)
+       (* fsync the temp file before rename so a crash after rename cannot leave
+          a truncated/empty target (power-loss durability). *)
        try Unix.fsync (Unix.descr_of_out_channel oc) with
        | _ -> ());
   Sys.rename tmp path;
   t.file_tree <- Some tree
 ;;
 
-(** Extracts every [key : { balanced-object }] pair from [text], tolerating
-    garbage BETWEEN pairs: stray braces, commas, doubled documents, truncated
-    tails. Each candidate object is validated with the real JSON parser
-    before being accepted, and keys keep their LAST occurrence (latest-wins).
-    This exists because operators hand-edit these files, and the store must
+(** Extract every [key : { balanced-object }] pair from [text], tolerating garbage
+    between pairs: stray braces, commas, doubled documents, truncated tails. Each
+    candidate is validated with the real JSON parser; keys keep their last
+    occurrence (latest-wins). Operators hand-edit these files, and the store must
     not zero accruals over a syntax slip such as appending a second top-level
-    object instead of adding a key inside the existing one. *)
+    object instead of a key inside the existing one. *)
 let salvage_assoc (text : string) : (string * Yojson.Basic.t) list =
   let len = String.length text in
   let is_ws c = c = ' ' || c = '\n' || c = '\r' || c = '\t' in
@@ -150,13 +146,12 @@ let salvage_assoc (text : string) : (string * Yojson.Basic.t) list =
   List.rev (Hashtbl.fold (fun k v acc -> (k, v) :: acc) results [])
 ;;
 
-(** Reads and parses the store's data file. Returns an empty assoc on missing
-    or unreadable files. On CORRUPT JSON a salvage pass first extracts every
-    well-formed key/object pair it can find (recovers the common hand-edit
-    mistake of appending a second top-level document); the cleaned merge is
-    written back immediately, and whatever cannot be salvaged stays in the
-    <name>.corrupt.<ts> backup - never silently discarded. Must be called
-    under [t.file_mutex]. *)
+(** Read and parse the store's data file; empty assoc when missing or unreadable.
+    On corrupt JSON, salvage every well-formed key/object pair first (recovers
+    the common hand-edit mistake of appending a second top-level document), write
+    the cleaned merge back, and back the original up to <name>.corrupt.<ts>;
+    nothing salvageable is silently discarded. MUST be called under
+    [t.file_mutex]. *)
 let read_file_unsafe t : Yojson.Basic.t =
   let path = file_path t in
   if not (Sys.file_exists path)
@@ -231,9 +226,8 @@ let update_entry t key entry_json =
        try attempt () with
        | Sys_error _ | Unix.Unix_error _ ->
          (* Transient disk failure (ENOSPC, EACCES, rename race): retry once
-            after a short pause before surfacing. This runs under file_mutex;
-            it is only hit on the rare failure path, and update_entry is never
-            called from a hot strategy domain. *)
+            after a short pause before surfacing. Runs under file_mutex on the
+            rare failure path; update_entry is never called from a hot domain. *)
          (try Thread.delay 0.05 with
           | _ -> ());
          (try attempt () with
@@ -257,7 +251,8 @@ let update_entry t key entry_json =
            (Printexc.to_string exn))
 ;;
 
-(** Ensures the whole file is parsed into the per-key cache (lazy first read). Must be called under both mutexes in the caller-chosen order. *)
+(** Parse the whole file into the per-key cache (lazy first read). MUST be called
+    under both mutexes in the caller-chosen order. *)
 let populate_cache_unsafe t =
   let tree = read_file_unsafe t in
   let entries = t.parse tree in
@@ -300,11 +295,10 @@ let put t ~key value =
   update_entry t key (t.serialize value)
 ;;
 
-(** Coalesced async save: latest-wins per key. Only the LATEST snapshot per
-    key matters (each snapshot carries the full state), so the queue is a
-    table that overwrites; the worker drains the whole table and writes each
-    key once. This collapses redundant full-file rewrites when a hot loop
-    marks the store dirty cycle after cycle. *)
+(** Coalesced async save, latest-wins per key. Each snapshot carries full state,
+    so the queue is a table that overwrites and the worker writes each key once.
+    This collapses redundant full-file rewrites when a hot loop marks the store
+    dirty every cycle. *)
 let rec background_worker t () =
   Mutex.lock t.save_queue_mutex;
   while Hashtbl.length t.save_queue = 0 do
@@ -319,10 +313,10 @@ let rec background_worker t () =
   (try
      Hashtbl.iter
        (fun k v ->
-          (* Serialize is evaluated BEFORE update_entry's internal try, so an
-             exception here would otherwise escape the worker and kill the
-             persistence domain (all future saves silently lost). Guard it
-             per-key: skip the bad entry, keep the rest. *)
+          (* Serialize is evaluated before update_entry's internal try, so an
+             exception here would escape the worker and kill the persistence
+             domain (all future saves lost). Guard per key: skip the bad entry,
+             keep the rest. *)
           let json =
             match t.serialize v with
             | json -> Some json
@@ -341,8 +335,8 @@ let rec background_worker t () =
        pending
    with
    | exn ->
-     (* Any other escaping exception must not kill the persistence domain -
-        otherwise every future save is silently lost. Log and keep draining. *)
+     (* Any other escaping exception must not kill the persistence domain, or
+        every future save is lost. Log and keep draining. *)
      Logging.critical_f
        ~section
        "Persistence worker for %s aborted a drain cycle (%s); continuing"
@@ -352,8 +346,8 @@ let rec background_worker t () =
 ;;
 
 let put_async t ~key value =
-  (* Update the read cache immediately so a load after an async save observes
-     the latest value even before the background writer flushes to disk. *)
+  (* Update the read cache immediately so a load after an async save observes the
+     latest value before the background writer flushes to disk. *)
   Mutex.lock t.cache_mutex;
   Hashtbl.replace t.cache key value;
   Mutex.unlock t.cache_mutex;
@@ -402,10 +396,9 @@ let create ~filename ~parse ~serialize =
 ;;
 
 (** Synchronously drain every store's coalesced save queue. Used at shutdown so
-    in-memory state (accumulation P&L, reserved_base, last_fill_oid, sell
-    levels) reaches disk before the process exits, instead of being dropped by
-    the coalesce window. Fire-and-forget background writes that are still
-    queued when SIGTERM/SIGINT lands are otherwise lost. *)
+    in-memory state (accumulation P&L, reserved_base, last_fill_oid, sell levels)
+    reaches disk before exit instead of being dropped by the coalesce window;
+    queued background writes are otherwise lost on SIGTERM/SIGINT. *)
 let flush_all () = List.iter (fun drain -> drain ()) !drainers
 
 (** All keys currently known to the store (cache + file). *)
@@ -433,17 +426,16 @@ let keys t =
   result
 ;;
 
-(** Configured strategies registered at startup (from config.json's trading
-    entries): (strategy_name, symbol, venue, base_accumulation, sell_levels)
-    tuples. Migration consults this to auto-map legacy symbol-keyed entries
-    to full strategy keys when exactly one configured strategy matches the
-    symbol. The opt-in flags let the strategy layer achieve STRICT opt-out
-    semantics: when a subsystem is disabled for a symbol, hydration skips
-    that store entirely (zero reads), not just zero writes. *)
+(** Configured strategies registered at startup from config.json's trading
+    entries: (strategy_name, symbol, venue, base_accumulation, sell_levels).
+    Migration uses this to map legacy symbol-keyed entries to full strategy keys
+    when exactly one configured strategy matches the symbol. The opt-in flags
+    give strict opt-out: when a subsystem is disabled for a symbol, hydration
+    skips that store entirely (zero reads, not just zero writes). *)
 let configured_strategies : (string * string * string * bool * bool) list ref = ref []
 
-(** Bumped whenever the configured-strategy registry is (re)registered, so
-    callers that cache a symbol -> strategy:venue resolution can invalidate. *)
+(** Bumped whenever the configured-strategy registry is registered, so callers
+    caching a symbol -> strategy:venue resolution can invalidate. *)
 let configured_strategies_version = Atomic.make 0
 
 let register_configured_strategies entries =
@@ -453,8 +445,8 @@ let register_configured_strategies entries =
 
 let current_configured_strategies_version () = Atomic.get configured_strategies_version
 
-(** Returns the unique configured strategy matching [symbol], or None (zero or
-    ambiguous matches). *)
+(** The unique configured strategy matching [symbol], or [None] for zero or
+    ambiguous matches. *)
 let unique_configured_strategy_for_symbol symbol =
   let matches =
     List.filter (fun (_, sym, _, _, _) -> sym = symbol) !configured_strategies
@@ -464,9 +456,9 @@ let unique_configured_strategy_for_symbol symbol =
   | _ -> None
 ;;
 
-(** Returns the per-strategy persistence opt-in flags for [symbol] when
-    exactly one configured strategy matches, else None. Flags default to the
-    spec defaults (base_accumulation: true, sell_levels: false) when unknown. *)
+(** Per-strategy persistence opt-in flags for [symbol] when exactly one
+    configured strategy matches; [None] otherwise. Unknown symbols use the spec
+    defaults (base_accumulation: true, sell_levels: false). *)
 let opt_in_flags_for_symbol symbol =
   let matches =
     List.filter (fun (_, sym, _, _, _) -> sym = symbol) !configured_strategies
@@ -499,17 +491,17 @@ let sell_levels_opted_in symbol =
 (* Legacy migration                                                    *)
 (* ------------------------------------------------------------------ *)
 
-(** Hooks registered by the concrete stores: each receives one legacy entry
-    (symbol, raw JSON) and decides what to import from it and under which key. *)
+(** Hooks registered by concrete stores: each receives one legacy entry
+    (symbol, raw JSON) and decides what to import and under which key. *)
 let migrate_hooks : (string -> Yojson.Basic.t -> unit) list ref = ref []
 
 let register_migrate_hook f = migrate_hooks := f :: !migrate_hooks
 let legacy_file () = Filename.concat (state_dir ()) "accumulated_state.json"
 
-(** Detects the legacy flat symbol-keyed accumulated_state.json, splits every
-    entry into the new stores via registered hooks, and renames the original
-    to accumulated_state.json.migrated.<ts> (retained until prod
-    verification). Called once at startup, before any strategy hydrates. *)
+(** Detect the legacy flat symbol-keyed accumulated_state.json, split every entry
+    into the new stores via registered hooks, and rename the original to
+    accumulated_state.json.migrated.<ts>. Called once at startup, before any
+    strategy hydrates. *)
 let migrate_if_legacy () =
   let path = legacy_file () in
   if Sys.file_exists path

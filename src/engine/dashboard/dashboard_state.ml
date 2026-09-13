@@ -1,6 +1,5 @@
-(** Dashboard state serialization.
-    Aggregates engine state from multiple modules and serializes it
-    as JSON for transmission to the TUI dashboard via Unix domain socket. *)
+(** Dashboard state serialization. Aggregates engine state from multiple modules
+    and serializes it as JSON for the TUI dashboard over a Unix domain socket. *)
 
 module Exchange = Dio_exchange.Exchange_intf
 module Fear_and_greed = Cmc.Fear_and_greed
@@ -80,21 +79,17 @@ let json_of_domains () =
 
 (* Strategy state: Grid *)
 
-(* Concurrency note: this encoder reads grid strategy state WITHOUT
-   state.mutex, from the dashboard server context (main domain), while the
-   symbol's asset domain mutates it. This is deliberate and benign under
-   OCaml 5's representation: every field read here is either a word-sized
-   slot swapped atomically in practice (floats are boxed immutable values,
-   options/strings are pointers) or an immutable list replaced wholesale,
-   so a concurrent reader observes either the old or the new value - never
-   a torn mix within a field. Worst case is one dashboard poll showing a
-   snapshot a few fields apart in time; no update can be lost (readers do
-   no read-modify-write). Writers from other threads were eliminated by the
-   lifecycle event queues (grid H3 / MM R2): only the symbol's domain
-   thread mutates this state now. Do NOT add locking here without also
-   shrinking the domain's whole-cycle critical section - blocking the
-   dashboard on a full strategy cycle would trade a cosmetic race for a
-   real stall. *)
+(* Concurrency: this encoder reads grid strategy state without state.mutex,
+   from the dashboard server (main domain), while the symbol's asset domain
+   mutates it. Benign under OCaml 5: every field read is a word-sized slot
+   swapped atomically (boxed immutable floats, pointer options/strings) or an
+   immutable list replaced wholesale, so a reader sees the old or new value,
+   never a torn mix; no update can be lost (readers do no read-modify-write).
+   Only the symbol's domain thread mutates this state (writers from other
+   threads were removed by the lifecycle event queues, grid H3 / MM R2). Do not
+   add locking here unless the domain's whole-cycle critical section also
+   shrinks; blocking the dashboard on a full strategy cycle trades a cosmetic
+   race for a real stall. *)
 let json_of_grid_strategy exchange symbol =
   let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
   let exch = Exchange.Types.exchange_of_string exchange in
@@ -104,12 +99,11 @@ let json_of_grid_strategy exchange symbol =
     | Alpaca -> not (Alpaca.Market_hours.is_market_open ())
     | _ -> false
   in
-  (* The live sell set the SELLS count reports. The venue feed alone is not
-     enough: Kraken's open-order cache can drop a resting sell, which showed
-     as 0 pending sells while the order still rested. The in-flight ledger is
-     armed at dispatch and kept across feed gaps, so union it with the feed
-     (dedup by order id; the feed wins when it lists the order, since its
-     remaining qty is fresher). No new column - this is the same count. *)
+  (* Sell set for the SELLS count. The venue feed alone is insufficient:
+     Kraken's open-order cache can drop a resting sell (reported 0 pending while
+     the order rested). The in-flight ledger is armed at dispatch and kept across
+     feed gaps, so union it with the feed, deduped by order id (the feed wins,
+     its remaining qty is fresher). Same count, no new column. *)
   let sell_orders =
     let seen = Hashtbl.create 16 in
     let from_feed =
@@ -200,8 +194,8 @@ let json_of_mm_strategy exchange symbol =
 
 (* Per-symbol market data *)
 
-(** Splits a trading symbol on '/' into (base_asset, quote_currency).
-    Defaults quote to "USD" when no delimiter is present. *)
+(** Split a trading symbol on '/' into (base_asset, quote_currency); quote
+    defaults to "USD" when no delimiter is present. *)
 let split_symbol symbol =
   if String.contains symbol '/'
   then (
@@ -406,10 +400,10 @@ let json_of_latency_snapshot (snap : Latency_profiler.snapshot) =
 ;;
 
 (** Merge the capital-oracle per-asset latency windows into the per-domain
-    latency map under the "oracle" label, so the dashboard's ENGINE LATENCY
-    rows show how long the oracle's per-asset pipeline took this pass. Keys
-    match the trading-config symbols the domains are keyed by (case
-    insensitive); the original key spelling is preserved. *)
+    latency map under the "oracle" label, so ENGINE LATENCY rows show this
+    pass's per-asset oracle pipeline time. Keys match the trading-config symbols
+    the domains are keyed by, case-insensitively; the original spelling is
+    preserved. *)
 let merge_oracle_asset_latencies latencies =
   let by_symbol = Hashtbl.create 16 in
   List.iter
@@ -430,13 +424,11 @@ let merge_oracle_asset_latencies latencies =
   Hashtbl.fold (fun _ (orig, json) acc -> (orig, json) :: acc) by_symbol []
 ;;
 
-(** Merge the per-venue network latency windows into the per-domain latency
-    map under the NETWORK-page labels (ws_ping / ws_feed / rest_request /
-    signer), so the dashboard's ENGINE LATENCY rows show the network
-    characteristics of each domain's venue. Keys match the trading-config
-    symbols the domains are keyed by (case insensitive). Venues that never
-    had a network measurement are simply absent; the NETWORK page renders
-    "--" for them. *)
+(** Merge the per-venue network latency windows into the per-domain latency map
+    under the NETWORK-page labels (ws_ping / ws_feed / rest_request / signer), so
+    ENGINE LATENCY rows show each domain venue's network characteristics. Keys
+    match the trading-config symbols the domains are keyed by, case-insensitively.
+    Venues with no network measurement are absent; the NETWORK page renders "--". *)
 let merge_network_latencies latencies =
   let by_symbol = Hashtbl.create 16 in
   List.iter
@@ -485,9 +477,8 @@ let json_of_domain_latencies () =
   `Assoc (merge_network_latencies (merge_oracle_asset_latencies latencies))
 ;;
 
-(** The engine-global capital-oracle latency windows (per-pass stages),
-    serialized for the dashboard's latency cards. Empty until the runtime has
-    completed its first pass. *)
+(** Engine-global capital-oracle latency windows (per-pass stages), serialized
+    for the latency cards. Empty until the runtime completes its first pass. *)
 let json_of_oracle_latency () =
   let snaps = Dio_oracle.Oracle_runtime.profiler_snapshots () in
   `Assoc
@@ -527,9 +518,8 @@ let json_of_memory () =
     ]
 ;;
 
-(** One capital-oracle decision, serialized for the dashboard: the dashboard
-    shows the oracle's ACTIVE/INACTIVE verdict (the pause state), the sizing
-    it published and how much capital it consumed. *)
+(** One capital-oracle decision, serialized for the dashboard: the ACTIVE/INACTIVE
+    verdict (pause state), the sizing it published, and the capital consumed. *)
 let json_of_decision (d : Dio_oracle.Oracle_runtime.decision) =
   `Assoc
     [ "exchange", `String d.exchange
@@ -550,8 +540,7 @@ let json_of_decision (d : Dio_oracle.Oracle_runtime.decision) =
     ]
 ;;
 
-(** All current oracle decisions, keyed by symbol (one decision per tracked
-    asset). *)
+(** All current oracle decisions, keyed by symbol (one per tracked asset). *)
 let json_of_oracle_decisions () =
   let decisions = Dio_oracle.Oracle_runtime.decisions () in
   `Assoc
@@ -605,9 +594,9 @@ let build_snapshot () =
     | Some v -> `Float v
     | None -> `Null
   in
-  (* Per-symbol strategy state, market data and the capital-oracle decision
-     (the oracle verdict drives the dashboard's paused status; before the
-     first oracle pass there is no decision and the oracle field is null). *)
+  (* Per-symbol strategy state, market data, and capital-oracle decision. The
+     oracle verdict drives the dashboard's paused status; before the first oracle
+     pass there is no decision and the oracle field is null. *)
   let oracle_by_symbol =
     match json_of_oracle_decisions () with
     | `Assoc l -> l
@@ -646,8 +635,8 @@ let build_snapshot () =
              ] ))
       config.trading
   in
-  (* Aggregate balances from all registered exchanges,
-     enriched with ticker data and open sell orders *)
+  (* Aggregate balances from all registered exchanges, enriched with ticker data
+     and open sell orders. *)
   let configured_symbols =
     List.map
       (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange, tc.symbol)
@@ -740,9 +729,9 @@ let build_snapshot () =
                     try Ex.get_tradeable_balance ~asset with
                     | _ -> bal
                   in
-                  (* Retrieve open sell orders for this symbol.
-               Also query across all symbol stores for this asset to catch
-               orders stored under alternative symbol keys. *)
+                  (* Open sell orders for this symbol; also query all symbol
+                     stores for this asset to catch orders under alternative
+                     symbol keys. *)
                   let open_orders = Ex.get_open_orders ~symbol in
                   let asset_orders = Ex.get_all_orders_for_asset ~asset in
                   let seen = Hashtbl.create 8 in

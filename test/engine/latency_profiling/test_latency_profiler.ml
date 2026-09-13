@@ -3,7 +3,7 @@ module LP = Latency_profiler
 
 let test_basic () =
   let t = LP.create "test" in
-  (* Record 100 samples of 10us *)
+  (* Fixture: 100 samples at 10us. *)
   for _ = 1 to 100 do
     LP.record t (Mtime.Span.of_uint64_ns 10000L)
   done;
@@ -17,7 +17,7 @@ let test_basic () =
 
 let test_distribution () =
   let t = LP.create "dist" in
-  (* 50 samples of 10us, 50 samples of 20us *)
+  (* Fixture: 50 at 10us, 50 at 20us. *)
   for _ = 1 to 50 do
     LP.record t (Mtime.Span.of_uint64_ns 10000L)
   done;
@@ -32,7 +32,7 @@ let test_distribution () =
 
 let test_percentile_accuracy () =
   let t = LP.create "accuracy" in
-  (* 90 samples at 5us, 10 samples at 100us *)
+  (* Fixture: 90 at 5us, 10 at 100us. *)
   for _ = 1 to 90 do
     LP.record t (Mtime.Span.of_uint64_ns 5000L)
   done;
@@ -52,7 +52,7 @@ let test_percentile_accuracy () =
 
 let test_overflow () =
   let t = LP.create "overflow" in
-  (* Record a sample well above max_latency_us (10ms = 10000us) *)
+  (* Above max_latency_us (10ms = 10000us). *)
   LP.record t (Mtime.Span.of_uint64_ns 50_000_000L);
   (* 50ms *)
   LP.record t (Mtime.Span.of_uint64_ns 5000L);

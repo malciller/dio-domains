@@ -1,11 +1,10 @@
-(** Order lifecycle operations for the IBKR TWS API: placement,
-    modification, and cancellation.
+(** Order lifecycle for the IBKR TWS API: placement, modification,
+    cancellation.
 
-    Rate limiting is omitted: TWS accepts ~50 messages/second, above this
-    application's throughput.
+    Rate limiting omitted: TWS accepts ~50 msg/s, above this adapter's rate.
 
-    Orders go out as placeOrder messages (msgId 3). Fills and status
-    arrive asynchronously via orderStatus/openOrder and are processed by
+    Placement and modification use placeOrder (msgId 3). Fills and status
+    arrive asynchronously via orderStatus/openOrder, handled by
     [Ibkr_executions_feed]. *)
 
 open Lwt.Infix
@@ -27,7 +26,7 @@ let place_order
   Ibkr_contracts.resolve conn ~symbol
   >>= fun contract ->
   let order_id = Ibkr_connection.get_next_order_id conn in
-  (* Map order id -> symbol for execution tracking. *)
+  (* Route executions: order id -> symbol. *)
   Ibkr_executions_feed.register_order ~order_id ~symbol;
   let order =
     match order_type with

@@ -1,13 +1,13 @@
 (** Central order processing loop. Drains pending orders from all strategy
-    ring buffers (grid, market maker, hedger) and dispatches them to the
-    Order_executor via Lwt.async. Blocks on OrderSignal when idle.
+    ring buffers (grid, market maker, hedger) and dispatches them to
+    [Order_executor] via [Lwt.async]. Blocks on [OrderSignal] when idle.
 
-    Uses a unified dispatch pipeline with strategy-specific callbacks
-    to eliminate duplicated order handling code. *)
+    Uses a unified dispatch pipeline with strategy-specific callbacks to
+    avoid duplicated order handling. *)
 
 open Lwt.Infix
 
-(* Shared order types (side, operation, strategy_order). *)
+(* Shared order types: side, operation, strategy_order. *)
 open Dio_strategies.Strategy_common
 open Supervisor_types
 open Supervisor_connection
@@ -18,8 +18,8 @@ let section = "order_processor"
    Strategy callback interface
    -------------------------------------------------------------------------- *)
 
-(** Per-strategy callbacks invoked during order lifecycle events.
-    Each strategy provides its own implementation to preserve unique behavior. *)
+(** Per-strategy callbacks invoked during order lifecycle events. Each
+    strategy supplies its own implementation to preserve unique behavior. *)
 type strategy_callbacks =
   { on_place_ok : strategy_order -> string (* order_id *) -> unit
   ; on_place_fail : strategy_order -> string (* error *) -> unit
@@ -56,11 +56,10 @@ let contains_fragment s fragment =
 ;;
 
 (** True when a placement error means the strategy's inventory view diverged
-    from the venue: a shorting/capacity rejection proves the venue was
-    holding the funds (a resting order the local view missed) or that the
-    position was already consumed (an unobserved fill). Retrying against a
-    stale view just re-sells inventory the account no longer has - the BOTZ
-    20:02 "account is not allowed to short" incident. *)
+    from the venue: a shorting/capacity rejection proves the venue held the
+    funds (a resting order the local view missed), or the position was already
+    consumed (an unobserved fill). Retrying against a stale view re-sells
+    inventory the account no longer has. *)
 let is_inventory_rejection err =
   let lower = String.lowercase_ascii err in
   contains_fragment lower "not allowed to short"
@@ -76,29 +75,27 @@ let is_inventory_rejection err =
 
 let reconciliation_in_flight = Atomic.make false
 
-(** Set when a rejection arrives while a reconcile is already running, so
-    the running reconcile re-runs once after finishing instead of silently
-    dropping the suppression (the dropped rejection's desync could predate
-    the running reconcile's balance snapshot). *)
+(** Set when a rejection arrives during an in-flight reconcile; the running
+    reconcile then re-runs once after finishing. Dropping it silently is
+    unsafe because its desync may predate the running reconcile's balance
+    snapshot. *)
 let reconciliation_pending = Atomic.make false
 
 (** Event-driven reconciliation after an inventory-class placement rejection:
-    re-bootstrap the venue's open orders and balances, then let their
-    completion wakeups re-run the symbol's strategy against fresh state.
+    re-bootstrap the venue's open orders and balances; their completion
+    wakeups re-run the symbol's strategy against fresh state.
 
-    Alpaca only - its balances are GROSS (open-order holds are not netted),
-    so a fill event the strategy missed leaves the ladder believing it still
-    holds sellable inventory. Other venues report tradeable (hold-netted)
-    balances and are not exposed to this desync class. *)
+    Alpaca only: its balances are gross (open-order holds are not netted), so
+    a missed fill leaves the ladder believing it still holds sellable
+    inventory. Other venues report tradeable (hold-netted) balances. *)
 let refresh_inventory_state_on_rejection (order : strategy_order) err =
   if String.equal order.exchange "alpaca" && is_inventory_rejection err
   then (
     let rec run ~with_open_orders =
       match Atomic.compare_and_set reconciliation_in_flight false true with
       | false ->
-        (* A reconcile is already running. Never drop the rejection
-           silently: queue exactly one re-run - the current reconcile's
-           snapshot may predate this rejection's desync. *)
+        (* A reconcile is running: queue exactly one re-run; the current
+           reconcile's snapshot may predate this rejection's desync. *)
         Atomic.set reconciliation_pending true;
         Logging.warn_f
           ~section
@@ -134,8 +131,8 @@ let refresh_inventory_state_on_rejection (order : strategy_order) err =
           >>= fun () ->
           Atomic.set reconciliation_in_flight false;
           (* The queued re-run always includes the open-orders bootstrap:
-             the suppressed rejection's side is unknown here, and the extra
-             bootstrap is a cheap idempotent fetch. *)
+             the suppressed rejection's side is unknown, and the bootstrap is
+             a cheap idempotent fetch. *)
           if Atomic.get reconciliation_pending
           then (
             Atomic.set reconciliation_pending false;
@@ -164,7 +161,7 @@ let grid_callbacks : strategy_callbacks =
           order_id;
         match order.price with
         | Some price ->
-          (* enqueue onto the per-symbol lifecycle queue; the domain thread
+          (* Enqueue onto the per-symbol lifecycle queue; the domain thread
              drains it, so the strategy mutex is never taken cross-thread. *)
           Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
             order.symbol
@@ -254,8 +251,8 @@ let grid_callbacks : strategy_callbacks =
       (fun order target_order_id ->
         Logging.info_f ~section "✓ Cancelled order: %s" target_order_id;
         (* Enqueue, never mutate directly: these callbacks run on the
-           supervisor's Lwt fiber, and strategy state must only be touched
-           on the symbol's domain thread. *)
+           supervisor's Lwt fiber, and strategy state must be touched only on
+           the symbol's domain thread. *)
         Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
           order.symbol
           (Cancel_cleanup { order_id = target_order_id }))
@@ -289,9 +286,9 @@ let mm_callbacks : strategy_callbacks =
           (price_str order)
           err;
         refresh_inventory_state_on_rejection order err;
-        (* enqueue instead of calling handlers directly on this Lwt
-           fiber - the symbol's domain thread drains and executes them, so
-           MM state is never mutated cross-thread against execute_strategy. *)
+        (* Enqueue instead of calling handlers directly on this Lwt fiber:
+           the symbol's domain thread drains and executes them, so MM state is
+           never mutated cross-thread against execute_strategy. *)
         Dio_strategies.Market_maker.Strategy.enqueue_event
           order.symbol
           (Failed { now = Unix.gettimeofday (); side = order.side; reason = err });
@@ -405,9 +402,8 @@ let hedger_callbacks : strategy_callbacks =
   }
 ;;
 
-(** Resolves the correct callbacks for the given strategy_order.
-    For orders processed in the MM batch, the strategy field determines
-    routing since MM batch handles both Grid and MM amend/cancel orders. *)
+(** Resolves the callbacks for [order]. The MM batch handles both Grid and MM
+    amend/cancel orders, so the strategy field determines routing. *)
 let callbacks_for_strategy (order : strategy_order) =
   match order.strategy with
   | Ladder -> grid_callbacks
@@ -421,20 +417,18 @@ let callbacks_for_strategy (order : strategy_order) =
 
 (** Deadline after which a dispatched Place/Amend that has produced no
     terminal callback is declared failed. Must exceed the worst-case
-    legitimate REST duration including the venue retry budget (3 attempts
-    with up to 30s backoff); 120s keeps the zombie-completion window small
-    while guaranteeing the in-flight guards the removed 5s sweeps used to
-    heal cannot wedge forever - e.g. the Alpaca placement REST has no HTTP
-    timeout, so a black-holed connection produces no terminal event on its
-    own. A REST completion arriving after the deadline fired is a zombie:
-    it is suppressed so exactly one terminal event ever reaches the
-    strategy, mirroring the documented single-attempt tradeoff on Kraken
-    (a request that landed venue-side before the deadline is adopted by the
-    next open-orders scan). *)
+    legitimate REST duration including the venue retry budget (3 attempts with
+    up to 30s backoff); 120s keeps the zombie-completion window small while
+    guaranteeing in-flight guards cannot wedge forever - e.g. the Alpaca
+    placement REST has no HTTP timeout, so a black-holed connection produces
+    no terminal event on its own. A REST completion after the deadline fires
+    is a zombie and is suppressed, so exactly one terminal event reaches the
+    strategy; a request that landed venue-side before the deadline is adopted
+    by the next open-orders scan. *)
 let dispatch_deadline_s = 120.0
 
-(** Latches the first of [f] / the deadline. Returns a runner that executes
-    [f] only if no terminal event has been delivered yet. *)
+(** Atomic first-wins latch: runs [f] only if no terminal event has been
+    delivered yet ([resolved] unset), setting [resolved] on the way. *)
 let once_only resolved f () =
   if Atomic.compare_and_set resolved false true then f () else Lwt.return_unit
 ;;
@@ -696,10 +690,10 @@ let process_single_order
          | Some target_order_id ->
            dispatch_amend ~auth_token ~orders_placed ~cb order target_order_id
          | None ->
-           (* A terminal callback is mandatory now that the 5s sweeps are
-              gone: with no callback and no deadline the amend's
-              pending_amend_ token and InFlightAmendments entry (which
-              cleanup never reaps while Pending) wedge the side forever. *)
+           (* A terminal callback is mandatory: with no callback and no
+              deadline, the amend's pending_amend_ token and
+              InFlightAmendments entry (never reaped while Pending) wedge the
+              side forever. *)
            Logging.error_f
              ~section
              "Amendment request missing target order ID for %s %s - failing fast"
@@ -726,8 +720,8 @@ let process_single_order
       | Cancel ->
         (* A cancel rejected because the venue is disconnected must still
            reach the strategy's [on_cancel_fail] -> cleanup_pending_cancellation.
-           Swallowing it leaves inflight_cancel_buy set forever, which
-           suppresses ghost-buy cleanup and the excess-buy cancellation leg. *)
+           Swallowing it leaves inflight_cancel_buy set forever, suppressing
+           ghost-buy cleanup and the excess-buy cancellation leg. *)
         (match order.order_id with
          | Some target_order_id -> cb.on_cancel_fail order target_order_id
          | None -> ())
@@ -765,7 +759,6 @@ let order_processing_loop () =
     if Atomic.get shutdown_requested
     then Lwt.return_unit
     else (
-      (* Check exchange connection liveness *)
       let kraken_connected = Kraken.Kraken_trading_client.is_connected () in
       let is_hyperliquid_connected =
         try
@@ -815,8 +808,8 @@ let order_processing_loop () =
       let pending_hedge_orders = Dio_strategies.Auto_hedger.get_pending_orders 100 in
       if pending_grid_orders = [] && pending_mm_orders = [] && pending_hedge_orders = []
       then (
-        (* No pending orders; block until signalled.
-           Sever promise chain via Lwt.async to prevent Forward node accumulation. *)
+        (* No pending orders: block until signalled. Sever the promise chain
+           via [Lwt.async] to prevent [Forward] node accumulation. *)
         OrderSignal.wait ()
         >>= fun () ->
         Lwt.async loop;
@@ -824,18 +817,14 @@ let order_processing_loop () =
       else (
         incr cycle_count;
         try
-          (* Process grid strategy orders *)
           List.iter
             (process_single_order ~orders_placed ~order_mutex ~is_connected)
             pending_grid_orders;
-          (* Process market maker orders; abort if shutdown raised after grid batch *)
           if not (Atomic.get shutdown_requested)
           then
             List.iter
               (process_single_order ~orders_placed ~order_mutex ~is_connected)
               pending_mm_orders;
-          (* Process hedger orders; abort if shutdown raised after MM batch.
-               Hedger only supports Place; other operations log a warning. *)
           if not (Atomic.get shutdown_requested)
           then
             List.iter

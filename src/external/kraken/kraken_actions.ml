@@ -117,7 +117,6 @@ let next_req_id =
   fun () ->
     incr counter;
     let id = !counter in
-    (* Log a warning when the ID approaches the ping ID collision boundary. *)
     if id >= ping_start_id - 1000
     then
       Logging.warn_f
@@ -242,7 +241,6 @@ let place_order
       | Some id -> add_to_assoc params ("cl_ord_id", `String id)
       | None -> params
     in
-    (* Appends conditional trigger parameters. *)
     let params =
       match trigger_price with
       | Some price ->
@@ -256,19 +254,16 @@ let place_order
         add_to_assoc params ("triggers", triggers)
       | None -> params
     in
-    (* Appends execution display limits. *)
     let params =
       match display_qty with
       | Some qty -> add_to_assoc params ("display_qty", `Float qty)
       | None -> params
     in
-    (* Appends fee structure preference. *)
     let params =
       match fee_preference with
       | Some pref -> add_to_assoc params ("fee_preference", `String pref)
       | None -> params
     in
-    (* Appends execution validation flag. *)
     let params =
       match validate with
       | Some v -> add_to_assoc params ("validate", `Bool v)
@@ -284,7 +279,6 @@ let place_order
       (match limit_price with
        | Some p -> Printf.sprintf "%.6f" (truncate_price_to_precision p symbol)
        | None -> "market");
-    (* Logs serialized order payload. *)
     let json_str = json_to_string_precise (Some symbol) params in
     Logging.debug_f ~section "Order parameters: %s" json_str;
     Kraken_trading_client.send_request
@@ -358,9 +352,7 @@ let amend_order
     if symbol_str = "" then failwith "Symbol required for price precision in amend_order";
     (* Fail if no symbol was supplied; price precision truncation requires it. *)
 
-    (* Appends immutable parameters. *)
     let params = `Assoc [ "order_id", `String order_id; "token", `String token ] in
-    (* Appends dynamic quantity parameter. *)
     let params =
       match order_qty with
       | Some qty -> add_to_assoc params ("order_qty", `Float qty)
@@ -405,19 +397,16 @@ let amend_order
       | Some qty -> add_to_assoc params ("display_qty", `Float qty)
       | None -> params
     in
-    (* Appends expiration deadline parameter. *)
     let params =
       match deadline with
       | Some deadline -> add_to_assoc params ("deadline", `String deadline)
       | None -> params
     in
-    (* Appends execution validation flag. *)
     let params =
       match validate with
       | Some v -> add_to_assoc params ("validate", `Bool v)
       | None -> params
     in
-    (* Appends asset symbol mapping. *)
     let params =
       match symbol with
       | Some s -> add_to_assoc params ("symbol", `String s)
@@ -498,7 +487,6 @@ let cancel_orders ~token ?order_ids ?cl_ord_ids ?order_userrefs ?retry_config ()
     | Some c -> c
     | None -> default_retry_config
   in
-  (* Build a list of individual cancel parameter sets, one per order. *)
   let individual_cancels =
     let from_order_ids =
       match order_ids with

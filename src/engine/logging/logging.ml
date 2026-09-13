@@ -1,51 +1,38 @@
 (** Structured logging system with ANSI formatting, per-section level filtering,
     and domain-safe asynchronous output.
 
-    Line layout (scannable, aligned):
+    Line layout (aligned):
       HH:MM:SS.mmm LVL  SECTION         message
       19:17:23.672 INFO oracle_runtime  [2/8] hyperliquid/BTC/USDC ACTIVE ...
       19:17:23.672 INFO oracle_runtime   ┆ worst drop 83.6% (peak $19497.40 ...
-    - Compact time-only timestamp (gray); the date is available from
-      `docker logs --timestamps`; dropping it keeps the interesting content
-      close to the left margin.
-    - Level column is a fixed 5 chars, colored by severity.
-    - Section column is a fixed 20 chars, so the message column is identical
-      on every line (it never shifts as longer section names appear), and it
-      is colored with a stable per-section hue, so a component's lines can be
-      tracked down the screen.
-    - Multi-line messages (e.g. the capital-oracle decision blocks) render
-      their continuation lines under a dim ┆ gutter at the message column
-      instead of a repeated colored prefix, so each block reads as one unit
-      of sub-details under its header rather than a pile of full lines.
-    - Long lines are word-wrapped to the terminal width (auto-detected, or a
-      fixed `logging_width` override). When the output is not a terminal
-      (pipes, `docker logs`) the width comes from the `COLUMNS` env var when
-      set, otherwise a generous default (200), so wrapped lines keep the ┆
-      gutter without being cramped at a narrow width. Wrapped chunks stay
-      under the same gutter.
-    - With colors disabled the layout (and alignment) is preserved, without
-      any ANSI escapes.
+    - Time-only timestamp, gray; the date is available from
+      `docker logs --timestamps`.
+    - Level column fixed at 5 chars, colored by severity.
+    - Section column fixed at 20 chars so the message column never shifts, and
+      colored with a stable per-section hue.
+    - Multi-line messages render continuation lines under a dim ┆ gutter at the
+      message column instead of a repeated prefix.
+    - Lines are word-wrapped to the terminal width (auto-detected or a fixed
+      `logging_width` override). Non-terminal output uses `COLUMNS` when set,
+      else 200, so wrapped lines keep the gutter without being cramped.
+    - With colors disabled the layout and alignment are preserved without ANSI
+      escapes.
 
-    Hot-path contract (see HFT_AUDIT.md H1/M1):
-    - All levels except CRITICAL are formatted and pushed to an async queue;
-      the caller performs zero I/O and never drains the queue.
-    - The single background drain thread owns every write + flush, at ~50ms
+    Hot-path contract:
+    - All levels except CRITICAL are formatted and pushed to an async queue; the
+      caller performs zero I/O and never drains the queue.
+    - The single background drain thread owns every write and flush, at ~50ms
       cadence (DEBUG/INFO) or ~1ms while a WARN/ERROR requests prompt flush.
-    - A single log line costs roughly a microsecond and a handful of
-      allocations on the caller (timestamp, colored line, queue push),
-      independent of how many lines are already buffered. *)
+    - A log line costs roughly a microsecond and a handful of allocations on the
+      caller (timestamp, colored line, queue push), independent of buffered lines. *)
 
 (* OxCaml marks [Domain.DLS] and [Unix.putenv] as [unsafe_multidomain].
-   - [Domain.DLS] here caches the last section lookup per domain, storing a
-     shared [section] record whose [min_level] may be mutated via
-     [set_section_level]. OxCaml's [Domain.Safe.DLS] requires the stored value
-     to be portable (free of shared mutable state), which this record is not, so
-     the race-safe variant cannot express the existing design without changing
-     cache semantics. The record is only mutated during configuration changes.
+   - [Domain.DLS] caches the last section lookup per domain, storing a shared
+     [section] record whose [min_level] may be mutated via [set_section_level].
+     [Domain.Safe.DLS] requires a portable stored value, which this record is
+     not; the record is only mutated during configuration changes.
    - [Unix.putenv] is called once at startup by [load_dotenv], before any domain
-     is spawned.
-   Acknowledged rather than rewritten; a migration of the DLS cache to
-   [Domain.Safe.DLS] is tracked as a separate follow-up. *)
+     is spawned. *)
 [@@@alert "-unsafe_multidomain"]
 
 type level =
@@ -92,17 +79,14 @@ let level_color = function
   | CRITICAL -> "\027[1m\027[41m\027[37m"
 ;;
 
-(* Timestamp rendered in gray so it recedes; the eye jumps straight to the
-   level and section columns. *)
+(* Timestamp gray so the level and section columns stand out. *)
 let timestamp_color = "\027[90m"
 let ansi code = "\027[" ^ string_of_int code ^ "m"
 
-(* Per-section identity colors: a curated mapping for the sections that log
-   most, so the heavily interleaved components (oracle_runtime, domain_spawner,
-   jacobs_ladder, order_processor, supervisor, main) are always mutually
-   distinct. The oracle_* family shares bright-yellow on purpose, so a block
-   of oracle lines reads as one subsystem. Any unlisted section falls back to
-   a stable hash into [section_color_palette]. *)
+(* Per-section identity colors for the most frequent sections, keeping the
+   interleaved components mutually distinct. The oracle_* family shares
+   bright-yellow so a block of oracle lines reads as one subsystem. Unlisted
+   sections fall back to a stable hash into [section_color_palette]. *)
 let section_color_overrides =
   let tbl = Hashtbl.create 16 in
   List.iter
@@ -125,8 +109,8 @@ let section_color_overrides =
   tbl
 ;;
 
-(* Section palette deliberately excludes the severity colors (31 red, 32 green,
-   33 yellow) so the level column keeps its meaning. *)
+(* Palette excludes the severity colors (31 red, 32 green, 33 yellow) so the
+   level column keeps its meaning. *)
 let section_color_palette = [| 34; 35; 36; 90; 92; 93; 94; 95; 96; 97 |]
 
 let hash_string s =
@@ -157,12 +141,11 @@ let enabled_sections = ref []
 let quiet_mode = ref false
 
 (* ---- Line width ----
-   [configured_width] overrides everything (None = auto). In auto mode the
-   width is detected from the output fd via [Notty_unix.winsize] (notty is
-   already a project dependency), cached ~1s so terminal resizes are picked
-   up without an ioctl per line. When the output is not a terminal (pipes,
-   `docker logs`, files) we fall back to the `COLUMNS` env var when set, else
-   a generous [default_width] - wrapping still applies, just not cramped. *)
+   [configured_width] overrides all (None = auto). Auto mode detects the width
+   from the output fd via [Notty_unix.winsize], cached ~1s so terminal resizes
+   are picked up without an ioctl per line. Non-terminal output (pipes,
+   `docker logs`, files) falls back to `COLUMNS` when set, else [default_width];
+   wrapping still applies. *)
 
 let default_width = 200
 let configured_width : int option ref = ref None
@@ -183,8 +166,8 @@ let detect_terminal_width () =
   | _ -> None
 ;;
 
-(* Dynamic width hint for non-terminal output (e.g. `COLUMNS=200 app | less`).
-   Returns None when unset or malformed, so [default_width] applies. *)
+(* Width hint for non-terminal output (e.g. `COLUMNS=200 app | less`); [None]
+   when unset or malformed, so [default_width] applies. *)
 let env_width () =
   match Sys.getenv_opt "COLUMNS" with
   | Some s ->
@@ -194,7 +177,7 @@ let env_width () =
   | None -> None
 ;;
 
-(* Always Some in practice: [configured_width], a detected terminal, COLUMNS,
+(* Always [Some] in practice: [configured_width], a detected terminal, COLUMNS,
    or [default_width]. Wrapping is always on. *)
 let current_width () =
   match !configured_width with
@@ -228,15 +211,14 @@ let set_enabled_sections secs = enabled_sections := secs
 let set_quiet_mode quiet = quiet_mode := quiet
 let set_log_callback callback = log_callback := callback
 
-(** Mutex serializing output_channel writes across OCaml 5.x domains
-    to prevent interleaved log lines from concurrent workers. *)
+(** Serializes output_channel writes across domains to prevent interleaved log
+    lines from concurrent workers. *)
 let output_mutex = Mutex.create ()
 
-(** Guards the [sections] registry only. Deliberately separate from
-    [output_mutex]: [get_section] runs on the trading hot path (via
-    [will_log], whenever a domain's Domain.DLS section cache misses), and
-    must never block behind the drain thread's [output_mutex], which it holds
-    across a potentially blocking [flush]. *)
+(** Guards the [sections] registry only; separate from [output_mutex] so
+    [get_section] on the trading hot path (via [will_log], on a Domain.DLS cache
+    miss) never blocks behind the drain thread's [output_mutex], held across a
+    potentially blocking [flush]. *)
 let sections_mutex = Mutex.create ()
 
 let get_section name =
@@ -259,10 +241,9 @@ let get_section name =
 let dummy_section = { name = ""; min_level = CRITICAL }
 let tls_section_cache = Domain.DLS.new_key (fun () -> "", dummy_section)
 
-(** Returns true if [level] passes both the section and global minimum
-    level filters. Used as a guard to skip allocation on disabled paths.
-    Uses Domain.DLS to aggressively cache the last localized section lookup,
-    eliminating Hashtbl lookup overhead on the hot path. *)
+(** [true] when [level] passes both the section and global minimum filters;
+    guards allocation on disabled paths. Domain.DLS caches the last section
+    lookup, eliminating Hashtbl overhead on the hot path. *)
 let will_log level section_name =
   let last_name, section = Domain.DLS.get tls_section_cache in
   let sec =
@@ -278,10 +259,9 @@ let will_log level section_name =
   && level_to_int level >= level_to_int !global_min_level
 ;;
 
-(* Formats the current wall-clock time as "HH:MM:SS.mmm" (time only; the date
-   is redundant when live-tailing and is available from `docker logs
-   --timestamps`). Caches the time prefix per second using Atomic for
-   lock-free thread safety. *)
+(* Format the current wall-clock time as "HH:MM:SS.mmm" (time only; the date is
+   available from `docker logs --timestamps`). Caches the time prefix per second
+   via Atomic for lock-free thread safety. *)
 let timestamp_cache = Atomic.make (0.0, "")
 
 let format_timestamp () =
@@ -304,16 +284,13 @@ let format_timestamp () =
 ;;
 
 (* ---- Column alignment ----
-   The level column is a fixed width (5) and the section column is a fixed
-   width (20, enough for every section that logs in practice, including
-   dashboard_server / domain_supervisor / discord_notifier / hyperliquid_startup).
-   Both are fixed so the message column NEVER shifts mid-stream: every message
-   starts at the same column in every line, which is what makes the log
-   scannable. A fixed column is worth a little trailing whitespace after short
-   names like "main"; a section longer than 20 simply runs on (rare, and the
-   rest of the line still reads fine). Multi-line messages render their
+   Level column width 5; section column width 20 (fits every section that logs
+   in practice, including dashboard_server, domain_supervisor, discord_notifier,
+   hyperliquid_startup). Both fixed so the message column never shifts
+   mid-stream: every message starts at the same column, which makes the log
+   scannable. A section longer than 20 runs on. Multi-line messages render
    continuation lines under a dim ┆ gutter at the message column (see
-   [render_message]) so each block reads as one unit. *)
+   [render_message]). *)
 
 let level_width = 5
 let section_width = 20
@@ -324,9 +301,9 @@ let pad_to n s =
 ;;
 
 (* ---- Word wrapping ----
-   Wraps [text] at word boundaries so no physical line exceeds [width]
-   columns. Multi-space runs are collapsed; an over-long word is emitted on
-   its own line rather than lost. *)
+   Wrap [text] at word boundaries so no physical line exceeds [width] columns.
+   Multi-space runs are collapsed; an over-long word is emitted on its own line
+   rather than lost. *)
 let wrap_text ~width text =
   let width = max 16 width in
   if String.length text <= width
@@ -360,17 +337,15 @@ let wrap_text ~width text =
     String.sub s 0 (String.length s - 1))
 ;;
 
-(* The gutter glyph marking continuation lines of a multi-line message.
-   Rendered dim so it recedes; blank lines in a block are dropped. *)
+(* Gutter glyph for continuation lines of a multi-line message; rendered dim.
+   Blank lines in a block are dropped. *)
 let gutter_glyph = "┆"
 
-(* Splits a message into the physical lines to render. The first line is the
-   header; every following line is a detail/gutter line. Caller-embedded
-   leading whitespace on continuation lines is stripped - the gutter replaces
-   the manual indent callers used to hard-code. Each line is word-wrapped to
-   fit the terminal width ([width] = None leaves lines unwrapped); the header
-   gets [width - prefix], continuation lines a touch less (the gutter takes
-   two columns). *)
+(* Split a message into physical lines. The first is the header; the rest are
+   detail/gutter lines with caller-embedded leading whitespace stripped. Lines
+   are word-wrapped to the terminal width ([width] = [None] leaves them
+   unwrapped); the header gets [width - prefix], continuation lines two columns
+   less for the gutter. *)
 let render_message ~prefix_len ~width message =
   let lines = String.split_on_char '\n' message in
   let head, rest =
@@ -395,8 +370,7 @@ let render_message ~prefix_len ~width message =
   head_lines @ cont_lines
 ;;
 
-(* Render one log line. Pure: no I/O, no queue; callers (or tests) can use
-   it directly. *)
+(* Render one log line. Pure: no I/O or queue; callable directly. *)
 let format_line level section_name message =
   let timestamp = format_timestamp () in
   let level_str = pad_to level_width (level_to_string level) in
@@ -448,25 +422,24 @@ let format_line level section_name message =
   Buffer.contents buf
 ;;
 
-(* ---- Async log drain (all levels; CRITICAL excepted) ----
-   Hot path: format the message, push onto async_queue under async_mutex.
-   Cost: ~50ns (mutex + Queue.push). Zero I/O, zero output_mutex contention.
+(* ---- Async log drain (all levels except CRITICAL) ----
+   Hot path: format the message and push onto async_queue under async_mutex.
+   Cost ~50ns (mutex + Queue.push); zero I/O and no output_mutex contention.
 
-   Background drain thread: takes all queued messages, writes each with
-   per-message flush to output_channel. The drain thread owns every flush;
-   no caller ever does I/O. The thread idles on a 50ms cadence but drops to
-   ~1ms cadence while a WARN/ERROR has requested a prompt flush, so urgent
-   lines still appear within ~ms without blocking the calling domain.
+   Background drain thread: writes all queued messages to output_channel,
+   batching flushes. The thread owns every flush, so no caller does I/O. It
+   idles at 50ms cadence, dropping to ~1ms while a WARN/ERROR requests prompt
+   flush, so urgent lines appear within ~ms without blocking the caller.
 
    CRITICAL: drains the async queue first (preserving order), then writes
-   synchronously with flush; this is the one emergency path allowed to block. *)
+   synchronously with flush; the one emergency path allowed to block. *)
 
 let async_queue : string Queue.t = Queue.create ()
 let async_mutex = Mutex.create ()
 let async_drain_started = Atomic.make false
 
-(* Set when a WARN/ERROR line has been queued and should be flushed promptly.
-   Read/cleared by the drain thread only; set by any domain. *)
+(* Set when a WARN/ERROR line is queued and should be flushed promptly. Cleared
+   by the drain thread; set by any domain. *)
 let flush_requested = Atomic.make false
 
 (** Push a pre-formatted log line onto the async queue. No I/O. *)
@@ -482,24 +455,22 @@ let[@inline always] log_async_urgent formatted =
   Atomic.set flush_requested true
 ;;
 
-(** Drain all pending async messages to output_channel.
-    Caller must NOT hold output_mutex. *)
+(** Drain all pending async messages to output_channel. Caller MUST NOT hold
+    [output_mutex]. *)
 let drain_async_queue () =
   Mutex.lock async_mutex;
   if Queue.is_empty async_queue
   then Mutex.unlock async_mutex
   else (
-    (* Transfer pending messages out of the async queue in O(1).
-       This minimizes async_mutex hold time; producers can push
-       immediately after we unlock. *)
+    (* Transfer pending messages out of the async queue in O(1), minimizing
+       async_mutex hold time so producers can push immediately after unlock. *)
     let batch = Queue.create () in
     Queue.transfer async_queue batch;
     Mutex.unlock async_mutex;
-    (* Write the batch under output_mutex with ONE flush per batch: a
-       flush per line made an N-message burst cost N write syscalls plus N
-       flush syscalls on the drain thread. Batch-flush keeps lines equally
-       prompt (the whole batch lands in this drain iteration) at one
-       syscall each for writes and one flush total. *)
+    (* Write the batch under output_mutex with one flush per batch: a flush per
+       line cost N write plus N flush syscalls per burst. Batch-flush keeps lines
+       equally prompt (the whole batch lands this iteration) at one write call
+       each and a single flush. *)
     Mutex.lock output_mutex;
     try
       Queue.iter
@@ -515,11 +486,10 @@ let drain_async_queue () =
       ignore exn)
 ;;
 
-(** Start the background drain thread. Called once; idempotent.
-    Uses Thread.create (not Domain.spawn) to avoid consuming a core.
-    The drain thread owns ALL output flushing: no caller of any log level
-    performs I/O. While [flush_requested] is set it polls at ~1ms so WARN/
-    ERROR lines surface promptly; otherwise it idles at 50ms. *)
+(** Start the background drain thread; called once, idempotent. Uses
+    [Thread.create] (not [Domain.spawn]) to avoid consuming a core. The thread
+    owns all output flushing, so no caller performs I/O. While [flush_requested]
+    is set it polls at ~1ms so WARN/ERROR lines surface promptly; else 50ms. *)
 let start_async_drain () =
   if Atomic.compare_and_set async_drain_started false true
   then (
@@ -540,10 +510,9 @@ let start_async_drain () =
     ())
 ;;
 
-(* Core logging function. Domain-safe. All levels except CRITICAL are pushed
-   to the async queue; no synchronous I/O, no draining of the whole queue on
-   the caller. CRITICAL is the single emergency path that drains the queue and
-   writes + flushes synchronously for immediate visibility. *)
+(* Core logging function. Domain-safe. All levels except CRITICAL are pushed to
+   the async queue with no synchronous I/O and no caller-side draining. CRITICAL
+   drains the queue and writes + flushes synchronously for immediate visibility. *)
 let log_sync level section_name message =
   let section = get_section section_name in
   if
@@ -557,8 +526,8 @@ let log_sync level section_name message =
     let formatted = format_line level section_name message in
     if level = CRITICAL
     then (
-      (* Emergency path: drain async queue first to preserve ordering,
-         then write this message with immediate flush. *)
+      (* Emergency path: drain the async queue first to preserve ordering, then
+         write with immediate flush. *)
       drain_async_queue ();
       Mutex.lock output_mutex;
       try
@@ -571,9 +540,9 @@ let log_sync level section_name message =
         Mutex.unlock output_mutex;
         ignore exn)
     else (
-      (* Async path for every other level (incl. WARN/ERROR): just buffer the
-         formatted line. The drain thread owns all flushing, within ~50ms
-         normally or ~1ms for WARN/ERROR via flush_requested. *)
+      (* Async path for every other level (including WARN/ERROR): buffer the
+         formatted line. The drain thread flushes within ~50ms, or ~1ms for
+         WARN/ERROR via flush_requested. *)
       start_async_drain ();
       if level_to_int level >= level_to_int WARN
       then log_async_urgent formatted
@@ -586,9 +555,9 @@ let log level section_name message =
   Lwt.return_unit
 ;;
 
-(* Format-string log API. Zero-allocation when the level is disabled:
-   [Printf.ifprintf] consumes format arguments without allocating a string;
-   [Printf.ksprintf] allocates a buffer only when the message will be emitted. *)
+(* Format-string log API. Zero-allocation when disabled: [Printf.ifprintf]
+   consumes format arguments without allocating a string, and [Printf.ksprintf]
+   allocates only when the message is emitted. *)
 let debug_f ~section (fmt : ('a, unit, string, unit) format4) =
   if will_log DEBUG section
   then Printf.ksprintf (fun msg -> log_sync DEBUG section msg) fmt
@@ -621,13 +590,12 @@ let critical_f ~section (fmt : ('a, unit, string, unit) format4) =
 
 (** Deferred (non-blocking) sibling of [critical_f].
 
-    Formats at CRITICAL severity but enqueues on the async drain queue with a
-    prompt-flush request, like WARN/ERROR, instead of draining and flushing
-    synchronously under [output_mutex]. Use this for CRITICAL messages emitted
-    from latency-sensitive paths (e.g. an order-fill handler running inside a
-    domain's execution cycle): a full or slow output pipe would otherwise block
-    the caller in [flush] for the duration of the backpressure, inflating
-    execution latency. The line still reaches the output within ~1ms. *)
+    Formats at CRITICAL but enqueues on the async drain queue with a
+    prompt-flush request, as WARN/ERROR do, instead of draining and flushing
+    synchronously under [output_mutex]. Use from latency-sensitive paths (e.g. an
+    order-fill handler inside a domain's execution cycle): a full or slow output
+    pipe would otherwise block the caller in [flush] for the duration of the
+    backpressure. The line still reaches the output within ~1ms. *)
 let critical_async_f ~section (fmt : ('a, unit, string, unit) format4) =
   if will_log CRITICAL section && not !quiet_mode
   then
@@ -661,12 +629,11 @@ let get_section_level name = (get_section name).min_level
 (* Re-exported utility. *)
 let level_to_string = level_to_string
 
-(** Minimal [.env] loader, replacement for the [dotenv] package. If [path]
-    exists, every [KEY=VALUE] line is exported into the process environment.
-    Blank lines and lines starting with [#] are skipped, a leading [export ] is
-    ignored, and matching single/double quotes around a value are stripped.
-    Existing environment variables are never overwritten, matching the default
-    behaviour of [Dotenv.export]. A missing file is a no-op. *)
+(** Minimal [.env] loader. When [path] exists, every [KEY=VALUE] line is exported
+    into the process environment. Blank lines and [#] lines are skipped, a leading
+    [export ] is ignored, and matching single/double quotes around a value are
+    stripped. Existing variables are never overwritten. A missing file is a
+    no-op. *)
 let load_dotenv ?(path = ".env") () =
   match
     try Some (open_in path) with

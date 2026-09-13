@@ -46,13 +46,11 @@ let get_api_credentials_from_env () : (string * string) Lwt.t =
   Lwt.both (get_env "KRAKEN_API_KEY") (get_env "KRAKEN_API_SECRET")
 ;;
 
-(** Fetches the fee schedule for [symbol] via the Kraken [/0/private/TradeVolume]
-    endpoint. Constructs a signed POST request using HMAC authentication,
-    parses the JSON response, and extracts maker/taker fee percentages from the
-    [fees] and [fees_maker] objects. Fee percentages are converted from the
-    API's percentage representation (e.g. 0.26) to decimal fractions
-    (e.g. 0.0026) before returning. Returns [None] on HTTP errors, API errors,
-    missing pair data, or parse failures. *)
+(** Fetches the fee schedule for [symbol] via [/0/private/TradeVolume] using a
+    signed HMAC POST. Extracts maker/taker percentages from the [fees] and
+    [fees_maker] objects and converts them to decimal fractions (0.26 ->
+    0.0026). Returns [None] on HTTP error, API error, missing pair data, or
+    parse failure. *)
 let get_fee_info symbol : fee_info option Lwt.t =
   Lwt.catch
     (fun () ->

@@ -1,17 +1,17 @@
 open Notty
 open Theme
 
-(** Whether the capital oracle's decision for this strategy entry says
-    INACTIVE - the oracle-paused state (the grid should not place new
-    orders). Kept as aliases so existing callers/tests keep working. *)
+(** INACTIVE oracle decision (oracle-paused; the grid places no new orders);
+    [false] when no decision exists. Alias of [Snapshot.oracle_inactive] for
+    existing callers/tests. *)
 let oracle_inactive = Snapshot.oracle_inactive
 
 let strategy_paused = Snapshot.strategy_paused
 
-(** Accumulated quantity: the inventory held that is not committed to a
-    resting sell. [staked] is part of [base] but can never be covered by a
-    pending sell (it is not tradeable), so it is never reduced by
-    [pending_sell_qty]. *)
+(** Accumulated quantity: inventory not committed to a resting sell.
+    [staked] is part of [base] but non-tradeable, so it is never reduced by
+    [pending].
+    @return [staked] + max 0.0 ([base] - [staked] - [pending]) *)
 let accum_qty_of ~staked ~pending base =
   staked +. Float.max 0.0 (base -. staked -. pending)
 ;;
@@ -33,8 +33,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
   let strats = snapshot.strategies in
   let all_balances = snapshot.balances in
   let is_compact = w < 120 in
-  (* Build the column header row, which differs between compact and wide
-     layouts. *)
+  (* Column header row; compact layout (w < 120) omits the spread and delta columns. *)
   let header =
     close_row
       w
@@ -89,10 +88,10 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let base_bal = s.market.base_balance in
     let staked_bal = s.market.staked_balance in
     let hold_value = base_bal *. mid in
-    (* The resting buy price prefers the strategy's tracked price because it
-       follows amendments, then falls back to the exchange's real open buy
-       orders. This keeps a committed buy visible even when the domain is
-       halted by an oracle INACTIVE decision and its state goes stale. *)
+    (* Resting buy price: the strategy's tracked price (follows amendments),
+       else the lowest open exchange buy order. Keeps a committed buy visible
+       when the domain is halted by an oracle INACTIVE decision and its state
+       goes stale. *)
     let buy_price =
       if s.buy_price > 0.0
       then s.buy_price
@@ -188,9 +187,9 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         in
         is_near_buy, false
     in
-    (* Blink the near-fill tint while price sits close to execution. A solid
-       tint (the previous [Anim.flash]-while-active behavior) read as a static
-       highlight, losing the "about to fill" cue. *)
+    (* Blink the near-fill tint while price is close to execution; a solid
+       tint (the previous [Anim.flash] behavior) reads as static and loses the
+       "about to fill" cue. *)
     if near_buy || near_sell then Anim.motion_pending := true;
     let blink_on = Anim.blink () in
     let flash_buy = near_buy && blink_on in

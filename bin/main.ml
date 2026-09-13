@@ -1,45 +1,43 @@
 (** main.ml -- Dio Trading Engine process entry point.
 
-    Responsibilities:
-    - Parse CLI arguments and load engine configuration (config.json).
-    - Initialize the logging subsystem, GC tuning, and CSPRNG backend.
-    - Eagerly force the Conduit TLS context to avoid Lazy.force race conditions
-      across OCaml 5 domains.
-    - Register signal handlers: SIGINT/SIGTERM for graceful shutdown with hedge
-      liquidation, and SIGSEGV/SIGABRT/SIGBUS/SIGFPE for crash diagnostics.
-    - Start the Supervisor, which establishes websocket feeds and returns
-      fee-augmented trading configs.
-    - Spawn one supervised domain per asset via Domain_spawner for market data
-      consumption and strategy execution.
-    - Launch the Order Executor and Dashboard UDS server as background Lwt fibers.
-    - Run a periodic memory reporter (600s interval) in the main Lwt scheduler.
-    - Block on a shutdown condition variable; on signal, close Hyperliquid hedge
-      positions, tear down feeds/domains, and force-exit after a 3s timeout. *)
+    Startup sequence:
+    - Parse CLI arguments; load engine configuration from config.json.
+    - Initialize logging, GC tuning, and CSPRNG backend.
+    - Force the Conduit TLS context to avoid Lazy.force races across OCaml 5 domains.
+    - Start the Supervisor (establishes websocket feeds; returns fee-augmented
+      trading configs).
+    - Spawn one supervised domain per asset via Domain_spawner.
+    - Launch the Order Executor, Discord notifier, and Dashboard UDS server as
+      background Lwt fibers.
+    - Run a memory reporter at 600s intervals in the main Lwt scheduler.
+
+    Shutdown: SIGINT/SIGTERM starts graceful shutdown (liquidate Hyperliquid hedge
+    positions, tear down feeds/domains) with forced exit after a 3s timeout;
+    SIGSEGV/SIGABRT/SIGBUS/SIGFPE handlers capture crash diagnostics. The process
+    blocks on a shutdown condition variable. *)
 
 open Lwt.Infix
 
-(* OxCaml marks [Sys.set_signal] as [unsafe_multidomain]. The shutdown handlers
-   are installed once from the main domain and only touch atomics, Lwt state and
-   the logging subsystem; they close over process-wide state and cannot be
-   [portable], so [Sys.Safe.set_signal] cannot express them. Acknowledged rather
-   than rewritten. *)
+(* OxCaml marks [Sys.set_signal] as [unsafe_multidomain]. Handlers are installed once
+   from the main domain and touch only atomics, Lwt state, and logging; they close
+   over process-wide state and are not [portable], so [Sys.Safe.set_signal] cannot
+   express them. Acknowledged rather than rewritten. *)
 [@@@alert "-unsafe_multidomain"]
 
-(* Capital-oracle runtime (wrapped library: explicit alias avoids opening the
-   whole Dio_oracle namespace). *)
+(* Capital-oracle runtime; explicit alias avoids opening the whole Dio_oracle namespace. *)
 module Oracle_runtime = Dio_oracle.Oracle_runtime
 
-(** Conditionally enable backtraces via DIO_BACKTRACE to avoid allocation overhead in production. *)
+(** Enable backtraces only when DIO_BACKTRACE is set; avoids allocation overhead in production. *)
 let () = Printexc.record_backtrace (Sys.getenv_opt "DIO_BACKTRACE" |> Option.is_some)
 
 module Fear_and_greed = Cmc.Fear_and_greed
 
-(** Register atexit handler to emit a final log entry on process termination. *)
+(** atexit handler: flush persistence and emit a final log entry on process termination. *)
 let () =
   at_exit (fun () ->
-    (* Synchronously flush coalesced persistence writes so in-memory state
-       (accumulation P&L, last_fill_oid, sell levels) is not lost in the
-       async-save coalesce window when the process exits. *)
+    (* Flush coalesced persistence writes synchronously; prevents loss of in-memory
+       state (accumulation P&L, last_fill_oid, sell levels) within the async-save
+       coalesce window at process exit. *)
     Dio_persistence.Persistence_orchestrator.flush_all ();
     Logging.info ~section:"main" "Process exiting - final cleanup complete")
 ;;
@@ -449,29 +447,24 @@ let init_trading_engine_sync (config : Dio_engine.Config.config) =
     ~section:"main"
     "%d supervised asset domains initialized!"
     (List.length configs_with_fees);
-  (* Start the capital-oracle live runtime as a SUPERVISED module (like the
-     exchange feeds and the order executor): it is registered in the
-     supervisor's connection registry, started through the standard
-     lifecycle machinery, heartbeated on each pass and liveness tick, and
-     auto-restarted by the health monitor if its loop ever dies. One
-     analysis pass runs immediately, then background refreshes on the
-     configured cadence. Trading domains read the published qty /
-     grid_interval / active decisions every cycle; the on_publish hook wakes
-     them so a new decision applies right away instead of on the next market
-     event. The runtime tolerates every failure mode (network, history,
-     balance) with last-known-good fallback and never blocks or crashes the
-     engine. *)
+  (* Start the capital-oracle live runtime as a supervised module: registered in
+     the supervisor's connection registry, driven by the standard lifecycle
+     machinery, heartbeated on each pass and liveness tick, and auto-restarted by
+     the health monitor if its loop dies. One analysis pass runs immediately, then
+     background refreshes on the configured cadence. Trading domains read the
+     published qty / grid_interval / active decisions every cycle; on_publish wakes
+     them so a new decision applies immediately rather than on the next market
+     event. Failure modes (network, history, balance) fall back to last-known-good
+     and never block or crash the engine. *)
   (try
      Supervisor.start_oracle
        ~config:(Option.value config.oracle ~default:(Oracle_runtime.default_config ()))
        ~trading:configs_with_fees
        ~on_publish:(fun changed_symbols _decisions ->
-         (* Per-symbol changed-only wakeups: signal only the domains whose
-            asset's decision changed this pass (the oracle exposes the changed
-            set). Each domain blocks on its own per-symbol condition, so an
-            unrelated asset's domain is never woken by a pass that did not
-            touch it. The lock-free decision read path (decision_for, cached
-            on publish_generation) is unchanged. *)
+         (* Signal only the domains whose asset's decision changed this pass; each
+            domain blocks on its own per-symbol condition, so unrelated domains are
+            never woken. Decision reads are lock-free via decision_for, cached on
+            publish_generation. *)
          List.iter
            (fun symbol -> Concurrency.Exchange_wakeup.signal ~symbol)
            changed_symbols)
@@ -506,12 +499,12 @@ let () =
   Logging.set_level config.logging.level;
   Logging.set_enabled_sections config.logging.sections;
   Logging.set_width config.logging.width;
-  (* Register the configured strategies with the persistence layer, then run
-     the one-shot legacy migration: the flat symbol-keyed
-     accumulated_state.json is split into accumulation_state.json and
-     sell_levels_state.json under "{strategy}:{symbol}:{venue}" keys (auto-
-     mapped when exactly one configured strategy matches the symbol), and the
-     original file is renamed to accumulated_state.json.migrated.<ts>. *)
+  (* Register configured strategies with the persistence layer, then run the
+     one-shot legacy migration: flat symbol-keyed accumulated_state.json is split
+     into accumulation_state.json and sell_levels_state.json under
+     "{strategy}:{symbol}:{venue}" keys (auto-mapped when exactly one configured
+     strategy matches the symbol); the original is renamed to
+     accumulated_state.json.migrated.<ts>. *)
   Dio_persistence.Persistence_orchestrator.register_configured_strategies
     (List.map
        (fun (t : Dio_engine.Config.trading_config) ->
@@ -533,21 +526,17 @@ let () =
        ; Gc.major_heap_increment = gc_cfg.major_heap_increment
        }
    | None -> ());
-  (* Start the stop-the-world canary AFTER GC configuration is applied, so the
-      detector observes the same collector settings as the trading domains. Its
-      window cadence matches the per-domain latency windows, letting a global
-      pause be matched to the domain cycles that spiked. Disable with
-      DIO_CANARY=0. *)
+  (* Start the stop-the-world canary after GC configuration is applied so it
+     observes the same collector settings as the trading domains; its window
+     cadence matches the per-domain latency windows, allowing a global pause to be
+     matched to the domain cycles that spiked. Disable with DIO_CANARY=0. *)
   Canary.start ();
-  (* Periodic memory reporter using an Lwt timer (600s interval).
-     Replaces the prior Gc.create_alarm approach which had two issues:
-     1. GC alarm callbacks run in GC signal context; calling Mutex.lock from
-        within is unsafe on OCaml 5.x if the alarmed domain already holds
-        the lock (latent deadlock on InFlightOrders/Amendments mutexes).
-     2. cycle_mod=10000 with space_overhead=20 caused the alarm to fire
-        thousands of times per minute without reaching the threshold.
-     The Lwt timer executes in the main domain scheduler, is always safe,
-     and reports on a predictable wall-clock cadence. *)
+  (* Periodic memory reporter on an Lwt timer (600s interval). Runs in the main
+     domain scheduler, avoiding the prior Gc.create_alarm approach: alarm callbacks
+     run in GC signal context, where Mutex.lock is unsafe on OCaml 5.x if the
+     alarmed domain already holds the lock (latent deadlock on InFlightOrders/
+     Amendments mutexes), and cycle_mod=10000 with space_overhead=20 fired without
+     reaching the threshold. *)
   let start_time = Unix.gettimeofday () in
   let _memory_reporter =
     Lwt.async (fun () ->
@@ -596,11 +585,10 @@ let () =
   setup_signal_handlers ();
   (* Register fatal signal handlers (SIGSEGV, SIGABRT, etc.) for crash diagnostics. *)
   setup_fatal_signal_handlers ();
-  (* Main-loop watchdog: the whole engine (feeds, order processing, health
-     monitor, dashboard server, per-asset wakeups) hinges on the main Lwt
-     event loop, and a loop wedged in an unbounded blocking op previously
-     froze the entire process silently. The watchdog thread detects a lost
-     main-loop heartbeat and force-exits for supervised restart. *)
+  (* Main-loop watchdog: the engine (feeds, order processing, health monitor,
+     dashboard server, per-asset wakeups) depends on the main Lwt event loop; a
+     loop wedged in an unbounded blocking op freezes the process silently. Detects
+     a lost main-loop heartbeat and force-exits for supervised restart. *)
   Concurrency.Main_loop_watchdog.start ();
   Lwt.async Concurrency.Main_loop_watchdog.beat_loop;
   (* Install Lwt async exception hook. *)

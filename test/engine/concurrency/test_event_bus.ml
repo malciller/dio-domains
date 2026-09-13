@@ -15,18 +15,17 @@ let test_event_publish_subscribe () =
     let received = ref [] in
     let finished = Lwt_condition.create () in
     let subscription = EventBus.subscribe bus in
-    (* Subscribe to events *)
     Lwt.async (fun () ->
       let rec loop () =
         Lwt.pick
-          [ (* Try to get an event from the stream *)
+          [
             (Lwt_stream.get subscription.stream
              >>= function
              | Some event ->
                received := event :: !received;
                Lwt.return `Continue
              | None -> Lwt.return `Stop)
-          ; (* Or wait for the finish signal *)
+          ;
             (Lwt_condition.wait finished >>= fun () -> Lwt.return `Stop)
           ]
         >>= function
@@ -34,15 +33,13 @@ let test_event_publish_subscribe () =
         | `Stop -> Lwt.return_unit
       in
       loop ());
-    (* Publish an event *)
     EventBus.publish bus "test_event";
-    (* Give some time for async processing *)
+    (* Allow async delivery. *)
     Lwt_unix.sleep 0.01
     >>= fun () ->
     Alcotest.(check (list string)) "event received" [ "test_event" ] !received;
-    (* Signal the async loop to finish *)
     Lwt_condition.signal finished ();
-    (* Give a little more time for the async loop to terminate *)
+    (* Allow async loop termination. *)
     Lwt_unix.sleep 0.001 >>= fun () -> Lwt.return_unit
   in
   Lwt_main.run (test_async ())

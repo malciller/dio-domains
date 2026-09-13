@@ -1,36 +1,24 @@
-(** Exchange Wakeup
+(** Per-symbol wakeup mechanism.
 
-    Per-symbol wakeup mechanism that allows domain workers to block until
-    exchange data arrives for their assigned symbol, avoiding unnecessary
-    wakeups across unrelated symbols.
+    Domain workers block until exchange data arrives for their assigned symbol,
+    avoiding cross-symbol wakeups.
 
-    Exchange-specific modules call [signal ~symbol] AFTER writing new data
-    for that symbol. Domain workers capture [get_generation ~symbol] at the
-    top of a work cycle and call [wait_since ~symbol ~since] at the bottom:
-    the call returns immediately if any signal arrived while the cycle ran,
-    and otherwise parks until the next one. This closes the classic
-    check-then-sleep lost-wakeup race where a signal landing between the
-    last data read and the park was silently dropped (Condition.signal is
-    not sticky), which previously stalled a quiet symbol's domain until an
-    unrelated event happened to arrive.
+    Protocol (both sides MUST follow):
+    - Producers: write data, then [signal ~symbol]. The signal increments a
+      monotonic per-symbol generation counter under the symbol mutex and fires
+      the condition variable.
+    - Consumers: capture [get_generation ~symbol] BEFORE reading producer state,
+      do the work, then call [wait_since ~symbol ~since]. A generation greater
+      than the baseline proves data was written during the cycle, so the wait
+      cannot sleep through it. This closes the check-then-sleep lost-wakeup
+      race (Condition.signal is not sticky).
 
-    Protocol rules (both sides MUST follow them):
-    - Producers: write data first, then [signal]. The signal bumps a
-      monotonic per-symbol generation counter under the symbol mutex and
-      fires the condition variable.
-    - Consumers: capture the generation BEFORE reading producer state, do
-      the work, then [wait_since]. A generation greater than the captured
-      baseline proves data was written during the cycle, so the wait cannot
-      sleep through it.
-
-    [wait_since] spins briefly on the lock-free atomic counter before
-    parking on the condition variable. Signals landing inside the spin
-    window are absorbed without a futex wake/sleep round-trip, removing
-    kernel scheduler latency from the common case.
+    [wait_since] spins briefly on the atomic counter before parking on the
+    condition variable; signals inside the spin window are absorbed without a
+    futex wake/sleep round-trip.
 
     [signal_all] broadcasts to all waiting workers for cross-cutting events
-    such as shutdown or snapshot completion.
-*)
+    such as shutdown or snapshot completion. *)
 
 type symbol_sync =
   { mutex : Mutex.t
@@ -38,11 +26,10 @@ type symbol_sync =
   ; generation : int Atomic.t (** Monotonic count of signals ever sent. *)
   }
 
-(** Immutable map of known symbol sync records published through a single
-    atomic cell. Reads ([get_sync] fast path) are lock-free and allocation-
-    free; inserts CAS-replace the map. Entries are never removed, so a
-    reader either sees a record or inserts it - no resize/torn-read hazard,
-    unlike the previous raw Hashtbl read outside the registry mutex. *)
+(** Immutable map of symbol sync records in one atomic cell. The [get_sync] fast
+    path is lock-free and allocation-free; inserts CAS-replace the map. Entries
+    are never removed: a reader either sees a record or inserts one, so no
+    resize or torn read is possible. *)
 module SymbolMap = Map.Make (String)
 
 let syncs : symbol_sync SymbolMap.t Atomic.t = Atomic.make SymbolMap.empty
@@ -55,7 +42,7 @@ let[@inline] get_sync symbol =
     Mutex.lock registry_mutex;
     let s =
       (* Re-check under the lock so concurrent first-signallers share one
-         record. Publish via CAS so readers never observe a stale map. *)
+         record; publish via CAS so readers never see a stale map. *)
       let rec insert () =
         let current = Atomic.get syncs in
         match SymbolMap.find_opt symbol current with
@@ -82,16 +69,13 @@ type sync_handle = symbol_sync
 let get_sync_handle = get_sync
 let[@inline] get_generation_fast (sync : sync_handle) = Atomic.get sync.generation
 
-(** Lock-free read of the symbol's current generation. Consumers use this
-    as the baseline argument to [wait_since]. *)
+(** Lock-free read of the symbol's current generation; baseline for [wait_since]. *)
 let[@inline] get_generation ~symbol = get_generation_fast (get_sync symbol)
 
-(** Signals the condition variable for [symbol], waking the domain worker
-    blocked on that symbol. The generation bump happens under the symbol
-    mutex so it can never interleave with a waiter's predicate re-check
-    (the standard condition-variable discipline that makes the signal
-    impossible to lose). Callers must have finished writing the data the
-    signal advertises BEFORE calling this. *)
+(** Signal [symbol]'s condition variable, waking its blocked worker. The
+    generation bump occurs under the symbol mutex, so it cannot interleave with
+    a waiter's predicate re-check. Callers MUST finish writing the signalled
+    data before calling. *)
 let signal ~symbol =
   let sync = get_sync symbol in
   Mutex.lock sync.mutex;
@@ -100,10 +84,8 @@ let signal ~symbol =
   Mutex.unlock sync.mutex
 ;;
 
-(** Signals all per-symbol condition variables. Used for events that require
-    waking every waiting worker, such as shutdown or snapshot completion.
-    Acquires per-symbol mutexes sequentially, guaranteeing no cross-symbol
-    contention. *)
+(** Signal every per-symbol condition variable for cross-cutting events such as
+    shutdown or snapshot completion. Acquires per-symbol mutexes sequentially. *)
 let signal_all () =
   let all_syncs = SymbolMap.fold (fun _ sync acc -> sync :: acc) (Atomic.get syncs) [] in
   List.iter
@@ -115,16 +97,13 @@ let signal_all () =
     all_syncs
 ;;
 
-(* Spin iterations before parking. Absorbs a producer racing ahead of the
-   waiter, but kept modest: each iteration is an atomic read, and with many
-   domains the old 400-iteration spin burned significant aggregate CPU on
-   every idle park. The generation re-check makes the spin purely a latency
-   optimization, so a shorter spin costs at most a futex wake/sleep round-trip
-   in the rare race case. *)
+(* Spin iterations before parking. Each iteration is one atomic read; the spin
+   is a latency optimization only. A shorter spin costs at most one futex
+   wake/sleep round-trip in the rare race case. *)
 let default_spin_iterations = 100
 
-(** Fast-path [wait_since] using a pre-resolved [sync_handle], avoiding
-    Map traversal on the hot domain cycle. *)
+(** Fast-path [wait_since] over a pre-resolved [sync_handle]; avoids map
+    traversal on the hot domain cycle. *)
 let wait_since_fast (sync : sync_handle) ~since =
   let rec spin i =
     if Atomic.get sync.generation <> since
@@ -143,16 +122,11 @@ let wait_since_fast (sync : sync_handle) ~since =
   spin default_spin_iterations
 ;;
 
-(** Blocks until the symbol's generation exceeds [since], i.e. until any
-    producer signals this symbol after the caller captured its baseline.
-    Returns immediately (without taking any lock) when a signal already
-    arrived between the baseline capture and this call - the property that
-    makes the surrounding produce/consume cycle race-free.
-
-    Phase 1 spins on the atomic generation counter; phase 2 takes the
-    symbol mutex and parks on the condition variable with a predicate loop
-    (spurious wakeups and signals fired before the mutex was acquired are
-    both handled by re-checking the generation under the lock). *)
+(** Block until the symbol's generation exceeds [since]. Returns immediately
+    without locking when a signal arrived after the baseline capture.
+    Phase 1 spins on the atomic generation; phase 2 parks on the condition
+    variable under the symbol mutex with a predicate loop, which handles
+    spurious wakeups and signals fired before the mutex was acquired. *)
 let wait_since ~symbol ~since =
   let sync = get_sync symbol in
   wait_since_fast sync ~since

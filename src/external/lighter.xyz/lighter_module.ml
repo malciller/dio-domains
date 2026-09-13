@@ -174,8 +174,7 @@ module Lighter_impl = struct
       let results =
         Lwt_list.map_s
           (fun order_id ->
-             (* Use the given symbol, else look the order up in the
-                executions feed. *)
+             (* Symbol from the argument, else from the executions feed. *)
              let sym =
                match symbol with
                | Some s -> s
@@ -431,7 +430,6 @@ module Lighter_impl = struct
     match Hashtbl.find_opt fee_cache symbol with
     | Some (maker, taker) -> Some maker, Some taker
     | None ->
-      (* Cache miss: load fees from the instruments feed. *)
       (match Lighter_instruments_feed.lookup_info symbol with
        | Some info ->
          Hashtbl.replace fee_cache symbol (info.maker_fee, info.taker_fee);

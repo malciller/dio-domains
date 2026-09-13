@@ -1,17 +1,14 @@
 (** Kraken oracle data-venue adapter.
 
-    Implements [Exchange_intf.Oracle.S] for the capital oracle's data
-    layer: historical daily OHLC (/0/public/OHLC, paginated on "last"),
-    account fees (TradeVolume via [Kraken_get_fee]), the trade-wallet balance
-    snapshot (/0/private/Balance) and instrument metadata (price tick / lot
-    size via [Kraken_instruments_feed]).
+    Implements [Exchange_intf.Oracle.S]: daily OHLC (/0/public/OHLC,
+    paginated on "last"), account fees (TradeVolume via [Kraken_get_fee]),
+    trade-wallet balance (/0/private/Balance), and instrument metadata
+    (via [Kraken_instruments_feed]).
 
-    The pure [parse_*] functions are fixture-testable without network.
-    [fetch_bars] returns RAW bars (any order); the oracle sorts, de-duplicates
-    and normalizes centrally (normalize is idempotent, so this contract is
-    safe). HTTP calls are timeout-bounded so a blackholed upstream cannot
-    freeze the oracle pass (mirrors the oracle's HTTP timeout pattern,
-    which is not reachable from the venue library). *)
+    [parse_*] functions are pure and fixture-testable. [fetch_bars] returns
+    RAW bars in arbitrary order; the oracle sorts, de-duplicates, and
+    normalizes centrally (normalize is idempotent). HTTP calls are
+    timeout-bounded so a blackholed upstream cannot freeze the oracle pass. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf

@@ -1,7 +1,6 @@
-(** Connection lifecycle management. Owns registration, state transitions,
-    circuit breaker, reconnection dispatch, and graceful shutdown.
-    All connection primitives consumed by other supervisor submodules
-    are defined here. *)
+(** Connection lifecycle management: registration, state transitions,
+    circuit breaker, reconnection dispatch, and graceful shutdown. Defines
+    the connection primitives used by the other supervisor submodules. *)
 
 open Supervisor_types
 
@@ -12,12 +11,12 @@ let shutdown_requested = Atomic.make false
 let shutdown_mutex = Mutex.create ()
 let shutdown_cond = Condition.create ()
 
-(* Timestamp of the last Supervisor_cache.force_update call.
-   Rate-limits cache refreshes to prevent allocation bursts during
-   rapid reconnect cycles. *)
+(* Timestamp of the last [Supervisor_cache.force_update]. Rate-limits cache
+   refreshes to prevent allocation bursts during rapid reconnect cycles. *)
 let last_supervisor_cache_update = ref 0.0
 
-(** Polls the shutdown flag in 100ms increments and returns early if set. *)
+(** Sleeps up to [seconds], polling the shutdown flag every 100ms and
+    returning early if it is set. *)
 let interruptible_sleep seconds =
   if Atomic.get shutdown_requested
   then ()
@@ -55,9 +54,9 @@ let next_ping_req_id =
     !counter
 ;;
 
-(** Registers a new supervised connection in the global registry.
-    Initializes all state fields and stores the optional connect_fn
-    for automatic reconnection. *)
+(** Registers a supervised connection in the global registry, initializing
+    all state fields and storing the optional [connect_fn] for automatic
+    reconnection. *)
 let register ~name ~connect_fn =
   Mutex.lock registry_mutex;
   let conn =
@@ -85,8 +84,8 @@ let register ~name ~connect_fn =
   conn
 ;;
 
-(** Registers an existing connection for health monitoring only.
-    No connect_fn is provided, so automatic reconnection is disabled. *)
+(** Registers an already-connected connection for health monitoring only.
+    [connect_fn] is [None], so automatic reconnection is disabled. *)
 let register_for_monitoring ~name =
   Mutex.lock registry_mutex;
   let conn =
@@ -106,7 +105,7 @@ let register_for_monitoring ~name =
     ; circuit_breaker_failures = 0
     ; circuit_breaker_last_failure = None
     ; connect_fn = None
-    ; (* No connect_fn: reconnection disabled *)
+    ; (* [None] disables reconnection. *)
       mutex = Mutex.create ()
     }
   in
@@ -116,9 +115,9 @@ let register_for_monitoring ~name =
   conn
 ;;
 
-(** Transitions connection to [new_state], updating timestamps and counters
-    under the per-connection mutex. Propagates changes to the supervisor
-    cache at most once per second. *)
+(** Transitions to [new_state], updating timestamps and counters under the
+    per-connection mutex. Propagates changes to the supervisor cache at most
+    once per second. *)
 let set_state conn new_state =
   Mutex.lock conn.mutex;
   let old_state = conn.state in
@@ -159,12 +158,10 @@ let set_state conn new_state =
        reason
        conn.reconnect_attempts);
   Mutex.unlock conn.mutex;
-  (* Propagate state transitions to the supervisor cache *)
   if old_state <> new_state
   then (
-    (* Rate-limit cache updates to at most once per second.
-       The dashboard state_broadcaster picks up interim deltas
-       at its next 500ms tick regardless. *)
+    (* Rate-limit cache updates to once per second; the dashboard
+       state_broadcaster picks up interim deltas at its next 500ms tick. *)
     let now = Unix.gettimeofday () in
     let last = !last_supervisor_cache_update in
     if now -. last >= 1.0
@@ -208,9 +205,9 @@ let update_data_heartbeat conn =
   Mutex.unlock conn.mutex
 ;;
 
-(** Checks whether the circuit breaker permits a connection attempt.
-    Caller must hold conn.mutex. Transitions Open to HalfOpen after
-    a 300s (5 min) cooldown. *)
+(** Returns whether the circuit breaker permits a connection attempt.
+    Caller must hold [conn.mutex]. Transitions [Open] to [HalfOpen] after a
+    300s cooldown. *)
 let circuit_breaker_allows_connection_unlocked conn =
   let current_time = Unix.time () in
   match conn.circuit_breaker with
@@ -218,7 +215,6 @@ let circuit_breaker_allows_connection_unlocked conn =
   | Open ->
     (match conn.circuit_breaker_last_failure with
      | Some failure_time when current_time -. failure_time > 300.0 ->
-       (* 5 min cooldown *)
        conn.circuit_breaker <- HalfOpen;
        Logging.info_f
          ~section
@@ -237,24 +233,21 @@ let circuit_breaker_allows_connection conn =
   allowed
 ;;
 
-(** Updates circuit breaker state. On success, resets to Closed.
-    On failure, increments the counter and opens the circuit
-    after 5 consecutive failures. *)
+(** Updates circuit breaker state: on success resets to [Closed]; on failure
+    increments the counter and opens the circuit after 5 consecutive
+    failures. *)
 let update_circuit_breaker conn success =
   Mutex.lock conn.mutex;
   if success
   then (
-    (* Reset circuit breaker on success *)
     conn.circuit_breaker <- Closed;
     conn.circuit_breaker_failures <- 0;
     conn.circuit_breaker_last_failure <- None)
   else (
-    (* Increment failure counter; open circuit at threshold *)
     conn.circuit_breaker_failures <- conn.circuit_breaker_failures + 1;
     conn.circuit_breaker_last_failure <- Some (Unix.time ());
     if conn.circuit_breaker_failures >= 5
     then (
-      (* Threshold: 5 consecutive failures *)
       conn.circuit_breaker <- Open;
       Logging.warn_f
         ~section
@@ -264,9 +257,9 @@ let update_circuit_breaker conn success =
   Mutex.unlock conn.mutex
 ;;
 
-(** Schedules connect_fn in the Lwt event loop if the circuit breaker
-    permits and the connection is not already in Connecting state.
-    Transitions state to Connecting under mutex before launching. *)
+(** Schedules [connect_fn] on the Lwt event loop if the circuit breaker
+    permits and the connection is not already [Connecting]. Transitions to
+    [Connecting] under [conn.mutex] before launching. *)
 let start_async conn =
   match conn.connect_fn with
   | None ->
@@ -334,7 +327,7 @@ let start_async conn =
           (fun () ->
              connect_fn ()
              >>= fun () ->
-             (* WebSocket connect_fn should block indefinitely; early return is abnormal *)
+             (* WebSocket connect_fn blocks indefinitely; early return is abnormal. *)
              Mutex.lock conn.mutex;
              let already_failed =
                match conn.state with
@@ -363,7 +356,6 @@ let start_async conn =
                  "[%s] Unexpected error in connection function: %s"
                  conn.name
                  error_msg;
-               (* Transition to Failed on unhandled exception *)
                set_state conn (Failed error_msg))
              else
                Logging.debug_f
@@ -374,12 +366,11 @@ let start_async conn =
              Lwt.return_unit)))
 ;;
 
-(** Forces a reconnect by resetting state to Disconnected and
-    clearing the reconnect counter before calling [start_async]. *)
+(** Forces a reconnect: resets state to [Disconnected], clears the reconnect
+    counter, then calls [start_async]. *)
 let restart conn =
   Logging.info_f ~section "[%s] Manually restarting connection" conn.name;
   set_state conn Disconnected;
-  (* Reset backoff counter for manual restart *)
   Mutex.lock conn.mutex;
   conn.reconnect_attempts <- 0;
   Mutex.unlock conn.mutex;
@@ -413,27 +404,23 @@ let get_all_connections () =
     to interrupt any sleeping threads. *)
 let stop_order_processing () =
   Atomic.set shutdown_requested true;
-  (* Signal all waiters on the shutdown condition *)
   Mutex.lock shutdown_mutex;
   Condition.broadcast shutdown_cond;
   Mutex.unlock shutdown_mutex;
   Logging.info ~section "Order processing loop shutdown requested"
 ;;
 
-(** Stops order processing and transitions all registered connections
-    to Disconnected. Includes a 500ms drain window for in-flight orders.
-    Also stops the supervised capital-oracle runtime (registered by
-    [Supervisor.start_oracle]) so its pass loop exits on the same shutdown
-    signal as every other supervised module. *)
+(** Stops order processing and transitions all registered connections to
+    [Disconnected], allowing a 500ms drain window for in-flight orders. Also
+    stops the supervised capital-oracle runtime so its pass loop exits on the
+    same shutdown signal as every other supervised module. *)
 let stop_all () =
   stop_order_processing ();
-  (* The capital oracle is a supervised module: signal its loop to stop
-     (the loop checks its own flag at every wait slice and on the next
-     pass). *)
+  (* Capital oracle: signal its loop to stop (the loop checks its own flag at
+     every wait slice and on the next pass). *)
   (try Dio_oracle.Oracle_runtime.shutdown () with
    | _ -> ());
   interruptible_sleep 0.5;
-  (* Drain window for in-flight order iterations *)
   Logging.warn ~section "Stopping all supervised connections";
   Mutex.lock registry_mutex;
   let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in

@@ -1,10 +1,9 @@
 (** Background renewal of resting Lighter orders.
 
-    Lighter mandates Good-Till-Time (GTT) orders with a maximum 28-day TTL,
-    and [SignModifyOrder] cannot change TIF or expiry. To emulate GTC, this
-    daemon watches open orders and extends ones nearing expiry via
-    cancel-and-replace: the only way to extend validity without losing the
-    resting order. *)
+    Lighter mandates Good-Till-Time (GTT) orders with a 28-day maximum TTL,
+    and [SignModifyOrder] cannot change TIF or expiry. GTC is emulated by
+    cancel-and-replace of orders nearing expiry; this is the only way to
+    extend validity while preserving the resting order. *)
 
 open Lwt.Infix
 
@@ -54,7 +53,6 @@ let renew_order (order : Lighter_executions_feed.open_order) : (unit, string) re
       qty
       price
       remaining_qty;
-    (* Step 1: cancel the resting order. *)
     Lighter_actions.cancel_order ~symbol ~order_id
     >>= fun cancel_result ->
     match cancel_result with
@@ -70,8 +68,8 @@ let renew_order (order : Lighter_executions_feed.open_order) : (unit, string) re
       (* Brief pause so the cancel propagates back over the WS feed first. *)
       Lwt_unix.sleep 0.5
       >>= fun () ->
-      (* Step 2: re-place at the same price with the remaining qty; the
-         default expiry gives a fresh 28-day TTL. *)
+      (* Re-place at the same price with the remaining qty; the default
+         expiry yields a fresh 28-day TTL. *)
       Lighter_actions.place_order ~symbol ~is_buy ~qty:remaining_qty ~price ()
       >>= fun place_result ->
       (match place_result with
@@ -111,7 +109,6 @@ let run_renewal_cycle () =
            let remaining = expiry -. now in
            remaining < renewal_threshold_seconds && remaining > 0.0
          | None ->
-           (* No expiry data: skip. *)
            false)
       all_orders
   in

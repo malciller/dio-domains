@@ -1,10 +1,9 @@
-(* Jacobs Ladder - Exchange Configuration & Dynamic Helpers *)
+(* Jacobs Ladder: exchange configuration and dynamic helpers. *)
 
 open Jacobs_ladder_types
 
-(* Kraken runs the same model as HL/Lighter/IBKR: 1:1 sells and a
-   persistence-layer reserved_base accrual on profitable sell fills
-   (Base_accumulation_store). *)
+(* Kraken matches HL/Lighter/IBKR: 1:1 sells and persistence-layer
+   reserved_base accrual on profitable sell fills (Base_accumulation_store). *)
 let kraken_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
@@ -187,23 +186,21 @@ let round_qty qty symbol exchange =
   floor ((qty *. inv) +. 1e-9) /. inv
 ;;
 
-(** Venue minimum accepted order QUANTITY for [symbol] in base-asset units,
-    resolved from the live venue module (e.g. 0.0005 BTC on Hyperliquid spot;
-    0.0 = unknown). This is the exchange's minimum - the floor every order
-    must clear - entirely separate from the grid's configured order [qty]. *)
+(** Minimum accepted order QUANTITY for [symbol] in base-asset units, from the
+    live venue module (e.g. 0.0005 BTC on Hyperliquid spot; 0.0 = unknown).
+    Venue floor every order must clear; independent of the grid's [qty]. *)
 let get_qty_min_val symbol exchange =
   match get_exchange_module exchange with
   | Some (module Ex : Exchange.S) -> Option.value (Ex.get_qty_min ~symbol) ~default:0.0
   | None -> 0.0
 ;;
 
-(** Venue default minimum order notional in quote terms for [symbol]
-    (0.0 = not constrained), resolved through the venue's oracle adapter
-    ([Exchange_intf.Oracle.S.min_notional] - Hyperliquid's 10 USDC spot
-    floor, Alpaca's $1 fractional minimum; others 0.0 here). Unregistered
-    venues are not notional-constrained. Same resolution the oracle's
-    [Grid_adapter] uses, so the live grid and the replay agree on the
-    floor. *)
+(** Default minimum order notional for [symbol] in quote terms (0.0 =
+    unconstrained), from the venue's oracle adapter
+    ([Exchange_intf.Oracle.S.min_notional]): Hyperliquid 10 USDC spot floor,
+    Alpaca $1 fractional minimum, others 0.0. Unregistered venues are
+    unconstrained. Same resolution as the oracle's [Grid_adapter], so the
+    live grid and replay agree on the floor. *)
 let get_min_notional_val symbol exchange =
   match Exchange.Oracle.Registry.get exchange with
   | Some (module V) -> V.min_notional ~symbol
@@ -248,12 +245,10 @@ let parse_config_float config value_name default exchange symbol =
 ;;
 
 let get_min_move_threshold price_increment =
-  (* The exchange's minimum price move: one tick ([price_increment], e.g.
-     $0.01 on Alpaca/Hyperliquid). An amendment to any price one tick away is
-     a valid resting-order price, so the trailing leg re-anchors on every
-     valid price step and the buy tracks price action smoothly. This replaces
-     the old magic deadband (max of 10 ticks and 5% of the grid interval)
-     which made the book jump in large, delayed steps instead of trailing. *)
+  (* Exchange minimum price move: one tick ([price_increment], e.g. $0.01 on
+     Alpaca/Hyperliquid). An amendment one tick away is a valid resting price,
+     so the trailing leg re-anchors on every valid price step and the buy
+     tracks price action without a deadband. *)
   price_increment
 ;;
 

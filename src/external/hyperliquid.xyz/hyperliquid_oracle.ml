@@ -1,26 +1,20 @@
-(** Hyperliquid oracle data-venue adapter.
+(** Hyperliquid data-venue adapter for the capital oracle; implements
+    [Exchange_intf.Oracle.S].
 
-    Implements [Exchange_intf.Oracle.S] for the capital oracle's data
-    layer: historical daily OHLC via the public Info API (POST /info
-    {"type":"candleSnapshot"}, paginated forward in day-windows), account fees
-    (userFees via [Get_fee]), the SPOT wallet balance snapshot
-    (spotClearinghouseState - deliberately spot-only, perp margin is not grid
-    capital) and instrument metadata ([Instruments_feed]).
+    Sources: historical daily OHLC via POST /info {"type":"candleSnapshot"}
+    paginated forward in day-windows; account fees via [Get_fee]; spot wallet
+    balance via spotClearinghouseState (spot-only; perp margin is not grid
+    capital); instrument metadata via [Instruments_feed]. All HTTP calls are
+    timeout-bounded.
 
-    Spot vs perpetual resolution replicates the live instruments feed: a bare
-    coin name is a perpetual and is used as-is; a "BASE/QUOTE" symbol resolves
-    through the spotMeta universe to the candle coin ("PURR/USDC" or the "@N"
-    alias). A "/" symbol with no matching Hyperliquid spot pair has no spot
-    history and returns no bars (the asset is then INACTIVE) - never a
-    silent perpetual substitute.
+    Spot/perp resolution: a bare coin is a perpetual and used as-is; a
+    "BASE/QUOTE" symbol resolves through spotMeta to the candle coin
+    ("PURR/USDC" or "@N"). A "/" symbol with no matching spot pair has no
+    history and yields no bars (asset INACTIVE) - never perpetual data.
 
-    Raw-bar contract: [fetch_bars] returns the fetched windows concatenated,
-    sorted and de-duplicated (ISO dates sort lexicographically), but NOT
-    source-normalized; the oracle applies its shared clean-series
-    normalization ([Oracle_calendar.normalize_bars]) on every read, so the
-    placeholder/outlier filtering, its self-healing and the dropped/clamped
-    counts all live in one central place. HTTP calls are timeout-bounded so a
-    hung upstream cannot freeze the oracle pass. *)
+    [fetch_bars] returns fetched windows concatenated, sorted, and
+    de-duplicated (ISO dates sort lexicographically) but NOT source-normalized;
+    the oracle applies [Oracle_calendar.normalize_bars] on every read. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
@@ -45,9 +39,9 @@ let post_info (payload : string) : (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
       (Uri.of_string endpoint))
 ;;
 
-(* ---- Civil-date arithmetic (ISO date <-> unix ms). No timezone
-   dependence (mktime is local-time dependent; the oracle forbids it).
-   Hinnant's days-from-civil, same as Oracle_calendar. *)
+(* Civil-date arithmetic (ISO date <-> unix ms). No timezone dependence
+   (mktime is local-time dependent). Hinnant's days-from-civil, as in
+   Oracle_calendar. *)
 
 let days_from_civil y m d =
   let y = if m <= 2 then y - 1 else y in
@@ -87,8 +81,8 @@ let unix_ms_to_iso (t : int64) =
     tm.Unix.tm_mday
 ;;
 
-(** Canonicalize the wrapped spot base tokens the same way
-    [Hyperliquid_instruments_feed] does when it builds its spot keys. *)
+(** Canonicalizes wrapped spot base tokens, matching
+    [Hyperliquid_instruments_feed] spot keys. *)
 let canon_base = function
   | "UBTC" -> "BTC"
   | "UETH" -> "ETH"
@@ -96,28 +90,22 @@ let canon_base = function
   | other -> other
 ;;
 
-(** Cached mapping of feed-style spot symbols ("BASE/QUOTE", e.g. "BTC/USDC")
-    to the candleSnapshot coin (the spotMeta universe "name": "PURR/USDC" or
-    the "@N" alias, e.g. "@142") from the last spotMeta fetch. *)
+(** Feed-style spot symbol ("BTC/USDC") to candleSnapshot coin ("PURR/USDC" or
+    "@N") mapping from the last spotMeta fetch. *)
 let spot_meta_pairs : (string, string) Hashtbl.t = Hashtbl.create 512
 
 let spot_meta_fetched_at : float ref = ref 0.0
 let spot_meta_mutex = Mutex.create ()
 let spot_meta_ttl = 6.0 *. 3600.0
 
-(* Symbols already reported as having no Hyperliquid spot pair this run.
-   These are expected for class members that never had a spot listing
-   (e.g. DOGE/USD), so every oracle pass would otherwise re-log the same
-   warning on each refresh. Warn once, then debug. *)
+(* Symbols already reported as having no spot pair this run, to avoid
+   re-logging the same warning on every oracle pass. Warn once, then debug. *)
 let warned_no_spot_history : (string, unit) Hashtbl.t = Hashtbl.create 32
 
-(** Pure: extract (feed_symbol, candle_coin) mappings from a spotMeta
-    response. [feed_symbol] replicates the instruments-feed spot key: the base
-    token name canonicalized for the wrapped majors (UBTC/UETH/USOL) plus the
-    quote name (e.g. "BTC/USDC", "LINK0/USDC"). [candle_coin] is the universe
-    entry's "name" field, which candleSnapshot accepts directly for spot: the
-    canonical "PURR/USDC" or the "@N" alias (e.g. "@142") for every wrapped
-    pair. *)
+(** Extracts (feed_symbol, candle_coin) mappings from a spotMeta response.
+    [feed_symbol] = canonicalized base (UBTC/UETH/USOL) ^ "/" ^ quote.
+    [candle_coin] = the universe entry's "name", accepted by candleSnapshot
+    for spot ("PURR/USDC" or the "@N" alias). *)
 let spot_meta_pairs_of_json (json : Yojson.Safe.t) : (string * string) list =
   let open Yojson.Safe.Util in
   let token_name idx =
@@ -193,16 +181,11 @@ let refresh_spot_meta () : unit Lwt.t =
          Lwt.return_unit)
 ;;
 
-(** Pure: resolve a config symbol to the candleSnapshot coin, replicating the
-    instruments-feed mapping.
-    - Bare coin (no "/"): a perpetual -> the coin itself (perp candles).
-    - "BASE/QUOTE": a spot pair. The quote is normalized ("USD" -> "USDC",
-      Hyperliquid spot is USDC-quoted) and the pair is looked up by its
-      feed-style key (canonicalized base). A match yields the spot candle coin
-      - the canonical "PURR/USDC" or the "@N" alias (e.g. "@142") - so the
-      asset's spot history is used; no match means the symbol is not a
-      Hyperliquid spot pair -> [None], and the caller returns no bars instead
-      of substituting perpetual data. *)
+(** Resolves a config symbol to its candleSnapshot coin.
+    - Bare coin: perpetual; returned uppercased.
+    - "BASE/QUOTE": spot. Quote "USD" is normalized to "USDC"; lookup is by
+      feed-style key. A match yields the spot coin ("PURR/USDC" or "@N"); no
+      match yields [None] (no bars, never perpetual data). *)
 let coin_of_symbol ~(pairs : (string * string) list) (symbol : string) : string option =
   let sym = String.trim symbol in
   if sym = ""
@@ -256,14 +239,10 @@ let parse_candles ~(symbol : string) (json : Yojson.Safe.t) : Exchange.Types.bar
          (Yojson.Safe.to_string json))
 ;;
 
-(** Order the fetched candle windows into ascending time (oldest -> newest):
-    ISO dates sort lexicographically, so a plain sort is exact. The LAST bar
-    must be the CURRENT close: the grid start price and all ladder capital
-    math read it, so an unordered series prices every ladder from a stale
-    close. Source normalization is NOT applied here - the oracle's central
-    clean-series path ([Oracle_calendar.normalize_bars]) sorts, de-duplicates
-    and filters on every read, so this helper only guarantees window-boundary
-    order for direct consumers. *)
+(** Orders fetched windows ascending by ISO date (lexicographic sort is exact).
+    The last bar must be the current close: the grid start price and ladder
+    capital math read it. No source normalization here;
+    [Oracle_calendar.normalize_bars] sorts, de-dupes, and filters on read. *)
 let windows_to_series (windows : Exchange.Types.bar list list) : Exchange.Types.bar list =
   let bars =
     List.concat windows
@@ -281,12 +260,9 @@ let windows_to_series (windows : Exchange.Types.bar list list) : Exchange.Types.
 let calendar_kind = Exchange.Types.Crypto
 let fetch_calendar ~start_date:_ ~end_date:_ : string list Lwt.t = Lwt.return []
 
-(** Fetch daily candles forward from [from] (ISO date of the first day;
-    [None] = 2022-01-01), in day-windows. Spot symbols (containing "/")
-    resolve through the feed-style mapping to the mapped spot asset's candle
-    coin ("PURR/USDC" or "@N"); symbols without a matching spot pair resolve
-    to no bars (never perpetual data for a spot-named symbol). Bare coin
-    names denote perpetuals. *)
+(** Fetches daily candles forward from [from] (ISO first-day; [None] =
+    2022-01-01) in day-windows. Spot symbols resolve through the feed mapping;
+    no matching pair yields no bars. Bare coins are perpetuals. *)
 let fetch_bars ?feed:_ ?end_date:_ ~from ~symbol () : Exchange.Types.bar list Lwt.t =
   refresh_spot_meta ()
   >>= fun () ->
@@ -485,10 +461,8 @@ let fetch_balances ~testnet : ((string * float * float) list, string) result Lwt
   match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
   | None | Some "" -> Lwt.return (Error "HYPERLIQUID_WALLET_ADDRESS is not set")
   | Some wallet ->
-    (* The jacobs_ladder strategy trades spot only, so the pool is the spot
-       wallet's USDC (and any other spot tokens) exclusively. The perpetual
-       clearinghouse balance is deliberately not included: it is margin
-       reserved for perp positions, not capital available to the spot grid. *)
+    (* Spot-only pool: the spot wallet's USDC and tokens. Perp clearinghouse
+       margin is reserved for perp positions and excluded from the spot grid. *)
     post_json
       ~url:(base_url testnet ^ "/info")
       (`Assoc [ "type", `String "spotClearinghouseState"; "user", `String wallet ])
@@ -497,13 +471,10 @@ let fetch_balances ~testnet : ((string * float * float) list, string) result Lwt
      | Ok spot_json -> parse_spot_balances spot_json)
 ;;
 
-(** Hyperliquid deliberately has no live balance snapshot for the oracle:
-    the live websocket-fed "USDC" store aggregates the perp clearinghouse
-    USDC with the spot wallet, while the oracle pool counts spot capital only
-    (perp margin is not grid capital). REST spotClearinghouseState stays
-    authoritative there, so this always returns [None] and the oracle runtime
-    falls back to [fetch_balances]. Revisit only if a WS spot-only balance
-    semantics is proven equivalent to the REST spot view. *)
+(** Always [None]: the WS-fed "USDC" store aggregates perp clearinghouse USDC
+    with the spot wallet, whereas the oracle pool is spot-only. REST
+    spotClearinghouseState remains authoritative; the runtime falls back to
+    [fetch_balances]. *)
 let live_balances () : (string * float * float) list option = None
 
 let default_quote = "USDC"

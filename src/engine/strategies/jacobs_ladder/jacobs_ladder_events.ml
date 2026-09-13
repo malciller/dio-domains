@@ -1,4 +1,4 @@
-(* Jacobs Ladder - Order Lifecycle Event Handlers & Persistence *)
+(* Jacobs Ladder: order lifecycle event handlers and persistence. *)
 
 open Strategy_common
 open Jacobs_ladder_types
@@ -6,15 +6,13 @@ open Jacobs_ladder_config
 open Jacobs_ladder_reservation
 open Jacobs_ladder_orders
 
-(* per-symbol lock-free lifecycle event queue. The Lwt supervisor thread
-   (REST callbacks, supervisor_orders.ml) enqueues lifecycle events instead of
-   calling the handlers directly; the domain worker drains the queue at the
-   top of every cycle, so ALL handler execution happens on the domain thread.
-   The per-symbol state mutex is then never contended across threads (the
-   supervisor never blocks on it, the domain never blocks on a REST batch).
-   Each queue is single-consumer (its symbol's domain); LockFreeQueue is
-   MPSC-safe, and enqueue signals Exchange_wakeup so an idle domain wakes to
-   drain promptly. *)
+(* Per-symbol lock-free lifecycle event queue. The Lwt supervisor thread (REST
+   callbacks, supervisor_orders.ml) enqueues events instead of calling handlers
+   directly; the domain worker drains the queue at the top of every cycle, so
+   all handler execution stays on the domain thread and the per-symbol state
+   mutex is never contended across threads. Each queue has a single consumer
+   (its symbol's domain); LockFreeQueue is MPSC-safe, and enqueue signals
+   Exchange_wakeup so an idle domain wakes promptly. *)
 
 type lifecycle_event =
   | Ack of
@@ -74,8 +72,8 @@ let get_event_queue symbol =
     q
 ;;
 
-(** Enqueue a lifecycle event from any thread (supervisor REST path). Lock-free
-    push plus a per-symbol wakeup so the domain drains it promptly. *)
+(** Enqueues a lifecycle event from any thread (supervisor REST path). Lock-free
+    push plus a per-symbol wakeup so the domain drains promptly. *)
 let enqueue_event symbol (ev : lifecycle_event) =
   ignore (LockFreeQueue.write (get_event_queue symbol) ev);
   Concurrency.Exchange_wakeup.signal ~symbol
@@ -149,13 +147,12 @@ let flush_persistence asset_symbol =
     | None -> ())
 ;;
 
-(** [filter_keep_if_needed keep xs] is [List.filter keep xs] but returns [xs]
-    physically unchanged when nothing is dropped. The lifecycle handlers below
-    usually find no matching pending token (it was already consumed), and
-    [List.filter] would still copy the whole list on every event - allocation
-    that fills this domain's minor heap and can force a stop-the-world minor
-    collection inside the execution-event drain. Sharing the original list is
-    safe: these lists are immutable and only ever replaced wholesale. *)
+(** [filter_keep_if_needed keep xs] returns [xs] physically unchanged when
+    [keep] drops nothing, else [List.filter keep xs]. Handlers usually find no
+    matching pending token, and an unconditional [List.filter] would copy the
+    whole list on every event - allocation that fills the minor heap and can
+    force a stop-the-world minor collection inside the event drain. Sharing is
+    safe: the lists are immutable and only replaced wholesale. *)
 let filter_keep_if_needed keep xs =
   let rec all_kept = function
     | [] -> true
@@ -164,10 +161,9 @@ let filter_keep_if_needed keep xs =
   if all_kept xs then xs else List.filter keep xs
 ;;
 
-(** Non-allocating equivalent of
-    [String.starts_with s ~prefix:"pending_amend_" && String.sub s 14
-    (String.length s - 14) = target]. The old predicates allocated a fresh
-    substring for every pending entry scanned ("pending_amend_" is 14 bytes). *)
+(** Non-allocating equivalent of [String.starts_with s ~prefix:"pending_amend_"
+    && String.sub s 14 (String.length s - 14) = target]. Avoids allocating a
+    fresh substring per pending entry scanned. *)
 let pending_amend_for s target =
   String.starts_with ~prefix:"pending_amend_" s
   && String.length s = 14 + String.length target
@@ -208,8 +204,8 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
           state.inflight_amend_buy <- false;
           state.last_buy_attempted_insufficient <- false;
           (* Start the open-orders feed-lag grace: the venue lists the acked buy
-             a moment later, and [sync_open_orders] must not purge it as a ghost
-             in that window. *)
+             a moment later; [sync_open_orders] must not purge it as a ghost in
+             that window. *)
           state.last_buy_ack_ts <- now;
           (* The buy is resting again - any pending TIF-recovery re-attempt
              is satisfied. *)
@@ -217,23 +213,21 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
           ()
         | Sell ->
           state.inflight_sell <- false;
-          (* Release the in-flight marker when the placement completes. The
-             key is added by [push_order] at dispatch and must be removed here
-             (the placement is acknowledged), not left latched until a fill/
-             cancel/failure: while it stayed set, [has_active_sell] reported
-             true for the entire time a sell rested on the book, which gated
-             every later sell attempt behind a buy fill (the only event that
-             force-cleared it). The marker now means "a sell placement is in
-             flight", so a resting sell no longer blocks the next sell for new
-             inventory - the inventory gate (available >= sell qty) is what
-             prevents duplicates. *)
+          (* Release the in-flight marker when the placement completes. The key
+             is added by [push_order] at dispatch and removed here, not held
+             until a fill/cancel/failure: while held, [has_active_sell] reported
+             true for the entire time a sell rested on the book, gating every
+             later sell attempt behind a buy fill. The marker now means "a sell
+             placement is in flight", so a resting sell no longer blocks the
+             next sell for new inventory - the inventory gate (available >=
+             sell qty) prevents duplicates. *)
           ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell);
           state.recently_injected_sells
           <- (order_id, price, now) :: state.recently_injected_sells;
           (* Re-key the in-flight commitment from the temporary pending id to
-              the venue order id. Matching by price is exact enough: only one
-              sell placement is in flight at a time (the dedup key is released
-              when this ack lands). *)
+             the venue order id. Matching by price is exact enough: only one
+             sell placement is in flight at a time (the dedup key is released
+             when this ack lands). *)
           let pending_sell_id =
             Hashtbl.fold
               (fun i c acc ->
@@ -335,11 +329,11 @@ let handle_order_failed ~now asset_symbol side reason =
        (match side with
         | Buy when not is_insufficient_balance ->
           (* A terminal placement loss (TIF/ALO/post-only, transient venue
-             errors) must not leave the asset buyless while the capital
-             oracle is INACTIVE: arm TIF recovery so the buy leg re-attempts
-             (re-priced, after the normal cooldown) even through the halt.
-             Insufficient-balance failures are excluded - capital_low owns
-             those and the recovery must not fight a real capital drought. *)
+             errors) must not leave the asset buyless while the capital oracle
+             is INACTIVE: arm TIF recovery so the buy leg re-attempts (repriced,
+             after the normal cooldown) through the halt. Insufficient-balance
+             failures are excluded - capital_low owns those and recovery must
+             not fight a real capital drought. *)
           state.tif_recovery_pending <- true;
           state.tif_recovery_since <- Unix.gettimeofday ();
           Logging.info_f
@@ -355,10 +349,10 @@ let handle_order_failed ~now asset_symbol side reason =
           then
             (* The buy was knowingly placed against a stale, under-funded
                balance snapshot: the rejection is foreordained, so latching
-               capital_low would pause buying on a snapshot that is about to
-               be replaced by the fresh balance. The fresh store value on the
-               next update governs (and the fresh-insufficient placement path
-               latches capital_low itself when the shortage is real). *)
+               capital_low would pause buying on a snapshot about to be
+               replaced. The fresh store value governs; the fresh-insufficient
+               placement path latches capital_low itself when the shortage is
+               real. *)
             Logging.info_f
               ~section
               "Exchange rejected buy for %s with insufficient funds (foreordained: stale \
@@ -582,14 +576,13 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
            if dominated then state.highest_startup_oid <- Some order_id)
          else if state.skipped_fill_streak >= 50
          then (
-           (* A monotonic high-water skip guard can permanently eat every
-               real fill if the persisted mark lands above the venue's live
-               id space (state restored across accounts/venues, id reset).
-               After 50 consecutive skips with zero processed fills this is
-               the only consistent explanation (ordinary duplicate redelivery
-               is bounded and covered by processed_fills). Reset the mark so
-               real fills flow again; processed_fills still guards in-window
-               redelivery. *)
+            (* A monotonic high-water skip guard can permanently eat every real
+               fill if the persisted mark lands above the venue's live id space
+               (state restored across accounts/venues, id reset). After 50
+               consecutive skips with zero processed fills this is the only
+               consistent explanation (ordinary duplicate redelivery is bounded
+               and covered by processed_fills). Reset the mark so real fills
+               flow again; processed_fills still guards in-window redelivery. *)
            Logging.critical_async_f
              ~section
              "Fill replay guard stuck: %d consecutive skips for %s (last_fill_oid=%s) \
@@ -604,9 +597,9 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
          add_processed_fill state order_id;
          add_tracked_order_id state order_id;
          state.skipped_fill_streak <- 0;
-         (* A buy fill means a buy is working again - any pending TIF
-            recovery is satisfied and consumed (the re-anchor places the
-            next pair through the normal cycle). *)
+          (* A buy fill means a buy is working again: pending TIF recovery is
+             satisfied and consumed (the re-anchor places the next pair through
+             the normal cycle). *)
          if side = Buy then state.tif_recovery_pending <- false;
          state.pending_orders
          <- filter_keep_if_needed
@@ -629,11 +622,11 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
              -> true
            | _ -> false
          in
-         (* A fill for the OLD id of a just-replaced order (Hyperliquid/Alpaca
-            cancel+create can fill the old order at the moment of
-            replacement): the fill is real and its accounting below stands,
-            but the RESTING buy is the replacement - clearing the buy
-            tracking here would make the grid place a second resting buy. *)
+          (* A fill for the OLD id of a just-replaced order (Hyperliquid/Alpaca
+             cancel+create can fill the old order at the moment of replacement):
+             the fill is real and its accounting below stands, but the RESTING
+             buy is the replacement - clearing buy tracking here would make the
+             grid place a second resting buy. *)
          let is_superseded_old_fill =
            side = Buy
            && (not _was_tracked_buy)
@@ -641,9 +634,9 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
          in
          if side = Buy
          then (
-           (* Route the buy-fill bookkeeping through the base-accumulation
-             store's pure decision logic (updates the last-buy reference for
-             the next sell's profitability check). *)
+            (* Route buy-fill bookkeeping through the base-accumulation store's
+               pure decision logic (updates the last-buy reference for the next
+               sell's profitability check). *)
            let updated =
              Dio_persistence.Base_accumulation_store.apply_buy_fill
                { Dio_persistence.Base_accumulation_store.reserved_base =
@@ -663,29 +656,27 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
            <- updated.Dio_persistence.Base_accumulation_store.last_buy_fill_price;
            state.last_buy_fill_qty
            <- updated.Dio_persistence.Base_accumulation_store.last_buy_fill_qty;
-           (* Persistence dirty-marking follows the per-strategy config
-              opt-in (base_accumulation), not a hardcoded venue list - all
-              venues track identically now. *)
+            (* Persistence dirty-marking follows the per-strategy config opt-in
+               (base_accumulation), not a hardcoded venue list. *)
            if state.base_accumulation_enabled then state.persistence_dirty <- true;
-           (* Spec-aligned buy fill: only the reference info for the next
-              sell's profitability check is updated (done above via
-              apply_buy_fill). The legacy per-fill slice retention into
-              reserved_base is gone - accumulation happens at sell-fill time
-              when the profit window exceeds the buffer (see below). *)
+            (* Spec-aligned buy fill: only the reference info for the next sell's
+               profitability check is updated (done above via apply_buy_fill).
+               Per-fill slice retention into reserved_base is gone - accumulation
+               happens at sell-fill time when the profit window exceeds the
+               buffer (see below). *)
            if acc_qty > 0.0 && not state.startup_replay
            then (
-             (* Record the buy credit for the fill-aware sizing bridge rather
-                 than mutating a running ledger: on Hyperliquid-like spot
-                 venues the buy fee is subtracted from the received BASE, so
-                 crediting the raw fill qty would overstate inventory by the
-                 fee on every fill - exactly the balance-vs-ledger drift that
-                 lets a sell dip into reserved_base.
+              (* Record the buy credit for the fill-aware sizing bridge rather
+                 than mutating a running ledger: on Hyperliquid-like spot venues
+                 the buy fee is subtracted from the received base, so crediting
+                 the raw fill qty would overstate inventory by the fee on every
+                 fill and let a sell dip into reserved_base.
 
-                 Draw down [attributed_balance_increase] first: the balance
-                 feed may have already adopted this fill (independent feeds,
-                 message before execution event), and adding the credit then
-                 would double-count it. Only the unmatched remainder is an
-                 unreflected credit. *)
+                 Draw down [attributed_balance_increase] first: the balance feed
+                 may have already adopted this fill (independent feeds, message
+                 before execution event), and adding the credit would then
+                 double-count it. Only the unmatched remainder is an unreflected
+                 credit. *)
              let credit_qty =
                if hl_like_spot_fee_exchange state.exchange_id && state.maker_fee > 0.0
                then Float.max 0.0 (acc_qty -. (state.maker_fee *. acc_qty))
@@ -710,7 +701,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
                already_reflected
                (List.length state.buy_credits_since_balance)
                order_id);
-           (* A buy fill does not complete a sell placement: the sell's own
+            (* A buy fill does not complete a sell placement: the sell's own
                ack/fill/cancel events own the sell in-flight lifecycle, so the
                sell markers ([inflight_sell], the duplicate-key latch, the
                recently-injected debounce) are left untouched here. Clearing
@@ -744,17 +735,17 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
            if dominated then state.highest_startup_oid <- Some order_id);
          (match side with
           | Sell ->
-            (* A [Filled] event is TERMINAL for the order: release the whole
-               commitment by id, never merely the reported fill qty. On
-               Hyperliquid the orderUpdates "filled" event retires the order
-               from the open-order feed (and is filtered out of the strategy
-               stream), so the userEvents Trade that reaches us can be left
-               computing from an untracked order and report only the LAST
-               partial size; subtracting that would strand the earlier fills'
-               base in the ledger forever (the retained stale sell / negative
-               closest-sell distance, and the under-counted sellable balance
-               that then re-buys). Partial fills arrive as [PartiallyFilled]
-               and never reach this handler. *)
+             (* A [Filled] event is terminal for the order: release the whole
+                commitment by id, never merely the reported fill qty. On
+                Hyperliquid the orderUpdates "filled" event retires the order
+                from the open-order feed (and is filtered out of the strategy
+                stream), so the userEvents Trade that reaches us can be left
+                computing from an untracked order and report only the LAST
+                partial size; subtracting that would strand the earlier fills'
+                base in the ledger forever (the retained stale sell / negative
+                closest-sell distance, and the under-counted sellable balance
+                that then re-buys). Partial fills arrive as [PartiallyFilled]
+                and never reach this handler. *)
             remove_sell_commitment ~state ~id:order_id;
             let known_open_sell =
               List.find_opt (fun (oid, _, _) -> oid = order_id) state.open_sell_orders
@@ -797,7 +788,8 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
                   (match remove_exact [] false state.persisted_sell_levels with
                    | Some updated -> updated
                    | None ->
-                     (* Support price improvement: find candidate where sp <= sell_fill_price closest to fill price *)
+                      (* Price improvement: candidate with sp <= sell_fill_price
+                         closest to the fill price. *)
                      let candidate =
                        List.fold_left
                          (fun best (sp, sq) ->
@@ -833,24 +825,24 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
             then
               if
                 (* Accumulation venues report tradeable = total - open-order
-                 hold: when a resting sell fills, the hold release offsets the
-                 total drop, so the venue figure does not fall and the ledger
-                 must not decrement here (that would double-count against
-                 [unnetted_hold]); the venue reconciliation absorbs the netting.
-                 Gross-balance venues fall by the sold qty at fill. *)
+                   hold: when a resting sell fills, the hold release offsets the
+                   total drop, so the venue figure does not fall and the ledger
+                   must not decrement here (that would double-count against
+                   [unnetted_hold]); venue reconciliation absorbs the netting.
+                   Gross-balance venues fall by the sold qty at fill. *)
                 not state.cached_ecfg.use_accumulation_sells
               then state.position_base <- Float.max 0.0 (state.position_base -. acc_qty);
             state.last_sell_fill_qty <- Some acc_qty;
-            (* Spec-aligned sell fill: profit is measured against the LAST
-               BUY fill (single local buy/sell cycle pair). The legacy
-               prior-sell cost basis and grid-spread fallback are removed.
-               All fees (both legs) are folded into a single [fees] figure
-               passed to the store's pure decision logic, which:
+            (* Spec-aligned sell fill: profit is measured against the LAST BUY
+               fill (single local buy/sell cycle pair). The prior-sell cost basis
+               and grid-spread fallback are removed. All fees (both legs) are
+               folded into one [fees] figure passed to the store's pure decision
+               logic, which:
                  - accrues net profit into accumulated_profit when > 0,
                  - when accumulated_profit >= base_cost + buffer (realtime F&G),
-                   adds oracle_qty * (1 - sell_mult) to reserved_base and
-                   debits accumulated_profit by base_cost, preserving the
-                   buffer and surplus profit in the quote ledger. *)
+                   adds oracle_qty * (1 - sell_mult) to reserved_base and debits
+                   accumulated_profit by base_cost, preserving the buffer and
+                   surplus profit in the quote ledger. *)
             let store_t =
               { Dio_persistence.Base_accumulation_store.reserved_base =
                   state.reserved_base
@@ -938,32 +930,31 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
-       (* The tracking reset is deferred only when THIS order is the subject
-          of an in-flight amendment (the amend handler later re-keys the
-          tracking to the replacement id). [state.inflight_amend_buy] must
-          NOT be consulted here: it is a per-symbol flag that also covers
-          amends of other orders, so a cancel for a different order would be
-          swallowed and its reset lost forever. The registry and the
-          pending_amend_ entries are keyed by the amended (old) order id,
-          which is exactly the id the exchange's mid-amend cancel event
-          carries. [is_amend_lifecycle_active] also covers the window AFTER
-          the exchange confirmed a replace (Hyperliquid/Alpaca): the old
-          order's cancel event can arrive after the amend response, and it is
-          still the replace's side effect, not a real cancellation. *)
+       (* Defer the tracking reset only when THIS order is the subject of an
+          in-flight amendment (the amend handler later re-keys the tracking to
+          the replacement id). [state.inflight_amend_buy] must not be consulted
+          here: it is a per-symbol flag that also covers amends of other orders,
+          so a cancel for a different order would be swallowed and its reset
+          lost forever. The registry and the pending_amend_ entries are keyed by
+          the amended (old) order id, exactly the id the exchange's mid-amend
+          cancel event carries. [is_amend_lifecycle_active] also covers the
+          window after the exchange confirmed a replace (Hyperliquid/Alpaca):
+          the old order's cancel event can arrive after the amend response and
+          is still the replace's side effect, not a real cancellation. *)
        let is_being_amended =
          InFlightAmendments.is_amend_lifecycle_active order_id
          || List.exists
               (fun (pending_id, _, _, _) -> pending_amend_for pending_id order_id)
               state.pending_orders
        in
-       (* A "ghost" placement is an order the venue reports as canceled whose id we
-           never tracked (lost ack, TIF/post-only reject after dispatch). Only
-           in that case may the cancel purge in-flight placement tokens of the
-           same side. If the canceled order IS known (a resting buy/sell we
-           are tracking), its cancel is a legitimate cancel of a different
-           order - purging the side's placement tokens here would free the
-           dedup key / clear the in-flight guard of a CONCURRENTLY dispatched
-           placement and allow a duplicate order. *)
+       (* A "ghost" placement is an order the venue reports as canceled whose id
+          we never tracked (lost ack, TIF/post-only reject after dispatch). Only
+          then may the cancel purge in-flight placement tokens of the same side.
+          If the canceled order IS known (a resting buy/sell we track), its
+          cancel is a legitimate cancel of a different order - purging the
+          side's placement tokens here would free the dedup key / clear the
+          in-flight guard of a concurrently dispatched placement and allow a
+          duplicate order. *)
        let is_known_order =
          (match state.last_buy_order_id with
           | Some id -> buy_tracking_matches_exchange_event id order_id cl_ord_id
@@ -971,14 +962,14 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
          || List.exists (fun (sell_id, _, _) -> sell_id = order_id) state.open_sell_orders
        in
        (* A STALE cancel references an order this strategy tracked long ago
-           (acked/adopted/filled) that is no longer current - e.g. the late WS
-           cancel for a buy whose cancel REST call timed out but still landed
-           venue-side, arriving after a replacement placement was dispatched.
-           Such a cancel must not purge placement tokens (the ghost purge
-           below would kill the concurrent placement's token) and must not
-           clobber the placement's guards. A GHOST cancel (never-acked
-           placement, id absent from the tracked set) is the opposite: purge
-           and reset are REQUIRED, otherwise the side wedges forever. *)
+          (acked/adopted/filled) that is no longer current - e.g. the late WS
+          cancel for a buy whose cancel REST call timed out but still landed
+          venue-side, arriving after a replacement placement was dispatched.
+          Such a cancel must not purge placement tokens (the ghost purge below
+          would kill the concurrent placement's token) and must not clobber the
+          placement's guards. A GHOST cancel (never-acked placement, id absent
+          from the tracked set) is the opposite: purge and reset are required,
+          otherwise the side wedges forever. *)
        let is_stale_order_cancel =
          (not is_known_order) && Hashtbl.mem state.tracked_order_ids order_id
        in
@@ -997,11 +988,11 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
        <- (if is_stale_order_cancel
            then state.pending_orders
            else (
-             (* A WS kill (reject/cancel/expired) of an in-flight placement
-                surfaces here as a ghost: the pending token is about to be
-                purged. If that placement was our BUY, arm TIF recovery so
-                the buy leg re-attempts promptly rather than leaving the
-                asset buyless while the capital oracle is INACTIVE. *)
+              (* A WS kill (reject/cancel/expired) of an in-flight placement
+                 surfaces here as a ghost: the pending token is about to be
+                 purged. If that placement was our BUY, arm TIF recovery so the
+                 buy leg re-attempts promptly rather than leaving the asset
+                 buyless while the capital oracle is INACTIVE. *)
              let buy_placement_died =
                (not is_known_order)
                && side = Buy
@@ -1049,12 +1040,12 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
            state.last_buy_order_id <- None;
            state.last_buy_order_price <- None;
            ());
-         (* The canceled order's own cancel/amend markers always clear: they
+          (* The canceled order's own cancel/amend markers always clear: they
              describe THIS cancel's lifecycle. But the side's placement guards
-             (reserved quote, inflight flag, dedup key) may already belong to
-             a NEWER placement dispatched after this cancel was believed
-             failed - wipe them only when no same-side placement token is
-             alive, i.e. no concurrent placement can be clobbered. *)
+             (reserved quote, inflight flag, dedup key) may already belong to a
+             NEWER placement dispatched after this cancel was believed failed -
+             wipe them only when no same-side placement token is alive, i.e. no
+             concurrent placement can be clobbered. *)
          let placement_in_flight =
            List.exists
              (fun (pending_id, s, _, _) ->
@@ -1207,9 +1198,9 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
 
 (** Handles skipped order amendment (suppressed as a no-op by the executor).
 
-    Clears the pending-amend entry and applies a short cooldown so the
-    strategy does not re-push the same suppressed amendment every cycle
-    (previously this produced a silent retry loop that looked like a hang). *)
+    Clears the pending-amend entry and applies a short cooldown so the strategy
+    does not re-push the same suppressed amendment every cycle (previously this
+    produced a silent retry loop that looked like a hang). *)
 let handle_order_amendment_skipped ~now asset_symbol order_id side _ =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
@@ -1319,11 +1310,11 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
          if side = Buy then state.inflight_cancel_buy <- true;
          (match side with
           | Buy when is_tif_rejection ->
-            (* The trailing/amended buy died to a TIF/ALO/post-only reject
-                - typically a violent move making the target momentarily
-                cross. Arm TIF recovery so the buy leg re-attempts promptly
-                at a fresh (re-validated) price instead of leaving the asset
-                buyless while the capital oracle is INACTIVE. *)
+           (* The trailing/amended buy died to a TIF/ALO/post-only reject -
+              typically a violent move making the target momentarily cross. Arm
+              TIF recovery so the buy leg re-attempts promptly at a fresh
+              (re-validated) price instead of leaving the asset buyless while
+              the capital oracle is INACTIVE. *)
             state.tif_recovery_pending <- true;
             state.tif_recovery_since <- Unix.gettimeofday ();
             Logging.info_f
@@ -1389,11 +1380,11 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
              | Sell -> state.duplicate_key_sell)))
 ;;
 
-(** Cleans up in-flight cancellation markers on cancellation failure. Runs
-    on the domain thread (drained as a [Cancel_cleanup] lifecycle event), so
-    the flag writes below are mutex-synchronized like every other handler -
-    the supervisor's REST callbacks enqueue this event instead of mutating
-    strategy state cross-domain. *)
+(** Cleans up in-flight cancellation markers on cancellation failure. Runs on
+    the domain thread (drained as a [Cancel_cleanup] lifecycle event), so the
+    flag writes below are mutex-synchronized like every other handler - the
+    supervisor's REST callbacks enqueue this event instead of mutating strategy
+    state cross-domain. *)
 let cleanup_pending_cancellation asset_symbol _order_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
@@ -1404,10 +1395,10 @@ let cleanup_pending_cancellation asset_symbol _order_id =
        state.inflight_amend_buy <- false)
 ;;
 
-(* drain lifecycle events queued by the supervisor REST path and dispatch
-   them to the handlers. Runs on the domain thread at the top of every cycle,
-   so every handler invocation (REST- or WS-sourced) executes on the domain
-   thread, so the strategy mutex is never shared across threads. *)
+(* Drain lifecycle events queued by the supervisor REST path and dispatch them
+   to the handlers. Runs on the domain thread at the top of every cycle, so
+   every handler invocation (REST- or WS-sourced) executes on the domain
+   thread and the strategy mutex is never shared across threads. *)
 let dispatch_event symbol (ev : lifecycle_event) =
   match ev with
   | Ack { now; order_id; side; price } ->

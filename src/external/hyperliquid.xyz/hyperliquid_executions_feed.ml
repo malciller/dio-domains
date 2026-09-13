@@ -1,8 +1,7 @@
-(** Hyperliquid executions feed.
-    Provides real-time order and trade event tracking via WebSocket subscriptions.
-    Maintains per-symbol execution ring buffers, open order state, and trade
-    deduplication with bounded FIFO eviction. Thread-safe access is enforced
-    through per-resource mutexes and atomic flags. *)
+(** Real-time order and trade event tracking via WebSocket subscriptions.
+    Per-symbol execution ring buffers, open-order state, and trade
+    deduplication with bounded FIFO eviction; per-resource mutexes and atomic
+    flags. *)
 
 open Lwt.Infix
 
@@ -82,7 +81,7 @@ type store =
   { events_buffer : execution_event RingBuffer.t
   ; open_orders : (string, open_order) Hashtbl.t
   ; open_orders_cache : open_order list Atomic.t
-    (** Lock-free atomic snapshot cache of active open orders for the domain hotpath. *)
+    (** Lock-free snapshot of active open orders for the domain hot path. *)
   ; ready : bool Atomic.t
   ; processed_tids : (int64, float) Hashtbl.t
     (** trade_id to arrival_time mapping for deduplication. *)
@@ -96,15 +95,13 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Dedicated mutex for the global order_to_symbol index.
-    Separated from initialization_mutex (which guards the stores Hashtbl)
-    to eliminate cross-contention between domain workers calling
-    fold_open_orders/get_symbol_store and the WS thread updating
-    order_to_symbol on every incoming event. *)
+(** Guards [order_to_symbol]. Separate from [initialization_mutex] (which
+    guards [stores]) to avoid contention between domain workers reading open
+    orders and the WS thread updating the index per event. *)
 let order_index_mutex = Mutex.create ()
 
-(** Global order_id to symbol index with adaptive capacity and FIFO eviction.
-    All access requires holding order_index_mutex. *)
+(** order_id to symbol index with adaptive capacity and FIFO eviction.
+    Callers must hold [order_index_mutex]. *)
 let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 16
 
 (** FIFO insertion queue governing eviction order for order_to_symbol entries. *)
@@ -116,9 +113,9 @@ let order_to_symbol_cap : int ref = ref max_int
 
 let order_to_symbol_startup_done = Atomic.make false
 
-(** Atomic flag set once after inject_open_orders completes. Domains poll this
-    flag in their cycle loop. Exchange_wakeup.signal_all is invoked on transition
-    so sleeping domains wake immediately without requiring a wall-clock delay. *)
+(** Set once after [inject_open_orders]. Domains poll it each cycle;
+    [Exchange_wakeup.signal_all] on transition wakes sleeping domains without a
+    wall-clock delay. *)
 let _startup_snapshot_done : bool Atomic.t = Atomic.make false
 
 let is_startup_snapshot_done () = Atomic.get _startup_snapshot_done
@@ -160,9 +157,8 @@ let mark_startup_complete () =
       observed)
 ;;
 
-(** Blacklist of order IDs removed by cancel-replace amendments.
-    Prevents late WebSocket orderUpdates events from re-adding orders
-    that have already been superseded by a newer cancel-replace. *)
+(** Order IDs removed by cancel-replace amendments, to block late WebSocket
+    orderUpdates events from re-adding a superseded order. *)
 let amended_blacklist : (string, float) Hashtbl.t = Hashtbl.create 16
 
 let amended_blacklist_mutex = Mutex.create ()
@@ -199,9 +195,8 @@ let get_symbol_store symbol =
     store
 ;;
 
-(** Increments whenever the account's open-orders snapshot is republished, so
-    consumers (the grid strategy's [sync_open_orders]) can skip a full rescan
-    when nothing changed. Mirrors [Kraken_executions_feed.orders_generation]. *)
+(** Bumped on every open-orders snapshot republish so consumers can skip a full
+    rescan when unchanged. Mirrors [Kraken_executions_feed.orders_generation]. *)
 let orders_generation : int Atomic.t = Atomic.make 0
 
 let[@inline] get_orders_generation () = Atomic.get orders_generation
@@ -369,12 +364,9 @@ let cleanup_stale_orders () =
             if now -. arrival_time > 600.0 then tids_to_remove := tid :: !tids_to_remove)
          store.processed_tids;
        List.iter (Hashtbl.remove store.processed_tids) !tids_to_remove;
-       (* Purge orphaned entries from processed_tids_queue, mirroring the
-          order_to_symbol_queue rebuild below. The FIFO eviction loop only
-          fires once the table exceeds [max_processed_tids]; on low trade-rate
-          symbols the table shrinks via the age-based removal above while the
-          queue retains every id, leaking one int64 per unique trade id for
-          the process lifetime. Retain only ids still present in the table. *)
+       (* Purge orphaned processed_tids_queue entries. FIFO eviction only fires
+          above [max_processed_tids], so age-based removal can shrink the table
+          while the queue retains every id. Retain only ids in the table. *)
        let original_queue_len = Queue.length store.processed_tids_queue in
        if original_queue_len > 0
        then (
@@ -394,12 +386,9 @@ let cleanup_stale_orders () =
            tids_removed
            symbol)
     all_symbols;
-  (* Purge orphaned entries from order_to_symbol_queue.
-     Terminal events (fill/cancel) remove order_ids from the Hashtbl but not
-     from the Queue (OCaml Queue lacks O(1) removal by value). The queue
-     accumulates dead entries over time since the eviction loop only fires
-     when the Hashtbl exceeds its cap. This rebuild pass retains only entries
-     still present in the Hashtbl. Runs at most once per cleanup cycle. *)
+  (* Purge orphaned order_to_symbol_queue entries. Terminal events remove
+     order_ids from the Hashtbl but not the Queue (no O(1) removal by value);
+     eviction only fires above the cap. Retain only entries still in the table. *)
   Mutex.lock order_index_mutex;
   let original_queue_len = Queue.length order_to_symbol_queue in
   if original_queue_len > 0
@@ -523,19 +512,15 @@ let apply_index_action (action : [ `None | `Remove of string | `Add of string * 
   | `None -> ()
 ;;
 
-(** Core internal handler for order state transitions. Updates the open orders
-    table, writes the event to the ring buffer, and signals the relevant domain.
-    Handles terminal removal, amendment blacklist filtering, and userref recovery.
+(** Core order-state transition handler. Updates [open_orders], writes the event
+    to the ring buffer, and signals the domain. Handles terminal removal,
+    amendment-blacklist filtering, and userref recovery.
 
-    Variant below: ASSUMES store.orders_mutex is held. It performs the full
-    read-modify-write (and the lock-free buffer write + domain wakeup) under
-    the caller's lock, so a caller that must compute a merged event from the
-    current table state (e.g. the userFills Trade path) can do so atomically
-    - two concurrent readers could otherwise both compute from the same
-    snapshot and the second write would erase the first fill. Returns the
-    deferred global order_to_symbol index action for the caller to apply
-    after releasing the mutex (nested orders_mutex -> order_index_mutex
-    acquisition is avoided, matching the Kraken architecture). *)
+    Caller must hold [store.orders_mutex]. The full read-modify-write (plus
+    buffer write and wakeup) runs under the caller's lock, so a merged event
+    computed from table state (userFills Trade path) is atomic. Returns a
+    deferred [order_to_symbol] action to apply after unlock, avoiding nested
+    orders_mutex -> order_index_mutex acquisition. *)
 let update_orders_internal_locked ?user_ref store (event : execution_event) =
   let now = Unix.gettimeofday () in
   let is_terminal =
@@ -579,16 +564,12 @@ let update_orders_internal_locked ?user_ref store (event : execution_event) =
       index_action := `Remove event.order_id)
     else (
       (* UserRef recovery precedence:
-       1. Explicitly provided user_ref (from proactive inject_order).
-       2. Previously tracked user_ref on the existing open order.
-       3. Decoded from the cloid hex string. Two layouts share the
-          trailing-16-hex storage:
-          - tagged (hyperliquid_module.next_unique_cloid): bits 63..56 =
-            strategy userref tag, bits 55..0 = unique nonce;
-          - legacy (pre-unique-cloid orders still resting across a deploy):
-            the trailing hex IS the raw userref.
-          A value >= 2^56 can only be tagged (a raw userref never reaches
-          that magnitude), so the layouts are unambiguous. *)
+       1. provided user_ref (proactive inject_order);
+       2. existing open order's user_ref;
+       3. decoded from the cloid's trailing 16 hex digits:
+          - tagged ([next_unique_cloid]): bits 63..56 = tag, 55..0 = nonce;
+          - legacy: trailing hex is the raw userref.
+          A value >= 2^56 is always tagged, so the layouts are unambiguous. *)
       let recovered_user_ref =
         match user_ref with
         | Some _ -> user_ref
@@ -611,11 +592,9 @@ let update_orders_internal_locked ?user_ref store (event : execution_event) =
                      in
                      let v = Int64.of_string ("0x" ^ last_part) in
                      let uref =
-                       (* Logical shift + zero-tag test: a signed compare
-                          would misclassify tags with bit 63 set (tags
-                          128-255) as negative Int64s and fall through to
-                          the legacy decode. Legacy raw userrefs never have
-                          high bits set, so tag > 0 is unambiguous. *)
+                       (* Logical shift and zero-tag test: a signed compare
+                          would misclassify bit-63 tags (128-255) as negative
+                          and fall through to the legacy decode. *)
                        let tag = Int64.shift_right_logical v 56 in
                        if Int64.compare tag 0L > 0
                        then Int64.to_int tag
@@ -700,11 +679,10 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
       (fun () ->
          match Hashtbl.find_opt store.open_orders order_id with
          | Some existing when existing.cum_qty > 0.0 ->
-           (* A WS trade beat this proactive inject (fast IOC fills can be
-              processed before the placement REST response returns). The
-              inject exists only to make the order visible pre-webData2;
-              overwriting it with a fresh cum_qty=0 entry would erase real
-              fill progress. *)
+           (* A WS trade beat this proactive inject (fast IOC fills can arrive
+              before the placement response). The inject only makes the order
+              visible pre-webData2; a fresh cum_qty=0 entry would erase fill
+              progress. *)
            Logging.debug_f
              ~section
              "Skipping proactive inject for %s: fill progress already tracked \
@@ -731,12 +709,10 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
 ;;
 
 let find_registered_symbol coin =
-  (* Prefer a registered spot-pair store (e.g. "BTC/USDC") over the bare base
-     symbol (e.g. "BTC") when the coin is the base asset: Hyperliquid spot
+  (* Prefer a registered "BASE/QUOTE" store over the bare base symbol: spot
      fills carry the base coin name, and routing them to the perp/base store
-     would strand them in a store the domain worker never reads (the domain
-     reads the full "BASE/QUOTE" store). Only fall back to the resolved
-     perp symbol when no spot-pair store is registered for this coin. *)
+     would strand them where the domain worker never reads. Fall back to the
+     resolved perp symbol only when no spot-pair store is registered. *)
   let result = ref None in
   let exact = ref None in
   Mutex.lock initialization_mutex;
@@ -936,11 +912,10 @@ let process_order_updates data_json =
                | FilledStatus | CanceledStatus | RejectedStatus | ExpiredStatus -> true
                | _ -> false
              in
-             (* Guard: if the order is already gone from open_orders
-               (removed by a prior userFills Trade event), skip redundant
-               terminal dispatch from orderUpdates.  The userFills path
-               provides accurate fill_price and fee; orderUpdates uses
-               limitPx which can diverge and corrupt strategy state. *)
+              (* Skip redundant terminal orderUpdates events when the order is
+                already gone (removed by a prior userFills Trade). userFills
+                carries accurate fill price and fee; orderUpdates uses limitPx,
+                which can diverge and corrupt strategy state. *)
              let is_already_terminal = is_terminal_ou && existing_order = None in
              if is_already_terminal
              then
@@ -1070,22 +1045,17 @@ let process_user_events data_json =
            Mutex.unlock store.tids_mutex;
            if not already_processed
            then (
-             (* Hold mutex for the full read-compute-write cycle: the merge
-                 of this fill into the tracked order is computed from the
-                 table snapshot and written back under the same lock, so two
-                 concurrent Trade events can never both compute from the
-                 same snapshot (the second write erasing the first fill).
-                 [was_filled]/[filled_out]/[avg_out]/[qty_out] carry the
-                 computed values out of the protected section for the
-                 logging and fill-publishing block below. *)
+              (* Hold the mutex for the full read-compute-write cycle so two
+                  concurrent Trade events cannot both compute from the same
+                  snapshot (the second write erasing the first fill).
+                  [was_filled]/[filled_out]/[avg_out]/[qty_out] export the
+                  computed values for the logging block below. *)
              let was_filled = ref false in
              let filled_out = ref 0.0 in
              let avg_out = ref 0.0 in
              let qty_out = ref 0.0 in
-             (* Fun.protect the window: an unexpected exception between
-                 lock and unlock would permanently deadlock the symbol's
-                 orders_mutex (nothing here currently raises, but the
-                 invariant must not depend on that). *)
+              (* [Fun.protect]: an exception between lock and unlock would
+                  permanently deadlock the symbol's orders_mutex. *)
              Mutex.lock store.orders_mutex;
              let index_action =
                Fun.protect
@@ -1298,9 +1268,8 @@ let process_market_data json =
       let data = member "data" json in
       process_user_events data
     | Some "webData2" ->
-      (* webData2 parsing for openOrders and fills has been removed.
-           All order and fill tracking now uses the targeted WebSocket feeds:
-           orderUpdates, userFills, and userEvents. *)
+      (* webData2 order/fill parsing removed; tracking uses orderUpdates,
+           userFills, and userEvents. *)
       ()
     | _ -> ()
   with
@@ -1311,9 +1280,8 @@ let process_market_data json =
       (Printexc.to_string exn)
 ;;
 
-(** Event-driven cleanup signal channel. Fires on-demand (reconnect, manual
-    trigger) and falls back to a 120s safety timer. Implemented as an Lwt_mvar
-    used as a one-shot signal; request_cleanup is idempotent. *)
+(** Cleanup signal channel: fires on demand (reconnect, manual trigger) or a
+    120s safety timer. One-shot Lwt_mvar; [request_cleanup] is idempotent. *)
 let cleanup_mvar : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
 
 (** Signal the cleanup loop to run immediately. Idempotent: skipped if a signal

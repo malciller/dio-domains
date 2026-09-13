@@ -4,7 +4,7 @@ let test_connection_state_initially_false () =
 
 let test_subscribe_market_data () =
   let sub = Hyperliquid.Ws.subscribe_market_data () in
-  (* The stream should exist and be initially empty *)
+  (* A fresh subscription yields an empty stream. *)
   let item = Lwt_stream.get_available sub.stream in
   Alcotest.(check int) "initially empty" 0 (List.length item);
   sub.close ()

@@ -1,7 +1,8 @@
-(** Tick event bus: unit-payload specialization of [Event_bus] for tick-driven scheduling.
+(** Tick event bus: unit-payload specialization of [Event_bus] for tick-driven
+    scheduling.
 
-    Exposes a singleton [global_bus] and convenience wrappers for publishing
-    and subscribing to tick events without constructing or passing a bus handle. *)
+    Exposes a singleton [global_bus] and wrappers that publish and subscribe
+    without passing a bus handle. *)
 
 module Payload = struct
   (** Unit payload; tick events carry no data, only signal occurrence. *)

@@ -1,29 +1,20 @@
-(* Account balance snapshots for the survival oracle.
+(* Oracle_balances - account balance snapshots for the survival oracle.
 
-   Two sources, chosen by the caller's context:
-
-   1. The live exchange balance stores (websocket-fed by the engine's
-      supervisor) - [snapshot_of_live_store]. Preferred by the live runtime
-      (oracle_runtime.ml): the data is already in-process over websocket
-      channels, so the oracle pass never pays a standalone HTTP round-trip.
-      Best-effort: an unregistered exchange or an empty store yields None and
+   Two sources, selected by the caller:
+   1. Live exchange balance stores (websocket-fed by the engine supervisor) -
+      [snapshot_of_live_store]. The live runtime prefers this: data is
+      already in-process, so a pass pays no standalone HTTP round-trip.
+      Best-effort: an unregistered exchange or empty store yields None and
       the caller falls back to REST.
+   2. One-shot REST fetches ([fetch_account] / [fetch_task]), used by the CLI
+      (bin/oracle.ml) and as runtime fallback. Per-venue fetch and asset
+      normalization live in the venue's oracle adapter
+      ([Exchange_intf.Oracle.S.fetch_balances] via
+      [Exchange_intf.Oracle.Registry]).
 
-   2. One-shot REST fetches - [fetch_account] / [fetch_task]. Used by the
-      standalone CLI (bin/oracle.ml), which has no supervisor, and by the
-      runtime when the live store is unavailable. Read-only snapshots whose
-      per-venue fetch + asset normalization now live in the venue's own
-      oracle adapter ([Exchange_intf.Oracle.S.fetch_balances], dispatched
-      through [Exchange_intf.Oracle.Registry]) - a new venue is plug-and-play
-      here too.
-
-   Hyperliquid is always REST: the live balance store used to aggregate the
-   perp clearinghouse USDC into the same "USDC" entry as spot, while the
-   oracle's pool must count spot capital only (perp margin is not grid
-   capital), so the REST spotClearinghouseState path stays authoritative
-   there. (The engine's live store itself now tracks spot available = total -
-   hold and excludes perp/staking wallets from its tradeable figure, so the
-   two sources agree; REST remains the oracle's choice for its own pool.) *)
+   Hyperliquid is always REST: its live "USDC" store aggregates perp margin
+   with spot, while the oracle pool counts spot capital only (perp margin is
+   not grid capital), so REST spotClearinghouseState stays authoritative. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
@@ -81,8 +72,7 @@ let available_quote (snapshot : snapshot) ~(quote : string) =
 ;;
 
 (** Available (unlocked) balance of one base asset: what the strategy can
-    actually sell or the sizing can count as held inventory. The oracle seeds
-    its replay grid with this. *)
+    sell or sizing can count as held inventory. Seeds the replay grid. *)
 let available_asset (snapshot : snapshot) ~(asset : string) =
   let asset = String.uppercase_ascii (String.trim asset) in
   snapshot.balances
@@ -109,10 +99,9 @@ let cache : (string * bool, snapshot) Hashtbl.t = Hashtbl.create 8
 let clear_cache () = Hashtbl.clear cache
 
 (** One-shot REST account fetch through the venue registry, cached per
-    (exchange, testnet) for the short-lived CLI oracle. The engine runtime
-    prefers the live websocket-fed store ([fetch_account_live]) and only hits
-    this path as fallback. Each venue's adapter returns already-normalized
-    (asset, available, total) triples. *)
+    (exchange, testnet). The runtime prefers the live store
+    ([fetch_account_live]) and uses this only as fallback. Each adapter
+    returns normalized (asset, available, total) triples. *)
 let fetch_account ~exchange ~testnet () : (snapshot, string) result Lwt.t =
   let exchange = String.lowercase_ascii exchange in
   match Hashtbl.find_opt cache (exchange, testnet) with
@@ -152,18 +141,12 @@ let fetch_account ~exchange ~testnet () : (snapshot, string) result Lwt.t =
        Ok snapshot)
 ;;
 
-(** Build a balance snapshot from the live exchange registry stores - the
-    websocket-fed caches owned by the engine supervisor - instead of a
-    standalone REST call. Returns [None] when the venue's oracle adapter has
-    no live store semantics ([Oracle.S.live_balances], e.g. Hyperliquid: its
-    live "USDC" store aggregates perp margin with spot, so the oracle keeps
-    REST authoritative there), when the exchange is not registered (standalone
-    CLI runs, unknown venue), or when its store is empty (no websocket
-    snapshot received yet); callers then fall back to the REST fetch.
-
-    Which venues have a WS-fed live store - and whether its semantics match
-    the oracle's REST balance view - is the venue's own answer, not this
-    module's. *)
+(** Build a snapshot from the live registry stores (websocket-fed caches
+    owned by the engine supervisor) instead of a REST call. Returns [None]
+    when the venue's adapter has no live-store semantics
+    ([Oracle.S.live_balances]), the exchange is unregistered, or the store is
+    empty; callers then fall back to REST. Whether a WS-fed store matches the
+    oracle's REST balance view is the venue's own answer. *)
 let snapshot_of_live_store ~(exchange : string) ~(testnet : bool) () : snapshot option =
   let exchange = String.lowercase_ascii exchange in
   match Exchange.Oracle.Registry.get exchange with

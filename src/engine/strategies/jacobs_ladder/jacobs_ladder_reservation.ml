@@ -1,9 +1,9 @@
-(* Jacobs Ladder - Capital Reservation & Accumulation Tracking *)
+(* Jacobs Ladder: capital reservation and accumulation tracking. *)
 
 open Strategy_common
 open Jacobs_ladder_types
 
-(** Tracking total reserved quote per exchange to avoid O(N) strategy_states locking. *)
+(** Total reserved quote per exchange; avoids O(N) strategy_states locking. *)
 let total_reserved_by_exchange =
   Atomic.make
     (List.fold_left
@@ -12,7 +12,7 @@ let total_reserved_by_exchange =
        [ "kraken"; "hyperliquid"; "lighter"; "ibkr" ])
 ;;
 
-(** Gets the cached total reserved quote atomic for [exchange]. *)
+(** Cached total-reserved-quote atomic for [exchange]. *)
 let rec get_exchange_reserved_atomic exchange =
   let map = Atomic.get total_reserved_by_exchange in
   match Strategy_common.StringMap.find_opt exchange map with
@@ -42,7 +42,7 @@ let rec atomic_add a diff =
   if not (Atomic.compare_and_set a old_val (old_val +. diff)) then atomic_add a diff
 ;;
 
-(** Sets this asset's reserved_quote safely. *)
+(** Sets [state.reserved_quote]; applies the delta to the exchange atomic. *)
 let set_asset_reserved_quote state v =
   let diff = v -. state.reserved_quote in
   state.reserved_quote <- v;
@@ -59,7 +59,7 @@ let set_asset_reserved_quote state v =
     atomic_add a diff)
 ;;
 
-(** Atomically checks available quote balance and reserves for a buy if sufficient.
+(** Atomically reserves [reserve_amount] when available quote >= [quote_needed].
     Returns (balance_ok, available_quote, total_reserved). *)
 let atomic_check_and_reserve state quote_bal quote_needed reserve_amount =
   let a =
@@ -91,12 +91,12 @@ let atomic_check_and_reserve state quote_bal quote_needed reserve_amount =
   attempt ()
 ;;
 
-(** Returns true if quote_balance >= quote_needed. *)
+(** True iff [quote_balance] >= [quote_needed]. *)
 let can_place_buy_order (_qty : float) quote_balance quote_needed =
   quote_balance >= quote_needed
 ;;
 
-(** Returns true if an amendment is permitted for [order_id]. *)
+(** True if an amendment of [order_id] is permitted. *)
 let amend_allowed
       ~state
       ~order_id
@@ -121,19 +121,15 @@ let amend_allowed
   && target_price <> current_price_rounded
 ;;
 
-(** Returns true if asset_balance >= asset_needed. *)
+(** True iff [asset_balance] >= [asset_needed]. *)
 let can_place_sell_order (_qty : float) asset_balance asset_needed =
   asset_balance >= asset_needed
 ;;
 
-(** Returns true if a sell order placement is currently in-flight or registered
-    in InFlightOrders. The marker now means exactly "a sell placement is in
-    flight": [handle_order_acknowledged] releases the duplicate key when the
-    placement completes, so a RESTING sell no longer reports as active here -
-    the inventory gate (sellable base >= sell qty) is what prevents duplicate
-    sells, and the sell for a new fill is placed while earlier sells rest (the
-    1-buy x multi-sell ladder). The old [just_filled_buy] bypass existed to
-    defeat the latch leak and is gone with it. *)
+(** True if a sell placement is in flight or registered in InFlightOrders.
+    [handle_order_acknowledged] releases the duplicate key on completion, so a
+    resting sell does not report active here; the inventory gate (sellable base
+    >= sell qty) prevents duplicate sells. *)
 let has_active_sell state =
   state.inflight_sell || InFlightOrders.is_in_flight state.duplicate_key_sell
 ;;
@@ -141,35 +137,23 @@ let has_active_sell state =
 (* ------------------------------------------------------------------ *)
 (* Sell-commitment ledger                                              *)
 (*                                                                     *)
-(* The single source of truth for base already committed to a sell on   *)
-(* ANY venue. Sellable base is always:                                  *)
-(*                                                                     *)
-(*   spot_holding - reserved_base - committed_sell_base                 *)
-(*                                                                     *)
-(* The venue-specific part is only [spot_holding] (and, on Alpaca, the  *)
-(* venue's own free figure). A resting or in-flight sell's base is      *)
-(* NEVER offered again, no matter what the venue's open-order feed      *)
-(* reports. This is what makes in-flight inventory correct under high   *)
-(* order volume and reconciles the local ledger to the exchange: the    *)
-(* feed updates quantities while it lists an order, but a feed that     *)
-(* drops a live order (reconnect / snapshot truncation) can no longer   *)
-(* make its base look free.                                             *)
+(* Single source of truth for base committed to a sell on any venue.    *)
+(* Sellable base = spot_holding - reserved_base - committed_sell_base.  *)
+(* Only [spot_holding] is venue-specific (on Alpaca, the venue's own    *)
+(* free figure). A resting or in-flight sell's base is never offered    *)
+(* again regardless of the open-order feed, so a dropped live order     *)
+(* (reconnect/snapshot truncation) cannot make its base look free.      *)
 (* ------------------------------------------------------------------ *)
 
-(** How long a dispatched sell with no venue confirmation is kept as committed
-    base. Only applies to an order that was never acked and never seen in the
-    feed (a lost dispatch); an acked order is real base the venue holds and is
-    kept until its terminal event. *)
+(** Seconds a dispatched sell with no venue confirmation is kept as committed
+    base. Applies only to a never-acked, never-seen (lost) dispatch; an acked
+    order is kept until its terminal event. *)
 let sell_commitment_in_flight_timeout_s = 120.0
 
 (** Inserts or updates a commitment, preserving the earliest arm time.
-
-    Backed by an id-keyed hashtable: [sync_open_orders] calls this once for
-    every open sell on every execution with the feed's live price/qty and
-    seen=acked=true, and the lookup/update is O(1). The previous association
-    list made one scan O(n^2) (a full-list scan per open sell); on a wide grid
-    that scan was the dominant [strat[sync=]] cost. The steady-state no-op
-    writes nothing. *)
+    Id-keyed hashtable: [sync_open_orders] calls this once per open sell per
+    execution with the feed's live price/qty and seen=acked=true; lookup/update
+    is O(1) and a steady-state no-op writes nothing. *)
 let upsert_sell_commitment ~state ~id ~price ~qty ~seen ~acked =
   match Hashtbl.find_opt state.sell_commitments id with
   | Some c ->
@@ -204,10 +188,9 @@ let arm_sell_commitment ~state ~id ~price ~qty =
   if qty > 0.0 then upsert_sell_commitment ~state ~id ~price ~qty ~seen:false ~acked:false
 ;;
 
-(** Moves a commitment to the venue order id once ack/amend supplies it. If
-    the old id is unknown (the order was adopted straight from the feed), the
-    new id is inserted. [acked] marks the order as accepted by the venue, so
-    it is never expired by the dispatch window. *)
+(** Rekeys a commitment from [old_id] to [new_id] on ack/amend. An unknown
+    [old_id] (order adopted from the feed) inserts the new id. [acked] marks
+    the order venue-accepted, so the dispatch window never expires it. *)
 let rekey_sell_commitment ~state ~old_id ~new_id ~price ~qty ~acked =
   let q = if qty > 0.0 then qty else 0.0 in
   if old_id = new_id
@@ -254,22 +237,19 @@ let committed_sell_base state =
   Hashtbl.fold (fun _ c acc -> acc +. c.sc_qty) state.sell_commitments 0.0
 ;;
 
-(** The base to subtract from the venue's reported holding:
-
-      spot_holding - reserved_base - committed_sell_base
+(** Base to subtract from the venue's reported holding:
+    [spot_holding - reserved_base - committed_sell_base].
 
     - Net-balance venues ([balance_nets_open_order_holds]):
-      - [hold_netted_from_venue_state] (Hyperliquid): the venue's tradeable
-        figure nets holds from its OWN state (spotState [hold]), independent of
-        our executions feed. It is authoritative even when our feed drops a
-        live order, so subtracting the ledger's excess over the feed would
-        DOUBLE-count (the observed HYPE under-count after a fill). Only the
-        short [unnetted_hold] dispatch overlay is subtracted.
-      - otherwise (Kraken): the venue derives holds from the SAME open-order
-        feed the ledger tracks, so a feed that drops a live order frees that
-        base; the ledger's EXCESS over the feed is the compensation and IS
-        subtracted (never below [unnetted_hold]).
-    - Gross-balance venues: the venue removed nothing, so the WHOLE ledger is
+      - [hold_netted_from_venue_state] (Hyperliquid): the venue nets holds from
+        its own state (spotState [hold]), independent of our feed. Authoritative
+        even when our feed drops a live order, so subtracting the ledger's
+        excess over the feed would double-count. Only the short [unnetted_hold]
+        dispatch overlay is subtracted.
+      - otherwise (Kraken): holds derive from the same open-order feed the
+        ledger tracks, so the ledger's excess over the feed compensates a
+        dropped order and is subtracted, never below [unnetted_hold].
+    - Gross-balance venues: the venue removes nothing, so the whole ledger is
       subtracted. *)
 let effective_committed_sell_base ~ecfg ~ledger_total ~feed_total ~unnetted_hold =
   if ecfg.balance_nets_open_order_holds

@@ -1,8 +1,6 @@
-(** Hyperliquid instrument metadata feed.
-    Maintains a local cache of perpetual and spot instrument definitions
-    (symbol, size decimals, max leverage, asset index) derived from
-    WebSocket meta payloads. Provides lookup, rounding, and subscription
-    identifier resolution for downstream consumers. *)
+(** Instrument metadata cache (symbol, size decimals, max leverage, asset
+    index) built from WebSocket meta payloads. Provides lookup, rounding, and
+    subscription-identifier resolution. *)
 
 let section = "hyperliquid_instruments_feed"
 
@@ -18,12 +16,10 @@ type pair_info =
 let pair_cache : (string, pair_info) Hashtbl.t = Hashtbl.create 128
 let cache_mutex = Mutex.create ()
 
-(* lock-free reads. [published_cache] is a copy-on-write snapshot: the
-   single writer (WS init / initialize / register_test_instrument, all cold
-   paths) mutates [pair_cache] under [cache_mutex] then republishes a fresh
-   table with one [Atomic.set]. [lookup_info], called dozens of times per
-   tick from cached_round_price, does one [Atomic.get] + Hashtbl.find, no
-   mutex. The published table is never mutated after publication. *)
+(* Lock-free reads. [published_cache] is a copy-on-write snapshot: the single
+   writer mutates [pair_cache] under [cache_mutex], then republishes via one
+   [Atomic.set]. [lookup_info] does one [Atomic.get] + [Hashtbl.find] with no
+   mutex. The published table is never mutated. *)
 let published_cache : (string, pair_info) Hashtbl.t Atomic.t =
   Atomic.make (Hashtbl.create 128)
 ;;
@@ -83,7 +79,7 @@ let process_meta_response payload_perp payload_spot =
                 "Failed to parse perp item: %s"
                 (Printexc.to_string exn))
          universe_perp;
-       (* Iterate spot universe; resolve base/quote from token index table. *)
+       (* Spot: resolve base/quote through the token index table. *)
        List.iter
          (fun item ->
             try
@@ -179,12 +175,9 @@ let register_test_instrument ~symbol ~sz_decimals =
   publish_cache ()
 ;;
 
-(** Looks up instrument info by symbol. Lock-free : reads the published
-    copy-on-write snapshot; one [Atomic.get] + Hashtbl.find, no mutex on the
-    per-tick rounding path. Falls back to stripping the quote suffix (e.g.
-    "BTC/USDC" to "BTC") to resolve perpetuals, which are cached under their
-    base name only. Spot pairs are stored under their full "BASE/QUOTE" key
-    (asset_index >= 10000). *)
+(** Looks up instrument info by symbol from the published snapshot (lock-free).
+    Falls back to the base name (strip "/QUOTE") to resolve perpetuals. Spot
+    pairs are keyed by full "BASE/QUOTE" with [asset_index >= 10000]. *)
 let lookup_info symbol =
   let cache = Atomic.get published_cache in
   let direct = Hashtbl.find_opt cache symbol in
@@ -203,16 +196,14 @@ let lookup_info symbol =
     [round_price_to_tick_for_symbol]. *)
 let get_price_increment _symbol = Some 0.01
 
-(** Fetch the perpetual + spot instrument metadata from the Hyperliquid REST
-    /info endpoint and populate the cache. Used by out-of-process consumers
-    (e.g. the capital oracle CLI) that do not run the WebSocket instrument
-    feed.
+(** Fetches perp + spot metadata from REST /info into the cache. Used by
+    out-of-process consumers (e.g. the capital oracle CLI) that do not run the
+    WebSocket feed.
 
-    [~testnet] selects the endpoint. The cache is SHARED with the live
-    engine's WebSocket-initialized instrument feed, so this MUST fetch the
-    same environment the engine trades on: mainnet spot pair indices differ
-    from testnet's, and sending a mainnet asset id to the testnet exchange
-    routes orders to an unrelated testnet spot pair. *)
+    [~testnet] selects the endpoint. The cache is shared with the live engine,
+    so this MUST fetch the same environment the engine trades on: spot pair
+    indices differ between mainnet and testnet, and a mismatched asset id
+    routes orders to an unrelated pair. *)
 let fetch_meta_from_rest ~testnet () : unit Lwt.t =
   Lwt.catch
     (fun () ->

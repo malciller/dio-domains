@@ -6,8 +6,8 @@ let section = "ibkr_types"
 
 (* Subsystem configuration defaults *)
 
-(** Legacy constant; no ticker stream in this adapter. Retained only
-    because the type tests pin its value. *)
+(** Legacy constant. No ticker stream in this adapter; retained because
+    the type tests pin its value. *)
 let default_ring_buffer_size_ticker = 100
 
 (** Order book ring buffer capacity: absorbs bursts without lapping

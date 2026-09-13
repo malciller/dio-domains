@@ -1,5 +1,5 @@
 let test_string_contains () =
-  (* Test string substring matching *)
+  (* Substring containment. *)
   Alcotest.(check bool)
     "contains 'world'"
     true
@@ -27,11 +27,11 @@ let test_string_contains () =
 ;;
 
 let test_json_to_string_precise () =
-  (* Test JSON encoding without symbol precision (should use default 8) *)
+  (* JSON encoding uses default precision (8) when no symbol precision given. *)
   let json = `Assoc [ "key", `Float 1.23456789 ] in
   let result = Kraken.Kraken_trading_client.json_to_string_precise None json in
   Alcotest.(check string) "basic JSON encoding" "{\"key\":1.23456789}" result;
-  (* Test with string escaping *)
+  (* JSON string escaping. *)
   let json_with_strings = `Assoc [ "msg", `String "hello\"world\\test" ] in
   let result2 =
     Kraken.Kraken_trading_client.json_to_string_precise None json_with_strings
@@ -40,14 +40,14 @@ let test_json_to_string_precise () =
     "string escaping contains escaped quotes"
     true
     (String.contains result2 '\\');
-  (* Test nested structures *)
+  (* Nested list encoding. *)
   let nested = `Assoc [ "data", `List [ `Int 1; `Int 2; `Int 3 ] ] in
   let result3 = Kraken.Kraken_trading_client.json_to_string_precise None nested in
   Alcotest.(check string) "nested structures" "{\"data\":[1,2,3]}" result3
 ;;
 
 let test_parse_ws_response () =
-  (* Test parsing WebSocket response from JSON *)
+  (* parse_ws_response. *)
   let json_str =
     {|
     {
@@ -79,24 +79,23 @@ let test_parse_ws_response () =
 ;;
 
 let test_event_bus_operations () =
-  (* Test event bus functionality *)
-  (* Test heartbeat bus *)
+  (* Event bus. *)
+  (* Heartbeat bus. *)
   let _heartbeat_sub = Kraken.Kraken_trading_client.heartbeat_stream () in
   Kraken.Kraken_trading_client.notify_heartbeat ();
-  (* Test connection bus *)
+  (* Connection bus. *)
   let _connection_sub = Kraken.Kraken_trading_client.connection_stream () in
   Kraken.Kraken_trading_client.notify_connection `Connected;
   Alcotest.(check bool) "event bus operations completed" true true
 ;;
 
 let test_state_structure () =
-  (* Test state record structure *)
-  (* We can't directly access the state, but we can test that the module exists *)
+  (* State record (module existence only). *)
   Alcotest.(check bool) "module exists" true true
 ;;
 
 let test_precision_field_detection () =
-  (* Test that precision detection works for different field names *)
+  (* Precision-field detection by field name. *)
   let test_cases =
     [ "limit_price", true
     ; "order_qty", false
@@ -122,7 +121,7 @@ let test_precision_field_detection () =
 ;;
 
 let test_json_parsing_edge_cases () =
-  (* Test JSON parsing with edge cases *)
+  (* json_to_string_precise edge cases. *)
   let test_cases =
     [ `Null, "null"
     ; `Bool true, "true"
@@ -139,7 +138,7 @@ let test_json_parsing_edge_cases () =
 ;;
 
 let test_connection_status_types () =
-  (* Test connection status types *)
+  (* Connection status variants. *)
   let connected_status = `Connected in
   let disconnected_status = `Disconnected "test reason" in
   match connected_status, disconnected_status with
@@ -149,8 +148,7 @@ let test_connection_status_types () =
 ;;
 
 let test_constants () =
-  (* Test that constants are properly defined *)
-  (* We can't directly access the section constant, but we can verify functionality *)
+  (* Constants are defined (placeholder assertion). *)
   Alcotest.(check bool) "constants defined" true true
 ;;
 

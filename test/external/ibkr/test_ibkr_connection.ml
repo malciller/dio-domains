@@ -18,7 +18,7 @@ let test_get_next_order_id () =
 
 let test_disconnect_when_not_connected () =
   let conn = Ibkr.Connection.create ~host:"127.0.0.1" ~port:4002 ~client_id:2 in
-  (* Disconnecting when not connected should be safe *)
+  (* Disconnect is safe when not connected. *)
   let result = Lwt_main.run (Ibkr.Connection.disconnect conn) in
   Alcotest.(check unit) "disconnect ok when not connected" () result;
   Alcotest.(check bool) "still not connected" false (Ibkr.Connection.is_connected conn)
@@ -27,11 +27,11 @@ let test_disconnect_when_not_connected () =
 let test_multiple_connections () =
   let conn1 = Ibkr.Connection.create ~host:"127.0.0.1" ~port:4001 ~client_id:10 in
   let conn2 = Ibkr.Connection.create ~host:"127.0.0.1" ~port:4002 ~client_id:20 in
-  (* Should be independent *)
+  (* Per-connection order IDs are independent. *)
   let _id1 = Ibkr.Connection.get_next_order_id conn1 in
   let _id2 = Ibkr.Connection.get_next_order_id conn1 in
   let id_from_conn2 = Ibkr.Connection.get_next_order_id conn2 in
-  (* conn2 should still start at 0 *)
+  (* conn2 starts at 0. *)
   Alcotest.(check int) "conn2 independent order ID" 0 id_from_conn2
 ;;
 

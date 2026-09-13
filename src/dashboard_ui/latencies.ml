@@ -1,32 +1,23 @@
 open Notty
 open Theme
 
-(** ENGINE LATENCY, a paginated metric table.
+(** ENGINE LATENCY: paginated metric table, one row per domain.
 
-    The section renders one row per domain, but instead of cramming every
-    measurement into a fixed set of columns (which capped the old design at
-    4 metrics / about 170 columns), the columns are organized into PAGES.
-    Each page is a named group of metric columns; only the active page's
-    columns are rendered. The rows, trend sparkline, and exec-rate columns
-    adapt to the active page.
-
-    Adding a new latency measurement, for example a per-domain network or
-    request latency, is now just a matter of adding its label to a page in
-    [metric_pages]; the engine publishes it under the domain's latency map
-    and it appears. No layout math, no width crisis. Switch pages with
-    ←/→ in the main view.
-*)
+    Columns are grouped into pages ([metric_pages]); only the active page's
+    columns render. The rows, trend sparkline, and exec-rate columns adapt to
+    the active page. To add a measurement, add its label to a page; the engine
+    publishes it under the domain's latency map and it appears. Switch pages
+    with ←/→ in the main view. *)
 
 let history_len = 15
 let hist_tbl : (string * string, float array) Hashtbl.t = Hashtbl.create 32
 let hist_max = 128
 
-(** Active latency page (index into [metric_pages]). Switched with ←/→ from
-    the main view via [next_page]/[prev_page]. *)
+(** Active page index into [metric_pages]; switched with [next_page]/[prev_page]. *)
 let active_page_ref = ref 0
 
-(** Exponential moving average over a history array. Smooths the windowed
-    p99 samples so the sparkline tracks trend rather than single-window noise. *)
+(** Exponential moving average of a history array; smooths windowed p99
+    samples so the sparkline tracks trend, not single-window noise. *)
 let ema_smooth (arr : float array) ~alpha =
   let out = Array.copy arr in
   let prev = ref arr.(0) in
@@ -37,9 +28,8 @@ let ema_smooth (arr : float array) ~alpha =
   out
 ;;
 
-(** Rolling p99 history keyed by (symbol, metric) so each latency page keeps
-    its own sparkline, and switching pages never clobbers another page's
-    trend. Evicts everything when the table outgrows [hist_max]; the
+(** Rolling p99 history keyed by (symbol, metric), so each page keeps its own
+    sparkline. Clears the whole table when it exceeds [hist_max] entries;
     sparklines repopulate within seconds. *)
 let update_hist symbol metric p99 =
   if Hashtbl.length hist_tbl > hist_max then Hashtbl.clear hist_tbl;
@@ -59,12 +49,10 @@ let update_hist symbol metric p99 =
 ;;
 
 (** Last measured window values per (symbol, metric), persisted across idle
-    windows so that short-lived measurements, such as signer, ws ping, or
-    rest request, which only get samples when an event actually happens,
-    keep showing their last value instead of flipping back to "idle". Only
-    refreshed by windows with samples; a window with zero samples keeps the
-    previous values rendered dimmed until a fresh one arrives. Evicts
-    everything when the table outgrows [last_vals_max]. *)
+    windows so event-driven metrics (signer, ws ping, rest request) keep their
+    last value instead of flipping back to "idle". Only windows with samples
+    refresh it; zero-sample windows keep prior values rendered dimmed. Clears
+    when it exceeds [last_vals_max] entries. *)
 let last_vals : (string * string, float * float * float) Hashtbl.t = Hashtbl.create 64
 
 let last_vals_max = 256
@@ -77,10 +65,9 @@ let hist_of symbol metric =
   | None -> Array.make history_len 0.0
 ;;
 
-(** Advance the sparkline history once per snapshot, at the data cadence.
-    This must NOT run on every render: the frame clock runs at up to 30 fps,
-    and shifting the history per frame would scroll the sparkline absurdly
-    fast and make the section differ every frame (re-emitting it endlessly). *)
+(** Advance the sparkline history once per snapshot (data cadence), not per
+    render: at up to 30 fps, shifting per frame would scroll the sparkline
+    absurdly fast and force a redraw every frame. *)
 let ingest (snapshot : Snapshot.t) =
   List.iter
     (fun (_symbol, metrics) ->
@@ -91,18 +78,16 @@ let ingest (snapshot : Snapshot.t) =
     snapshot.latencies
 ;;
 
-(** Freshness tolerance per metric label: the oracle windows are published
-    once per analysis pass (~5 min cadence + jitter), everything else every
-    ~15s. *)
+(** Freshness tolerance per metric label: 600s for [oracle] (one analysis pass
+    per ~5 min + jitter), 15s for everything else. *)
 let freshness_tolerance = function
   | "oracle" -> 600.0
   | _ -> 15.0
 ;;
 
-(** A latency page: a named group of per-domain metric columns. Each page
-    renders the same domain rows with a different set of measurement columns,
-    so the ENGINE LATENCY section can grow arbitrarily many metrics without
-    widening the table. *)
+(** A latency page: named group of per-domain metric columns. Every page
+    renders the same domain rows with a different column set, so the section
+    grows to arbitrarily many metrics without widening the table. *)
 type metric_group =
   { page_label : string
   ; metrics : string list
@@ -111,18 +96,16 @@ type metric_group =
   ; trend_max_us : float (* full-scale value for the trend sparkline *)
   }
 
-(** The latency pages.
+(** Latency pages.
 
-    - INTERNAL: the per-asset work, with the separate [oracle] measurement
-      first: the capital-oracle's per-asset analysis pass, which runs on its own
-      (~5 min) cadence and is not part of the per-cycle span. The remaining
-      columns are the in-process work in the order the engine runs it:
+    - INTERNAL: per-asset work. [oracle] is the capital-oracle's per-asset
+      analysis pass (own ~5 min cadence, outside the per-cycle span).
       [orderbook] -> [execution] -> [prep] -> [strategy] are the four sequential
-      SEGMENTS of one cycle, and [cycle] is the WHOLE cycle (their sum). They
-      are all in-process work with the same sub-10us target.
-    - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed
-      gap, REST round-trip, signer time). These measure exchange round-trips
-      and socket lifetimes, not in-process work, and carry their own budgets. *)
+      segments of one cycle; [cycle] is their sum. All are in-process work with
+      the same sub-10us target.
+    - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed gap,
+      REST round-trip, signer time). These measure exchange round-trips and
+      socket lifetimes, not in-process work, and carry their own budgets. *)
 let metric_pages =
   [ { page_label = "INTERNAL"
     ; metrics = [ "oracle"; "orderbook"; "execution"; "prep"; "strategy"; "cycle" ]
@@ -161,17 +144,15 @@ let page_trend_label i =
   | None -> ""
 ;;
 
-(** Width of the trend column (sparkline + header). The trend header label
-    and the sparkline must both stay within this width; a longer label
-    would silently overrun the column and shift every border to its right
-    out of alignment. Guarded by a test in test_dashboard_holdings. *)
+(** Width of the trend column (sparkline + header). The trend header label and
+    the sparkline must both fit; a longer label would silently overrun the
+    column and shift every border to its right out of alignment. Guarded by a
+    test in test_dashboard_holdings. *)
 let trend_col_w = 12
 
-(** Short header label for a latency metric. *)
-
-(** Short display header for a latency metric. The INTERNAL columns read ORACLE
-    (the separate analysis-pass metric) first, then the cycle's segments and its
-    total: BOOK -> EVENTS -> PREP -> STRATEGY, then TOTAL (the whole cycle). *)
+(** Short display header per latency metric: ORACLE (the separate analysis-pass
+    metric), then the cycle segments BOOK -> EVENTS -> PREP -> STRATEGY, then
+    TOTAL (the whole cycle). *)
 let short_label = function
   | "oracle" -> "ORACLE"
   | "orderbook" -> "BOOK"
@@ -194,9 +175,9 @@ let take_first n l =
   aux [] n l
 ;;
 
-(** Section title with the page tabs embedded: the active page is wrapped in
-    ◀ ▶ (bold cyan), inactive pages are dim, and the ←/→ hint marks the
-    switch keys. *)
+(** Section title with page tabs embedded: the active page is wrapped in
+    ◀ ▶ (bold cyan), inactive pages are dim, and the ←/→ hint marks the switch
+    keys. *)
 let render_latency_title w =
   let t = Theme.current () in
   let left =
@@ -230,7 +211,7 @@ let render_latency_title w =
 let render_latencies w (snapshot : Snapshot.t) =
   let t = Theme.current () in
   let lats = snapshot.latencies in
-  (* Build a symbol -> exchange lookup table from the strategies. *)
+  (* Symbol -> exchange lookup from the strategies. *)
   let sym_to_exch =
     List.map (fun (sym, (s : Snapshot.strategy)) -> sym, s.exchange) snapshot.strategies
   in
@@ -239,12 +220,11 @@ let render_latencies w (snapshot : Snapshot.t) =
     | Some e when e <> "" -> e
     | _ -> ""
   in
-  (* Filter to rows with at least one fresh metric window (published within
-     the snapshot timestamp's freshness tolerance for that metric). A running
-     domain always publishes a window even with zero samples, so idle-but-
-     running domains stay visible instead of flickering out between resets.
-     Freshness is checked across ALL pages so rows stay stable when the user
-     flips pages. *)
+  (* Keep rows with at least one metric window fresh within its tolerance. A
+     running domain publishes a window even with zero samples, so
+     idle-but-running domains stay visible instead of flickering out between
+     resets. Freshness is checked across all pages so rows stay stable when the
+     user flips pages. *)
   let snapshot_ts = snapshot.timestamp in
   let all_page_labels = List.concat_map (fun p -> p.metrics) metric_pages in
   let row_is_active (_symbol, (metrics : (string * Snapshot.latency_metric) list)) =
@@ -262,17 +242,13 @@ let render_latencies w (snapshot : Snapshot.t) =
   if active_lats = []
   then I.empty
   else (
-    (* Per-metric latency thresholds: (yellow_us, red_us). The four internal
-       pipeline SEGMENTS (orderbook, execution, prep, strategy) share one budget
-       - green under 10us, yellow 10-20us, red above 20us - because they are all
-       in-process work with the same sub-10us target. [cycle] (the TOTAL column)
-       is the whole-cycle sum and carries the wider end-to-end budget: green
-       under 50us, yellow 50-100us, red above 100us. [oracle] is the separate
-       analysis pass. The NETWORK page metrics keep their own much larger
-       budgets: they measure exchange round-trips and socket lifetimes, not
-       in-process work. [f > crit] red / [f >= warn] yellow makes the warn edge
-       the first yellow and the crit edge the last yellow, so the bands read as
-       <warn green / [warn,crit] yellow / >crit red. *)
+    (* Per-metric (warn_us, crit_us) thresholds. The four internal segments
+       (orderbook, execution, prep, strategy) share one budget: green < 10us,
+       yellow 10-20us, red > 20us. [cycle] is the whole-cycle sum with the wider
+       end-to-end budget: green < 50us, yellow 50-100us, red > 100us. [oracle]
+       is the separate analysis pass. NETWORK metrics keep much larger budgets
+       (exchange round-trips, not in-process work). [f >= warn] is yellow,
+       [f > crit] is red, else green. *)
     let latency_thresholds label =
       match label with
       | "cycle" -> 50.0, 100.0
@@ -300,7 +276,7 @@ let render_latencies w (snapshot : Snapshot.t) =
     let page_cols = if w < full_page_w then take_first 2 page.metrics else page.metrics in
     let page_labels = List.map short_label page_cols in
     let metric_cell_w = 8 in
-    (* Two-row header: metric names on the first row and p50/p99/p999
+    (* Two-row header: metric names on the first row, p50/p99/p999
        sub-headers on the second. *)
     let header_row1 =
       I.hcat

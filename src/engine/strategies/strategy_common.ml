@@ -101,12 +101,10 @@ let generate_duplicate_key symbol side quantity limit_price =
 
 (** Per-symbol strategy order-action counters.
 
-    Incremented each time a strategy successfully pushes an order action
-    (place/amend/cancel) to a ring buffer; snapshot+reset once per latency
-    window by the domain worker so the dashboard's STRAT/S column reports
-    ACTUAL strategy executions per second, not raw strategy-invocation
-    cycles, which for a fast feed are far higher than the real number of
-    order actions the strategy takes. *)
+    Incremented on each successful push of a place/amend/cancel to a ring
+    buffer. The domain worker snapshots and resets once per latency window;
+    the dashboard STRAT/S column reports actual order actions per second, not
+    strategy-invocation cycles. *)
 module Order_actions = struct
   let counters : (string, int Atomic.t) Hashtbl.t = Hashtbl.create 16
   let mutex = Mutex.create ()
@@ -142,12 +140,10 @@ end
 
 (** In-flight order cache for deduplication of pending place/cancel requests.
 
-    Sharded (HFT_AUDIT.md H4): the registry used to be ONE Hashtbl behind ONE
-    global mutex shared by every symbol and every domain, the single most
-    cross-cutting lock in the engine. Now the table and its mutex are split
-    across [num_shards] independent shards keyed by hash of the duplicate key
-    (which embeds the symbol), so independent symbols/domains no longer
-    serialize on one lock; the common case locks only the key's own shard. *)
+    Sharded across [num_shards] independent tables and mutexes keyed by hash
+    of the duplicate key (which embeds the symbol). Independent symbols and
+    domains do not serialize on one global lock; the common case locks only
+    the key's own shard. *)
 module InFlightOrders = struct
   let num_shards = 64
 
@@ -241,26 +237,22 @@ module InFlightOrders = struct
 end
 
 (** In-flight amendment lifecycle registry: deduplication of pending amend
-    requests PLUS the exchange's mid-amend order-replacement events.
+    requests plus the exchange's mid-amend order-replacement events.
 
-    Exchanges implement amendments differently - Kraken modifies the order in
-    place (same id), Hyperliquid and Alpaca replace it under the hood (the old
-    order is cancelled and a new id is created). A replacement therefore emits
-    a cancel event for the OLD id, either while the amend request is pending or
-    shortly after it completes (event ordering on the wire). This registry
-    gives every exchange the same lifecycle so strategies react uniformly:
+    Amendment semantics differ by exchange: Kraken modifies the order in place
+    (same id); Hyperliquid/Alpaca cancel the old order and create a new id. A
+    replacement emits a cancel event for the old id, either while the amend is
+    pending or shortly after completion. This registry maps all exchanges to
+    one lifecycle:
 
-    - [Pending] while the request is in flight: a cancel event for the old id
-      is the amend's side effect, not a real cancellation.
-    - [Replaced new_id] once the exchange confirms (old_id <> new_id): the
-      entry is retained for the cleanup window so a LATE cancel event for the
-      old id is still recognized as the amend's side effect and cannot reset
-      the replacement order's tracking.
-    - Same-id amends (Kraken) do not retain an entry: events for that id are
-      always real.
-    - [Failed]/[Skipped] are terminal: the entry is dropped so a follow-up
-      cancel event is handled as a real one (the failure path already
-      reconciled tracking). *)
+    - [Pending]: amend request in flight; a cancel for the old id is the
+      amend's side effect, not a real cancellation.
+    - [Replaced new_id]: exchange confirmed a replace (old_id <> new_id); the
+      entry is retained through the cleanup window so a late cancel for the old
+      id cannot reset the replacement order's tracking.
+    - Same-id amends (Kraken) retain no entry: events for that id are real.
+    - [Failed]/[Skipped]: terminal; the entry is dropped so a follow-up cancel
+      is handled as real (the failure path reconciled tracking). *)
 module InFlightAmendments = struct
   type phase =
     | Pending
@@ -273,8 +265,7 @@ module InFlightAmendments = struct
     ; mutable last : float
     }
 
-  (* Sharded like InFlightOrders (HFT_AUDIT.md H4): no single global mutex
-     across all symbols/domains. Keyed by hash of the order id. *)
+  (* Sharded like InFlightOrders: keyed by hash of the order id. *)
   let num_shards = 64
 
   let registries : (string, entry) Hashtbl.t array =
@@ -391,14 +382,13 @@ module InFlightAmendments = struct
 
   let last_cleanup = Atomic.make 0.0
 
-  (** Reap only TERMINAL leftovers older than [max_age] seconds - the
-      [Replaced] recognition window is bounded by this cleanup. [Pending]
-      entries are owned by an in-flight REST request and are always resolved
-      by exactly one guaranteed terminal event (Amended/Amendment_skipped/
-      Amendment_failed) or a recognized cancel; aging one out here would
-      drop the amend-recognition window while the exchange still owns the
-      request, so a mid-flight cancel event would reset tracking as if it
-      were real. Returns [(0, removed_count)]. *)
+  (** Evict only terminal entries older than [max_age] seconds; this bounds
+      the [Replaced] recognition window. [Pending] entries are owned by an
+      in-flight REST request and are always resolved by exactly one terminal
+      event (Amended/Amendment_skipped/Amendment_failed) or a recognized
+      cancel. Evicting a [Pending] entry would drop the amend-recognition
+      window while the exchange still owns the request, so a mid-flight cancel
+      would reset tracking as if real. Returns [(0, removed_count)]. *)
   let cleanup ?(max_age = 60.0) () =
     let now = Unix.gettimeofday () in
     let last = Atomic.get last_cleanup in
@@ -432,9 +422,8 @@ module InFlightAmendments = struct
   ;;
 end
 
-(** Fixed-size, zero-allocation MPSC ring buffer.
-    Replaces the Michael-Scott queue to eliminate node allocations on the hot path.
-    Uses padding to prevent false sharing between producer and consumer domains. *)
+(** Fixed-size, zero-allocation MPSC ring buffer. Cache-line padding
+    separates producer and consumer indices to prevent false sharing. *)
 module LockFreeQueue = struct
   type 'a t =
     { array : 'a option Atomic.t array
@@ -524,14 +513,14 @@ module LockFreeQueue = struct
   ;;
 end
 
-(** Domain-safe order signal channel.
-    Domain workers call [broadcast ()] to notify the supervisor's Lwt event loop
-    that new orders are available. Implemented via a Unix self-pipe so that a
-    single-byte write from any domain wakes the Lwt scheduler without touching
-    Lwt internals (Lwt_condition is NOT safe from non-Lwt domains).
+(** Domain-safe order signal channel. Domain workers call [broadcast ()] to
+    notify the supervisor's Lwt event loop that new orders are available.
+    Implemented via a Unix self-pipe: a single-byte write from any domain wakes
+    the Lwt scheduler without touching Lwt internals (Lwt_condition is not safe
+    from non-Lwt domains).
 
-    The [pending] atomic flag coalesces multiple rapid broadcasts into a single
-    pipe write to avoid saturating the pipe buffer under high order throughput. *)
+    [pending] coalesces rapid broadcasts into one pipe write to avoid
+    saturating the pipe buffer under high order throughput. *)
 module OrderSignal = struct
   let read_fd, write_fd =
     let r, w = Unix.pipe ~cloexec:true () in

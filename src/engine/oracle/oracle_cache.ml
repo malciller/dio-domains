@@ -1,40 +1,26 @@
-(* Oracle_cache - disk-persisted daily OHLC history for the capital oracle.
+(* Oracle_cache - disk-persisted daily OHLC history.
 
-   Why: the pass pipeline re-fetched FULL histories on every refresh - the
-   Kraken feed alone walks back to each pair's inception (up to 60 pages)
-   per pass, Hyperliquid re-downloads the whole candleSnapshot range, Yahoo
-   re-downloads the entire deep history. That is what made a pass take 20-30s
-   and the per-asset ORACLE latency read 2-8s on the dashboard.
+   Full-history refetch per pass was too slow (Kraken walks to pair
+   inception, up to 60 pages; Hyperliquid re-downloads the candleSnapshot
+   range; Yahoo re-downloads deep history). Bars are immutable except the
+   latest, so each pass fetches only the delta since the last cached bar,
+   merges (dedup keeps the newest occurrence of a date), re-normalizes
+   through [Oracle_calendar.normalize_bars] and persists. A current cache
+   skips the network; a failed delta fetch falls back to the cached history
+   (stale but real). Persistence never fails the caller; corrupt files are
+   treated as a fresh start; writes are atomic.
 
-   Established engine practice (same as the persistence orchestrator stores):
-   persist state to disk under data/ (/app/data in Docker), write atomically,
-   treat corrupt files as a fresh start, never let persistence fail the
-   caller. History bars are immutable except the latest one, so each pass
-   fetches only the DELTA since the last cached bar (one small request per
-   asset), merges (dedup keeps the newest occurrence of the current day's
-   bar), re-normalizes through the shared [Oracle_calendar.normalize_bars]
-   so every consumer - runtime, CLI, replay - still sees one clean series,
-   and persists the merged result. A cache that is already current skips the
-   network entirely; a failed delta fetch falls back to the cached history
-   (stale but real beats nothing - the runtime's last-known-good machinery
-   sits on top).
-
-   File layout: <dir>/<exchange>/<symbol>.json - one JSON array of bars
-   [{date,o,h,l,c,v}], ascending. The cache stores RAW bars (the source
-   truth, sorted + de-duplicated); the shared clean-series normalization
-   (Oracle_calendar.normalize_bars) is applied on READ, so a corrected
-   normalization rule self-heals the served series without a refetch. v2:
-   the v1 cache persisted already-normalized (gapped) series, so the layout
-   was versioned to force one cold refetch. *)
+   File layout: <dir>/<exchange>/<symbol>.json - ascending JSON array of raw
+   bars [{date,o,h,l,c,v}]. Normalization is applied on read, so a corrected
+   rule self-heals without a refetch. v2 stores raw bars (v1 stored
+   normalized series and could not self-heal). *)
 
 open Lwt.Infix
 
 let section = "oracle_cache"
 
-(** Base directory for history files. Resolves to /app/data in Docker,
-    ./data locally - same convention as the persistence stores. v2: raw bars +
-    read-time normalization (v1 stored normalized series and could not
-    self-heal after a rule change). *)
+(** Base history directory: /app/data in Docker, ./data locally. v2 stores
+    raw bars with read-time normalization. *)
 let cache_dir =
   if Sys.file_exists "/app"
   then "/app/data/oracle_history/v2"
@@ -177,16 +163,11 @@ let is_fresh ~(today : string) (bars : Oracle_types.bar list) =
   | [] -> false
 ;;
 
-(** A bounded history (e.g. the Yahoo deep extension, which only covers up
-    to the day before the venue series starts) is COMPLETE when its last bar
-    reaches its end date - after that it never needs a fetch again, however
-    far today has moved on. [tolerance_days] absorbs non-trading days: the
-    deep boundary for an equity asset usually lands on a weekend/holiday
-    (venue_first - 1, e.g. a Sunday when the venue series starts Monday),
-    and the venue's last bar is then the Friday before - a weekend-only
-    sliver holds no data at all, so requiring an exact date match would
-    re-request the same empty range on every pass forever. 7 days covers
-    any weekend + holiday span. *)
+(** A bounded history (e.g. the Yahoo deep extension, covering up to the day
+    before the venue series starts) is complete when its last bar reaches
+    [date] - afterwards it never needs another fetch. [tolerance_days]
+    absorbs non-trading days so a weekend/holiday boundary is not
+    re-requested forever; 7 days covers any weekend plus holiday span. *)
 let covers_through ?(tolerance_days = 0) ~(date : string) (bars : Oracle_types.bar list) =
   let floor = Oracle_calendar.add_days date (-tolerance_days) in
   match List.rev bars with
@@ -194,10 +175,9 @@ let covers_through ?(tolerance_days = 0) ~(date : string) (bars : Oracle_types.b
   | [] -> false
 ;;
 
-(** Merge cached history with freshly fetched bars, RAW (the cache is the
-    source truth; normalization happens on read). [dedup] keeps the LAST
-    occurrence of a date, so a revised current-day bar replaces the cached
-    one. *)
+(** Merge cached and fresh bars raw (the cache is source truth; normalization
+    is on read). [dedup] keeps the last occurrence of a date, so a revised
+    current-day bar replaces the cached one. *)
 let merge_bars (cached : Oracle_types.bar list) (fresh : Oracle_types.bar list) =
   cached @ fresh
   |> Array.of_list
@@ -206,33 +186,27 @@ let merge_bars (cached : Oracle_types.bar list) (fresh : Oracle_types.bar list) 
   |> Array.to_list
 ;;
 
-(** The shared clean-series view of a (raw) cached history: normalization
-    applies at read time, so the served series always reflects the current
-    rules without a refetch. *)
+(** Clean-series view of raw cached history: normalization applies at read
+    time, so the served series reflects current rules without a refetch. *)
 let clean_bars (bars : Oracle_types.bar list) : Oracle_types.bar list =
   let clean, _, _ = Oracle_calendar.normalize_bars bars in
   Array.to_list clean
 ;;
 
-(** Read-only cache access for offline / cache-only runs: the cleaned view of
-    whatever is on disk for this asset, with NO network fallback. A cache miss
-    returns [] (the caller's existing "no usable history" handling applies). *)
+(** Read-only cache access for offline/cache-only runs: cleaned on-disk bars
+    for this asset, no network fallback. A cache miss returns []. *)
 let read_cached ?(dir = cache_dir) ~(exchange : string) ~(symbol : string) ()
   : Oracle_types.bar list
   =
   load_bars ~dir ~exchange ~symbol |> clean_bars
 ;;
 
-(** The delta-fetch policy, one asset at a time:
-    - cache current (last bar >= today-1, or - for a bounded history given
-      [complete_through] - the last bar already reaches that end date):
-      return the clean view, no network;
-    - else call [fetch] with [Some start_date] = the day AFTER the last
-      cached bar (None = no cache yet, fetch the full history), merge raw,
-      persist raw, return the clean view. A failed delta fetch logs and
-      returns the cached history (stale but real); an empty cache that
-      fails to fetch returns [] and the caller's existing failure handling
-      applies. *)
+(** Delta-fetch policy for one asset. If the cache is current (last bar >=
+    today-1, or a bounded history reaching [complete_through]), return the
+    clean view with no network. Otherwise call [fetch] with [Some start_date]
+    = day after the last cached bar (None = full history), merge raw, persist
+    raw, return the clean view. A failed delta fetch logs and returns the
+    cached history (stale but real); an empty failing cache returns []. *)
 let with_delta
       ?(dir = cache_dir)
       ?(complete_through : string option)

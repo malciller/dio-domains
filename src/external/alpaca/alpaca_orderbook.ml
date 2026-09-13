@@ -5,13 +5,12 @@ open Dio_exchange.Exchange_intf.Types
 
 let section = "alpaca_orderbook"
 
-(** The top-of-book comes primarily from the WebSocket quote stream:
-    WS "q" messages on the session-appropriate feed (regular v2 by day,
-    v1beta1/overnight at night). When the active WS feed has no quotes (e.g.
-    during pre-market/after-hours on the free IEX feed when IEX is closed),
-    [get_best_bid_ask] falls back to the account position mark from
-    [Alpaca_balances.get_position_price]. Trade prints are recorded for
-    analytics only and never fabricate quotes. *)
+(** Top-of-book from the WebSocket quote stream: "q" messages on the
+    session-appropriate feed (v2 by day, v1beta1/overnight at night). When the
+    active feed has no quotes (e.g. IEX closed pre/after-market),
+    [get_best_bid_ask] falls back to the position mark from
+    [Alpaca_balances.get_position_price]. Trade prints are analytics only and
+    never fabricate quotes. *)
 
 type quote =
   { bid_price : float
@@ -29,10 +28,9 @@ type trade =
   }
 
 module SymbolStore = struct
-  (** Single-writer atomic TOB cache : the WS writer publishes a fresh
-      immutable record on every push, and readers do a single [Atomic.get]
-      with no mutex. Position and best-bid/ask travel together so a reader
-      can never observe a torn (mixed-generation) snapshot. *)
+  (** Single-writer atomic TOB cache: the WS writer publishes a fresh immutable
+      record per push; readers do one lock-free [Atomic.get]. Position and
+      best-bid/ask travel together, so no torn snapshot. *)
   type tob_cache =
     { pos : int
     ; bid_px : float
@@ -106,9 +104,8 @@ module SymbolStore = struct
       cache
     in
     Atomic.set t.tob tob_cache;
-    (* wake only the domain trading this symbol. signal_all here woke
-       every configured asset per tick (O(N) futex wakes + N wasted cycles
-       on every quote). *)
+    (* Wake only the domain trading this symbol; signal_all woke every
+       configured asset per tick (O(N) futex wakes). *)
     Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
   ;;
 
@@ -206,16 +203,15 @@ let get_or_create_store symbol =
 let active_subscriptions : string list ref = ref []
 let active_conn : Ws_lwt.conn option ref = ref None
 
-(* Ping/pong liveness tracking.
-   The supervisor monitor loop calls [send_ping] on a 15s cadence and expects
-   a [bool]; a Pong frame arriving in the read loop broadcasts [pong_condition]
-   and stamps [last_pong_time] so the waiter can resolve. [last_pong_time] also
-   closes the race where the Pong lands before [send_ping] starts waiting. *)
+(* Ping/pong liveness. The supervisor monitor loop calls [send_ping] every 15s
+   and expects a [bool]; the read loop broadcasts [pong_condition] and stamps
+   [last_pong_time]. The stamp closes the race where the Pong lands before
+   [send_ping] starts waiting. *)
 let last_pong_time = ref 0.0
 let pong_condition = Lwt_condition.create ()
 
 (** Timestamp of the last data frame, for the ws_feed inter-message gap
-    measurement (recorded under the "alpaca" venue in [Network_latency]). *)
+    measurement (recorded under venue "alpaca" in [Network_latency]). *)
 let last_frame_time = ref 0.0
 
 let get_best_bid_ask symbol =
@@ -356,13 +352,10 @@ let handle_message_str ?on_auth_success ?on_auth_error content =
                    else "trade"
                  | None -> "trade"
                in
-               (* Trades are recorded for analytics ONLY. A print is evidence
-                    of price, never a two-sided quote: it must never fabricate
-                    a bid/ask (the old stale-quote fallback published
-                    bid = ask = last trade, which showed raw print volatility
-                    that is not a real market). The top-of-book comes from the
-                    WS quote stream only, so a quote gap simply holds the last
-                    real quote until the feed resumes. *)
+               (* Trades are analytics ONLY. A print is evidence of price, not
+                    a two-sided quote, and never fabricates a bid/ask. Top-of-book
+                    comes only from the WS quote stream; a quote gap holds the
+                    last real quote until the feed resumes. *)
                SymbolStore.push_trade
                  store
                  { price; size; timestamp = ts; side = side_str };
@@ -452,10 +445,8 @@ let send_subscription symbols =
 ;;
 
 let subscribe_symbols symbols =
-  (* WS-only data feed: subscribing triggers the stream to send the current
-     quote per symbol, then continuous "q" updates (same as every other
-     exchange here - Kraken/HL/Lighter stream the book, Alpaca streams L1
-     quotes). No REST seed or snapshot poll. *)
+  (* WS-only feed: subscribing sends the current quote per symbol, then
+     continuous "q" updates. No REST seed or snapshot poll. *)
   let new_syms = List.filter (fun s -> not (List.mem s !active_subscriptions)) symbols in
   if new_syms <> []
   then (
@@ -464,25 +455,24 @@ let subscribe_symbols symbols =
   else Lwt.return_unit
 ;;
 
-(** Session-appropriate market-data feed URL: the derived Alpaca overnight
-    feed during overnight hours (8:00 PM - 4:00 AM ET, when the regular v2
-    stream carries nothing), the configured iex/sip stream otherwise. *)
+(** Session-appropriate feed URL: overnight (20:00-04:00 ET, when the regular
+    v2 stream carries nothing) during overnight hours, else the configured
+    iex/sip stream. *)
 let session_data_ws_url () =
   if Alpaca_market_hours.is_overnight_hours ()
   then Alpaca_types.Config.overnight_ws_url ()
   else Alpaca_types.Config.data_ws_url ()
 ;;
 
-(** Monotone incarnation counter for data connections: each [connect_and_monitor]
-    invocation captures the current value and bumps it, so a session-watcher
-    spawned by a superseded incarnation stops itself instead of acting on a
-    connection that is no longer current. *)
+(** Monotone incarnation counter for data connections. Each
+    [connect_and_monitor] captures and bumps it; a session-watcher from a
+    superseded incarnation stops instead of acting on a stale connection. *)
 let conn_generation = ref 0
 
-(** How often the data connection re-evaluates which session feed it should
-    be on (5s: keeps the pre-market/after-hours <-> overnight switch within a
-    few seconds of the boundary). During the switch the store simply holds
-    the last real quote until the other feed streams fresh "q" messages. *)
+(** Session-feed re-evaluation interval (5s), keeping the
+    pre/after-hours <-> overnight switch within seconds of the boundary.
+    During the switch the store holds the last real quote until the other feed
+    streams fresh "q" messages. *)
 let session_watch_seconds = 5.0
 
 let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
@@ -493,8 +483,8 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
   let uri = Uri.of_string url_str in
   let host = Uri.host uri |> Option.value ~default:"stream.data.alpaca.markets" in
   let port = Uri.port uri |> Option.value ~default:443 in
-  (* Set by the session watcher when the required feed changes; the catch
-     handler then reconnects internally instead of reporting a failure. *)
+  (* Set by the session watcher on a feed change; the catch handler then
+     reconnects internally instead of reporting failure. *)
   let session_switch = ref false in
   Lwt.catch
     (fun () ->
@@ -509,8 +499,8 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
        let client = `TLS (`Hostname host, `IP ip, `Port port) in
        let ctx = Ws_lwt.resolve_ctx () in
        (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP
-          connection during the handshake would otherwise block the
-          reconnect (which runs on the main Lwt loop) indefinitely. *)
+          connection would otherwise block the reconnect (main Lwt loop)
+          indefinitely. *)
        Lwt_unix.with_timeout 20.0 (fun () -> Ws_lwt.connect ~ctx client uri)
        >>= fun conn ->
        active_conn := Some conn;
@@ -519,7 +509,6 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
          "Connected to Alpaca Market Data WS at %s (%s feed)"
          url_str
          (if is_overnight_feed then "overnight" else "regular");
-       (* Send the WebSocket authentication request. *)
        let auth_msg =
          `Assoc
            [ "action", `String "auth"
@@ -565,7 +554,7 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
                in
                Ws_lwt.write conn pong_frame
              | Websocket.Frame.Opcode.Pong ->
-               (* Reply to our active [send_ping]; resolves any pending waiter. *)
+               (* Reply to [send_ping]; resolves any pending waiter. *)
                last_pong_time := Unix.gettimeofday ();
                Lwt_condition.broadcast pong_condition ();
                Lwt.return_unit
@@ -575,7 +564,7 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
                let content = String.trim frame.Websocket.Frame.content in
                if content <> ""
                then (
-                 (* Feed cadence: gap since the previous data frame on this venue. *)
+                 (* Feed cadence: gap since the previous data frame. *)
                  let now = Unix.gettimeofday () in
                  if !last_frame_time > 0.0
                  then Network_latency.record_feed_s "alpaca" (now -. !last_frame_time);
@@ -586,12 +575,10 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
                 | None -> Lwt.return_unit)))
          >>= fun () -> read_loop ()
        in
-       (* Seamless session switching: while this incarnation is current, watch
-           for the market session boundary. When the required feed changes
-           (regular/pre-market/after-hours <-> overnight) close the socket so
-           this read loop unwinds and the catch handler reconnects on the other
-           feed - the store holds the last real quote during the sub-second
-           gap, then fresh "q" messages resume streaming. *)
+       (* Session switching: while this incarnation is current, watch the
+           session boundary. On a feed change (regular/pre/after-hours <->
+           overnight) close the socket; the catch handler reconnects on the
+           other feed, holding the last real quote during the gap. *)
        let rec session_watcher () =
          Lwt_unix.sleep session_watch_seconds
          >>= fun () ->
@@ -635,10 +622,9 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
          Lwt.return_unit))
 ;;
 
-(** Sends a protocol-level WebSocket Ping frame and waits for the matching
-    Pong within [timeout_ms]. Returns [true] when the Pong arrived, [false]
-    on timeout or send failure. Records the round trip in the "alpaca" venue
-    profiler (the dashboard's ws_ping column). *)
+(** Sends a WebSocket Ping frame and waits for the matching Pong within
+    [timeout_ms]. Returns [true] when the Pong arrived, [false] on timeout or
+    send failure. Records the round trip in venue "alpaca" (dashboard ws_ping). *)
 let send_ping ~req_id ~timeout_ms : bool Lwt.t =
   match !active_conn with
   | None -> Lwt.return false

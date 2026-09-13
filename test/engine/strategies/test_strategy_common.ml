@@ -1,4 +1,4 @@
-(* Create sample strategy orders for testing *)
+(* Sample strategy-order fixture. *)
 let create_test_order
       ?(operation = Dio_strategies.Strategy_common.Place)
       ?(order_id = None)
@@ -41,7 +41,6 @@ let create_test_order
 ;;
 
 let test_order_side_conversion () =
-  (* Test order_side to string conversion *)
   Alcotest.(check string)
     "buy side conversion"
     "buy"
@@ -55,7 +54,6 @@ let test_order_side_conversion () =
 ;;
 
 let test_operation_type_conversion () =
-  (* Test operation_type to string conversion *)
   Alcotest.(check string)
     "place operation conversion"
     "place"
@@ -74,7 +72,6 @@ let test_operation_type_conversion () =
 ;;
 
 let test_strategy_order_creation () =
-  (* Test strategy order record creation *)
   let order = create_test_order ~userref:(Some 12345) () in
   Alcotest.(check bool)
     "order operation"
@@ -96,7 +93,6 @@ let test_strategy_order_creation () =
 ;;
 
 let test_strategy_order_variants () =
-  (* Test different strategy order variants *)
   let place_order =
     create_test_order ~operation:Dio_strategies.Strategy_common.Place ()
   in
@@ -136,20 +132,15 @@ let test_strategy_order_variants () =
 ;;
 
 let test_queue_creation () =
-  (* Test LockFreeQueue creation *)
   let _ = Dio_strategies.Strategy_common.LockFreeQueue.create () in
   Alcotest.(check bool) "queue created" true true
 ;;
 
 let test_queue_basic_write_read () =
-  (* Test basic write/read operations *)
   let buffer = Dio_strategies.Strategy_common.LockFreeQueue.create () in
   let order = create_test_order () in
-  (* Write an order *)
   let write_result = Dio_strategies.Strategy_common.LockFreeQueue.write buffer order in
-  (* Should succeed *)
   Alcotest.(check (option unit)) "write success" (Some ()) write_result;
-  (* Read the order back *)
   let read_result = Dio_strategies.Strategy_common.LockFreeQueue.read buffer in
   Alcotest.(check bool) "read order success" true (Option.is_some read_result);
   let read_order = Option.get read_result in
@@ -161,29 +152,24 @@ let test_queue_basic_write_read () =
 ;;
 
 let test_queue_empty_read () =
-  (* Test reading from empty queue *)
   let buffer = Dio_strategies.Strategy_common.LockFreeQueue.create () in
   let read_result = Dio_strategies.Strategy_common.LockFreeQueue.read buffer in
   Alcotest.(check bool) "empty read" true (Option.is_none read_result)
 ;;
 
 let test_queue_batch_read () =
-  (* Test batch reading *)
   let buffer = Dio_strategies.Strategy_common.LockFreeQueue.create () in
   let order1 = create_test_order ~symbol:"BTC/USD" () in
   let order2 = create_test_order ~symbol:"ETH/USD" () in
   let order3 = create_test_order ~symbol:"LTC/USD" () in
-  (* Write three orders *)
   let _ = Dio_strategies.Strategy_common.LockFreeQueue.write buffer order1 in
   let _ = Dio_strategies.Strategy_common.LockFreeQueue.write buffer order2 in
   let _ = Dio_strategies.Strategy_common.LockFreeQueue.write buffer order3 in
-  (* Batch read with limit of 2 *)
   let batch = Dio_strategies.Strategy_common.LockFreeQueue.read_batch buffer 2 in
   Alcotest.(check int) "batch size" 2 (List.length batch)
 ;;
 
 let test_queue_batch_read_empty () =
-  (* Test batch reading from empty queue *)
   let buffer = Dio_strategies.Strategy_common.LockFreeQueue.create () in
   let batch = Dio_strategies.Strategy_common.LockFreeQueue.read_batch buffer 10 in
   Alcotest.(check bool) "empty batch" true (batch = [])

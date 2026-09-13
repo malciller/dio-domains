@@ -1,4 +1,4 @@
-(* Oracle types - the shared data vocabulary of the capital oracle. *)
+(* Oracle_types - shared data types for the capital oracle. *)
 
 type calendar_kind = Dio_exchange.Exchange_intf.Types.calendar_kind =
   | Crypto
@@ -22,10 +22,8 @@ type gap =
   ; missing_days : int
   }
 
-(** One asset's daily price history as fetched and merged by Oracle_fetch:
-    an ordered bar array plus any gaps detected against the asset's session
-    calendar (informational - there is no gap tolerance and no forward
-    filling; what the sources provide is what consumers see). *)
+(** One asset's daily merged price history. [gaps] is informational only: no
+    gap tolerance, no forward filling. *)
 type series =
   { symbol : string
   ; calendar_kind : calendar_kind

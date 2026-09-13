@@ -1,7 +1,7 @@
 (**
    Kraken authenticated balances WebSocket feed.
-   Maintains per-asset balance state via atomic variables for lock-free reads.
-   State is mutated in response to WebSocket balance snapshot and update messages.
+   Maintains per-asset balance state in atomic variables for lock-free reads;
+   mutated by WebSocket balance snapshot and update messages.
 *)
 
 open Lwt.Infix
@@ -134,7 +134,6 @@ module BalanceStore = struct
              oldest_key := k))
         store.wallets;
       if !oldest_key <> "" then Hashtbl.remove store.wallets !oldest_key);
-    (* Recompute aggregate balance across all wallets. *)
     let total =
       Hashtbl.fold (fun _ wallet acc -> acc +. wallet.balance) store.wallets 0.0
     in
@@ -325,7 +324,6 @@ let wait_for_balance_data = wait_for_balance_data_lwt
 let cleanup_dynamic_assets () =
   Mutex.lock balance_stores_mutex;
   Mutex.lock configured_assets_mutex;
-  (* Partition assets into configured (static) and dynamic sets. *)
   let all_assets = ref [] in
   Hashtbl.iter (fun asset _ -> all_assets := asset :: !all_assets) balance_stores;
   let configured = ref [] in
@@ -336,7 +334,6 @@ let cleanup_dynamic_assets () =
        then configured := asset :: !configured
        else dynamic := asset :: !dynamic)
     !all_assets;
-  (* Sort dynamic assets by last update time, most recent first. *)
   let dynamic_with_times =
     List.map
       (fun asset ->
@@ -359,14 +356,12 @@ let cleanup_dynamic_assets () =
       (fun (_, t1) (_, t2) -> Float.compare t2 t1)
       (List.combine !dynamic dynamic_with_times)
   in
-  (* Retain only the most recently updated dynamic assets up to the cap. *)
   let dynamic_to_keep =
     List.map fst (List.filteri (fun i _ -> i < dynamic_assets_cap) dynamic_sorted)
   in
   let dynamic_to_remove =
     List.filter (fun asset -> not (List.mem asset dynamic_to_keep)) !dynamic
   in
-  (* Remove evicted assets from both balance stores and timestamp tracking. *)
   let removed_count = List.length dynamic_to_remove in
   List.iter
     (fun asset ->
@@ -419,7 +414,6 @@ let parse_snapshot json on_heartbeat =
            let asset = member "asset" asset_data |> to_string in
            let base_asset = normalize_asset asset in
            let store = get_balance_store base_asset in
-           (* Iterate over embedded wallet entries and update each. *)
            let wallets = member "wallets" asset_data |> to_list in
            List.iter
              (fun wallet ->
@@ -459,7 +453,7 @@ let parse_snapshot json on_heartbeat =
              "Failed to parse balance snapshot item: %s"
              (Printexc.to_string exn))
       data;
-    (* Mark any pre-initialized assets with zero balance as updated if not yet touched. *)
+    (* Mark pre-initialized zero-balance assets as updated if untouched. *)
     let now = Unix.time () in
     Mutex.lock balance_stores_mutex;
     let all_assets = Hashtbl.fold (fun asset _ acc -> asset :: acc) balance_stores [] in
@@ -477,7 +471,6 @@ let parse_snapshot json on_heartbeat =
              asset))
       all_assets;
     notify_ready ();
-    (* Trigger cleanup if dynamic asset count exceeds the cap. *)
     maybe_cleanup_after_balance_update ();
     Some ()
   with
@@ -508,7 +501,6 @@ let parse_update json on_heartbeat =
            BalanceStore.update_wallet store balance wallet_type wallet_id asset;
            update_balance_timestamp base_asset;
            notify_ready ();
-           (* Publish aggregated balance data to event bus subscribers. *)
            let balance_data = BalanceStore.get_all store in
            let event_data =
              { asset = base_asset
@@ -535,7 +527,6 @@ let parse_update json on_heartbeat =
              "Failed to parse balance update item: %s"
              (Printexc.to_string exn))
       data;
-    (* Trigger cleanup if dynamic asset count exceeds the cap. *)
     maybe_cleanup_after_balance_update ();
     Some ()
   with
@@ -598,12 +589,11 @@ let handle_message message on_heartbeat =
       message
 ;;
 
-(** Quote value locked in resting BUY orders across every pair priced in
-    [quote_asset]: sum of remaining_qty x limit_price. A buy hold reduces
-    tradeable quote exactly like a sell hold reduces tradeable base.
-    Kraken wallet snapshots report TOTAL balances, so these holds must be
-    subtracted to obtain the tradeable figure (Hyperliquid's store nets the
-    hold at ingestion; here it is derived on read). *)
+(** Quote value held in resting BUY orders across every pair priced in
+    [quote_asset]: sum of remaining_qty * limit_price. Kraken wallet snapshots
+    report TOTAL balances, so this hold is subtracted on read to obtain the
+    tradeable figure; a buy hold reduces tradeable quote as a sell hold
+    reduces tradeable base. *)
 let get_pending_buy_quote_value quote_asset =
   let suffix = "/" ^ quote_asset in
   let all_symbols = Kraken_executions_feed.get_all_symbols () in
@@ -621,10 +611,9 @@ let get_pending_buy_quote_value quote_asset =
     open_orders
 ;;
 
-(** Base quantity locked in resting SELL orders across every pair whose base
-    is [asset] (e.g. "XMR" over "XMR/USD"). Mirrors Hyperliquid's [hold]
-    semantics: Kraken's wallet snapshots report TOTAL balances, so the
-    open-order hold must be subtracted to obtain the tradeable figure. *)
+(** Base quantity held in resting SELL orders across every pair whose base
+    is [asset] (e.g. "XMR" over "XMR/USD"). Kraken wallet snapshots report
+    TOTAL balances, so this hold is subtracted to obtain the tradeable figure. *)
 let get_pending_sell_qty base_asset =
   let prefix = base_asset ^ "/" in
   let all_symbols = Kraken_executions_feed.get_all_symbols () in
@@ -738,7 +727,6 @@ let poll_earn_allocations () =
                   let store = get_balance_store base_asset in
                   BalanceStore.update_wallet store adjusted_val "earn" strategy_id asset;
                   update_balance_timestamp base_asset;
-                  (* Publish aggregated balance data to event bus subscribers. *)
                   let balance_data = BalanceStore.get_all store in
                   let event_data =
                     { asset = base_asset
@@ -835,9 +823,7 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
     Must be called before the WebSocket feed begins producing messages. *)
 let initialize assets =
   Logging.debug_f ~section "Initializing balances feed for %d assets" (List.length assets);
-  (* Normalize all input assets first. *)
   let assets = List.map normalize_asset assets in
-  (* Merge user-configured assets with default fiat currencies. *)
   let all_assets =
     List.sort_uniq
       String.compare

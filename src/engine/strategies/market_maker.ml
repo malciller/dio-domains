@@ -213,7 +213,7 @@ let meets_min_qty symbol qty exchange =
       exchange
       symbol
       qty;
-    true (* If we can't find min_qty, assume it's valid to avoid blocking *)
+    true (* Missing min_qty: assume valid to avoid blocking placement *)
 ;;
 
 (** Generates a side-specific duplicate key for InFlightOrders deduplication. *)
@@ -527,13 +527,12 @@ let execute_strategy
   then (
     let now = Unix.time () in
     (* Pending order/amendment tokens are resolved purely by events: every
-       dispatched place/amend yields exactly one guaranteed terminal event
-       (Ack/Failed, Amended/Amendment_skipped/Amendment_failed) and each
-       handler removes the token, the in-flight flag, and the registry entry.
-       The old 5s age-based sweep resolved state while the exchange could
-       still be executing the request, so a mid-flight cancel for the old
-       order was no longer recognized as the amend's side effect - dropped
-       instead of tuned. *)
+       dispatched place/amend yields exactly one terminal event (Ack/Failed or
+       Amended/Amendment_skipped/Amendment_failed) and each handler removes the
+       token, the in-flight flag, and the registry entry. No age-based sweep:
+       resolving state while the exchange still executes the request would
+       cause a mid-flight cancel for the old order to be dropped instead of
+       tuned. *)
     (* Evict cancelled order blacklist entries older than 15s; cap at 20 *)
     let rec filter_cancelled kept removed lst =
       match lst with
@@ -561,12 +560,11 @@ let execute_strategy
         List.iter
           (fun order_id -> Hashtbl.remove state.pending_cancellations order_id)
           ids);
-    (* state.mutex is intentionally not locked in this function.
-     The strategy runs in its own OCaml domain; handler callbacks
-     (handle_order_amended, etc.) dispatch via Lwt.async in the Lwt domain.
-     Locking the non-recursive Mutex.t here would cause EDEADLK on
-     concurrent callbacks. Handlers lock state.mutex for inter-domain
-     safety, which is correct and sufficient. *)
+    (* state.mutex is intentionally not locked here: the strategy runs in its
+       own OCaml domain while handler callbacks run via Lwt.async in the Lwt
+       domain. Locking the non-recursive Mutex.t here would EDEADLK on
+       concurrent callbacks. Handlers lock state.mutex for inter-domain
+       safety. *)
     match current_price, top_of_book with
     | Some _, Some (bid, _bid_size, ask, _ask_size) ->
       (* Parse config values *)
@@ -791,7 +789,7 @@ let execute_strategy
           state.last_buy_order_price <- !best_buy_price;
           state.last_buy_order_id <- !best_buy_id)
         else if
-          (* Hyperliquid: trust our internal tracking if open_orders is empty but we have an active tracker. *)
+          (* Hyperliquid: trust internal tracking when open_orders is empty but a tracker is active. *)
           !sync_open_buy_count > 0
         then (
           state.last_buy_order_price <- !best_buy_price;
@@ -1559,15 +1557,13 @@ let set_startup_replay_done symbol =
   Mutex.unlock state.mutex
 ;;
 
-(** per-symbol lock-free lifecycle event queue - the MM counterpart of
-    the grid's H3 queue. The Lwt supervisor thread (REST callbacks in
-    supervisor_orders.ml) enqueues lifecycle events instead of calling the
-    handlers directly; the symbol's domain worker drains the queue at the
-    top of every cycle. All handler execution therefore happens on the
-    domain thread, so [state.mutex] is never taken cross-thread against
-    [execute_strategy] (which mutates the same record without the mutex).
-    LockFreeQueue is MPSC-safe; enqueue signals Exchange_wakeup so an idle
-    domain wakes to drain promptly. *)
+(** Per-symbol lock-free lifecycle event queue. The Lwt supervisor thread
+    (REST callbacks in supervisor_orders.ml) enqueues lifecycle events; the
+    symbol's domain worker drains the queue at the top of every cycle. All
+    handler execution therefore happens on the domain thread, so [state.mutex]
+    is never taken cross-thread against [execute_strategy] (which mutates the
+    same record without the mutex). LockFreeQueue is MPSC-safe; enqueue signals
+    Exchange_wakeup so an idle domain wakes to drain promptly. *)
 type mm_lifecycle_event =
   | Failed of
       { now : float
@@ -1625,9 +1621,8 @@ let get_event_queue symbol =
     insert ()
 ;;
 
-(** Dropped-event counter for observability: a full ring previously lost
-    lifecycle events silently, leaving stuck inflight_* state until the
-    stale-pending cleanup rescued it. *)
+(** Dropped-event counter: a full ring silently loses lifecycle events,
+    leaving stuck inflight_* state until stale-pending cleanup rescues it. *)
 let dropped_events = Atomic.make 0
 
 (** Enqueue a lifecycle event from any thread (supervisor REST path). *)

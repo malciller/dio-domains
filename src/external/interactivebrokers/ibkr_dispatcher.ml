@@ -41,10 +41,9 @@ let register_req_handler ~req_id ~on_data ~on_end =
     leaking entries. *)
 let remove_req_handler ~req_id = Hashtbl.remove req_handlers req_id
 
-(** Callback fired when the initial open-order snapshot ends. Set via
-    this reference (rather than a module dependency) so the executions
-    feed can finalize state without a cyclic dependency on the
-    dispatcher. *)
+(** Callback fired when the initial open-order snapshot ends. Set via this
+    reference (rather than a module dependency) so the executions feed can
+    finalize state without a dispatcher cycle. *)
 let on_open_orders_end : (unit -> unit) option ref = ref None
 
 (** Clears all handlers and connection state. Called before connecting
@@ -57,7 +56,6 @@ let reset () =
   Logging.info ~section "Dispatcher state reset (handlers cleared)"
 ;;
 
-(** Stores the connection handle. *)
 let set_connection conn = connection := Some conn
 
 (** Active connection; fails if not yet initialized. *)

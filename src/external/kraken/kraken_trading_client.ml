@@ -316,12 +316,10 @@ let reset_state conn ~notify_failure reason =
   else (
     (* Reader loop terminates naturally upon detecting a generation mismatch. *)
     ignore pending_count;
-    (* Tear down the underlying TCP/TLS transport. *)
     Lwt.catch
       (fun () -> Ws_lwt.close_transport conn)
       (fun _ -> Lwt.return_unit)
     >>= fun () ->
-    (* Fail all pending request promises with the reset reason. *)
     List.iter
       (fun wak ->
          try Lwt.wakeup_later_exn wak (Failure reason) with
@@ -338,20 +336,17 @@ let handle_frame frame ~expected_generation =
   Concurrency.Tick_event_bus.publish_tick ();
   notify_heartbeat ();
   let content = frame.Websocket.Frame.content in
-  (* executions pushes are offloaded to the Parse_worker domain by a
-     raw-string prefix check BEFORE the central Yojson parse - the parse
-     was the expensive part. Safe: request/response frames (order
-     acks/rejects) always carry a "method" field and never match the
-     prefix, so an acknowledgement can never be misrouted to the worker.
-     On a full worker queue we fall through to the original inline path
-     (parse + message buffer), which preserves delivery at the cost of
-     temporarily losing the offload benefit. *)
+  (* Offload executions pushes to the Parse_worker domain via a raw-string
+     prefix check before the Yojson parse (the expensive step). Request/
+     response frames always carry a "method" field and never match the
+     prefix, so an acknowledgement cannot be misrouted to the worker. On a
+     full worker queue, fall through to the inline parse + message-buffer
+     path. *)
   if
     String.starts_with ~prefix:"{\"channel\":\"executions" content
     && Concurrency.Parse_worker.submit "kraken_exec" content
   then Lwt.return_unit
   else
-    (* Parse the frame JSON, then atomically verify generation and response table membership. *)
     (try
        let json = Yojson.Safe.from_string content in
        let open Yojson.Safe.Util in
@@ -568,7 +563,6 @@ let ensure_connection ?on_failure ?on_connected token =
             Ws_lwt.write conn (Websocket.Frame.create ~content ()))
          (List.rev subs)
        >>= fun () ->
-       (* Invoke on_connected callback after subscription replay. *)
        (match on_connected with
         | Some f -> f ()
         | None -> ());
@@ -654,7 +648,6 @@ let start_periodic_tasks () =
 ;;
 
 let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
-  (* Reject requests if a shutdown is in progress. *)
   if Atomic.get shutdown_requested
   then Lwt.fail_with (Printf.sprintf "Request req_id %d cancelled due to shutdown" req_id)
   else
@@ -687,7 +680,6 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
             req_id
             (wakener, expected_method, Unix.time ());
           let pending_count = Response_table.length state.responses in
-          (* Trigger cleanup if the pending request count exceeds the threshold. *)
           if pending_count > 10
           then (
             Logging.warn_f
@@ -712,7 +704,6 @@ let send_message ~message_str ~req_id ~expected_method ~timeout_ms =
     >>= function
     | Error exn -> Lwt.fail exn
     | Ok waiter ->
-      (* Register a cancellation callback to evict the entry from the response table. *)
       Lwt.on_cancel waiter (fun () ->
         Lwt.async (fun () ->
           Lwt_mutex.with_lock state.mutex (fun () ->

@@ -1,10 +1,7 @@
-(** Hyperliquid balance tracking module.
-
-    Aggregates balance state from two WebSocket channels:
-    - [webData2]: perpetual clearinghouse state (withdrawable, accountValue).
-    - [spotState]: streaming spot token balance updates.
-
-    Exposes a thread-safe per-asset balance store with readiness signaling. *)
+(** Per-asset balance aggregation from two WebSocket channels:
+    - [webData2]: perpetual clearinghouse state (withdrawable, accountValue);
+    - [spotState]: spot token balances.
+    Thread-safe store with readiness signaling. *)
 
 open Lwt.Infix
 
@@ -23,9 +20,8 @@ type balance_data =
 module BalanceStore = struct
   type wallet_balance =
     { balance : float
-      (** Available balance: what can actually be spent/traded. For spot this
-          is [total -. hold] (hold = value locked in open orders); the spot
-          order book rejects anything beyond it. *)
+      (** Spendable balance. Spot = [total -. hold] ([hold] locked in open
+          orders); the spot order book rejects anything beyond it. *)
     ; total : float (** The wallet's full balance, holds included. *)
     ; wallet_type : string
     ; wallet_id : string
@@ -51,13 +47,10 @@ module BalanceStore = struct
     }
   ;;
 
-  (** Wallet types whose funds are NOT spendable by the spot grid:
-      - "staking": delegated/locked HYPE (the grid cannot sell it);
-      - "perp": USDC margin in the perp clearinghouse (it is not spot
-        capital - the spot order book cannot spend it, and the capital
-        oracle's pool is spot-only too). Including either in the tradeable
-        figure overstates what the grid can buy, which lets buy placement
-        pass its balance guard with an order the exchange then rejects. *)
+  (** Wallet types excluded from the tradeable figure: "staking" (delegated
+      HYPE, unsellable) and "perp" (USDC margin, not spot capital). Counting
+      either overstates buy capacity and lets placement pass its balance
+      guard with an order the venue then rejects. *)
   let is_excluded_wallet = function
     | "staking" | "perp" -> true
     | _ -> false
@@ -71,15 +64,12 @@ module BalanceStore = struct
       match Hashtbl.find_opt store.wallets wallet_key with
       | Some prev when Float.equal prev.balance available && Float.equal prev.total total
         ->
-        (* This asset's balance did not move: KEEP the original change
-           timestamp. Hyperliquid pushes one spotState snapshot for the whole
-           account, so a fill on another coin re-sends this unchanged entry.
-           Bumping [last_updated] here used to certify THIS asset's figure as
-           fresh on another asset's activity, which advanced its venue
-           timestamp and cleared its sell-hold guard - letting the strategy
-           sell base that was still committed (reserved_base). Per-asset
-           freshness must reflect when THIS asset moved, not when any
-           snapshot arrived. *)
+        (* Unchanged balance: keep the original timestamp. Hyperliquid resends
+           one whole-account spotState snapshot per fill, so bumping
+           [last_updated] here would certify this asset as fresh on another
+           asset's activity and clear its sell-hold guard, permitting sale of
+           base still committed (reserved_base). Per-asset freshness must
+           reflect when THIS asset moved. *)
         prev
       | _ -> { balance = available; total; wallet_type; wallet_id; last_updated = now }
     in
@@ -116,14 +106,10 @@ module BalanceStore = struct
       (0.0 = never updated). Used for balance-snapshot staleness. *)
   let get_last_updated store = Atomic.get store.last_updated
 
-  (** Wall-clock timestamp of the newest SPENDABLE (non-excluded) wallet
-      record - 0.0 when none exists. The store-wide [last_updated] is bumped
-      by every [update_wallet] call, including the staking-balance poller
-      which refreshes excluded wallets that contribute nothing to the
-      tradeable figure (~every 10s for staked tokens like HYPE). Freshness
-      consumers (the sell-hold netting guard) must key on the spendable
-      wallets: a staking poll that leaves the tradeable figure unchanged
-      must not certify it as current. *)
+  (** Wall-clock timestamp of the newest spendable (non-excluded) wallet, or
+      0.0 if none. Store-wide [last_updated] is also bumped by the staking
+      poller (~10s), which cannot change the tradeable figure, so freshness
+      consumers must key on spendable wallets. *)
   let get_spendable_last_updated store =
     Mutex.lock store.mutex;
     let t =
@@ -293,7 +279,6 @@ let process_market_data json =
     in
     notify_ready ()
   | Some "spotState" ->
-    (* Process spot balance snapshot from the spotState subscription. *)
     let data = member "data" json in
     let () =
       try
@@ -304,11 +289,9 @@ let process_market_data json =
                let raw_coin = member "coin" item |> to_string in
                let coin = canonicalize_coin raw_coin in
                let total = parse_json_float (member "total" item) in
-               (* The spotState subscription reports [total] and [hold] per
-                  balance (hold = value locked in open orders). The grid can
-                  only spend [total -. hold] - using [total] overstates the
-                  tradeable balance and lets buy placement pass its guard
-                  with an order the exchange then rejects. *)
+               (* Spot reports [total] and [hold] (locked in open orders);
+                  only [total -. hold] is spendable. Using [total] would
+                  overstate capacity and pass placement with a rejected order. *)
                let hold = parse_json_float (member "hold" item) in
                let available = max 0.0 (total -. hold) in
                let store = get_balance_store coin in
@@ -346,9 +329,8 @@ let _processor_task =
          let%lwt () =
            Concurrency.Lwt_util.consume_stream process_market_data sub.stream
          in
-         (* Stream ended (disconnect pushed None). Re-subscribe immediately;
-         consume_stream blocks event-driven on the new stream until the
-         WS reconnects and data flows. Sever Forward chain via Lwt.async. *)
+         (* Disconnect pushed None. Re-subscribe; [consume_stream] blocks on
+            the new stream until the WS reconnects. *)
          sub.close ();
          Logging.debug ~section "Balances stream ended (disconnect), re-subscribing...";
          Lwt.async run;
@@ -371,7 +353,6 @@ let initialize ~testnet assets =
     "Initializing Hyperliquid balances feed for %d assets (testnet=%b)"
     (List.length assets)
     testnet;
-  (* Pre-allocate balance stores for each requested asset. *)
   List.iter (fun asset -> ignore (get_balance_store asset)) assets;
   Logging.debug ~section "Hyperliquid balance stores initialized"
 ;;

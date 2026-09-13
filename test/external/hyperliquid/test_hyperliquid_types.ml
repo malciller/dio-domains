@@ -25,13 +25,13 @@ let test_tpsl_to_string () =
 ;;
 
 let test_pack_id () =
-  (* Test packing an ID that fits in int *)
+  (* ID that fits in int. *)
   let id1 = 12345L in
   let packed1 = Hyperliquid.Types.pack_id id1 in
   (match packed1 with
    | Msgpck.Int i -> Alcotest.(check int) "fits in int" 12345 i
    | _ -> Alcotest.fail "Expected Int");
-  (* Test packing a large ID (might not fit in 63-bit int on 32-bit systems, but should fit in int64) *)
+  (* Large ID: may not fit a 63-bit int on 32-bit systems, but fits int64. *)
   let id2 =
     9223372036854775807L
     (* Int64.max_int *)
@@ -41,7 +41,6 @@ let test_pack_id () =
   | Msgpck.Int i ->
     (try
        let _ = Int64.of_int i in
-       (* If it fits, it's ok, maybe 64-bit system *)
        ()
      with
      | _ -> Alcotest.fail "Int conversion overflowed")
@@ -84,7 +83,7 @@ let test_pack_order_type_wire_limit () =
   let ot = Hyperliquid.Types.Limit { tif = Hyperliquid.Types.Alo } in
   let packed = Hyperliquid.Types.pack_order_type_wire ot in
   match packed with
-  | Msgpck.Map _ -> () (* Valid map structure *)
+  | Msgpck.Map _ -> ()
   | _ -> Alcotest.fail "Expected Map for Limit order type"
 ;;
 

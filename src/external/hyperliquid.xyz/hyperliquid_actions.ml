@@ -6,11 +6,9 @@ open Lwt.Infix
 
 let section = "hyperliquid_actions"
 
-(** Maps an Exchange_intf order type to an order_type_wire.
-    Plain limit orders are always posted Alo (add-liquidity-only); the
-    caller's time-in-force is honored only by the catch-all branch, which
-    handles non-standard order types. FOK is not supported by the venue
-    and degrades to IOC. *)
+(** Maps an [ExTypes.order_type] to an [order_type_wire].
+    Limit orders are always posted Alo. [tif] applies only to the catch-all
+    branch for non-standard types; FOK is unsupported and degrades to IOC. *)
 let hl_order_type (ot : ExTypes.order_type) (tif_opt : ExTypes.time_in_force option)
   : order_type_wire
   =
@@ -37,7 +35,6 @@ let hl_order_type (ot : ExTypes.order_type) (tif_opt : ExTypes.time_in_force opt
     Hyperliquid requires normalized numeric strings without trailing zeros. *)
 let format_number f =
   let rounded = Printf.sprintf "%.8f" f in
-  (* Iteratively strip trailing '0' characters and a dangling decimal point. *)
   let rec strip_zeros s =
     if String.length s > 1 && s.[String.length s - 1] = '0' && String.contains s '.'
     then strip_zeros (String.sub s 0 (String.length s - 1))
@@ -101,10 +98,9 @@ type amend_order_result =
   ; order_id : int64
   }
 
-(** Cached credentials : environment reads are hoisted to a lazy cache.
-    Env vars are static for the process lifetime, so per-order [getenv_opt]
-    calls are pure overhead. Lazy so modules can load (and tests can run)
-    without the env vars set; the first real order resolves them. *)
+(** Credentials from the environment, resolved once on first use.
+    Env vars are static for the process lifetime; lazy so the module loads
+    without them set. Missing vars raise [Failure]. *)
 let cached_credentials : (string * string) Lazy.t =
   lazy
     (let pkey =
@@ -122,9 +118,8 @@ let cached_credentials : (string * string) Lazy.t =
 
 let get_credentials () = Lazy.force cached_credentials
 
-(** Monotonically increasing nonce derived from wall-clock milliseconds.
-    Lock-free : a CAS loop on an Atomic counter replaces the per-order
-    mutex; contention is a single compare-and-set retry. *)
+(** Monotonically increasing nonce from wall-clock milliseconds.
+    Lock-free CAS loop on [Atomic]; contention is one retry. *)
 let last_nonce = Atomic.make 0L
 
 let get_next_nonce () =
@@ -184,8 +179,7 @@ let post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet =
   else Lwt.return (Error (Printf.sprintf "HTTP Error %d: %s" status body_str))
 ;;
 
-(** Returns true if [substr] occurs anywhere within [str].
-    Delegates to centralized [Error_handling.string_contains]. *)
+(** Alias of [Error_handling.string_contains]. *)
 let string_contains = Error_handling.string_contains
 
 (** Retry configuration, re-exported from centralized [Error_handling]. *)
@@ -198,8 +192,7 @@ type retry_config = Error_handling.retry_config =
 
 let default_retry_config = Error_handling.default_retry_config
 
-(** Classifies an error string as retriable.
-    Delegates to centralized [Error_handling.is_retriable_error]. *)
+(** Alias of [Error_handling.is_retriable_error]. *)
 let is_retriable_error = Error_handling.is_retriable_error
 
 (** Atomic counter for WebSocket request IDs. *)
@@ -212,10 +205,8 @@ let next_ws_req_id () =
 ;;
 
 (** Submits a signed action via the WebSocket "post" channel.
-    Returns Error immediately if the WebSocket is not connected.
-    The response payload is extracted from the nested WS frame structure
-    (data.response.payload) to match the REST response shape, allowing
-    shared downstream parsing logic. *)
+    Returns [Error] immediately when disconnected. Extracts
+    data.response.payload to match the REST response shape for shared parsing. *)
 let post_exchange_ws ~testnet:_ ~action_json ~action_msgpack ~is_mainnet =
   if not (Hyperliquid_ws.is_connected ())
   then Lwt.return (Error "Hyperliquid WS not connected - order rejected")
@@ -253,7 +244,6 @@ let post_exchange_ws ~testnet:_ ~action_json ~action_msgpack ~is_mainnet =
       (fun () ->
          Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:10000
          >>= fun resp ->
-         (* Extract data.response.payload from the WS broadcast frame. *)
          let open Yojson.Safe.Util in
          let payload =
            try resp |> member "data" |> member "response" |> member "payload" with

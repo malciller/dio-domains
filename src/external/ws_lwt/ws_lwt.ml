@@ -1,18 +1,18 @@
 (* Internal, client-only replacement for the lwt websocket wrapper.
-   Derived from the websocket 2.17 lwt wrapper (ISC, Vincent Bernardoff); framing is
-   delegated to [Websocket.Make] over a bounded [Cohttp_lwt_unix.IO], so the wire
-   format is byte-identical. Differences from the reference:
+   Derived from the websocket 2.17 lwt wrapper (ISC, Vincent Bernardoff);
+   framing is delegated to [Websocket.Make] over a bounded [Cohttp_lwt_unix.IO],
+   so the wire format is byte-identical. Differences from the reference:
    - no [Lwt_log] dependency (removed the [lwt < 6] cap);
-   - no server-side code (we only ever connect as a client).
+   - no server-side code (client connections only).
    [set_tcp_nodelay] and [Conduit_lwt_unix.connect] are reproduced verbatim. *)
 
 open Websocket
 open Lwt.Infix
 
-(* Cap the payload a single WebSocket frame may declare. The frame parser in
-   [websocket] allocates and reads the whole payload with no upper bound, so a
-   hostile endpoint could otherwise force a multi-gigabyte allocation. 64 MiB is
-   far above any message we receive from an exchange. *)
+(* Cap the payload a single WebSocket frame may declare. The [websocket] frame
+   parser reads the whole payload with no upper bound, so a hostile endpoint
+   could force a multi-gigabyte allocation. 64 MiB is far above any exchange
+   message. *)
 let max_frame_bytes = 64 * 1024 * 1024
 
 (* [Cohttp_lwt_unix.IO] with a bounded [read]. [Websocket.Make] reads a frame
@@ -51,7 +51,7 @@ let set_tcp_nodelay flow =
 let fail_unless eq f = if not eq then f () else Lwt.return_unit
 let fail_if eq f = if eq then f () else Lwt.return_unit
 
-(* Close both directions. Closing an already-closed channel is a no-op, and a
+(* Close both directions. Closing an already-closed channel is a no-op; a
    failure while closing must not mask the original error. *)
 let close_quietly ch =
   Lwt.catch (fun () -> Lwt_io.close ch) (fun _ -> Lwt.return_unit)

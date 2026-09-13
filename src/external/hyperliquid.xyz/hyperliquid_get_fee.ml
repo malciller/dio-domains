@@ -1,7 +1,6 @@
-(** Hyperliquid_get_fee: per-user fee rate retrieval for perpetual and spot markets.
-   Queries the Hyperliquid /info endpoint with the configured wallet address,
-   parses account-specific and schedule-level rates, and falls back to
-   hardcoded tier maximums when neither is available. *)
+(** Per-user fee-rate retrieval for perpetual and spot markets.
+    POSTs /info with the configured wallet address and parses account-specific
+    rates, then schedule-level rates, then hardcoded tier maximums. *)
 
 let section = "hyperliquid_get_fee"
 
@@ -25,17 +24,17 @@ let parse_fee_info body_str =
   let open Yojson.Safe.Util in
   try
     let json = Yojson.Safe.from_string body_str in
-    (* Perp fee rates. The API returns decimal string values (e.g. "0.0001"). *)
+    (* Perp rates; API returns decimal strings (e.g. "0.0001"). *)
     let maker =
       member "userAddRate" json |> to_string_option |> Option.map float_of_string
     in
     let taker =
       member "userCrossRate" json |> to_string_option |> Option.map float_of_string
     in
-    (* Spot fee resolution order:
-       1. userSpotAddRate / userSpotCrossRate (account-specific, includes referral and staking discounts).
-       2. feeSchedule.spotAdd / feeSchedule.spotCross (base schedule rates).
-       3. Hardcoded defaults: 0.0004 maker, 0.0007 taker (highest Hyperliquid spot tier). *)
+    (* Spot resolution order:
+       1. userSpotAddRate / userSpotCrossRate (account-specific discounts);
+       2. feeSchedule.spotAdd / feeSchedule.spotCross;
+       3. defaults 0.0004 maker, 0.0007 taker (highest spot tier). *)
     let spot_maker =
       let user_rate =
         member "userSpotAddRate" json |> to_string_option |> Option.map float_of_string
@@ -120,7 +119,6 @@ let get_fee_info ~testnet () : fee_info option Lwt.t =
        in
        let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
        Logging.debug_f ~section "Fetching Hyperliquid fees for wallet %s..." wallet;
-       (* 5-second timeout guard against unresponsive upstream *)
        Lwt_unix.with_timeout 5.0 (fun () ->
          Cohttp_lwt_unix.Client.post ~headers ~body url
          >>= fun (resp, resp_body) ->

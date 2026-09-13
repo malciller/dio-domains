@@ -47,17 +47,15 @@ let encode_uint64_be n =
     The vault and expiration fields are optional; vault uses a 0x00/0x01 presence tag. *)
 let action_hash ~action_msgpack ~nonce ~vault_address ~expires_after =
   let buf = Buffer.create 128 in
-  (* Append the msgpack-serialized action payload. *)
   Buffer.add_string buf action_msgpack;
-  (* Append nonce as a big-endian uint64 (8 bytes). *)
+  (* Nonce: big-endian uint64. *)
   Buffer.add_string buf (encode_uint64_be nonce);
-  (* Append vault address with presence tag: 0x00 if absent, 0x01 + 20-byte address if present. *)
+  (* Vault: 0x00 if absent, else 0x01 followed by the 20-byte address. *)
   (match vault_address with
    | None -> Buffer.add_char buf '\x00'
    | Some addr_raw ->
      Buffer.add_char buf '\x01';
      let addr = String.lowercase_ascii addr_raw in
-     (* Strip optional "0x" prefix and decode hex to raw bytes. *)
      let clean_addr =
        if String.starts_with ~prefix:"0x" addr
        then String.sub addr 2 (String.length addr - 2)
@@ -65,13 +63,12 @@ let action_hash ~action_msgpack ~nonce ~vault_address ~expires_after =
      in
      let addr_bytes = bytes_of_hex clean_addr in
      Buffer.add_string buf addr_bytes);
-  (* Append optional expiration: 0x00 tag followed by big-endian uint64 timestamp. *)
+  (* Expiration: 0x00 tag followed by a big-endian uint64 timestamp. *)
   (match expires_after with
    | None -> ()
    | Some expiration ->
      Buffer.add_char buf '\x00';
      Buffer.add_string buf (encode_uint64_be expiration));
-  (* Compute Keccak-256 digest of the concatenated buffer. *)
   let digest = Digestif.KECCAK_256.digest_string (Buffer.contents buf) in
   Digestif.KECCAK_256.to_raw_string digest
 ;;
@@ -148,10 +145,9 @@ let bs_sub_to_string bs ofs len =
   Bytes.to_string s
 ;;
 
-(** Hoisted signing context : [Secp256k1.Context.create] is expensive;
-    create it once at module load and reuse it for every signature instead of
-    allocating a fresh context per order. All signing runs on the Lwt
-    scheduler, so the shared context is single-threaded in practice. *)
+(** Shared signing context: [Secp256k1.Context.create] is expensive, so it is
+    created once at module load and reused. Signing runs on the single-threaded
+    Lwt scheduler. *)
 let sign_ctx = Secp256k1.Context.create [ Secp256k1.Context.Sign ]
 
 let sign_hash ~private_key_raw ~msg_hash_raw =
@@ -182,7 +178,7 @@ let address_of_private_key_hex ~private_key_hex =
   let ctx = sign_ctx in
   let seckey = Secp256k1.Key.read_sk_exn ctx (bs_of_string private_key_raw) in
   let pubkey = Secp256k1.Key.neuterize_exn ctx seckey in
-  (* Serialize uncompressed public key (65 bytes: 0x04 || x || y), hash with Keccak-256, take last 20 bytes. *)
+  (* Uncompressed pubkey (65 bytes: 0x04 || x || y), Keccak-256 hashed; last 20 bytes are the address. *)
   let pubkey_buf = Secp256k1.Key.to_bytes ~compress:false ctx pubkey in
   let pubkey_str =
     Array1.dim pubkey_buf

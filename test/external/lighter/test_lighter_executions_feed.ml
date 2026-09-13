@@ -81,8 +81,7 @@ let test_terminal_status_removes_order () =
     ();
   let before = Lighter.Executions_feed.get_open_order "EXTERM" "term_1" in
   Alcotest.(check bool) "order exists" true (Option.is_some before);
-  (* Simulate a filled event via process_account_orders_update.
-     Must provide correct Lighter JSON structure. *)
+  (* Filled event (status 3) must remove the open order. *)
   Lighter.Instruments_feed.initialize [ "EXTERM" ];
   let json =
     `Assoc
@@ -110,7 +109,6 @@ let test_terminal_status_removes_order () =
 ;;
 
 let test_startup_snapshot_done () =
-  (* is_startup_snapshot_done should return true after set_startup_snapshot_done *)
   Lighter.Executions_feed.initialize [ "EXSNAP" ];
   Lighter.Executions_feed.set_startup_snapshot_done ();
   Alcotest.(check bool)
@@ -121,7 +119,7 @@ let test_startup_snapshot_done () =
 
 let test_has_execution_data () =
   Lighter.Executions_feed.initialize [ "EXHAS" ];
-  (* inject_order triggers notify_ready on the store *)
+  (* inject_order triggers notify_ready on the store. *)
   Lighter.Executions_feed.inject_order
     ~symbol:"EXHAS"
     ~order_id:"has_1"

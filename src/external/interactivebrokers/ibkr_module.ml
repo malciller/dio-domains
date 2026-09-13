@@ -101,7 +101,7 @@ module Config = struct
   ;;
 end
 
-(** Active gateway connection handle; thread-safe via atomic swap. *)
+(** Active gateway connection handle. *)
 let connection = ref None
 
 let get_conn () =

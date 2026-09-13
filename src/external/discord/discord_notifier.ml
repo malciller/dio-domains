@@ -1,34 +1,31 @@
 (** Discord order fill notifier.
 
-    Consumes fill events from the centralized [Fill_event_bus] ring buffer
-    and delivers formatted notifications to a Discord webhook. Implements
-    strict rate limiting via a token bucket to guarantee compliance with
-    Discord's webhook rate limits (5 requests per 2 seconds).
+    Consumes fill events from the centralized [Fill_event_bus] ring buffer and
+    delivers formatted notifications to a Discord webhook. A token bucket
+    enforces compliance with Discord's webhook rate limit (5 requests / 2 s).
 
     Architecture:
-    - A single Lwt consumer fiber drains the ring buffer on each wakeup.
-    - Fills arriving in the same drain cycle are batched into a single
-      Discord embed (up to 10 fields per embed) to minimize API calls.
-    - A token bucket (5 tokens, 1 refill per 400ms) governs POST timing.
-    - On 429 (rate limited): sleeps for the Retry-After duration.
-    - On 5xx / network error: backs off 5s, retries up to 3 times.
+    - One Lwt consumer fiber drains the ring buffer per wakeup.
+    - Fills in the same drain cycle batch into one embed (up to 10 fields).
+    - Token bucket (5 tokens, 1 refill / 400ms) governs POST timing.
+    - On 429: sleeps for the Retry-After duration.
+    - On 5xx / network error: 5s backoff, up to 3 attempts.
     - Self-restarts on crash with 10s backoff. *)
 
 open Lwt.Infix
 
 let section = "discord_notifier"
 
-(** Maximum number of fill events per Discord embed message.
-    Discord supports up to 25 fields per embed; we use 10 to keep
+(** Maximum fill events per embed. Discord supports up to 25 fields; 10 keeps
     messages readable (each fill uses ~5-6 fields). *)
 let max_fills_per_message = 10
 
 (* Token bucket rate limiter. *)
 
 (** Token bucket state for rate limiting webhook POSTs.
-    Discord enforces 5 requests per 2 seconds per webhook URL.
-    We use 5 tokens with a 400ms refill interval (= 2.5 req/s steady state),
-    safely under the 5/2s limit even accounting for clock drift. *)
+    Discord enforces 5 requests / 2 seconds per webhook URL. 5 tokens with a
+    400ms refill interval = 2.5 req/s steady state, below the limit with margin
+    for clock drift. *)
 type token_bucket =
   { mutable tokens : float
   ; mutable last_refill : float
@@ -64,7 +61,7 @@ let acquire_token () =
       bucket.tokens <- bucket.tokens -. 1.0;
       Lwt.return_unit)
     else (
-      (* Calculate sleep duration until next token is available *)
+      (* Sleep until the next token is available. *)
       let deficit = 1.0 -. bucket.tokens in
       let sleep_time = deficit *. bucket.refill_interval in
       Lwt_unix.sleep sleep_time >>= fun () -> try_acquire ())
@@ -191,9 +188,9 @@ let build_webhook_payload (fills : Concurrency.Fill_event_bus.fill_event list) =
 
 (* Webhook HTTP client. *)
 
-(** Send a JSON payload to the Discord webhook URL.
+(** POST a JSON payload to the Discord webhook URL.
     Returns [Ok ()] on success, [Error msg] on failure.
-    Handles 429 rate limit responses by sleeping for Retry-After. *)
+    On 429, sleeps for the Retry-After duration. *)
 let send_webhook ~webhook_url payload =
   let json_str = Yojson.Safe.to_string payload in
   let body = Cohttp_lwt.Body.of_string json_str in
@@ -238,7 +235,7 @@ let send_webhook ~webhook_url payload =
        Lwt.return (Error (Printexc.to_string exn)))
 ;;
 
-(** Send with retry: up to 3 attempts with 5s backoff on transient errors. *)
+(** Send with retry: up to 3 attempts, 5s backoff on transient errors. *)
 let send_with_retry ~webhook_url payload =
   let rec attempt n =
     if n > 3
@@ -261,8 +258,8 @@ let send_with_retry ~webhook_url payload =
 
 (* Consumer loop. *)
 
-(** Main consumer loop. Drains the fill event ring buffer on each wakeup,
-    batches fills into webhook payloads, and sends them with rate limiting. *)
+(** Main consumer loop. Drains the fill event ring buffer per wakeup, batches
+    fills into webhook payloads, and sends with rate limiting. *)
 let consumer_loop ~webhook_url () =
   let read_pos = ref (Concurrency.Fill_event_bus.get_position ()) in
   let done_p, done_u = Lwt.wait () in
@@ -343,9 +340,9 @@ let consumer_loop ~webhook_url () =
 
 (* Initialization. *)
 
-(** Start the Discord notifier. Reads DISCORD_WEBHOOK_URL from environment.
-    If not set, logs a warning and returns silently (no-op).
-    Spawns the consumer loop as a self-restarting Lwt.async fiber. *)
+(** Start the Discord notifier. Reads DISCORD_WEBHOOK_URL from the environment;
+    if unset, logs a warning and returns (no-op). Spawns the consumer loop as a
+    self-restarting Lwt.async fiber. *)
 let start () =
   let webhook_url =
     try

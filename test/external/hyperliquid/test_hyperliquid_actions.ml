@@ -5,7 +5,7 @@ let test_hl_order_type () =
   (match hl_type1 with
    | Hyperliquid.Types.Limit { tif } ->
      Alcotest.(check string) "Limit GTC" "Alo" (Hyperliquid.Types.tif_to_string tif)
-     (* The code maps Limit to Alo always, tif arg is ignored *)
+     (* Limit always maps to Alo; the tif argument is ignored. *)
    | _ -> Alcotest.fail "Expected Limit");
   let hl_type2 = Hyperliquid.Actions.hl_order_type ExTypes.Market None in
   match hl_type2 with

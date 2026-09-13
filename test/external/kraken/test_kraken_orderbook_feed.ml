@@ -1,5 +1,5 @@
 let test_take_function () =
-  (* Test take function for list truncation *)
+  (* take: list truncation. *)
   let test_list = [ 1; 2; 3; 4; 5 ] in
   let take_3 = Kraken.Kraken_orderbook_feed.take 3 test_list in
   let take_10 = Kraken.Kraken_orderbook_feed.take 10 test_list in
@@ -12,7 +12,7 @@ let test_take_function () =
 ;;
 
 let test_to_decimal_str () =
-  (* Test decimal string conversion *)
+  (* to_decimal_str conversions. *)
   Alcotest.(check string)
     "to_decimal_str Float 1.5"
     "1.5"
@@ -36,14 +36,14 @@ let test_to_decimal_str () =
 ;;
 
 let test_to_decimal_str_with_precision () =
-  (* Test decimal string conversion with custom precision *)
+  (* to_decimal_str with custom precision. *)
   let json = `Float 1.23456789 in
   let result = Kraken.Kraken_orderbook_feed.to_decimal_str ~dec:2 json in
   Alcotest.(check string) "to_decimal_str with 2 decimal precision" "1.23" result
 ;;
 
 let test_is_effectively_zero () =
-  (* Test zero-checking for orderbook levels *)
+  (* is_effectively_zero. *)
   Alcotest.(check bool)
     "is_effectively_zero '0'"
     true
@@ -75,7 +75,7 @@ let test_is_effectively_zero () =
 ;;
 
 let test_orderbook_structure () =
-  (* Test orderbook record structure *)
+  (* orderbook record. *)
   let empty_bids =
     Array.make
       25
@@ -114,7 +114,7 @@ let test_orderbook_structure () =
 ;;
 
 let test_level_structure () =
-  (* Test level record structure *)
+  (* level record. *)
   let test_level =
     { Kraken.Kraken_orderbook_feed.price = "45000.50"
     ; price_wire = "45000.5"
@@ -131,33 +131,32 @@ let test_level_structure () =
 ;;
 
 let test_store_operations () =
-  (* Test basic store operations *)
+  (* Store lookup. *)
   let symbol = "STORE_TEST" in
-  (* Initially should not have store *)
+  (* No store before creation. *)
   match Kraken.Kraken_orderbook_feed.store_opt symbol with
   | None -> Alcotest.(check bool) "store initially None" true true
   | Some _ -> Alcotest.fail "unexpected initial store"
 ;;
 
 let test_constants () =
-  (* Test that constants are properly defined *)
-  (* We can't directly access these, but we can verify related functionality exists *)
+  (* Constants are defined (placeholder assertion). *)
   Alcotest.(check bool) "constants test placeholder" true true
 ;;
 
 let test_json_parsing_helpers () =
-  (* Test JSON parsing helper functions *)
+  (* JSON parsing helpers. *)
   try
-    (* These functions exist and don't crash on valid input *)
+    (* Valid input does not crash. *)
     Alcotest.(check bool) "json parsing helpers don't crash" true true
   with
   | _ -> Alcotest.fail "json parsing helpers crashed"
 ;;
 
 (* Kraken's official book-checksum example (docs.kraken.com, "Book checksum
-   (WebSocket v2)"). The concatenated normalization of the documented BTC/USD
-   snapshot must CRC32 to exactly 3310070434. Guards against regressions in
-   both the CRC32 table and the dot/leading-zero normalization. *)
+   (WebSocket v2)"). Concatenated normalization of the documented BTC/USD
+   snapshot must CRC32 to exactly 3310070434. Guards the CRC32 table and the
+   dot/leading-zero normalization. *)
 let official_asks =
   [ "45285.2", "0.00100000"
   ; "45286.4", "1.54571953"
@@ -201,9 +200,9 @@ let test_crc32_official_documented_example () =
 ;;
 
 let test_checksum_normalization_matches_kraken_spec () =
-  (* Feed the official snapshot through our per-level normalization path
-     (asks ascending first, then bids descending) and require the documented
-     result. This is the exact code path used by calculate_checksum. *)
+  (* Feed the official snapshot through per-level normalization (asks ascending
+     first, then bids descending), the path used by calculate_checksum; require
+     the documented result. *)
   let crc =
     ref (Kraken.Kraken_orderbook_feed.crc32_zlib "")
     (* placeholder; replaced below *)
@@ -229,8 +228,8 @@ let test_checksum_normalization_matches_kraken_spec () =
 ;;
 
 let test_parse_level_preserves_wire_price () =
-  (* The wire representation must survive parsing: it is the checksum input.
-     Re-formatting it (padding to fixed decimals) invalidates every check. *)
+  (* Wire representation must survive parsing: it is the checksum input.
+     Re-formatting (padding to fixed decimals) invalidates every check. *)
   match
     Kraken.Kraken_orderbook_feed.parse_level
       "WIRE_TEST/USD"
@@ -255,9 +254,9 @@ let test_parse_level_preserves_wire_price () =
 ;;
 
 let test_get_top_levels () =
-  (* Test getting top levels from orderbook *)
+  (* get_top_levels. *)
   let symbol = "TOP_LEVELS_TEST" in
-  (* Should not crash even if no data exists *)
+  (* No data: returns empty arrays. *)
   let bids, asks = Kraken.Kraken_orderbook_feed.get_top_levels symbol in
   Alcotest.(check int)
     "get_top_levels bids length for unknown symbol"

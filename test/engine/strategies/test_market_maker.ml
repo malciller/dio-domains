@@ -1,6 +1,6 @@
 open Alcotest
 
-(* Helper to create trading config for testing *)
+(* Trading-config fixture. *)
 let create_test_asset
       ?(exchange = "kraken")
       ?(symbol = "BTC/USD")
@@ -39,12 +39,10 @@ let create_test_asset
 ;;
 
 let test_initialization () =
-  (* Test strategy initialization *)
   check unit "market_maker init" () (Dio_strategies.Market_maker.Strategy.init ())
 ;;
 
 let test_order_creation_place () =
-  (* Test creating place orders *)
   let order =
     Dio_strategies.Market_maker.create_place_order
       "BTC/USD"
@@ -73,7 +71,6 @@ let test_order_creation_place () =
 ;;
 
 let test_order_creation_amend () =
-  (* Test creating amend orders *)
   let order =
     Dio_strategies.Market_maker.create_amend_order
       "order123"
@@ -104,7 +101,6 @@ let test_order_creation_amend () =
 ;;
 
 let test_order_creation_cancel () =
-  (* Test creating cancel orders *)
   let order =
     Dio_strategies.Market_maker.create_cancel_order
       "order456"
@@ -129,7 +125,6 @@ let test_order_creation_cancel () =
 ;;
 
 let test_fee_calculation () =
-  (* Test fee calculation logic *)
   let asset_no_fee = create_test_asset ~maker_fee:(Some 0.0) () in
   let asset_maker_fee = create_test_asset ~maker_fee:(Some 0.001) () in
   let asset_taker_fee = create_test_asset ~taker_fee:(Some 0.002) () in
@@ -142,28 +137,24 @@ let test_fee_calculation () =
 ;;
 
 let test_price_rounding () =
-  (* Test price rounding - this is tricky to test without mocking Kraken instruments feed *)
-  (* For now, just test that the function doesn't crash and returns a reasonable value *)
+  (* No instrument-precision feed here; assert a non-negative float. *)
   let rounded =
     Dio_strategies.Market_maker.round_price 50000.12345678 "BTC/USD" "kraken"
   in
-  (* Should return a float, even if no precision info is available *)
   check bool "price rounding non-negative" true (rounded >= 0.0)
 ;;
 
 let test_state_management () =
-  (* Test strategy state management *)
   let state1 = Dio_strategies.Market_maker.get_strategy_state "BTC/USD" in
   let state2 = Dio_strategies.Market_maker.get_strategy_state "BTC/USD" in
-  (* Should return the same state for same symbol *)
+  (* Same symbol returns the same state record. *)
   check bool "same state for same symbol" true (state1 == state2)
 ;;
 
 let test_userref_generation () =
-  (* Test userref tagging - MM strategy should use userref=2 *)
+  (* MM strategy tags orders with userref=2. *)
   let strategy_userref = Dio_strategies.Strategy_common.strategy_userref_mm in
   check int "mm strategy userref" 2 strategy_userref;
-  (* Test that is_strategy_order correctly identifies MM orders *)
   check
     bool
     "userref 2 matches mm"
@@ -177,42 +168,33 @@ let test_userref_generation () =
 ;;
 
 let test_order_acknowledgment () =
-  (* Test order acknowledgment handling *)
   let initial_state = Dio_strategies.Market_maker.get_strategy_state "TEST/USD" in
-  (* Add a pending order manually for testing *)
   initial_state.pending_orders
   <- ("test123", Dio_strategies.Strategy_common.Buy, 50000.0, Unix.time ())
      :: initial_state.pending_orders;
-  (* Handle acknowledgment *)
   Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
     ~now:0.0
     "TEST/USD"
     "order456"
     Dio_strategies.Strategy_common.Buy
     50000.0;
-  (* Should update tracking but not remove pending orders since IDs don't match exactly *)
-  (* This is a bit tricky to test precisely without more complex mocking *)
+  (* IDs differ, so tracking updates without removing the pending order. *)
   check bool "acknowledgment handled" true true
 ;;
 
 let test_order_cancellation () =
-  (* Test order cancellation handling *)
   let state = Dio_strategies.Market_maker.get_strategy_state "TEST2/USD" in
-  (* Set up some tracked orders *)
   state.last_buy_order_id <- Some "buy123";
   state.last_buy_order_price <- Some 49000.0;
   state.open_sell_orders <- [ "sell456", 51000.0, 1.0 ];
-  (* Cancel the buy order *)
   Dio_strategies.Market_maker.Strategy.handle_order_cancelled
     ~now:0.0
     "TEST2/USD"
     "buy123"
     Dio_strategies.Strategy_common.Buy
     None;
-  (* Should clear buy order tracking *)
   check (option string) "buy order id cleared" None state.last_buy_order_id;
   check (option (float 0.)) "buy order price cleared" None state.last_buy_order_price;
-  (* Verify sell order preserved *)
   let sell_preserved =
     List.exists (fun (id, _, _) -> id = "sell456") state.open_sell_orders
   in
@@ -220,15 +202,12 @@ let test_order_cancellation () =
 ;;
 
 let test_minimum_quantity_check () =
-  (* Test minimum quantity checking - this relies on Kraken instruments feed *)
-  (* For now, just test that it doesn't crash *)
+  (* Depends on instrument feed data; assert a boolean result. *)
   let result = Dio_strategies.Market_maker.meets_min_qty "BTC/USD" 0.001 "kraken" in
-  (* Result depends on feed data, but should be boolean *)
   check bool "min qty returns bool" true (result = true || result = false)
 ;;
 
 let test_config_parsing () =
-  (* Test configuration value parsing *)
   let test_parse str default expected =
     let result =
       Dio_strategies.Market_maker.parse_config_float
@@ -246,7 +225,6 @@ let test_config_parsing () =
 ;;
 
 let test_config_parsing_optional () =
-  (* Test optional configuration value parsing *)
   let test_parse str exchange symbol expected =
     let result =
       Dio_strategies.Market_maker.parse_config_float_opt str "test_param" exchange symbol
@@ -266,25 +244,21 @@ let test_config_parsing_optional () =
 ;;
 
 let test_duplicate_cancellation () =
-  (* Test duplicate order cancellation logic *)
   let open_orders =
     [ "order1", 50000.0, 0.001, "buy", Some 2
     ; "order2", 50000.0, 0.001, "buy", Some 2
-    ; (* Same price - should be cancelled *)
+    ; (* Same price: duplicate, cancelled. *)
       "order3", 51000.0, 0.001, "buy", Some 2
-      (* Different price - should not be cancelled *)
+      (* Different price: kept. *)
     ]
   in
-  (* Mock the strategy state to have a cancelled order *)
   let state = Dio_strategies.Market_maker.get_strategy_state "TEST/USD" in
+  (* order1 already cancelled. *)
   state.cancelled_orders <- [ "order1", Unix.time () ];
-  (* Mark order1 as cancelled *)
 
-  (* Re-map the mocked list into the shape the new duplicate function expects *)
   let open_orders_list =
     List.map (fun (oid, price, qty, _, _) -> oid, price, qty) open_orders
   in
-  (* Count duplicates cancelled *)
   let cancelled_count =
     Dio_strategies.Market_maker.cancel_duplicate_orders
       ~state
@@ -295,21 +269,18 @@ let test_duplicate_cancellation () =
       Dio_strategies.Strategy_common.MM
       "kraken"
   in
-  (* Should cancel 1 duplicate (order2), order1 is already cancelled *)
+  (* Only order2 is newly cancelled; order1 was already. *)
   check int "duplicate cancellation count" 1 cancelled_count
 ;;
 
 let test_sell_first_placement_logic () =
-  (* Test that sell orders are created before buy orders *)
-  (* This is more of an integration test - we'd need to mock the entire execution flow *)
-  (* For now, just test that the logic functions exist and don't crash *)
+  (* Sell orders are placed before buy orders. *)
   let asset = create_test_asset () in
   let current_price = Some 50000.0 in
   let top_of_book = Some (49950.0, 1.0, 50050.0, 1.0) in
   let asset_balance = Some 0.1 in
   let quote_balance = Some 1000.0 in
-  (* This would trigger the sell-first logic, but testing it fully requires mocking the order ringbuffer *)
-  (* For now, just ensure the function can be called without crashing *)
+  (* Full sell-first path requires mocking the order ringbuffer. *)
   Dio_strategies.Market_maker.Strategy.execute
     asset
     current_price
@@ -324,16 +295,13 @@ let test_sell_first_placement_logic () =
 ;;
 
 let test_fee_cache_integration () =
-  (* Test that fee cache is initialized and can be queried *)
   Dio_strategies.Fee_cache.init ();
   Dio_strategies.Fee_cache.clear ();
-  (* Ensure clean state *)
   let fee_opt =
     Dio_strategies.Fee_cache.get_maker_fee ~exchange:"kraken" ~symbol:"BTC/USD"
   in
-  (* Initially should be None since no data cached *)
+  (* No cached entry yet. *)
   check (option (float 0.)) "initial fee cache empty" None fee_opt;
-  (* Test cache storage and retrieval *)
   Dio_strategies.Fee_cache.store_fees
     ~exchange:"kraken"
     ~symbol:"BTC/USD"
@@ -347,15 +315,12 @@ let test_fee_cache_integration () =
 ;;
 
 let test_fee_cache_stats () =
-  (* Test that fee cache stats work *)
   Dio_strategies.Fee_cache.init ();
   Dio_strategies.Fee_cache.clear ();
-  (* Clear any existing entries from other tests *)
 
-  (* Test stats on empty cache *)
+  (* Empty cache: zero totals. *)
   let total, valid = Dio_strategies.Fee_cache.stats () in
   check bool "empty stats returns integers" true (total = 0 && valid = 0);
-  (* Add some data and test stats *)
   Dio_strategies.Fee_cache.store_fees
     ~exchange:"kraken"
     ~symbol:"BTC/USD"
@@ -373,13 +338,8 @@ let test_fee_cache_stats () =
 ;;
 
 let test_profitability_checks () =
-  (* Test profitability calculations *)
-  (* For zero fee assets, any spread should be profitable *)
   let zero_fee_asset = create_test_asset ~maker_fee:(Some 0.0) () in
-  (* For fee assets, test the required spread calculation *)
   let fee_asset = create_test_asset ~maker_fee:(Some 0.001) () in
-  (* These tests would require more complex mocking of the execution environment *)
-  (* For now, ensure the fee calculation functions work *)
   let fee1 = Dio_strategies.Market_maker.get_fee_for_asset zero_fee_asset in
   let fee2 = Dio_strategies.Market_maker.get_fee_for_asset fee_asset in
   check (float 0.) "zero fee calculation" 0.0 fee1;
@@ -387,11 +347,8 @@ let test_profitability_checks () =
 ;;
 
 let test_post_only_checks () =
-  (* Test post-only validation logic *)
-  (* This is mainly tested through the execution logic, which requires extensive mocking *)
-  (* For now, just ensure the strategy can handle various price scenarios *)
   let asset = create_test_asset () in
-  (* Test with prices where buy < bid (valid post-only) *)
+  (* buy < bid: valid post-only. *)
   Dio_strategies.Market_maker.Strategy.execute
     asset
     (Some 50000.0)
@@ -402,7 +359,7 @@ let test_post_only_checks () =
     0
     (fun _ -> ())
     1;
-  (* Test with prices where buy >= bid (invalid post-only - should be skipped) *)
+  (* buy >= bid: invalid post-only. *)
   Dio_strategies.Market_maker.Strategy.execute
     asset
     (Some 50000.0)
@@ -417,15 +374,13 @@ let test_post_only_checks () =
 ;;
 
 (* ---- Inflight flag lifecycle tests ----
-   Directly exercises the bug fixed in this changeset: inflight_buy/inflight_sell
-   were set on Place but never cleared on ack/fill/cancel, blocking re-placement
-   after the first cycle. *)
+   inflight_buy/inflight_sell are set on Place; ack/fill/cancel must clear
+   them or re-placement is blocked after the first cycle. *)
 
 (** Helper: get or create a fresh state for a unique test symbol. *)
 let fresh_state prefix =
   let symbol = Printf.sprintf "%s_%d/USD" prefix (Random.bits ()) in
   let state = Dio_strategies.Market_maker.get_strategy_state symbol in
-  (* Ensure clean slate *)
   state.inflight_buy <- false;
   state.inflight_sell <- false;
   state.pending_orders <- [];
@@ -438,10 +393,8 @@ let fresh_state prefix =
 
 let test_inflight_cleared_on_ack () =
   let symbol, state = fresh_state "ACK" in
-  (* Simulate: Place buy sets inflight_buy *)
   state.inflight_buy <- true;
   state.inflight_sell <- true;
-  (* Ack should clear the flags *)
   Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
     ~now:(Unix.time ())
     symbol
@@ -449,7 +402,6 @@ let test_inflight_cleared_on_ack () =
     Dio_strategies.Strategy_common.Buy
     50000.0;
   check bool "inflight_buy cleared on ack" false state.inflight_buy;
-  (* Sell flag should also clear on sell ack *)
   Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
     ~now:(Unix.time ())
     symbol
@@ -487,7 +439,7 @@ let test_inflight_cleared_on_cancel () =
   let symbol, state = fresh_state "CANCEL" in
   state.inflight_buy <- true;
   state.inflight_sell <- true;
-  (* Genuine cancel (no pending_amend entry) *)
+  (* Genuine cancel: no pending_amend entry. *)
   Dio_strategies.Market_maker.Strategy.handle_order_cancelled
     ~now:(Unix.time ())
     symbol
@@ -544,7 +496,7 @@ let test_inflight_preserves_opposite_side () =
   let symbol, state = fresh_state "PRESERVE" in
   state.inflight_buy <- true;
   state.inflight_sell <- true;
-  (* Ack buy should only clear buy, not sell *)
+  (* Ack clears only its own side. *)
   Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
     ~now:(Unix.time ())
     symbol
@@ -553,7 +505,6 @@ let test_inflight_preserves_opposite_side () =
     50000.0;
   check bool "inflight_buy cleared" false state.inflight_buy;
   check bool "inflight_sell preserved" true state.inflight_sell;
-  (* Reset and test inverse *)
   state.inflight_buy <- true;
   state.inflight_sell <- true;
   Dio_strategies.Market_maker.Strategy.handle_order_filled
@@ -569,12 +520,10 @@ let test_inflight_preserves_opposite_side () =
 ;;
 
 let test_inflight_full_lifecycle () =
-  (* Simulate: place buy -> ack -> fill -> verify re-placement not blocked *)
+  (* place buy -> ack -> fill -> re-placement not blocked *)
   let symbol, state = fresh_state "LIFECYCLE" in
-  (* 1. Simulate placement: set inflight_buy *)
   state.inflight_buy <- true;
   check bool "inflight_buy set after place" true state.inflight_buy;
-  (* 2. Ack clears inflight *)
   Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
     ~now:(Unix.time ())
     symbol
@@ -582,9 +531,7 @@ let test_inflight_full_lifecycle () =
     Dio_strategies.Strategy_common.Buy
     50000.0;
   check bool "inflight_buy cleared after ack" false state.inflight_buy;
-  (* 3. Simulate new placement *)
   state.inflight_buy <- true;
-  (* 4. Fill clears inflight *)
   Dio_strategies.Market_maker.Strategy.handle_order_filled
     ~now:(Unix.time ())
     symbol
@@ -594,41 +541,36 @@ let test_inflight_full_lifecycle () =
     ~fill_qty:1.0
     None;
   check bool "inflight_buy cleared after fill" false state.inflight_buy;
-  (* 5. Verify state is ready for re-placement (not blocked) *)
   check bool "re-placement not blocked" false state.inflight_buy
 ;;
 
 let test_inflight_cancel_replace_preserves_flag () =
-  (* Cancel-replace (amendment): cancel should preserve inflight because
-     a replacement order is incoming. *)
+  (* Cancel-replace (amendment) preserves inflight: a replacement is incoming. *)
   let symbol, state = fresh_state "AMEND" in
   state.inflight_buy <- true;
-  (* Add pending_amend entry to simulate cancel-replace *)
+  (* pending_amend entry marks cancel-replace. *)
   state.pending_orders
   <- [ ( "pending_amend_order_buy_cr"
        , Dio_strategies.Strategy_common.Buy
        , 50000.0
        , Unix.time () )
      ];
-  (* Cancel with pending amend should take the cancel-replace path *)
   Dio_strategies.Market_maker.Strategy.handle_order_cancelled
     ~now:(Unix.time ())
     symbol
     "order_buy_cr"
     Dio_strategies.Strategy_common.Buy
     None;
-  (* In cancel-replace path, inflight_buy should NOT be cleared
-     (the replacement order is still pending) *)
+  (* Cancel-replace keeps inflight_buy: the replacement is still pending. *)
   check bool "inflight_buy preserved during cancel-replace" true state.inflight_buy
 ;;
 
 (* ---- InFlightAmendments cleanup tests ----
-   Exercises the medium-severity fix: handle_order_amended and
-   handle_order_amendment_skipped now release InFlightAmendments. *)
+   handle_order_amended and handle_order_amendment_skipped must release
+   InFlightAmendments entries. *)
 
 let test_amendment_clears_inflight_amendment () =
   let symbol, state = fresh_state "AMEND_IFA" in
-  (* Register an in-flight amendment *)
   let _added =
     Dio_strategies.Strategy_common.InFlightAmendments.add_in_flight_amendment
       "amend_order_1"
@@ -638,7 +580,7 @@ let test_amendment_clears_inflight_amendment () =
     "amendment registered"
     true
     (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight "amend_order_1");
-  (* Set up buy tracking so the handler finds a match *)
+  (* Buy tracking must match for the handler to fire. *)
   state.last_buy_order_id <- Some "amend_order_1";
   state.last_buy_order_price <- Some 50000.0;
   Dio_strategies.Market_maker.Strategy.handle_order_amended
@@ -648,7 +590,6 @@ let test_amendment_clears_inflight_amendment () =
     "amend_order_2"
     Dio_strategies.Strategy_common.Buy
     50500.0;
-  (* InFlightAmendment should be cleared *)
   check
     bool
     "inflight amendment cleared after amended"
@@ -658,7 +599,6 @@ let test_amendment_clears_inflight_amendment () =
 
 let test_amendment_skipped_clears_inflight_amendment () =
   let symbol, _state = fresh_state "SKIP_IFA" in
-  (* Register an in-flight amendment *)
   let _added =
     Dio_strategies.Strategy_common.InFlightAmendments.add_in_flight_amendment
       "skip_order_1"
@@ -674,7 +614,6 @@ let test_amendment_skipped_clears_inflight_amendment () =
     "skip_order_1"
     Dio_strategies.Strategy_common.Buy
     50000.0;
-  (* InFlightAmendment should be cleared *)
   check
     bool
     "inflight amendment cleared after skip"
@@ -684,7 +623,6 @@ let test_amendment_skipped_clears_inflight_amendment () =
 
 let test_amendment_failed_clears_inflight_amendment () =
   let symbol, state = fresh_state "FAIL_IFA" in
-  (* Register an in-flight amendment *)
   let _added =
     Dio_strategies.Strategy_common.InFlightAmendments.add_in_flight_amendment
       "fail_order_1"
@@ -702,7 +640,6 @@ let test_amendment_failed_clears_inflight_amendment () =
     "fail_order_1"
     Dio_strategies.Strategy_common.Buy
     "test reason";
-  (* InFlightAmendment should be cleared (this already worked before the fix) *)
   check
     bool
     "inflight amendment cleared after fail"

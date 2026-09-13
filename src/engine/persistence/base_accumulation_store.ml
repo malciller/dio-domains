@@ -1,20 +1,19 @@
 (* Base accumulation persistence store.
 
-   Per-strategy opt-in tracking of accumulated base assets and local
-   buy/sell cycle profitability. One entry per strategy key
-   ("{strategy_name}:{symbol}:{venue}", synthesized from config.json's
-   strategy field).
+   Per-strategy opt-in tracking of accumulated base assets and local buy/sell
+   cycle profitability. One entry per strategy key
+   ("{strategy_name}:{symbol}:{venue}", from config.json's strategy field).
 
    Persisted fields (data/accumulation_state.json, keyed by strategy key):
-   - reserved_base: base asset accumulated via sell_mult; excluded from sellable balance
-   - accumulated_profit: realized local PnL denominated in quote
-   - last_fill_oid / last_buy_fill_* / last_sell_fill_*: most recent fill references
+   - reserved_base: base accumulated via sell_mult; excluded from sellable balance
+   - accumulated_profit: realized local PnL in quote
+   - last_fill_oid / last_buy_fill_* / last_sell_fill_*: most recent fill refs
 
-   Crash-window semantics: async saves may lose the most recent coalesced
-   write, so accumulation may under-count profit after a crash. Accepted.
+   Crash window: an async save may lose the most recent coalesced write, so
+   accumulation may under-count profit after a crash. Accepted.
 
-   Opt-in: callers consult the per-strategy config flag before invoking
-   save/save_async; disabled means zero I/O. *)
+   Opt-in: callers check the per-strategy config flag before save/save_async;
+   disabled means zero I/O. *)
 
 let section = "base_accumulation_store"
 
@@ -105,23 +104,22 @@ let orchestrator =
 
 (* Pure decision logic: no I/O, unit-testable *)
 
-(** Buy fill: update the last-buy reference info for the next sell's
-    profitability check. [oid] is accepted per the store contract; OID
-    sequencing itself is owned by the execution layer. *)
+(** Buy fill: update the last-buy reference for the next sell's profitability
+    check. [oid] is accepted per the store contract; OID sequencing is owned by
+    the execution layer. *)
 let apply_buy_fill t ~price ~qty ~oid =
   let _ = oid in
   { t with last_buy_fill_price = Some price; last_buy_fill_qty = Some qty }
 ;;
 
 (** Sell fill: compare against the last buy fill for profitability.
-    profit = (sell_price - last_buy_price) * paired qty; the optional [fees]
-    (all-inclusive: both legs) are subtracted; if net profit > 0 it is added
-    to accumulated_profit. When accumulated_profit covers the acquisition
-    cost of the reserved base plus [buffer] (realtime, fear-and-greed driven):
-    reserved_base += oracle_qty * (1 - sell_mult) and accumulated_profit is
-    debited by the base cost (accumulated_profit <- accumulated_profit - base_cost),
-    preserving the buffer and surplus profit in the quote ledger.
-    [fees] defaults to 0.0 so the pure spec formula holds exactly. *)
+    profit = (sell_price - last_buy_price) * paired_qty - [fees] (fees are
+    all-inclusive, both legs); when net profit > 0 it is added to
+    accumulated_profit. When accumulated_profit covers the acquisition cost of
+    the reserved base plus [buffer] (realtime, fear-and-greed driven):
+    reserved_base += oracle_qty * (1 - sell_mult) and accumulated_profit -=
+    base_cost, preserving the buffer and surplus profit in the quote ledger.
+    [fees] defaults to 0.0. *)
 let apply_sell_fill t ~price ~qty ~oid ~buffer ~sell_mult ~oracle_qty ?(fees = 0.0) () =
   let t =
     { t with
@@ -163,9 +161,9 @@ let load ~key =
   | None -> default
 ;;
 
-(** Resolves the unique store key whose symbol segment is [symbol]
+(** Resolve the store key whose symbol segment is [symbol]
     ("{strategy}:{symbol}:{venue}"). Used during hydration before the strategy
-    name is known; logs loudly when ambiguous. *)
+    name is known; logs a warning and picks the first when ambiguous. *)
 let resolve_key_for_symbol ~symbol =
   let matches_symbol k =
     match String.split_on_char ':' k with
@@ -191,10 +189,10 @@ let save_async ~key t = Persistence_orchestrator.put_async orchestrator ~key t
 
 (* -- Legacy migration -------------------------------------------------- *)
 
-(** Imports one legacy flat entry: accumulation fields go under a full
-    strategy key when exactly one configured strategy matches the symbol,
-    else under "migrated:{symbol}" (logged loudly either way). Sell levels in
-    the legacy entry are ignored here - sell_levels_store has its own hook. *)
+(** Import one legacy flat entry: accumulation fields go under a full strategy
+    key when exactly one configured strategy matches the symbol, else under
+    "migrated:{symbol}" (logged either way). Legacy sell levels are ignored
+    here; sell_levels_store has its own hook. *)
 let migrate_entry symbol json =
   let open Yojson.Basic.Util in
   let has field = json |> member field <> `Null in

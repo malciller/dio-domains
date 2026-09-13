@@ -1,21 +1,20 @@
 (** Per-venue network latency profilers.
 
-    Measures the four NETWORK-page metrics the dashboard displays under each
-    domain row (a domain's venue):
+    Measure the four NETWORK-page metrics shown under each domain row (the
+    domain's venue):
     - ws_ping:      venue WebSocket ping/pong round trip
     - ws_feed:      gap between consecutive market-data feed messages
     - rest_request: HTTP REST round trip (trading actions and oracle fetches)
     - signer:       local signature generation time
 
     Profilers are keyed by venue name ("hyperliquid", "kraken", "lighter",
-    "alpaca") so every connection/fetch on a venue feeds one histogram. The
-    dashboard merges these per-venue windows into the per-symbol latency map
-    by looking up each configured symbol's exchange.
+    "alpaca"), so every connection or fetch on a venue feeds one histogram. The
+    dashboard merges these windows into the per-symbol latency map via each
+    configured symbol's exchange.
 
-    Windows are published (snapshot_and_reset) every ~10s by [start_publisher],
-    well inside the dashboard's 15s freshness tolerance, so the NETWORK
-    page always has a fresh window per metric, even when a venue is idle
-    (which then reads as "idle", not "--"). *)
+    [start_publisher] publishes (snapshot_and_reset) every ~10s, inside the
+    dashboard's 15s freshness tolerance, so the NETWORK page always has a fresh
+    window per metric; an idle venue reads as "idle", not "--". *)
 
 open Lwt.Infix
 
@@ -88,7 +87,7 @@ let[@inline always] venue_profilers venue =
     p
 ;;
 
-(** A span of [seconds] (wall clock delta), for call sites that time with
+(** Span of [seconds] (wall-clock delta) for call sites timing with
     [Unix.gettimeofday]. *)
 let span_of_seconds s = Mtime.Span.of_uint64_ns (Int64.of_float (s *. 1_000_000_000.0))
 
@@ -100,9 +99,8 @@ let record_ping_s venue s = record_ping venue (span_of_seconds s)
 let record_feed_s venue s = record_feed venue (span_of_seconds s)
 let record_rest_s venue s = record_rest venue (span_of_seconds s)
 
-(** Most recent published windows for [venue], in the label order the
-    dashboard's NETWORK page expects. Empty when the venue has no profilers
-    yet (nothing measured). *)
+(** Most recent published windows for [venue], in the label order the dashboard's
+    NETWORK page expects. Empty when the venue has no profilers yet. *)
 let snapshots venue =
   match Hashtbl.find_opt profilers venue with
   | None -> []
@@ -119,16 +117,16 @@ let all_venue_snapshots () =
   Hashtbl.fold (fun venue _ acc -> (venue, snapshots venue) :: acc) profilers []
 ;;
 
-(** Cadence of network window publication, in seconds. Shared by the
-    background loop and the spike-log window label so the two cannot drift. *)
+(** Network window publication cadence, in seconds. Shared by the background
+    loop and the spike-log window label so the two cannot drift. *)
 let publish_interval_seconds = 10.0
 
-(** Advances the window of every venue profiler, publishing an immutable
-    snapshot for the dashboard. Safe to call from any thread; profilers use
-    the internal mutex for the atomic publish. When [log_spikes] is set, each
-    venue emits at most one INFO line naming the network metrics that recorded
-    a sample at or above [threshold_us]. Gated by the caller so the noisy
-    network tail can be silenced while internal ops are profiled. *)
+(** Advance every venue profiler's window, publishing an immutable snapshot for
+    the dashboard. Safe from any thread; profilers hold an internal mutex for the
+    atomic publish. When [log_spikes] is set, each venue emits at most one INFO
+    line naming the network metrics with a sample at or above [threshold_us].
+    Gated by the caller so the network tail can be silenced while internal ops
+    are profiled. *)
 let publish_all ?(log_spikes = false) ?(threshold_us = 10.0) () =
   Hashtbl.iter
     (fun venue p ->
@@ -158,10 +156,10 @@ let publish_all ?(log_spikes = false) ?(threshold_us = 10.0) () =
     profilers
 ;;
 
-(** Background window publisher: advances all venue windows every
-    [publish_interval_seconds] so the dashboard always has a fresh NETWORK
-    page. Runs as an Lwt fiber; call once from engine startup. [log_spikes]
-    controls whether network windows also emit spike logs (see [publish_all]). *)
+(** Background publisher: advance all venue windows every
+    [publish_interval_seconds] so the dashboard always has a fresh NETWORK page.
+    Runs as an Lwt fiber; call once at engine startup. [log_spikes] controls
+    whether windows also emit spike logs (see [publish_all]). *)
 let start_publisher ?(log_spikes = false) ?(threshold_us = 10.0) () =
   let rec loop () =
     Lwt_unix.sleep publish_interval_seconds

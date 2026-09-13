@@ -46,17 +46,16 @@ let braille_bit sub_x sub_y =
 (** Fixed 15-minute time window in seconds (900s). *)
 let window_seconds = 900.0
 
-(** Rolling price & order history buffer per asset key.
-    Tracks live mid prices as well as active buy and sell order price levels over 15 minutes. *)
+(** Rolling price and order history per asset key: mid prices and buy/sell
+    price levels over [window_seconds]. *)
 let price_history : (string, price_snapshot Queue.t) Hashtbl.t = Hashtbl.create 32
 
-(** Most recently recorded snapshot per asset key, so the append guard below
-    does not have to traverse the entire queue on every push. *)
+(** Newest recorded snapshot per asset key; lets the append guard below avoid
+    traversing the whole queue on every push. *)
 let last_snapshots : (string, price_snapshot) Hashtbl.t = Hashtbl.create 32
 
-(** Global zoom level per asset key.
-    0 = Full view showing all orders.
-    Higher values = zoomed in around mid price (capped at 1 order on each side). *)
+(** Zoom level per asset key. 0 = full view (all orders); higher values zoom
+    in around the mid price, capped at one order per side. *)
 let zoom_levels : (string, int) Hashtbl.t = Hashtbl.create 16
 
 let get_zoom asset_key =
@@ -88,8 +87,8 @@ let record_all_prices (snapshot : Snapshot.t) =
          match a.kind with
          | Snapshot.Strategy s ->
            let buy_ps =
-             (* The strategy's own resting-buy target is tracked as a price,
-                not an order list, so it is the only buy level available. *)
+             (* The strategy's resting-buy target is tracked as a price, not an
+                order list, so it is the only buy level available. *)
              if s.buy_price > 0.0 then [ s.buy_price ] else []
            in
            s.market.bid, s.market.ask, buy_ps, order_prices s.sell_orders
@@ -106,7 +105,7 @@ let record_all_prices (snapshot : Snapshot.t) =
              Hashtbl.add price_history a.key q;
              q
          in
-         (* Prune entries older than the 15 minute window. *)
+         (* Prune entries older than [window_seconds]. *)
          while
            (not (Queue.is_empty q)) && now -. (Queue.peek q).timestamp > window_seconds
          do
@@ -173,9 +172,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     let title_str = Printf.sprintf "%s (%s)" a.symbol exch_tag in
     let exch_attr = exch_sym_attr a.exchange in
     let header_bar = section_title ~title_attr:exch_attr w title_str in
-    (* Extract the market data block, which lives under "market" for
-       strategy assets and is synthesized from the balance entry for
-       balances. *)
+    (* Market block: "market" for strategy assets, synthesized from the balance
+       entry for balances. *)
     let market =
       match a.kind with
       | Snapshot.Strategy s -> s.market
@@ -197,7 +195,6 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     let base_bal = market.base_balance in
     let quote_bal = market.quote_balance in
     let hold_val = base_bal *. mid in
-    (* Extract the strategy and order details for the summary card. *)
     let strat_opt =
       match a.kind with
       | Snapshot.Strategy s -> Some s
@@ -218,8 +215,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       | Some s -> s.last_sell_fill
       | None -> 0.0
     in
-    (* Collect the sell orders, preferring the strategy's own list and
-       falling back to the exchange feed. *)
+    (* Sell orders: the strategy's own list, else the exchange feed. *)
     let sell_orders =
       match a.kind with
       | Snapshot.Strategy s ->
@@ -228,21 +224,18 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         else to_triples s.market.sell_orders
       | Snapshot.Balance b -> to_triples b.sell_orders
     in
-    (* Calculate the accumulated holding and its value, excluding the
-       pending sell quantity. *)
+    (* Accumulated holding, excluding pending sell quantity. *)
     let pending_sell_qty =
       List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 sell_orders
     in
     let staked_bal = market.staked_balance in
-    (* Staked HYPE is part of [base_bal] but can never be covered by a
-       resting sell (it is not tradeable), so it is never reduced by the
-       pending sell quantity. *)
+    (* [staked_bal] is part of [base_bal] but non-tradeable, so it is never
+       reduced by the pending sell quantity. *)
     let accum_qty =
       staked_bal +. Float.max 0.0 (base_bal -. staked_bal -. pending_sell_qty)
     in
     let accum_val = accum_qty *. mid in
-    (* Collect the buy orders and distinguish real exchange orders from
-       synthetic strategy targets. *)
+    (* Buy orders: real exchange orders, else a synthetic strategy target. *)
     let cap_low =
       match strat_opt with
       | Some s -> s.capital_low
@@ -261,9 +254,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         | Some s when s.buy_price > 0.0 -> [ s.buy_id, s.buy_price, s.buy_qty ], cap_low
         | _ -> [], false)
     in
-    (* Asset summary card layout: line 1 shows the strategy type, the
-       bid/mid/ask prices, and the holding; line 2 shows the last buy/sell
-       fills, the quote balance, and the accumulated quantity. *)
+    (* Summary card: row 1 = strategy type, bid/mid/ask, holding; row 2 = last
+       buy/sell fills, quote balance, accumulated quantity. *)
     let r1 =
       I.hcat
         [ I.string a_label " Strategy: "
@@ -332,9 +324,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
           ]
     in
     let summary_card =
-      (* Capital-oracle line: the published decision for this asset, namely
-         the ACTIVE/INACTIVE verdict (the oracle-paused state), the sizing,
-         and the reason. It is rendered only when a decision exists. *)
+      (* Oracle line (rendered only when a decision exists): ACTIVE/INACTIVE
+         verdict (the oracle-paused state), sizing, and reason. *)
       let oracle_line =
         match strat_opt with
         | Some { oracle = Some o; _ } ->
@@ -399,10 +390,10 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         I.vcat [ summary; close_row w (I.hcat [ I.string a_border " │"; line ]) ]
       | None -> summary
     in
-    (* Compute the time bounds of the 15 minute history window. *)
+    (* Time bounds of the [window_seconds] history window. *)
     let now = Unix.gettimeofday () in
     let window_start = now -. window_seconds in
-    (* Retrieve and prune the 15 minute history points for this asset. *)
+    (* Retrieve and prune the history points for this asset. *)
     let hist_points =
       match Hashtbl.find_opt price_history a.key with
       | None -> []
@@ -417,8 +408,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     let hist_mid_prices = List.map (fun s -> s.mid_p) hist_points in
     let hist_buy_prices = List.concat_map (fun s -> s.buy_ps) hist_points in
     let hist_sell_prices = List.concat_map (fun s -> s.sell_ps) hist_points in
-    (* The price scale must cover all buy and sell orders, the fills, and
-       the 15 minute historical mid and order prices. *)
+    (* Price scale covers all buy/sell orders, the fills, and the 15 minute
+       historical mid and order prices. *)
     let all_prices =
       (if mid > 0.0 then [ mid ] else [])
       @ (if last_buy_fill > 0.0 then [ last_buy_fill ] else [])
@@ -439,8 +430,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         let span = max (high -. low) (low *. 0.01) in
         low -. (span *. 0.06), high +. (span *. 0.06)
     in
-    (* Find the nearest buy order (price below mid) and the nearest sell
-       order (price above mid). *)
+    (* Nearest buy (highest below mid) and nearest sell (lowest above mid).
+       Defaults to mid * 0.985 / mid * 1.015 when that side is absent. *)
     let nearest_buy_p =
       let buy_ps =
         List.filter_map
@@ -461,12 +452,12 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       | [] -> mid *. 1.015
       | l -> List.fold_left min Float.max_float l
     in
-    (* Hard cap bounds: at most one order is visible on each side, and
-       zooming never goes inside that span. *)
+    (* Cap bounds: at most one order visible per side; zooming never goes
+       inside that span. *)
     let cap_span_low = nearest_buy_p *. 0.995 in
     let cap_span_high = nearest_sell_p *. 1.005 in
-    (* Determine max_z, the zoom level at which the zoomed bounds reach the
-       cap span. *)
+    (* [max_z]: zoom level at which the zoomed bounds reach the cap span
+       (searched over 1..15). *)
     let max_z =
       let rec find_max i =
         if i >= 15
@@ -497,7 +488,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         let clamped_max = max cap_span_high target_max in
         max full_min_p clamped_min, min full_max_p clamped_max)
     in
-    (* Compute the available canvas dimensions from the window size. *)
+    (* Canvas dimensions derived from the window size. *)
     let ob_col_w = max 24 (w / 5) in
     let chart_area_w = max 35 (w - ob_col_w - 4) in
     let y_axis_w = 14 in
@@ -506,17 +497,16 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     let canvas_h = max 8 (h - 8) in
     let sub_h = canvas_h * 4 in
     let sub_w = canvas_w * 2 in
-    (* The "liquid" depth fill near the mid price is a dimmed accent tint
-       blended into the theme background. Derived from the active theme so it
-       stays coherent across all 18 palettes (the old constants were hardcoded
-       Tokyo Night colors). *)
+    (* Depth fill near the mid price: a dimmed accent tint blended into the
+       theme background, derived from the active theme so it stays coherent
+       across all palettes. *)
     let liquid_base = blend_rgb t.accent_rgb t.bg_rgb 0.6 in
-    (* Ambient breathing of the depth fill while the data stream is live; only
-       the chart rows that actually change are re-transmitted. *)
+    (* Depth-fill breathing while the data stream is live; only chart rows that
+       actually change are re-transmitted. *)
     let live_pulse =
       if !Anim.reduced_motion || not (Anim.active ()) then 0.0 else 0.10 *. Anim.pulse ()
     in
-    (* Extract the L2 order book depth from the market data. *)
+    (* L2 order book depth from the market data. *)
     let ob_bids_raw =
       List.filter_map
         (fun (l : Snapshot.level) ->
@@ -529,8 +519,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
            if l.price > 0.0 then Some (l.price, l.qty) else None)
         market.asks
     in
-    (* Fall back to synthesized levels when the order book feed has only a
-       single top-of-book level or is missing entirely. *)
+    (* Synthesize five levels from top-of-book when the order book feed has
+       only a single top-of-book level or is missing. *)
     let ob_asks_clean =
       if ob_asks_raw <> []
       then ob_asks_raw
@@ -545,8 +535,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       then List.init 5 (fun i -> bid *. (1.0 -. (float i *. 0.001)), 1.0)
       else []
     in
-    (* Extract trade prints when present, for example from Alpaca or other
-       trade feeds. *)
+    (* Trade prints when present (e.g. Alpaca). *)
     let ob_trades_raw =
       List.filter_map
         (fun (tr : Snapshot.trade) ->
@@ -555,7 +544,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     in
     let is_alpaca = String.equal (String.lowercase_ascii a.exchange) "alpaca" in
     let show_trade_prints = is_alpaca || ob_trades_raw <> [] in
-    (* Prepare the rows that make up the order book sidebar. *)
+    (* Order book sidebar rows. *)
     let ob_rows =
       Array.make canvas_h (I.string A.(fg c_bg ++ bg c_bg) (String.make ob_col_w ' '))
     in
@@ -615,15 +604,13 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
                ob_rows.(r) <- I.string attr (pad_right ob_col_w line_txt)))
           trades_to_show))
     else (
-      (* Sort asks ascending so the best ask sits nearest the mid and
-         higher asks stack above it. *)
+      (* Asks ascending: best ask nearest mid, higher asks above. *)
       let sorted_asks = List.sort (fun (p1, _) (p2, _) -> compare p1 p2) ob_asks_clean in
       let asks_to_show =
         let taken = List.filteri (fun i _ -> i < ask_rows_cnt) sorted_asks in
         List.rev taken
       in
-      (* Sort bids descending so the best bid sits nearest the mid and
-         lower bids fall below it. *)
+      (* Bids descending: best bid nearest mid, lower bids below. *)
       let sorted_bids = List.sort (fun (p1, _) (p2, _) -> compare p2 p1) ob_bids_clean in
       let bids_to_show = List.filteri (fun i _ -> i < bid_rows_cnt) sorted_bids in
       let max_ask_q = List.fold_left (fun acc (_, q) -> max acc q) 0.0 ob_asks_clean in
@@ -632,13 +619,13 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         abs_float (order_p -. level_p) < 0.000001
         || String.equal (format_price order_p) (format_price level_p)
       in
-      (* Render the order book title row. *)
+      (* Order book title row. *)
       ob_rows.(0)
       <- I.string
            A.(fg c_title ++ bg c_bg ++ st bold)
            (pad_right ob_col_w " ══ L2 ORDER BOOK ══");
-      (* Render the ask levels with depth bars; levels that match our own
-         sell orders are marked. *)
+      (* Ask levels with depth bars; levels matching a strategy sell order are
+         marked ★MY. *)
       List.iteri
         (fun idx (p, q) ->
            let r = 1 + idx in
@@ -681,7 +668,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
              in
              ob_rows.(r) <- I.hsnap ~align:`Left ob_col_w line_img))
         asks_to_show;
-      (* Render the mid price and spread banner between the asks and bids. *)
+      (* Mid price and spread banner between the asks and bids. *)
       let mid_row_idx = 1 + ask_rows_cnt in
       if mid_row_idx < canvas_h
       then (
@@ -692,8 +679,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         let mid_str = Printf.sprintf "▶ MID %s%s" (format_price mid) sprd_str in
         ob_rows.(mid_row_idx)
         <- I.string A.(fg c_bg ++ bg c_green ++ st bold) (pad_right ob_col_w mid_str));
-      (* Render the bid levels with depth bars; levels that match our own
-         buy orders are marked. *)
+      (* Bid levels with depth bars; levels matching a strategy buy order are
+         marked ★MY. *)
       List.iteri
         (fun idx (p, q) ->
            let r = mid_row_idx + 1 + idx in
@@ -736,7 +723,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
              in
              ob_rows.(r) <- I.hsnap ~align:`Left ob_col_w line_img))
         bids_to_show);
-    (* Render the most recent fills as a footer footprint line. *)
+    (* Most recent fills as a footer footprint line. *)
     if has_fill_footer
     then (
       let fill_idx = canvas_h - 1 in
@@ -764,7 +751,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       min (canvas_h - 1) (sy / 4)
     in
     let mid_row = price_to_row mid in
-    (* Group the sell orders by their exact canvas row. *)
+    (* Sell orders grouped by their exact canvas row. *)
     let sell_by_row = Hashtbl.create 16 in
     List.iter
       (fun (id, p, q) ->
@@ -775,7 +762,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
          in
          Hashtbl.replace sell_by_row r ((id, p, q) :: existing))
       sell_orders;
-    (* Group the buy orders by their exact canvas row. *)
+    (* Buy orders grouped by their exact canvas row. *)
     let buy_by_row = Hashtbl.create 16 in
     List.iter
       (fun (id, p, q) ->
@@ -942,7 +929,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
          let sy_last = mid_sub_y.(sub_w - 1) in
          draw_line mid_grid (sub_w - 1) sy_last (sub_w - 1) sy_last;
          (* Interpolate the buy and sell order level pin traces across
-             columns. *)
+            columns. *)
          connect_pin_traces buy_grid buy_sub_y_list;
          connect_pin_traces sell_grid sell_sub_y_list));
     let buy_row_opt =
@@ -971,8 +958,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         | _ -> None)
       else None
     in
-    (* Compute which rows get a Y-axis price tick so labels stay readable
-       and never crowd the mid or order rows. *)
+    (* Y-axis tick rows: always the mid and order rows, plus every 4th row that
+       is not adjacent to a labeled row. *)
     let show_y_label = Array.make canvas_h false in
     let label_prices = Array.make canvas_h 0.0 in
     for r = 0 to canvas_h - 1 do
@@ -1027,7 +1014,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
           then A.(fg c_title ++ bg c_bg)
           else A.(fg c_dim ++ bg c_bg)
         in
-        (* Render the price time series curve cells for this row. *)
+        (* Price time-series curve cells for this row. *)
         let cells =
           List.init canvas_w (fun c ->
             let sx0 = c * 2 in
@@ -1079,9 +1066,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
             if combined_mask <> 0
             then (
               let str = braille_to_utf8 combined_mask in
-              (* Overlapping traces collapse to the theme's dominant trace
-                 color (mid wins, then buy/sell); colors themselves are
-                 theme-derived rather than hardcoded. *)
+              (* Overlapping traces collapse to the theme's dominant trace color
+                 (mid wins, then buy/sell); colors are theme-derived. *)
               let fg_color =
                 if !mid_mask <> 0 && !buy_mask <> 0
                 then c_green
@@ -1127,7 +1113,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
             else I.string A.(fg c_bg ++ bg c_bg) " ")
         in
         let chart_line_img = I.hcat cells in
-        (* Render the right-docked order target pins with their badges. *)
+        (* Right-docked order target pins with their badges. *)
         let right_pin_img =
           if is_mid_l
           then (
@@ -1222,7 +1208,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
              ; right_pin_img
              ]))
     in
-    (* Render the X-axis tick bar and the realtime timeline labels. *)
+    (* X-axis tick bar and realtime timeline labels. *)
     let x_axis_ticks =
       let tick_bar = repeat_utf8 "─" (canvas_w + pin_col_w) in
       close_row

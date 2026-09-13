@@ -50,7 +50,7 @@ let test_data_accessors_empty () =
 ;;
 
 let test_get_fees_with_instruments () =
-  (* Initialize instruments with mock data (these have 0.0 maker/taker fees) *)
+  (* Mock instruments carry 0.0 maker/taker fees. *)
   Lighter.Instruments_feed.initialize [ "FEETEST" ];
   let maker, taker = Lighter.Module.Lighter_impl.get_fees ~symbol:"FEETEST" in
   Alcotest.(check bool) "maker fee found" true (Option.is_some maker);

@@ -1,24 +1,22 @@
 (** Histogram-based latency profiler.
-    Records latency samples into fixed-width buckets and computes
-    percentile distributions (p50, p90, p95, p99, p999).
+    Records latency samples into fixed-width buckets and computes percentile
+    distributions (p50, p90, p95, p99, p999).
 
-    Three resolution tiers, so low-end precision is INDEPENDENT of the
-    (memory-bounded) coarse bucket width:
-    - samples below 1us are captured in a nanosecond tier (1ns buckets);
-    - samples from 1us up to the coarse bucket width are captured in a fine
-      microsecond tier (1us buckets);
-    - samples at/above the coarse bucket width use the wide buckets as before.
-    Without the fine tier, a profiler configured with wide buckets (e.g.
-    bucket_us=1000 for the oracle) would collapse every latency between 1us
-    and 999us into bucket 0 and report 0us. Reported percentile values are
-    in microseconds as floats; a sub-microsecond percentile is a fraction
-    (e.g. 0.5 = 500ns); consumers that need nanosecond display scale by 1000.
+    Three resolution tiers keep low-end precision independent of the
+    memory-bounded coarse bucket width:
+    - below 1us: nanosecond tier (1ns buckets);
+    - [1us, bucket_us): fine microsecond tier (1us buckets);
+    - at/above [bucket_us]: coarse buckets.
+    Without the fine tier a wide-bucket profiler (e.g. bucket_us=1000 for the
+    oracle) would collapse every latency in [1us, 999us] into bucket 0 and
+    report 0us. Percentiles are microseconds as floats; a sub-microsecond value
+    is a fraction (e.g. 0.5 = 500ns); nanosecond display scales by 1000.
 
-    Metrics are accumulated in a window and published atomically via
-    [snapshot_and_reset] (typically once per window from the recording
-    domain). Readers consume the immutable published snapshot through
-    [published_snapshot], a lock-free [Atomic.get], which removes the
-    torn-read race between the histogram writer and the dashboard reader. *)
+    Metrics accumulate in a window and are published atomically via
+    [snapshot_and_reset] (typically once per window, from the recording domain).
+    Readers consume the immutable snapshot via [published_snapshot], a lock-free
+    [Atomic.get], which removes the torn-read race between histogram writer and
+    dashboard reader. *)
 
 open Mtime
 
@@ -30,9 +28,9 @@ let bucket_us = 1
 (* Upper bound of tracked latency range in microseconds. *)
 let max_latency_us = 100_000
 
-(* Nanosecond tier for sub-microsecond samples: one bucket per nanosecond.
-   The sub-us range is inherently 0..999ns, so a fixed 1000-bucket tier fully
-   covers it with 1ns resolution (no division needed on the hot path). *)
+(* Nanosecond tier for sub-microsecond samples: one bucket per nanosecond. The
+   sub-us range is 0..999ns, so a fixed 1000-bucket tier covers it at 1ns
+   resolution with no division on the hot path. *)
 let ns_bucket_count = 1000
 
 (** Read-only snapshot of a completed measurement window. Immutable once
@@ -58,9 +56,8 @@ type snapshot =
   ; window_end : float (* Unix time the window was published. *)
   }
 
-(** Profiler state. Contains a fixed-size histogram array, running counters
-    for total samples and overflow events, per-window activity counters, and
-    the immutable snapshot of the most recently completed window. *)
+(** Profiler state: fixed-size histogram arrays, running sample/overflow
+    counters, per-window activity counters, and the last completed snapshot. *)
 type t =
   { name : string (* Identifier for this profiler instance. *)
   ; buckets : int array (* Coarse histogram bins (>= bucket_us us). *)
@@ -82,9 +79,8 @@ type t =
   }
 
 (** [create ?bucket_us ?max_latency_us name] allocates a profiler with
-    [max_latency_us / bucket_us] coarse buckets plus the fine microsecond
-    tier ([bucket_us - 1] one-us buckets) and the nanosecond tier for
-    sub-microsecond samples, all initialized to zero. *)
+    [max_latency_us / bucket_us] coarse buckets, a fine tier of [bucket_us - 1]
+    one-us buckets, and a 1000-bucket nanosecond tier, all zeroed. *)
 let create ?(bucket_us = 1) ?(max_latency_us = 10_000) name =
   let count = max_latency_us / bucket_us in
   let us_count = max 0 (bucket_us - 1) in
@@ -108,14 +104,12 @@ let create ?(bucket_us = 1) ?(max_latency_us = 10_000) name =
   }
 ;;
 
-(** [record_ns t ns] records a latency already expressed in nanoseconds,
-    bypassing the [Mtime.Span] argument (and its [int64] boxing) of [record].
-    Used by callers that hold a non-allocating nanosecond timestamp, notably the
-    stop-the-world canary's C-stub clock. Negative values (a backwards clock)
-    are clamped to zero so they cannot index below the histogram. Sub-
-    microsecond samples are bucketed in the dedicated nanosecond tier (1ns
-    resolution); samples in [1us, bucket_us) use the fine one-microsecond tier;
-    samples at/above [bucket_us] use the coarse buckets. Samples that exceed the
+(** [record_ns t ns] records a latency in nanoseconds, bypassing the
+    [Mtime.Span] argument and its [int64] boxing in [record]. Used by callers
+    holding a non-allocating nanosecond timestamp, notably the stop-the-world
+    canary's C-stub clock. Negative values are clamped to zero. Sub-microsecond
+    samples use the nanosecond tier (1ns resolution); [1us, bucket_us) uses the
+    fine tier; at/above [bucket_us] uses the coarse buckets. Samples above the
     histogram range are clamped to the last coarse bucket and counted as
     overflow. *)
 let[@inline] record_ns t ns =
@@ -129,7 +123,7 @@ let[@inline] record_ns t ns =
     let us = ns / 1000 in
     if us < t.bucket_us
     then
-      (* Fine tier: exact microsecond resolution (bucket i holds (i+1)us),
+      (* Fine tier: exact microsecond resolution; bucket i holds (i+1)us,
          independent of the coarse bucket width. *)
       t.us_buckets.(us - 1) <- t.us_buckets.(us - 1) + 1
     else (
@@ -150,10 +144,9 @@ let[@inline] record_ns t ns =
     [record_ns]. *)
 let[@inline] record t span = record_ns t (Int64.to_int (Span.to_uint64_ns span))
 
-(** [record_max_ns t ns] is [record_ns] but returns [true] when [ns] established
-    a new window maximum, so the caller can build an expensive cause string
-    only on that rare path instead of allocating a cause closure (and boxing
-    its captured floats) on every recorded cycle. *)
+(** [record_max_ns t ns] behaves as [record_ns] and returns [true] when [ns] set
+    a new window maximum, so the caller builds an expensive cause string only on
+    that rare path instead of allocating a cause closure per cycle. *)
 let[@inline] record_max_ns t ns =
   let ns = if ns < 0 then 0 else ns in
   if ns < 1000
@@ -183,14 +176,13 @@ let[@inline] record_max_ns t ns =
 (** [record_max t span] is [record_max_ns] on a [Mtime.Span]. *)
 let[@inline] record_max t span = record_max_ns t (Int64.to_int (Span.to_uint64_ns span))
 
-(** [set_cause t cause] attaches a cause string to the current window's
-    maximum sample. Only meaningful immediately after [record_max] returned
-    [true] (the maximum it just recorded). *)
+(** [set_cause t cause] attaches a cause string to the current window's maximum
+    sample. Only meaningful immediately after [record_max] returned [true]. *)
 let set_cause t cause = t.max_cause <- Some cause
 
-(** [record_with_cause t span cause_thunk] is like [record] but if the span
-    establishes a new maximum latency, it evaluates [cause_thunk ()] and
-    records the result as the cause. *)
+(** [record_with_cause t span cause_thunk] behaves as [record], but if [span] sets
+    a new maximum latency it evaluates [cause_thunk ()] and records the result as
+    the cause. *)
 let[@inline] record_with_cause t span cause_thunk =
   let ns = Int64.to_int (Span.to_uint64_ns span) in
   if ns < 1000
@@ -215,36 +207,32 @@ let[@inline] record_with_cause t span cause_thunk =
     t.max_cause <- Some (cause_thunk ()))
 ;;
 
-(** [tick_exec t ~now] records one activity event (e.g. a strategy execution)
-    at Unix time [now]. The count and timestamp appear in the next published
-    snapshot so consumers can derive an executions-per-second rate and the
-    time of last activity even when a window has zero latency samples. *)
+(** [tick_exec t ~now] records one activity event (e.g. a strategy execution) at
+    Unix time [now]. The count and timestamp appear in the next snapshot so
+    consumers can derive an executions-per-second rate and last-activity time
+    even when a window has zero latency samples. *)
 let tick_exec t ~now =
   t.executions <- t.executions + 1;
   t.last_exec_time <- now
 ;;
 
 (** [set_executions t count] overwrites the current window's execution count
-    (e.g. the number of order actions the strategy actually pushed this
-    window, not raw strategy-invocation cycles) and refreshes [last_exec_time]
-    when the count is positive. Callers must invoke it before
-    [snapshot_and_reset] so the published snapshot carries the real count. *)
+    (e.g. order actions actually pushed, not raw strategy-invocation cycles) and
+    refreshes [last_exec_time] when [count > 0]. Call before [snapshot_and_reset]
+    so the published snapshot carries the real count. *)
 let set_executions t count =
   t.executions <- count;
   if count > 0 then t.last_exec_time <- Unix.gettimeofday ()
 ;;
 
-(** [percentile t p] computes the p-th percentile (0.0 to 1.0) from the
-    histogram by performing a cumulative scan over the buckets. Returns the
-    bucket boundary in microseconds; a sub-microsecond result is a fraction
-    (e.g. 0.5 = 500ns). Returns 0.0 when no samples exist.
-    The sub-microsecond nanosecond tier is scanned first (0..999ns), then the
-    fine one-microsecond tier ([1, bucket_us) us), then the coarse buckets,
-    so percentiles below the coarse bucket width keep microsecond/nanosecond
-    resolution regardless of [bucket_us]. Uses early exit to avoid scanning
-    the full bucket array once the target cumulative count is reached;
-    critical for large histograms (e.g. the cycle profiler with 100,000
-    buckets). *)
+(** [percentile t p] returns the p-th percentile ([0.0, 1.0]) by a cumulative
+    scan over the histogram. Returns the bucket boundary in microseconds; a
+    sub-microsecond result is a fraction (e.g. 0.5 = 500ns); 0.0 when no samples
+    exist. Scans the nanosecond tier (0..999ns), then the fine microsecond tier
+    ([1, bucket_us) us), then the coarse buckets, so percentiles below the coarse
+    bucket width keep their resolution regardless of [bucket_us]. Early-exits
+    once the target cumulative count is reached, critical for large histograms
+    (e.g. the cycle profiler with 100,000 buckets). *)
 let percentile t p =
   if t.samples = 0
   then 0.0
@@ -278,20 +266,19 @@ let percentile t p =
         float (!k * t.bucket_us))))
 ;;
 
-(** [percentiles5 t] computes p50/p90/p95/p99/p999 in a SINGLE cumulative pass
-    over the histogram instead of five independent scans (the oracle
-    profilers are 60k-100k buckets, so five scans cost ~0.5-5ms per window).
-    The sub-microsecond nanosecond tier is scanned first, then the fine
-    one-microsecond tier, then the coarse buckets; each target is captured
-    the moment its cumulative count is crossed. Sub-microsecond percentiles
-    are fractions of a microsecond (e.g. 0.5 = 500ns). *)
+(** [percentiles5 t] computes p50/p90/p95/p99/p999 in a single cumulative pass
+    instead of five scans (oracle profilers are 60k-100k buckets, where five
+    scans cost ~0.5-5ms per window). Scans the nanosecond tier, then the fine
+    microsecond tier, then the coarse buckets, capturing each target when its
+    cumulative count is crossed. Sub-microsecond percentiles are fractions of a
+    microsecond (e.g. 0.5 = 500ns). *)
 let percentiles5 t =
   if t.samples = 0
   then 0.0, 0.0, 0.0, 0.0, 0.0
   else (
     let fracs = [| 0.50; 0.90; 0.95; 0.99; 0.999 |] in
-    (* -1.0 marks "not yet captured": a real percentile can legitimately be
-       0.0 (all samples sub-microsecond), which must not re-trigger capture. *)
+    (* -1.0 marks "not yet captured": a real percentile can be 0.0 (all samples
+       sub-microsecond), which must not re-trigger capture. *)
     let vals = [| -1.0; -1.0; -1.0; -1.0; -1.0 |] in
     let cumulative = ref 0 in
     let remaining = ref 5 in
@@ -329,9 +316,9 @@ let percentiles5 t =
     vals.(0), vals.(1), vals.(2), vals.(3), vals.(4))
 ;;
 
-(** [reset t] zeroes all histogram buckets (all three tiers) and resets
-    sample/overflow and activity counters. Does not touch [window_start];
-    callers that advance the window must set it explicitly. *)
+(** [reset t] zeroes all three histogram tiers and the sample/overflow and
+    activity counters. Does not touch [window_start]; callers advancing the
+    window must set it explicitly. *)
 let reset t =
   Array.fill t.buckets 0 t.bucket_count 0;
   Array.fill t.us_buckets 0 t.us_bucket_count 0;
@@ -345,23 +332,20 @@ let reset t =
   t.last_exec_time <- 0.0
 ;;
 
-(** [count_above t threshold_us] returns the number of samples in the live
-    histogram whose value is at or above [threshold_us]. The nanosecond tier is
-    exact; the fine-microsecond tier is exact to its microsecond bucket; a
-    coarse bucket is counted when its lower edge reaches the threshold. This
-    makes the count inclusive of a bucket that straddles the threshold, so a
-    spike at the ceiling is never missed to bucket rounding. Used to report
-    per-window latency spikes. *)
+(** [count_above t threshold_us] returns the number of live-histogram samples at
+    or above [threshold_us]. The nanosecond tier is exact; the fine tier is exact
+    to its microsecond bucket; a coarse bucket counts when its lower edge reaches
+    the threshold, so a spike at the ceiling is not missed to bucket rounding.
+    Used for per-window spike counts. Non-finite thresholds return 0. *)
 let count_above t threshold_us =
   if not (Float.is_finite threshold_us)
   then 0
   else (
     let count = ref 0 in
-    (* Skip every bucket whose lower edge is below the threshold instead of
-     scanning the whole histogram: the nanosecond and fine-microsecond tiers
-     are fully below a multi-us threshold, and the coarse tier starts at the
-     first bucket edge >= threshold. This turns the per-window spike count on
-     a 20k-bucket cycle histogram from a full scan into a tail scan. *)
+    (* Skip buckets whose lower edge is below the threshold: the nanosecond and
+       fine tiers are fully below a multi-us threshold, and the coarse tier
+       starts at the first edge >= threshold, turning a full 20k-bucket scan
+       into a tail scan. *)
     let start_ns =
       if threshold_us <= 0.0
       then 0
@@ -387,14 +371,13 @@ let count_above t threshold_us =
     !count)
 ;;
 
-(** [snapshot_and_reset ?spike_threshold_us t] computes the percentile
-    distribution of the current window, publishes it as an immutable snapshot
-    (replacing the previous window's snapshot in the Atomic cell), zeroes the
-    histogram, and starts a new window. Always publishes a snapshot, even when
-    the window had zero samples, so consumers can distinguish "idle" from
-    "no data". When [spike_threshold_us] is supplied, the snapshot's
-    [over_threshold] is the count of samples at or above it. Returns the
-    published snapshot. *)
+(** [snapshot_and_reset ?spike_threshold_us t] computes the current window's
+    percentiles, publishes them as an immutable snapshot (replacing the previous
+    one in the Atomic cell), zeroes the histogram, and starts a new window.
+    Always publishes, even for a zero-sample window, so consumers can distinguish
+    "idle" from "no data". [spike_threshold_us] sets [over_threshold] to the
+    count of samples at or above it. Locked against concurrent resets.
+    @return the published snapshot. *)
 let snapshot_and_reset ?(spike_threshold_us = infinity) t =
   let now = Unix.gettimeofday () in
   Mutex.lock t.mutex;
@@ -450,15 +433,13 @@ let snapshot_and_reset ?(spike_threshold_us = infinity) t =
   snap
 ;;
 
-(** [published_snapshot t] returns the snapshot of the most recently completed
-    window. [None] before the first window is published. Lock-free: reads the
-    Atomic cell only, never the live histogram. *)
+(** [published_snapshot t] returns the most recently completed window's
+    snapshot, or [None] before the first publication. Lock-free: reads only the
+    Atomic cell, never the live histogram. *)
 let published_snapshot t = Atomic.get t.published
 
-(** [format_us f] renders a microsecond value, switching to nanoseconds below
-    one microsecond (e.g. 500ns) and to milliseconds at or above one
-    millisecond (e.g. 1.20ms), so log output stays readable across the whole
-    tracked range. *)
+(** [format_us f] renders a microsecond value: nanoseconds below 1us (e.g.
+    "500ns"), milliseconds at or above 1ms (e.g. "1.20ms"), else microseconds. *)
 let format_us f =
   if f < 1.0
   then Printf.sprintf "%.0fns" (f *. 1000.0)
@@ -467,13 +448,11 @@ let format_us f =
   else Printf.sprintf "%.2fms" (f /. 1000.0)
 ;;
 
-(** [spike_message ~key ~window_seconds ~threshold_us stages] renders a
-    one-line spike report for every stage in [stages] whose [over_threshold] is
-    non-zero, naming the stage, its worst spike, its breach count over the
-    sample total and its p99. Appends the first non-empty [max_cause] among the
-    stages (the internal pipeline's cycle profiler) as a continuation line.
-    Returns [None] when no stage breached, so callers can stay silent on healthy
-    windows. Pure, so the exact rendered line is unit-testable. *)
+(** [spike_message ~key ~window_seconds ~threshold_us stages] renders a one-line
+    spike report for each stage in [stages] with non-zero [over_threshold],
+    naming the stage, worst spike, breach count over sample total, and p99.
+    Appends the first non-empty [max_cause] among the stages as a continuation
+    line. Returns [None] when no stage breached. Pure and unit-testable. *)
 let spike_message ~key ~window_seconds ~threshold_us stages =
   let breached = List.filter (fun (_, (s : snapshot)) -> s.over_threshold > 0) stages in
   if breached = []
@@ -511,9 +490,9 @@ let spike_message ~key ~window_seconds ~threshold_us stages =
        | Some c -> base ^ "\n worst-cycle cause: " ^ c))
 ;;
 
-(** [report ?sample_threshold t] logs the current window's percentile
-    distribution if at least [sample_threshold] samples have been collected,
-    then advances the window (publishing + resetting). *)
+(** [report ?sample_threshold t] logs the current window's percentiles when at
+    least [sample_threshold] samples were collected, then advances the window
+    (publish + reset). *)
 let report ?(sample_threshold = 1) t =
   if t.samples >= sample_threshold
   then (
@@ -534,8 +513,8 @@ let report ?(sample_threshold = 1) t =
       snap.executions)
 ;;
 
-(** [time_it t f] measures the wall-clock execution time of [f ()],
-    records the resulting span in the profiler, and returns the result of [f]. *)
+(** [time_it t f] records the wall-clock execution time of [f ()] in the profiler
+    and returns the result of [f]. *)
 let time_it t f =
   let start = Mtime_clock.now_ns () in
   let res = f () in
@@ -545,10 +524,9 @@ let time_it t f =
   res
 ;;
 
-(** [snapshot prof] returns [Some snapshot] with the live percentile values,
-    or [None] if no samples have been recorded. Does not reset the profiler.
-    Intended for non-windowed consumers that need a quick read of the
-    currently accumulating histogram. *)
+(** [snapshot prof] returns [Some snapshot] of the live percentiles, or [None]
+    if no samples were recorded. Does not reset. For non-windowed consumers
+    reading the accumulating histogram. *)
 let snapshot (prof : t) : snapshot option =
   if prof.samples = 0
   then None

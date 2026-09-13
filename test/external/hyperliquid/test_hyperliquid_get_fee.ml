@@ -30,7 +30,7 @@ let test_parse_fee_info_missing_fields () =
   | Some info ->
     Alcotest.(check (option (float 0.000001))) "maker None" None info.maker_fee;
     Alcotest.(check (option (float 0.000001))) "taker None" None info.taker_fee;
-    (* spot fees fall back to hardcoded defaults when API fields are missing *)
+    (* Spot fees fall back to hardcoded defaults when API fields are missing. *)
     Alcotest.(check (option (float 0.000001)))
       "spot_maker default"
       (Some 0.0004)

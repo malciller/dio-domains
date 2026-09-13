@@ -1,7 +1,7 @@
 (** Order actions for Lighter: place/cancel/modify via signed transactions.
-    Dispatch goes through REST [POST /api/v1/sendTx] via the configured
-    LIGHTER_PROXY; signing happens in [lighter_signer.ml] over FFI. (The WS
-    [jsonapi/sendtx] path in [lighter_ws.ml] exists but is currently unused.) *)
+    Dispatch uses REST [POST /api/v1/sendTx] via the configured LIGHTER_PROXY;
+    signing happens in [lighter_signer.ml] over FFI. The WS [jsonapi/sendtx]
+    path in [lighter_ws.ml] is unused. *)
 
 open Lwt.Infix
 

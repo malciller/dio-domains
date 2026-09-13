@@ -1,16 +1,15 @@
 open Notty
 open Theme
 
-(** Reusable table for exchange connectivity deduplication. *)
+(** Exchange connectivity state keyed by exchange name; cleared each render. *)
 let exch_tbl : (string, bool) Hashtbl.t = Hashtbl.create 4
 
 let render_footer w (snapshot : Snapshot.t) =
   let t = Theme.current () in
   let uptime = snapshot.uptime_s in
   let fng = Option.value snapshot.fear_and_greed ~default:0.0 in
-  (* Per-exchange connectivity: shown green if any strategy has a live
-     bid/ask feed on that exchange, red otherwise. Exchanges are
-     deduplicated and sorted by name. *)
+  (* Per-exchange connectivity: live (green) when any strategy has bid > 0
+     and ask > 0 on that exchange, else dead (red). Deduplicated, sorted by name. *)
   let exch_connected =
     Hashtbl.clear exch_tbl;
     List.iter

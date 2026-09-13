@@ -1,28 +1,21 @@
-(* Oracle_fees - resolves real maker/taker fees per trading venue and holds
-   them per asset, mirroring the live supervisor's fee enrichment.
+(* Oracle_fees - resolve maker/taker fees per venue and hold them per asset.
 
-   The grid path replay and inverse sizing depend on the maker fee. Instead of
-   a hardcoded flat rate, each asset's fee is resolved from its venue's oracle
-   adapter ([Exchange_intf.Oracle.S.fetch_fees], dispatched through
-   [Exchange_intf.Oracle.Registry]) - a new venue is plug-and-play here too.
-   Fees are cached per (exchange, symbol) for the process lifetime and also
-   stored in the shared Dio_strategies.Fee_cache, so a fee fetched here is
-   held per asset like the supervisor does. [default_fees] is the venue's own
-   offline / failed-fetch fallback.
-
-   A maker fee explicitly set in config.json ("maker_fee") or passed via
-   --fee always wins; fetching only happens when neither is present. *)
+   The grid replay and inverse sizing depend on the maker fee, resolved from
+   the venue's oracle adapter ([Exchange_intf.Oracle.S.fetch_fees] via
+   [Exchange_intf.Oracle.Registry]) rather than a hardcoded rate. Fees are
+   cached per (exchange, symbol) for the process lifetime and stored in
+   [Dio_strategies.Fee_cache]. The venue's [default_fees] is the
+   offline/failed-fetch fallback. An explicit config.json "maker_fee" (or
+   --fee) always wins; fetching happens only when neither is set. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
 
 let section = "oracle_fees"
 
-(* Last-resort generic fee, used ONLY when no oracle adapter is registered
-   for the venue (pure/offline/test contexts where the venue libraries are
-   not linked). Registered venues use their own
-   [Exchange_intf.Oracle.S.default_fees] instead - venue-specific fee data
-   lives in the venue's adapter, never here. *)
+(* Last-resort generic fee, used only when no oracle adapter is registered
+   for the venue (pure/offline/test contexts). Registered venues use their
+   own [Exchange_intf.Oracle.S.default_fees]. *)
 let fallback_maker_fee = 0.0016
 let fallback_taker_fee = 0.0026
 
@@ -53,8 +46,8 @@ let fetch_fees ~(exchange : string) ~(symbol : string) ~(testnet : bool)
     Lwt.return (fallback_maker_fee, fallback_taker_fee)
 ;;
 
-(** Load .env (KRAKEN/HYPERLIQUID/ALPACA credentials) into the process env, if
-    present. Idempotent enough for CLI use. *)
+(** Load .env (KRAKEN/HYPERLIQUID/ALPACA credentials) into the process env if
+    present. *)
 let load_dotenv () =
   try Logging.load_dotenv ~path:".env" () with
   | _ -> ()
@@ -86,10 +79,10 @@ let resolved_fees ~(exchange : string) ~(symbol : string) ~(testnet : bool)
     fees
 ;;
 
-(** Enrich a trading_config with the real exchange maker/taker fee, holding the
-    result per asset on the config itself and in the shared Fee_cache. Honors an
-    explicit config.json "maker_fee"/"taker_fee". In offline mode no network is
-    used and the venue's [default_fees] is applied with a warning. *)
+(** Enrich a trading_config with the exchange maker/taker fee, stored on the
+    config and in the shared Fee_cache. An explicit config.json
+    "maker_fee"/"taker_fee" wins. Offline mode uses the venue [default_fees]
+    with a warning and no network. *)
 let enrich (tc : Dio_strategies.Strategy_common.trading_config) ~(offline : bool)
   : Dio_strategies.Strategy_common.trading_config Lwt.t
   =

@@ -1,8 +1,9 @@
 (** Order status and execution tracking from orderStatus, openOrder, and
-    execDetails messages; no explicit market data subscription is needed,
-    TWS streams these automatically for orders placed by this client.
-    On startup the module requests an open-order snapshot via
-    reqOpenOrders (sent by the supervisor feeds) to prime state. *)
+    execDetails. TWS streams these automatically for orders placed by this
+    client; no explicit subscription is required.
+
+    Startup: requests an open-order snapshot via reqOpenOrders to prime
+    state. *)
 
 let section = "ibkr_executions"
 
@@ -201,7 +202,6 @@ let handle_order_status fields =
       ; timestamp = Unix.gettimeofday ()
       }
     in
-    (* Recover the side from the per-symbol open-order store. *)
     let store = get_symbol_store symbol in
     Mutex.lock store.orders_mutex;
     let side =
@@ -221,7 +221,6 @@ let handle_order_status fields =
       filled
       remaining
       avg_fill_price;
-    (* Publish fills on the shared event bus. *)
     if status = Ibkr_types.Filled
     then (
       let fill_value = filled *. avg_fill_price in
@@ -428,9 +427,9 @@ let register_handlers () =
     ~handler:handle_exec_details
 ;;
 
-(** Requests an execution history snapshot from the gateway. Unused by
-    the current startup sequence (open orders are requested instead);
-    kept for manual replay of the day's fills. *)
+(** Requests an execution history snapshot. Unused by the startup
+    sequence (open orders are requested instead); retained for manual fill
+    replay. *)
 let request_executions conn =
   Logging.info ~section "Requesting execution history snapshot";
   Ibkr_connection.send
@@ -518,8 +517,8 @@ let[@inline always] has_execution_data_fast symbol =
 ;;
 
 (** Marks every initialized symbol store ready. Called on openOrderEnd
-    after the startup snapshot, so waiters do not block on symbols that
-    simply have no executions yet. *)
+    after the startup snapshot, so waiters do not block on symbols with
+    no executions yet. *)
 let mark_ready_all () =
   Hashtbl.iter
     (fun symbol store ->

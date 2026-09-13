@@ -3,7 +3,6 @@ module Types = Exchange.Types
 module ExecFeed = Hyperliquid.Executions_feed
 
 let test_module_registration () =
-  (* Check that the module name is correctly defined *)
   Alcotest.(check string)
     "module name is hyperliquid"
     "hyperliquid"

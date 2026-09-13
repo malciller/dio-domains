@@ -44,9 +44,10 @@ let fetch_and_initialize ~base_url ~required_symbols =
                    try
                      let market_index = member "market_id" market |> to_int in
                      let raw_symbol = member "symbol" market |> to_string in
-                     (* Lighter returns bare symbols for perpetual futures (for example "ETH") and dash separated
-               symbols for spot markets (for example "ETH-USDC"). Keep perpetual futures symbols in their raw format to avoid collision
-               with spot ETH/USDC which we register separately at index 2048. *)
+                     (* Lighter returns bare symbols for perpetual futures
+               ("ETH") and dash-separated symbols for spot markets
+               ("ETH-USDC"). Perpetual symbols stay raw to avoid collision
+               with spot ETH/USDC, registered separately at index 2048. *)
                      let symbol = raw_symbol in
                      let supported_size_decimals =
                        member "supported_size_decimals" market |> to_int

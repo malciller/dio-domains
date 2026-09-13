@@ -225,7 +225,6 @@ let encode_order (o : Ibkr_types.order) : string list =
     All set to empty/default values for simple STK limit/market orders.
     Field order matches ib_insync client.py placeOrder exactly. *)
 let encode_order_tail () : string list =
-  (* After the basic order fields above, placeOrder expects: *)
   [ (* --- no comboLegs for non-BAG --- *)
     ""
   ; (* deprecated sharesAllocation / empty string *)
@@ -241,7 +240,7 @@ let encode_order_tail () : string list =
   ; (* faMethod *)
     ""
   ; (* faPercentage *)
-    (* faProfile removed in v177, but we're v176 so include it *)
+    (* faProfile removed in v177; present in v176. *)
     ""
   ; (* faProfile *)
     ""

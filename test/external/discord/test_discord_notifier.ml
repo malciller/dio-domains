@@ -1,10 +1,9 @@
 open Lwt.Infix
 
-(* Aliases for readability *)
 module Notifier = Discord.Notifier
 module Fill_event_bus = Concurrency.Fill_event_bus
 
-(** Helper to create dummy fill events. *)
+(** Fill event with per-field test defaults. *)
 let create_fill_event
       ?(venue = "test_venue")
       ?(symbol = "BTC/USD")
@@ -29,7 +28,7 @@ let create_fill_event
   }
 ;;
 
-(** Test that formatting a single fill event produces the correct single embed structure. *)
+(** Single fill formats to one embed. *)
 let test_format_single_fill () =
   let ev = create_fill_event ~side:"buy" 1620000000.0 in
   match Notifier.build_webhook_payload [ ev ] with
@@ -47,7 +46,7 @@ let test_format_single_fill () =
     Alcotest.(check int) "has 6 fields for single message" 6 (List.length fields)
 ;;
 
-(** Test that formatting multiple fills produces the batched embed structure. *)
+(** Multiple fills format to one batched embed. *)
 let test_format_multiple_fills () =
   let ev1 = create_fill_event ~side:"buy" ~venue:"kraken" 1620000000.0 in
   let ev2 = create_fill_event ~side:"sell" ~venue:"lighter" 1620000010.0 in
@@ -72,10 +71,10 @@ let test_format_multiple_fills () =
     Alcotest.(check int) "color matches blue for batch" 0x3498DB color
 ;;
 
-(** Test the rate limiter token consumption logic. *)
+(** Rate limiter token acquisition. *)
 let test_rate_limiter_logic _switch () =
-  (* Since bucket is global and relies on gettimeofday, this test primarily
-     exercises the acquire path to ensure it eventually resolves. *)
+  (* Bucket is global and clock-based; exercises the acquire path for eventual
+     resolution. *)
   let start_time = Unix.gettimeofday () in
   Notifier.acquire_token ()
   >>= fun () ->

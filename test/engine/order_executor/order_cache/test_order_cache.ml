@@ -2,7 +2,7 @@ open Alcotest
 
 let test_inflight_amendments_cache () =
   let order_id = "test_amend_oid_1" in
-  (* Clean state *)
+  (* Reset cache entry. *)
   ignore
     (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment
        order_id);
@@ -35,7 +35,7 @@ let test_inflight_amendments_cleanup () =
        order_id);
   ignore
     (Dio_strategies.Strategy_common.InFlightAmendments.add_in_flight_amendment order_id);
-  (* Immediate cleanup with max_age=0.0 should evict *)
+  (* max_age=0.0 evicts immediately. *)
   let _drift, trimmed =
     Dio_strategies.Strategy_common.InFlightAmendments.cleanup ~max_age:0.0 ()
   in

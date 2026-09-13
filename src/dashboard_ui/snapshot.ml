@@ -1,9 +1,8 @@
-(** Typed, parse-once model of the engine's dashboard snapshot.
+(** Typed, parse-once model of the engine dashboard snapshot.
 
-    Every renderer consumes [t] instead of walking the raw Yojson tree with
-    [|?>]. The snapshot is decoded exactly once per received frame, and the
-    derived values (mid prices, selectable assets, pause state) are computed
-    once rather than once per module. *)
+    Decoded once per received frame; derived values (mid prices, selectable
+    assets, pause state) are computed once rather than per module. Renderers
+    consume [t] instead of walking the raw Yojson tree with [|?>]. *)
 
 open Theme
 
@@ -321,18 +320,17 @@ let parse_memory j =
 (* Pause state and selectable-asset derivation                                *)
 (* -------------------------------------------------------------------------- *)
 
-(** [true] when the capital oracle's decision for this strategy says
-    INACTIVE (the oracle-paused state). [false] when there is no decision. *)
+(** [true] iff the capital oracle's decision for this strategy is INACTIVE
+    (oracle-paused); [false] when absent. *)
 let oracle_inactive (s : strategy) =
   match s.oracle with
   | Some o -> not o.active
   | None -> false
 ;;
 
-(** Paused = the capital oracle says INACTIVE, or the grid's own capital-low
-    flag is set (or the market is closed). If an open resting buy order
-    already exists, the strategy cannot be considered paused by
-    capital/oracle gates since the order is already placed and funded. *)
+(** Paused if the oracle is INACTIVE, [capital_low] is set, or the market is
+    closed. A resting buy overrides the capital/oracle gates (already placed
+    and funded), leaving only [market_is_closed] to pause it. *)
 let strategy_paused (s : strategy) =
   let has_resting_buy = s.buy_price > 0.0 || s.market.buy_orders <> [] in
   if has_resting_buy
