@@ -8,8 +8,6 @@ reference
 test
 docs
 README.md
-compose.yaml
-config.example.json
 
 # Python artifacts
 __pycache__
@@ -28,6 +26,7 @@ data
 # Credentials (mounted at runtime, never baked into image)
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 *.crt

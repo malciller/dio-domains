@@ -87,6 +87,10 @@ RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 COPY THIRD_PARTY_LICENSES third_party/ /usr/share/licenses/dio/
 COPY --from=builder /app/opam-packages.txt /usr/share/licenses/dio/opam-packages.txt
 
+# 5d. Starter kit. Lets someone with only the image create a working setup
+#     without cloning the repository.
+COPY config.example.json .env.example compose.yaml /usr/share/doc/dio/
+
 # 6. Setup non-root system user and runtime directories
 RUN groupadd -g 1000 dio && useradd -u 1000 -g dio -s /bin/false dio \
     && mkdir -p /var/run/dio /app/data \

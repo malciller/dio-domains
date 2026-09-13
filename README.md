@@ -20,9 +20,15 @@ Unix domain socket.
 The container image is private; request access first
 ([docs/ACCESS.md](docs/ACCESS.md)).
 
+The image ships the example config, env template, and compose file. Pull them
+out first (no repository clone needed):
+
 ```sh
-cp config.example.json config.json   # pick your venues and instruments
-cp .env.example .env                 # add exchange credentials
+IMAGE=ghcr.io/malciller/dio-domains:latest
+docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE /usr/share/doc/dio/config.example.json /out/config.json
+docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE /usr/share/doc/dio/.env.example /out/.env
+docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE /usr/share/doc/dio/compose.yaml /out/compose.yaml
+# edit config.json and .env for your venues and instruments
 
 docker compose up -d                 # start the engine
 docker compose run --rm dashboard    # attach the dashboard (Ctrl-p Ctrl-q to detach)

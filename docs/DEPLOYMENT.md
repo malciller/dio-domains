@@ -6,15 +6,21 @@ The prebuilt image is private; request access per [ACCESS.md](ACCESS.md).
 
 The image contains only the compiled binaries and their runtime libraries. It
 **ships without a configuration**, so the engine refuses to start until you
-mount one.
+mount one. The example config, the env template, and `compose.yaml` are inside
+the image; you do not need the repository.
 
 1. Request access and log in ([ACCESS.md](ACCESS.md)).
-2. Create your configuration:
+2. Extract the templates and edit them:
 
    ```sh
-   cp config.example.json config.json
-   cp .env.example .env
-   # edit both for your venues and instruments
+   IMAGE=ghcr.io/malciller/dio-domains:latest
+   docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE \
+     /usr/share/doc/dio/config.example.json /out/config.json
+   docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE \
+     /usr/share/doc/dio/.env.example /out/.env
+   docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE \
+     /usr/share/doc/dio/compose.yaml /out/compose.yaml
+   # edit config.json and .env for your venues and instruments
    ```
 
 3. Start the engine and attach the dashboard:

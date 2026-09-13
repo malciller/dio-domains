@@ -3,7 +3,9 @@
 The engine reads `config.json` from the working directory. Credentials and
 one-off overrides come from the environment; if a `.env` file is present it is
 loaded dotenv-style (`KEY=value` per line). Start from
-[`config.example.json`](../config.example.json) and `.env.example`.
+[`config.example.json`](../config.example.json) and `.env.example` (both ship
+inside the image at `/usr/share/doc/dio/`; see
+[DEPLOYMENT.md](DEPLOYMENT.md) for extracting them).
 
 The `trading` schema is **strict**: an unknown key under `trading`, an unknown
 key in the `oracle` section, or a key that does not apply to the selected venue
