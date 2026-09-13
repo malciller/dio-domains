@@ -1,16 +1,17 @@
 name: grant-image-access
 
 # When a maintainer applies the "access-approved" label to an image-access
-# request, this posts the pull instructions for the requester, assigns the
-# issue to the maintainer as a reminder to grant access, and closes it.
+# request, this posts the pull instructions for the requester and then posts a
+# short maintainer mention carrying the direct package-access link, so the
+# approver gets the reminder (and the link) as a GitHub notification.
 #
-# GitHub issues have no private notes, so the maintainer-only steps are kept
-# out of the issue comment and go to the workflow run summary plus the
-# assignment notification instead.
+# The package settings URL works only for the account that owns the package, so
+# exposing it on the issue is harmless. GitHub cannot attach custom text to an
+# assignment notification, which is why the link goes in a mention comment.
 #
 # GitHub has no API to grant access to a package scoped to a personal account
 # (only organization-scoped packages can be granted programmatically), so the
-# invite is a one-click manual step in the package settings.
+# invite stays a manual click for the owner.
 
 on:
   issues:
@@ -47,7 +48,7 @@ jobs:
           esac
           echo "username=$username" >> "$GITHUB_OUTPUT"
 
-      - name: Post instructions and close
+      - name: Post pull instructions for the requester
         env:
           # Passed through the environment rather than interpolated into the
           # script, so a crafted username cannot inject shell syntax.
@@ -85,18 +86,12 @@ jobs:
           not been added yet; wait a few minutes and try again.
           EOF
 
-          gh issue edit "$ISSUE_NUMBER" --add-assignee "$MAINTAINER"
-          gh issue close "$ISSUE_NUMBER" --reason completed
-
-      - name: Maintainer reminder
+      - name: Notify maintainer and close
         env:
           REQ_USER: ${{ steps.who.outputs.username }}
         run: |
-          {
-            echo "### Maintainer: grant package access"
-            echo
-            echo "Approved request from \`$REQ_USER\` (issue #$ISSUE_NUMBER)."
-            echo
-            echo "1. Open https://github.com/users/malciller/packages/container/dio-domains/settings"
-            echo "2. Manage access -> Invite people -> \`$REQ_USER\` -> Read"
-          } >> "$GITHUB_STEP_SUMMARY"
+          username="$REQ_USER"
+          gh issue comment "$ISSUE_NUMBER" --body \
+            "@$MAINTAINER grant Read for @$username: https://github.com/users/$MAINTAINER/packages/container/dio-domains/settings"
+          gh issue edit "$ISSUE_NUMBER" --add-assignee "$MAINTAINER"
+          gh issue close "$ISSUE_NUMBER" --reason completed
