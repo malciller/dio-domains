@@ -15,10 +15,13 @@ other secrets into the issue.
 ## What happens next
 
 1. A maintainer reviews the request and applies the `access-approved` label.
-2. A workflow posts the pull instructions on the issue and closes it.
-3. The maintainer grants your account the **Read** role on the package.
+   That pings the maintainer with the package settings link; nothing is sent to
+   you yet.
+2. The maintainer grants your account the **Read** role and applies the
+   `access-granted` label.
+3. That posts the pull instructions on the issue and closes it.
 
-Step 3 is manual because GitHub's API only grants package access for
+The invite is manual because GitHub's API only grants package access for
 organization-scoped packages, not personal-account ones.
 
 ## Pull the image
