@@ -41,6 +41,22 @@ RUN eval $(opam env) \
        | sort -f > /app/opam-packages.txt
 
 # ==============================================================================
+# STAGE 1b — Optional Lighter signer
+# ==============================================================================
+# The precompiled Go signer (lighter-go) statically bundles go-ethereum,
+# gnark-crypto and a Go stdlib; those modules dominate image CVE scans and are
+# reported against the published image even though the library is only loaded
+# when a Lighter symbol is configured (ctypes dlopen, lazily). It is therefore
+# EXCLUDED from the default image. Re-include it for a Lighter deployment with:
+#   docker build --build-arg INCLUDE_LIGHTER_SIGNER=1 ...
+FROM builder AS lighter_signer
+ARG INCLUDE_LIGHTER_SIGNER=0
+RUN mkdir -p /app/signer-out \
+    && if [ "$INCLUDE_LIGHTER_SIGNER" = "1" ]; then \
+         cp /app/lighter-signer-linux-amd64.so /app/signer-out/; \
+       fi
+
+# ==============================================================================
 # STAGE 2 — Runtime (minimal)
 # ==============================================================================
 FROM ubuntu:22.04@sha256:829f6df217bcbae2b371026e81711d1a787c61b2967ad09d015063663ebafbf7 AS runtime
@@ -66,8 +82,10 @@ RUN ldconfig
 COPY --from=builder /app/_build/default/bin/main.exe /usr/local/bin/dio
 COPY --from=builder /app/_build/default/bin/dashboard.exe /usr/local/bin/dio-dashboard
 
-# 5a. Copy Lighter signer shared library (Go-compiled .so for linux/amd64)
-COPY --from=builder /app/lighter-signer-linux-amd64.so /app/lighter-signer-linux-amd64.so
+# 5a. Optional Lighter signer shared library (linux/amd64). The directory is
+#     empty unless the image was built with INCLUDE_LIGHTER_SIGNER=1 (see stage
+#     1b); the runtime loader only touches it when a Lighter symbol runs.
+COPY --from=lighter_signer /app/signer-out/ /opt/lighter-signer/
 
 # 5b. Entrypoint guard. Refuses to start the engine when no config is mounted,
 #     instead of failing later inside the config parser.
@@ -99,8 +117,10 @@ ENV MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:2"
 # 9. OCaml runtime GC defaults (Forces OCaml 5 minor_heap_size scaling per-domain natively)
 ENV OCAMLRUNPARAM="s=33554432,o=120,O=1000000,h=100,w=1"
 
-# 9a. Lighter signer library path (linux/amd64 .so in /app)
-ENV LIGHTER_SIGNER_LIB_PATH=./lighter-signer-linux-amd64
+# 9a. Lighter signer library path. The .so is absent from the default image
+#     (build with INCLUDE_LIGHTER_SIGNER=1 to include it); the loader warns and
+#     only fails if a Lighter symbol is actually signed.
+ENV LIGHTER_SIGNER_LIB_PATH=/opt/lighter-signer/lighter-signer-linux-amd64
 
 # 10. Expose metrics broadcast port
 EXPOSE 8080
