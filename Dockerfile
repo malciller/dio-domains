@@ -134,8 +134,21 @@ ENV LD_PRELOAD=libjemalloc.so.2
 # 8. jemalloc tuning: fast dirty/muzzy page decay, limited arenas for OCaml 5
 ENV MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:2"
 
-# 9. OCaml runtime GC defaults (Forces OCaml 5 minor_heap_size scaling per-domain natively)
-ENV OCAMLRUNPARAM="s=33554432,o=120,O=1000000,h=100,w=1"
+# 9. OCaml runtime GC tuning. Verified against this OxCaml runtime
+#    (oxcaml-compiler.5.2.0minus40) with Gc.get ():
+#      s = minor_heap_size, in words per domain (OxCaml default 1M words = 8MB)
+#      o = space_overhead, major-GC pacing (OxCaml default 80)
+#      O = max_overhead, compaction trigger (OxCaml default 500; >=1000000
+#          disables compaction)
+#    h is not a runtime parameter (silently ignored) and w had no observable
+#    effect, so both are omitted. a (allocation_policy) is likewise a no-op in
+#    OCaml 5. Sweep s and o with test/engine/perf/sweep_gc_params.sh; do not
+#    sweep a.
+#    NB: the gc block in config.json is applied per-domain via Gc.set at startup
+#    (engine/config.ml apply_gc_config) and OVERRIDES s/o/O here, so those are
+#    the effective values at runtime. This ENV only covers the window before
+#    apply_gc_config runs.
+ENV OCAMLRUNPARAM="s=33554432,o=120,O=1000000"
 
 # 9a. Lighter signer library path. The .so is absent from the default image
 #     (build with INCLUDE_LIGHTER_SIGNER=1 to include it); the loader warns and

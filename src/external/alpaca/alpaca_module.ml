@@ -425,9 +425,18 @@ module Alpaca_impl = struct
   let fetch_open_orders () = Alpaca_executions.bootstrap_open_orders ()
   let round_price ~symbol:_ ~price = Float.round (price *. 100.0) /. 100.0
   let get_fees ~symbol:_ = Some 0.0, Some 0.0 (* Alpaca commission-free *)
+
+  (* Uniform decode entry: Alpaca market-data frames (quotes/trades) are
+     context-free; auth/control callbacks stay in the WS layer. *)
+  let decode_frame content = Alpaca_orderbook.handle_message_str content
 end
 
 let () = Exchange.Registry.register (module Alpaca_impl)
+
+(* Register the uniform venue decoder for the parse-domain offload route. *)
+let () =
+  Concurrency.Parse_worker.register_venue_decoder ~venue:"alpaca" Alpaca_impl.decode_frame
+;;
 
 (* Register the oracle data-venue adapter at load time. *)
 let () = Exchange.Oracle.Registry.register (module Alpaca_oracle)

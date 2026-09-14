@@ -96,7 +96,7 @@ type sell_commitment =
 type strategy_state =
   { mutable last_buy_order_price : float option
   ; mutable last_buy_order_id : string option
-  ; mutable open_sell_orders : (string * float * float) list (* (order_id, price, qty) *)
+  ; mutable open_sell_orders : Jacobs_ladder_sell_orders.t (* (order_id, price, qty) *)
   ; mutable persisted_sell_levels : (float * float) list
     (* (target_price, qty) stack for Alpaca GTC *)
   ; mutable recently_injected_sells : (string * float * float) list
@@ -268,7 +268,7 @@ type strategy_state =
   ; mutable cached_has_recent_amend_buy : bool
   ; mutable cached_locked_in_buys : float
   ; mutable cached_closest_sell_order : (string * float) option
-  ; mutable cached_feed_sell_orders : (string * float * float) list
+  ; mutable cached_feed_sell_orders : Jacobs_ladder_sell_orders.t
     (* Last feed scan's derived outputs, reused by [sync_open_orders] when the
        venue's open-orders generation is unchanged: the scan is O(open orders)
        and dominated by string-keyed hashtable work, so skipping it when nothing
@@ -517,7 +517,7 @@ let rec get_strategy_state asset_symbol =
     let new_state =
       { last_buy_order_price = None
       ; last_buy_order_id = None
-      ; open_sell_orders = []
+      ; open_sell_orders = Jacobs_ladder_sell_orders.create 16
       ; persisted_sell_levels
       ; recently_injected_sells = []
       ; sell_commitments = Hashtbl.create 64
@@ -580,7 +580,7 @@ let rec get_strategy_state asset_symbol =
       ; cached_has_recent_amend_buy = false
       ; cached_locked_in_buys = 0.0
       ; cached_closest_sell_order = None
-      ; cached_feed_sell_orders = []
+      ; cached_feed_sell_orders = Jacobs_ladder_sell_orders.create 16
       ; time_buy_ns = 0
       ; time_sell_ns = 0
       ; last_fill_oid = persisted_last_fill_oid

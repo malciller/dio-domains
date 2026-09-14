@@ -12,6 +12,10 @@
  (name gc_hammer)
  (libraries dio.latency_profiling mtime unix))
 
+(executable
+ (name sync_alloc_profile)
+ (libraries dio.strategies unix))
+
 (rule
  (alias runtest)
  (deps

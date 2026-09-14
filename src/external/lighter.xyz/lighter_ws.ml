@@ -271,6 +271,93 @@ let record_orderbook_latency json =
   | None -> ()
 ;;
 
+(** Classification of an inbound text frame. *)
+type text_frame_kind =
+  | Frame_data
+  | Frame_pong
+  | Frame_unmatched of string * string
+
+(** Pure decode of one inbound text frame: routes market-data and execution
+    frames to the appropriate feed, and reports pong/unmatched frames to the
+    caller. Parse-domain safe: no Lwt and no connection state. *)
+let decode_text_frame content : text_frame_kind =
+  let json = Yojson.Safe.from_string content in
+  let channel =
+    let open Yojson.Safe.Util in
+    try member "channel" json |> to_string with
+    | _ -> ""
+  in
+  let msg_type =
+    let raw_type =
+      let open Yojson.Safe.Util in
+      try member "type" json |> to_string with
+      | _ -> ""
+    in
+    if channel <> ""
+    then (
+      let ch_prefix =
+        try
+          String.sub
+            channel
+            0
+            (min
+               (try String.index channel '/' with
+                | Not_found -> String.length channel)
+               (try String.index channel ':' with
+                | Not_found -> String.length channel))
+        with
+        | _ -> channel
+      in
+      if raw_type = "update" || raw_type = "snapshot" || raw_type = "subscribed"
+      then raw_type ^ "/" ^ ch_prefix
+      else raw_type)
+    else raw_type
+  in
+  let market_index_from_channel ch =
+    try
+      let sep_pos =
+        try String.index ch ':' with
+        | Not_found -> String.index ch '/'
+      in
+      int_of_string (String.sub ch (sep_pos + 1) (String.length ch - sep_pos - 1))
+    with
+    | _ -> -1
+  in
+  match msg_type with
+  | "snapshot/order_book" | "subscribed/order_book" ->
+    Atomic.incr msg_counter_orderbook;
+    record_orderbook_latency json;
+    let mi = market_index_from_channel channel in
+    if mi >= 0 then Lighter_orderbook_feed.process_orderbook_snapshot ~market_index:mi json;
+    Frame_data
+  | "update/order_book" ->
+    Atomic.incr msg_counter_orderbook;
+    record_orderbook_latency json;
+    let mi = market_index_from_channel channel in
+    if mi >= 0 then Lighter_orderbook_feed.process_orderbook_update ~market_index:mi json;
+    Frame_data
+  | "update/account_all_orders"
+  | "snapshot/account_all_orders"
+  | "subscribed/account_all_orders" ->
+    Atomic.incr msg_counter_account;
+    Lighter_executions_feed.process_account_orders_update json;
+    Frame_data
+  | "update/account_all"
+  | "snapshot/account_all"
+  | "subscribed/account_all"
+  | "update/account_all_assets"
+  | "snapshot/account_all_assets"
+  | "subscribed/account_all_assets"
+  | "update/user_stats"
+  | "snapshot/user_stats"
+  | "subscribed/user_stats" ->
+    Atomic.incr msg_counter_account;
+    Lighter_balances.process_market_data json;
+    Frame_data
+  | "pong" -> Frame_pong
+  | t -> Frame_unmatched (t, channel)
+;;
+
 (** Dispatches one WS frame by opcode and message type. *)
 let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
   match frame.Websocket.Frame.opcode with
@@ -281,83 +368,14 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
     if state == private_state && not (Atomic.get private_stream_confirmed)
     then Atomic.set private_stream_confirmed true;
     (try
-       let json = Yojson.Safe.from_string frame.Websocket.Frame.content in
-       let channel =
-         let open Yojson.Safe.Util in
-         try member "channel" json |> to_string with
-         | _ -> ""
-       in
-       let msg_type =
-         let raw_type =
-           let open Yojson.Safe.Util in
-           try member "type" json |> to_string with
-           | _ -> ""
-         in
-         if channel <> ""
-         then (
-           let ch_prefix =
-             try
-               String.sub
-                 channel
-                 0
-                 (min
-                    (try String.index channel '/' with
-                     | Not_found -> String.length channel)
-                    (try String.index channel ':' with
-                     | Not_found -> String.length channel))
-             with
-             | _ -> channel
-           in
-           if raw_type = "update" || raw_type = "snapshot" || raw_type = "subscribed"
-           then raw_type ^ "/" ^ ch_prefix
-           else raw_type)
-         else raw_type
-       in
-       let market_index_from_channel ch =
-         try
-           let sep_pos =
-             try String.index ch ':' with
-             | Not_found -> String.index ch '/'
-           in
-           int_of_string (String.sub ch (sep_pos + 1) (String.length ch - sep_pos - 1))
-         with
-         | _ -> -1
-       in
-       (match msg_type with
-        | "snapshot/order_book" | "subscribed/order_book" ->
-          Atomic.incr msg_counter_orderbook;
-          record_orderbook_latency json;
-          let mi = market_index_from_channel channel in
-          if mi >= 0
-          then Lighter_orderbook_feed.process_orderbook_snapshot ~market_index:mi json
-        | "update/order_book" ->
-          Atomic.incr msg_counter_orderbook;
-          record_orderbook_latency json;
-          let mi = market_index_from_channel channel in
-          if mi >= 0
-          then Lighter_orderbook_feed.process_orderbook_update ~market_index:mi json
-        | "update/account_all_orders"
-        | "snapshot/account_all_orders"
-        | "subscribed/account_all_orders" ->
-          Atomic.incr msg_counter_account;
-          Lighter_executions_feed.process_account_orders_update json
-        | "update/account_all"
-        | "snapshot/account_all"
-        | "subscribed/account_all"
-        | "update/account_all_assets"
-        | "snapshot/account_all_assets"
-        | "subscribed/account_all_assets"
-        | "update/user_stats"
-        | "snapshot/user_stats"
-        | "subscribed/user_stats" ->
-          Atomic.incr msg_counter_account;
-          Lighter_balances.process_market_data json
-        | "pong" ->
+       (match decode_text_frame frame.Websocket.Frame.content with
+        | Frame_data -> ()
+        | Frame_pong ->
           state.last_pong_time := Unix.gettimeofday ();
           (try Lwt_condition.broadcast state.pong_condition () with
            | _ -> ());
           on_heartbeat ()
-        | t ->
+        | Frame_unmatched (t, channel) ->
           Atomic.incr msg_counter_other;
           if Atomic.get msg_counter_other <= 5
           then

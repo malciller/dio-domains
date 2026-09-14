@@ -11,5 +11,9 @@
  (libraries dio.strategies dio.engine dio.hyperliquid dio.alpaca alcotest))
 
 (test
+ (name test_jacobs_ladder_sell_orders)
+ (libraries dio.strategies alcotest))
+
+(test
  (name test_auto_hedger)
  (libraries dio.strategies dio.engine alcotest))

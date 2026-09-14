@@ -578,9 +578,32 @@ module Kraken_impl = struct
            let taker = Option.value info.taker_fee ~default:0.0 in
            Hashtbl.replace fee_cache symbol (maker, taker)
          | None -> ())
-      symbols
+       symbols
+  ;;
+
+  (* Uniform decode entry: route a raw frame to the right feed by its channel,
+     read with the allocation-light scanner rather than a JSON DOM. Each feed's
+     [process_parse_domain_frame] owns parse + dispatch with the connection's
+     current heartbeat and no tick publication (the WS fiber owns tick). *)
+  let decode_frame content =
+    let channel =
+      if String.length content >= 2 && content.[0] = '{'
+      then (
+        match Json_scan.find_field content 1 (String.length content - 1) "channel" with
+        | Some (i, j) -> Json_scan.string_of_span content i j
+        | None -> "")
+      else ""
+    in
+    match channel with
+    | "book" -> Kraken_orderbook_feed.process_parse_domain_frame content
+    | "executions" -> Kraken_executions_feed.process_parse_domain_frame content
+    | "balances" -> Kraken_balances_feed.process_parse_domain_frame content
+    | _ -> ()
   ;;
 end
+
+(* Register the uniform venue decoder for the parse-domain offload route. *)
+let () = Concurrency.Parse_worker.register_venue_decoder ~venue:"kraken" Kraken_impl.decode_frame
 
 (* Register Kraken_impl into the global exchange registry at load time. *)
 let () = Exchange.Registry.register (module Kraken_impl)

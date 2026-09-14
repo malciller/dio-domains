@@ -492,6 +492,18 @@ module type S = sig
   (** Return cached (maker_fee, taker_fee) for [symbol]. Each component
       is [None] if the fee has not been fetched. *)
   val get_fees : symbol:string -> float option * float option
+
+  (* ---- Raw frame decoding (uniform ingress) ---- *)
+
+  (** Decode one raw inbound market-data/execution frame. The single,
+      venue-uniform entry point the engine uses to hand a raw payload to a
+      venue; implementations route it to the right feed internally.
+
+      Runs on the parse domain: implementations MUST NOT touch Lwt primitives,
+      promises, streams or other single-domain state. Mutexes, atomics and
+      [Logging] are allowed. Connection management, authentication and Lwt
+      subscriber fan-out stay in the venue's WebSocket layer. *)
+  val decode_frame : string -> unit
 end
 
 (** Dynamic registry mapping exchange names to their [(module S)]

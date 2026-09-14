@@ -215,6 +215,34 @@ let test_parse_worker_roundtrip () =
   Alcotest.(check bool) "handler executed" true (Atomic.get hits >= 1)
 ;;
 
+let test_parse_worker_uniform_route () =
+  let venue = "test_uniform_venue" in
+  let hits = Atomic.make 0 in
+  let last = ref "" in
+  Concurrency.Parse_worker.register_venue_decoder ~venue (fun payload ->
+    last := payload;
+    ignore (Atomic.fetch_and_add hits 1));
+  (* A venue with no registered decoder must report false so the caller decodes
+     inline rather than having the frame silently dropped by the worker. *)
+  Alcotest.(check bool)
+    "unregistered venue falls back inline"
+    false
+    (Concurrency.Parse_worker.submit_frame "definitely_unregistered" "x");
+  let queued = Concurrency.Parse_worker.submit_frame venue "uniform-frame" in
+  Alcotest.(check bool) "registered venue queued" true queued;
+  let rec poll n =
+    if Atomic.get hits > 0
+    then ()
+    else if n <= 0
+    then Alcotest.fail "venue decoder never ran"
+    else (
+      Thread.delay 0.01;
+      poll (n - 1))
+  in
+  poll 500;
+  Alcotest.(check string) "payload delivered to venue decoder" "uniform-frame" !last
+;;
+
 let test_watchdog_staleness () =
   let open Concurrency.Main_loop_watchdog in
   (* A fresh beat survives many beat intervals without tripping. *)
@@ -269,7 +297,9 @@ let () =
             test_wakeup_wait_releases_on_signal
         ] )
     ; ( "parse_worker"
-      , [ Alcotest.test_case "roundtrip" `Quick test_parse_worker_roundtrip ] )
+      , [ Alcotest.test_case "roundtrip" `Quick test_parse_worker_roundtrip
+        ; Alcotest.test_case "uniform_route" `Quick test_parse_worker_uniform_route
+        ] )
     ; ( "main_loop_watchdog"
       , [ Alcotest.test_case "stall threshold" `Quick test_watchdog_staleness ] )
     ]

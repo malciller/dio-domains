@@ -285,156 +285,173 @@ let record_feed_latency ts_opt =
   | None -> ()
 ;;
 
+(** Float from a [Json_scan] value span, mirroring [json_to_float]: JSON numbers
+    are parsed in place without allocation; string-encoded numbers are decoded
+    from the (unescaped) string. *)
+let json_float_of_span s i j =
+  if Json_scan.value_is_string s i
+  then (
+    try float_of_string (Json_scan.string_of_span s i j) with
+    | _ -> 0.0)
+  else Json_scan.float_of_span s i j
+;;
+
 let handle_message_str ?on_auth_success ?on_auth_error content =
   let trimmed = String.trim content in
   if trimmed <> ""
   then (
     try
-      let json = Yojson.Safe.from_string trimmed in
-      let items =
-        match json with
-        | `List l -> l
-        | _ -> [ json ]
-      in
-      List.iter
-        (fun j ->
-           let open Yojson.Safe.Util in
-           let msg_type =
-             j |> member "T" |> to_string_option |> Option.value ~default:""
-           in
-           match msg_type with
-           | "q" ->
-             let symbol =
-               j |> member "S" |> to_string_option |> Option.value ~default:""
-             in
-             let bp = j |> member "bp" |> json_to_float in
-             let bs = j |> member "bs" |> json_to_float in
-             let ap = j |> member "ap" |> json_to_float in
-             let as_val = j |> member "as" |> json_to_float in
-             let ts_str =
-               j |> member "t" |> to_string_option |> Option.value ~default:""
-             in
-             let ts_opt = parse_timestamp_opt ts_str in
-             let ts = Option.value ts_opt ~default:(Unix.gettimeofday ()) in
-             record_feed_latency ts_opt;
-             if symbol <> ""
-             then (
-               let store = get_or_create_store symbol in
-               let final_bp, final_bs, final_ap, final_as =
-                 match SymbolStore.get_best_bid_ask store with
-                 | Some (prev_bp, prev_bs, prev_ap, prev_as) ->
-                   let b_price = if bp > 0.0 then bp else prev_bp in
-                   let b_sz = if bp > 0.0 then bs else prev_bs in
-                   let a_price = if ap > 0.0 then ap else prev_ap in
-                   let a_sz = if ap > 0.0 then as_val else prev_as in
-                   b_price, b_sz, a_price, a_sz
-                 | None -> bp, bs, ap, as_val
-               in
-               if final_bp > 0.0 || final_ap > 0.0
-               then (
-                 SymbolStore.push
-                   store
-                   { bid_price = final_bp
-                   ; bid_size = final_bs
-                   ; ask_price = final_ap
-                   ; ask_size = final_as
-                   ; timestamp = ts
-                   };
-                 Logging.debug_f
-                   ~section
-                   "[%s] Quote update: bid %.2f (sz %.2f), ask %.2f (sz %.2f)"
-                   symbol
-                   final_bp
-                   final_bs
-                   final_ap
-                   final_as))
-           | "t" ->
-             let symbol =
-               j |> member "S" |> to_string_option |> Option.value ~default:""
-             in
-             let price = j |> member "p" |> json_to_float in
-             let size = j |> member "s" |> json_to_float in
-             let ts_str =
-               j |> member "t" |> to_string_option |> Option.value ~default:""
-             in
-             let ts_opt = parse_timestamp_opt ts_str in
-             let ts = Option.value ts_opt ~default:(Unix.gettimeofday ()) in
-             record_feed_latency ts_opt;
-             if symbol <> "" && price > 0.0
-             then (
-               let store = get_or_create_store symbol in
-               let side_str =
-                 match SymbolStore.get_best_bid_ask store with
-                 | Some (bp, _, ap, _) ->
-                   if ap > 0.0 && price >= ap
-                   then "buy"
-                   else if bp > 0.0 && price <= bp
-                   then "sell"
-                   else "trade"
-                 | None -> "trade"
-               in
-               (* Trades are analytics ONLY. A print is evidence of price, not
-                    a two-sided quote, and never fabricates a bid/ask. Top-of-book
-                    comes only from the WS quote stream; a quote gap holds the
-                    last real quote until the feed resumes. *)
-               SymbolStore.push_trade
-                 store
-                 { price; size; timestamp = ts; side = side_str };
-               Logging.debug_f
-                 ~section
-                 "[%s] Live trade update: price %.2f (sz %.2f)"
-                 symbol
-                 price
-                 size)
-           | "b" ->
-             let symbol =
-               j |> member "S" |> to_string_option |> Option.value ~default:""
-             in
-             let close_p = j |> member "c" |> json_to_float in
-             Logging.debug_f ~section "[%s] Bar close: %.2f" symbol close_p
-           | "heartbeat" -> Logging.debug ~section "Alpaca Market Data WS heartbeat"
-           | "success" ->
-             let msg =
-               j |> member "msg" |> to_string_option |> Option.value ~default:""
-             in
-             Logging.info_f ~section "Alpaca Market Data WS status: %s" msg;
-             if msg = "authenticated"
-             then (
-               match on_auth_success with
-               | Some f -> f ()
-               | None -> ())
-           | "subscription" ->
-             let quotes =
-               match j |> member "quotes" with
-               | `List l -> List.filter_map to_string_option l
-               | _ -> []
-             in
-             let trades =
-               match j |> member "trades" with
-               | `List l -> List.filter_map to_string_option l
-               | _ -> []
-             in
-             Logging.debug_f
-               ~section
-               "Alpaca Market Data WS subscription confirmed - quotes: [%s], trades: [%s]"
-               (String.concat ", " quotes)
-               (String.concat ", " trades)
-           | "error" ->
-             let code = j |> member "code" |> to_int_option |> Option.value ~default:0 in
-             let msg =
-               j |> member "msg" |> to_string_option |> Option.value ~default:""
-             in
-             Logging.error_f ~section "Alpaca Market Data WS error (%d): %s" code msg;
-             (match on_auth_error with
-              | Some f -> f code msg
+      (* Field-directed decode via [Json_scan]: no JSON DOM is built, so no
+         AST allocation per frame. Field order is arbitrary; each lookup is a
+         bounded scan of the item span. *)
+      let len = String.length trimmed in
+      let process_item i j =
+        if j - i >= 2 && trimmed.[i] = '{' && trimmed.[j - 1] = '}'
+        then (
+          let oi, oj = Json_scan.object_interior trimmed i j in
+          let string_field key =
+            match Json_scan.find_field trimmed oi oj key with
+            | Some (pi, pj) -> Json_scan.string_of_span trimmed pi pj
+            | None -> ""
+          in
+          let float_field key =
+            match Json_scan.find_field trimmed oi oj key with
+            | Some (pi, pj) -> json_float_of_span trimmed pi pj
+            | None -> 0.0
+          in
+          let msg_type = string_field "T" in
+          match msg_type with
+          | "q" ->
+            let symbol = string_field "S" in
+            let bp = float_field "bp" in
+            let bs = float_field "bs" in
+            let ap = float_field "ap" in
+            let as_val = float_field "as" in
+            let ts_str = string_field "t" in
+            let ts_opt = parse_timestamp_opt ts_str in
+            let ts = Option.value ts_opt ~default:(Unix.gettimeofday ()) in
+            record_feed_latency ts_opt;
+            if symbol <> ""
+            then (
+              let store = get_or_create_store symbol in
+              let final_bp, final_bs, final_ap, final_as =
+                match SymbolStore.get_best_bid_ask store with
+                | Some (prev_bp, prev_bs, prev_ap, prev_as) ->
+                  let b_price = if bp > 0.0 then bp else prev_bp in
+                  let b_sz = if bp > 0.0 then bs else prev_bs in
+                  let a_price = if ap > 0.0 then ap else prev_ap in
+                  let a_sz = if ap > 0.0 then as_val else prev_as in
+                  b_price, b_sz, a_price, a_sz
+                | None -> bp, bs, ap, as_val
+              in
+              if final_bp > 0.0 || final_ap > 0.0
+              then (
+                SymbolStore.push
+                  store
+                  { bid_price = final_bp
+                  ; bid_size = final_bs
+                  ; ask_price = final_ap
+                  ; ask_size = final_as
+                  ; timestamp = ts
+                  };
+                Logging.debug_f
+                  ~section
+                  "[%s] Quote update: bid %.2f (sz %.2f), ask %.2f (sz %.2f)"
+                  symbol
+                  final_bp
+                  final_bs
+                  final_ap
+                  final_as))
+          | "t" ->
+            let symbol = string_field "S" in
+            let price = float_field "p" in
+            let size = float_field "s" in
+            let ts_str = string_field "t" in
+            let ts_opt = parse_timestamp_opt ts_str in
+            let ts = Option.value ts_opt ~default:(Unix.gettimeofday ()) in
+            record_feed_latency ts_opt;
+            if symbol <> "" && price > 0.0
+            then (
+              let store = get_or_create_store symbol in
+              let side_str =
+                match SymbolStore.get_best_bid_ask store with
+                | Some (bp, _, ap, _) ->
+                  if ap > 0.0 && price >= ap
+                  then "buy"
+                  else if bp > 0.0 && price <= bp
+                  then "sell"
+                  else "trade"
+                | None -> "trade"
+              in
+              (* Trades are analytics ONLY. A print is evidence of price, not
+                   a two-sided quote, and never fabricates a bid/ask. Top-of-book
+                   comes only from the WS quote stream; a quote gap holds the
+                   last real quote until the feed resumes. *)
+              SymbolStore.push_trade
+                store
+                { price; size; timestamp = ts; side = side_str };
+              Logging.debug_f
+                ~section
+                "[%s] Live trade update: price %.2f (sz %.2f)"
+                symbol
+                price
+                size)
+          | "b" ->
+            let symbol = string_field "S" in
+            let close_p = float_field "c" in
+            Logging.debug_f ~section "[%s] Bar close: %.2f" symbol close_p
+          | "heartbeat" -> Logging.debug ~section "Alpaca Market Data WS heartbeat"
+          | "success" ->
+            let msg = string_field "msg" in
+            Logging.info_f ~section "Alpaca Market Data WS status: %s" msg;
+            if msg = "authenticated"
+            then (
+              match on_auth_success with
+              | Some f -> f ()
               | None -> ())
-           | other ->
-             Logging.debug_f
-               ~section
-               "Alpaca Market Data WS received msg (T=%s): %s"
-               other
-               (Yojson.Safe.to_string j))
-        items
+          | "subscription" ->
+            let strings_of key =
+              match Json_scan.find_field trimmed oi oj key with
+              | Some (ai, aj) when trimmed.[ai] = '[' ->
+                Json_scan.array_fold trimmed (ai + 1) (aj - 1) [] (fun acc pi pj ->
+                  if Json_scan.value_is_string trimmed pi
+                  then Json_scan.string_of_span trimmed pi pj :: acc
+                  else acc)
+                |> List.rev
+              | _ -> []
+            in
+            let quotes = strings_of "quotes" in
+            let trades = strings_of "trades" in
+            Logging.debug_f
+              ~section
+              "Alpaca Market Data WS subscription confirmed - quotes: [%s], trades: [%s]"
+              (String.concat ", " quotes)
+              (String.concat ", " trades)
+          | "error" ->
+            let code =
+              match Json_scan.find_field trimmed oi oj "code" with
+              | Some (pi, pj) -> Json_scan.int_of_span trimmed pi pj
+              | None -> 0
+            in
+            let msg = string_field "msg" in
+            Logging.error_f ~section "Alpaca Market Data WS error (%d): %s" code msg;
+            (match on_auth_error with
+             | Some f -> f code msg
+             | None -> ())
+          | other ->
+            let excerpt =
+              let n = j - i in
+              if n > 600 then String.sub trimmed i 600 ^ "..." else String.sub trimmed i n
+            in
+            Logging.debug_f
+              ~section
+              "Alpaca Market Data WS received msg (T=%s): %s"
+              other
+              excerpt)
+      in
+      if len >= 1 && trimmed.[0] = '['
+      then Json_scan.array_iter trimmed 1 (len - 1) process_item
+      else process_item 0 len
     with
     | exn ->
       Logging.error_f

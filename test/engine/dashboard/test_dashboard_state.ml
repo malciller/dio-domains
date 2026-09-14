@@ -2,6 +2,8 @@
    snapshot carries the oracle's ACTIVE/INACTIVE verdict, sizing and capital
    accounting per tracked asset (the dashboard's pause state source). *)
 
+module Sell_orders = Dio_strategies.Jacobs_ladder_sell_orders
+
 let make_decision () =
   { Dio_oracle.Oracle_runtime.exchange = "hyperliquid"
   ; symbol = "HYPE/USDC"
@@ -93,7 +95,7 @@ let test_ladder_sell_count_uses_ledger () =
      commitments => count 2. *)
   let symbol = "DASH_SELLCOUNT/XMR/USD" in
   let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   Hashtbl.clear state.sell_commitments;
   Hashtbl.replace
     state.sell_commitments

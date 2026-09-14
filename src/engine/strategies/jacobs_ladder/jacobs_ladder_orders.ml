@@ -5,6 +5,8 @@ open Jacobs_ladder_types
 open Jacobs_ladder_config
 open Jacobs_ladder_reservation
 
+module Sell_orders = Jacobs_ladder_sell_orders
+
 (** Shared order ringbuffer across all strategy domains. *)
 let order_buffer = LockFreeQueue.create ()
 
@@ -167,8 +169,7 @@ let push_order ~now ?state order =
                 :: state.pending_orders;
              match order.side, order.price with
              | Sell, Some price ->
-               state.open_sell_orders
-               <- (temp_order_id, price, order.qty) :: state.open_sell_orders
+               Sell_orders.push state.open_sell_orders temp_order_id price order.qty
              | _ -> ())
          | Amend ->
            let temp_order_id =

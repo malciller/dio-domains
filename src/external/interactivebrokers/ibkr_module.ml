@@ -576,7 +576,16 @@ module Ibkr_impl = struct
        makes downstream consumers treat the fee as 0.0. *)
     None, None
   ;;
+
+  (* IBKR ingestion is REST-poll based; it exposes no raw frame stream to
+     decode, so the uniform entry point is a no-op. *)
+  let decode_frame (_ : string) = ()
 end
 
 (* Register into the exchange registry at module load. *)
 let () = Exchange.Registry.register (module Ibkr_impl)
+
+(* Register the uniform venue decoder for the parse-domain offload route. *)
+let () =
+  Concurrency.Parse_worker.register_venue_decoder ~venue:"ibkr" Ibkr_impl.decode_frame
+;;

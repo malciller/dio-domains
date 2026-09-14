@@ -138,6 +138,7 @@ let sections = Hashtbl.create 32
 let use_colors = ref true
 let output_channel = ref stderr
 let enabled_sections = ref []
+let enabled_set : (string, unit) Hashtbl.t = Hashtbl.create 16
 let quiet_mode = ref false
 
 (* ---- Line width ----
@@ -207,7 +208,12 @@ let log_callback : (level -> string -> string -> unit Lwt.t) ref =
   ref (fun _level _section _message -> Lwt.return_unit)
 ;;
 
-let set_enabled_sections secs = enabled_sections := secs
+let set_enabled_sections secs =
+  enabled_sections := secs;
+  Hashtbl.reset enabled_set;
+  List.iter (fun s -> Hashtbl.replace enabled_set s ()) secs
+;;
+
 let set_quiet_mode quiet = quiet_mode := quiet
 let set_log_callback callback = log_callback := callback
 
@@ -254,7 +260,7 @@ let will_log level section_name =
       Domain.DLS.set tls_section_cache (section_name, s);
       s)
   in
-  (!enabled_sections = [] || List.mem section_name !enabled_sections)
+  (Hashtbl.length enabled_set = 0 || Hashtbl.mem enabled_set section_name)
   && level_to_int level >= level_to_int sec.min_level
   && level_to_int level >= level_to_int !global_min_level
 ;;
@@ -516,7 +522,7 @@ let start_async_drain () =
 let log_sync level section_name message =
   let section = get_section section_name in
   if
-    (!enabled_sections <> [] && not (List.mem section_name !enabled_sections))
+    (Hashtbl.length enabled_set <> 0 && not (Hashtbl.mem enabled_set section_name))
     || level_to_int level < level_to_int section.min_level
     || level_to_int level < level_to_int !global_min_level
   then ()
