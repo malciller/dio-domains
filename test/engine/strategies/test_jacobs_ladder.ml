@@ -4375,15 +4375,16 @@ let test_alpaca_venue_available_blocks_reserve_dip () =
     (pushed_sell_for symbol = None)
 ;;
 
-let test_alpaca_excess_sweep_capped_to_one_lot () =
-  (* A single sweep may grow the top rung by at most one grid lot. An uncapped
-     sweep turns any transient over-estimate of sellable inventory into a rung
-     sized to the whole position. Ladder 101x1 fully resting, 5.0 sellable,
-     lot 1.0: the top rung must end at 2.0, not 6.0. *)
-  let symbol = "ALPACA_SWEEP_CAP/USD" in
+let test_alpaca_excess_sweep_takes_full_excess () =
+  (* The sweep routes the WHOLE sellable excess onto the top rung in one amend
+     (there is deliberately no per-invocation lot cap). The allowance is bounded
+     by the reserve-excluded ledger headroom, so it can never include
+     reserved_base. Ladder 101x1 resting (1.0 committed), asset 6.0, lot 1.0:
+     the top rung ends at 6.0 (the entire position), not 2.0. *)
+  let symbol = "ALPACA_SWEEP_FULL/USD" in
   let state = reset_alpaca_excess_state symbol in
   state.persisted_sell_levels <- [ 101.0, 1.0 ];
-  state.open_sell_orders <- [ "cap-top-oid", 101.0, 1.0 ];
+  state.open_sell_orders <- [ "full-top-oid", 101.0, 1.0 ];
   let asset = alpaca_excess_asset ~symbol in
   let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
   Dio_strategies.Jacobs_ladder.evaluate_sell_leg
@@ -4410,12 +4411,147 @@ let test_alpaca_excess_sweep_capped_to_one_lot () =
   in
   match amends with
   | [ o ] ->
-    check (float 1e-6) "excess sweep grows the top rung by at most one lot" 2.0 o.qty
+    check
+      (float 1e-6)
+      "excess sweep routes the full sellable excess onto the top rung"
+      6.0
+      o.qty
   | _ ->
     failwith
       (Printf.sprintf
-         "expected exactly one capped sell amend on the top rung, got %d"
+         "expected exactly one full-excess sell amend on the top rung, got %d"
          (List.length amends))
+;;
+
+let test_alpaca_restore_excludes_reserved_base () =
+  (* A manually cancelled resting rung is restored - but for [target_q -
+     reserved_base], never re-committing the reserve. Account holds 1.0 with
+     0.1 reserved; the sole persisted rung (1.0 @ 101) has no live order. The
+     fundable headroom is [position - reserved_base - committed] = 0.9, so the
+     replacement places 0.9 and the persisted rung is clamped to match. *)
+  let symbol = "ALPACA_RESTORE_RESERVED/USD" in
+  let state = reset_alpaca_excess_state symbol in
+  state.reserved_base <- 0.1;
+  state.persisted_sell_levels <- [ 101.0, 1.0 ];
+  state.open_sell_orders <- [];
+  let asset = alpaca_excess_asset ~symbol in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:100.0
+    ~ask_price:100.1
+    ~asset_balance:1.0
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:None
+    ~oracle_halted:false;
+  (match pushed_sell_for symbol with
+   | Some o ->
+     check
+       (float 0.005)
+       "cancelled rung restored at its recorded price"
+       101.0
+       (Option.value o.price ~default:0.0);
+     check
+       (float 1e-6)
+       "restored rung qty is the recorded qty minus reserved_base"
+       0.9
+       o.qty
+   | None -> failwith "expected the cancelled rung to be restored");
+  check
+    bool
+    "persisted rung clamped to the reserve-excluded qty"
+    true
+    (List.exists (fun (p, q) -> p = 101.0 && abs_float (q -. 0.9) < 1e-6)
+       state.persisted_sell_levels)
+;;
+
+let test_alpaca_restore_partial_headroom_clamped () =
+  (* A cancelled rung larger than the free headroom is restored for what IS
+     fundable, not pruned. Account holds 1.0 with 0.1 reserved; the persisted
+     rung is 2.0 @ 101. Headroom is 0.9, so the shortfall (1.1) exceeds
+     reserved_base - the old rule pruned the rung here and stranded the base.
+     The rung must be re-placed at 0.9. *)
+  let symbol = "ALPACA_RESTORE_PARTIAL/USD" in
+  let state = reset_alpaca_excess_state symbol in
+  state.reserved_base <- 0.1;
+  state.persisted_sell_levels <- [ 101.0, 2.0 ];
+  state.open_sell_orders <- [];
+  let asset = alpaca_excess_asset ~symbol in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:100.0
+    ~ask_price:100.1
+    ~asset_balance:1.0
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:None
+    ~oracle_halted:false;
+  (match pushed_sell_for symbol with
+   | Some o ->
+     check
+       (float 0.005)
+       "partially-fundable rung restored at its recorded price"
+       101.0
+       (Option.value o.price ~default:0.0);
+     check
+       (float 1e-6)
+       "partially-fundable rung restored for the available headroom"
+       0.9
+       o.qty
+   | None -> failwith "expected the partially-fundable rung to be restored");
+  check
+    bool
+    "persisted rung clamped to headroom (not pruned)"
+    true
+    (List.exists (fun (p, q) -> p = 101.0 && abs_float (q -. 0.9) < 1e-6)
+       state.persisted_sell_levels)
+;;
+
+let test_alpaca_sweep_skips_dust_delta () =
+  (* The sweep gates on the added DELTA's notional, not the whole rung's. A
+     dust excess (here 1e-6 shares, worth ~1e-4) must not spin an Alpaca
+     cancel+replace amend every cycle. *)
+  let symbol = "ALPACA_SWEEP_DUST/USD" in
+  let state = reset_alpaca_excess_state symbol in
+  state.persisted_sell_levels <- [ 101.0, 1.0 ];
+  state.open_sell_orders <- [ "dust-top-oid", 101.0, 1.0 ];
+  let asset = alpaca_excess_asset ~symbol in
+  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
+  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:100.0
+    ~ask_price:100.1
+    ~asset_balance:1.000001
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:1.0
+    ~base_balance_age:None
+    ~oracle_halted:false;
+  let amends =
+    List.filter
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Amend
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+  in
+  check bool "dust excess does not spin a sweep amend" true (amends = [])
 ;;
 
 let test_alpaca_sell_anchors_on_fill_not_ask () =
@@ -4965,13 +5101,15 @@ let test_sync_open_orders_price_keyed_index () =
     true
     (List.exists (fun (p, q) -> p = 97.0 && q = 1.0) state.persisted_sell_levels);
   check bool "adopted level persisted flag" true state.persistence_dirty;
-  (* Case 2: duplicate open sells at the same price must not both consume the
-     same persisted level (1-to-1 matching). *)
+  (* Case 2: two live orders at ONE price collapse to a single persisted rung
+     carrying the max live qty (one rung per grid price; this is the duplicate
+     that used to flap the recorded qty every scan). A repeat sync must leave the
+     ladder unchanged and not re-dirty it. *)
   let state2 = get_strategy_state "IDX_MATCH2/USD" in
   state2.persisted_sell_levels <- [ 105.00, 1.0 ];
   let iter_orders2 f =
     f "oid_a" 105.0 1.0 "sell" (Some 1);
-    f "oid_b" 105.0 1.0 "sell" (Some 1)
+    f "oid_b" 105.0 1.5 "sell" (Some 1)
   in
   let _ =
     sync_open_orders
@@ -4984,9 +5122,30 @@ let test_sync_open_orders_price_keyed_index () =
       ~get_open_orders_generation:(fun () -> -1)
       ~ecfg
   in
-  (* One level matches; the second sell adopts a new level. *)
   let matches = List.filter (fun (p, _) -> p = 105.0) state2.persisted_sell_levels in
-  check bool "duplicate open sells matched 1-to-1" true (List.length matches = 2)
+  check bool "same-price live orders collapse to one rung" true (List.length matches = 1);
+  check
+    (float 1e-9)
+    "collapsed rung carries the max live qty"
+    1.5
+    (snd (List.hd matches));
+  state2.persistence_dirty <- false;
+  let _ =
+    sync_open_orders
+      ~state:state2
+      ~now:101.0
+      ~asset:{ asset_alpaca with symbol = "IDX_MATCH2/USD" }
+      ~bid_price:105.0
+      ~lot_qty:1.0
+      ~iter_open_orders:iter_orders2
+      ~get_open_orders_generation:(fun () -> -1)
+      ~ecfg
+  in
+  check
+    bool
+    "repeat sync with the same two orders leaves the ladder untouched"
+    false
+    state2.persistence_dirty
 ;;
 
 let test_sync_open_orders_reconcile_agreement () =
@@ -6152,9 +6311,21 @@ let () =
             `Quick
             test_alpaca_venue_available_blocks_reserve_dip
         ; test_case
-            "alpaca excess sweep is capped to one lot"
+            "alpaca excess sweep routes the full excess"
             `Quick
-            test_alpaca_excess_sweep_capped_to_one_lot
+            test_alpaca_excess_sweep_takes_full_excess
+        ; test_case
+            "alpaca restore excludes reserved_base"
+            `Quick
+            test_alpaca_restore_excludes_reserved_base
+        ; test_case
+            "alpaca restore clamps a partially-fundable rung"
+            `Quick
+            test_alpaca_restore_partial_headroom_clamped
+        ; test_case
+            "alpaca sweep skips a dust delta"
+            `Quick
+            test_alpaca_sweep_skips_dust_delta
         ; test_case
             "new buy respects the 2x gi closest-sell cap"
             `Quick
