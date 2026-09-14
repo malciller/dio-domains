@@ -108,10 +108,14 @@ COPY --from=builder /app/opam-packages.txt /usr/share/licenses/dio/opam-packages
 #     without cloning the repository.
 COPY config.example.json .env.example compose.yaml /usr/share/doc/dio/
 
-# 6. Setup non-root system user and runtime directories
-RUN groupadd -g 1000 dio && useradd -u 1000 -g dio -s /bin/false dio \
+# 6. Setup non-root runtime user (UID/GID 1000, matching the host bind mounts)
+#    and directories. Ubuntu 24.04 already ships UID/GID 1000 as `ubuntu`, so
+#    reuse it rather than failing; create `dio` only when the slot is free.
+#    Run as the numeric UID so the username does not matter.
+RUN (getent group 1000 >/dev/null || groupadd -g 1000 dio) \
+    && (getent passwd 1000 >/dev/null || useradd -u 1000 -g 1000 -s /bin/false -M dio) \
     && mkdir -p /var/run/dio /app/data \
-    && chown -R dio:dio /var/run/dio /app
+    && chown -R 1000:1000 /var/run/dio /app
 
 WORKDIR /app
 
@@ -132,8 +136,8 @@ ENV LIGHTER_SIGNER_LIB_PATH=/opt/lighter-signer/lighter-signer-linux-amd64
 # 10. Expose metrics broadcast port
 EXPOSE 8080
 
-# 11. Run as non-root user
-USER dio
+# 11. Run as non-root user (numeric UID 1000; the name is `ubuntu` on 24.04)
+USER 1000
 
 # 12. Entrypoint guard + default command
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
