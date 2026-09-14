@@ -1029,15 +1029,29 @@ let trigger_orderbook_cleanup ~reason () =
     Lwt.return_unit)
 ;;
 
-(** Timestamp of the last orderbook frame, for the ws_feed inter-message gap
-    measurement (recorded only on book data, so heartbeats don't mask a
-    stalled book feed). *)
-let last_book_time = ref 0.0
-
 (* Per-connection heartbeat closure, published so the Parse_worker handler
    can invoke it from the parse domain (domain-safe: mutex + timestamp
    update). One orderbook connection exists at a time. *)
 let current_on_heartbeat : (unit -> unit) option Atomic.t = Atomic.make None
+
+(** Records the clock-corrected one-way network latency of each [book] data
+    entry from its RFC3339 server [timestamp]. No-op for entries without one.
+    Recorded only on book data so heartbeats don't mask a stalled book feed. *)
+let record_book_latency json =
+  let open Yojson.Safe.Util in
+  match member "data" json with
+  | `List entries ->
+    List.iter
+      (fun entry ->
+         match entry |> member "timestamp" |> to_string_option with
+         | Some ts ->
+           (match Network_latency.unix_of_rfc3339 ts with
+            | Some event -> Network_latency.record_feed_event_s "kraken" ~event ()
+            | None -> ())
+         | None -> ())
+      entries
+  | _ -> ()
+;;
 
 let extract_symbol_opt json =
   let open Yojson.Safe.Util in
@@ -1070,16 +1084,10 @@ let handle_dispatch json on_heartbeat =
   | Some "heartbeat", _, _ -> on_heartbeat ()
   | _, _, Some "heartbeat" -> on_heartbeat ()
   | Some "book", Some "snapshot", _ ->
-    let now = Unix.gettimeofday () in
-    if !last_book_time > 0.0
-    then Network_latency.record_feed_s "kraken" (now -. !last_book_time);
-    last_book_time := now;
+    record_book_latency json;
     ignore (process_orderbook_message ~reset:true json on_heartbeat)
   | Some "book", Some "update", _ ->
-    let now = Unix.gettimeofday () in
-    if !last_book_time > 0.0
-    then Network_latency.record_feed_s "kraken" (now -. !last_book_time);
-    last_book_time := now;
+    record_book_latency json;
     ignore (process_orderbook_message ~reset:false json on_heartbeat)
   | _, _, Some "subscribe" ->
     let success = member "success" json |> to_bool_option |> Option.value ~default:true in

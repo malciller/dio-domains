@@ -251,9 +251,25 @@ let send_tx_ws ~tx_type ~tx_info =
   send_private_json json "Private"
 ;;
 
-(** Timestamp of the last market-data frame on the public connection, for the
-    ws_feed inter-message gap measurement. *)
-let last_feed_time = ref 0.0
+(** Records the clock-corrected one-way network latency of an order-book frame
+    from its top-level [timestamp] (milliseconds since epoch). No-op when the
+    frame carries no parseable timestamp. *)
+let record_orderbook_latency json =
+  let open Yojson.Safe.Util in
+  let ms =
+    match member "timestamp" json with
+    | `Int i -> Some (float_of_int i)
+    | `Intlit s -> (try Some (float_of_string s) with
+      | _ -> None)
+    | `Float f -> Some f
+    | `String s -> (try Some (float_of_string s) with
+      | _ -> None)
+    | _ -> None
+  in
+  match ms with
+  | Some ms -> Network_latency.record_feed_event_ms "lighter" ~event_ms:ms ()
+  | None -> ()
+;;
 
 (** Dispatches one WS frame by opcode and message type. *)
 let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
@@ -261,14 +277,6 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
   | Websocket.Frame.Opcode.Text ->
     Concurrency.Tick_event_bus.publish_tick ();
     on_heartbeat ();
-    (* Feed cadence: gap since the previous market-data frame (public
-       connection only; the private stream carries account/order data). *)
-    if state != private_state
-    then (
-      let now = Unix.gettimeofday () in
-      if !last_feed_time > 0.0
-      then Network_latency.record_feed_s "lighter" (now -. !last_feed_time);
-      last_feed_time := now);
     (* Any inbound text frame proves the private relay works. *)
     if state == private_state && not (Atomic.get private_stream_confirmed)
     then Atomic.set private_stream_confirmed true;
@@ -318,11 +326,13 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
        (match msg_type with
         | "snapshot/order_book" | "subscribed/order_book" ->
           Atomic.incr msg_counter_orderbook;
+          record_orderbook_latency json;
           let mi = market_index_from_channel channel in
           if mi >= 0
           then Lighter_orderbook_feed.process_orderbook_snapshot ~market_index:mi json
         | "update/order_book" ->
           Atomic.incr msg_counter_orderbook;
+          record_orderbook_latency json;
           let mi = market_index_from_channel channel in
           if mi >= 0
           then Lighter_orderbook_feed.process_orderbook_update ~market_index:mi json
