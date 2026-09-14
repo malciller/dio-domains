@@ -71,14 +71,23 @@ FROM ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca0
 #    gcc_s, m, c. gmp/pcre/pq/zlib are NOT linked and are deliberately omitted
 #    here; libpq5 in particular drags in krb5/ldap/gnutls. libssl is named
 #    libssl3t64 on 24.04 (the 64-bit time_t rename).
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libffi8 \
-    libssl3t64 \
-    libstdc++6 \
-    libgcc-s1 \
-    libjemalloc2 \
-    ca-certificates \
-    netbase \
+#
+#    `apt-get upgrade` applies the security updates the pinned base digest is
+#    missing (e.g. glibc 2.39-0ubuntu8.8 -> 8.9, which fixes six CVEs). After
+#    this the image has zero *fixable* CVEs; the residual are base-OS packages
+#    with no upstream patch (glibc/perl/tar/zlib/passwd/libudev1), present in
+#    any glibc image - distroless was measurably worse (Debian glibc carries
+#    more unfixed legacy CVEs).
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       libffi8 \
+       libssl3t64 \
+       libstdc++6 \
+       libgcc-s1 \
+       libjemalloc2 \
+       ca-certificates \
+       netbase \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
     && rm -rf /var/lib/apt/lists/*
 
 # 4. Copy libsecp256k1 from builder
