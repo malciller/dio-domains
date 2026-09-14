@@ -11,11 +11,20 @@ drawdown history. A terminal dashboard attaches to the running engine over a
 Unix domain socket.
 
 [![ci](https://github.com/malciller/dio-domains/actions/workflows/ci.yml/badge.svg)](https://github.com/malciller/dio-domains/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/malciller/dio-domains)](https://github.com/malciller/dio-domains/releases)
+[![stars](https://img.shields.io/github/stars/malciller/dio-domains?style=social&label=Star)](https://github.com/malciller/dio-domains/stargazers)
+[![docker pulls](https://img.shields.io/docker/pulls/malciller/dio-domains)](https://hub.docker.com/r/malciller/dio-domains)
+[![OCaml](https://img.shields.io/github/languages/top/malciller/dio-domains)](https://ocaml.org)
+[![license](https://img.shields.io/github/license/malciller/dio-domains)](LICENSE)
 
 > **This trades real money.** It comes with no warranty. The auto-hedge strategy
 > is experimental — test on a testnet before risking capital.
 
 ![dio terminal dashboard](assets/dio-dashboard.gif)
+
+> Building with this? [Star the repo](https://github.com/malciller/dio-domains/stargazers)
+> and [watch releases](https://github.com/malciller/dio-domains/releases) to follow
+> where it goes. Bug reports and ideas go in the issue tracker.
 
 ## Quick start
 

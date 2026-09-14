@@ -2,6 +2,9 @@ name: ci
 on:
   push:
     branches: ["**"]
+    # Tags are release gates: build-test on the exact commit that the
+    # release workflow waits for before publishing a GitHub Release.
+    tags: ["v*"]
   pull_request:
 
 jobs:

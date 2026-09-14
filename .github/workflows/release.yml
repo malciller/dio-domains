@@ -1,0 +1,48 @@
+name: release
+
+# Publishes a GitHub Release for every v* tag (dio tags are cut by the
+# maintainer, and publish.yml handles the container images). A tag without a
+# release shows up as a bare ref; this workflow makes each tag visible as a
+# first-class Release with auto-generated notes and a "Latest" marker.
+#
+# It uses the repository-scoped GITHUB_TOKEN so it needs no external
+# credentials. The tag itself is the source of truth: if a tag is re-pushed
+# with new commits, the release body is already published and this workflow
+# simply skips (a Success is not required for release reliability).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Wait for the CI on this exact tag to finish, so a release is never
+      # attached to a red build. build-test is the classic-flambda gate; the
+      # OxCaml image path is exercised by publish.yml on the same tag.
+      - name: Wait for CI on the tag
+        id: wait
+        uses: lewagon/wait-on-check-action@ccfb013c15c8afb7bf2b7c028fb74dc5a068cccc # v1.3.4
+        with:
+          ref: ${{ github.ref }}
+          check-name: "build-test"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 30
+          allowed-conclusions: success
+
+      - name: Publish release
+        # Drafts nothing: every tag that passes CI ships as a Release
+        # immediately. `generate_release_notes` fills the body from the PRs
+        # and commits merged since the previous tag.
+        uses: softprops/action-gh-release@64df7ca660f0a62e71442d521755ff05b68b9b9b # v2.0.1
+        with:
+          generate_release_notes: true
+          make_latest: true
+          prerelease: false
