@@ -22,9 +22,9 @@ Unix domain socket.
 
 ![dio terminal dashboard](assets/dio-dashboard.gif)
 
-> Building with this? [Star the repo](https://github.com/malciller/dio-domains/stargazers)
-> and [watch releases](https://github.com/malciller/dio-domains/releases) to follow
-> where it goes. Bug reports and ideas go in the issue tracker.
+> Like it? [Star the repo](https://github.com/malciller/dio-domains/stargazers)
+> so more people find it. [Watch releases](https://github.com/malciller/dio-domains/releases)
+> to see what's next. Bugs and ideas go in the issue tracker.
 
 ## Quick start
 
