@@ -80,6 +80,38 @@ let partition_persisted_sell_levels persisted open_orders =
   List.rev !open_acc, List.rev !missing_acc
 ;;
 
+(** Tolerance used to treat two persisted rung prices as the same level: 1 bp
+    of price or 1e-4 absolute, matching [partition_persisted_sell_levels]. *)
+let price_within_tolerance ~reference p =
+  abs_float (p -. reference) <= reference *. 0.0001 || abs_float (p -. reference) <= 1e-4
+;;
+
+(** Collapse persisted levels whose prices fall within the same tolerance bucket
+    to a single rung, price-descending, keeping the FIRST occurrence. Callers
+    pass a list with the live (feed-matched) entries ahead of the stale/missing
+    ones - [open_levels @ kept_missing] - so the surviving rung carries the live
+    qty and the stale duplicate from an amend (cancel+replace) window is dropped.
+    This is what stops the 1-to-1 reconcile from rewriting the recorded qty back
+    and forth between duplicates on every scan (the "0.26 -> 2.34 -> 0.26"
+    flapping). Returns the input list physically unchanged when there is nothing
+    to drop, so the scan's index cache is not invalidated on the common
+    no-change pass. *)
+let dedupe_persisted_sell_levels levels =
+  let sorted = List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) levels in
+  let changed = ref false in
+  let rec go acc = function
+    | [] -> List.rev acc
+    | (p, q) :: rest ->
+      (match acc with
+       | (ap, _) :: _ when price_within_tolerance ~reference:ap p ->
+         changed := true;
+         go acc rest
+       | _ -> go ((p, q) :: acc) rest)
+  in
+  let merged = go [] sorted in
+  if !changed then merged else levels
+;;
+
 (** Reconciles the persisted-sell grid (Alpaca offline fill recovery). Computed
     once per execution and reused by the three persisted-sell branches. *)
 let reconcile_persisted_sell_levels ~state =
@@ -118,6 +150,13 @@ let buy_ack_ghost_grace_s = 15.0
     spurious tiny positive delta would read as an "increase" and wedge an
     outstanding sell hold. *)
 let balance_delta_epsilon = 1e-9
+
+(** Max base-balance snapshot age for the excess sweep to run. The sweep sizes
+    against the venue's [qty_available]; while a poll is hung (REST timeout) or
+    the venue is still reconstructing an amend's hold, that figure is stale-HIGH
+    and the sweep ratchets the top rung past [reserved_base]. A hung poll ages
+    the snapshot past this bound and the sweep waits it out. *)
+let sweep_max_balance_age_s = 10.0
 
 (** Portion of placed-sell base the balance feed may not yet be netting.
     Applies to every accumulation venue (Hyperliquid, Kraken, IBKR, Lighter):
@@ -474,33 +513,6 @@ let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
     List.iter (Hashtbl.remove state.evicted_orders) !to_remove)
 ;;
 
-(** Scratch matcher for [sync_open_orders]'s persisted-sell-level reconcile.
-    [scan_persisted_bucket] probes one [persisted_idx] bucket for a level within
-    tolerance of [price] not yet matched this scan, keeping the lowest-index
-    candidate (mirroring the original in-order scan). [probe_persisted_bucket]
-    is the top-level entry. Both are top-level (not per-order closures) to avoid
-    re-allocating a callback per open sell per execution. *)
-let rec scan_persisted_bucket ~matched_persisted_indices ~price ~bk ~best = function
-  | [] -> ()
-  | (idx, p, q) :: rest ->
-    if
-      (not (Hashtbl.mem matched_persisted_indices idx))
-      && (abs_float (p -. price) <= price *. 0.0001 || abs_float (p -. price) <= 1e-4)
-    then (
-      match !best with
-      | None -> best := Some (bk, idx, p, q)
-      | Some (_, b_idx, _, _) when idx < b_idx -> best := Some (bk, idx, p, q)
-      | _ -> ());
-    scan_persisted_bucket ~matched_persisted_indices ~price ~bk ~best rest
-;;
-
-let probe_persisted_bucket bk ~matched_persisted_indices ~persisted_idx ~price ~best =
-  match Hashtbl.find_opt persisted_idx bk with
-  | None -> ()
-  | Some bucket ->
-    scan_persisted_bucket ~matched_persisted_indices ~price ~bk ~best bucket
-;;
-
 (** Scans open orders feed, updates local sell tracking, and debounces ghost buy orders. *)
 let sync_open_orders
       ~state
@@ -535,9 +547,6 @@ let sync_open_orders
   let locked_in_sells = ref 0.0 in
   let feed_total = ref 0.0 in
   let closest_sell_order = ref None in
-  (* Alias into [state] used by the persisted-level tail split below. The scan
-     branch shadows it with its own alias for the index. *)
-  let matched_level_counts = state.matched_level_counts in
   (* Rescan gate. The scan below is O(open orders) and dominated by
      string-keyed hashtable work; when the venue exposes an open-orders
      generation ([get_open_orders_generation]) that has not moved since the
@@ -569,65 +578,6 @@ let sync_open_orders
     Hashtbl.iter (fun _ c -> c.sc_listed <- false) state.sell_commitments;
     state.open_sell_orders <- [];
     state.sync_orders_seen <- 0;
-    let matched_persisted_indices = state.matched_persisted_indices in
-    Hashtbl.clear matched_persisted_indices;
-    (* Index persisted sell levels by rounded price key so each open sell's
-     match lookup is O(1) instead of rescanning the whole list. Buckets store
-     (index, price, qty) so a 1-to-1 match consumes the entry, preserving the
-     original tolerance check and qty-update semantics. *)
-    (* Matched persisted levels keyed by price key -> count. Built during the
-     scan (each open sell consumes one persisted level, accumulating a
-     multiset of per-price counts), so the open/missing split for the
-     virtual-GTC reconcile falls out in O(m) instead of re-partitioning the
-     persisted-vs-open multiset a second time. *)
-    let matched_level_counts = state.matched_level_counts in
-    Hashtbl.clear matched_level_counts;
-    let persisted_idx = state.persisted_idx in
-    let build_persisted_idx () =
-      (* Rebuild only when the levels list actually changed. The list is
-       immutable and replaced wholesale on edit, so physical inequality is a
-       sound "changed" test; this skips the O(m) index rebuild (and its bucket
-       list allocations) on the common no-change execution. *)
-      if state.persisted_idx_source != state.persisted_sell_levels
-      then (
-        state.persisted_idx_source <- state.persisted_sell_levels;
-        Hashtbl.reset persisted_idx;
-        List.iteri
-          (fun idx (p, q) ->
-             let k = price_key p in
-             let bucket = Option.value (Hashtbl.find_opt persisted_idx k) ~default:[] in
-             Hashtbl.replace persisted_idx k ((idx, p, q) :: bucket))
-          state.persisted_sell_levels)
-    in
-    build_persisted_idx ();
-    (* Deferred persisted-level qty updates. Writing each update straight into
-     [state.persisted_sell_levels] via [List.mapi] inside the open-order scan
-     made reconciliation O(k*m) (k changed levels x a full-list rebuild each).
-     Collect them and apply once; matching only keys off prices, so deferring
-     the qtys is behavior-preserving. Flushed before any adoption re-sorts the
-     list (which invalidates indices) and once at the end of the scan. *)
-    let pending_level_updates = ref [] in
-    let apply_pending_level_updates () =
-      match !pending_level_updates with
-      | [] -> ()
-      | updates ->
-        pending_level_updates := [];
-        let tbl = Hashtbl.create (List.length updates) in
-        List.iter (fun (idx, p, q) -> Hashtbl.replace tbl idx (p, q)) updates;
-        state.persisted_sell_levels
-        <- List.mapi
-             (fun i item ->
-                match Hashtbl.find_opt tbl i with
-                | Some (p, q) -> p, q
-                | None -> item)
-             state.persisted_sell_levels
-    in
-    let record_matched pk =
-      Hashtbl.replace
-        matched_level_counts
-        pk
-        (1 + Option.value (Hashtbl.find_opt matched_level_counts pk) ~default:0)
-    in
     let t_scan_start = Monotonic_clock.now_ns () in
     iter_open_orders (fun oid price qty side_str userref_opt ->
       state.sync_orders_seen <- state.sync_orders_seen + 1;
@@ -664,107 +614,66 @@ let sync_open_orders
            a sell adopted straight from the feed (no prior local arm) is
            entered here so it is reserved from now on. *)
           upsert_sell_commitment ~state ~id:oid ~price ~qty ~seen:true ~acked:true;
-          if ecfg.remaintain_expired_sells
-          then (
-            let k = price_key price in
-            let match_entry =
-              (* Probe the bucket and its neighbors: grid levels are 0.25%+
-                 apart while the tolerance is 0.01% (price*0.0001) or 1e-4
-                 absolute, so a within-tolerance candidate is always the same
-                 grid level; neighbor probes only absorb float rounding at the
-                 4-decimal bucket boundary. Pick the lowest-index candidate. *)
-              let best = ref None in
-              probe_persisted_bucket
-                (k - 1)
-                ~matched_persisted_indices
-                ~persisted_idx
-                ~price
-                ~best;
-              probe_persisted_bucket
-                k
-                ~matched_persisted_indices
-                ~persisted_idx
-                ~price
-                ~best;
-              probe_persisted_bucket
-                (k + 1)
-                ~matched_persisted_indices
-                ~persisted_idx
-                ~price
-                ~best;
-              match !best with
-              | Some (bk, idx, _p, _q) ->
-                let remaining =
-                  match Hashtbl.find_opt persisted_idx bk with
-                  | Some b -> List.filter (fun (i, _, _) -> i <> idx) b
-                  | None -> []
-                in
-                Some (bk, idx, _p, _q, remaining)
-              | None -> None
-            in
-            match match_entry with
-            | Some (bk, idx, _existing_p, existing_q, remaining_bucket) ->
-              Hashtbl.add matched_persisted_indices idx ();
-              Hashtbl.replace persisted_idx bk remaining_bucket;
-              (* count the persisted level (keyed by ITS price) as matched. *)
-              record_matched (price_key _existing_p);
-              let min_order_size =
-                if state.cached_qty_increment > 0.0
-                then state.cached_qty_increment
-                else 1e-8
-              in
-              if
-                abs_float (existing_q -. qty) > 1e-6
-                && qty >= min_order_size -. 1e-9
-                && qty > 0.0
-              then (
-                pending_level_updates := (idx, price, qty) :: !pending_level_updates;
-                state.persistence_dirty <- true;
-                Logging.info_f
-                  ~section
-                  "Updated persisted sell level quantity for %s @ %.4f: %.8f -> %.8f"
-                  asset.symbol
-                  price
-                  existing_q
-                  qty)
-            | None ->
-              (* Flush deferred qty updates first: the sort/insert below shifts
-               persisted-level indices, so pending updates keyed by index must
-               land before it. *)
-              apply_pending_level_updates ();
-              let min_order_size =
-                if state.cached_qty_increment > 0.0
-                then state.cached_qty_increment
-                else 1e-8
-              in
-              if qty >= min_order_size -. 1e-9 && qty > 0.0
-              then (
-                state.persisted_sell_levels
-                <- List.sort
-                     (fun (p1, _) (p2, _) -> Float.compare p2 p1)
-                     ((price, qty) :: state.persisted_sell_levels);
-                state.persistence_dirty <- true;
-                (* the adopted level was matched by this open sell by
-                 construction - count it so the end-of-scan split keeps it on
-                 the open side. *)
-                record_matched (price_key price);
-                (* The list was re-sorted with a new level: rebuild the price
-                 index so later orders in this scan match against the current
-                 list (O(m), only on the rare adoption path). *)
-                build_persisted_idx ();
-                Logging.info_f
-                  ~section
-                  "Adopted open exchange sell order for %s @ %.4f (qty %.8f) into \
-                   persistent tracking"
-                  asset.symbol
-                  price
-                  qty));
           match !closest_sell_order with
           | None -> closest_sell_order := Some (oid, price)
           | Some (_, best_p) ->
             if price < best_p then closest_sell_order := Some (oid, price)));
     state.time_sync_scan_ns <- Monotonic_clock.now_ns () - t_scan_start;
-    apply_pending_level_updates ();
+    (* Rebuild the persisted ladder from the feed deterministically: one rung per
+       price (within the same tolerance the matcher uses), its qty the live order
+       qty at that price; levels with no live order keep their recorded (missing)
+       qty; feed prices absent from the ladder are adopted. The per-price qty is
+       the MAX across order ids so an Alpaca amend (cancel+replace) window -
+       which transiently lists the old id and its replacement at the same price -
+       or a historical duplicate cannot flap the recorded qty. Replacing the old
+       per-order 1-to-1 match/adopt is what removes the SMH/REMX "Updated ... ->
+       ..." / "Adopted ..." churn: with two ids at one price the old code consumed
+       the single level with the first id and re-adopted the second every scan. *)
+    if ecfg.remaintain_expired_sells
+    then (
+      let feed = state.open_sell_orders in
+      let live_qty_at p =
+        List.fold_left
+          (fun acc (_, fp, fq) ->
+             if fq > acc && price_within_tolerance ~reference:p fp then fq else acc)
+          0.0
+          feed
+      in
+      let base =
+        List.map
+          (fun (p, recorded_q) ->
+             let live_q = live_qty_at p in
+             if live_q > 0.0 then p, live_q else p, recorded_q)
+          (dedupe_persisted_sell_levels state.persisted_sell_levels)
+      in
+      (* Adopt feed orders whose price is not already represented, deduped within
+         tolerance by the running accumulated list. *)
+      let rebuilt_rev =
+        List.fold_left
+          (fun acc (_, fp, fq) ->
+             if
+               fq > 0.0
+               && not
+                    (List.exists
+                       (fun (p, _) -> price_within_tolerance ~reference:p fp)
+                       acc)
+             then (fp, fq) :: acc
+             else acc)
+          (List.rev base)
+          feed
+      in
+      let rebuilt =
+        List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) rebuilt_rev
+      in
+      if rebuilt <> state.persisted_sell_levels
+      then (
+        state.persisted_sell_levels <- rebuilt;
+        state.persistence_dirty <- true;
+        Logging.debug_f
+          ~section
+          "Persisted sell ladder for %s rebuilt from feed: %d level(s)"
+          asset.symbol
+          (List.length rebuilt)));
     state.cached_feed_total <- !feed_total;
     state.cached_open_buy_count <- !open_buy_count_from_scan;
     state.cached_has_recent_amend_buy <- !has_recent_amend_buy;
@@ -905,30 +814,21 @@ let sync_open_orders
         state.tif_recovery_pending <- false;
         set_asset_reserved_quote state (best_price *. lot_qty))
     | None -> ());
-  (* Split the final persisted list into open/missing by draining the
-     per-price-key match counts (multiset semantics: duplicate levels at the
-     same price each consume one count, mirroring
-     [partition_persisted_sell_levels]' 1-to-1 matching). This is O(m) on data
-     the scan already touched. *)
-  (* The persisted open/missing split is only consumed by the
-     [remaintain_expired_sells] (Alpaca GTC) reconcile
-     ([evaluate_sell_leg]); building it costs an O(m) list rebuild per
-     execution, so skip it entirely for the venues that never read it. *)
+  (* Split the persisted ladder into open/missing by whether a live order rests
+     at each rung's price (within the matcher tolerance). The rebuild above
+     already collapsed the list to one entry per price, so a membership
+     partition is exact (no per-price count drain). Only the
+     [remaintain_expired_sells] (Alpaca GTC) reconcile ([evaluate_sell_leg])
+     reads it, so other venues skip the O(m) work. *)
   let open_persisted_levels, missing_persisted_levels =
     if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> []
     then (
-      let open_levels_acc = ref [] in
-      let missing_levels_acc = ref [] in
-      List.iter
-        (fun ((p, _) as level) ->
-           let k = price_key p in
-           match Hashtbl.find_opt matched_level_counts k with
-           | Some n when n > 0 ->
-             Hashtbl.replace matched_level_counts k (n - 1);
-             open_levels_acc := level :: !open_levels_acc
-           | _ -> missing_levels_acc := level :: !missing_levels_acc)
-        state.persisted_sell_levels;
-      List.rev !open_levels_acc, List.rev !missing_levels_acc)
+      let feed_open p =
+        List.exists
+          (fun (_, fp, _) -> price_within_tolerance ~reference:p fp)
+          state.open_sell_orders
+      in
+      List.partition (fun (p, _) -> feed_open p) state.persisted_sell_levels)
     else [], []
   in
   ( !open_buy_count_from_scan
@@ -1472,32 +1372,34 @@ let evaluate_buy_leg
     the highest-priced rung absorbs it, so surplus is offered only at the best
     price.
 
-    [reserved_base] is never part of the sweep: [available] already excludes it.
+    [reserved_base] is never part of the sweep: [available] already excludes it
+    (the caller passes the min of the venue free figure and the local ledger
+    headroom [position_total - reserved_base - committed_sell_base]).
 
     The top rung is amended to a larger quantity (qty-only at the same price, so
-    its fill anchor is unchanged). *)
+    its fill anchor is unchanged). The amend's delta is armed into the
+    un-netted-hold overlay so a stale venue snapshot cannot authorize the next
+    sweep against base the venue has not yet netted. *)
 let evaluate_excess_sweep
       ~state
       ~now
       ~(asset : trading_config)
       ~(available : float)
-      ~(lot_qty : float)
       ~(min_notional : float)
+      ~(ecfg : exchange_config)
   =
   match state.persisted_sell_levels with
   | (top_price, _) :: _ when top_price > 0.0 ->
     let min_order_size =
       if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
     in
-    (* Cap the sweep at ONE grid lot per invocation. The sweep exists to clear
-       residual/dust inventory onto the best rung, not to concentrate the whole
-       book on a single price. An uncapped sweep turns any transient
-       over-estimate of sellable inventory (e.g. Alpaca's reconstructed hold
-       lagging the venue during an amend) into a rung sized to the entire
-       position, which then fills in one print. The per-sweep cap bounds the
-       blast radius; the amend cooldown then limits how fast it can repeat. *)
-    let sweep_cap = Float.max lot_qty min_order_size in
-    let excess = Float.min (Float.max 0.0 available) sweep_cap in
+    (* The whole sellable excess routes to the top rung in one amend. There is
+       deliberately no per-invocation lot cap: [available] is already the
+       reserve-excluded, ledger-headroom-capped sellable base (see the caller),
+       so the rung it grows to can never include [reserved_base], and routing it
+       in one pass avoids the slow per-cycle ratchet that concentrated the book
+       over many executions. *)
+    let excess = Float.max 0.0 available in
     if excess >= min_order_size -. 1e-9
     then (
       let top_open =
@@ -1514,8 +1416,9 @@ let evaluate_excess_sweep
         let target_q = round_qty (top_open_qty +. excess) asset.symbol asset.exchange in
         let delta = target_q -. top_open_qty in
         if
-          delta >= min_order_size -. 1e-9
-          && (min_notional <= 0.0 || target_q *. top_open_price >= min_notional -. 1e-9)
+          delta > 1e-9
+          && delta >= min_order_size -. 1e-9
+          && (min_notional <= 0.0 || delta *. top_open_price >= min_notional -. 1e-9)
           && (not (InFlightAmendments.is_in_flight oid))
           && (not (Hashtbl.mem state.amend_cooldowns oid))
           && not (has_active_sell state)
@@ -1531,7 +1434,9 @@ let evaluate_excess_sweep
               Ladder
               asset.exchange
           in
-          ignore (push_order ~now ~state order);
+          let pushed = push_order ~now ~state order in
+          if pushed && ecfg.use_unnetted_sell_hold && delta > 0.0
+          then arm_sell_hold ~state ~qty:delta ~now;
           (* A real qty increase is a meaningful execution event; a
              rounding-dust sweep that leaves the top rung unchanged is
              internal churn and belongs at DEBUG, not in the INFO stream. *)
@@ -1645,6 +1550,25 @@ let evaluate_sell_leg
     then alpaca_available
     else ledger_balance -. state.reserved_base -. committed_sell
   in
+  (* Total base committed to sells, taking the larger of the in-flight ledger
+     and the live open-order list. The ledger is authoritative in the running
+     system (the scan rebuilds it each execution); the open-order sum keeps the
+     reserve headroom honest for direct callers that populate only
+     [open_sell_orders], and when the ledger transiently undercounts a dropped
+     order. Taking the max avoids double-counting the overlap. *)
+  let committed_total =
+    let open_sum =
+      List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 state.open_sell_orders
+    in
+    Float.max (committed_sell_base state) open_sum
+  in
+  (* Reserve-bounded headroom from the local ledger: base we hold that is not
+     already committed to a resting/in-flight sell. Independent of the venue
+     snapshot, so a stale [qty_available] cannot authorize committing
+     [reserved_base]. *)
+  let reserve_headroom =
+    Float.max 0.0 (ledger_balance -. state.reserved_base -. committed_total)
+  in
   (* The persisted-sell grid is reconciled once per execution and the result is
      reused by the three persisted-sell branches below. After the pruning below
      rebuilds [persisted_sell_levels] to [open_levels @ kept_missing], a
@@ -1662,7 +1586,18 @@ let evaluate_sell_leg
     let open_levels, missing_levels = persisted_reconcile in
     if not (Float.is_nan asset_balance)
     then (
-      let available_for_missing_sells = Float.max 0.0 available_base in
+      (* Fundable base comes from the LOCAL ledger, not the venue's
+         [qty_available]: [position_total - reserved_base - committed_total] is
+         base we hold that is not already committed to a resting/in-flight sell.
+         The venue figure lags hold reconstruction (and freezes during REST poll
+         timeouts), so sizing a restore against it can re-commit [reserved_base]
+         that is already sitting inside a resting order. After a manual cancel
+         the order leaves the committed set but its base stays in
+         [position_total], so the headroom still funds the rung - by exactly
+         [target_q - reserved_base]. *)
+      let available_for_missing_sells =
+        if is_alpaca then reserve_headroom else Float.max 0.0 available_base
+      in
       let missing_desc =
         List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels
       in
@@ -1670,7 +1605,7 @@ let evaluate_sell_leg
       let kept_missing = ref [] in
       let pruned = ref [] in
       List.iter
-        (fun ((_target_p, target_q) as level) ->
+        (fun ((target_p, target_q) as level) ->
            let min_order_size =
              if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
            in
@@ -1681,11 +1616,24 @@ let evaluate_sell_leg
            then (
              kept_missing := level :: !kept_missing;
              rem_avail := max 0.0 (!rem_avail -. target_q))
+           else if
+             (* Under-funded but still fundable: re-place the rung for the
+                available remainder instead of pruning it. Headroom is the
+                local ledger's [position - reserved_base - committed], so an
+                offline FILL (base actually gone) leaves ~no headroom and still
+                prunes, while a cancelled or partially-filled rung restores the
+                remaining sellable base - including when the only shortfall was
+                [reserved_base]. *)
+             is_alpaca
+             && target_q >= min_order_size -. 1e-9
+             && !rem_avail >= min_order_size -. 1e-9
+           then (
+             kept_missing := (target_p, !rem_avail) :: !kept_missing;
+             rem_avail := 0.0)
            else pruned := level :: !pruned)
         missing_desc;
       let new_persisted = open_levels @ List.rev !kept_missing in
-      state.persisted_sell_levels
-      <- List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) new_persisted;
+      state.persisted_sell_levels <- dedupe_persisted_sell_levels new_persisted;
       (* After the rebuild the missing set is exactly the fundable
          [kept_missing] subset (descending, as [missing_desc] was). *)
       missing_after_reconcile := List.rev !kept_missing;
@@ -2071,9 +2019,8 @@ let evaluate_sell_leg
             && effective_sell_qty > 0.0
           then (
             state.persisted_sell_levels
-            <- List.sort
-                 (fun (p1, _) (p2, _) -> Float.compare p2 p1)
-                 ((sell_price, effective_sell_qty) :: state.persisted_sell_levels);
+            <- dedupe_persisted_sell_levels
+                 (state.persisted_sell_levels @ [ sell_price, effective_sell_qty ]);
             state.persistence_dirty <- true);
           Logging.info_f
             ~section
@@ -2176,11 +2123,14 @@ let evaluate_sell_leg
       min_notional
       base_ref_price);
   (* Alpaca excess-inventory sweep: the ladder is refilled first (every rung
-     restored from the tracker); only once NO rung is missing do we dump the
+     restored from the tracker); only once NO rung is missing do we route the
      leftover sellable base onto the TOP rung as a qty-only amend, so the
      surplus is offered at the best price instead of sitting idle. Runs after
      the retry block so a blocked owed sell keeps its reservation and never
-     races the amend. [available_base] already excludes reserved_base. *)
+     races the amend. The sweep allowance is the min of the venue free figure
+     and the local ledger headroom ([position - reserved_base - committed]) so a
+     stale/hung balance snapshot cannot size it into reserved_base, and a stale
+     snapshot blocks the sweep outright. *)
   if
     ecfg.remaintain_expired_sells
     && !missing_after_reconcile = []
@@ -2190,19 +2140,21 @@ let evaluate_sell_leg
     && (not !sell_pushed)
     && (not (has_active_sell state))
     && not (Float.is_nan asset_balance)
+    && (match base_balance_age with
+        | Some age -> age <= sweep_max_balance_age_s
+        | None -> true)
   then (
-    let sweep_lot =
-      match state.last_buy_fill_qty with
-      | Some q when q > 0.0 -> q
-      | _ -> venue_lot_qty state.grid_qty asset.exchange state
+    let sweep_available =
+      let venue = Float.max 0.0 available_base in
+      if is_alpaca then Float.min venue reserve_headroom else venue
     in
     evaluate_excess_sweep
       ~state
       ~now
       ~asset
-      ~available:(Float.max 0.0 available_base)
-      ~lot_qty:sweep_lot
-      ~min_notional);
+      ~available:sweep_available
+      ~min_notional
+      ~ecfg);
   state.resuming_after_balance_flag <- false
 ;;
 
