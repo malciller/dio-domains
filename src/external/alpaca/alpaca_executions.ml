@@ -706,9 +706,11 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
 ;;
 
 (** Connectivity probe for the supervised monitor loop. SSE has no protocol
-    ping: liveness means the stream is open and produced a line (data or
-    comment heartbeat) within [sse_idle_failure_s]. Returns [false] when
-    disconnected. *)
+    ping, so there is no RTT to measure here: liveness means the stream is open
+    and produced a line (data or comment heartbeat) within [sse_idle_failure_s].
+    Returns [false] when disconnected. The idle interval is deliberately NOT
+    recorded as a ws_ping sample: it is a staleness signal, not a round trip,
+    and would pin the venue's latency histogram at the idle ceiling. *)
 let send_ping ~req_id ~timeout_ms : bool Lwt.t =
   ignore req_id;
   ignore timeout_ms;
@@ -717,9 +719,7 @@ let send_ping ~req_id ~timeout_ms : bool Lwt.t =
   else (
     let idle = Unix.gettimeofday () -. !last_activity in
     if idle <= sse_idle_failure_s
-    then (
-      Network_latency.record_ping_s "alpaca" idle;
-      Lwt.return true)
+    then Lwt.return true
     else (
       Logging.warn_f
         ~section

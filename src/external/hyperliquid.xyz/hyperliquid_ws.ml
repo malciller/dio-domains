@@ -398,9 +398,50 @@ let subscribe_to_feeds ~symbols ~wallet =
     symbols
 ;;
 
-(** Timestamp of the last text frame, for the ws_feed inter-message gap
-    measurement (recorded per venue in [Network_latency]). *)
-let last_frame_time = ref 0.0
+(** Extracts a server event timestamp (milliseconds since epoch) from a raw
+    text frame by scanning for `"time":`, returning it as Unix seconds. Cheap
+    and allocation-light: no JSON parse on the l2Book hot path. [None] when the
+    frame carries no timestamp (e.g. ping/pong, subscription responses). *)
+let extract_event_time_s content =
+  let key = "\"time\":" in
+  let klen = String.length key in
+  let n = String.length content in
+  let matches_at i =
+    let rec go k = k >= klen || (content.[i + k] = key.[k] && go (k + 1)) in
+    i + klen <= n && go 0
+  in
+  let is_num_char c =
+    (c >= '0' && c <= '9') || c = '.' || c = '-' || c = '+' || c = 'e' || c = 'E'
+  in
+  let rec find i =
+    if i + klen > n
+    then None
+    else if matches_at i
+    then (
+      let j = ref (i + klen) in
+      while !j < n && (content.[!j] = ' ' || content.[!j] = '\t') do
+        incr j
+      done;
+      let start = !j in
+      while !j < n && is_num_char content.[!j] do
+        incr j
+      done;
+      if !j > start
+      then (
+        (* Guard against matching a non-epoch numeric field: accept only a
+           plausible epoch-ms value (2001..2286). *)
+        try
+          let ms = float_of_string (String.sub content start (!j - start)) in
+          if ms >= 1_000_000_000_000.0 && ms < 10_000_000_000_000.0
+          then Some (ms /. 1000.0)
+          else None
+        with
+        | _ -> None)
+      else None)
+    else find (i + 1)
+  in
+  find 0
+;;
 
 (** Processes a single WebSocket frame.
     Text frames are parsed as JSON, then either matched to a pending
@@ -411,12 +452,12 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
   | Websocket.Frame.Opcode.Text ->
     Concurrency.Tick_event_bus.publish_tick ();
     on_heartbeat ();
-    (* Feed cadence: gap since the previous frame on this venue. *)
-    let now = Unix.gettimeofday () in
-    if !last_frame_time > 0.0
-    then Network_latency.record_feed_s "hyperliquid" (now -. !last_frame_time);
-    last_frame_time := now;
+    (* Feed network latency: server event time -> local receive, corrected for
+       the host/exchange clock offset. *)
     let content = frame.Websocket.Frame.content in
+    (match extract_event_time_s content with
+     | Some event -> Network_latency.record_feed_event_s "hyperliquid" ~event ()
+     | None -> ());
     if String.starts_with ~prefix:"{\"channel\":\"l2Book\"," content
     then (
       broadcast_raw_message content;

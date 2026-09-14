@@ -103,9 +103,10 @@ type metric_group =
       [orderbook] -> [execution] -> [prep] -> [strategy] are the four sequential
       segments of one cycle; [cycle] is their sum. All are in-process work with
       the same sub-10us target.
-    - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed gap,
-      REST round-trip, signer time). These measure exchange round-trips and
-      socket lifetimes, not in-process work, and carry their own budgets. *)
+    - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed
+      one-way latency, REST round-trip, signer time). These measure exchange
+      round-trips and feed transit, not in-process work, and carry their own
+      budgets. *)
 let metric_pages =
   [ { page_label = "INTERNAL"
     ; metrics = [ "oracle"; "orderbook"; "execution"; "prep"; "strategy"; "cycle" ]
@@ -117,7 +118,7 @@ let metric_pages =
     ; metrics = [ "ws_ping"; "ws_feed"; "rest_request"; "signer" ]
     ; trend_metric = "ws_feed"
     ; trend_label = "(FEED P99)"
-    ; trend_max_us = 50_000.0
+    ; trend_max_us = 200_000.0
     }
   ]
 ;;

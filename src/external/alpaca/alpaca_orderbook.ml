@@ -211,10 +211,6 @@ let active_conn : Ws_lwt.conn option ref = ref None
 let last_pong_time = ref 0.0
 let pong_condition = Lwt_condition.create ()
 
-(** Timestamp of the last data frame, for the ws_feed inter-message gap
-    measurement (recorded under venue "alpaca" in [Network_latency]). *)
-let last_frame_time = ref 0.0
-
 let get_best_bid_ask symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> SymbolStore.get_best_bid_ask store
@@ -275,7 +271,19 @@ let json_to_float = function
   | _ -> 0.0
 ;;
 
-let parse_timestamp _str = Unix.gettimeofday ()
+(** Parses the RFC3339 [t] field of a market-data message into Unix seconds.
+    Returns [None] when absent or malformed, so the caller can fall back to the
+    local clock for storage without recording a bogus latency. *)
+let parse_timestamp_opt str = Network_latency.unix_of_rfc3339 str
+
+(** Records the clock-corrected one-way network latency of a feed message from
+    its server event timestamp. No-op when the message carries no parseable
+    timestamp. *)
+let record_feed_latency ts_opt =
+  match ts_opt with
+  | Some event -> Network_latency.record_feed_event_s "alpaca" ~event ()
+  | None -> ()
+;;
 
 let handle_message_str ?on_auth_success ?on_auth_error content =
   let trimmed = String.trim content in
@@ -306,7 +314,9 @@ let handle_message_str ?on_auth_success ?on_auth_error content =
              let ts_str =
                j |> member "t" |> to_string_option |> Option.value ~default:""
              in
-             let ts = parse_timestamp ts_str in
+             let ts_opt = parse_timestamp_opt ts_str in
+             let ts = Option.value ts_opt ~default:(Unix.gettimeofday ()) in
+             record_feed_latency ts_opt;
              if symbol <> ""
              then (
                let store = get_or_create_store symbol in
@@ -347,7 +357,9 @@ let handle_message_str ?on_auth_success ?on_auth_error content =
              let ts_str =
                j |> member "t" |> to_string_option |> Option.value ~default:""
              in
-             let ts = parse_timestamp ts_str in
+             let ts_opt = parse_timestamp_opt ts_str in
+             let ts = Option.value ts_opt ~default:(Unix.gettimeofday ()) in
+             record_feed_latency ts_opt;
              if symbol <> "" && price > 0.0
              then (
                let store = get_or_create_store symbol in
@@ -572,13 +584,7 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
              | _ ->
                let content = String.trim frame.Websocket.Frame.content in
                if content <> ""
-               then (
-                 (* Feed cadence: gap since the previous data frame. *)
-                 let now = Unix.gettimeofday () in
-                 if !last_frame_time > 0.0
-                 then Network_latency.record_feed_s "alpaca" (now -. !last_frame_time);
-                 last_frame_time := now;
-                 handle_message_str ~on_auth_success ~on_auth_error content);
+               then (handle_message_str ~on_auth_success ~on_auth_error content);
                (match !auth_failure_reason with
                 | Some reason -> Lwt.fail (Failure reason)
                 | None -> Lwt.return_unit)))
