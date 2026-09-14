@@ -1235,28 +1235,33 @@ let handle_message message on_heartbeat =
    update). One authenticated connection exists at a time. *)
 let current_on_heartbeat : (unit -> unit) option Atomic.t = Atomic.make None
 
+(** Parse-domain body: parse and dispatch on the parse domain with the
+    connection's current heartbeat, no tick. Shared by the legacy "kraken_exec"
+    handler and the uniform venue decoder. [handle_message_json] is
+    domain-safe: per-symbol mutexes, ring writes, Atomics, logging, wakeups. *)
+let process_parse_domain_frame message =
+  let heartbeat =
+    match Atomic.get current_on_heartbeat with
+    | Some f -> f
+    | None -> fun () -> ()
+  in
+  try
+    let json = Yojson.Safe.from_string message in
+    handle_message_json json heartbeat
+  with
+  | exn ->
+    Logging.error_f
+      ~section
+      "Error parsing message: %s - %s"
+      (Printexc.to_string exn)
+      message
+;;
+
 (** Parse-worker entry point. Executions pushes are intercepted in
     Kraken_trading_client.handle_frame by a raw-string prefix check before the
     central Yojson parse, so this handler owns both parse and dispatch for the
-    channel. [handle_message_json] is domain-safe: per-symbol mutexes, ring
-    writes, Atomics, logging, wakeups. *)
-let () =
-  Concurrency.Parse_worker.register "kraken_exec" (fun message ->
-    let heartbeat =
-      match Atomic.get current_on_heartbeat with
-      | Some f -> f
-      | None -> fun () -> ()
-    in
-    try
-      let json = Yojson.Safe.from_string message in
-      handle_message_json json heartbeat
-    with
-    | exn ->
-      Logging.error_f
-        ~section
-        "Error parsing message: %s - %s"
-        (Printexc.to_string exn)
-        message)
+    channel. *)
+let () = Concurrency.Parse_worker.register "kraken_exec" process_parse_domain_frame
 ;;
 
 (** Deprecated. Superseded by the unified connection hub. Retained for interface compatibility. *)

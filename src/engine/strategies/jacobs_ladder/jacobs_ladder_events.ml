@@ -6,6 +6,8 @@ open Jacobs_ladder_config
 open Jacobs_ladder_reservation
 open Jacobs_ladder_orders
 
+module Sell_orders = Jacobs_ladder_sell_orders
+
 (* Per-symbol lock-free lifecycle event queue. The Lwt supervisor thread (REST
    callbacks, supervisor_orders.ml) enqueues events instead of calling handlers
    directly; the domain worker drains the queue at the top of every cycle, so
@@ -252,19 +254,12 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
                ~qty:0.0
                ~acked:true
            | None -> ());
-          let replaced = ref false in
-          state.open_sell_orders
-          <- List.map
-               (fun (oid, p, q) ->
-                  if
-                    (not !replaced)
-                    && String.starts_with ~prefix:"pending_sell_" oid
-                    && abs_float (p -. price) < price *. 0.01
-                  then (
-                    replaced := true;
-                    order_id, p, q)
-                  else oid, p, q)
-               state.open_sell_orders;
+          Sell_orders.replace_first
+            state.open_sell_orders
+            (fun oid p _ ->
+               String.starts_with ~prefix:"pending_sell_" oid
+               && abs_float (p -. price) < price *. 0.01)
+            (fun _ p q -> order_id, p, q);
           ());
        ())
 ;;
@@ -299,17 +294,14 @@ let handle_order_failed ~now asset_symbol side reason =
         | Buy -> set_asset_reserved_quote state 0.0
         | Sell ->
           remove_pending_sell_commitments ~state;
-          state.open_sell_orders
-          <- filter_keep_if_needed
-               (fun (oid, _, _) -> not (String.starts_with ~prefix:"pending_sell_" oid))
-               state.open_sell_orders);
-       let duplicate_key =
-         match side with
-         | Buy -> state.duplicate_key_buy
-         | Sell -> state.duplicate_key_sell
-       in
-       ignore (InFlightOrders.remove_in_flight_order duplicate_key);
-       let lower_reason = String.lowercase_ascii reason in
+          Sell_orders.remove_prefix state.open_sell_orders "pending_sell_");
+        let duplicate_key =
+          match side with
+          | Buy -> state.duplicate_key_buy
+          | Sell -> state.duplicate_key_sell
+        in
+        ignore (InFlightOrders.remove_in_flight_order duplicate_key);
+        let lower_reason = String.lowercase_ascii reason in
        let is_rate_limit =
          contains_fragment lower_reason "too many cumulative requests"
          || contains_fragment lower_reason "rate limit"
@@ -467,10 +459,7 @@ let handle_order_rejected ~now:_ asset_symbol side price =
         | Sell ->
           state.inflight_sell <- false;
           remove_pending_sell_commitments ~state;
-          state.open_sell_orders
-          <- filter_keep_if_needed
-               (fun (oid, _, _) -> not (String.starts_with ~prefix:"pending_sell_" oid))
-               state.open_sell_orders);
+          Sell_orders.remove_prefix state.open_sell_orders "pending_sell_");
        let duplicate_key =
          match side with
          | Buy -> state.duplicate_key_buy
@@ -607,15 +596,12 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
               state.pending_orders;
          let sell_fill_price =
            match
-             List.find_opt (fun (id, _, _) -> id = order_id) state.open_sell_orders
+             Sell_orders.find_first state.open_sell_orders (fun id _ _ -> id = order_id)
            with
            | Some (_, p, _) -> p
            | None -> fill_price
          in
-         state.open_sell_orders
-         <- filter_keep_if_needed
-              (fun (sell_id, _, _) -> sell_id <> order_id)
-              state.open_sell_orders;
+         ignore (Sell_orders.remove_by_id state.open_sell_orders order_id);
          let _was_tracked_buy =
            match side, state.last_buy_order_id with
            | Buy, Some id when buy_tracking_matches_exchange_event id order_id cl_ord_id
@@ -747,13 +733,10 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
                 that then re-buys). Partial fills arrive as [PartiallyFilled]
                 and never reach this handler. *)
             remove_sell_commitment ~state ~id:order_id;
-            let known_open_sell =
-              List.find_opt (fun (oid, _, _) -> oid = order_id) state.open_sell_orders
-            in
-            state.open_sell_orders
-            <- filter_keep_if_needed
-                 (fun (oid, _, _) -> oid <> order_id)
-                 state.open_sell_orders;
+           let known_open_sell =
+             Sell_orders.find_first state.open_sell_orders (fun oid _ _ -> oid = order_id)
+           in
+           ignore (Sell_orders.remove_by_id state.open_sell_orders order_id);
             if state.persisted_sell_levels <> []
             then (
               let matched_by_limit =
@@ -959,7 +942,7 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
          (match state.last_buy_order_id with
           | Some id -> buy_tracking_matches_exchange_event id order_id cl_ord_id
           | None -> false)
-         || List.exists (fun (sell_id, _, _) -> sell_id = order_id) state.open_sell_orders
+         || Sell_orders.exists_id state.open_sell_orders order_id
        in
        (* A STALE cancel references an order this strategy tracked long ago
           (acked/adopted/filled) that is no longer current - e.g. the late WS
@@ -1069,10 +1052,7 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
             then (
               state.inflight_sell <- false;
               ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell)));
-         state.open_sell_orders
-         <- filter_keep_if_needed
-              (fun (sell_id, _, _) -> sell_id <> order_id)
-              state.open_sell_orders;
+         ignore (Sell_orders.remove_by_id state.open_sell_orders order_id);
          remove_sell_commitment ~state ~id:order_id)
        else
          Logging.info_f
@@ -1131,13 +1111,15 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
                price
                asset_symbol;
              state.inflight_amend_buy <- false)
-        | Sell ->
-          add_tracked_order_id state new_order_id;
-          let original_sell_count = List.length state.open_sell_orders in
-          let old_entry =
-            List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders
-          in
-          let old_qty =
+         | Sell ->
+           add_tracked_order_id state new_order_id;
+           let original_sell_count = Sell_orders.length state.open_sell_orders in
+           let old_entry =
+             Sell_orders.find_first
+               state.open_sell_orders
+               (fun id _ _ -> id = old_order_id)
+           in
+           let old_qty =
             match old_entry with
             | Some (_, _, q) -> q
             | None -> venue_lot_qty state.grid_qty state.exchange_id state
@@ -1161,12 +1143,9 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
              | None -> "NOT_FOUND")
             old_qty
             original_sell_count;
-          state.open_sell_orders
-          <- (new_order_id, price, old_qty)
-             :: filter_keep_if_needed
-                  (fun (sell_id, _, _) -> sell_id <> old_order_id)
-                  state.open_sell_orders;
-          state.recently_injected_sells
+           ignore (Sell_orders.remove_by_id state.open_sell_orders old_order_id);
+           Sell_orders.push state.open_sell_orders new_order_id price old_qty;
+           state.recently_injected_sells
           <- (new_order_id, price, now) :: state.recently_injected_sells;
           (match old_entry with
            | Some (_, old_p, _) when state.persisted_sell_levels <> [] ->
@@ -1187,8 +1166,8 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
           Logging.debug_f
             ~section
             "SELL_AMEND [%s] result: sells_after=%d"
-            asset_symbol
-            (List.length state.open_sell_orders));
+             asset_symbol
+             (Sell_orders.length state.open_sell_orders));
        let cooldown = if old_order_id = new_order_id then 2.0 else 10.0 in
        Hashtbl.replace state.amend_cooldowns old_order_id (now +. cooldown);
        Hashtbl.replace state.amend_cooldowns new_order_id (now +. cooldown);
@@ -1339,13 +1318,10 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
               Hashtbl.remove state.amend_cooldowns "place_Buy";
               ())
          | Sell ->
-           let original_sell_count = List.length state.open_sell_orders in
-           state.open_sell_orders
-           <- filter_keep_if_needed
-                (fun (sell_id, _, _) -> sell_id <> order_id)
-                state.open_sell_orders;
-           remove_sell_commitment ~state ~id:order_id;
-           if List.length state.open_sell_orders < original_sell_count
+            let original_sell_count = Sell_orders.length state.open_sell_orders in
+            ignore (Sell_orders.remove_by_id state.open_sell_orders order_id);
+            remove_sell_commitment ~state ~id:order_id;
+            if Sell_orders.length state.open_sell_orders < original_sell_count
            then
              Logging.info_f
                ~section

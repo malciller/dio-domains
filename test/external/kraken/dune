@@ -31,6 +31,10 @@
  (libraries dio.kraken alcotest))
 
 (test
+ (name test_kraken_span_orderbook)
+ (libraries dio.kraken alcotest))
+
+(test
  (name test_kraken_trading_client)
  (libraries dio.kraken alcotest))
 

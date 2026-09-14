@@ -6,6 +6,8 @@ open Jacobs_ladder_config
 open Jacobs_ladder_reservation
 open Jacobs_ladder_orders
 
+module Sell_orders = Jacobs_ladder_sell_orders
+
 (** Price key: [price * 10000] rounded to int. Shared by the persisted-sell
     matching in [sync_open_orders] and the reconcile in [evaluate_sell_leg].
     An int key keeps within-tolerance prices in the same (or an adjacent)
@@ -97,25 +99,103 @@ let price_within_tolerance ~reference p =
     to drop, so the scan's index cache is not invalidated on the common
     no-change pass. *)
 let dedupe_persisted_sell_levels levels =
-  let sorted = List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) levels in
-  let changed = ref false in
-  let rec go acc = function
-    | [] -> List.rev acc
-    | (p, q) :: rest ->
-      (match acc with
-       | (ap, _) :: _ when price_within_tolerance ~reference:ap p ->
-         changed := true;
-         go acc rest
-       | _ -> go ((p, q) :: acc) rest)
+  (* The common steady-state list is already strictly price-descending with one
+     rung per tolerance bucket, which is exactly the fixed point of the sort+merge
+     below. Detect that (linear, no allocation) and return the input physically
+     unchanged, skipping the [List.sort] the old code always paid - the sort is
+     charged even when it produces an identical list. *)
+  let rec already_deduped_desc prev = function
+    | [] -> true
+    | (p, _) :: rest ->
+      (match prev with
+       | Some pp ->
+         Float.compare pp p > 0 && not (price_within_tolerance ~reference:pp p)
+       | None -> true)
+      && already_deduped_desc (Some p) rest
   in
-  let merged = go [] sorted in
-  if !changed then merged else levels
+  if already_deduped_desc None levels
+  then levels
+  else (
+    let sorted = List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) levels in
+    let changed = ref false in
+    let rec go acc = function
+      | [] -> List.rev acc
+      | (p, q) :: rest ->
+        (match acc with
+         | (ap, _) :: _ when price_within_tolerance ~reference:ap p ->
+           changed := true;
+           go acc rest
+         | _ -> go ((p, q) :: acc) rest)
+    in
+    let merged = go [] sorted in
+    if !changed then merged else levels)
+;;
+
+(** [persisted_rebuild_needed ~feed persisted] is true iff the
+    [remaintain_expired_sells] rebuild would change [persisted] given [feed] (the
+    scan's live open-sell store).
+
+    It duplicates the rebuild's change condition exactly - no rung added,
+    dropped, re-quantified, re-priced, or de-duplicated, and the list already
+    price-descending with one rung per tolerance bucket - but without building
+    the rebuilt list. The common cycle therefore skips the rebuild's two sorts,
+    [List.map], and fold, which is the bulk of the sync stage's minor-word
+    budget; a genuine change still takes the original path.
+
+    Written with explicit recursion and index reads (no list conversion, no
+    closures, no [Some] boxes) so the check itself is allocation-free. *)
+let persisted_rebuild_needed ~(feed : Sell_orders.t) persisted =
+  let flen = Sell_orders.length feed in
+  let rec ordered has_prev prev_p = function
+    | [] -> true
+    | (p, _) :: rest ->
+      let ok =
+        (not has_prev)
+        || (Float.compare prev_p p > 0 && not (price_within_tolerance ~reference:prev_p p))
+      in
+      ok && ordered true p rest
+  in
+  (* Max live qty whose price is within tolerance of [p]. Max is
+     order-independent, so a right fold matches the original left fold. *)
+  let rec live_qty p j =
+    if j >= flen
+    then 0.0
+    else (
+      let fp = Sell_orders.get_price feed j in
+      let fq = Sell_orders.get_qty feed j in
+      let acc = live_qty p (j + 1) in
+      if fq > acc && price_within_tolerance ~reference:p fp then fq else acc)
+  in
+  let rec any_qty_changed = function
+    | [] -> false
+    | (p, q) :: rest ->
+      let live = live_qty p 0 in
+      if live > 0.0 && live <> q then true else any_qty_changed rest
+  in
+  let rec matches_persisted fp = function
+    | [] -> false
+    | (p, _) :: rest ->
+      price_within_tolerance ~reference:p fp || matches_persisted fp rest
+  in
+  let rec any_adopted j =
+    if j >= flen
+    then false
+    else (
+      let fp = Sell_orders.get_price feed j in
+      let fq = Sell_orders.get_qty feed j in
+      if fq > 0.0 && not (matches_persisted fp persisted)
+      then true
+      else any_adopted (j + 1))
+  in
+  (not (ordered false 0.0 persisted)) || any_qty_changed persisted || any_adopted 0
 ;;
 
 (** Reconciles the persisted-sell grid (Alpaca offline fill recovery). Computed
     once per execution and reused by the three persisted-sell branches. *)
 let reconcile_persisted_sell_levels ~state =
-  partition_persisted_sell_levels state.persisted_sell_levels state.open_sell_orders
+  partition_persisted_sell_levels
+    state.persisted_sell_levels
+    (Sell_orders.to_list state.open_sell_orders)
 ;;
 
 (** Seconds after a sell placement during which its venue-side hold is treated
@@ -562,7 +642,7 @@ let sync_open_orders
   in
   if can_skip
   then (
-    state.open_sell_orders <- state.cached_feed_sell_orders;
+    Sell_orders.blit ~src:state.cached_feed_sell_orders ~dst:state.open_sell_orders;
     open_buy_count_from_scan := state.cached_open_buy_count;
     has_recent_amend_buy := state.cached_has_recent_amend_buy;
     locked_in_buys := state.cached_locked_in_buys;
@@ -576,8 +656,10 @@ let sync_open_orders
        open sell and a string-hash lookup per ledger entry. [execute_strategy]
        holds [state.mutex], so this is single-writer. O(ledger), no allocation. *)
     Hashtbl.iter (fun _ c -> c.sc_listed <- false) state.sell_commitments;
-    state.open_sell_orders <- [];
+    Sell_orders.clear state.open_sell_orders;
     state.sync_orders_seen <- 0;
+    (* Loop-invariant: [evicted_orders] does not change during the scan. *)
+    let evicted_empty = Hashtbl.length state.evicted_orders = 0 in
     let t_scan_start = Monotonic_clock.now_ns () in
     iter_open_orders (fun oid price qty side_str userref_opt ->
       state.sync_orders_seen <- state.sync_orders_seen + 1;
@@ -589,8 +671,7 @@ let sync_open_orders
       if
         qty > 0.0
         && is_our_strategy
-        && (Hashtbl.length state.evicted_orders = 0
-            || not (Hashtbl.mem state.evicted_orders oid))
+        && (evicted_empty || not (Hashtbl.mem state.evicted_orders oid))
       then
         if side_str = "buy"
         then (
@@ -606,7 +687,7 @@ let sync_open_orders
         else if side_str = "sell"
         then (
           add_tracked_order_id state oid;
-          state.open_sell_orders <- (oid, price, qty) :: state.open_sell_orders;
+          Sell_orders.push state.open_sell_orders oid price qty;
           (* A snapshot lists each order id at most once, so accumulate directly;
            [upsert_sell_commitment] flips [sc_listed] for the reconcile below. *)
           feed_total := !feed_total +. qty;
@@ -629,9 +710,11 @@ let sync_open_orders
        per-order 1-to-1 match/adopt is what removes the SMH/REMX "Updated ... ->
        ..." / "Adopted ..." churn: with two ids at one price the old code consumed
        the single level with the first id and re-adopted the second every scan. *)
-    if ecfg.remaintain_expired_sells
+    if
+      ecfg.remaintain_expired_sells
+      && persisted_rebuild_needed ~feed:state.open_sell_orders state.persisted_sell_levels
     then (
-      let feed = state.open_sell_orders in
+      let feed = Sell_orders.to_list state.open_sell_orders in
       let live_qty_at p =
         List.fold_left
           (fun acc (_, fp, fq) ->
@@ -679,7 +762,10 @@ let sync_open_orders
     state.cached_has_recent_amend_buy <- !has_recent_amend_buy;
     state.cached_locked_in_buys <- !locked_in_buys;
     state.cached_closest_sell_order <- !closest_sell_order;
-    state.cached_feed_sell_orders <- state.open_sell_orders;
+    (* Only venues that can take the generation skip read this cache; Alpaca
+       (remaintain) rescans every cycle, so skip the snapshot there. *)
+    if not ecfg.remaintain_expired_sells
+    then Sell_orders.blit ~src:state.open_sell_orders ~dst:state.cached_feed_sell_orders;
     state.open_orders_scan_generation <- generation;
     state.open_orders_scan_valid <- true);
   let t_rec_start = Monotonic_clock.now_ns () in
@@ -735,12 +821,10 @@ let sync_open_orders
          then
            if trust_feed
            then to_remove := id :: !to_remove
-           else
-             state.open_sell_orders
-             <- (id, c.sc_price, c.sc_qty) :: state.open_sell_orders
+           else Sell_orders.push state.open_sell_orders id c.sc_price c.sc_qty
          else if now_time -. c.sc_armed <= sell_commitment_in_flight_timeout_s
          then
-           state.open_sell_orders <- (id, c.sc_price, c.sc_qty) :: state.open_sell_orders
+           Sell_orders.push state.open_sell_orders id c.sc_price c.sc_qty
          else to_remove := id :: !to_remove)
       state.sell_commitments;
     List.iter (Hashtbl.remove state.sell_commitments) !to_remove)
@@ -750,7 +834,7 @@ let sync_open_orders
          if c.sc_listed
          then ()
          else
-           state.open_sell_orders <- (id, c.sc_price, c.sc_qty) :: state.open_sell_orders)
+           Sell_orders.push state.open_sell_orders id c.sc_price c.sc_qty)
       state.sell_commitments;
   state.time_sync_rec_ns <- Monotonic_clock.now_ns () - t_rec_start;
   state.feed_locked_sell_base <- !feed_total;
@@ -823,12 +907,38 @@ let sync_open_orders
   let open_persisted_levels, missing_persisted_levels =
     if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> []
     then (
+      (* Index walk (no per-rung closure/predicate allocation). O(m) per rung is
+         fine: m is the open-order count and this is the remaintain path only. *)
+      let feedm = state.open_sell_orders in
+      let flen = Sell_orders.length feedm in
       let feed_open p =
-        List.exists
-          (fun (_, fp, _) -> price_within_tolerance ~reference:p fp)
-          state.open_sell_orders
+        let rec go j =
+          if j >= flen
+          then false
+          else if price_within_tolerance ~reference:p (Sell_orders.get_price feedm j)
+          then true
+          else go (j + 1)
+        in
+        go 0
       in
-      List.partition (fun (p, _) -> feed_open p) state.persisted_sell_levels)
+      let missing_acc = ref [] in
+      List.iter
+        (fun ((p, _) as level) ->
+           if not (feed_open p)
+           then missing_acc := level :: !missing_acc)
+        state.persisted_sell_levels;
+      (* All rungs open (the common steady state): reuse the persisted list by
+         pointer so the sell leg's [open_levels @ ...] and its dedupe stay
+         allocation-free. Only a genuinely missing rung forces a fresh split. *)
+      if !missing_acc = []
+      then state.persisted_sell_levels, []
+      else (
+        let open_acc = ref [] in
+        List.iter
+          (fun ((p, _) as level) ->
+             if feed_open p then open_acc := level :: !open_acc)
+          state.persisted_sell_levels;
+        List.rev !open_acc, List.rev !missing_acc))
     else [], []
   in
   ( !open_buy_count_from_scan
@@ -1031,10 +1141,9 @@ let evaluate_buy_leg
     let buy_cooldown_key = "place_Buy" in
     let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns buy_cooldown_key in
     let has_crossing_sell =
-      List.exists
-        (fun (_, price, _) ->
-           price <= buy_price || (bid_price > 0.0 && price <= bid_price))
+      Sell_orders.exists_price_leq
         state.open_sell_orders
+        (if bid_price > 0.0 then Float.max buy_price bid_price else buy_price)
       || Hashtbl.length state.evicted_orders > 0
     in
     if state.capital_low
@@ -1403,12 +1512,12 @@ let evaluate_excess_sweep
     if excess >= min_order_size -. 1e-9
     then (
       let top_open =
-        List.find_opt
-          (fun (oid, p, _q) ->
+        Sell_orders.find_first
+          state.open_sell_orders
+          (fun oid p _q ->
              (not (String.starts_with ~prefix:"pending" oid))
              && (abs_float (p -. top_price) <= top_price *. 0.0001
                  || abs_float (p -. top_price) <= 1e-4))
-          state.open_sell_orders
       in
       match top_open with
       | None -> ()
@@ -1557,9 +1666,7 @@ let evaluate_sell_leg
      [open_sell_orders], and when the ledger transiently undercounts a dropped
      order. Taking the max avoids double-counting the overlap. *)
   let committed_total =
-    let open_sum =
-      List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 state.open_sell_orders
-    in
+    let open_sum = Sell_orders.sum_qty state.open_sell_orders in
     Float.max (committed_sell_base state) open_sum
   in
   (* Reserve-bounded headroom from the local ledger: base we hold that is not
@@ -1715,7 +1822,8 @@ let evaluate_sell_leg
           || buy_attempted
           || state.resuming_after_balance_flag
           || missing_lvl_check <> []
-          || (state.open_sell_orders = [] && Option.is_some state.last_buy_fill_price)))
+          || (Sell_orders.is_empty state.open_sell_orders
+              && Option.is_some state.last_buy_fill_price)))
     else false
   in
   (* Oracle-inactive: buys are halted but the sell leg always runs (sells
@@ -1812,7 +1920,8 @@ let evaluate_sell_leg
       || buy_attempted
       || state.resuming_after_balance_flag
       || halt_inventory_check
-      || (state.open_sell_orders = [] && Option.is_some state.last_buy_fill_price)
+      || (Sell_orders.is_empty state.open_sell_orders
+          && Option.is_some state.last_buy_fill_price)
     in
     let target_sell_price_opt, target_sell_qty_override =
       if

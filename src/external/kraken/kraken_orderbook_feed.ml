@@ -455,6 +455,91 @@ let int32_of_json json =
   | _ -> None
 ;;
 
+(** True when the token in [i, j) is a JSON float (contains a fraction or
+    exponent marker), matching Yojson's lexer rule that any [. e E] token is a
+    [Float]; otherwise the token is an integer ([Int] or [Intlit]). *)
+let span_contains_float_marker s i j =
+  let rec go k =
+    k < j
+    && (s.[k] = '.'
+        || s.[k] = 'e'
+        || s.[k] = 'E'
+        || go (k + 1))
+  in
+  go i
+;;
+
+(** Span analogues of [int64_of_json]/[int32_of_json]: reproduce the DOM
+    classification from the raw token, including the string case and the
+    float-vs-integer split. Exactly one [String.sub]/[string_of_span] per
+    scalar, versus two variant nodes plus the token string under the DOM. *)
+let int64_of_span s i j =
+  if i >= j
+  then None
+  else if s.[i] = '"'
+  then (
+    try Some (Int64.of_string (Json_scan.string_of_span s i j)) with
+    | _ -> None)
+  else if span_contains_float_marker s i j
+  then (
+    try Some (Int64.of_float (float_of_string (String.sub s i (j - i)))) with
+    | _ -> None)
+  else (
+    try Some (Int64.of_string (String.sub s i (j - i))) with
+    | _ -> None)
+;;
+
+let int32_of_span s i j =
+  if i >= j
+  then None
+  else if s.[i] = '"'
+  then (
+    try Some (Int32.of_string (Json_scan.string_of_span s i j)) with
+    | _ -> None)
+  else if span_contains_float_marker s i j
+  then (
+    try Some (Int32.of_float (float_of_string (String.sub s i (j - i)))) with
+    | _ -> None)
+  else (
+    let token = String.sub s i (j - i) in
+    (* Mirror the DOM split: a native-int token is [Int i] and goes through
+       [Int32.of_int], which wraps modulo 2^32. Only beyond native int does
+       Yojson emit [Intlit s], whose [Int32.of_string] raises past 2^31 and is
+       caught to [None]. Real Kraken checksums (e.g. 3310070434) fall in the
+       wrap case, so this must not raise. *)
+    match int_of_string_opt token with
+    | Some n -> Some (Int32.of_int n)
+    | None -> (try Some (Int32.of_string token) with
+               | _ -> None))
+;;
+
+(** Span analogue of [to_decimal_str ~trim_trailing:false] (the hot-path call
+    shape used by the checksum inputs), with bit-identical output:
+    - strings pass through verbatim (unescaped, as Yojson's lexer yields);
+    - float tokens re-render via [float_of_string] on the exact substring, then
+      [sprintf "%.*f"], so the rounded decimal string matches the DOM bit for
+      bit even at last-ulp boundaries ([Json_scan.float_of_span] does not);
+    - integer tokens are re-normalized through [int_of_string_opt]
+      (["-0"] -> ["0"], matching [Int 0]); a token beyond OCaml's native int
+      overflows to [None] and is passed through verbatim, exactly the
+      [Intlit] case.
+    The single slice alloc is the rendered price/qty payload itself. *)
+let decimal_str_of_span ?dec s i j =
+  if i >= j
+  then "0"
+  else if s.[i] = '"'
+  then Json_scan.string_of_span s i j
+  else if span_contains_float_marker s i j
+  then (
+    let d = match dec with Some d -> d | None -> 12 in
+    Printf.sprintf "%.*f" d (float_of_string (String.sub s i (j - i))))
+  else (
+    let token = String.sub s i (j - i) in
+    match int_of_string_opt token with
+    | Some n -> string_of_int n
+    | None -> token)
+;;
+
 let parse_level symbol price_json size_json =
   let pd, ld =
     match get_precision_from_instruments symbol with
@@ -520,6 +605,95 @@ let parse_and_apply_levels symbol tbl json =
   | _ -> ()
 ;;
 
+(** Span analogue of [parse_level]: renders price/qty from their value spans
+    instead of JSON values. Same precision lookup and fixed-decimal re-render,
+    so [price_wire]/[size] (the checksum inputs) are bit-identical to the DOM
+    path. *)
+let parse_level_from_span symbol s price_span size_span =
+  let pd, ld =
+    match get_precision_from_instruments symbol with
+    | Some (price_prec, qty_prec) -> price_prec, qty_prec
+    | None ->
+      (try Hashtbl.find decimals_tbl symbol with
+       | Not_found -> 8, 8)
+  in
+  let price_str_raw =
+    decimal_str_of_span ~dec:pd s (fst price_span) (snd price_span)
+  in
+  let qty_str = decimal_str_of_span ~dec:ld s (fst size_span) (snd size_span) in
+  let price_float =
+    try float_of_string price_str_raw with
+    | _ -> 0.0
+  in
+  let qty_float =
+    try float_of_string qty_str with
+    | _ -> 0.0
+  in
+  let price_str = Printf.sprintf "%.*f" pd price_float in
+  { price = price_str
+  ; price_wire = price_str_raw
+  ; size = qty_str
+  ; price_float
+  ; size_float = qty_float
+  }
+;;
+
+(** Mirror of the DOM level-array patterns `[price; qty]` and
+    `[price; qty; timestamp]`: returns the price/qty element spans only when
+    the level array holds exactly 2 or 3 elements (fewer or more are skipped,
+    as the DOM pattern match does). *)
+let level_price_qty_spans s i j =
+  let i, j = Json_scan.array_interior s i j in
+  let count = ref 0 in
+  let pspan = ref (0, 0) in
+  let qspan = ref (0, 0) in
+  Json_scan.array_fold s i j () (fun () a b ->
+      (match !count with
+       | 0 -> pspan := (a, b)
+       | 1 -> qspan := (a, b)
+       | _ -> ());
+      incr count);
+  match !count with
+  | 2 | 3 -> Some (!pspan, !qspan)
+  | _ -> None
+;;
+
+(** Span analogue of [parse_and_apply_levels]: applies a level array (object or
+    scalar-pair form) straight into the store's Hashtbl without building a DOM.
+    Non-array values (and malformed levels) are ignored exactly as the DOM
+    path ignores non-`List` inputs and non-matching entries. *)
+let apply_levels_from_span symbol s tbl (i, j) =
+  if i < j && s.[i] = '['
+  then (
+    let lo, hi = Json_scan.array_interior s i j in
+    Json_scan.array_fold s lo hi () (fun () e0 e1 ->
+        if e0 < e1 && s.[e0] = '{'
+        then (
+          (* Object format: {"price": ..., "qty": ...} *)
+          let olo, ohi = Json_scan.object_interior s e0 e1 in
+          match
+            Json_scan.find_field s olo ohi "price", Json_scan.find_field s olo ohi "qty"
+          with
+          | Some price_span, Some qty_span ->
+            let lvl = parse_level_from_span symbol s price_span qty_span in
+            if is_effectively_zero lvl.size
+            then Hashtbl.remove tbl lvl.price
+            else Hashtbl.replace tbl lvl.price lvl
+          | _ -> ())
+        else if e0 < e1 && s.[e0] = '['
+        then (
+          (* Array format: [price, qty] or [price, qty, timestamp] *)
+          match level_price_qty_spans s e0 e1 with
+          | Some (price_span, qty_span) ->
+            let lvl = parse_level_from_span symbol s price_span qty_span in
+            if is_effectively_zero lvl.size
+            then Hashtbl.remove tbl lvl.price
+            else Hashtbl.replace tbl lvl.price lvl
+          | None -> ())
+        else ()))
+  else ()
+;;
+
 (** Converts a Hashtbl to a sorted level array truncated to [depth] entries.
     [sort_desc] controls descending (bids) vs ascending (asks) order. *)
 let levels_to_array ?(sort_desc = false) tbl depth =
@@ -550,34 +724,10 @@ let truncate_hashtbl tbl sort_desc max_levels =
   Array.iter (fun lvl -> Hashtbl.replace tbl lvl.price lvl) levels_array
 ;;
 
-(** Constructs an [orderbook] record from the current store state and the raw JSON entry metadata. *)
-let build_orderbook store symbol entry =
-  let open Yojson.Safe.Util in
-  let sequence =
-    match int64_of_json (member "sequence" entry) with
-    | Some seq -> Some seq
-    | None -> None
-  in
-  (* Skip checksum JSON extraction when depth < 10: checksum validation is
-     bypassed anyway, and parsing the JSON field allocates Int32 boxes. *)
-  let checksum =
-    if orderbook_depth >= 10
-    then (
-      let checksum_json = member "checksum" entry in
-      match checksum_json with
-      | `Int i -> Some (Int32.of_int i)
-      | `Intlit s ->
-        (try Some (Int32.of_string s) with
-         | _ -> None)
-      | `Float f ->
-        (try Some (Int32.of_float f) with
-         | _ -> None)
-      | `String s ->
-        (try Some (Int32.of_string s) with
-         | _ -> None)
-      | _ -> None)
-    else None
-  in
+(** Constructs an [orderbook] record from the current store state, the parsed
+    entry sequence, and the wire checksum. The caller extracts the scalars
+    (DOM member access or span scan) so this is shared by both paths. *)
+let make_orderbook store symbol ~sequence ~checksum =
   let bids = levels_to_array ~sort_desc:true store.bids orderbook_depth in
   let asks = levels_to_array ~sort_desc:false store.asks orderbook_depth in
   { symbol; bids; asks; sequence; checksum; timestamp = Unix.time () }
@@ -649,9 +799,165 @@ let fetch_decimals symbols =
 
 let notified_symbols_reusable : (string, store) Hashtbl.t = Hashtbl.create 16
 
-(** Process a single orderbook WebSocket message. When [reset] is true, the message
-    is treated as a snapshot (full state replacement). Otherwise it is an incremental update.
-    Performs sequence validation, checksum verification, and ring buffer writes.
+(** Shared per-entry book processing for the DOM and span paths. Callers
+    extract the entry scalars (symbol, sequence, checksum) their own way and
+    hand the level application in as [apply_levels]; everything from sequence
+    validation onward is path-independent: state mutation, truncation,
+    checksum validation, ring write, readiness, heartbeat. [reset] selects
+    snapshot (full replacement) vs incremental update semantics. *)
+let process_book_entry ~reset ~symbol ~sequence ~checksum ~apply_levels on_heartbeat notified_symbols =
+  try
+    let store = ensure_store symbol in
+    if reset
+    then (
+      (* Snapshot: clear existing state and reinitialize from this message. *)
+      Hashtbl.clear store.bids;
+      Hashtbl.clear store.asks;
+      Atomic.set store.has_snapshot true;
+      Atomic.set store.last_sequence sequence;
+      Logging.debug_f
+        ~section
+        "Received snapshot for %s (sequence=%s), ready for updates"
+        symbol
+        (match sequence with
+         | Some s -> Int64.to_string s
+         | None -> "none"))
+    else (
+      (* Incremental update: discard if no snapshot has been received yet. *)
+      if not (Atomic.get store.has_snapshot)
+      then (
+        Logging.debug_f
+          ~section
+          "Ignoring update for %s: waiting for snapshot after reconnect"
+          symbol;
+        raise Exit);
+      (* Validate monotonic sequence ordering. Rollbacks and gaps trigger full resync. *)
+      let last_seq_opt = Atomic.get store.last_sequence in
+      match sequence, last_seq_opt with
+      | Some curr_seq, Some last_seq when Int64.compare curr_seq last_seq <= 0 ->
+        Logging.info_f
+          ~section
+          "Sequence rollback for %s: current=%Ld last=%Ld, marking out-of-sync"
+          symbol
+          curr_seq
+          last_seq;
+        Hashtbl.clear store.bids;
+        Hashtbl.clear store.asks;
+        RingBuffer.clear store.buffer;
+        Atomic.set store.has_snapshot false;
+        Atomic.set store.last_sequence None;
+        (* domain-safe trigger - the Lwt watcher drains this. *)
+        request_resubscribe symbol;
+        raise Exit
+      | Some curr_seq, Some last_seq
+        when Int64.compare curr_seq (Int64.add last_seq 1L) > 0 ->
+        let gap = Int64.sub curr_seq last_seq in
+        Logging.info_f
+          ~section
+          "Sequence gap for %s: current=%Ld last=%Ld (gap=%Ld), marking \
+           out-of-sync"
+          symbol
+          curr_seq
+          last_seq
+          gap;
+        Hashtbl.clear store.bids;
+        Hashtbl.clear store.asks;
+        RingBuffer.clear store.buffer;
+        Atomic.set store.has_snapshot false;
+        Atomic.set store.last_sequence None;
+        (* domain-safe trigger - the Lwt watcher drains this. *)
+        request_resubscribe symbol;
+        raise Exit
+      | _ -> ());
+    apply_levels store;
+    Atomic.set store.last_update_ns (Mtime_clock.now_ns ());
+    (* Kraken v2 book contract: levels that fall out of the subscribed
+        scope never receive a qty:0 removal. Retaining entries beyond
+        [orderbook_depth] accumulates stale levels that re-enter the
+        computed top-10 during removal cascades and desync checksum
+        validation. Truncate to the subscribed depth after every
+        message. *)
+    if Hashtbl.length store.bids > orderbook_depth
+    then truncate_hashtbl store.bids true orderbook_depth;
+    if Hashtbl.length store.asks > orderbook_depth
+    then truncate_hashtbl store.asks false orderbook_depth;
+    let orderbook = make_orderbook store symbol ~sequence ~checksum in
+    (* CRC32 from current state over the top 10 levels per side. If
+      [orderbook_depth] < 10, validation is bypassed (the map lacks the
+      requisite levels). The recompute is throttled to every
+      [checksum_every_n] updates; the book is still built and written
+      per tick, only the redundant CRC pass is slowed. *)
+    store.checksum_tick <- store.checksum_tick + 1;
+    let checksum_valid =
+      if orderbook_depth >= 10 && store.checksum_tick mod checksum_every_n = 0
+      then (
+        let calculated_checksum =
+          calculate_checksum
+            symbol
+            (levels_to_array ~sort_desc:true store.bids 10)
+            (levels_to_array ~sort_desc:false store.asks 10)
+        in
+        match orderbook.checksum with
+        | Some received_checksum ->
+          if Int32.compare calculated_checksum received_checksum <> 0
+          then (
+            (* Cooldown: a persistently failing validator must degrade
+                to periodic heals, not hot-loop unsub/resub. Touched
+                only from the parse domain; no locking needed. *)
+            let now = Unix.gettimeofday () in
+            let last =
+              match Hashtbl.find_opt resubscribe_cooldown symbol with
+              | Some t -> t
+              | None -> 0.0
+            in
+            Logging.warn_f
+              ~section
+              "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld \
+               (0x%08lx) - book desynced, requesting resubscribe"
+              symbol
+              received_checksum
+              received_checksum
+              calculated_checksum
+              calculated_checksum;
+            Hashtbl.clear store.bids;
+            Hashtbl.clear store.asks;
+            RingBuffer.clear store.buffer;
+            Atomic.set store.has_snapshot false;
+            Atomic.set store.last_sequence None;
+            if now -. last >= resubscribe_cooldown_s
+            then (
+              Hashtbl.replace resubscribe_cooldown symbol now;
+              request_resubscribe symbol)
+            else
+              Logging.debug_f
+                ~section
+                "Resubscribe for %s suppressed by cooldown (%.1fs)"
+                symbol
+                (resubscribe_cooldown_s -. (now -. last));
+            raise Exit)
+          else true
+        | None -> true)
+      else true
+    in
+    if checksum_valid
+    then (
+      RingBuffer.write store.buffer orderbook;
+      Hashtbl.replace notified_symbols symbol store;
+      Atomic.set store.last_sequence sequence);
+    on_heartbeat ()
+  with
+  | Exit ->
+    () (* Control flow: entry skipped due to missing snapshot or sequence error. *)
+  | exn ->
+    Logging.warn_f
+      ~section
+      "Failed to process orderbook entry: %s"
+      (Printexc.to_string exn)
+;;
+
+(** Process a single orderbook WebSocket message via the DOM. Kept as the
+    reference path: state parity with the span version is enforced by
+    [test_kraken_span_orderbook]. [reset] selects snapshot vs update semantics.
     Returns [Some ()] on successful parse, [None] on failure. *)
 let process_orderbook_message ~reset json on_heartbeat =
   let open Yojson.Safe.Util in
@@ -663,162 +969,26 @@ let process_orderbook_message ~reset json on_heartbeat =
       (fun entry ->
          try
            let symbol = member "symbol" entry |> to_string in
-           let store = ensure_store symbol in
-           if reset
-           then (
-             (* Snapshot: clear existing state and reinitialize from this message. *)
-             Hashtbl.clear store.bids;
-             Hashtbl.clear store.asks;
-             Atomic.set store.has_snapshot true;
-             let sequence =
-               match int64_of_json (member "sequence" entry) with
-               | Some seq -> Some seq
-               | None -> None
-             in
-             Atomic.set store.last_sequence sequence;
-             Logging.debug_f
-               ~section
-               "Received snapshot for %s (sequence=%s), ready for updates"
-               symbol
-               (match sequence with
-                | Some s -> Int64.to_string s
-                | None -> "none"))
-           else (
-             (* Incremental update: discard if no snapshot has been received yet. *)
-             if not (Atomic.get store.has_snapshot)
-             then (
-               Logging.debug_f
-                 ~section
-                 "Ignoring update for %s: waiting for snapshot after reconnect"
-                 symbol;
-               raise Exit (* Skip processing this entry *));
-             (* Validate monotonic sequence ordering. Rollbacks and gaps trigger full resync. *)
-             let current_sequence =
-               match int64_of_json (member "sequence" entry) with
-               | Some seq -> Some seq
-               | None -> None
-             in
-             let last_seq_opt = Atomic.get store.last_sequence in
-             match current_sequence, last_seq_opt with
-             | Some curr_seq, Some last_seq when Int64.compare curr_seq last_seq <= 0 ->
-               Logging.info_f
-                 ~section
-                 "Sequence rollback for %s: current=%Ld last=%Ld, marking out-of-sync"
-                 symbol
-                 curr_seq
-                 last_seq;
-               Hashtbl.clear store.bids;
-               Hashtbl.clear store.asks;
-               RingBuffer.clear store.buffer;
-               Atomic.set store.has_snapshot false;
-               Atomic.set store.last_sequence None;
-               (* domain-safe trigger - the Lwt watcher drains this. *)
-               request_resubscribe symbol;
-               raise Exit (* Skip processing this entry *)
-             | Some curr_seq, Some last_seq
-               when Int64.compare curr_seq (Int64.add last_seq 1L) > 0 ->
-               let gap = Int64.sub curr_seq last_seq in
-               Logging.info_f
-                 ~section
-                 "Sequence gap for %s: current=%Ld last=%Ld (gap=%Ld), marking \
-                  out-of-sync"
-                 symbol
-                 curr_seq
-                 last_seq
-                 gap;
-               Hashtbl.clear store.bids;
-               Hashtbl.clear store.asks;
-               RingBuffer.clear store.buffer;
-               Atomic.set store.has_snapshot false;
-               Atomic.set store.last_sequence None;
-               (* domain-safe trigger - the Lwt watcher drains this. *)
-               request_resubscribe symbol;
-               raise Exit (* Skip processing this entry *)
-             | _ -> ());
+           let sequence = int64_of_json (member "sequence" entry) in
+           (* Skip checksum extraction when depth < 10: validation is bypassed
+              anyway, and the DOM field allocates Int32 boxes per frame. *)
+           let checksum =
+             if orderbook_depth >= 10
+             then int32_of_json (member "checksum" entry)
+             else None
+           in
            let bids_json = member "bids" entry in
            let asks_json = member "asks" entry in
-           parse_and_apply_levels symbol store.bids bids_json;
-           parse_and_apply_levels symbol store.asks asks_json;
-           Atomic.set store.last_update_ns (Mtime_clock.now_ns ());
-            (* Kraken v2 book contract: levels that fall out of the subscribed
-                scope never receive a qty:0 removal. Retaining entries beyond
-                [orderbook_depth] accumulates stale levels that re-enter the
-                computed top-10 during removal cascades and desync checksum
-                validation. Truncate to the subscribed depth after every
-                message. *)
-           if Hashtbl.length store.bids > orderbook_depth
-           then truncate_hashtbl store.bids true orderbook_depth;
-           if Hashtbl.length store.asks > orderbook_depth
-           then truncate_hashtbl store.asks false orderbook_depth;
-           let orderbook = build_orderbook store symbol entry in
-            (* CRC32 from current state over the top 10 levels per side. If
-             [orderbook_depth] < 10, validation is bypassed (the map lacks the
-             requisite levels). The recompute is throttled to every
-             [checksum_every_n] updates; the book is still built and written
-             per tick, only the redundant CRC pass is slowed. *)
-           store.checksum_tick <- store.checksum_tick + 1;
-           let checksum_valid =
-             if orderbook_depth >= 10 && store.checksum_tick mod checksum_every_n = 0
-             then (
-               let calculated_checksum =
-                 calculate_checksum
-                   symbol
-                   (levels_to_array ~sort_desc:true store.bids 10)
-                   (levels_to_array ~sort_desc:false store.asks 10)
-               in
-               match orderbook.checksum with
-               | Some received_checksum ->
-                 if Int32.compare calculated_checksum received_checksum <> 0
-                 then (
-                    (* Cooldown: a persistently failing validator must degrade
-                        to periodic heals, not hot-loop unsub/resub. Touched
-                        only from the parse domain; no locking needed. *)
-                   let now = Unix.gettimeofday () in
-                   let last =
-                     match Hashtbl.find_opt resubscribe_cooldown symbol with
-                     | Some t -> t
-                     | None -> 0.0
-                   in
-                   Logging.warn_f
-                     ~section
-                     "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld \
-                      (0x%08lx) - book desynced, requesting resubscribe"
-                     symbol
-                     received_checksum
-                     received_checksum
-                     calculated_checksum
-                     calculated_checksum;
-                   Hashtbl.clear store.bids;
-                   Hashtbl.clear store.asks;
-                   RingBuffer.clear store.buffer;
-                   Atomic.set store.has_snapshot false;
-                   Atomic.set store.last_sequence None;
-                   if now -. last >= resubscribe_cooldown_s
-                   then (
-                     Hashtbl.replace resubscribe_cooldown symbol now;
-                     request_resubscribe symbol)
-                   else
-                     Logging.debug_f
-                       ~section
-                       "Resubscribe for %s suppressed by cooldown (%.1fs)"
-                       symbol
-                       (resubscribe_cooldown_s -. (now -. last));
-                   raise Exit)
-                 else true
-               | None -> true)
-             else true
-           in
-           if checksum_valid
-           then (
-             RingBuffer.write store.buffer orderbook;
-             Hashtbl.replace notified_symbols symbol store;
-             let current_sequence =
-               match int64_of_json (member "sequence" entry) with
-               | Some seq -> Some seq
-               | None -> None
-             in
-             Atomic.set store.last_sequence current_sequence);
-           on_heartbeat ()
+           process_book_entry
+             ~reset
+             ~symbol
+             ~sequence
+             ~checksum
+             ~apply_levels:(fun store ->
+               parse_and_apply_levels symbol store.bids bids_json;
+               parse_and_apply_levels symbol store.asks asks_json)
+             on_heartbeat
+             notified_symbols
          with
          | Exit ->
            () (* Control flow: entry skipped due to missing snapshot or sequence error. *)
@@ -831,6 +1001,81 @@ let process_orderbook_message ~reset json on_heartbeat =
     (* Broadcast readiness and signal exchange wakeup for each symbol that received a valid write. *)
     Hashtbl.iter (fun symbol store -> notify_ready ~symbol store) notified_symbols;
     Some ()
+  with
+  | exn ->
+    Logging.warn_f
+      ~section
+      "Failed to parse orderbook message: %s"
+      (Printexc.to_string exn);
+    None
+;;
+
+(** Process a single orderbook WebSocket message via the allocation-light scan.
+    Same book semantics as [process_orderbook_message]; enforceable state
+    parity is verified by [test_kraken_span_orderbook]. Each data entry's
+    scalars are located as spans and the levels applied without a DOM. Returns
+    [Some ()] on successful parse, [None] on failure. *)
+let process_orderbook_message_span ~reset message on_heartbeat =
+  try
+    let dlen = String.length message in
+    match Json_scan.find_field message 1 (max 0 (dlen - 1)) "data" with
+    | Some (di, dj) when di < dj && message.[di] = '[' ->
+      let ilo, ihi = Json_scan.array_interior message di dj in
+      Hashtbl.clear notified_symbols_reusable;
+      let notified_symbols = notified_symbols_reusable in
+      Json_scan.array_fold message ilo ihi () (fun () e0 e1 ->
+          if e0 < e1 && message.[e0] = '{'
+          then (
+            try
+              let olo, ohi = Json_scan.object_interior message e0 e1 in
+              let symbol =
+                match Json_scan.find_field message olo ohi "symbol" with
+                | Some (si, sj) when Json_scan.value_is_string message si ->
+                  Json_scan.string_of_span message si sj
+                | _ -> raise Exit
+              in
+              let sequence =
+                match Json_scan.find_field message olo ohi "sequence" with
+                | Some (si, sj) -> int64_of_span message si sj
+                | None -> None
+              in
+              let checksum =
+                if orderbook_depth >= 10
+                then (
+                  match Json_scan.find_field message olo ohi "checksum" with
+                  | Some (si, sj) -> int32_of_span message si sj
+                  | None -> None)
+                else None
+              in
+              let bids_span = Json_scan.find_field message olo ohi "bids" in
+              let asks_span = Json_scan.find_field message olo ohi "asks" in
+              process_book_entry
+                ~reset
+                ~symbol
+                ~sequence
+                ~checksum
+                ~apply_levels:(fun store ->
+                  (match bids_span with
+                   | Some bs -> apply_levels_from_span symbol message store.bids bs
+                   | None -> ());
+                  (match asks_span with
+                   | Some as_ -> apply_levels_from_span symbol message store.asks as_
+                   | None -> ()))
+                on_heartbeat
+                notified_symbols
+            with
+            | Exit ->
+              () (* Control flow: entry skipped or state reset. *)
+            | exn ->
+              Logging.warn_f
+                ~section
+                "Failed to process orderbook entry: %s"
+                (Printexc.to_string exn))
+          else ());
+      (* Broadcast readiness and signal exchange wakeup for each symbol that received a valid write. *)
+      Hashtbl.iter (fun symbol store -> notify_ready ~symbol store) notified_symbols;
+      Some ()
+    | _ -> None
   with
   | exn ->
     Logging.warn_f
@@ -1053,6 +1298,29 @@ let record_book_latency json =
   | _ -> ()
 ;;
 
+(** Span analogue of [record_book_latency]: extracts each data entry's
+    [timestamp] string directly from the frame with no DOM. *)
+let record_book_latency_span message =
+  let dlen = String.length message in
+  match Json_scan.find_field message 1 (max 0 (dlen - 1)) "data" with
+  | Some (di, dj) when di < dj && message.[di] = '[' ->
+    let ilo, ihi = Json_scan.array_interior message di dj in
+    Json_scan.array_fold message ilo ihi () (fun () e0 e1 ->
+        if e0 < e1 && message.[e0] = '{'
+        then (
+          let olo, ohi = Json_scan.object_interior message e0 e1 in
+          match Json_scan.find_field message olo ohi "timestamp" with
+          | Some (ti, tj) when Json_scan.value_is_string message ti ->
+            (match
+               Network_latency.unix_of_rfc3339 (Json_scan.string_of_span message ti tj)
+             with
+             | Some event -> Network_latency.record_feed_event_s "kraken" ~event ()
+             | None -> ())
+          | _ -> ())
+        else ())
+  | _ -> ()
+;;
+
 let extract_symbol_opt json =
   let open Yojson.Safe.Util in
   match member "symbol" json with
@@ -1165,24 +1433,53 @@ let handle_dispatch json on_heartbeat =
     Logging.info_f ~section "Unhandled orderbook payload: %s" (Yojson.Safe.to_string json)
 ;;
 
+(** Parse-domain body: parse + dispatch without publishing a tick (the WS fiber
+    owns tick accounting) and with the connection's current heartbeat. Shared by
+    the legacy "kraken_ob" handler and the uniform venue decoder.
+    Book frames (the hot path) are read with the allocation-light scan;
+    heartbeats are answered without a DOM; everything else
+    (subscribe/unsubscribe/status/control) falls back to the DOM [handle_dispatch]. *)
+let process_parse_domain_frame message =
+  try
+    let on_heartbeat =
+      match Atomic.get current_on_heartbeat with
+      | Some f -> f
+      | None -> fun () -> ()
+    in
+    let len = String.length message in
+    let top_level_field key =
+      (* The scanner needs the top-level object interior; frames are tight
+         (no leading whitespace), matching [Kraken_impl.decode_frame]. *)
+      match Json_scan.find_field message 1 (max 0 (len - 1)) key with
+      | Some (i, j) when Json_scan.value_is_string message i ->
+        Json_scan.string_of_span message i j
+      | _ -> ""
+    in
+    let channel = top_level_field "channel" in
+    let msg_type = top_level_field "type" in
+    let method_type = top_level_field "method" in
+    match channel, msg_type, method_type with
+    | "heartbeat", _, _ | _, _, "heartbeat" -> on_heartbeat ()
+    | "book", "snapshot", _ ->
+      record_book_latency_span message;
+      ignore (process_orderbook_message_span ~reset:true message on_heartbeat)
+    | "book", "update", _ ->
+      record_book_latency_span message;
+      ignore (process_orderbook_message_span ~reset:false message on_heartbeat)
+    | _ ->
+      (* Non-book control frames are rare; keep the DOM router for them. *)
+      handle_dispatch (Yojson.Safe.from_string message) on_heartbeat
+  with
+  | exn ->
+    Logging.error_f
+      ~section
+      "Error parsing message: %s - %s"
+      (Printexc.to_string exn)
+      message
+;;
+
 (** Parse-worker entry point: parse + dispatch on the parse domain. *)
-let () =
-  Concurrency.Parse_worker.register "kraken_ob" (fun message ->
-    try
-      let json = Yojson.Safe.from_string message in
-      let on_heartbeat =
-        match Atomic.get current_on_heartbeat with
-        | Some f -> f
-        | None -> fun () -> ()
-      in
-      handle_dispatch json on_heartbeat
-    with
-    | exn ->
-      Logging.error_f
-        ~section
-        "Error parsing message: %s - %s"
-        (Printexc.to_string exn)
-        message)
+let () = Concurrency.Parse_worker.register "kraken_ob" process_parse_domain_frame
 ;;
 
 (** Synchronous path: parse + dispatch inline on the calling thread.
@@ -1210,7 +1507,7 @@ let handle_message message on_heartbeat =
 let handle_message_async message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
   Atomic.set current_on_heartbeat (Some on_heartbeat);
-  if not (Concurrency.Parse_worker.submit "kraken_ob" message)
+  if not (Concurrency.Parse_worker.submit_frame "kraken" message)
   then handle_message message on_heartbeat
 ;;
 

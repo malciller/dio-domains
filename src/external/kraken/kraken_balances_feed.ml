@@ -574,6 +574,21 @@ let handle_message_json json on_heartbeat =
   | exn -> Logging.error_f ~section "Error handling message: %s" (Printexc.to_string exn)
 ;;
 
+(** Parse-domain body: parse and dispatch without publishing a tick (the WS
+    fiber owns tick accounting). Used by the uniform venue decoder. *)
+let process_parse_domain_frame message =
+  try
+    let json = Yojson.Safe.from_string message in
+    handle_message_json json (fun () -> ())
+  with
+  | exn ->
+    Logging.error_f
+      ~section
+      "Error handling message: %s - %s"
+      (Printexc.to_string exn)
+      message
+;;
+
 (** Parses a raw text WebSocket message as JSON and dispatches it. *)
 let handle_message message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();

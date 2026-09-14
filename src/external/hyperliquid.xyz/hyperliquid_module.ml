@@ -657,6 +657,14 @@ module Hyperliquid_impl = struct
       ~to_perp
       ~testnet:(Atomic.get is_testnet)
   ;;
+
+  (* Uniform decode entry: l2Book frames go through the zero-alloc TOB parser.
+     Control channels (pong/responses/subscriber fan-out) touch Lwt and stay in
+     the WS layer. *)
+  let decode_frame content =
+    if String.starts_with ~prefix:"{\"channel\":\"l2Book\"," content
+    then Hyperliquid_orderbook_feed.process_raw_market_data content
+  ;;
 end
 
 (** WebSocket-based initialization routines.
@@ -1012,6 +1020,13 @@ let fetch_open_orders_ws () =
 
 (* Register Hyperliquid_impl with the exchange registry at module load time *)
 let () = Exchange.Registry.register (module Hyperliquid_impl)
+
+(* Register the uniform venue decoder for the parse-domain offload route. *)
+let () =
+  Concurrency.Parse_worker.register_venue_decoder
+    ~venue:"hyperliquid"
+    Hyperliquid_impl.decode_frame
+;;
 
 (* Register the oracle data-venue adapter (historical candles, fees, spot
    balances, instruments for the capital oracle) at load time. *)

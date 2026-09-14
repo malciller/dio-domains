@@ -1,5 +1,7 @@
 open Alcotest
 
+module Sell_orders = Dio_strategies.Jacobs_ladder_sell_orders
+
 (* Links Alpaca.Module.Alpaca_impl to run its registry registration so venue
    metadata resolves as in production (the 1e-9 fractional increment behind
    dust-level pruning). *)
@@ -245,7 +247,7 @@ let test_blocked_placement_sell_retries () =
   state.cached_venue_min_qty <- 0.01;
   state.reserved_base <- 0.5;
   state.accumulated_profit <- 1.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.just_filled_buy <- false;
   state.last_buy_fill_price <- Some 62369.0;
   state.last_buy_fill_qty <- Some 0.5;
@@ -405,7 +407,7 @@ let test_unnetted_sell_hold_gates_second_sizing () =
   state.cached_venue_min_notional <- 10.0;
   state.reserved_base <- 0.0224;
   state.accumulated_profit <- 24.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.inflight_sell <- false;
   state.asset_low <- false;
   state.just_filled_buy <- true;
@@ -546,7 +548,7 @@ let test_unnetted_sell_hold_expires_after_grace () =
   state.cached_venue_min_notional <- 10.0;
   state.reserved_base <- 0.0;
   state.accumulated_profit <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.inflight_sell <- false;
   state.asset_low <- false;
   state.just_filled_buy <- false;
@@ -616,7 +618,7 @@ let test_unnetted_sell_hold_capped_even_with_age () =
   state.cached_venue_min_notional <- 10.0;
   state.reserved_base <- 0.0;
   state.accumulated_profit <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.inflight_sell <- false;
   state.asset_low <- false;
   state.just_filled_buy <- false;
@@ -689,7 +691,7 @@ let test_unnetted_sell_hold_releases_on_newer_message () =
   state.cached_venue_min_notional <- 10.0;
   state.reserved_base <- 0.19917916;
   state.accumulated_profit <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.inflight_sell <- false;
   state.asset_low <- false;
   state.just_filled_buy <- true;
@@ -787,7 +789,7 @@ let test_unnetted_sell_hold_burst_downmove () =
   state.cached_venue_min_notional <- 10.0;
   state.reserved_base <- 0.199;
   state.accumulated_profit <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.inflight_sell <- false;
   state.asset_low <- false;
   state.just_filled_buy <- false;
@@ -915,7 +917,7 @@ let test_unnetted_sell_hold_ignores_buy_increase () =
   state.cached_venue_min_notional <- 10.0;
   state.reserved_base <- 0.0;
   state.accumulated_profit <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.inflight_sell <- false;
   state.asset_low <- false;
   state.just_filled_buy <- true;
@@ -1043,7 +1045,7 @@ let test_ghost_buy_suppressed_within_ack_grace () =
   let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
   state.exchange_id <- "kraken";
   state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "kraken";
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.pending_orders <- [];
   Hashtbl.clear state.sell_commitments;
   Hashtbl.clear state.amend_cooldowns;
@@ -1129,7 +1131,7 @@ let test_position_ledger_bridges_unreflected_fill () =
   state.cached_venue_min_notional <- 10.0;
   state.reserved_base <- 0.19117916;
   state.accumulated_profit <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.inflight_sell <- false;
   state.asset_low <- false;
   state.just_filled_buy <- true;
@@ -1440,7 +1442,7 @@ let test_position_balance_before_fill_no_double_credit () =
   state.position_venue_ts <- 1000.0;
   state.attributed_balance_increase <- 0.0;
   state.buy_credits_since_balance <- [];
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.inflight_sell <- false;
   state.asset_low <- false;
   state.startup_replay <- false;
@@ -1595,7 +1597,7 @@ let test_position_buy_credit_and_sell_hold_cancel () =
   state.cached_venue_min_qty <- 0.0;
   state.cached_venue_min_notional <- 10.0;
   state.reserved_base <- 0.19117916;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.inflight_sell <- false;
   state.asset_low <- false;
   state.just_filled_buy <- true;
@@ -1673,7 +1675,7 @@ let test_position_dead_feed_credit_expires () =
   state.cached_venue_min_qty <- 0.0;
   state.cached_venue_min_notional <- 10.0;
   state.reserved_base <- 0.19117916;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.inflight_sell <- false;
   state.asset_low <- false;
   state.just_filled_buy <- true;
@@ -1753,7 +1755,7 @@ let test_position_reserved_exceeds_ledger_clamps () =
   state.cached_venue_min_qty <- 0.0;
   state.cached_venue_min_notional <- 10.0;
   state.reserved_base <- 0.19117916;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.inflight_sell <- false;
   state.asset_low <- false;
   state.just_filled_buy <- true;
@@ -2036,7 +2038,7 @@ let test_sell_never_offers_locked_inventory () =
   state.buy_credits_since_balance <- [];
   state.attributed_balance_increase <- 0.0;
   state.sell_holds_since_balance <- [];
-  state.open_sell_orders <- [ "resting-sell", 537.78, 0.0388 ];
+  state.open_sell_orders <- Sell_orders.of_list [ "resting-sell", 537.78, 0.0388 ];
   set_sell_commitments
     state.sell_commitments
     [ "resting-sell", 537.78, 0.0388, true, true, 0.0 ];
@@ -2124,7 +2126,7 @@ let test_inflight_sell_commitment_survives_feed_gap () =
   let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
   state.exchange_id <- "kraken";
   state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "kraken";
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   Hashtbl.clear state.sell_commitments;
   state.pending_orders <- [];
   state.last_buy_order_id <- None;
@@ -2178,7 +2180,7 @@ let test_inflight_sell_commitment_survives_feed_gap () =
     bool
     "the in-flight sell is merged into the open-order view"
     true
-    (List.exists (fun (id, _, _) -> id = "pending_sell_100.00") state.open_sell_orders);
+    (Sell_orders.exists_id state.open_sell_orders "pending_sell_100.00");
   (* 2) Ack re-keys to the venue id; still not listed. *)
   Dio_strategies.Jacobs_ladder.rekey_sell_commitment
     ~state
@@ -2237,7 +2239,7 @@ let test_sub_minimum_qty_sell_places () =
   state.cached_venue_min_notional <- 1.0;
   state.reserved_base <- 0.5;
   state.accumulated_profit <- 1.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.just_filled_buy <- true;
   state.last_buy_fill_price <- Some 62369.0;
   state.last_buy_fill_qty <- Some 0.5;
@@ -2340,7 +2342,7 @@ let test_order_cancellation () =
   let state = Dio_strategies.Jacobs_ladder.get_strategy_state "TEST2/USD" in
   state.last_buy_order_id <- Some "buy123";
   state.last_buy_order_price <- Some 49000.0;
-  state.open_sell_orders <- [ "sell456", 51000.0, 1.0; "sell789", 52000.0, 1.0 ];
+  state.open_sell_orders <- Sell_orders.of_list [ "sell456", 51000.0, 1.0; "sell789", 52000.0, 1.0 ];
   Dio_strategies.Jacobs_ladder.Strategy.handle_order_cancelled
     ~now:0.0
     "TEST2/USD"
@@ -2541,7 +2543,7 @@ let test_tif_recovery_armed_on_ghost_buy_ws_kill () =
   state.exchange_id <- "hyperliquid";
   state.tif_recovery_pending <- false;
   state.last_buy_order_id <- None;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
@@ -2604,7 +2606,7 @@ let test_tif_recovery_not_armed_on_stale_cancel () =
   state.exchange_id <- "hyperliquid";
   state.tif_recovery_pending <- false;
   state.last_buy_order_id <- None;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
@@ -2669,7 +2671,7 @@ let test_accumulation_profit_tracking () =
     "buy fill price recorded"
     (Some 39.50)
     state.last_buy_fill_price;
-  state.open_sell_orders <- [ "sell001", 39.90, 1.0 ];
+  state.open_sell_orders <- Sell_orders.of_list [ "sell001", 39.90, 1.0 ];
   Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
     ~now:0.0
     symbol
@@ -2728,7 +2730,7 @@ let test_accumulation_full_lifecycle () =
       ~fill_price:buy_price
       ~fill_qty:0.35
       None;
-    state.open_sell_orders <- [ sell_id, sell_price, 1.0 ];
+    state.open_sell_orders <- Sell_orders.of_list [ sell_id, sell_price, 1.0 ];
     Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
       ~now:0.0
       symbol
@@ -2790,7 +2792,7 @@ let test_accumulation_multi_strategy_isolation () =
       ~fill_price:84000.0
       ~fill_qty:0.0002
       None;
-    btc.open_sell_orders <- [ sell_id, 84336.0, 1.0 ];
+    btc.open_sell_orders <- Sell_orders.of_list [ sell_id, 84336.0, 1.0 ];
     Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
       ~now:0.0
       btc_sym
@@ -2822,7 +2824,7 @@ let test_accumulation_multi_strategy_isolation () =
       ~fill_price:39.50
       ~fill_qty:0.35
       None;
-    hype.open_sell_orders <- [ sell_id, 39.90, 1.0 ];
+    hype.open_sell_orders <- Sell_orders.of_list [ sell_id, 39.90, 1.0 ];
     Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
       ~now:0.0
       hype_sym
@@ -2856,7 +2858,7 @@ let test_virtual_gtc_sell_grid_maintenance () =
   let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
   state.persisted_sell_levels <- [ 101.00, 1.0; 98.98, 1.0; 96.96, 1.0 ];
   state.last_buy_fill_price <- Some 96.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   (* Expired or missing DAY orders *)
   let asset_alpaca =
     { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
@@ -2918,7 +2920,7 @@ let test_virtual_gtc_sell_grid_maintenance () =
     Dio_strategies.Jacobs_ladder.get_strategy_state "OFFLINE_TEST/USD"
   in
   state_offline.persisted_sell_levels <- [ 105.00, 1.0 ];
-  state_offline.open_sell_orders <- [];
+  Sell_orders.clear state_offline.open_sell_orders;
   let asset_offline = { asset_alpaca with symbol = "OFFLINE_TEST/USD" } in
   Dio_strategies.Jacobs_ladder.evaluate_sell_leg
     ~persisted_reconcile:
@@ -2962,7 +2964,7 @@ let test_virtual_gtc_sell_grid_maintenance () =
   (* Venue isolation: Kraken has remaintain_expired_sells = false. *)
   let kraken_symbol = "KRAKEN_TEST/USD" in
   let state_kraken = Dio_strategies.Jacobs_ladder.get_strategy_state kraken_symbol in
-  state_kraken.open_sell_orders <- [];
+  Sell_orders.clear state_kraken.open_sell_orders;
   let asset_kraken =
     { Dio_strategies.Jacobs_ladder.exchange = "kraken"
     ; symbol = kraken_symbol
@@ -3021,7 +3023,7 @@ let test_halted_ladders_second_sell_beside_resting_one () =
   state.cached_sell_mult <- 0.999;
   state.cached_venue_min_qty <- 0.0;
   state.reserved_base <- 0.0;
-  state.open_sell_orders <- [ "resting1", 462.13, 0.04 ];
+  state.open_sell_orders <- Sell_orders.of_list [ "resting1", 462.13, 0.04 ];
   set_sell_commitments
     state.sell_commitments
     [ "resting1", 462.13, 0.04, true, true, 0.0 ];
@@ -3099,7 +3101,7 @@ let test_halted_startup_places_inventory_sell () =
   state.cached_venue_min_qty <- 0.0;
   state.reserved_base <- 0.0;
   state.accumulated_profit <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.persisted_sell_levels <- [];
   (* Startup-inactive: no fills this session, no buy attempted. *)
   state.just_filled_buy <- false;
@@ -3153,7 +3155,7 @@ let test_halted_startup_places_inventory_sell () =
   check bool "startup-inactive places an inventory sell (XMR case)" true found;
   (* No inventory -> no sell: the halt check requires a placeable balance. *)
   drain ();
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   Dio_strategies.Jacobs_ladder.evaluate_sell_leg
     ~persisted_reconcile:
       (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
@@ -3188,7 +3190,7 @@ let test_halted_path_still_places_sell () =
   state.cached_venue_min_qty <- 0.01;
   state.reserved_base <- 0.0;
   state.accumulated_profit <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   (* A buy filled right before capital ran out: the sell must still go out. *)
   state.just_filled_buy <- true;
   state.last_buy_fill_price <- Some 39.50;
@@ -3262,7 +3264,7 @@ let test_capital_low_still_places_bottom_rung_sell () =
   state.cached_venue_min_notional <- 0.0;
   state.reserved_base <- 0.0;
   state.accumulated_profit <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.persisted_sell_levels <- [];
   state.position_initialized <- true;
   state.position_base <- 0.05;
@@ -3343,7 +3345,7 @@ let test_burst_tracked_venue_no_reserved_dip () =
   state.cached_venue_min_notional <- 0.0;
   state.reserved_base <- 0.02;
   state.accumulated_profit <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.persisted_sell_levels <- [];
   state.position_initialized <- true;
   state.position_base <- 0.05;
@@ -3548,7 +3550,7 @@ let test_sell_retry_until_placed () =
   state.cached_venue_min_qty <- 0.01;
   state.reserved_base <- 0.0;
   state.accumulated_profit <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.just_filled_buy <- true;
   state.last_buy_fill_price <- Some 39.50;
   state.last_buy_fill_qty <- Some 0.35;
@@ -3642,7 +3644,7 @@ let test_accumulation_sells_non_accrued_inventory () =
   state.cached_venue_min_notional <- 10.0;
   state.reserved_base <- 0.5;
   state.accumulated_profit <- 2.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   set_sell_commitments state.sell_commitments [ "resting", 62369.0, 0.4, true, true, 0.0 ];
   state.feed_locked_sell_base <- 0.4;
   state.just_filled_buy <- true;
@@ -3732,7 +3734,7 @@ let test_nothing_placeable_clears_latch () =
   (* Balance is below the reserved accrual: no sellable inventory. *)
   state.reserved_base <- 0.0006248;
   state.accumulated_profit <- 2.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.just_filled_buy <- true;
   state.last_buy_fill_price <- Some 62369.0;
   state.last_buy_fill_qty <- Some 0.0005;
@@ -3797,7 +3799,7 @@ let test_kraken_partial_sell_clamp () =
   state.cached_venue_min_qty <- 0.01;
   state.cached_venue_min_notional <- 0.0;
   state.reserved_base <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.just_filled_buy <- true;
   state.last_buy_fill_price <- Some 100.0;
   state.last_buy_fill_qty <- Some 1.0;
@@ -3864,7 +3866,7 @@ let test_alpaca_dollar_floor_gate () =
   state.cached_venue_min_qty <- 0.000000001;
   state.cached_venue_min_notional <- 1.0;
   state.reserved_base <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.just_filled_buy <- true;
   state.last_buy_fill_price <- Some 142.0;
   state.last_buy_fill_qty <- Some 0.25;
@@ -3958,7 +3960,7 @@ let test_alpaca_verified_nothing_to_sell_consumes_latch () =
   state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
   state.cached_price_increment <- 0.01;
   state.reserved_base <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.persisted_sell_levels <- [];
   state.last_buy_fill_price <- Some 73.95;
   state.last_buy_fill_qty <- Some 0.26;
@@ -4056,7 +4058,7 @@ let test_alpaca_persistence_never_hijacks_owed_sell () =
   state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
   state.cached_price_increment <- 0.01;
   state.reserved_base <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.just_filled_buy <- true;
   state.last_buy_fill_price <- Some 76.87;
   state.last_buy_fill_qty <- Some 0.26;
@@ -4134,7 +4136,7 @@ let test_alpaca_persistence_never_hijacks_owed_sell () =
   ignore
     (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
        state.duplicate_key_sell);
-  state.open_sell_orders <- [ "rest1", 77.25, 0.26 ];
+  state.open_sell_orders <- Sell_orders.of_list [ "rest1", 77.25, 0.26 ];
   evaluate ~now:160.0;
   let pending2 = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
   check bool "nothing pushed while pruning the dust level" true (pending2 = []);
@@ -4191,7 +4193,7 @@ let reset_alpaca_excess_state symbol =
   state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
   state.cached_price_increment <- 0.01;
   state.reserved_base <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.persisted_sell_levels <- [];
   state.just_filled_buy <- false;
   state.resuming_after_balance_flag <- false;
@@ -4260,7 +4262,7 @@ let test_alpaca_excess_amends_open_top_rung () =
   let symbol = "ALPACA_EXCESS_AMEND/USD" in
   let state = reset_alpaca_excess_state symbol in
   state.persisted_sell_levels <- [ 101.0, 1.0; 99.0, 1.0 ];
-  state.open_sell_orders <- [ "top-oid", 101.0, 1.0; "low-oid", 99.0, 1.0 ];
+  state.open_sell_orders <- Sell_orders.of_list [ "top-oid", 101.0, 1.0; "low-oid", 99.0, 1.0 ];
   let asset = alpaca_excess_asset ~symbol in
   let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
   Dio_strategies.Jacobs_ladder.evaluate_sell_leg
@@ -4309,7 +4311,7 @@ let test_alpaca_excess_excludes_reserved_base () =
   let state = reset_alpaca_excess_state symbol in
   state.reserved_base <- 2.0;
   state.persisted_sell_levels <- [ 101.0, 1.0 ];
-  state.open_sell_orders <- [ "top-oid", 101.0, 1.0 ];
+  state.open_sell_orders <- Sell_orders.of_list [ "top-oid", 101.0, 1.0 ];
   let asset = alpaca_excess_asset ~symbol in
   let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
   Dio_strategies.Jacobs_ladder.evaluate_sell_leg
@@ -4346,7 +4348,7 @@ let test_alpaca_venue_available_blocks_reserve_dip () =
   let symbol = "ALPACA_VENUE_AVAIL/USD" in
   let state = reset_alpaca_excess_state symbol in
   state.reserved_base <- 0.00234;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.persisted_sell_levels <- [];
   state.just_filled_buy <- true;
   state.last_buy_fill_price <- Some 100.0;
@@ -4384,7 +4386,7 @@ let test_alpaca_excess_sweep_takes_full_excess () =
   let symbol = "ALPACA_SWEEP_FULL/USD" in
   let state = reset_alpaca_excess_state symbol in
   state.persisted_sell_levels <- [ 101.0, 1.0 ];
-  state.open_sell_orders <- [ "full-top-oid", 101.0, 1.0 ];
+  state.open_sell_orders <- Sell_orders.of_list [ "full-top-oid", 101.0, 1.0 ];
   let asset = alpaca_excess_asset ~symbol in
   let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
   Dio_strategies.Jacobs_ladder.evaluate_sell_leg
@@ -4433,7 +4435,7 @@ let test_alpaca_restore_excludes_reserved_base () =
   let state = reset_alpaca_excess_state symbol in
   state.reserved_base <- 0.1;
   state.persisted_sell_levels <- [ 101.0, 1.0 ];
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   let asset = alpaca_excess_asset ~symbol in
   let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
   Dio_strategies.Jacobs_ladder.evaluate_sell_leg
@@ -4481,7 +4483,7 @@ let test_alpaca_restore_partial_headroom_clamped () =
   let state = reset_alpaca_excess_state symbol in
   state.reserved_base <- 0.1;
   state.persisted_sell_levels <- [ 101.0, 2.0 ];
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   let asset = alpaca_excess_asset ~symbol in
   let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
   Dio_strategies.Jacobs_ladder.evaluate_sell_leg
@@ -4526,7 +4528,7 @@ let test_alpaca_sweep_skips_dust_delta () =
   let symbol = "ALPACA_SWEEP_DUST/USD" in
   let state = reset_alpaca_excess_state symbol in
   state.persisted_sell_levels <- [ 101.0, 1.0 ];
-  state.open_sell_orders <- [ "dust-top-oid", 101.0, 1.0 ];
+  state.open_sell_orders <- Sell_orders.of_list [ "dust-top-oid", 101.0, 1.0 ];
   let asset = alpaca_excess_asset ~symbol in
   let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
   Dio_strategies.Jacobs_ladder.evaluate_sell_leg
@@ -4568,7 +4570,7 @@ let test_alpaca_sell_anchors_on_fill_not_ask () =
   state.cached_venue_min_qty <- 0.000000001;
   state.cached_venue_min_notional <- 1.0;
   state.reserved_base <- 0.0;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.just_filled_buy <- true;
   state.last_buy_fill_price <- Some 100.0;
   state.last_buy_fill_qty <- Some 1.0;
@@ -5248,7 +5250,7 @@ let test_sync_open_orders_generation_skip () =
   state.exchange_id <- "kraken";
   state.cached_ecfg <- get_exchange_config "kraken";
   Hashtbl.clear state.sell_commitments;
-  state.open_sell_orders <- [];
+  Sell_orders.clear state.open_sell_orders;
   state.open_orders_scan_valid <- false;
   let asset =
     { exchange = "kraken"
@@ -5287,7 +5289,7 @@ let test_sync_open_orders_generation_skip () =
   check int "first sync scans once" 1 !scan_calls;
   check int "open-buy count cached" 1 obc1;
   check (float 1e-9) "locked-in buys from scan" 99.0 lib1;
-  check int "feed sells recorded" 1 (List.length state.open_sell_orders);
+  check int "feed sells recorded" 1 (Sell_orders.length state.open_sell_orders);
   (* Same generation: the scan closure must not run. *)
   let iter_orders_boom _ = failwith "scan must be skipped" in
   let _obc2, _hrab2, lib2, _lis2, _cs2, _op2, _mp2 =
@@ -5302,7 +5304,7 @@ let test_sync_open_orders_generation_skip () =
       ~ecfg
   in
   check (float 1e-9) "locked-in buys reused on skip" 99.0 lib2;
-  check int "sell list reused on skip" 1 (List.length state.open_sell_orders);
+  check int "sell list reused on skip" 1 (Sell_orders.length state.open_sell_orders);
   (* A lost placement (armed, never listed/acked) still ages out on a skipped
      cycle because the reconcile always runs. *)
   arm_sell_commitment ~state ~id:"pending_sell_lost" ~price:95.0 ~qty:3.0;
@@ -5730,7 +5732,7 @@ let sell_matrix_feed_and_size
   state.cached_venue_min_notional <- 0.0;
   state.reserved_base <- reserved;
   state.accumulated_profit <- 0.0;
-  state.open_sell_orders <- [ "resting", 100.0, ledger ];
+  state.open_sell_orders <- Sell_orders.of_list [ "resting", 100.0, ledger ];
   set_sell_commitments
     state.sell_commitments
     [ "resting", 100.0, ledger, true, true, 0.0 ];
@@ -5848,7 +5850,7 @@ let test_sell_commitment_lifecycle_all_venues () =
        state.base_accumulation_enabled <- true;
        state.reserved_base <- 0.0;
        state.accumulated_profit <- 0.0;
-       state.open_sell_orders <- [];
+       Sell_orders.clear state.open_sell_orders;
        Hashtbl.clear state.sell_commitments;
        state.feed_locked_sell_base <- 0.0;
        state.sell_holds_since_balance <- [];
@@ -5949,7 +5951,7 @@ let test_sell_commitment_lifecycle_all_venues () =
              then "an evicted sell leaves the open-order view"
              else "an in-flight sell remains visible to the buy leg"))
          (not trust_feed)
-         (List.exists (fun (id, _, _) -> id = "life-oid") state.open_sell_orders);
+         (Sell_orders.exists_id state.open_sell_orders "life-oid");
        let effective =
          Dio_strategies.Jacobs_ladder.effective_committed_sell_base
            ~ecfg
@@ -6005,7 +6007,7 @@ let test_terminal_sell_fill_releases_full_commitment () =
   state.reserved_base <- 0.0;
   state.accumulated_profit <- 0.0;
   set_sell_commitments state.sell_commitments [ "part-oid", 100.0, 0.2, true, true, 0.0 ];
-  state.open_sell_orders <- [ "part-oid", 100.0, 0.2 ];
+  state.open_sell_orders <- Sell_orders.of_list [ "part-oid", 100.0, 0.2 ];
   state.feed_locked_sell_base <- 0.2;
   state.sell_holds_since_balance <- [];
   state.buy_credits_since_balance <- [];
@@ -6034,7 +6036,7 @@ let test_terminal_sell_fill_releases_full_commitment () =
     bool
     "the filled sell is dropped from the open-order view"
     true
-    (not (List.exists (fun (id, _, _) -> id = "part-oid") state.open_sell_orders))
+    (not (Sell_orders.exists_id state.open_sell_orders "part-oid"))
 ;;
 
 let () =

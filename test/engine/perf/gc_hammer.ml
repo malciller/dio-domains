@@ -58,6 +58,25 @@ let worker_domain id total_ticks =
   LP.percentile profiler 0.99, LP.percentile profiler 0.999
 ;;
 
+(** Process-wide GC counters and total allocation, for attributing latency
+    changes to collector activity under each sweep configuration. [Gc.quick_stat]
+    is cheap and returns the same [stat] record shape as [Gc.stat]. *)
+type gc_counters =
+  { minor : int
+  ; major : int
+  ; compactions : int
+  ; promoted : float
+  }
+
+let gc_counters () =
+  let s = Gc.quick_stat () in
+  { minor = s.minor_collections
+  ; major = s.major_collections
+  ; compactions = s.compactions
+  ; promoted = s.promoted_words
+  }
+;;
+
 let () =
   let domains_count = 6 in
   let ticks_per_domain = 40_000 in
@@ -65,6 +84,7 @@ let () =
     "Starting GC Hammer with %d domains, %d ticks each...\n%!"
     domains_count
     ticks_per_domain;
+  let gc_before = gc_counters () in
   let start_time = Unix.gettimeofday () in
   let handles =
     List.init domains_count (fun id ->
@@ -72,6 +92,12 @@ let () =
   in
   let results = List.map Domain.join handles in
   let end_time = Unix.gettimeofday () in
+  let gc_after = gc_counters () in
+  let minor_gc = gc_after.minor - gc_before.minor in
+  let major_gc = gc_after.major - gc_before.major in
+  let compactions = gc_after.compactions - gc_before.compactions in
+  let promoted_words = gc_after.promoted -. gc_before.promoted in
+  let promoted_mb = promoted_words *. 8.0 /. 1_048_576.0 in
   Printf.printf "\n============= GC HAMMER SUMMARY =============\n";
   Printf.printf "Total Wall Time: %.2fs\n" (end_time -. start_time);
   let p99s = List.map fst results in
@@ -82,8 +108,18 @@ let () =
   Printf.printf "AVG P99 Latency:  %10.2f us\n" avg_p99;
   Printf.printf "AVG P999 Latency: %10.2f us\n" avg_p999;
   Printf.printf "MAX P999 Latency: %10.2f us\n" max_p999;
+  Printf.printf
+    "MINOR GCs: %d  MAJOR GCs: %d  COMPACTIONS: %d  PROMOTED: %.1f MB\n"
+    minor_gc
+    major_gc
+    compactions
+    promoted_mb;
   (* Machine-readable metric lines consumed by the sweep script. *)
   Printf.printf "SWEEP_METRIC_P99: %10.2f\n" avg_p99;
   Printf.printf "SWEEP_METRIC_MAX_P999: %10.2f\n" max_p999;
+  Printf.printf "SWEEP_METRIC_MINOR_GC: %d\n" minor_gc;
+  Printf.printf "SWEEP_METRIC_MAJOR_GC: %d\n" major_gc;
+  Printf.printf "SWEEP_METRIC_COMPACTIONS: %d\n" compactions;
+  Printf.printf "SWEEP_METRIC_PROMOTED_MB: %.2f\n" promoted_mb;
   Printf.printf "=============================================\n%!"
 ;;

@@ -437,6 +437,18 @@ module Lighter_impl = struct
          Some info.maker_fee, Some info.taker_fee
        | None -> None, None)
   ;;
+
+  (* Uniform decode entry: routes one inbound text frame through the same pure
+     decoder used by the WS layer ([Lighter_ws.decode_text_frame]), which has no
+     Lwt or connection-state dependencies. *)
+  let decode_frame content =
+    try ignore (Lighter_ws.decode_text_frame content) with
+    | exn ->
+      Logging.warn_f
+        ~section:Lighter_ws.section
+        "Failed to decode frame: %s"
+        (Printexc.to_string exn)
+  ;;
 end
 
 (** Blocks until both Lighter WS connections are up. *)
@@ -690,3 +702,8 @@ let fetch_balances () =
 
 (* Register the implementation with the exchange registry at module load. *)
 let () = Exchange.Registry.register (module Lighter_impl)
+
+(* Register the uniform venue decoder for the parse-domain offload route. *)
+let () =
+  Concurrency.Parse_worker.register_venue_decoder ~venue:"lighter" Lighter_impl.decode_frame
+;;

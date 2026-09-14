@@ -3,6 +3,7 @@
 
 module Exchange = Dio_exchange.Exchange_intf
 module Fear_and_greed = Cmc.Fear_and_greed
+module Sell_orders = Dio_strategies.Jacobs_ladder_sell_orders
 
 (** Cached engine start time. Set once by the server at startup. *)
 let engine_start_time = ref 0.0
@@ -114,7 +115,7 @@ let json_of_grid_strategy exchange symbol =
            else (
              Hashtbl.replace seen oid ();
              true))
-        state.open_sell_orders
+        (Sell_orders.to_list state.open_sell_orders)
     in
     let from_ledger =
       Hashtbl.fold
@@ -582,6 +583,27 @@ let json_of_recent_fills () =
        recent)
 ;;
 
+(** Parse-domain offload health: submitted/processed/fallen-back frame counts,
+    peak queue depth, and per-handler cumulative parse time. A rising
+    [fallbacks] count means the parse domain is saturated and hot threads are
+    parsing frames inline instead. *)
+let json_of_parse_worker () =
+  let handlers =
+    Concurrency.Parse_worker.handler_stats_snapshot ()
+    |> List.map (fun (name, frames, seconds) ->
+      name, `Assoc [ "frames", `Int frames; "seconds", `Float seconds ])
+    |> List.sort (fun (a, _) (b, _) -> String.compare a b)
+  in
+  `Assoc
+    [ "submitted", `Int (Concurrency.Parse_worker.frames_submitted ())
+    ; "processed", `Int (Concurrency.Parse_worker.frames_processed ())
+    ; "fallbacks", `Int (Concurrency.Parse_worker.fallbacks ())
+    ; "queue_length", `Int (Concurrency.Parse_worker.queue_length ())
+    ; "queue_high_water", `Int (Concurrency.Parse_worker.high_water ())
+    ; "handlers", `Assoc handlers
+    ]
+;;
+
 let build_snapshot () =
   let now = Unix.gettimeofday () in
   let uptime = now -. !engine_start_time in
@@ -839,6 +861,7 @@ let build_snapshot () =
     ; "recent_fills", json_of_recent_fills ()
     ; "latencies", json_of_domain_latencies ()
     ; "oracle_latency", json_of_oracle_latency ()
+    ; "parse_worker", json_of_parse_worker ()
     ]
 ;;
 
