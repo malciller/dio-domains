@@ -1,45 +1,37 @@
 # Contributing
 
-Thanks for considering a contribution to dio. The project is small and
-operationally focused — a few pointers so your PR lands cleanly.
+Send a PR if you want to fix something. A few notes so it goes smoothly.
 
 ## Ground rules
 
-- dio **trades real money**. Behavioral changes to the engine are assessed
-  against the [specification](https://diophantsolutions.com/dio/SPEC/) and the
-  risk policy. If your change alters sizing, execution, or hedging, say exactly
-  how and discuss it in an issue first.
-- No surprise dependencies. New opam packages or changes to the production
-  dependency closure need a clear justification and must build cleanly under
-  both the classic-flambda toolchain (CI's `build-test`) and OxCaml/flambda2
-  (the image build).
-- Zero compiler alerts. The OxCaml test run treats `Alert` output as a failure.
-- Never commit `.env` or any credentials — CI enforces this and will fail the
-  build.
+- dio trades real money. If your change touches sizing, execution, or hedging,
+  explain how in an issue first.
+- No new dependencies unless there's a reason. New opam packages have to build
+  clean under both toolchains (the `build-test` CI job and the OxCaml image
+  build).
+- No compiler alerts. The OxCaml test run fails on any `Alert` output.
+- Never commit `.env` or credentials. CI checks for this and fails the build.
 
-## Development loop
+## Local build
 
-The reference build process lives in the CI workflow
-(`.github/workflows/ci.yml`); locally that means:
+The CI workflow (`.github/workflows/ci.yml`) shows the full process. Locally
+that means:
 
-- `opam switch` on OCaml 5.2.0 with `dune`
-- `dune build @all` to compile `dio`, `dio-dashboard`, `dio-oracle`
-- `dune runtest` for the test suite
+- OCaml 5.2.0 with dune
+- `dune build @all` builds `dio`, `dio-dashboard`, `dio-oracle`
+- `dune runtest` runs the tests
 
-See the [deployment](https://diophantsolutions.com/dio/DEPLOYMENT/) and
-[configuration](https://diophantsolutions.com/dio/CONFIGURATION/) pages for how
-the pieces fit together.
+The docs pages cover how the pieces fit:
+<https://diophantsolutions.com/dio/DEPLOYMENT/> and
+<https://diophantsolutions.com/dio/CONFIGURATION/>.
 
 ## Submitting changes
 
-1. Open an issue describing the problem or the feature and the motivation.
-2. Branch from `main`, keep the change focused, and add tests that fail without
-   the change.
-3. Open a PR referencing the issue. The `build-test` CI job must pass; keep the
-   main build green.
-4. Releases are cut by the maintainer. A merged PR will be included in the next
-   `v*` tag automatically.
+1. Open an issue with the problem or feature and why.
+2. Branch from `main`. Keep the change small. Add tests that fail without it.
+3. Open a PR that references the issue. The `build-test` CI job has to pass.
+4. The maintainer cuts releases. A merged PR shows up in the next `v*` tag.
 
-Questions and bug reports go through the issue tracker:
-<https://github.com/malciller/dio-domains/issues>. Never paste API keys, wallet
-seeds, or other secrets into an issue.
+Questions go through the issue tracker:
+<https://github.com/malciller/dio-domains/issues>. Never paste API keys,
+wallet seeds, or other secrets into an issue.

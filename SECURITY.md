@@ -2,34 +2,31 @@
 
 ## Reporting a vulnerability
 
-dio handles exchange API keys and has access to live positions, so security
-reports are taken seriously.
+dio holds exchange API keys and live positions. Take security seriously.
 
-Please do **not** open a public issue for a security problem. Email
-<security@diophantsolutions.com> instead, or use GitHub's private vulnerability
-reporting on the repository (Security → Report a vulnerability) if available.
+Do not open a public issue for a security problem. Email
+<security@diophantsolutions.com>, or use GitHub's private vulnerability
+reporting (Security tab, Report a vulnerability).
 
 Include:
 
-- the affected version (git tag or commit) and how to reproduce
-- the impact, and whether keys, funds, or the runtime are exposed
-- any proof-of-concept, sanitized of credentials
+- the version or commit, and how to reproduce
+- what is exposed, keys, funds, runtime
+- a proof of concept, with credentials removed
 
-Reports are acknowledged within 72 hours and fixed in a private branch; the fix
-ships in the next release and is attributed in the release notes unless you
-prefer anonymity.
+Reports get a reply within 72 hours. The fix ships in the next release and gets
+credited in the release notes, unless you want to stay anonymous.
 
-## What to keep out of this repository
+## What to keep out of this repo
 
-- `.env` files (API keys, secrets). Only `.env.example` is tracked; CI fails
-  builds that commit anything else.
-- Private keys, mnemonic seeds, or wallet credentials in any file, issue, or
-  comment.
+- `.env` files. Only `.env.example` is tracked. CI fails builds that commit the
+  rest.
+- Private keys, seeds, or wallet credentials in any file, issue, or comment.
 
 ## Disclosure policy
 
-- Low/no-impact issues may be disclosed immediately once acknowledged.
-- Issues with financial or operational impact: notify the maintainer first and
-  allow a 30-day window (extendable by agreement) before public disclosure.
+- Low impact stuff can go public right after a reply.
+- If it touches money or operations, the maintainer gets 30 days before public
+  disclosure. You can extend that if you both agree.
 
-Verified reporters are added to the repository acknowledgments on request.
+Verified reporters can get a mention in the repo's acknowledgments on request.
