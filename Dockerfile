@@ -59,16 +59,23 @@ RUN mkdir -p /app/signer-out \
 # ==============================================================================
 # STAGE 2 — Runtime (minimal)
 # ==============================================================================
-FROM ubuntu:22.04@sha256:829f6df217bcbae2b371026e81711d1a787c61b2967ad09d015063663ebafbf7 AS runtime
+# Pinned ubuntu:24.04. Moving off 22.04 is what clears the CVEs carried by its
+# old base packages (glibc 2.35, perl 5.34, tar 1.34, pcre2 10.39, zstd 1.4.8,
+# ncurses 6.3, systemd 249, shadow 4.8, gcc-12). 24.04 ships the patched versions
+# and keeps a shell + coreutils, which the documented `--entrypoint cp` config
+# extraction and deploy.sh rely on (a distroless base would drop those).
+FROM ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254 AS runtime
 
-# 3. Runtime shared libraries only (no compilers, no opam, no git)
+# 3. Runtime shared libraries only. Kept to what the engine actually links:
+#    `ldd /usr/local/bin/dio` -> jemalloc, secp256k1, ffi, ssl/crypto, stdc++,
+#    gcc_s, m, c. gmp/pcre/pq/zlib are NOT linked and are deliberately omitted
+#    here; libpq5 in particular drags in krb5/ldap/gnutls. libssl is named
+#    libssl3t64 on 24.04 (the 64-bit time_t rename).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi8 \
-    libgmp10 \
-    libpcre3 \
-    libssl3 \
-    libpq5 \
-    zlib1g \
+    libssl3t64 \
+    libstdc++6 \
+    libgcc-s1 \
     libjemalloc2 \
     ca-certificates \
     netbase \
