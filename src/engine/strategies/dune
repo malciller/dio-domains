@@ -25,7 +25,6 @@
   Jacobs_ladder_execution
   Jacobs_ladder_events
   Fee_cache
-  Auto_hedger
   Strategy_actions
   Strategy_actions_builtin
   Strategy_actions_grid
