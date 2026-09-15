@@ -864,22 +864,7 @@ let asset_domain_worker
                          ~fill_price:event.avg_price
                          ~fill_qty:event.filled_qty
                          event.cl_ord_id)
-                     ();
-                 (* Trigger Auto-Hedging module *)
-                 if asset_with_fees.hedge
-                 then (
-                   let hedge_symbol =
-                     String.split_on_char '/' asset_with_fees.symbol |> List.hd
-                   in
-                   let perp_tob = Ex.get_top_of_book ~symbol:hedge_symbol in
-                   Dio_strategies.Auto_hedger.handle_order_filled
-                     asset_with_fees.testnet
-                     asset_with_fees.exchange
-                     hedge_symbol
-                     side
-                     event.filled_qty
-                     event.avg_price
-                     perp_tob)
+                     ()
                | Types.New | Types.PartiallyFilled ->
                  should_execute_strategy := true;
                  (* Skip handle_order_acknowledged for in-place amendment confirmations

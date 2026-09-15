@@ -11,10 +11,6 @@
  (libraries dio.strategies alcotest))
 
 (test
- (name test_auto_hedger)
- (libraries dio.strategies dio.engine alcotest))
-
-(test
  (name test_strategy_compose)
  (libraries dio.strategies alcotest))
 

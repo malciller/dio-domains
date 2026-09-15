@@ -686,8 +686,7 @@ let order_processing_loop () =
       let pending_grid_orders =
         Dio_strategies.Jacobs_ladder.Strategy.get_pending_orders 100
       in
-      let pending_hedge_orders = Dio_strategies.Auto_hedger.get_pending_orders 100 in
-      if pending_grid_orders = [] && pending_hedge_orders = []
+      if pending_grid_orders = []
       then (
         (* No pending orders: block until signalled. Sever the promise chain via
            [Lwt.async] to prevent [Forward] node accumulation. *)
@@ -701,18 +700,6 @@ let order_processing_loop () =
           List.iter
             (process_single_order ~orders_placed ~order_mutex ~is_connected)
             pending_grid_orders;
-          if not (Atomic.get shutdown_requested)
-          then
-            List.iter
-              (fun order ->
-                if order.operation <> Place
-                then
-                  Logging.warn_f
-                    ~section
-                    "Auto hedger only supports Place operations, got other for %s"
-                    order.symbol
-                else process_single_order ~orders_placed ~order_mutex ~is_connected order)
-              pending_hedge_orders;
           (* Sever promise chain before next drain cycle. *)
           Lwt.async loop;
           Lwt.return_unit
