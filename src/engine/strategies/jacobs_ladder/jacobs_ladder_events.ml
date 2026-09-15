@@ -5,7 +5,7 @@ open Jacobs_ladder_types
 open Jacobs_ladder_config
 open Jacobs_ladder_reservation
 open Jacobs_ladder_orders
-module Sell_orders = Jacobs_ladder_sell_orders
+module Sell_orders = Strategy_sell_orders
 
 (* Per-symbol lock-free lifecycle event queue. The Lwt supervisor thread (REST callbacks,
    supervisor_orders.ml) enqueues events instead of calling handlers directly; the domain

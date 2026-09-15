@@ -21,7 +21,7 @@
   Jacobs_ladder_config
   Jacobs_ladder_reservation
   Jacobs_ladder_orders
-  Jacobs_ladder_sell_orders
+  Strategy_sell_orders
   Jacobs_ladder_execution
   Jacobs_ladder_events
   Fee_cache

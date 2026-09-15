@@ -202,7 +202,7 @@ let seed
 let snapshot_collections (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
   : (string * Expr.value) list
   =
-  let module S = Dio_strategies.Jacobs_ladder_sell_orders in
+  let module S = Dio_strategies.Strategy_sell_orders in
   let open_sells =
     `List
       (List.map
@@ -269,7 +269,7 @@ let seed_collections
   (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
   (entries : (string * Expr.value) list)
   =
-  let module S = Dio_strategies.Jacobs_ladder_sell_orders in
+  let module S = Dio_strategies.Strategy_sell_orders in
   let j k =
     match List.assoc_opt k entries with
     | Some (Expr.V_string s) -> Some (Yojson.Basic.from_string s)

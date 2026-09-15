@@ -3,7 +3,7 @@
 
 module Exchange = Dio_exchange.Exchange_intf
 module Fear_and_greed = Cmc.Fear_and_greed
-module Sell_orders = Dio_strategies.Jacobs_ladder_sell_orders
+module Sell_orders = Dio_strategies.Strategy_sell_orders
 
 (** Cached engine start time. Set once by the server at startup. *)
 let engine_start_time = ref 0.0

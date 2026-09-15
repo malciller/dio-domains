@@ -5,7 +5,7 @@ open Jacobs_ladder_types
 open Jacobs_ladder_config
 open Jacobs_ladder_reservation
 open Jacobs_ladder_orders
-module Sell_orders = Jacobs_ladder_sell_orders
+module Sell_orders = Strategy_sell_orders
 
 (* Moved to Platform_accounting (milestone 2). *)
 let price_key = Platform_accounting.price_key
