@@ -376,6 +376,25 @@ let seed_from_trace (state : Dio_strategies.Jacobs_ladder_types.strategy_state) 
   | [] -> ()
 ;;
 
+(** Normalize a recorded event to an interpreter event so the candidate replay can route
+    it through the strategy file's event steps. *)
+let runtime_event_of_obs (e : Trace.event_obs) : Strategy_runtime.event =
+  Strategy_runtime.make_event
+    e.Trace.ev_kind
+    [ "now", Expr.V_float e.ev_now
+    ; "order_id", Expr.V_string e.ev_order_id
+    ; "new_order_id", Expr.V_string e.ev_new_order_id
+    ; "side", Expr.V_string e.ev_side
+    ; "price", Expr.V_float e.ev_price
+    ; "qty", Expr.V_float e.ev_qty
+    ; ( "cl_ord_id"
+      , match e.ev_cl_ord_id with
+        | Some s -> Expr.V_string s
+        | None -> Expr.V_none )
+    ; "reason", Expr.V_string e.ev_reason
+    ]
+;;
+
 (** Drive [trace] through [execute], applying the recorded per-cycle inputs (oracle/F&G
     blend, domain knobs, venue-available snapshot) to [state] first, and capture the
     emitted intents per cycle. Shared by the reference and candidate replays. *)
@@ -383,6 +402,7 @@ let drive
   ~(asset : Jac.trading_config)
   ~(state : Dio_strategies.Jacobs_ladder_types.strategy_state)
   ~(set_venue_available : (string -> float -> unit) option)
+  ~(dispatch_events : events:Trace.event_obs list -> price:float -> now:float -> unit)
   ~(execute :
       asset:Jac.trading_config
       -> price:float
@@ -406,15 +426,17 @@ let drive
   List.mapi
     (fun idx (c : Trace.cycle) ->
       let entries, open_orders, events = split_cycle c in
-      (* Feed the recorded lifecycle events through the reference handlers first, in the
-         exact dispatch order, so state transitions match the live run before the cycle. *)
-      List.iter (Jac.apply_event asset.symbol) events;
       let price = f_entry entries "price" nan in
       let bid = f_entry entries "bid" nan in
       let ask = f_entry entries "ask" nan in
       let abal = f_entry entries "asset_balance" nan in
       let qbal = f_entry entries "quote_balance" nan in
       let now = f_entry entries "now" 0.0 in
+      (* Feed the recorded lifecycle events first, in the exact dispatch order, so state
+         transitions match the live run before the cycle. The reference path applies them
+         through the reference handlers; the candidate path routes them through the
+         strategy file's event steps (grid_on_event). *)
+      dispatch_events ~events ~price ~now;
       let cycle = i_entry entries "cycle" idx in
       let generation = i_entry entries "generation" 0 in
       let oracle_halted = b_entry entries "oracle_halted" false in
@@ -487,6 +509,8 @@ let replay
     ~asset
     ~state
     ~set_venue_available
+    ~dispatch_events:(fun ~events ~price:_ ~now:_ ->
+      List.iter (Jac.apply_event asset.symbol) events)
     ~execute:
       (fun
         ~asset
@@ -535,6 +559,7 @@ let replay_candidate
   let state = Jac.get_strategy_state asset.symbol in
   seed_from_trace state trace;
   let ctx = Config_grid_engine.create () in
+  ctx.cg_symbol <- asset.symbol;
   ctx.cg_state <- Some state;
   let module Handlers = Strategy_actions_grid.Make (Config_grid_engine) in
   let rt = Strategy_runtime.create ~handlers:(Handlers.handler ctx) file in
@@ -542,6 +567,12 @@ let replay_candidate
     ~asset
     ~state
     ~set_venue_available
+    ~dispatch_events:(fun ~events ~price ~now ->
+      List.iter
+        (fun e ->
+          ignore
+            (Strategy_runtime.run_cycle rt ~price ~now ~event:(runtime_event_of_obs e)))
+        events)
     ~execute:
       (fun
         ~asset

@@ -611,6 +611,7 @@ let asset_domain_worker
             None)
           else (
             let ctx = Config_grid_engine.create () in
+            ctx.cg_symbol <- asset_with_fees.symbol;
             Logging.info_f
               ~section
               "config_strategy: %s running %s"
@@ -622,6 +623,47 @@ let asset_domain_worker
                   ~handlers:(Config_grid_handlers.handler ctx)
                   file )))
       else None
+    in
+    (* M1 event ownership: route an execution event through the interpreter when the entry
+       is file-bound, else call the reference handler directly. The reference handler
+       locks state.mutex itself, so the interpreter path must run outside the book-cycle
+       lock. *)
+    let route_exec
+      ~kind
+      ~now
+      ?(order_id = "")
+      ?(new_order_id = "")
+      ?(side = "")
+      ?(price = 0.0)
+      ?(qty = 0.0)
+      ?(cl_ord_id = None)
+      ?(reason = "")
+      ~ref_call
+      ()
+      =
+      match config_grid with
+      | Some (_, rt) ->
+        ignore
+          (Dio_strategies.Strategy_runtime.run_cycle
+             rt
+             ~price:!current_price
+             ~now
+             ~event:
+               (Dio_strategies.Strategy_runtime.make_event
+                  kind
+                  [ "now", Dio_strategies.Strategy_expr.V_float now
+                  ; "order_id", Dio_strategies.Strategy_expr.V_string order_id
+                  ; "new_order_id", Dio_strategies.Strategy_expr.V_string new_order_id
+                  ; "side", Dio_strategies.Strategy_expr.V_string side
+                  ; "price", Dio_strategies.Strategy_expr.V_float price
+                  ; "qty", Dio_strategies.Strategy_expr.V_float qty
+                  ; ( "cl_ord_id"
+                    , match cl_ord_id with
+                      | Some s -> Dio_strategies.Strategy_expr.V_string s
+                      | None -> Dio_strategies.Strategy_expr.V_none )
+                  ; "reason", Dio_strategies.Strategy_expr.V_string reason
+                  ]))
+      | None -> ref_call ()
     in
     while Atomic.get state.is_running do
       let latency_this_cycle = !latency_active in
@@ -661,10 +703,33 @@ let asset_domain_worker
          never contended across threads. Runs unconditionally; the queue is empty on the
          common cycle. *)
       if is_grid_strategy
-      then
-        lifecycle_events
-        := !lifecycle_events
-           + Dio_strategies.Jacobs_ladder.Strategy.drain_events asset_with_fees.symbol;
+      then (
+        (* M1 event ownership: a file-bound asset routes lifecycle events through the
+           interpreter (the strategy file owns the event surface); the reference path
+           dispatches directly. The reference handlers lock state.mutex themselves, so
+           this runs OUTSIDE the interpreter's book-cycle lock. *)
+        match config_grid with
+        | Some (ctx, rt) ->
+          let now_ev = Unix.gettimeofday () in
+          ctx.cg_state <- cached_grid_state;
+          ctx.cg_asset <- !grid_strategy_asset_ref;
+          ctx.cg_now <- now_ev;
+          lifecycle_events
+          := !lifecycle_events
+             + Dio_strategies.Jacobs_ladder.Strategy.drain_events_with
+                 asset_with_fees.symbol
+                 (fun ev ->
+                    ignore
+                      (Dio_strategies.Strategy_runtime.run_cycle
+                         rt
+                         ~price:!current_price
+                         ~now:now_ev
+                         ~event:
+                           (Dio_strategies.Jacobs_ladder.runtime_event_of_lifecycle ev)))
+        | None ->
+          lifecycle_events
+          := !lifecycle_events
+             + Dio_strategies.Jacobs_ladder.Strategy.drain_events asset_with_fees.symbol);
       (* Drain MM lifecycle events queued by the supervisor REST path. Same discipline as
          the grid queue: handlers run on THIS domain thread, so MM state is never mutated
          cross-thread against execute_strategy. *)
@@ -743,12 +808,23 @@ let asset_domain_worker
                      ();
                  if is_grid_strategy
                  then
-                   Dio_strategies.Jacobs_ladder.Strategy.handle_order_cancelled
+                   route_exec
+                     ~kind:"cancelled"
                      ~now:now_exec
-                     asset_with_fees.symbol
-                     event.order_id
-                     side
-                     event.cl_ord_id;
+                     ~order_id:event.order_id
+                     ~side:
+                       (match side with
+                        | Dio_strategies.Strategy_common.Buy -> "buy"
+                        | Dio_strategies.Strategy_common.Sell -> "sell")
+                     ~cl_ord_id:event.cl_ord_id
+                     ~ref_call:(fun () ->
+                       Dio_strategies.Jacobs_ladder.Strategy.handle_order_cancelled
+                         ~now:now_exec
+                         asset_with_fees.symbol
+                         event.order_id
+                         side
+                         event.cl_ord_id)
+                     ();
                  if is_mm_strategy
                  then
                    Dio_strategies.Market_maker.Strategy.handle_order_cancelled
@@ -796,14 +872,27 @@ let asset_domain_worker
                      ();
                  if is_grid_strategy
                  then
-                   Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+                   route_exec
+                     ~kind:"filled"
                      ~now:now_exec
-                     asset_with_fees.symbol
-                     event.order_id
-                     side
-                     ~fill_price:event.avg_price
-                     ~fill_qty:event.filled_qty
-                     event.cl_ord_id;
+                     ~order_id:event.order_id
+                     ~side:
+                       (match side with
+                        | Dio_strategies.Strategy_common.Buy -> "buy"
+                        | Dio_strategies.Strategy_common.Sell -> "sell")
+                     ~price:event.avg_price
+                     ~qty:event.filled_qty
+                     ~cl_ord_id:event.cl_ord_id
+                     ~ref_call:(fun () ->
+                       Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+                         ~now:now_exec
+                         asset_with_fees.symbol
+                         event.order_id
+                         side
+                         ~fill_price:event.avg_price
+                         ~fill_qty:event.filled_qty
+                         event.cl_ord_id)
+                     ();
                  if is_mm_strategy
                  then
                    Dio_strategies.Market_maker.Strategy.handle_order_filled
@@ -870,13 +959,25 @@ let asset_domain_worker
                          ();
                      if is_grid_strategy
                      then
-                       Dio_strategies.Jacobs_ladder.Strategy.handle_order_amended
+                       route_exec
+                         ~kind:"amended"
                          ~now:now_exec
-                         asset_with_fees.symbol
-                         event.order_id
-                         event.order_id
-                         side
-                         price;
+                         ~order_id:event.order_id
+                         ~new_order_id:event.order_id
+                         ~side:
+                           (match side with
+                            | Dio_strategies.Strategy_common.Buy -> "buy"
+                            | Dio_strategies.Strategy_common.Sell -> "sell")
+                         ~price
+                         ~ref_call:(fun () ->
+                           Dio_strategies.Jacobs_ladder.Strategy.handle_order_amended
+                             ~now:now_exec
+                             asset_with_fees.symbol
+                             event.order_id
+                             event.order_id
+                             side
+                             price)
+                         ();
                      if is_mm_strategy
                      then
                        Dio_strategies.Market_maker.Strategy.handle_order_amended
@@ -910,12 +1011,23 @@ let asset_domain_worker
                          ();
                      if is_grid_strategy
                      then
-                       Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+                       route_exec
+                         ~kind:"acknowledged"
                          ~now:now_exec
-                         asset_with_fees.symbol
-                         event.order_id
-                         side
-                         price;
+                         ~order_id:event.order_id
+                         ~side:
+                           (match side with
+                            | Dio_strategies.Strategy_common.Buy -> "buy"
+                            | Dio_strategies.Strategy_common.Sell -> "sell")
+                         ~price
+                         ~ref_call:(fun () ->
+                           Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+                             ~now:now_exec
+                             asset_with_fees.symbol
+                             event.order_id
+                             side
+                             price)
+                         ();
                      if is_mm_strategy
                      then
                        Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
@@ -1006,12 +1118,23 @@ let asset_domain_worker
                      price)
                else if is_grid_strategy
                then
-                 Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+                 route_exec
+                   ~kind:"acknowledged"
                    ~now:now_inject
-                   asset_with_fees.symbol
-                   oid
-                   order_side
-                   price);
+                   ~order_id:oid
+                   ~side:
+                     (match order_side with
+                      | Dio_strategies.Strategy_common.Buy -> "buy"
+                      | Dio_strategies.Strategy_common.Sell -> "sell")
+                   ~price
+                   ~ref_call:(fun () ->
+                     Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+                       ~now:now_inject
+                       asset_with_fees.symbol
+                       oid
+                       order_side
+                       price)
+                   ());
           exec_ready := true;
           exec_ready_cycle := !cycle_count;
           (* Mark startup replay complete to ungate profit calculation *)

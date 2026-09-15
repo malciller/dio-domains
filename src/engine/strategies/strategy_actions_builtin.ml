@@ -57,6 +57,7 @@ let declarations =
   ; act "grid_sell_prepare" decision []
   ; act "grid_sell_place" decision []
   ; act "grid_sell_finalize" decision []
+  ; act "grid_on_event" decision []
   ; act "compute_sell_price" decision [ se "base" e; se "mult" e ]
   ; act
       "compute_amend_price"

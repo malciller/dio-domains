@@ -163,6 +163,7 @@ module type ENGINE = sig
   val sell_prepare : ctx -> unit
   val sell_place : ctx -> unit
   val sell_finalize : ctx -> unit
+  val on_event : ctx -> Strategy_runtime.event -> unit
 end
 
 module Make (E : ENGINE) = struct
@@ -231,6 +232,11 @@ module Make (E : ENGINE) = struct
             []
           | "grid_sell_finalize" ->
             E.sell_finalize ctx;
+            []
+          | "grid_on_event" ->
+            (match Strategy_runtime.current_event t with
+             | Some ev -> E.on_event ctx ev
+             | None -> ());
             []
           | _ -> [])
     }

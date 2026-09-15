@@ -198,6 +198,8 @@ let handle_order_amendment_failed = Jacobs_ladder_events.handle_order_amendment_
 let cleanup_pending_cancellation = Jacobs_ladder_events.cleanup_pending_cancellation
 let enqueue_event = Jacobs_ladder_events.enqueue_event
 let drain_events = Jacobs_ladder_events.drain_events
+let drain_events_with = Jacobs_ladder_events.drain_events_with
+let runtime_event_of_lifecycle = Jacobs_ladder_events.runtime_event_of_lifecycle
 
 (** Reads up to [max_orders] orders from the ringbuffer. *)
 let get_pending_orders max_orders = LockFreeQueue.read_batch order_buffer max_orders
@@ -237,6 +239,7 @@ module Strategy = struct
   let init = init
   let enqueue_event = enqueue_event
   let drain_events = drain_events
+  let drain_events_with = drain_events_with
 
   (** Supervisor REST callbacks enqueue lifecycle events of this type. *)
   type lifecycle_event = Jacobs_ladder_events.lifecycle_event =
