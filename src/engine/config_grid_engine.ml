@@ -277,6 +277,38 @@ let buy_gate c =
     false
 ;;
 
+(** Fine path step 6a': reset the per-cycle buy attempt latch and expire the TIF-recovery
+    window (the expiry side effect is state maintenance; the buy gate policy itself now
+    lives in the strategy file, computed from the published cycle facts). *)
+let expire_tif_recovery c =
+  c.cg_buy_attempted <- false;
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    if state.tif_recovery_pending && c.cg_now -. state.tif_recovery_since >= 900.0
+    then (
+      state.tif_recovery_pending <- false;
+      Logging.info_f
+        ~section:"config_grid_engine"
+        "TIF recovery window expired for %s - resuming normal oracle-gated buying"
+        asset.symbol)
+  | _ -> ()
+;;
+
+(** Fine path step 6a'': publish the raw gate facts the strategy file combines into the
+    buy-active condition: the oracle-halt latch and the TIF-recovery latch/timestamp. *)
+let cycle_facts c =
+  let state = c.cg_state in
+  let pending, since =
+    match state with
+    | Some s -> s.tif_recovery_pending, s.tif_recovery_since
+    | None -> false, 0.0
+  in
+  [ "oracle_halted", Dio_strategies.Strategy_expr.V_bool c.cg_oracle_halted
+  ; "tif_recovery_pending", Dio_strategies.Strategy_expr.V_bool pending
+  ; "tif_recovery_since", Dio_strategies.Strategy_expr.V_float since
+  ]
+;;
+
 (** Fine path step 6b: publish the buy-leg branch facts. Returns
     [(pending, effective_count, should_cancel)]. *)
 let buy_facts c =

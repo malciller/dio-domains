@@ -93,14 +93,20 @@
     {
       "id": "buy_gate",
       "when": { "event": "book_update", "engine": { "continue": true } },
-      "then": [{ "action": "buy_gate", "args": {} }]
+      "then": [
+        { "action": "expire_tif_recovery", "args": {} },
+        { "action": "cycle_facts", "args": {} }
+      ]
     },
     {
       "id": "buy_facts",
       "when": {
         "all": [
           { "event": "book_update" },
-          { "engine": { "buy_active": true } }
+          { "engine": { "continue": true } },
+          {
+            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+          }
         ]
       },
       "then": [{ "action": "buy_facts", "args": {} }]
@@ -110,7 +116,10 @@
       "when": {
         "all": [
           { "event": "book_update" },
-          { "engine": { "buy_active": true } },
+          { "engine": { "continue": true } },
+          {
+            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+          },
           { "not": { "engine": { "buy_pending": true } } },
           { "engine": { "buy_should_cancel": true } }
         ]
@@ -122,7 +131,10 @@
       "when": {
         "all": [
           { "event": "book_update" },
-          { "engine": { "buy_active": true } },
+          { "engine": { "continue": true } },
+          {
+            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+          },
           { "not": { "engine": { "buy_pending": true } } },
           { "not": { "engine": { "buy_should_cancel": true } } },
           { "engine": { "buy_count_zero": true } }
@@ -135,7 +147,10 @@
       "when": {
         "all": [
           { "event": "book_update" },
-          { "engine": { "buy_active": true } },
+          { "engine": { "continue": true } },
+          {
+            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+          },
           { "not": { "engine": { "buy_pending": true } } },
           { "not": { "engine": { "buy_should_cancel": true } } },
           { "engine": { "buy_count_positive": true } }

@@ -157,6 +157,8 @@ module type ENGINE = sig
   val refresh_fee : ctx -> unit
   val guard : ctx -> bool
   val buy_gate : ctx -> bool
+  val expire_tif_recovery : ctx -> unit
+  val cycle_facts : ctx -> (string * Strategy_expr.value) list
   val buy_facts : ctx -> bool * int * bool
   val buy_cancel : ctx -> unit
   val buy_place : ctx -> unit
@@ -199,6 +201,14 @@ module Make (E : ENGINE) = struct
           | "buy_gate" ->
             let active = E.buy_gate ctx in
             Strategy_runtime.set_platform t "engine:buy_active" (V_bool active);
+            []
+          | "expire_tif_recovery" ->
+            E.expire_tif_recovery ctx;
+            []
+          | "cycle_facts" ->
+            List.iter
+              (fun (k, v) -> Strategy_runtime.set_platform t k v)
+              (E.cycle_facts ctx);
             []
           | "buy_facts" ->
             let pending, effective, should_cancel = E.buy_facts ctx in
