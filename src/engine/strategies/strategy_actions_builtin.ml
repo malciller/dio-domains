@@ -48,6 +48,8 @@ let declarations =
   ; act "prepare_init" decision []
   ; act "prepare_recovery" decision []
   ; act "cycle_cleanup" decision []
+  ; act "expire_amend_cooldowns" decision []
+  ; act "evict_ghost_orders" decision []
   ; act "cycle_sync" decision []
   ; act "cycle_refresh_fee" decision []
   ; act "cycle_guard" decision []

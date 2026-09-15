@@ -195,6 +195,20 @@ let prepare c =
   prepare_recovery c
 ;;
 
+(** Fine path step 2a: expire stale amend cooldowns. *)
+let expire_amend_cooldowns c =
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset -> Jac.expire_amend_cooldowns ~state ~now:c.cg_now ~asset
+  | _ -> ()
+;;
+
+(** Fine path step 2b: evict expired ghost-order markers. *)
+let evict_ghost_orders c =
+  match c.cg_state with
+  | Some state -> Jac.evict_ghost_orders ~state ~now:c.cg_now
+  | None -> ()
+;;
+
 (** Fine path step 2: expire stale cooldowns/ghost markers. *)
 let cleanup c =
   match c.cg_state, c.cg_asset with
