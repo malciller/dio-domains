@@ -18,6 +18,7 @@
   Strategy_common
   Jacobs_ladder
   Jacobs_ladder_types
+  Strategy_state
   Jacobs_ladder_config
   Jacobs_ladder_reservation
   Jacobs_ladder_orders
