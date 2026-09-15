@@ -613,6 +613,13 @@ let asset_domain_worker
       else None
     in
     let cached_fng_check_threshold = config.fng_check_threshold in
+    (* Record the pre-run strategy-state snapshot so a replay can seed identical state. *)
+    (match trace_recorder, cached_grid_state with
+     | Some r, Some st ->
+       Dio_strategies.Strategy_event_recorder.record_state
+         r
+         (Strategy_replay.snapshot_entries st)
+     | _ -> ());
     let wakeup_sync =
       Concurrency.Exchange_wakeup.get_sync_handle asset_with_fees.symbol
     in

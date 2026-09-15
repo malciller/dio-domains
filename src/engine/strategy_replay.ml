@@ -72,10 +72,117 @@ let emitted_of_order (o : Order.strategy_order) : Trace.emitted =
   }
 ;;
 
+(** Snapshot the decision-relevant scalar/option strategy-state fields for replay seeding,
+    recorded as ["s_"-prefixed] entries. *)
+let snapshot_entries (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
+  : (string * Expr.value) list
+  =
+  let optf = function
+    | Some f -> Expr.V_float f
+    | None -> Expr.V_none
+  in
+  let opts = function
+    | Some s -> Expr.V_string s
+    | None -> Expr.V_none
+  in
+  [ "s_last_buy_order_id", opts st.last_buy_order_id
+  ; "s_last_buy_order_price", optf st.last_buy_order_price
+  ; "s_reserved_base", Expr.V_float st.reserved_base
+  ; "s_reserved_quote", Expr.V_float st.reserved_quote
+  ; "s_accumulated_profit", Expr.V_float st.accumulated_profit
+  ; "s_position_base", Expr.V_float st.position_base
+  ; "s_position_initialized", Expr.V_bool st.position_initialized
+  ; "s_last_buy_fill_price", optf st.last_buy_fill_price
+  ; "s_last_sell_fill_price", optf st.last_sell_fill_price
+  ; "s_last_buy_ack_ts", Expr.V_float st.last_buy_ack_ts
+  ; "s_last_seen_asset_balance", Expr.V_float st.last_seen_asset_balance
+  ; "s_last_balance_delta", Expr.V_float st.last_balance_delta
+  ; "s_cached_sell_mult", Expr.V_float st.cached_sell_mult
+  ; "s_asset_low", Expr.V_bool st.asset_low
+  ; "s_capital_low", Expr.V_bool st.capital_low
+  ; "s_resuming_after_balance_flag", Expr.V_bool st.resuming_after_balance_flag
+  ; "s_just_filled_buy", Expr.V_bool st.just_filled_buy
+  ; "s_force_buy_reanchor", Expr.V_bool st.force_buy_reanchor
+  ; "s_tif_recovery_pending", Expr.V_bool st.tif_recovery_pending
+  ; "s_inflight_buy", Expr.V_bool st.inflight_buy
+  ; "s_inflight_sell", Expr.V_bool st.inflight_sell
+  ; "s_inflight_amend_buy", Expr.V_bool st.inflight_amend_buy
+  ; "s_inflight_cancel_buy", Expr.V_bool st.inflight_cancel_buy
+  ; "s_last_buy_attempted_insufficient", Expr.V_bool st.last_buy_attempted_insufficient
+  ]
+;;
+
+(** Apply a {!snapshot_entries} snapshot to [st] before replay. *)
+let seed
+  (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
+  (entries : (string * Expr.value) list)
+  =
+  let getf k d =
+    match List.assoc_opt k entries with
+    | Some (Expr.V_float f) -> f
+    | Some (Expr.V_int i) -> float_of_int i
+    | _ -> d
+  in
+  let getb k d =
+    match List.assoc_opt k entries with
+    | Some (Expr.V_bool b) -> b
+    | _ -> d
+  in
+  let gets k =
+    match List.assoc_opt k entries with
+    | Some (Expr.V_string s) -> Some s
+    | _ -> None
+  in
+  let getfo k =
+    match List.assoc_opt k entries with
+    | Some (Expr.V_float f) -> Some f
+    | _ -> None
+  in
+  st.last_buy_order_id <- gets "s_last_buy_order_id";
+  st.last_buy_order_price <- getfo "s_last_buy_order_price";
+  st.reserved_base <- getf "s_reserved_base" st.reserved_base;
+  st.reserved_quote <- getf "s_reserved_quote" st.reserved_quote;
+  st.accumulated_profit <- getf "s_accumulated_profit" st.accumulated_profit;
+  st.position_base <- getf "s_position_base" st.position_base;
+  st.position_initialized <- getb "s_position_initialized" st.position_initialized;
+  st.last_buy_fill_price <- getfo "s_last_buy_fill_price";
+  st.last_sell_fill_price <- getfo "s_last_sell_fill_price";
+  st.last_buy_ack_ts <- getf "s_last_buy_ack_ts" st.last_buy_ack_ts;
+  st.last_seen_asset_balance
+  <- getf "s_last_seen_asset_balance" st.last_seen_asset_balance;
+  st.last_balance_delta <- getf "s_last_balance_delta" st.last_balance_delta;
+  st.cached_sell_mult <- getf "s_cached_sell_mult" st.cached_sell_mult;
+  st.asset_low <- getb "s_asset_low" st.asset_low;
+  st.capital_low <- getb "s_capital_low" st.capital_low;
+  st.resuming_after_balance_flag
+  <- getb "s_resuming_after_balance_flag" st.resuming_after_balance_flag;
+  st.just_filled_buy <- getb "s_just_filled_buy" st.just_filled_buy;
+  st.force_buy_reanchor <- getb "s_force_buy_reanchor" st.force_buy_reanchor;
+  st.tif_recovery_pending <- getb "s_tif_recovery_pending" st.tif_recovery_pending;
+  st.inflight_buy <- getb "s_inflight_buy" st.inflight_buy;
+  st.inflight_sell <- getb "s_inflight_sell" st.inflight_sell;
+  st.inflight_amend_buy <- getb "s_inflight_amend_buy" st.inflight_amend_buy;
+  st.inflight_cancel_buy <- getb "s_inflight_cancel_buy" st.inflight_cancel_buy;
+  st.last_buy_attempted_insufficient
+  <- getb "s_last_buy_attempted_insufficient" st.last_buy_attempted_insufficient
+;;
+
 (** Replay [trace] through the reference strategy for [asset], returning an emitted-only
     trace. *)
 let replay ~(asset : Jac.trading_config) ~(trace : Trace.t) : Trace.t =
   let state = Jac.get_strategy_state asset.symbol in
+  (* Seed the decision-relevant state from the recorded pre-run snapshot. *)
+  (match trace with
+   | (c : Trace.cycle) :: _ ->
+     let entries =
+       List.concat_map
+         (function
+           | Trace.State es -> es
+           | _ -> [])
+         c.c_obs
+     in
+     seed state entries
+   | [] -> ());
   (* Drain any pre-existing buffer so only this replay's intents are captured. *)
   ignore (Jac.get_pending_orders 1_000_000 : Order.strategy_order list);
   List.mapi
