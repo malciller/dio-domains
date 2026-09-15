@@ -163,6 +163,9 @@ type phase =
   | SellPlan
   | SellPlace
   | SellFinalize
+  | SfinLatch
+  | SfinSweep
+  | SfinEnd
 
 module type ENGINE = sig
   type ctx
@@ -280,14 +283,14 @@ module Make (E : ENGINE) = struct
           | "sell_place_body" -> ph SellPlace (fun () -> E.sell_place_body ctx)
           | "sell_finalize" -> ph SellFinalize (fun () -> E.sell_finalize ctx)
           | "sell_finalize_facts" ->
-            ph SellFinalize (fun () ->
+            ph SfinEnd (fun () ->
               List.iter
                 (fun (k, v) -> Strategy_runtime.set_platform t k v)
                 (E.sell_finalize_facts ctx))
-          | "sell_finalize_latch" -> ph SellFinalize (fun () -> E.sell_finalize_latch ctx)
+          | "sell_finalize_latch" -> ph SfinLatch (fun () -> E.sell_finalize_latch ctx)
           | "sell_excess_sweep_phase" ->
-            ph SellFinalize (fun () -> E.sell_excess_sweep_phase ctx)
-          | "sell_finalize_end" -> ph SellFinalize (fun () -> E.sell_finalize_end ctx)
+            ph SfinSweep (fun () -> E.sell_excess_sweep_phase ctx)
+          | "sell_finalize_end" -> ph SfinEnd (fun () -> E.sell_finalize_end ctx)
           | "apply_order_event" ->
             (match Strategy_runtime.current_event t with
              | Some ev -> E.on_event ctx ev

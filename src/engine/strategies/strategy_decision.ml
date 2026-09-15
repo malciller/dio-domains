@@ -173,6 +173,7 @@ let buy_place_plan
   let qty = venue_lot_qty state.grid_qty asset.exchange state in
   let grid_interval = asset.grid_interval in
   let quote_needed = ask_price *. qty in
+  let _bp_price = Strategy_state.sub_start state in
   let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
   let raw_buy_price = calculate_grid_price ref_price grid_interval false state in
   let buy_price =
@@ -201,13 +202,16 @@ let buy_place_plan
       min buy_price (floor_for_sell companion_sell_price))
     else buy_price
   in
+  Strategy_state.sub_stop state Strategy_state.Bplan_price _bp_price;
   let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Buy" in
+  let _bp_sells = Strategy_state.sub_start state in
   let has_crossing_sell =
     Sell_orders.exists_price_leq
       state.open_sell_orders
       (if bid_price > 0.0 then Float.max buy_price bid_price else buy_price)
     || Hashtbl.length state.evicted_orders > 0
   in
+  Strategy_state.sub_stop state Strategy_state.Bplan_sells _bp_sells;
   let quote_nan = Float.is_nan quote_balance in
   let available = quote_balance -. locked_in_buys in
   let balance_ok = (not quote_nan) && available >= buy_price *. qty in
@@ -861,6 +865,7 @@ let sell_leg_prepare
   (* Placed-sell holds the balance feed may not yet be netting: until a balance message
      newer than a placement arrives, the venue's [total - hold] figure still counts that
      base as free, and sizing against it is the reserved_base leak under volatility. *)
+  let _sp_ov = Strategy_state.sub_start state in
   let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age in
   (* The base to subtract from the venue's reported holding: the ledger total on
      gross-balance venues, and the ledger's excess over the venue feed (never below the
@@ -919,6 +924,7 @@ let sell_leg_prepare
   let reserve_headroom =
     Float.max 0.0 (ledger_balance -. state.reserved_base -. committed_total)
   in
+  Strategy_state.sub_stop state Strategy_state.Splan_overlays _sp_ov;
   (* The persisted-sell grid is reconciled once per execution and the result is reused by
      the three persisted-sell branches below. After the pruning below rebuilds
      [persisted_sell_levels] to [open_levels @ kept_missing], a re-partition against the
@@ -931,6 +937,7 @@ let sell_leg_prepare
      partition. *)
   let missing_after_reconcile = ref [] in
   let pruned_missing = ref [] in
+  let _sp_rec = Strategy_state.sub_start state in
   if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> []
   then (
     let open_levels, missing_levels = persisted_reconcile in
@@ -1003,6 +1010,7 @@ let sell_leg_prepare
           q;
         state.last_sell_fill_price <- Some p)
       !pruned_missing);
+  Strategy_state.sub_stop state Strategy_state.Splan_reconcile _sp_rec;
   (* Balance basis per venue: [locked_in_sells] (the in-flight sell ledger total) is
      subtracted on EVERY venue so base committed to a resting or in-flight sell is never
      considered free, regardless of whether the venue's reported figure nets open-order
