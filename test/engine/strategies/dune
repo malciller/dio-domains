@@ -29,3 +29,7 @@
 (test
  (name test_strategy_harness)
  (libraries dio.strategies alcotest))
+
+(test
+ (name test_platform_accounting)
+ (libraries dio.strategies alcotest))
