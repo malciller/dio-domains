@@ -29,11 +29,11 @@ let test_symbol_normalization () =
   in
   List.iter
     (fun (input, expected) ->
-       let result = Kraken.Kraken_get_fee.symbol_to_kraken_pair input in
-       Alcotest.(check string)
-         (Printf.sprintf "symbol normalization '%s'" input)
-         expected
-         result)
+      let result = Kraken.Kraken_get_fee.symbol_to_kraken_pair input in
+      Alcotest.(check string)
+        (Printf.sprintf "symbol normalization '%s'" input)
+        expected
+        result)
     test_cases
 ;;
 
@@ -62,21 +62,21 @@ let test_fee_info_creation () =
   in
   List.iteri
     (fun i (exchange, maker, taker) ->
-       let fee_info =
-         { Kraken.Kraken_get_fee.exchange; maker_fee = maker; taker_fee = taker }
-       in
-       Alcotest.(check string)
-         (Printf.sprintf "fee info creation %d exchange" i)
-         exchange
-         fee_info.exchange;
-       Alcotest.(check (option (float 0.0001)))
-         (Printf.sprintf "fee info creation %d maker_fee" i)
-         maker
-         fee_info.maker_fee;
-       Alcotest.(check (option (float 0.0001)))
-         (Printf.sprintf "fee info creation %d taker_fee" i)
-         taker
-         fee_info.taker_fee)
+      let fee_info =
+        { Kraken.Kraken_get_fee.exchange; maker_fee = maker; taker_fee = taker }
+      in
+      Alcotest.(check string)
+        (Printf.sprintf "fee info creation %d exchange" i)
+        exchange
+        fee_info.exchange;
+      Alcotest.(check (option (float 0.0001)))
+        (Printf.sprintf "fee info creation %d maker_fee" i)
+        maker
+        fee_info.maker_fee;
+      Alcotest.(check (option (float 0.0001)))
+        (Printf.sprintf "fee info creation %d taker_fee" i)
+        taker
+        fee_info.taker_fee)
     test_cases
 ;;
 

@@ -1,7 +1,6 @@
 (** Per-asset balance aggregation from two WebSocket channels:
     - [webData2]: perpetual clearinghouse state (withdrawable, accountValue);
-    - [spotState]: spot token balances.
-    Thread-safe store with readiness signaling. *)
+    - [spotState]: spot token balances. Thread-safe store with readiness signaling. *)
 
 open Lwt.Infix
 
@@ -20,8 +19,8 @@ type balance_data =
 module BalanceStore = struct
   type wallet_balance =
     { balance : float
-      (** Spendable balance. Spot = [total -. hold] ([hold] locked in open
-          orders); the spot order book rejects anything beyond it. *)
+    (** Spendable balance. Spot = [total -. hold] ([hold] locked in open orders); the spot
+        order book rejects anything beyond it. *)
     ; total : float (** The wallet's full balance, holds included. *)
     ; wallet_type : string
     ; wallet_id : string
@@ -47,10 +46,10 @@ module BalanceStore = struct
     }
   ;;
 
-  (** Wallet types excluded from the tradeable figure: "staking" (delegated
-      HYPE, unsellable) and "perp" (USDC margin, not spot capital). Counting
-      either overstates buy capacity and lets placement pass its balance
-      guard with an order the venue then rejects. *)
+  (** Wallet types excluded from the tradeable figure: "staking" (delegated HYPE,
+      unsellable) and "perp" (USDC margin, not spot capital). Counting either overstates
+      buy capacity and lets placement pass its balance guard with an order the venue then
+      rejects. *)
   let is_excluded_wallet = function
     | "staking" | "perp" -> true
     | _ -> false
@@ -64,12 +63,11 @@ module BalanceStore = struct
       match Hashtbl.find_opt store.wallets wallet_key with
       | Some prev when Float.equal prev.balance available && Float.equal prev.total total
         ->
-        (* Unchanged balance: keep the original timestamp. Hyperliquid resends
-           one whole-account spotState snapshot per fill, so bumping
-           [last_updated] here would certify this asset as fresh on another
-           asset's activity and clear its sell-hold guard, permitting sale of
-           base still committed (reserved_base). Per-asset freshness must
-           reflect when THIS asset moved. *)
+        (* Unchanged balance: keep the original timestamp. Hyperliquid resends one
+           whole-account spotState snapshot per fill, so bumping [last_updated] here would
+           certify this asset as fresh on another asset's activity and clear its sell-hold
+           guard, permitting sale of base still committed (reserved_base). Per-asset
+           freshness must reflect when THIS asset moved. *)
         prev
       | _ -> { balance = available; total; wallet_type; wallet_id; last_updated = now }
     in
@@ -80,14 +78,14 @@ module BalanceStore = struct
     let trading =
       Hashtbl.fold
         (fun _ wallet acc ->
-           if is_excluded_wallet wallet.wallet_type then acc else acc +. wallet.balance)
+          if is_excluded_wallet wallet.wallet_type then acc else acc +. wallet.balance)
         store.wallets
         0.0
     in
     let staked =
       Hashtbl.fold
         (fun _ wallet acc ->
-           if wallet.wallet_type = "staking" then acc +. wallet.total else acc)
+          if wallet.wallet_type = "staking" then acc +. wallet.total else acc)
         store.wallets
         0.0
     in
@@ -102,20 +100,19 @@ module BalanceStore = struct
   let get_total_balance store = Atomic.get store.total_balance
   let get_staked_balance store = Atomic.get store.staked_balance
 
-  (** Wall-clock timestamp of the last wallet update for this asset
-      (0.0 = never updated). Used for balance-snapshot staleness. *)
+  (** Wall-clock timestamp of the last wallet update for this asset (0.0 = never updated).
+      Used for balance-snapshot staleness. *)
   let get_last_updated store = Atomic.get store.last_updated
 
-  (** Wall-clock timestamp of the newest spendable (non-excluded) wallet, or
-      0.0 if none. Store-wide [last_updated] is also bumped by the staking
-      poller (~10s), which cannot change the tradeable figure, so freshness
-      consumers must key on spendable wallets. *)
+  (** Wall-clock timestamp of the newest spendable (non-excluded) wallet, or 0.0 if none.
+      Store-wide [last_updated] is also bumped by the staking poller (~10s), which cannot
+      change the tradeable figure, so freshness consumers must key on spendable wallets. *)
   let get_spendable_last_updated store =
     Mutex.lock store.mutex;
     let t =
       Hashtbl.fold
         (fun _ w acc ->
-           if is_excluded_wallet w.wallet_type then acc else Float.max acc w.last_updated)
+          if is_excluded_wallet w.wallet_type then acc else Float.max acc w.last_updated)
         store.wallets
         0.0
     in
@@ -220,9 +217,9 @@ let parse_json_float json =
   | _ -> 0.0
 ;;
 
-(** Maps wrapped spot token identifiers to canonical symbols.
-    The spot API returns prefixed names (e.g. "UBTC" for BTC).
-    This mapping must stay consistent with [hyperliquid_instruments_feed.ml]. *)
+(** Maps wrapped spot token identifiers to canonical symbols. The spot API returns
+    prefixed names (e.g. "UBTC" for BTC). This mapping must stay consistent with
+    [hyperliquid_instruments_feed.ml]. *)
 let canonicalize_coin = function
   | "UBTC" -> "BTC"
   | "UETH" -> "ETH"
@@ -285,31 +282,31 @@ let process_market_data json =
         let balances = member "spotState" data |> member "balances" |> to_list in
         List.iter
           (fun item ->
-             try
-               let raw_coin = member "coin" item |> to_string in
-               let coin = canonicalize_coin raw_coin in
-               let total = parse_json_float (member "total" item) in
-               (* Spot reports [total] and [hold] (locked in open orders);
-                  only [total -. hold] is spendable. Using [total] would
-                  overstate capacity and pass placement with a rejected order. *)
-               let hold = parse_json_float (member "hold" item) in
-               let available = max 0.0 (total -. hold) in
-               let store = get_balance_store coin in
-               BalanceStore.update_wallet store ~available ~total "spot" "account";
-               if coin = "USDC"
-               then
-                 Logging.debug_f
-                   ~section
-                   "spotState USDC: %.2f avail / %.2f total (hold %.2f)"
-                   available
-                   total
-                   hold
-             with
-             | exn ->
-               Logging.warn_f
-                 ~section
-                 "Failed to parse spotState entry: %s"
-                 (Printexc.to_string exn))
+            try
+              let raw_coin = member "coin" item |> to_string in
+              let coin = canonicalize_coin raw_coin in
+              let total = parse_json_float (member "total" item) in
+              (* Spot reports [total] and [hold] (locked in open orders); only
+                 [total -. hold] is spendable. Using [total] would overstate capacity and
+                 pass placement with a rejected order. *)
+              let hold = parse_json_float (member "hold" item) in
+              let available = max 0.0 (total -. hold) in
+              let store = get_balance_store coin in
+              BalanceStore.update_wallet store ~available ~total "spot" "account";
+              if coin = "USDC"
+              then
+                Logging.debug_f
+                  ~section
+                  "spotState USDC: %.2f avail / %.2f total (hold %.2f)"
+                  available
+                  total
+                  hold
+            with
+            | exn ->
+              Logging.warn_f
+                ~section
+                "Failed to parse spotState entry: %s"
+                (Printexc.to_string exn))
           balances
       with
       | _ -> ()
@@ -325,24 +322,22 @@ let _processor_task =
     let sub = Hyperliquid_ws.subscribe_market_data () in
     Lwt.catch
       (fun () ->
-         Logging.debug_f ~section "Starting Hyperliquid balances processor task";
-         let%lwt () =
-           Concurrency.Lwt_util.consume_stream process_market_data sub.stream
-         in
-         (* Disconnect pushed None. Re-subscribe; [consume_stream] blocks on
-            the new stream until the WS reconnects. *)
-         sub.close ();
-         Logging.debug ~section "Balances stream ended (disconnect), re-subscribing...";
-         Lwt.async run;
-         Lwt.return_unit)
+        Logging.debug_f ~section "Starting Hyperliquid balances processor task";
+        let%lwt () = Concurrency.Lwt_util.consume_stream process_market_data sub.stream in
+        (* Disconnect pushed None. Re-subscribe; [consume_stream] blocks on the new stream
+           until the WS reconnects. *)
+        sub.close ();
+        Logging.debug ~section "Balances stream ended (disconnect), re-subscribing...";
+        Lwt.async run;
+        Lwt.return_unit)
       (fun exn ->
-         sub.close ();
-         Logging.error_f
-           ~section
-           "Hyperliquid balances processor task crashed: %s. Re-subscribing..."
-           (Printexc.to_string exn);
-         Lwt.async run;
-         Lwt.return_unit)
+        sub.close ();
+        Logging.error_f
+          ~section
+          "Hyperliquid balances processor task crashed: %s. Re-subscribing..."
+          (Printexc.to_string exn);
+        Lwt.async run;
+        Lwt.return_unit)
   in
   Lwt.async run
 ;;

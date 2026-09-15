@@ -1,15 +1,13 @@
 (* Sell levels persistence store.
 
-   Per-strategy opt-in persistence of pending sell orders so they survive
-   restarts on venues that drop orders due to time constraints. The store only
-   loads and persists levels; reconciliation (fulfilled-vs-unfulfilled
-   verification, replacement under contention, adoption of unknown exchange
-   orders) stays in the strategy/execution layer
+   Per-strategy opt-in persistence of pending sell orders so they survive restarts on
+   venues that drop orders due to time constraints. The store only loads and persists
+   levels; reconciliation (fulfilled-vs-unfulfilled verification, replacement under
+   contention, adoption of unknown exchange orders) stays in the strategy/execution layer
    (jacobs_ladder_execution.ml).
 
-   Levels use the compact [p; q] JSON list form to keep the file small and
-   per-save serialization fast for large sell grids, and are stored sorted
-   price-descending. *)
+   Levels use the compact [p; q] JSON list form to keep the file small and per-save
+   serialization fast for large sell grids, and are stored sorted price-descending. *)
 
 let section = "sell_levels_store"
 
@@ -74,8 +72,8 @@ let load ~key =
   | None -> []
 ;;
 
-(** Resolve the store key whose symbol segment is [symbol]; logs a warning and
-    picks the first when ambiguous. *)
+(** Resolve the store key whose symbol segment is [symbol]; logs a warning and picks the
+    first when ambiguous. *)
 let resolve_key_for_symbol ~symbol =
   let matches_symbol k =
     match String.split_on_char ':' k with
@@ -122,8 +120,8 @@ let price_qty_match l r =
   && abs_float (l.qty -. r.qty) <= max (l.qty *. 0.0001) 1e-4
 ;;
 
-(** Remove [levels] from the store (verified filled or removed on the exchange).
-    Ordering (furthest-out first) is a caller decision. *)
+(** Remove [levels] from the store (verified filled or removed on the exchange). Ordering
+    (furthest-out first) is a caller decision. *)
 let remove_levels ~key ~(levels : t) =
   let remaining =
     List.filter (fun l -> not (List.exists (price_qty_match l) levels)) (load ~key)
@@ -139,13 +137,14 @@ let replace_levels ~key ~(old : t) ~(new_ : t) =
   save_async ~key (sort_levels (List.rev_append new_ remaining))
 ;;
 
-let save_async ~key t = Persistence_orchestrator.put_async orchestrator ~key (sort_levels t)
+let save_async ~key t =
+  Persistence_orchestrator.put_async orchestrator ~key (sort_levels t)
+;;
 
 (* -- Legacy migration ----------------------------------------------------- *)
 
-(** Import the legacy entry's "sell_levels" field under a full strategy key when
-    exactly one configured strategy matches the symbol, else under
-    "migrated:{symbol}". *)
+(** Import the legacy entry's "sell_levels" field under a full strategy key when exactly
+    one configured strategy matches the symbol, else under "migrated:[{symbol}]". *)
 let migrate_entry symbol json =
   let open Yojson.Basic.Util in
   match json |> member "sell_levels" with

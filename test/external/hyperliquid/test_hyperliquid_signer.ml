@@ -11,8 +11,8 @@ let test_encode_uint64_be () =
   Alcotest.(check string) "encode_uint64_be 1" "\x00\x00\x00\x00\x00\x00\x00\x01" encoded
 ;;
 
-(* Smoke test: signing runs without crashing. Exact cryptographic output
-   requires test vectors or an external web3 library, out of scope here. *)
+(* Smoke test: signing runs without crashing. Exact cryptographic output requires test
+   vectors or an external web3 library, out of scope here. *)
 let test_sign_l1_action () =
   (* Example private key (do not use in prod) *)
   let pkey = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" in

@@ -1,19 +1,18 @@
 open Lwt.Infix
-
 module Notifier = Discord.Notifier
 module Fill_event_bus = Concurrency.Fill_event_bus
 
 (** Fill event with per-field test defaults. *)
 let create_fill_event
-      ?(venue = "test_venue")
-      ?(symbol = "BTC/USD")
-      ?(side = "buy")
-      ?(amount = 1.5)
-      ?(fill_price = 50000.0)
-      ?(fee = 0.1)
-      ?(order_id = "test_oid")
-      ?(trade_id = "test_tid")
-      timestamp
+  ?(venue = "test_venue")
+  ?(symbol = "BTC/USD")
+  ?(side = "buy")
+  ?(amount = 1.5)
+  ?(fill_price = 50000.0)
+  ?(fee = 0.1)
+  ?(order_id = "test_oid")
+  ?(trade_id = "test_tid")
+  timestamp
   =
   { Fill_event_bus.venue
   ; symbol
@@ -73,8 +72,7 @@ let test_format_multiple_fills () =
 
 (** Rate limiter token acquisition. *)
 let test_rate_limiter_logic _switch () =
-  (* Bucket is global and clock-based; exercises the acquire path for eventual
-     resolution. *)
+  (* Bucket is global and clock-based; exercises the acquire path for eventual resolution. *)
   let start_time = Unix.gettimeofday () in
   Notifier.acquire_token ()
   >>= fun () ->

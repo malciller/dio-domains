@@ -1,6 +1,6 @@
-(* Tests for the disk-persisted history cache (Oracle_cache): save/load
-   roundtrip, freshness policy, delta-fetch boundary, merge normalization
-   and failure fallback. No network; file IO goes to a temp dir. *)
+(* Tests for the disk-persisted history cache (Oracle_cache): save/load roundtrip,
+   freshness policy, delta-fetch boundary, merge normalization and failure fallback. No
+   network; file IO goes to a temp dir. *)
 
 let mk_bar ~date ~close ~(volume : float) =
   Dio_oracle.Oracle_types.
@@ -19,8 +19,8 @@ let with_tmp_dir f =
 ;;
 
 let test_save_creates_missing_parents () =
-  (* The cache dir chain (data/oracle_history/v2/<exchange>) may not exist
-     at all on a fresh checkout; save must mkdir -p the whole chain. *)
+  (* The cache dir chain (data/oracle_history/v2/<exchange>) may not exist at all on a
+     fresh checkout; save must mkdir -p the whole chain. *)
   let base =
     Filename.concat (Filename.get_temp_dir_name ()) "dio_oracle_cache_test_deep"
   in
@@ -29,17 +29,17 @@ let test_save_creates_missing_parents () =
       try Unix.system ("rm -rf " ^ Filename.quote base) |> ignore with
       | _ -> ())
     (fun () ->
-       let dir = Filename.concat base "oracle_history/v2/kraken" in
-       Dio_oracle.Oracle_cache.save_bars
-         ~dir
-         ~exchange:"kraken"
-         ~symbol:"XMR/USD"
-         [ mk_bar ~date:"2025-01-01" ~close:10.0 ~volume:1.0 ];
-       Alcotest.(check int)
-         "deep parents created, bar persisted"
-         1
-         (List.length
-            (Dio_oracle.Oracle_cache.load_bars ~dir ~exchange:"kraken" ~symbol:"XMR/USD")))
+      let dir = Filename.concat base "oracle_history/v2/kraken" in
+      Dio_oracle.Oracle_cache.save_bars
+        ~dir
+        ~exchange:"kraken"
+        ~symbol:"XMR/USD"
+        [ mk_bar ~date:"2025-01-01" ~close:10.0 ~volume:1.0 ];
+      Alcotest.(check int)
+        "deep parents created, bar persisted"
+        1
+        (List.length
+           (Dio_oracle.Oracle_cache.load_bars ~dir ~exchange:"kraken" ~symbol:"XMR/USD")))
 ;;
 
 let test_save_load_roundtrip () =
@@ -107,9 +107,9 @@ let test_is_fresh () =
 ;;
 
 let test_merge_bars () =
-  (* Merge is RAW (the cache is the source truth; normalization happens on
-     read): a revised current-day bar replaces the cached one (dedup keeps
-     last), order is ascending, and nothing is dropped here. *)
+  (* Merge is RAW (the cache is the source truth; normalization happens on read): a
+     revised current-day bar replaces the cached one (dedup keeps last), order is
+     ascending, and nothing is dropped here. *)
   let cached =
     [ mk_bar ~date:"2025-02-14" ~close:97578.0 ~volume:145.0
     ; mk_bar ~date:"2025-02-15" ~close:97500.0 ~volume:150.0
@@ -136,9 +136,8 @@ let test_merge_bars () =
 ;;
 
 let test_with_delta_returns_clean_view_but_stores_raw () =
-  (* with_delta serves the clean series (fabricated rows dropped) while the
-     cache file stores the raw bars - so a corrected normalization rule
-     self-heals without a refetch. *)
+  (* with_delta serves the clean series (fabricated rows dropped) while the cache file
+     stores the raw bars - so a corrected normalization rule self-heals without a refetch. *)
   with_tmp_dir (fun dir ->
     let bars =
       [ mk_bar ~date:"2025-02-14" ~close:97578.0 ~volume:145.0
@@ -267,9 +266,9 @@ let test_with_delta_cold_start_fetches_full () =
 ;;
 
 let test_with_delta_complete_through () =
-  (* Bounded histories (Yahoo deep) are complete once their last bar reaches
-     the end date - however far "today" has moved - and are never re-fetched
-     with a start past their end. *)
+  (* Bounded histories (Yahoo deep) are complete once their last bar reaches the end
+     date - however far "today" has moved - and are never re-fetched with a start past
+     their end. *)
   with_tmp_dir (fun dir ->
     let cached =
       [ mk_bar ~date:"2020-08-30" ~close:1.0 ~volume:1.0
@@ -293,8 +292,8 @@ let test_with_delta_complete_through () =
     in
     Alcotest.(check bool) "complete-through cache skips the network" false !called;
     Alcotest.(check int) "serves the cached bars" 2 (List.length result);
-    (* Incomplete cache (last bar far before the end date): fetches the
-       delta with the day AFTER the last bar as the start boundary. *)
+    (* Incomplete cache (last bar far before the end date): fetches the delta with the day
+       AFTER the last bar as the start boundary. *)
     let called2 = ref false in
     let boundary2 = ref None in
     let incomplete = [ mk_bar ~date:"2020-08-01" ~close:1.0 ~volume:1.0 ] in
@@ -319,14 +318,13 @@ let test_with_delta_complete_through () =
 ;;
 
 let test_with_delta_complete_through_weekend () =
-  (* Equity deep histories: the bounded end date is venue_first - 1, which
-     often lands on a weekend/holiday (venue starts Monday -> end Sunday),
-     and the last trading day is the Friday before. The cache must count as
-     complete there - an exact-date match would re-request a weekend-only
-     sliver (no trading days at all) on every pass forever. *)
+  (* Equity deep histories: the bounded end date is venue_first - 1, which often lands on
+     a weekend/holiday (venue starts Monday -> end Sunday), and the last trading day is
+     the Friday before. The cache must count as complete there - an exact-date match would
+     re-request a weekend-only sliver (no trading days at all) on every pass forever. *)
   with_tmp_dir (fun dir ->
-    (* Venue starts Tue 2020-09-01 -> deep end_date Mon 2020-08-31; the
-         last cached (trading) bar is Friday 2020-08-28. *)
+    (* Venue starts Tue 2020-09-01 -> deep end_date Mon 2020-08-31; the last cached
+       (trading) bar is Friday 2020-08-28. *)
     let cached = [ mk_bar ~date:"2020-08-28" ~close:1.0 ~volume:1.0 ] in
     Dio_oracle.Oracle_cache.save_bars ~dir ~exchange:"yahoo-deep" ~symbol:"QQQ" cached;
     let called = ref false in
@@ -370,8 +368,8 @@ let test_with_delta_fetch_failure_falls_back () =
 ;;
 
 let test_read_cached_no_network () =
-  (* Cache-only runs must serve exactly what is on disk and never fetch: a
-     populated cache returns the cleaned bars, a cache miss returns []. *)
+  (* Cache-only runs must serve exactly what is on disk and never fetch: a populated cache
+     returns the cleaned bars, a cache miss returns []. *)
   with_tmp_dir (fun dir ->
     let bars =
       [ mk_bar ~date:"2025-01-01" ~close:10.0 ~volume:1.0

@@ -24,12 +24,12 @@ let trading_config ?(exchange = "kraken") ?(symbol = "X") ()
 ;;
 
 let resolve
-      ?(symbol = "")
-      ?(exchange = "kraken")
-      ?(exchange_explicit = false)
-      ~(trading : Dio_strategies.Strategy_common.trading_config list)
-      ?(offline = false)
-      ()
+  ?(symbol = "")
+  ?(exchange = "kraken")
+  ?(exchange_explicit = false)
+  ~(trading : Dio_strategies.Strategy_common.trading_config list)
+  ?(offline = false)
+  ()
   =
   Dio_oracle.Oracle_tasks.resolve_tasks
     ~symbol
@@ -42,7 +42,7 @@ let resolve
 let pairs tasks =
   List.map
     (fun (t : Dio_oracle.Oracle_tasks.task) ->
-       t.Dio_oracle.Oracle_tasks.symbol, t.Dio_oracle.Oracle_tasks.exchange)
+      t.Dio_oracle.Oracle_tasks.symbol, t.Dio_oracle.Oracle_tasks.exchange)
     tasks
 ;;
 

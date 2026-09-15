@@ -1,9 +1,8 @@
-(* Yahoo deep-history: symbol whitelist, chart parsing, pre-listing window
-   classification.
+(* Yahoo deep-history: symbol whitelist, chart parsing, pre-listing window classification.
 
-   The whitelist is safety-critical: Yahoo's crypto symbol space carries
-   dead-token collisions (HYPE-USD serves a dead 2021 token's prices), so only
-   known-continuous pairs may be deepened. Equities map by identity. *)
+   The whitelist is safety-critical: Yahoo's crypto symbol space carries dead-token
+   collisions (HYPE-USD serves a dead 2021 token's prices), so only known-continuous pairs
+   may be deepened. Equities map by identity. *)
 
 module Exchange = Dio_exchange.Exchange_intf
 
@@ -82,10 +81,9 @@ let test_parse_daily () =
 ;;
 
 let test_classify_error () =
-  (* Yahoo's pre-listing answer (HTTP 400, "Data doesn't exist for startDate")
-     is an empty range, not a failure: the walk skips it instead of aborting
-     (SPCX regression - a recently-listed asset must not re-request the same
-     doomed range every pass). *)
+  (* Yahoo's pre-listing answer (HTTP 400, "Data doesn't exist for startDate") is an empty
+     range, not a failure: the walk skips it instead of aborting (SPCX regression - a
+     recently-listed asset must not re-request the same doomed range every pass). *)
   Alcotest.(check bool)
     "400 + data-doesn't-exist = missing data"
     (Yahoo_deep_history.classify_error
@@ -119,9 +117,8 @@ let test_classify_error () =
 ;;
 
 let test_empty_prefix_cache () =
-  (* Confirmed-empty prefix is cached per symbol: a fetch whose whole requested
-     range sits before the known listing is answered locally with zero bars and
-     zero HTTP requests. *)
+  (* Confirmed-empty prefix is cached per symbol: a fetch whose whole requested range sits
+     before the known listing is answered locally with zero bars and zero HTTP requests. *)
   let symbol = "SPCX" in
   (* First pass recorded floor "no data before 2026-06-15". *)
   Yahoo_deep_history.remember_empty ~symbol "2026-06-15";
@@ -145,8 +142,8 @@ let test_empty_prefix_cache () =
 ;;
 
 let test_classify_exn () =
-  (* Fetch wraps failures as "Yahoo: HTTP <status> for <symbol> (<body>)";
-     classification extracts status and body. *)
+  (* Fetch wraps failures as "Yahoo: HTTP <status> for <symbol> (<body>)"; classification
+     extracts status and body. *)
   Alcotest.(check bool)
     "missing-data failure classified from the message"
     (Yahoo_deep_history.classify_exn

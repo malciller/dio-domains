@@ -1,23 +1,21 @@
-(** Abstract, array-backed set of live open sell orders for the Jacobs Ladder
-    strategy: a growable, reusable parallel-array store of
-    [(order_id, price, remaining_qty)].
+(** Abstract, array-backed set of live open sell orders for the Jacobs Ladder strategy: a
+    growable, reusable parallel-array store of [(order_id, price, remaining_qty)].
 
-    The previous representation was a fresh [(string * float * float) list]
-    rebuilt every strategy cycle. That allocated per order not only the cons
-    cell and the tuple block but also a boxed [float] for each of price and qty
-    (a non-float-only tuple boxes its floats), plus a boxed float on every
-    [ref] accumulator update. A single scan of an N-order feed therefore touched
-    the minor heap ~18 words per order. Storing ids in a [string array] and
-    price/qty in [float array]s keeps the doubles unboxed and reuses one backing
-    allocation across cycles, so a steady-state scan is allocation-free.
+    The previous representation was a fresh [(string * float * float) list] rebuilt every
+    strategy cycle. That allocated per order not only the cons cell and the tuple block
+    but also a boxed [float] for each of price and qty (a non-float-only tuple boxes its
+    floats), plus a boxed float on every [ref] accumulator update. A single scan of an
+    N-order feed therefore touched the minor heap ~18 words per order. Storing ids in a
+    [string array] and price/qty in [float array]s keeps the doubles unboxed and reuses
+    one backing allocation across cycles, so a steady-state scan is allocation-free.
 
     Semantics mirror the list operations it replaces:
-    - [push] appends; iteration is in insertion order (callers did not depend on
-      list order - first-match reads assume at most one order per id/price).
+    - [push] appends; iteration is in insertion order (callers did not depend on list
+      order - first-match reads assume at most one order per id/price).
     - [remove_by_id] and [replace_first] preserve the relative order of the
       surviving/following elements.
-    - [to_list]/[of_list] bridge to the old shape for persistence snapshots,
-      tests, and cold paths. *)
+    - [to_list]/[of_list] bridge to the old shape for persistence snapshots, tests, and
+      cold paths. *)
 
 type t =
   { mutable ids : string array
@@ -42,8 +40,8 @@ let[@inline] get_id t i = t.ids.(i)
 let[@inline] get_price t i = t.prices.(i)
 let[@inline] get_qty t i = t.qtys.(i)
 
-(** Grow the backing arrays to hold at least [n] elements, preserving the live
-    prefix. Doubles capacity so a full feed grows amortised-O(1). *)
+(** Grow the backing arrays to hold at least [n] elements, preserving the live prefix.
+    Doubles capacity so a full feed grows amortised-O(1). *)
 let ensure_capacity t n =
   let cap = Array.length t.ids in
   if n > cap
@@ -74,9 +72,9 @@ let iter t f =
   done
 ;;
 
-(** Copy [src] over [dst] in place, reusing [dst]'s backing arrays (growing only
-    if needed). Used to snapshot/restore the live scan between generations
-    without rebuilding a list. Allocates nothing once [dst] has capacity. *)
+(** Copy [src] over [dst] in place, reusing [dst]'s backing arrays (growing only if
+    needed). Used to snapshot/restore the live scan between generations without rebuilding
+    a list. Allocates nothing once [dst] has capacity. *)
 let blit ~src ~dst =
   ensure_capacity dst src.len;
   Array.blit src.ids 0 dst.ids 0 src.len;
@@ -98,16 +96,16 @@ let exists_id t id =
   go 0
 ;;
 
-(** Any element whose price satisfies [p]. The price predicate is passed the
-    price only (the common "is a live order resting at/below X" test). *)
+(** Any element whose price satisfies [p]. The price predicate is passed the price only
+    (the common "is a live order resting at/below X" test). *)
 let exists_price t p =
   let rec go i = i < t.len && (p t.prices.(i) || go (i + 1)) in
   go 0
 ;;
 
-(** Any element whose price is at or below [x]. Closure-free counterpart to
-    [exists_price] for the threshold test (avoids boxing the float into the
-    predicate closure on every element). *)
+(** Any element whose price is at or below [x]. Closure-free counterpart to [exists_price]
+    for the threshold test (avoids boxing the float into the predicate closure on every
+    element). *)
 let exists_price_leq t x =
   let rec go i = i < t.len && (t.prices.(i) <= x || go (i + 1)) in
   go 0
@@ -121,8 +119,8 @@ let sum_qty t =
   !s
 ;;
 
-(** First element matching [pred], or [None]. Allocates the result option/tuple;
-    only used on cold paths (excess sweep, amend handlers). *)
+(** First element matching [pred], or [None]. Allocates the result option/tuple; only used
+    on cold paths (excess sweep, amend handlers). *)
 let find_first t pred =
   let rec go i =
     if i >= t.len
@@ -134,9 +132,9 @@ let find_first t pred =
   go 0
 ;;
 
-(** Replace the first element matching [pred] with [f] applied to it, leaving
-    the rest untouched. Mirrors the old ["List.map" + first-match flag] used to
-    re-key a pending sell id on ack. *)
+(** Replace the first element matching [pred] with [f] applied to it, leaving the rest
+    untouched. Mirrors the old ["List.map" + first-match flag] used to re-key a pending
+    sell id on ack. *)
 let replace_first t pred f =
   let rec go i =
     if i < t.len
@@ -152,9 +150,8 @@ let replace_first t pred f =
   go 0
 ;;
 
-(** Remove every element whose id equals [id] (ids are unique in practice),
-    preserving the order of the survivors. Returns whether anything was removed.
-    In place; no allocation. *)
+(** Remove every element whose id equals [id] (ids are unique in practice), preserving the
+    order of the survivors. Returns whether anything was removed. In place; no allocation. *)
 let remove_by_id t id =
   let w = ref 0 in
   for i = 0 to t.len - 1 do
@@ -172,8 +169,8 @@ let remove_by_id t id =
   removed
 ;;
 
-(** Remove every element whose id starts with [prefix] (temporary
-    "pending_sell_" placeholders). In place; no allocation and no closure. *)
+(** Remove every element whose id starts with [prefix] (temporary "pending_sell_"
+    placeholders). In place; no allocation and no closure. *)
 let remove_prefix t prefix =
   let w = ref 0 in
   for i = 0 to t.len - 1 do

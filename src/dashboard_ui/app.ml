@@ -1,14 +1,13 @@
 open Notty
 open Theme
 
-(* OxCaml marks [Sys.set_signal] as [unsafe_multidomain]. The dashboard installs
-   its alarm/hangup handlers once from its own (single) domain, and they close
-   over local UI state, so [Sys.Safe.set_signal]'s [portable] requirement does
-   not fit. *)
+(* OxCaml marks [Sys.set_signal] as [unsafe_multidomain]. The dashboard installs its
+   alarm/hangup handlers once from its own (single) domain, and they close over local UI
+   state, so [Sys.Safe.set_signal]'s [portable] requirement does not fit. *)
 [@@@alert "-unsafe_multidomain"]
 
-(** Dashboard UI main loop: connects to the engine's Unix domain socket,
-    processes the JSON snapshot stream, and runs the frame renderer each cycle. *)
+(** Dashboard UI main loop: connects to the engine's Unix domain socket, processes the
+    JSON snapshot stream, and runs the frame renderer each cycle. *)
 
 let socket_path = ref ""
 
@@ -41,9 +40,9 @@ let connect_and_watch path =
   let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
   try
     Unix.connect fd (Unix.ADDR_UNIX path);
-    (* The socket is non-blocking so the render loop never stalls mid-payload:
-       a blocked read delays renders, causes missed heartbeats, and the server
-       prunes the client, leaving the dashboard blank on every engine cycle. *)
+    (* The socket is non-blocking so the render loop never stalls mid-payload: a blocked
+       read delays renders, causes missed heartbeats, and the server prunes the client,
+       leaving the dashboard blank on every engine cycle. *)
     Unix.set_nonblock fd;
     let _ = Unix.write_substring fd "W" 0 1 in
     fd
@@ -54,8 +53,8 @@ let connect_and_watch path =
     raise exn
 ;;
 
-(** Frame buffer reused across render cycles to avoid per-frame allocation;
-    cleared and refilled on each cycle. *)
+(** Frame buffer reused across render cycles to avoid per-frame allocation; cleared and
+    refilled on each cycle. *)
 let frame_buf = Buffer.create 65536
 
 let render_to_stdout_buf (draw : Buffer.t -> unit) =
@@ -73,8 +72,8 @@ let stdout_alive () =
 exception Render_timeout
 
 (** [SIGALRM] handler is installed once in [run], not saved/restored per frame.
-    [Unix.alarm] is armed only around a render and cleared immediately after,
-    so one handler suffices. *)
+    [Unix.alarm] is armed only around a render and cleared immediately after, so one
+    handler suffices. *)
 let render_to_stdout_safe ~timeout_s draw =
   let completed = ref false in
   (try
@@ -107,12 +106,11 @@ let render_wait_screen w h msg =
 
 (** Incremental, non-blocking frame assembler for the UDS stream.
 
-    The engine pushes a full state snapshot every ~500 ms; those frames can be
-    large, and a blocking read mid-payload would stall the render loop (no
-    pongs -> the server prunes the client -> blank dashboard + reconnect
-    flicker). The fd is non-blocking: whatever is available is drained into
-    [buf], complete length-prefixed frames are extracted, and the loop never
-    blocks on the socket. *)
+    The engine pushes a full state snapshot every ~500 ms; those frames can be large, and
+    a blocking read mid-payload would stall the render loop (no pongs -> the server prunes
+    the client -> blank dashboard + reconnect flicker). The fd is non-blocking: whatever
+    is available is drained into [buf], complete length-prefixed frames are extracted, and
+    the loop never blocks on the socket. *)
 type frame_assembler = { buf : Buffer.t }
 
 let assem_create () = { buf = Buffer.create 65536 }
@@ -147,8 +145,8 @@ let assem_extract (assem : frame_assembler) : string option =
     in
     if frame_len > 10_000_000
     then (
-      (* Oversized frame (> 10 MB): drop the whole buffer so the stream can
-         resynchronize at the next frame boundary. *)
+      (* Oversized frame (> 10 MB): drop the whole buffer so the stream can resynchronize
+         at the next frame boundary. *)
       Buffer.clear buf;
       None)
     else if len < 4 + frame_len
@@ -165,8 +163,8 @@ let assem_extract (assem : frame_assembler) : string option =
 let run ?(config_file = "config.json") () =
   (* Load the saved theme from config.json or ~/.dio_theme. *)
   Theme.load_saved_theme ~config_file ();
-  (* DIO_MOTION=off|0|false|no enables reduced motion; DIO_FPS (> 0) caps the
-     animated frame rate (default 30). *)
+  (* DIO_MOTION=off|0|false|no enables reduced motion; DIO_FPS (> 0) caps the animated
+     frame rate (default 30). *)
   (match Sys.getenv_opt "DIO_MOTION" with
    | Some s ->
      (match String.lowercase_ascii (String.trim s) with
@@ -179,16 +177,16 @@ let run ?(config_file = "config.json") () =
       | Some f when f > 0.0 -> Anim.target_fps := f
       | _ -> ())
    | None -> ());
-  (* GC tuning for the single-domain render loop. A small minor heap enables
-     frequent collection of short-lived frame data; moderate compaction keeps
-     the heap from fragmenting over multi-hour runs. *)
+  (* GC tuning for the single-domain render loop. A small minor heap enables frequent
+     collection of short-lived frame data; moderate compaction keeps the heap from
+     fragmenting over multi-hour runs. *)
   Gc.set
     { (Gc.get ()) with
       minor_heap_size = 4_194_304
-    ; (* 32MB: the render loop allocates heavily per frame (image trees,
-         gradients, formatted cells); a large minor heap cuts minor-GC
-         frequency. Measured with test/engine/dashboard/bench_dashboard.exe:
-         detail render ~2.4ms at 256KB vs ~1.6ms at 32MB. *)
+    ; (* 32MB: the render loop allocates heavily per frame (image trees, gradients,
+         formatted cells); a large minor heap cuts minor-GC frequency. Measured with
+         test/engine/dashboard/bench_dashboard.exe: detail render ~2.4ms at 256KB vs
+         ~1.6ms at 32MB. *)
       space_overhead = 40
     ; (* major GC targets 1.4x live data, overriding the engine's o=2000 *)
       major_heap_increment = 65536
@@ -262,7 +260,9 @@ let run ?(config_file = "config.json") () =
     List.rev (parse 0 [])
   in
   (* Frame-render alarm handler, installed once for the whole session. *)
-  Runtime_compat.set_signal Sys.sigalrm (Sys.Signal_handle (fun _ -> raise Render_timeout));
+  Runtime_compat.set_signal
+    Sys.sigalrm
+    (Sys.Signal_handle (fun _ -> raise Render_timeout));
   Runtime_compat.set_signal Sys.sighup (Sys.Signal_handle (fun _ -> quit := true));
   let fd_ref : Unix.file_descr option ref = ref None in
   let try_connect () =
@@ -290,9 +290,9 @@ let run ?(config_file = "config.json") () =
   in
   let disconnect fd =
     fd_ref := None;
-    (* Retain the last known state so a dropped connection does not blank the
-       dashboard: cached snapshot renders with frozen engine status until a
-       reconnect delivers fresh data. *)
+    (* Retain the last known state so a dropped connection does not blank the dashboard:
+       cached snapshot renders with frozen engine status until a reconnect delivers fresh
+       data. *)
     (try
        let _ = Unix.write_substring fd "Q" 0 1 in
        ()
@@ -301,22 +301,20 @@ let run ?(config_file = "config.json") () =
     try Unix.close fd with
     | _ -> ()
   in
-  (* Line-level frame diffing: render the whole frame each cycle (~1 ms), split
-     the ANSI stream into per-row strings, and re-emit only rows whose bytes
-     changed, addressed absolutely. Every row is cropped to the terminal height
-     and written with an explicit cursor position, so content taller than the
-     screen never scrolls the terminal. Only changed rows are transmitted,
-     making localized animation cheap over SSH. *)
+  (* Line-level frame diffing: render the whole frame each cycle (~1 ms), split the ANSI
+     stream into per-row strings, and re-emit only rows whose bytes changed, addressed
+     absolutely. Every row is cropped to the terminal height and written with an explicit
+     cursor position, so content taller than the screen never scrolls the terminal. Only
+     changed rows are transmitted, making localized animation cheap over SSH. *)
   let split_nel s =
     let parts = ref [] in
     let buf = Buffer.create 128 in
     let n = String.length s in
     let i = ref 0 in
     while !i < n do
-      if
-        !i + 1 < n
-        && String.unsafe_get s !i = '\x1b'
-        && String.unsafe_get s (!i + 1) = 'E'
+      if !i + 1 < n
+         && String.unsafe_get s !i = '\x1b'
+         && String.unsafe_get s (!i + 1) = 'E'
       then (
         parts := Buffer.contents buf :: !parts;
         Buffer.clear buf;
@@ -329,8 +327,8 @@ let run ?(config_file = "config.json") () =
     List.rev !parts
   in
   let prev_lines : string array option ref = ref None in
-  (* DIO_DAMAGE=off|0|false|no forces full-frame redraws if a terminal renders
-     the incremental updates incorrectly. *)
+  (* DIO_DAMAGE=off|0|false|no forces full-frame redraws if a terminal renders the
+     incremental updates incorrectly. *)
   let damage_enabled =
     match Sys.getenv_opt "DIO_DAMAGE" with
     | Some s ->
@@ -391,16 +389,16 @@ let run ?(config_file = "config.json") () =
        | Some prev when Array.length prev = Array.length lines ->
          Array.iteri
            (fun i line ->
-              if line <> prev.(i)
-              then (
-                Buffer.add_string buf (Printf.sprintf "\027[%d;1H" (i + 1));
-                Buffer.add_string buf line))
+             if line <> prev.(i)
+             then (
+               Buffer.add_string buf (Printf.sprintf "\027[%d;1H" (i + 1));
+               Buffer.add_string buf line))
            lines
        | _ ->
          Array.iteri
            (fun i line ->
-              Buffer.add_string buf (Printf.sprintf "\027[%d;1H" (i + 1));
-              Buffer.add_string buf line)
+             Buffer.add_string buf (Printf.sprintf "\027[%d;1H" (i + 1));
+             Buffer.add_string buf line)
            lines);
       prev_lines := Some lines;
       Buffer.add_string buf "\027[?2026l"
@@ -408,8 +406,8 @@ let run ?(config_file = "config.json") () =
     render_to_stdout_safe ~timeout_s:2 draw
   in
   (* Render throttle: draw on change at up to [Anim.target_fps], else every
-     [Anim.idle_interval] as a keep-alive. A frame exceeding the 2s alarm is
-     skipped, not fatal; the loop retries. *)
+     [Anim.idle_interval] as a keep-alive. A frame exceeding the 2s alarm is skipped, not
+     fatal; the loop retries. *)
   let render_if_due ~(now : float) ~(last_render : float ref) ~(interval : float) =
     if now -. !last_render < interval
     then `Not_due
@@ -437,8 +435,8 @@ let run ?(config_file = "config.json") () =
           | Some (w, h) -> w, h
           | None -> 80, 24
         in
-        (* With cached state, keep the last dashboard visible (stale but real)
-           while reconnecting; only a true first run shows the wait screen. *)
+        (* With cached state, keep the last dashboard visible (stale but real) while
+           reconnecting; only a true first run shows the wait screen. *)
         if !has_cached_data
         then ignore (draw_frame w h)
         else render_wait_screen w h "Waiting for engine...  (q to quit)";
@@ -471,9 +469,9 @@ let run ?(config_file = "config.json") () =
     let assem = assem_create () in
     while (not !quit) && not !lost_connection do
       let now = Unix.gettimeofday () in
-      (* Heartbeat runs on a fixed 1s cadence, decoupled from rendering: the
-         server prunes clients that miss pongs for about three seconds, so a
-         slow frame or a large snapshot parse must never cost the connection. *)
+      (* Heartbeat runs on a fixed 1s cadence, decoupled from rendering: the server prunes
+         clients that miss pongs for about three seconds, so a slow frame or a large
+         snapshot parse must never cost the connection. *)
       if now -. !last_pong_time >= 1.0
       then (
         last_pong_time := now;
@@ -510,100 +508,99 @@ let run ?(config_file = "config.json") () =
           let asset_count = List.length assets in
           List.iter
             (fun action ->
-               if !theme_modal_open
-               then (
-                 let num_themes = Theme.theme_count () in
-                 match action with
-                 | `Key_up ->
-                   theme_cursor_idx := max 0 (!theme_cursor_idx - 1);
-                   Theme.set_theme_by_index !theme_cursor_idx
-                 | `Key_down ->
-                   theme_cursor_idx := min (num_themes - 1) (!theme_cursor_idx + 1);
-                   Theme.set_theme_by_index !theme_cursor_idx
-                 | `Key_enter ->
-                   Theme.set_theme_by_index !theme_cursor_idx;
-                   Theme.save_theme (Theme.current ()).id;
-                   theme_modal_open := false
-                 | `Key_theme | `Key_back ->
-                    (* Cancel: revert to the original theme. *)
-                   if !original_theme_id <> ""
-                   then ignore (Theme.set_theme_by_id !original_theme_id);
-                   theme_modal_open := false
-                 | `Key_quit -> theme_modal_open := false
-                 | _ -> ())
-               else (
-                 match !view_mode_ref with
-                 | `MainView ->
-                   (match action with
-                    | `Key_theme ->
-                      theme_modal_open := true;
-                      theme_cursor_idx := Theme.current_theme_index ();
-                      original_theme_id := (Theme.current ()).id
-                    | `Key_quit -> quit := true
-                    | `Key_up ->
-                      if asset_count > 0
-                      then selected_index_ref := max 0 (!selected_index_ref - 1)
-                    | `Key_down ->
-                      if asset_count > 0
-                      then
-                        selected_index_ref
-                        := min (asset_count - 1) (!selected_index_ref + 1)
-                    | `Key_enter ->
-                      if asset_count > 0
-                      then (
-                        let idx = min (asset_count - 1) (max 0 !selected_index_ref) in
-                        let asset = List.nth assets idx in
-                        view_mode_ref := `DetailView asset.key)
-                    | `Key_back -> quit := true
-                    | `Key_left -> Latencies.prev_page ()
-                    | `Key_right -> Latencies.next_page ()
-                    | _ -> ())
-                 | `DetailView curr_key ->
-                   (match action with
-                    | `Key_theme ->
-                      theme_modal_open := true;
-                      theme_cursor_idx := Theme.current_theme_index ();
-                      original_theme_id := (Theme.current ()).id
-                    | `Key_quit -> quit := true
-                    | `Key_back -> view_mode_ref := `MainView
-                    | `Key_up | `Key_left ->
-                      if asset_count > 0
-                      then (
-                        let curr_idx =
-                          match find_asset_index curr_key assets with
-                          | Some i -> i
-                          | None -> 0
-                        in
-                        let new_idx =
-                          if curr_idx > 0 then curr_idx - 1 else asset_count - 1
-                        in
-                        selected_index_ref := new_idx;
-                        let new_asset = List.nth assets new_idx in
-                        view_mode_ref := `DetailView new_asset.key)
-                    | `Key_down | `Key_right ->
-                      if asset_count > 0
-                      then (
-                        let curr_idx =
-                          match find_asset_index curr_key assets with
-                          | Some i -> i
-                          | None -> 0
-                        in
-                        let new_idx =
-                          if curr_idx < asset_count - 1 then curr_idx + 1 else 0
-                        in
-                        selected_index_ref := new_idx;
-                        let new_asset = List.nth assets new_idx in
-                        view_mode_ref := `DetailView new_asset.key)
-                    | `Key_zoom_in -> Asset_graph.zoom_in curr_key
-                    | `Key_zoom_out -> Asset_graph.zoom_out curr_key
-                    | _ -> ())))
+              if !theme_modal_open
+              then (
+                let num_themes = Theme.theme_count () in
+                match action with
+                | `Key_up ->
+                  theme_cursor_idx := max 0 (!theme_cursor_idx - 1);
+                  Theme.set_theme_by_index !theme_cursor_idx
+                | `Key_down ->
+                  theme_cursor_idx := min (num_themes - 1) (!theme_cursor_idx + 1);
+                  Theme.set_theme_by_index !theme_cursor_idx
+                | `Key_enter ->
+                  Theme.set_theme_by_index !theme_cursor_idx;
+                  Theme.save_theme (Theme.current ()).id;
+                  theme_modal_open := false
+                | `Key_theme | `Key_back ->
+                  (* Cancel: revert to the original theme. *)
+                  if !original_theme_id <> ""
+                  then ignore (Theme.set_theme_by_id !original_theme_id);
+                  theme_modal_open := false
+                | `Key_quit -> theme_modal_open := false
+                | _ -> ())
+              else (
+                match !view_mode_ref with
+                | `MainView ->
+                  (match action with
+                   | `Key_theme ->
+                     theme_modal_open := true;
+                     theme_cursor_idx := Theme.current_theme_index ();
+                     original_theme_id := (Theme.current ()).id
+                   | `Key_quit -> quit := true
+                   | `Key_up ->
+                     if asset_count > 0
+                     then selected_index_ref := max 0 (!selected_index_ref - 1)
+                   | `Key_down ->
+                     if asset_count > 0
+                     then
+                       selected_index_ref
+                       := min (asset_count - 1) (!selected_index_ref + 1)
+                   | `Key_enter ->
+                     if asset_count > 0
+                     then (
+                       let idx = min (asset_count - 1) (max 0 !selected_index_ref) in
+                       let asset = List.nth assets idx in
+                       view_mode_ref := `DetailView asset.key)
+                   | `Key_back -> quit := true
+                   | `Key_left -> Latencies.prev_page ()
+                   | `Key_right -> Latencies.next_page ()
+                   | _ -> ())
+                | `DetailView curr_key ->
+                  (match action with
+                   | `Key_theme ->
+                     theme_modal_open := true;
+                     theme_cursor_idx := Theme.current_theme_index ();
+                     original_theme_id := (Theme.current ()).id
+                   | `Key_quit -> quit := true
+                   | `Key_back -> view_mode_ref := `MainView
+                   | `Key_up | `Key_left ->
+                     if asset_count > 0
+                     then (
+                       let curr_idx =
+                         match find_asset_index curr_key assets with
+                         | Some i -> i
+                         | None -> 0
+                       in
+                       let new_idx =
+                         if curr_idx > 0 then curr_idx - 1 else asset_count - 1
+                       in
+                       selected_index_ref := new_idx;
+                       let new_asset = List.nth assets new_idx in
+                       view_mode_ref := `DetailView new_asset.key)
+                   | `Key_down | `Key_right ->
+                     if asset_count > 0
+                     then (
+                       let curr_idx =
+                         match find_asset_index curr_key assets with
+                         | Some i -> i
+                         | None -> 0
+                       in
+                       let new_idx =
+                         if curr_idx < asset_count - 1 then curr_idx + 1 else 0
+                       in
+                       selected_index_ref := new_idx;
+                       let new_asset = List.nth assets new_idx in
+                       view_mode_ref := `DetailView new_asset.key)
+                   | `Key_zoom_in -> Asset_graph.zoom_in curr_key
+                   | `Key_zoom_out -> Asset_graph.zoom_out curr_key
+                   | _ -> ())))
             actions;
           dirty := true));
       if List.mem fd ready && not !quit
       then (
-        (* Non-blocking drain: complete frames are parsed immediately; partial
-           payloads wait in the assembler, and the loop never blocks on the
-           socket. *)
+        (* Non-blocking drain: complete frames are parsed immediately; partial payloads
+           wait in the assembler, and the loop never blocks on the socket. *)
         match assem_drain fd assem with
         | `Eof ->
           disconnect fd;

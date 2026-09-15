@@ -1,10 +1,9 @@
-(* Oracle_fetch deep-history merge tests: the Yahoo deep series (from the
-   [dio.yahoo] client) is prepended to the venue series, the venue wins on
-   any overlap, and nothing is synthesized.
+(* Oracle_fetch deep-history merge tests: the Yahoo deep series (from the [dio.yahoo]
+   client) is prepended to the venue series, the venue wins on any overlap, and nothing is
+   synthesized.
 
-   The merge lives in [Oracle_fetch] (it builds [Oracle_types.series], the
-   oracle's own domain type); the Yahoo client itself is tested in
-   test/external/yahoo/test_yahoo.ml. *)
+   The merge lives in [Oracle_fetch] (it builds [Oracle_types.series], the oracle's own
+   domain type); the Yahoo client itself is tested in test/external/yahoo/test_yahoo.ml. *)
 
 open Dio_oracle
 
@@ -21,8 +20,8 @@ let test_merge_series () =
     ; gaps = []
     }
   in
-  (* Deep bars strictly before the venue start are prepended; an overlapping
-     date stays with the venue. *)
+  (* Deep bars strictly before the venue start are prepended; an overlapping date stays
+     with the venue. *)
   let deep =
     { Oracle_types.symbol = "ETH-USD"
     ; calendar_kind = Oracle_types.Crypto
@@ -48,8 +47,8 @@ let test_merge_series () =
   let merged2, added2 = Oracle_fetch.merge_series ~venue ~deep:empty_deep in
   Alcotest.(check int) "no deep bars" 0 added2;
   Alcotest.(check int) "unchanged" 2 (Array.length merged2.bars);
-  (* A DESCENDING venue series (some venue feeds return newest-first) must
-     merge the same way: the venue start is its minimum date. *)
+  (* A DESCENDING venue series (some venue feeds return newest-first) must merge the same
+     way: the venue start is its minimum date. *)
   let desc_venue =
     { venue with bars = Array.of_list (Array.to_list venue.bars |> List.rev) }
   in

@@ -1,19 +1,16 @@
-(**
-   Single-short-per-cycle auto-hedging module.
+(** Single-short-per-cycle auto-hedging module.
 
-   Intercepts Hyperliquid spot fills and manages one perp short per grid cycle:
+    Intercepts Hyperliquid spot fills and manages one perp short per grid cycle:
 
-   - Spot buy: open a perp short only if no hedge is open.
-   - Spot sell: close the entire open hedge short.
+    - Spot buy: open a perp short only if no hedge is open.
+    - Spot sell: close the entire open hedge short.
 
-   Additional buys do not stack shorts; the single short rides the full move
-   during drawdowns. On a grid recovery sell the short is closed, realizing the
-   hedge profit and freeing the slot for the next cycle.
+    Additional buys do not stack shorts; the single short rides the full move during
+    drawdowns. On a grid recovery sell the short is closed, realizing the hedge profit and
+    freeing the slot for the next cycle.
 
-   Places IOC limit orders at perp top-of-book (best bid for sells, best ask
-   for buys) to minimize slippage; falls back to market orders when orderbook
-   data is unavailable.
-*)
+    Places IOC limit orders at perp top-of-book (best bid for sells, best ask for buys) to
+    minimize slippage; falls back to market orders when orderbook data is unavailable. *)
 
 open Strategy_common
 
@@ -32,10 +29,9 @@ let push_order order =
   | Some () -> Order_actions.incr order.symbol
 ;;
 
-(** Build a hedge order and push it to the ring buffer.
-    When [perp_tob] is available, places an IOC limit at best bid (sell) or
-    best ask (buy) to reduce slippage. Falls back to market order otherwise.
-    Returns the hedge quantity on success, or 0.0 on skip. *)
+(** Build a hedge order and push it to the ring buffer. When [perp_tob] is available,
+    places an IOC limit at best bid (sell) or best ask (buy) to reduce slippage. Falls
+    back to market order otherwise. Returns the hedge quantity on success, or 0.0 on skip. *)
 let build_and_push_hedge testnet hedge_symbol hedge_side filled_qty fill_price perp_tob =
   if fill_price <= 0.0
   then (
@@ -61,9 +57,9 @@ let build_and_push_hedge testnet hedge_symbol hedge_side filled_qty fill_price p
         else filled_qty)
       else filled_qty
     in
-    (* Determine order type and price from perp top-of-book.
-       Sell hedge: limit at best bid. Buy hedge: limit at best ask.
-       Falls back to market order when no orderbook data is available. *)
+    (* Determine order type and price from perp top-of-book. Sell hedge: limit at best
+       bid. Buy hedge: limit at best ask. Falls back to market order when no orderbook
+       data is available. *)
     let order_type, limit_price =
       match perp_tob with
       | Some (best_bid, _bid_sz, best_ask, _ask_sz) ->
@@ -163,10 +159,10 @@ let clear_hedge () =
   Mutex.unlock hedge_mutex
 ;;
 
-(** Handle a spot fill under the single-short-per-cycle model.
-    Spot buy: open perp short only if no hedge is currently open.
-    Spot sell: close the full open hedge short.
-    [perp_tob]: optional (bid_price, bid_size, ask_price, ask_size) from the perp orderbook. *)
+(** Handle a spot fill under the single-short-per-cycle model. Spot buy: open perp short
+    only if no hedge is currently open. Spot sell: close the full open hedge short.
+    [perp_tob]: optional (bid_price, bid_size, ask_price, ask_size) from the perp
+    orderbook. *)
 let handle_order_filled testnet exchange hedge_symbol side filled_qty fill_price perp_tob =
   if Dio_exchange.Exchange_intf.Types.exchange_of_string exchange <> Hyperliquid
   then ()

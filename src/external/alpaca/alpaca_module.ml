@@ -6,8 +6,8 @@ module Types = Exchange.Types
 
 module Config = struct
   include Alpaca_types.Config
-  (* Live and paper follow the same 24/5 calendar; market hours do not branch
-     on account mode (see Alpaca_market_hours.is_market_open). *)
+  (* Live and paper follow the same 24/5 calendar; market hours do not branch on account
+     mode (see Alpaca_market_hours.is_market_open). *)
 end
 
 module Alpaca_impl = struct
@@ -16,9 +16,9 @@ module Alpaca_impl = struct
   let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16
 
   (* Monotonic placement nonce; each logical placement gets a globally unique
-     [client_order_id]. Retries inside [Alpaca_rest.place_order] reuse the id,
-     and Alpaca enforces uniqueness, so an ambiguous failure that reached the
-     venue is rejected on retry instead of double-placing. *)
+     [client_order_id]. Retries inside [Alpaca_rest.place_order] reuse the id, and Alpaca
+     enforces uniqueness, so an ambiguous failure that reached the venue is rejected on
+     retry instead of double-placing. *)
   let placement_counter = Atomic.make 0
   let sanitize_symbol symbol = String.concat "_" (String.split_on_char '/' symbol)
 
@@ -51,21 +51,21 @@ module Alpaca_impl = struct
   ;;
 
   let place_order
-        ~token:_
-        ~order_type
-        ~side
-        ~qty
-        ~symbol
-        ?limit_price
-        ?time_in_force
-        ?post_only:_
-        ?reduce_only:_
-        ?order_userref:_
-        ?cl_ord_id
-        ?trigger_price:_
-        ?display_qty:_
-        ?retry_config:_
-        ()
+    ~token:_
+    ~order_type
+    ~side
+    ~qty
+    ~symbol
+    ?limit_price
+    ?time_in_force
+    ?post_only:_
+    ?reduce_only:_
+    ?order_userref:_
+    ?cl_ord_id
+    ?trigger_price:_
+    ?display_qty:_
+    ?retry_config:_
+    ()
     =
     let alpaca_side = alpaca_side_of_side side in
     let type_str = string_of_order_type order_type in
@@ -75,8 +75,8 @@ module Alpaca_impl = struct
       | Types.Sell -> "sell"
     in
     let tif_str = Option.map string_of_time_in_force time_in_force in
-    (* When the caller supplies no client id, generate a stable one before the
-       retry loop in [Alpaca_rest.place_order] so every attempt reuses it. *)
+    (* When the caller supplies no client id, generate a stable one before the retry loop
+       in [Alpaca_rest.place_order] so every attempt reuses it. *)
     let cl_ord_id =
       match cl_ord_id with
       | Some id -> Some id
@@ -102,17 +102,17 @@ module Alpaca_impl = struct
   ;;
 
   let amend_order
-        ~token:_
-        ~order_id
-        ?cl_ord_id
-        ?qty
-        ?limit_price
-        ?post_only:_
-        ?trigger_price:_
-        ?display_qty:_
-        ?symbol
-        ?retry_config:_
-        ()
+    ~token:_
+    ~order_id
+    ?cl_ord_id
+    ?qty
+    ?limit_price
+    ?post_only:_
+    ?trigger_price:_
+    ?display_qty:_
+    ?symbol
+    ?retry_config:_
+    ()
     =
     let is_fractional =
       match qty with
@@ -212,13 +212,13 @@ module Alpaca_impl = struct
   ;;
 
   let cancel_orders
-        ~token:_
-        ?order_ids
-        ?cl_ord_ids:_
-        ?order_userrefs:_
-        ?symbol:_
-        ?retry_config:_
-        ()
+    ~token:_
+    ?order_ids
+    ?cl_ord_ids:_
+    ?order_userrefs:_
+    ?symbol:_
+    ?retry_config:_
+    ()
     =
     match order_ids with
     | Some ids ->
@@ -235,7 +235,7 @@ module Alpaca_impl = struct
       let mapped =
         List.map
           (fun (r : Alpaca_types.cancel_order_result) ->
-             { Types.order_id = r.order_id; cl_ord_id = r.cl_ord_id })
+            { Types.order_id = r.order_id; cl_ord_id = r.cl_ord_id })
           succs
       in
       if mapped <> [] then Ok mapped else Error "Failed to cancel orders"
@@ -246,16 +246,12 @@ module Alpaca_impl = struct
   let get_top_of_book_fast ~symbol = Alpaca_orderbook.get_best_bid_ask_fast symbol
   let has_orderbook_data ~symbol = Alpaca_orderbook.has_orderbook_data symbol
   let get_tradeable_balance ~asset = Alpaca_balances.get_balance asset
-  let get_tradeable_balance_fast ~asset = fun () -> Alpaca_balances.get_balance asset
+  let get_tradeable_balance_fast ~asset () = Alpaca_balances.get_balance asset
 
-  (* Venue-authoritative free quantity from the positions poll [qty_available];
-     sell sizing uses this. Gross [get_balance] is retained for the ledger and
-     oracle. *)
-  let get_available_balance_fast ~asset =
-    fun () -> Alpaca_balances.get_available_balance asset
-  ;;
-
-  let get_balance_age_fast ~asset:_ = fun () -> Alpaca_balances.get_balance_age ()
+  (* Venue-authoritative free quantity from the positions poll [qty_available]; sell
+     sizing uses this. Gross [get_balance] is retained for the ledger and oracle. *)
+  let get_available_balance_fast ~asset () = Alpaca_balances.get_available_balance asset
+  let get_balance_age_fast ~asset:_ () = Alpaca_balances.get_balance_age ()
   let get_total_balance ~asset = Alpaca_balances.get_total_balance asset
   let get_staked_balance ~asset:_ = 0.0
   let get_all_balances () = Alpaca_balances.get_all_balances ()
@@ -282,17 +278,17 @@ module Alpaca_impl = struct
     let orders = Alpaca_executions.get_open_orders symbol in
     List.map
       (fun (o : Alpaca_executions.open_order_internal) ->
-         { Types.order_id = o.order_id
-         ; symbol = o.symbol
-         ; side = o.side
-         ; qty = o.qty
-         ; cum_qty = o.cum_qty
-         ; remaining_qty = o.remaining_qty
-         ; limit_price = o.limit_price
-         ; status = o.status
-         ; user_ref = o.user_ref
-         ; cl_ord_id = o.cl_ord_id
-         })
+        { Types.order_id = o.order_id
+        ; symbol = o.symbol
+        ; side = o.side
+        ; qty = o.qty
+        ; cum_qty = o.cum_qty
+        ; remaining_qty = o.remaining_qty
+        ; limit_price = o.limit_price
+        ; status = o.status
+        ; user_ref = o.user_ref
+        ; cl_ord_id = o.cl_ord_id
+        })
       orders
   ;;
 
@@ -340,17 +336,17 @@ module Alpaca_impl = struct
     let events = Alpaca_executions.read_execution_events symbol start_pos in
     List.map
       (fun (e : Alpaca_executions.execution_event_internal) ->
-         { Types.order_id = e.order_id
-         ; order_status = e.order_status
-         ; limit_price = e.limit_price
-         ; side = e.side
-         ; remaining_qty = e.remaining_qty
-         ; filled_qty = e.filled_qty
-         ; avg_price = e.avg_price
-         ; timestamp = e.timestamp
-         ; is_amended = e.is_amended
-         ; cl_ord_id = e.cl_ord_id
-         })
+        { Types.order_id = e.order_id
+        ; order_status = e.order_status
+        ; limit_price = e.limit_price
+        ; side = e.side
+        ; remaining_qty = e.remaining_qty
+        ; filled_qty = e.filled_qty
+        ; avg_price = e.avg_price
+        ; timestamp = e.timestamp
+        ; is_amended = e.is_amended
+        ; cl_ord_id = e.cl_ord_id
+        })
       events
   ;;
 
@@ -411,9 +407,9 @@ module Alpaca_impl = struct
         f o.order_id limit_price o.remaining_qty side_str o.user_ref)
   ;;
 
-  (* Account-wide open-orders generation. The grid strategy excludes Alpaca
-     from the rescan skip via [remaintain_expired_sells], which needs the
-     persisted GTC-level reconcile every cycle. *)
+  (* Account-wide open-orders generation. The grid strategy excludes Alpaca from the
+     rescan skip via [remaintain_expired_sells], which needs the persisted GTC-level
+     reconcile every cycle. *)
   let get_open_orders_generation ~symbol:_ = Alpaca_executions.get_orders_generation ()
   let get_price_increment ~symbol:_ = Some 0.01
 
@@ -426,8 +422,8 @@ module Alpaca_impl = struct
   let round_price ~symbol:_ ~price = Float.round (price *. 100.0) /. 100.0
   let get_fees ~symbol:_ = Some 0.0, Some 0.0 (* Alpaca commission-free *)
 
-  (* Uniform decode entry: Alpaca market-data frames (quotes/trades) are
-     context-free; auth/control callbacks stay in the WS layer. *)
+  (* Uniform decode entry: Alpaca market-data frames (quotes/trades) are context-free;
+     auth/control callbacks stay in the WS layer. *)
   let decode_frame content = Alpaca_orderbook.handle_message_str content
 end
 

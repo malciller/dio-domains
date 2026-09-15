@@ -1,7 +1,7 @@
-(* Live repro harness: replays Kraken's real book feed through production code
-   paths (parse_and_apply_levels, levels_to_array, calculate_checksum) and
-   validates CRC32 on every message to bisect whether snapshots validate
-   immediately or drift begins with deltas. *)
+(* Live repro harness: replays Kraken's real book feed through production code paths
+   (parse_and_apply_levels, levels_to_array, calculate_checksum) and validates CRC32 on
+   every message to bisect whether snapshots validate immediately or drift begins with
+   deltas. *)
 
 let _section = "debug_ws"
 
@@ -14,7 +14,7 @@ type state =
   ; mutable mismatched : int
   ; mutable snapshot_ok : bool
   ; recent_deltas : string Queue.t
-    (* Raw JSON of recent deltas; dumped on first mismatch. *)
+      (* Raw JSON of recent deltas; dumped on first mismatch. *)
   ; mutable first_mismatch_dumped : bool
   }
 
@@ -45,14 +45,14 @@ let dump_levels label arr =
   Printf.printf "    %s:\n" label;
   Array.iteri
     (fun i lvl ->
-       if i < 10
-       then
-         Printf.printf
-           "      [%d] key=%s wire=%s size=%s\n"
-           i
-           lvl.Kraken.Kraken_orderbook_feed.price
-           lvl.Kraken.Kraken_orderbook_feed.price_wire
-           lvl.Kraken.Kraken_orderbook_feed.size)
+      if i < 10
+      then
+        Printf.printf
+          "      [%d] key=%s wire=%s size=%s\n"
+          i
+          lvl.Kraken.Kraken_orderbook_feed.price
+          lvl.Kraken.Kraken_orderbook_feed.price_wire
+          lvl.Kraken.Kraken_orderbook_feed.size)
     arr
 ;;
 
@@ -64,8 +64,8 @@ let validate symbol st checksum_received =
   let ask_arr =
     Kraken.Kraken_orderbook_feed.levels_to_array ~sort_desc:false st.asks depth
   in
-  (* Production argument order: bids (desc) then asks (asc); the function hashes
-     asks first per Kraken's spec. *)
+  (* Production argument order: bids (desc) then asks (asc); the function hashes asks
+     first per Kraken's spec. *)
   let calc = Kraken.Kraken_orderbook_feed.calculate_checksum symbol bid_arr ask_arr in
   st.validated <- st.validated + 1;
   if Int32.compare calc checksum_received <> 0
@@ -77,8 +77,8 @@ let validate symbol st checksum_received =
       st.updates_since_snapshot
       checksum_received
       calc;
-    (* Independent recomputation from wire strings, bypassing
-       calculate_checksum: isolates math vs state. *)
+    (* Independent recomputation from wire strings, bypassing calculate_checksum: isolates
+       math vs state. *)
     let crc = ref 0xFFFFFFFFl in
     let feed s =
       crc
@@ -98,17 +98,17 @@ let validate symbol st checksum_received =
     let manual = Buffer.create 256 in
     Array.iter
       (fun lvl ->
-         feed lvl.Kraken.Kraken_orderbook_feed.price_wire;
-         feed lvl.Kraken.Kraken_orderbook_feed.size;
-         Buffer.add_string manual (norm_repr lvl.Kraken.Kraken_orderbook_feed.price_wire);
-         Buffer.add_string manual (norm_repr lvl.Kraken.Kraken_orderbook_feed.size))
+        feed lvl.Kraken.Kraken_orderbook_feed.price_wire;
+        feed lvl.Kraken.Kraken_orderbook_feed.size;
+        Buffer.add_string manual (norm_repr lvl.Kraken.Kraken_orderbook_feed.price_wire);
+        Buffer.add_string manual (norm_repr lvl.Kraken.Kraken_orderbook_feed.size))
       ask_arr;
     Array.iter
       (fun lvl ->
-         feed lvl.Kraken.Kraken_orderbook_feed.price_wire;
-         feed lvl.Kraken.Kraken_orderbook_feed.size;
-         Buffer.add_string manual (norm_repr lvl.Kraken.Kraken_orderbook_feed.price_wire);
-         Buffer.add_string manual (norm_repr lvl.Kraken.Kraken_orderbook_feed.size))
+        feed lvl.Kraken.Kraken_orderbook_feed.price_wire;
+        feed lvl.Kraken.Kraken_orderbook_feed.size;
+        Buffer.add_string manual (norm_repr lvl.Kraken.Kraken_orderbook_feed.price_wire);
+        Buffer.add_string manual (norm_repr lvl.Kraken.Kraken_orderbook_feed.size))
       bid_arr;
     let manual_crc = Kraken.Kraken_orderbook_feed.crc32_zlib (Buffer.contents manual) in
     Printf.printf "  independent-wire-crc=%ld manual-stream-crc=%ld\n%!" !crc manual_crc;
@@ -128,23 +128,23 @@ let validate symbol st checksum_received =
         symbol
         (Yojson.Safe.to_string
            (`List
-               [ `List
-                   (List.map
-                      (fun lvl ->
-                         `List
-                           [ `String lvl.Kraken.Kraken_orderbook_feed.price_wire
-                           ; `String lvl.Kraken.Kraken_orderbook_feed.size
-                           ])
-                      (Array.to_list bid_arr))
-               ; `List
-                   (List.map
-                      (fun lvl ->
-                         `List
-                           [ `String lvl.Kraken.Kraken_orderbook_feed.price_wire
-                           ; `String lvl.Kraken.Kraken_orderbook_feed.size
-                           ])
-                      (Array.to_list ask_arr))
-               ]));
+             [ `List
+                 (List.map
+                    (fun lvl ->
+                      `List
+                        [ `String lvl.Kraken.Kraken_orderbook_feed.price_wire
+                        ; `String lvl.Kraken.Kraken_orderbook_feed.size
+                        ])
+                    (Array.to_list bid_arr))
+             ; `List
+                 (List.map
+                    (fun lvl ->
+                      `List
+                        [ `String lvl.Kraken.Kraken_orderbook_feed.price_wire
+                        ; `String lvl.Kraken.Kraken_orderbook_feed.size
+                        ])
+                    (Array.to_list ask_arr))
+             ]));
     dump_levels "bids (desc)" bid_arr;
     dump_levels "asks (asc)" ask_arr;
     flush stdout)
@@ -170,56 +170,56 @@ let handle_message json =
       let data = member "data" json |> to_list in
       List.iter
         (fun entry ->
-           let symbol = member "symbol" entry |> to_string in
-           let st = get_state symbol in
-           (match typ with
-            | "snapshot" ->
-              Hashtbl.clear st.bids;
-              Hashtbl.clear st.asks;
-              st.updates_since_snapshot <- 0;
-              Queue.clear st.recent_deltas;
-              st.first_mismatch_dumped <- false;
-              (* One-time raw wire dump; reveals string vs number encoding. *)
-              if (not st.snapshot_ok) && st.validated = 0
-              then
-                Printf.printf
-                  "RAW_BIDS_JSON %s: %s\n%!"
-                  symbol
-                  (Yojson.Safe.to_string (member "bids" entry))
-            | _ ->
-              (* Keep the raw delta for post-mortem on first mismatch. *)
-              Queue.add (Yojson.Safe.to_string entry) st.recent_deltas;
-              if Queue.length st.recent_deltas > 40
-              then Queue.pop st.recent_deltas |> ignore;
-              (* Sequence-gap check as in production. *)
-              let seq_opt =
-                Kraken.Kraken_orderbook_feed.int64_of_json (member "sequence" entry)
-              in
-              (match seq_opt with
-               | Some curr ->
-                 (match st.seq with
-                  | Some last when Int64.compare curr (Int64.add last 1L) > 0 ->
-                    Printf.printf "GAP %s current=%Ld last=%Ld\n%!" symbol curr last
-                  | _ -> ())
-               | None -> Printf.printf "NO_SEQ_FIELD %s (%s)\n%!" symbol typ);
-              st.updates_since_snapshot <- st.updates_since_snapshot + 1);
-           let bids_json = member "bids" entry in
-           let asks_json = member "asks" entry in
-           Kraken.Kraken_orderbook_feed.parse_and_apply_levels symbol st.bids bids_json;
-           Kraken.Kraken_orderbook_feed.parse_and_apply_levels symbol st.asks asks_json;
-           (* Spec truncates to subscribed depth after every update:
-               out-of-scope levels are never removed via qty:0, so retained
-               ghosts corrupt the computed top-10 on removals. *)
-           if Hashtbl.length st.bids > 10
-           then Kraken.Kraken_orderbook_feed.truncate_hashtbl st.bids true 10;
-           if Hashtbl.length st.asks > 10
-           then Kraken.Kraken_orderbook_feed.truncate_hashtbl st.asks false 10;
-           st.seq <- Kraken.Kraken_orderbook_feed.int64_of_json (member "sequence" entry);
-           match
-             Yojson.Safe.Util.member "checksum" entry |> Yojson.Safe.Util.to_int_option
-           with
-           | Some cs -> validate symbol st (Int32.of_int cs)
-           | None -> Printf.printf "no checksum field for %s (%s)\n%!" symbol typ)
+          let symbol = member "symbol" entry |> to_string in
+          let st = get_state symbol in
+          (match typ with
+           | "snapshot" ->
+             Hashtbl.clear st.bids;
+             Hashtbl.clear st.asks;
+             st.updates_since_snapshot <- 0;
+             Queue.clear st.recent_deltas;
+             st.first_mismatch_dumped <- false;
+             (* One-time raw wire dump; reveals string vs number encoding. *)
+             if (not st.snapshot_ok) && st.validated = 0
+             then
+               Printf.printf
+                 "RAW_BIDS_JSON %s: %s\n%!"
+                 symbol
+                 (Yojson.Safe.to_string (member "bids" entry))
+           | _ ->
+             (* Keep the raw delta for post-mortem on first mismatch. *)
+             Queue.add (Yojson.Safe.to_string entry) st.recent_deltas;
+             if Queue.length st.recent_deltas > 40
+             then Queue.pop st.recent_deltas |> ignore;
+             (* Sequence-gap check as in production. *)
+             let seq_opt =
+               Kraken.Kraken_orderbook_feed.int64_of_json (member "sequence" entry)
+             in
+             (match seq_opt with
+              | Some curr ->
+                (match st.seq with
+                 | Some last when Int64.compare curr (Int64.add last 1L) > 0 ->
+                   Printf.printf "GAP %s current=%Ld last=%Ld\n%!" symbol curr last
+                 | _ -> ())
+              | None -> Printf.printf "NO_SEQ_FIELD %s (%s)\n%!" symbol typ);
+             st.updates_since_snapshot <- st.updates_since_snapshot + 1);
+          let bids_json = member "bids" entry in
+          let asks_json = member "asks" entry in
+          Kraken.Kraken_orderbook_feed.parse_and_apply_levels symbol st.bids bids_json;
+          Kraken.Kraken_orderbook_feed.parse_and_apply_levels symbol st.asks asks_json;
+          (* Spec truncates to subscribed depth after every update: out-of-scope levels
+             are never removed via qty:0, so retained ghosts corrupt the computed top-10
+             on removals. *)
+          if Hashtbl.length st.bids > 10
+          then Kraken.Kraken_orderbook_feed.truncate_hashtbl st.bids true 10;
+          if Hashtbl.length st.asks > 10
+          then Kraken.Kraken_orderbook_feed.truncate_hashtbl st.asks false 10;
+          st.seq <- Kraken.Kraken_orderbook_feed.int64_of_json (member "sequence" entry);
+          match
+            Yojson.Safe.Util.member "checksum" entry |> Yojson.Safe.Util.to_int_option
+          with
+          | Some cs -> validate symbol st (Int32.of_int cs)
+          | None -> Printf.printf "no checksum field for %s (%s)\n%!" symbol typ)
         data)
     else Printf.printf "ignoring channel=%s\n" channel
   with
@@ -248,10 +248,7 @@ let () =
          Ipaddr_unix.of_inet_addr addr
        | _ -> failwith "resolve failed"
      in
-     Ws_lwt.connect
-       ~ctx
-       (`TLS (`Hostname "ws.kraken.com", `IP ip, `Port 443))
-       uri
+     Ws_lwt.connect ~ctx (`TLS (`Hostname "ws.kraken.com", `IP ip, `Port 443)) uri
      >>= fun conn ->
      let sub =
        `Assoc
@@ -264,9 +261,7 @@ let () =
                ] )
          ]
      in
-     Ws_lwt.write
-       conn
-       (Websocket.Frame.create ~content:(Yojson.Safe.to_string sub) ())
+     Ws_lwt.write conn (Websocket.Frame.create ~content:(Yojson.Safe.to_string sub) ())
      >>= fun () ->
      let deadline = Unix.gettimeofday () +. 45.0 in
      let rec loop () =
@@ -290,12 +285,12 @@ let () =
      Printf.printf "\n==== SUMMARY ====\n";
      Hashtbl.iter
        (fun symbol st ->
-          Printf.printf
-            "%s: snapshot_ok=%b validated=%d mismatched=%d\n"
-            symbol
-            st.snapshot_ok
-            st.validated
-            st.mismatched)
+         Printf.printf
+           "%s: snapshot_ok=%b validated=%d mismatched=%d\n"
+           symbol
+           st.snapshot_ok
+           st.validated
+           st.mismatched)
        states;
      Lwt.return_unit)
 ;;

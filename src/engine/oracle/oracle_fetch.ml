@@ -1,17 +1,15 @@
 (* Oracle_fetch - shared venue-series pipeline for the capital oracle.
 
-   One registry-driven implementation of "fetch a symbol's daily series",
-   used by both the live runtime (oracle_runtime.ml) and the CLI
-   (bin/oracle.ml). Dispatch goes exclusively through
-   [Exchange_intf.Oracle.Registry]: each venue adapter
-   ([Exchange_intf.Oracle.S]) supplies raw bars, calendar kind, session
-   calendar and fee/balance/instrument endpoints. A new venue only implements
-   the signature, registers and links it.
+   One registry-driven implementation of "fetch a symbol's daily series", used by both the
+   live runtime (oracle_runtime.ml) and the CLI (bin/oracle.ml). Dispatch goes exclusively
+   through [Exchange_intf.Oracle.Registry]: each venue adapter ([Exchange_intf.Oracle.S])
+   supplies raw bars, calendar kind, session calendar and fee/balance/instrument
+   endpoints. A new venue only implements the signature, registers and links it.
 
-   The pipeline owns venue-independent concerns: the disk cache policy
-   (Oracle_cache, raw bars + delta fetch), clean-series normalization
-   ([Oracle_calendar.normalize_bars], applied on every read), Yahoo deep
-   history (src/external/yahoo/) and the equity session-calendar model. *)
+   The pipeline owns venue-independent concerns: the disk cache policy (Oracle_cache, raw
+   bars + delta fetch), clean-series normalization ([Oracle_calendar.normalize_bars],
+   applied on every read), Yahoo deep history (src/external/yahoo/) and the equity
+   session-calendar model. *)
 
 open Lwt.Infix
 
@@ -19,8 +17,8 @@ let section = "oracle_fetch"
 
 module Exchange = Dio_exchange.Exchange_intf
 
-(* The Yahoo deep-history client (src/external/yahoo/, [dio.yahoo]); the
-   wrapper module [Yahoo] re-exports the [Yahoo_deep_history] module. *)
+(* The Yahoo deep-history client (src/external/yahoo/, [dio.yahoo]); the wrapper module
+   [Yahoo] re-exports the [Yahoo_deep_history] module. *)
 module Yahoo_deep_history = Yahoo.Yahoo_deep_history
 
 let today_iso () =
@@ -32,13 +30,13 @@ let today_iso () =
     tm.Unix.tm_mday
 ;;
 
-(* Symbols already reported as normalized this run: drop/clamp counts are
-   logged once, then at debug level. *)
+(* Symbols already reported as normalized this run: drop/clamp counts are logged once,
+   then at debug level. *)
 let warned_normalized : (string, unit) Hashtbl.t = Hashtbl.create 32
 
 (** Clean-series view: sort, de-duplicate and normalize through
-    [Oracle_calendar.normalize_bars], logging drop/clamp counts once per
-    symbol. Idempotent, safe on an already-clean series. *)
+    [Oracle_calendar.normalize_bars], logging drop/clamp counts once per symbol.
+    Idempotent, safe on an already-clean series. *)
 let clean_bars ~(exchange : string) ~(symbol : string) (bars : Oracle_types.bar list)
   : Oracle_types.bar list
   =
@@ -66,9 +64,9 @@ let clean_bars ~(exchange : string) ~(symbol : string) (bars : Oracle_types.bar 
   Array.to_list clean
 ;;
 
-(** Build a [series] from (already clean) bars, using the venue's calendar
-    kind from the registry (static known-exchange fallback for pure/offline/
-    test contexts; unknown exchanges default to crypto). *)
+(** Build a [series] from (already clean) bars, using the venue's calendar kind from the
+    registry (static known-exchange fallback for pure/offline/ test contexts; unknown
+    exchanges default to crypto). *)
 let series_of_bars ~(exchange : string) ~(symbol : string) (bars : Oracle_types.bar list)
   : Oracle_types.series
   =
@@ -79,32 +77,30 @@ let series_of_bars ~(exchange : string) ~(symbol : string) (bars : Oracle_types.
   }
 ;;
 
-(** Per-pass cache of fetched series, shared across assets so e.g. ETH/USD is
-    downloaded once per pass. The durable cache is Oracle_cache; this de-dupes
-    within a pass. *)
+(** Per-pass cache of fetched series, shared across assets so e.g. ETH/USD is downloaded
+    once per pass. The durable cache is Oracle_cache; this de-dupes within a pass. *)
 let fetch_cache : (string * string, Oracle_types.series) Hashtbl.t = Hashtbl.create 32
 
-(** Drop the per-pass series cache so a new refresh cycle re-fetches rather
-    than reusing the previous cycle's series objects. *)
+(** Drop the per-pass series cache so a new refresh cycle re-fetches rather than reusing
+    the previous cycle's series objects. *)
 let clear_cache () = Hashtbl.clear fetch_cache
 
-(** Build a deep-history [series] from clean Yahoo bars under the venue's
-    calendar kind. The deep merge consumes only [bars], but class members
-    analyzed purely from Yahoo need the right kind for labels/gap semantics. *)
+(** Build a deep-history [series] from clean Yahoo bars under the venue's calendar kind.
+    The deep merge consumes only [bars], but class members analyzed purely from Yahoo need
+    the right kind for labels/gap semantics. *)
 let deep_series_of_bars
-      ~(calendar_kind : Oracle_types.calendar_kind)
-      ~(symbol : string)
-      (bars : Oracle_types.bar list)
+  ~(calendar_kind : Oracle_types.calendar_kind)
+  ~(symbol : string)
+  (bars : Oracle_types.bar list)
   : Oracle_types.series
   =
   { Oracle_types.symbol; calendar_kind; bars = Array.of_list bars; gaps = [] }
 ;;
 
-(** Merge deep history into the venue series: deep bars strictly before the
-    venue's first bar are prepended; venue bars win on overlap; result is
-    sorted and de-duplicated. Returns the number of deep bars added. The
-    venue's first bar is the minimum date over its bars (feeds are not
-    assumed ascending). *)
+(** Merge deep history into the venue series: deep bars strictly before the venue's first
+    bar are prepended; venue bars win on overlap; result is sorted and de-duplicated.
+    Returns the number of deep bars added. The venue's first bar is the minimum date over
+    its bars (feeds are not assumed ascending). *)
 let merge_series ~(venue : Oracle_types.series) ~(deep : Oracle_types.series)
   : Oracle_types.series * int
   =
@@ -134,17 +130,16 @@ let merge_series ~(venue : Oracle_types.series) ~(deep : Oracle_types.series)
       { venue with bars = merged }, List.length added))
 ;;
 
-(** Fetch one symbol's daily series through the registry, cached per run and
-    disk-cached via Oracle_cache (full history first, delta per refresh).
-    [offline] serves only the disk cache, no network. [feed] is the
-    Alpaca-only IEX/SIP knob. *)
+(** Fetch one symbol's daily series through the registry, cached per run and disk-cached
+    via Oracle_cache (full history first, delta per refresh). [offline] serves only the
+    disk cache, no network. [feed] is the Alpaca-only IEX/SIP knob. *)
 let fetch_series_for
-      ?(offline = false)
-      ~(exchange : string)
-      ~(symbol : string)
-      ?feed
-      ?end_date
-      ()
+  ?(offline = false)
+  ~(exchange : string)
+  ~(symbol : string)
+  ?feed
+  ?end_date
+  ()
   : Oracle_types.series Lwt.t
   =
   match Hashtbl.find_opt fetch_cache (exchange, symbol) with
@@ -173,15 +168,14 @@ let fetch_series_for
     series
 ;;
 
-(** Extend a venue series backward with Yahoo deep history for the same
-    underlying asset (venue bars win on overlap; nothing synthesized). Deep
-    history is disk-cached and delta-fetched like the venue series, keyed on
-    the resolved Yahoo symbol. Returns the deepened series and deep bars
-    added. *)
+(** Extend a venue series backward with Yahoo deep history for the same underlying asset
+    (venue bars win on overlap; nothing synthesized). Deep history is disk-cached and
+    delta-fetched like the venue series, keyed on the resolved Yahoo symbol. Returns the
+    deepened series and deep bars added. *)
 let deepen_series
-      ?(no_deep_history = false)
-      ?(offline = false)
-      (series : Oracle_types.series)
+  ?(no_deep_history = false)
+  ?(offline = false)
+  (series : Oracle_types.series)
   : (Oracle_types.series * int) Lwt.t
   =
   let venue_bars = series.bars in
@@ -195,9 +189,9 @@ let deepen_series
     | Some yahoo_symbol ->
       let venue_first = venue_bars.(0).Oracle_types.date in
       let end_date = Oracle_calendar.add_days venue_first (-1) in
-      (* Deep history is bounded by [end_date] (day before the venue series
-         starts) and complete once its last bar reaches it; a "today"
-         freshness check would re-fetch it with start > end every pass. *)
+      (* Deep history is bounded by [end_date] (day before the venue series starts) and
+         complete once its last bar reaches it; a "today" freshness check would re-fetch
+         it with start > end every pass. *)
       Oracle_cache.with_delta
         ~exchange:"yahoo-deep"
         ~symbol:yahoo_symbol

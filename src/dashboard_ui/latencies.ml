@@ -3,11 +3,10 @@ open Theme
 
 (** ENGINE LATENCY: paginated metric table, one row per domain.
 
-    Columns are grouped into pages ([metric_pages]); only the active page's
-    columns render. The rows, trend sparkline, and exec-rate columns adapt to
-    the active page. To add a measurement, add its label to a page; the engine
-    publishes it under the domain's latency map and it appears. Switch pages
-    with ←/→ in the main view. *)
+    Columns are grouped into pages ([metric_pages]); only the active page's columns
+    render. The rows, trend sparkline, and exec-rate columns adapt to the active page. To
+    add a measurement, add its label to a page; the engine publishes it under the domain's
+    latency map and it appears. Switch pages with ←/→ in the main view. *)
 
 let history_len = 15
 let hist_tbl : (string * string, float array) Hashtbl.t = Hashtbl.create 32
@@ -16,8 +15,8 @@ let hist_max = 128
 (** Active page index into [metric_pages]; switched with [next_page]/[prev_page]. *)
 let active_page_ref = ref 0
 
-(** Exponential moving average of a history array; smooths windowed p99
-    samples so the sparkline tracks trend, not single-window noise. *)
+(** Exponential moving average of a history array; smooths windowed p99 samples so the
+    sparkline tracks trend, not single-window noise. *)
 let ema_smooth (arr : float array) ~alpha =
   let out = Array.copy arr in
   let prev = ref arr.(0) in
@@ -28,9 +27,9 @@ let ema_smooth (arr : float array) ~alpha =
   out
 ;;
 
-(** Rolling p99 history keyed by (symbol, metric), so each page keeps its own
-    sparkline. Clears the whole table when it exceeds [hist_max] entries;
-    sparklines repopulate within seconds. *)
+(** Rolling p99 history keyed by (symbol, metric), so each page keeps its own sparkline.
+    Clears the whole table when it exceeds [hist_max] entries; sparklines repopulate
+    within seconds. *)
 let update_hist symbol metric p99 =
   if Hashtbl.length hist_tbl > hist_max then Hashtbl.clear hist_tbl;
   let key = symbol, metric in
@@ -48,11 +47,10 @@ let update_hist symbol metric p99 =
   arr
 ;;
 
-(** Last measured window values per (symbol, metric), persisted across idle
-    windows so event-driven metrics (signer, ws ping, rest request) keep their
-    last value instead of flipping back to "idle". Only windows with samples
-    refresh it; zero-sample windows keep prior values rendered dimmed. Clears
-    when it exceeds [last_vals_max] entries. *)
+(** Last measured window values per (symbol, metric), persisted across idle windows so
+    event-driven metrics (signer, ws ping, rest request) keep their last value instead of
+    flipping back to "idle". Only windows with samples refresh it; zero-sample windows
+    keep prior values rendered dimmed. Clears when it exceeds [last_vals_max] entries. *)
 let last_vals : (string * string, float * float * float) Hashtbl.t = Hashtbl.create 64
 
 let last_vals_max = 256
@@ -65,29 +63,29 @@ let hist_of symbol metric =
   | None -> Array.make history_len 0.0
 ;;
 
-(** Advance the sparkline history once per snapshot (data cadence), not per
-    render: at up to 30 fps, shifting per frame would scroll the sparkline
-    absurdly fast and force a redraw every frame. *)
+(** Advance the sparkline history once per snapshot (data cadence), not per render: at up
+    to 30 fps, shifting per frame would scroll the sparkline absurdly fast and force a
+    redraw every frame. *)
 let ingest (snapshot : Snapshot.t) =
   List.iter
     (fun (_symbol, metrics) ->
-       List.iter
-         (fun (label, (m : Snapshot.latency_metric)) ->
-            if m.samples > 0 then ignore (update_hist _symbol label m.p99))
-         metrics)
+      List.iter
+        (fun (label, (m : Snapshot.latency_metric)) ->
+          if m.samples > 0 then ignore (update_hist _symbol label m.p99))
+        metrics)
     snapshot.latencies
 ;;
 
-(** Freshness tolerance per metric label: 600s for [oracle] (one analysis pass
-    per ~5 min + jitter), 15s for everything else. *)
+(** Freshness tolerance per metric label: 600s for [oracle] (one analysis pass per ~5
+    min + jitter), 15s for everything else. *)
 let freshness_tolerance = function
   | "oracle" -> 600.0
   | _ -> 15.0
 ;;
 
-(** A latency page: named group of per-domain metric columns. Every page
-    renders the same domain rows with a different column set, so the section
-    grows to arbitrarily many metrics without widening the table. *)
+(** A latency page: named group of per-domain metric columns. Every page renders the same
+    domain rows with a different column set, so the section grows to arbitrarily many
+    metrics without widening the table. *)
 type metric_group =
   { page_label : string
   ; metrics : string list
@@ -98,15 +96,13 @@ type metric_group =
 
 (** Latency pages.
 
-    - INTERNAL: per-asset work. [oracle] is the capital-oracle's per-asset
-      analysis pass (own ~5 min cadence, outside the per-cycle span).
-      [orderbook] -> [execution] -> [prep] -> [strategy] are the four sequential
-      segments of one cycle; [cycle] is their sum. All are in-process work with
-      the same sub-10us target.
-    - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed
-      one-way latency, REST round-trip, signer time). These measure exchange
-      round-trips and feed transit, not in-process work, and carry their own
-      budgets. *)
+    - INTERNAL: per-asset work. [oracle] is the capital-oracle's per-asset analysis pass
+      (own ~5 min cadence, outside the per-cycle span). [orderbook] -> [execution] ->
+      [prep] -> [strategy] are the four sequential segments of one cycle; [cycle] is their
+      sum. All are in-process work with the same sub-10us target.
+    - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed one-way latency,
+      REST round-trip, signer time). These measure exchange round-trips and feed transit,
+      not in-process work, and carry their own budgets. *)
 let metric_pages =
   [ { page_label = "INTERNAL"
     ; metrics = [ "oracle"; "orderbook"; "execution"; "prep"; "strategy"; "cycle" ]
@@ -145,15 +141,15 @@ let page_trend_label i =
   | None -> ""
 ;;
 
-(** Width of the trend column (sparkline + header). The trend header label and
-    the sparkline must both fit; a longer label would silently overrun the
-    column and shift every border to its right out of alignment. Guarded by a
-    test in test_dashboard_holdings. *)
+(** Width of the trend column (sparkline + header). The trend header label and the
+    sparkline must both fit; a longer label would silently overrun the column and shift
+    every border to its right out of alignment. Guarded by a test in
+    test_dashboard_holdings. *)
 let trend_col_w = 12
 
-(** Short display header per latency metric: ORACLE (the separate analysis-pass
-    metric), then the cycle segments BOOK -> EVENTS -> PREP -> STRATEGY, then
-    TOTAL (the whole cycle). *)
+(** Short display header per latency metric: ORACLE (the separate analysis-pass metric),
+    then the cycle segments BOOK -> EVENTS -> PREP -> STRATEGY, then TOTAL (the whole
+    cycle). *)
 let short_label = function
   | "oracle" -> "ORACLE"
   | "orderbook" -> "BOOK"
@@ -176,9 +172,8 @@ let take_first n l =
   aux [] n l
 ;;
 
-(** Section title with page tabs embedded: the active page is wrapped in
-    ◀ ▶ (bold cyan), inactive pages are dim, and the ←/→ hint marks the switch
-    keys. *)
+(** Section title with page tabs embedded: the active page is wrapped in ◀ ▶ (bold cyan),
+    inactive pages are dim, and the ←/→ hint marks the switch keys. *)
 let render_latency_title w =
   let t = Theme.current () in
   let left =
@@ -187,9 +182,9 @@ let render_latency_title w =
   let tabs =
     List.mapi
       (fun i p ->
-         if i = current_page_index ()
-         then I.string A.(fg t.c_cyan ++ bg t.c_bg ++ st bold) (" ◀" ^ p.page_label ^ "▶ ")
-         else I.string t.a_dim ("  " ^ p.page_label ^ " "))
+        if i = current_page_index ()
+        then I.string A.(fg t.c_cyan ++ bg t.c_bg ++ st bold) (" ◀" ^ p.page_label ^ "▶ ")
+        else I.string t.a_dim ("  " ^ p.page_label ^ " "))
       metric_pages
   in
   let hint = I.string t.a_dim "←/→" in
@@ -221,35 +216,33 @@ let render_latencies w (snapshot : Snapshot.t) =
     | Some e when e <> "" -> e
     | _ -> ""
   in
-  (* Keep rows with at least one metric window fresh within its tolerance. A
-     running domain publishes a window even with zero samples, so
-     idle-but-running domains stay visible instead of flickering out between
-     resets. Freshness is checked across all pages so rows stay stable when the
-     user flips pages. *)
+  (* Keep rows with at least one metric window fresh within its tolerance. A running
+     domain publishes a window even with zero samples, so idle-but-running domains stay
+     visible instead of flickering out between resets. Freshness is checked across all
+     pages so rows stay stable when the user flips pages. *)
   let snapshot_ts = snapshot.timestamp in
   let all_page_labels = List.concat_map (fun p -> p.metrics) metric_pages in
   let row_is_active (_symbol, (metrics : (string * Snapshot.latency_metric) list)) =
     List.exists
       (fun label ->
-         match List.assoc_opt label metrics with
-         | Some m ->
-           m.window_end > 0.0
-           && snapshot_ts > 0.0
-           && snapshot_ts -. m.window_end < freshness_tolerance label
-         | None -> false)
+        match List.assoc_opt label metrics with
+        | Some m ->
+          m.window_end > 0.0
+          && snapshot_ts > 0.0
+          && snapshot_ts -. m.window_end < freshness_tolerance label
+        | None -> false)
       all_page_labels
   in
   let active_lats = List.filter row_is_active lats in
   if active_lats = []
   then I.empty
   else (
-    (* Per-metric (warn_us, crit_us) thresholds. The four internal segments
-       (orderbook, execution, prep, strategy) share one budget: green < 10us,
-       yellow 10-20us, red > 20us. [cycle] is the whole-cycle sum with the wider
-       end-to-end budget: green < 50us, yellow 50-100us, red > 100us. [oracle]
-       is the separate analysis pass. NETWORK metrics keep much larger budgets
-       (exchange round-trips, not in-process work). [f >= warn] is yellow,
-       [f > crit] is red, else green. *)
+    (* Per-metric (warn_us, crit_us) thresholds. The four internal segments (orderbook,
+       execution, prep, strategy) share one budget: green < 10us, yellow 10-20us, red >
+       20us. [cycle] is the whole-cycle sum with the wider end-to-end budget: green <
+       50us, yellow 50-100us, red > 100us. [oracle] is the separate analysis pass. NETWORK
+       metrics keep much larger budgets (exchange round-trips, not in-process work).
+       [f >= warn] is yellow, [f > crit] is red, else green. *)
     let latency_thresholds label =
       match label with
       | "cycle" -> 50.0, 100.0
@@ -277,8 +270,8 @@ let render_latencies w (snapshot : Snapshot.t) =
     let page_cols = if w < full_page_w then take_first 2 page.metrics else page.metrics in
     let page_labels = List.map short_label page_cols in
     let metric_cell_w = 8 in
-    (* Two-row header: metric names on the first row, p50/p99/p999
-       sub-headers on the second. *)
+    (* Two-row header: metric names on the first row, p50/p99/p999 sub-headers on the
+       second. *)
     let header_row1 =
       I.hcat
         ([ I.string t.a_border " │  "
@@ -289,11 +282,11 @@ let render_latencies w (snapshot : Snapshot.t) =
          ]
          @ List.mapi
              (fun i lbl ->
-                let len = String.length lbl in
-                let pad = (24 - len) / 2 in
-                let s = String.make pad ' ' ^ lbl in
-                let img = col 24 t.a_label s in
-                if i = 0 then img else I.hcat [ I.string t.a_border " │ "; img ])
+               let len = String.length lbl in
+               let pad = (24 - len) / 2 in
+               let s = String.make pad ' ' ^ lbl in
+               let img = col 24 t.a_label s in
+               if i = 0 then img else I.hcat [ I.string t.a_border " │ "; img ])
              page_labels
          @ [ I.string t.a_border " │ "; col 7 t.a_label "STRAT/S" ])
     in
@@ -307,14 +300,14 @@ let render_latencies w (snapshot : Snapshot.t) =
          ]
          @ List.mapi
              (fun i _lbl ->
-                let img =
-                  I.hcat
-                    [ col_right metric_cell_w t.a_dim "p50"
-                    ; col_right metric_cell_w t.a_dim "p99"
-                    ; col_right metric_cell_w t.a_dim "p999"
-                    ]
-                in
-                if i = 0 then img else I.hcat [ I.string t.a_border " │ "; img ])
+               let img =
+                 I.hcat
+                   [ col_right metric_cell_w t.a_dim "p50"
+                   ; col_right metric_cell_w t.a_dim "p99"
+                   ; col_right metric_cell_w t.a_dim "p999"
+                   ]
+               in
+               if i = 0 then img else I.hcat [ I.string t.a_border " │ "; img ])
              page_labels
          @ [ I.string t.a_border " │ "; col 7 t.a_dim "  rate  " ])
     in
@@ -322,161 +315,159 @@ let render_latencies w (snapshot : Snapshot.t) =
     let rows =
       List.mapi
         (fun i (symbol, metrics) ->
-           let bg_color = if i mod 2 = 1 then t.c_panel else t.c_bg in
-           let a_text = A.(t.a_text ++ bg bg_color) in
-           let a_green = A.(t.a_green ++ bg bg_color) in
-           let a_green_dark = A.(t.a_green_dark ++ bg bg_color) in
-           let a_red = A.(t.a_red ++ bg bg_color) in
-           let a_yellow = A.(t.a_yellow ++ bg bg_color) in
-           let a_dim = A.(t.a_dim ++ bg bg_color) in
-           let a_border = A.(t.a_border ++ bg bg_color) in
-           let a_border_outer = A.(t.a_border ++ bg t.c_bg) in
-           let a_bright = A.(t.a_bright ++ bg bg_color) in
-           let exch_sym_attr ?dim exch =
-             A.(Theme.exch_sym_attr ?dim exch ++ bg bg_color)
-           in
-           let attr_of_sev = function
-             | 2 -> a_red
-             | 1 -> a_yellow
-             | 0 -> a_green
-             | _ -> a_dim
-           in
-           let latency_cell_attr sev f =
-             if Theme.is_sub_us f then a_green_dark else sev
-           in
-           let col w attr s = I.string attr (Theme.pad_right w s) in
-           let col_right w attr s = I.string attr (Theme.pad_left w s) in
-           let close_row w img =
-             let d = w - I.width img - 2 in
-             I.hcat
-               [ img
-               ; I.string A.(bg bg_color) (String.make (max 0 d) ' ')
-               ; I.string A.(bg bg_color) " "
-               ; I.string a_border_outer "│"
-               ]
-           in
-           let render_sparkline_local w data max_val attr_fn =
-             let len = Array.length data in
-             let start_idx = max 0 (len - w) in
-             let visible_len = min w len in
-             let empty_w = w - visible_len in
-             let blocks =
-               List.init visible_len (fun idx ->
-                 let v = data.(start_idx + idx) in
-                 let ratio = if max_val > 0.0 then v /. max_val else 0.0 in
-                 let ratio = max 0.0 (min 1.0 ratio) in
-                 let block_idx = int_of_float (ratio *. 7.0) in
-                 let block_idx = max 0 (min 7 block_idx) in
-                 I.string (attr_fn v) Theme.block_chars.(block_idx))
-             in
-             I.hcat (I.string a_dim (String.make empty_w ' ') :: blocks)
-           in
-           let mlist = metrics in
-           let find_metric label =
-             match List.assoc_opt label mlist with
-             | Some (m : Snapshot.latency_metric) -> m.p50, m.p99, m.p999, m.samples
-             | None -> 0.0, 0.0, 0.0, 0
-           in
-           let worst_sev =
-             List.fold_left
-               (fun worst label ->
-                  let _, p99, _, samples = find_metric label in
+          let bg_color = if i mod 2 = 1 then t.c_panel else t.c_bg in
+          let a_text = A.(t.a_text ++ bg bg_color) in
+          let a_green = A.(t.a_green ++ bg bg_color) in
+          let a_green_dark = A.(t.a_green_dark ++ bg bg_color) in
+          let a_red = A.(t.a_red ++ bg bg_color) in
+          let a_yellow = A.(t.a_yellow ++ bg bg_color) in
+          let a_dim = A.(t.a_dim ++ bg bg_color) in
+          let a_border = A.(t.a_border ++ bg bg_color) in
+          let a_border_outer = A.(t.a_border ++ bg t.c_bg) in
+          let a_bright = A.(t.a_bright ++ bg bg_color) in
+          let exch_sym_attr ?dim exch =
+            A.(Theme.exch_sym_attr ?dim exch ++ bg bg_color)
+          in
+          let attr_of_sev = function
+            | 2 -> a_red
+            | 1 -> a_yellow
+            | 0 -> a_green
+            | _ -> a_dim
+          in
+          let latency_cell_attr sev f = if Theme.is_sub_us f then a_green_dark else sev in
+          let col w attr s = I.string attr (Theme.pad_right w s) in
+          let col_right w attr s = I.string attr (Theme.pad_left w s) in
+          let close_row w img =
+            let d = w - I.width img - 2 in
+            I.hcat
+              [ img
+              ; I.string A.(bg bg_color) (String.make (max 0 d) ' ')
+              ; I.string A.(bg bg_color) " "
+              ; I.string a_border_outer "│"
+              ]
+          in
+          let render_sparkline_local w data max_val attr_fn =
+            let len = Array.length data in
+            let start_idx = max 0 (len - w) in
+            let visible_len = min w len in
+            let empty_w = w - visible_len in
+            let blocks =
+              List.init visible_len (fun idx ->
+                let v = data.(start_idx + idx) in
+                let ratio = if max_val > 0.0 then v /. max_val else 0.0 in
+                let ratio = max 0.0 (min 1.0 ratio) in
+                let block_idx = int_of_float (ratio *. 7.0) in
+                let block_idx = max 0 (min 7 block_idx) in
+                I.string (attr_fn v) Theme.block_chars.(block_idx))
+            in
+            I.hcat (I.string a_dim (String.make empty_w ' ') :: blocks)
+          in
+          let mlist = metrics in
+          let find_metric label =
+            match List.assoc_opt label mlist with
+            | Some (m : Snapshot.latency_metric) -> m.p50, m.p99, m.p999, m.samples
+            | None -> 0.0, 0.0, 0.0, 0
+          in
+          let worst_sev =
+            List.fold_left
+              (fun worst label ->
+                let _, p99, _, samples = find_metric label in
+                if samples > 0
+                then max worst (severity label p99 samples)
+                else (
+                  match last_value symbol label with
+                  | Some (_, lp99, _) -> max worst (severity_of_value label lp99)
+                  | None -> worst))
+              0
+              page_cols
+          in
+          let dot_attr = attr_of_sev worst_sev in
+          let metric_cells =
+            List.mapi
+              (fun i label ->
+                let p50, p99, p999, samples = find_metric label in
+                let known = List.mem_assoc label mlist in
+                let img =
                   if samples > 0
-                  then max worst (severity label p99 samples)
+                  then (
+                    Hashtbl.replace last_vals (symbol, label) (p50, p99, p999);
+                    let s50 = severity label p50 samples in
+                    let s99 = max s50 (severity label p99 samples) in
+                    let s999 = max s99 (severity label p999 samples) in
+                    I.hcat
+                      [ col_right
+                          metric_cell_w
+                          (latency_cell_attr (attr_of_sev s50) p50)
+                          (format_latency_us p50)
+                      ; col_right
+                          metric_cell_w
+                          (latency_cell_attr (attr_of_sev s99) p99)
+                          (format_latency_us p99)
+                      ; col_right
+                          metric_cell_w
+                          (latency_cell_attr (attr_of_sev s999) p999)
+                          (format_latency_us p999)
+                      ])
                   else (
                     match last_value symbol label with
-                    | Some (_, lp99, _) -> max worst (severity_of_value label lp99)
-                    | None -> worst))
-               0
-               page_cols
-           in
-           let dot_attr = attr_of_sev worst_sev in
-           let metric_cells =
-             List.mapi
-               (fun i label ->
-                  let p50, p99, p999, samples = find_metric label in
-                  let known = List.mem_assoc label mlist in
-                  let img =
-                    if samples > 0
-                    then (
-                      Hashtbl.replace last_vals (symbol, label) (p50, p99, p999);
-                      let s50 = severity label p50 samples in
-                      let s99 = max s50 (severity label p99 samples) in
-                      let s999 = max s99 (severity label p999 samples) in
+                    | Some (lp50, lp99, lp999) ->
+                      let s50 = severity_of_value label lp50 in
+                      let s99 = max s50 (severity_of_value label lp99) in
+                      let s999 = max s99 (severity_of_value label lp999) in
                       I.hcat
                         [ col_right
                             metric_cell_w
-                            (latency_cell_attr (attr_of_sev s50) p50)
-                            (format_latency_us p50)
+                            (latency_cell_attr (attr_of_sev s50) lp50)
+                            (format_latency_us lp50)
                         ; col_right
                             metric_cell_w
-                            (latency_cell_attr (attr_of_sev s99) p99)
-                            (format_latency_us p99)
+                            (latency_cell_attr (attr_of_sev s99) lp99)
+                            (format_latency_us lp99)
                         ; col_right
                             metric_cell_w
-                            (latency_cell_attr (attr_of_sev s999) p999)
-                            (format_latency_us p999)
-                        ])
-                    else (
-                      match last_value symbol label with
-                      | Some (lp50, lp99, lp999) ->
-                        let s50 = severity_of_value label lp50 in
-                        let s99 = max s50 (severity_of_value label lp99) in
-                        let s999 = max s99 (severity_of_value label lp999) in
-                        I.hcat
-                          [ col_right
-                              metric_cell_w
-                              (latency_cell_attr (attr_of_sev s50) lp50)
-                              (format_latency_us lp50)
-                          ; col_right
-                              metric_cell_w
-                              (latency_cell_attr (attr_of_sev s99) lp99)
-                              (format_latency_us lp99)
-                          ; col_right
-                              metric_cell_w
-                              (latency_cell_attr (attr_of_sev s999) lp999)
-                              (format_latency_us lp999)
-                          ]
-                      | None ->
-                        let cell_w = 3 * metric_cell_w in
-                        let pad = (cell_w - 4) / 2 in
-                        col
-                          cell_w
-                          a_dim
-                          (String.make pad ' ' ^ if known then "idle" else "--"))
-                  in
-                  if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
-               page_cols
-           in
-           let t_smooth = ema_smooth (hist_of symbol page.trend_metric) ~alpha:0.5 in
-           let trend_spark =
-             render_sparkline_local trend_col_w t_smooth page.trend_max_us (fun v ->
-               latency_cell_attr (attr_of_sev (severity_of_value page.trend_metric v)) v)
-           in
-           let exch = exch_of_symbol symbol in
-           let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
-           let exec_s_cell =
-             match List.assoc_opt "strategy" mlist with
-             | Some (m : Snapshot.latency_metric) ->
-               if m.executions > 0
-               then col_right 7 a_bright (Printf.sprintf "%.1f/s" m.executions_per_sec)
-               else col_right 7 a_dim "idle"
-             | None -> col_right 7 a_dim "--"
-           in
-           close_row
-             w
-             (I.hcat
-                ([ I.string a_border_outer " │"
-                 ; I.string A.(bg bg_color) "  "
-                 ; I.string dot_attr "●"
-                 ; I.string a_text " "
-                 ; col 11 sym_attr (truncate_string 10 symbol)
-                 ; I.string a_border " │ "
-                 ; trend_spark
-                 ; I.string a_border " │ "
-                 ]
-                 @ metric_cells
-                 @ [ I.string a_border " │ "; exec_s_cell ])))
+                            (latency_cell_attr (attr_of_sev s999) lp999)
+                            (format_latency_us lp999)
+                        ]
+                    | None ->
+                      let cell_w = 3 * metric_cell_w in
+                      let pad = (cell_w - 4) / 2 in
+                      col
+                        cell_w
+                        a_dim
+                        (String.make pad ' ' ^ if known then "idle" else "--"))
+                in
+                if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
+              page_cols
+          in
+          let t_smooth = ema_smooth (hist_of symbol page.trend_metric) ~alpha:0.5 in
+          let trend_spark =
+            render_sparkline_local trend_col_w t_smooth page.trend_max_us (fun v ->
+              latency_cell_attr (attr_of_sev (severity_of_value page.trend_metric v)) v)
+          in
+          let exch = exch_of_symbol symbol in
+          let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
+          let exec_s_cell =
+            match List.assoc_opt "strategy" mlist with
+            | Some (m : Snapshot.latency_metric) ->
+              if m.executions > 0
+              then col_right 7 a_bright (Printf.sprintf "%.1f/s" m.executions_per_sec)
+              else col_right 7 a_dim "idle"
+            | None -> col_right 7 a_dim "--"
+          in
+          close_row
+            w
+            (I.hcat
+               ([ I.string a_border_outer " │"
+                ; I.string A.(bg bg_color) "  "
+                ; I.string dot_attr "●"
+                ; I.string a_text " "
+                ; col 11 sym_attr (truncate_string 10 symbol)
+                ; I.string a_border " │ "
+                ; trend_spark
+                ; I.string a_border " │ "
+                ]
+                @ metric_cells
+                @ [ I.string a_border " │ "; exec_s_cell ])))
         active_lats
     in
     let title = render_latency_title w in

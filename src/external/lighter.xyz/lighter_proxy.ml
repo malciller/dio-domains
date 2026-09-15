@@ -1,18 +1,17 @@
-(** Proxy routing for Lighter API and WebSocket traffic through Cloudflare
-    Workers, bypassing geographic access restrictions at the exchange ingress.
+(** Proxy routing for Lighter API and WebSocket traffic through Cloudflare Workers,
+    bypassing geographic access restrictions at the exchange ingress.
 
-    [LIGHTER_PROXY_URL] is a comma-separated pool; when set, all traffic goes
-    through workers in permitted jurisdictions. When unset, traffic connects
-    directly and the public WebSocket appends [readonly=true] to its query
-    params to bypass the geo block.
+    [LIGHTER_PROXY_URL] is a comma-separated pool; when set, all traffic goes through
+    workers in permitted jurisdictions. When unset, traffic connects directly and the
+    public WebSocket appends [readonly=true] to its query params to bypass the geo block.
 
     Deploy: [cd proxy/cloudflare && npx wrangler deploy]. *)
 
 let section = "lighter_proxy"
 let consecutive_proxy_failures = Atomic.make 0
 
-(** Parses KEY=VALUE pairs from [.env]; fallback when the process environment
-    lacks a variable. *)
+(** Parses KEY=VALUE pairs from [.env]; fallback when the process environment lacks a
+    variable. *)
 let read_dotenv key =
   try
     let ic = open_in ".env" in
@@ -50,8 +49,8 @@ let direct_hostname = "mainnet.zklighter.elliot.ai"
 (** Lighter mainnet REST base URL. *)
 let direct_base_url = "https://mainnet.zklighter.elliot.ai"
 
-(** Proxy pool from [LIGHTER_PROXY_URL]: comma separated, trailing slashes
-    stripped. Empty when unset. *)
+(** Proxy pool from [LIGHTER_PROXY_URL]: comma separated, trailing slashes stripped. Empty
+    when unset. *)
 let proxy_urls : string list =
   match env_or_dotenv "LIGHTER_PROXY_URL" with
   | Some s when s <> "" ->
@@ -86,9 +85,8 @@ let _do_log () =
 
 let current_proxy_index = Atomic.make 0
 
-(** Advances the proxy pool index round-robin and increments the failure
-    counter; called by the WS layer after connection failures so another
-    account's worker can take over. *)
+(** Advances the proxy pool index round-robin and increments the failure counter; called
+    by the WS layer after connection failures so another account's worker can take over. *)
 let rotate_proxy () =
   let len = List.length proxy_urls in
   if len > 1
@@ -127,8 +125,8 @@ let api_base_url () =
   | None -> direct_base_url
 ;;
 
-(** (host, port) for the private/authenticated WS: from the current proxy,
-    else the direct mainnet endpoint on 443. *)
+(** (host, port) for the private/authenticated WS: from the current proxy, else the direct
+    mainnet endpoint on 443. *)
 let private_ws_connect_target () =
   match proxy_url () with
   | Some url ->
@@ -142,12 +140,12 @@ let private_ws_connect_target () =
 (** (host, port) for the public WS: always direct, never proxied. *)
 let public_ws_connect_target () = direct_hostname, 443
 
-(** Public market data WS URL: direct, with [readonly=true] so the geo block
-    does not apply. *)
+(** Public market data WS URL: direct, with [readonly=true] so the geo block does not
+    apply. *)
 let public_ws_url () = Printf.sprintf "wss://%s/stream?readonly=true" direct_hostname
 
-(** Authenticated WS URL: proxied host (with [sessionId=dio-private]) when a
-    proxy is configured, else direct. *)
+(** Authenticated WS URL: proxied host (with [sessionId=dio-private]) when a proxy is
+    configured, else direct. *)
 let private_ws_url () =
   match proxy_url () with
   | Some url ->

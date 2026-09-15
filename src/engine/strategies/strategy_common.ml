@@ -1,6 +1,6 @@
-(** Common types and infrastructure shared across all trading strategies.
-    Provides unified order representation, in-flight deduplication caches,
-    a ring buffer for order queuing, and the strategy module signature. *)
+(** Common types and infrastructure shared across all trading strategies. Provides unified
+    order representation, in-flight deduplication caches, a ring buffer for order queuing,
+    and the strategy module signature. *)
 
 open Lwt.Infix
 module StringMap = Map.Make (String)
@@ -11,7 +11,8 @@ type trading_config =
   ; symbol : string
   ; qty : string
   ; grid_interval : float * float
-    (** (min, max) grid interval percentages; resolved to equal bounds when a scalar is provided *)
+  (** (min, max) grid interval percentages; resolved to equal bounds when a scalar is
+      provided *)
   ; sell_mult : string
   ; min_usd_balance : string option
   ; max_exposure : string option
@@ -21,14 +22,14 @@ type trading_config =
   ; testnet : bool
   ; hedge : bool
   ; accumulation_buffer : float * float
-    (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
+  (** (min, max) quote profit buffer; interpolated at runtime via Fear and Greed index *)
   ; data_feed : string option
   ; base_accumulation : bool
-    (** Per-strategy opt-in to base-accumulation persistence (default true
-        when absent from config.json; disabled means zero I/O). *)
+  (** Per-strategy opt-in to base-accumulation persistence (default true when absent from
+      config.json; disabled means zero I/O). *)
   ; sell_levels : bool
-    (** Per-strategy opt-in to pending-sell-level persistence (default true
-        when absent from config.json). *)
+  (** Per-strategy opt-in to pending-sell-level persistence (default true when absent from
+      config.json). *)
   }
 
 (** Integer userref tags for per-strategy order grouping on the exchange. *)
@@ -90,8 +91,8 @@ type strategy_order =
   ; duplicate_key : string (* composite key for deduplication *)
   }
 
-(** Build a composite deduplication key from order parameters.
-    Uses string concatenation to avoid intermediate buffer allocations. *)
+(** Build a composite deduplication key from order parameters. Uses string concatenation
+    to avoid intermediate buffer allocations. *)
 let generate_duplicate_key symbol side quantity limit_price =
   let q_str = string_of_float quantity in
   match limit_price with
@@ -101,10 +102,9 @@ let generate_duplicate_key symbol side quantity limit_price =
 
 (** Per-symbol strategy order-action counters.
 
-    Incremented on each successful push of a place/amend/cancel to a ring
-    buffer. The domain worker snapshots and resets once per latency window;
-    the dashboard STRAT/S column reports actual order actions per second, not
-    strategy-invocation cycles. *)
+    Incremented on each successful push of a place/amend/cancel to a ring buffer. The
+    domain worker snapshots and resets once per latency window; the dashboard STRAT/S
+    column reports actual order actions per second, not strategy-invocation cycles. *)
 module Order_actions = struct
   let counters : (string, int Atomic.t) Hashtbl.t = Hashtbl.create 16
   let mutex = Mutex.create ()
@@ -140,10 +140,9 @@ end
 
 (** In-flight order cache for deduplication of pending place/cancel requests.
 
-    Sharded across [num_shards] independent tables and mutexes keyed by hash
-    of the duplicate key (which embeds the symbol). Independent symbols and
-    domains do not serialize on one global lock; the common case locks only
-    the key's own shard. *)
+    Sharded across [num_shards] independent tables and mutexes keyed by hash of the
+    duplicate key (which embeds the symbol). Independent symbols and domains do not
+    serialize on one global lock; the common case locks only the key's own shard. *)
 module InFlightOrders = struct
   let num_shards = 64
 
@@ -154,8 +153,8 @@ module InFlightOrders = struct
   let shard_mutexes : Mutex.t array = Array.init num_shards (fun _ -> Mutex.create ())
   let shard_of key = Hashtbl.hash key land (num_shards - 1)
 
-  (** Atomically insert [duplicate_key] if absent. Returns true on insertion,
-      false if the key was already present. *)
+  (** Atomically insert [duplicate_key] if absent. Returns true on insertion, false if the
+      key was already present. *)
   let add_in_flight_order duplicate_key =
     let now = Unix.gettimeofday () in
     let shard = shard_of duplicate_key in
@@ -219,7 +218,7 @@ module InFlightOrders = struct
         let initial_size = Hashtbl.length registry in
         Hashtbl.filter_map_inplace
           (fun _ timestamp ->
-             if now -. timestamp <= max_age then Some timestamp else None)
+            if now -. timestamp <= max_age then Some timestamp else None)
           registry;
         removed := !removed + (initial_size - Hashtbl.length registry);
         Mutex.unlock mutex
@@ -229,30 +228,28 @@ module InFlightOrders = struct
   ;;
 
   (** Return a closure compatible with the event registry cleanup interface. *)
-  let get_cleanup_fn () =
-    fun () ->
+  let get_cleanup_fn () () =
     let drift, trimmed = cleanup () in
     Some (Some drift, Some trimmed)
   ;;
 end
 
-(** In-flight amendment lifecycle registry: deduplication of pending amend
-    requests plus the exchange's mid-amend order-replacement events.
+(** In-flight amendment lifecycle registry: deduplication of pending amend requests plus
+    the exchange's mid-amend order-replacement events.
 
-    Amendment semantics differ by exchange: Kraken modifies the order in place
-    (same id); Hyperliquid/Alpaca cancel the old order and create a new id. A
-    replacement emits a cancel event for the old id, either while the amend is
-    pending or shortly after completion. This registry maps all exchanges to
-    one lifecycle:
+    Amendment semantics differ by exchange: Kraken modifies the order in place (same id);
+    Hyperliquid/Alpaca cancel the old order and create a new id. A replacement emits a
+    cancel event for the old id, either while the amend is pending or shortly after
+    completion. This registry maps all exchanges to one lifecycle:
 
-    - [Pending]: amend request in flight; a cancel for the old id is the
-      amend's side effect, not a real cancellation.
-    - [Replaced new_id]: exchange confirmed a replace (old_id <> new_id); the
-      entry is retained through the cleanup window so a late cancel for the old
-      id cannot reset the replacement order's tracking.
+    - [Pending]: amend request in flight; a cancel for the old id is the amend's side
+      effect, not a real cancellation.
+    - [Replaced new_id]: exchange confirmed a replace (old_id <> new_id); the entry is
+      retained through the cleanup window so a late cancel for the old id cannot reset the
+      replacement order's tracking.
     - Same-id amends (Kraken) retain no entry: events for that id are real.
-    - [Failed]/[Skipped]: terminal; the entry is dropped so a follow-up cancel
-      is handled as real (the failure path reconciled tracking). *)
+    - [Failed]/[Skipped]: terminal; the entry is dropped so a follow-up cancel is handled
+      as real (the failure path reconciled tracking). *)
 module InFlightAmendments = struct
   type phase =
     | Pending
@@ -275,10 +272,9 @@ module InFlightAmendments = struct
   let shard_mutexes : Mutex.t array = Array.init num_shards (fun _ -> Mutex.create ())
   let shard_of key = Hashtbl.hash key land (num_shards - 1)
 
-  (** Atomically insert [order_id] as [Pending] if absent. Returns true on
-      insertion, false if the id is already tracked (any phase - a replaced
-      id stays tracked for the cleanup window, so re-amending it is a
-      duplicate). *)
+  (** Atomically insert [order_id] as [Pending] if absent. Returns true on insertion,
+      false if the id is already tracked (any phase - a replaced id stays tracked for the
+      cleanup window, so re-amending it is a duplicate). *)
   let add_in_flight_amendment order_id =
     let now = Unix.gettimeofday () in
     let shard = shard_of order_id in
@@ -309,25 +305,25 @@ module InFlightAmendments = struct
   (** Returns true if [order_id] has a pending (unanswered) amendment. *)
   let is_in_flight order_id = phase_of order_id = Some Pending
 
-  (** Returns true if [order_id] was just replaced by an amendment and its
-      old id is still in the recognition window. *)
+  (** Returns true if [order_id] was just replaced by an amendment and its old id is still
+      in the recognition window. *)
   let is_superseded order_id =
     match phase_of order_id with
     | Some (Replaced _) -> true
     | _ -> false
   ;;
 
-  (** True while the exchange may still deliver events for [order_id] as a
-      side effect of an amendment (request pending, or replacement just
-      completed): a cancel event in this state must not reset tracking. *)
+  (** True while the exchange may still deliver events for [order_id] as a side effect of
+      an amendment (request pending, or replacement just completed): a cancel event in
+      this state must not reset tracking. *)
   let is_amend_lifecycle_active order_id =
     match phase_of order_id with
     | Some (Pending | Replaced _) -> true
     | _ -> false
   ;;
 
-  (** Remove [order_id] from the registry (terminal phases, cleanup).
-      Returns true if it was present. *)
+  (** Remove [order_id] from the registry (terminal phases, cleanup). Returns true if it
+      was present. *)
   let remove_in_flight_amendment order_id =
     let shard = shard_of order_id in
     let registry = registries.(shard) in
@@ -339,10 +335,10 @@ module InFlightAmendments = struct
     exists
   ;;
 
-  (** The exchange confirmed the amendment. A replace (old_id <> new_id)
-      keeps the old id registered as [Replaced] for the cleanup window so a
-      late cancel event for it is recognized as the amend's side effect; a
-      same-id amend (Kraken) drops the entry - its events are always real. *)
+  (** The exchange confirmed the amendment. A replace (old_id <> new_id) keeps the old id
+      registered as [Replaced] for the cleanup window so a late cancel event for it is
+      recognized as the amend's side effect; a same-id amend (Kraken) drops the entry -
+      its events are always real. *)
   let note_amendment_succeeded ~old_id ~new_id =
     if old_id = new_id
     then ignore (remove_in_flight_amendment old_id)
@@ -360,9 +356,9 @@ module InFlightAmendments = struct
       Mutex.unlock mutex)
   ;;
 
-  (** The exchange rejected the amendment: terminal. The entry is dropped so
-      a follow-up cancel event for the old id is handled as a real one (the
-      amend-failure path has already reconciled tracking). *)
+  (** The exchange rejected the amendment: terminal. The entry is dropped so a follow-up
+      cancel event for the old id is handled as a real one (the amend-failure path has
+      already reconciled tracking). *)
   let note_amendment_failed ~old_id ~reason:_ = ignore (remove_in_flight_amendment old_id)
 
   (** The amendment was suppressed as a no-op: terminal, entry dropped. *)
@@ -382,13 +378,13 @@ module InFlightAmendments = struct
 
   let last_cleanup = Atomic.make 0.0
 
-  (** Evict only terminal entries older than [max_age] seconds; this bounds
-      the [Replaced] recognition window. [Pending] entries are owned by an
-      in-flight REST request and are always resolved by exactly one terminal
-      event (Amended/Amendment_skipped/Amendment_failed) or a recognized
-      cancel. Evicting a [Pending] entry would drop the amend-recognition
-      window while the exchange still owns the request, so a mid-flight cancel
-      would reset tracking as if real. Returns [(0, removed_count)]. *)
+  (** Evict only terminal entries older than [max_age] seconds; this bounds the [Replaced]
+      recognition window. [Pending] entries are owned by an in-flight REST request and are
+      always resolved by exactly one terminal event
+      (Amended/Amendment_skipped/Amendment_failed) or a recognized cancel. Evicting a
+      [Pending] entry would drop the amend-recognition window while the exchange still
+      owns the request, so a mid-flight cancel would reset tracking as if real. Returns
+      [(0, removed_count)]. *)
   let cleanup ?(max_age = 60.0) () =
     let now = Unix.gettimeofday () in
     let last = Atomic.get last_cleanup in
@@ -402,10 +398,10 @@ module InFlightAmendments = struct
         let initial_size = Hashtbl.length registry in
         Hashtbl.filter_map_inplace
           (fun _ (entry : entry) ->
-             match entry.phase with
-             | Pending -> Some entry
-             | Replaced _ | Failed _ | Skipped ->
-               if now -. entry.last <= max_age then Some entry else None)
+            match entry.phase with
+            | Pending -> Some entry
+            | Replaced _ | Failed _ | Skipped ->
+              if now -. entry.last <= max_age then Some entry else None)
           registry;
         removed := !removed + (initial_size - Hashtbl.length registry);
         Mutex.unlock mutex
@@ -415,15 +411,14 @@ module InFlightAmendments = struct
   ;;
 
   (** Return a closure compatible with the event registry cleanup interface. *)
-  let get_cleanup_fn () =
-    fun () ->
+  let get_cleanup_fn () () =
     let drift, trimmed = cleanup () in
     Some (Some drift, Some trimmed)
   ;;
 end
 
-(** Fixed-size, zero-allocation MPSC ring buffer. Cache-line padding
-    separates producer and consumer indices to prevent false sharing. *)
+(** Fixed-size, zero-allocation MPSC ring buffer. Cache-line padding separates producer
+    and consumer indices to prevent false sharing. *)
 module LockFreeQueue = struct
   type 'a t =
     { array : 'a option Atomic.t array
@@ -477,9 +472,9 @@ module LockFreeQueue = struct
     loop ()
   ;;
 
-  (** Single consumer dequeue. Non-blocking: returns None if the slot is
-      empty, even if the tail index has been advanced by a producer.
-      This prevents the consumer from spinning if a producer is preempted. *)
+  (** Single consumer dequeue. Non-blocking: returns None if the slot is empty, even if
+      the tail index has been advanced by a producer. This prevents the consumer from
+      spinning if a producer is preempted. *)
   let read q =
     let h = Atomic.get q.head in
     if h = Atomic.get q.tail
@@ -513,14 +508,13 @@ module LockFreeQueue = struct
   ;;
 end
 
-(** Domain-safe order signal channel. Domain workers call [broadcast ()] to
-    notify the supervisor's Lwt event loop that new orders are available.
-    Implemented via a Unix self-pipe: a single-byte write from any domain wakes
-    the Lwt scheduler without touching Lwt internals (Lwt_condition is not safe
-    from non-Lwt domains).
+(** Domain-safe order signal channel. Domain workers call [broadcast ()] to notify the
+    supervisor's Lwt event loop that new orders are available. Implemented via a Unix
+    self-pipe: a single-byte write from any domain wakes the Lwt scheduler without
+    touching Lwt internals (Lwt_condition is not safe from non-Lwt domains).
 
-    [pending] coalesces rapid broadcasts into one pipe write to avoid
-    saturating the pipe buffer under high order throughput. *)
+    [pending] coalesces rapid broadcasts into one pipe write to avoid saturating the pipe
+    buffer under high order throughput. *)
 module OrderSignal = struct
   let read_fd, write_fd =
     let r, w = Unix.pipe ~cloexec:true () in
@@ -529,15 +523,15 @@ module OrderSignal = struct
     r, w
   ;;
 
-  (** Lwt wrapper for the read end of the self-pipe. Created once at module
-      init to avoid per-wait allocation. *)
+  (** Lwt wrapper for the read end of the self-pipe. Created once at module init to avoid
+      per-wait allocation. *)
   let lwt_read_fd = Lwt_unix.of_unix_file_descr ~blocking:false ~set_flags:false read_fd
 
   (** Atomic flag to coalesce multiple broadcasts into one pipe write. *)
   let pending = Atomic.make false
 
-  (** Signal from any domain that new orders are available.
-      Safe to call from OCaml 5 domain workers, no Lwt internals are touched. *)
+  (** Signal from any domain that new orders are available. Safe to call from OCaml 5
+      domain workers, no Lwt internals are touched. *)
   let broadcast () =
     if not (Atomic.exchange pending true)
     then (
@@ -549,8 +543,8 @@ module OrderSignal = struct
       | _ -> ())
   ;;
 
-  (** Block in the Lwt event loop until the pipe becomes readable (a broadcast
-      arrived). Drains the pipe and clears the pending flag before returning. *)
+  (** Block in the Lwt event loop until the pipe becomes readable (a broadcast arrived).
+      Drains the pipe and clears the pending flag before returning. *)
   let wait () =
     Lwt_unix.wait_read lwt_read_fd
     >>= fun () ->

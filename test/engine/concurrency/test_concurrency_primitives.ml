@@ -1,13 +1,13 @@
 (* Regression coverage for concurrency primitives:
-   - Ring_buffer: absolute monotonic positions, deterministic lap clamping,
-     cursor validity across clear.
-   - Exchange_wakeup: generation counters make wait_since return immediately
-     when a signal races the work cycle (lost-wakeup fix).
+   - Ring_buffer: absolute monotonic positions, deterministic lap clamping, cursor
+     validity across clear.
+   - Exchange_wakeup: generation counters make wait_since return immediately when a signal
+     races the work cycle (lost-wakeup fix).
    - Parse_worker: submit/register round-trip. *)
 
-(* Tests spawn short-lived domains for concurrent producers/consumers, then
-   join them. Bounded and test-only; OxCaml [do_not_spawn_domains] and
-   [unsafe_multidomain] alerts acknowledged. *)
+(* Tests spawn short-lived domains for concurrent producers/consumers, then join them.
+   Bounded and test-only; OxCaml [do_not_spawn_domains] and [unsafe_multidomain] alerts
+   acknowledged. *)
 [@@@alert "-unsafe_multidomain"]
 [@@@alert "-do_not_spawn_domains"]
 
@@ -45,8 +45,8 @@ let test_ring_buffer_lap_clamps_deterministically () =
   Concurrency.Ring_buffer.RingBuffer.write b 1;
   Concurrency.Ring_buffer.RingBuffer.write b 2;
   Concurrency.Ring_buffer.RingBuffer.write b 3;
-  (* Reader stalled at 0 was lapped; entry 1 overwritten. Lap clamping resumes
-     at the oldest survivor instead of aliasing positions (old modulo bug). *)
+  (* Reader stalled at 0 was lapped; entry 1 overwritten. Lap clamping resumes at the
+     oldest survivor instead of aliasing positions (old modulo bug). *)
   let seen = Concurrency.Ring_buffer.RingBuffer.read_since b 0 in
   Alcotest.(check (list int)) "lapped reader gets survivors" [ 2; 3 ] seen;
   let pos = Concurrency.Ring_buffer.RingBuffer.iter_since b 0 (fun _ -> ()) in
@@ -70,9 +70,9 @@ let test_ring_buffer_clear_keeps_cursors_valid () =
   Alcotest.(check (list int)) "post-clear writes delivered once" [ 6 ] seen
 ;;
 
-(* Writer assigns value = absolute position, so cursor p must receive value p.
-   A lapped mis-delivery (pre-seqlock bug) surfaced a newer payload at an older
-   cursor, breaking monotonicity within a drain. *)
+(* Writer assigns value = absolute position, so cursor p must receive value p. A lapped
+   mis-delivery (pre-seqlock bug) surfaced a newer payload at an older cursor, breaking
+   monotonicity within a drain. *)
 let assert_monotonic_drain b =
   let seen = Concurrency.Ring_buffer.RingBuffer.read_since b 0 in
   let rec check prev = function
@@ -85,8 +85,8 @@ let assert_monotonic_drain b =
   match seen with
   | [] -> ()
   | last :: _ ->
-    (* read_latest is called after the drain, so its event position is >=
-        the last delivered one. *)
+    (* read_latest is called after the drain, so its event position is >= the last
+       delivered one. *)
     (match Concurrency.Ring_buffer.RingBuffer.read_latest b with
      | Some v when v < last -> Alcotest.failf "read_latest regressed: %d < %d" v last
      | _ -> ())
@@ -103,17 +103,15 @@ let test_ring_buffer_writer_lap_race_cross_domain () =
         Concurrency.Ring_buffer.RingBuffer.write b !i
       done)
   in
-  (* Reader drains while writer laps on another domain; every payload must be
-     the complete event for its cursor, never a newer payload at an older
-     cursor. *)
+  (* Reader drains while writer laps on another domain; every payload must be the complete
+     event for its cursor, never a newer payload at an older cursor. *)
   for _ = 1 to 3000 do
     assert_monotonic_drain b
   done;
   Atomic.set stop true;
   Domain.join writer;
-  (* Quiesced exact-replay check: writer stopped, surviving window is exactly
-     the last [size] events in order - no gaps, duplicates, or lapped
-     payloads. *)
+  (* Quiesced exact-replay check: writer stopped, surviving window is exactly the last
+     [size] events in order - no gaps, duplicates, or lapped payloads. *)
   let size = 8 in
   let n = Concurrency.Ring_buffer.RingBuffer.get_position b in
   let expected = List.init (min size n) (fun k -> n - min size n + 1 + k) in
@@ -121,11 +119,10 @@ let test_ring_buffer_writer_lap_race_cross_domain () =
   Alcotest.(check (list int)) "quiesced replay is exact" expected seen
 ;;
 
-(* Record payloads expose the clear-vs-reader hazard: pre-seqlock [clear]
-   stored [Obj.magic 0] into the payload before invalidating [seq], so a reader
-   validating [seq] just before clear dereferenced integer 0 as a pointer
-   (crash for record-typed buffers). The sentinel protocol prevents delivery; a
-   regression crashes this test. *)
+(* Record payloads expose the clear-vs-reader hazard: pre-seqlock [clear] stored
+   [Obj.magic 0] into the payload before invalidating [seq], so a reader validating [seq]
+   just before clear dereferenced integer 0 as a pointer (crash for record-typed buffers).
+   The sentinel protocol prevents delivery; a regression crashes this test. *)
 type clear_race_payload =
   { gen : int
   ; tag : int
@@ -166,8 +163,8 @@ let test_wakeup_generation_immediate_return () =
   let symbol = "TEST/WAKEUP" in
   let g0 = Concurrency.Exchange_wakeup.get_generation ~symbol in
   Concurrency.Exchange_wakeup.signal ~symbol;
-  (* Signal arriving after baseline capture must make wait_since return
-     immediately instead of parking (lost-wakeup fix); a regression hangs. *)
+  (* Signal arriving after baseline capture must make wait_since return immediately
+     instead of parking (lost-wakeup fix); a regression hangs. *)
   Concurrency.Exchange_wakeup.wait_since ~symbol ~since:g0;
   Alcotest.(check int)
     "generation advanced by one"
@@ -178,13 +175,13 @@ let test_wakeup_generation_immediate_return () =
 let test_wakeup_wait_releases_on_signal () =
   let symbol = "TEST/WAKEUP2" in
   let g0 = Concurrency.Exchange_wakeup.get_generation ~symbol in
-  (* Signal from another thread after a short delay; parked waiter must wake
-     promptly (a regression hangs this test). *)
+  (* Signal from another thread after a short delay; parked waiter must wake promptly (a
+     regression hangs this test). *)
   let _t =
     Thread.create
       (fun () ->
-         Thread.delay 0.05;
-         Concurrency.Exchange_wakeup.signal ~symbol)
+        Thread.delay 0.05;
+        Concurrency.Exchange_wakeup.signal ~symbol)
       ()
   in
   Concurrency.Exchange_wakeup.wait_since ~symbol ~since:g0;
@@ -222,8 +219,8 @@ let test_parse_worker_uniform_route () =
   Concurrency.Parse_worker.register_venue_decoder ~venue (fun payload ->
     last := payload;
     ignore (Atomic.fetch_and_add hits 1));
-  (* A venue with no registered decoder must report false so the caller decodes
-     inline rather than having the frame silently dropped by the worker. *)
+  (* A venue with no registered decoder must report false so the caller decodes inline
+     rather than having the frame silently dropped by the worker. *)
   Alcotest.(check bool)
     "unregistered venue falls back inline"
     false
@@ -250,8 +247,8 @@ let test_watchdog_staleness () =
     "fresh beat healthy"
     (is_stalled ~last_beat:1000.0 ~now:1025.0)
     false;
-  (* Exactly at the threshold is still healthy (strictly-greater rule):
-     several sequential bounded TLS ops must not false-trigger. *)
+  (* Exactly at the threshold is still healthy (strictly-greater rule): several sequential
+     bounded TLS ops must not false-trigger. *)
   Alcotest.(check bool)
     "threshold not exceeded"
     (is_stalled ~last_beat:1000.0 ~now:1060.0)

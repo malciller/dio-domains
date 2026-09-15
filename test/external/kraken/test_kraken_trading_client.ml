@@ -107,16 +107,16 @@ let test_precision_field_detection () =
   in
   List.iter
     (fun (field_name, should_be_price) ->
-       let is_price_field =
-         match field_name with
-         | "limit_price" | "trigger_price" -> true
-         | "order_qty" | "display_qty" -> false
-         | _ -> false
-       in
-       Alcotest.(check bool)
-         (Printf.sprintf "field '%s' detection" field_name)
-         should_be_price
-         is_price_field)
+      let is_price_field =
+        match field_name with
+        | "limit_price" | "trigger_price" -> true
+        | "order_qty" | "display_qty" -> false
+        | _ -> false
+      in
+      Alcotest.(check bool)
+        (Printf.sprintf "field '%s' detection" field_name)
+        should_be_price
+        is_price_field)
     test_cases
 ;;
 
@@ -132,8 +132,8 @@ let test_json_parsing_edge_cases () =
   in
   List.iter
     (fun (json, expected) ->
-       let result = Kraken.Kraken_trading_client.json_to_string_precise None json in
-       Alcotest.(check string) (Printf.sprintf "JSON type %s" expected) expected result)
+      let result = Kraken.Kraken_trading_client.json_to_string_precise None json in
+      Alcotest.(check string) (Printf.sprintf "JSON type %s" expected) expected result)
     test_cases
 ;;
 

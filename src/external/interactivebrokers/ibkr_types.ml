@@ -1,21 +1,19 @@
-(** Types and protocol constants for the IBKR TWS API: contracts,
-    orders, executions, and tick types, shared by the codec, connection,
-    feeds, and actions. *)
+(** Types and protocol constants for the IBKR TWS API: contracts, orders, executions, and
+    tick types, shared by the codec, connection, feeds, and actions. *)
 
 let section = "ibkr_types"
 
 (* Subsystem configuration defaults *)
 
-(** Legacy constant. No ticker stream in this adapter; retained because
-    the type tests pin its value. *)
+(** Legacy constant. No ticker stream in this adapter; retained because the type tests pin
+    its value. *)
 let default_ring_buffer_size_ticker = 100
 
-(** Order book ring buffer capacity: absorbs bursts without lapping
-    readers. *)
+(** Order book ring buffer capacity: absorbs bursts without lapping readers. *)
 let default_ring_buffer_size_orderbook = 64
 
-(** Execution report ring buffer capacity. Smaller sizes dropped
-    lifecycle events during bursts (mass cancels, volatile fills). *)
+(** Execution report ring buffer capacity. Smaller sizes dropped lifecycle events during
+    bursts (mass cancels, volatile fills). *)
 let default_ring_buffer_size_executions = 512
 
 (** Age in seconds at which untracked open orders are evicted. *)
@@ -41,8 +39,7 @@ let api_version_min = 100
 (** Maximum TWS API version the codec is written against. *)
 let api_version_max = 176
 
-(** Client id 0 is the master session, which receives all execution
-    reports. *)
+(** Client id 0 is the master session, which receives all execution reports. *)
 let default_client_id = 0
 
 (* Client egress protocol message identifiers *)
@@ -201,8 +198,7 @@ type tws_order_status =
   | ApiCancelled
   | Unknown_status of string
 
-(** Parses a TWS status string; unknown values log a warning and become
-    [Unknown_status]. *)
+(** Parses a TWS status string; unknown values log a warning and become [Unknown_status]. *)
 let parse_tws_order_status = function
   | "PreSubmitted" -> PreSubmitted
   | "Submitted" -> Submitted

@@ -1,8 +1,8 @@
 (** Typed, parse-once model of the engine dashboard snapshot.
 
-    Decoded once per received frame; derived values (mid prices, selectable
-    assets, pause state) are computed once rather than per module. Renderers
-    consume [t] instead of walking the raw Yojson tree with [|?>]. *)
+    Decoded once per received frame; derived values (mid prices, selectable assets, pause
+    state) are computed once rather than per module. Renderers consume [t] instead of
+    walking the raw Yojson tree with [|?>]. *)
 
 open Theme
 
@@ -317,7 +317,7 @@ let parse_memory j =
 ;;
 
 (* -------------------------------------------------------------------------- *)
-(* Pause state and selectable-asset derivation                                *)
+(* Pause state and selectable-asset derivation *)
 (* -------------------------------------------------------------------------- *)
 
 (** [true] iff the capital oracle's decision for this strategy is INACTIVE
@@ -328,9 +328,9 @@ let oracle_inactive (s : strategy) =
   | None -> false
 ;;
 
-(** Paused if the oracle is INACTIVE, [capital_low] is set, or the market is
-    closed. A resting buy overrides the capital/oracle gates (already placed
-    and funded), leaving only [market_is_closed] to pause it. *)
+(** Paused if the oracle is INACTIVE, [capital_low] is set, or the market is closed. A
+    resting buy overrides the capital/oracle gates (already placed and funded), leaving
+    only [market_is_closed] to pause it. *)
 let strategy_paused (s : strategy) =
   let has_resting_buy = s.buy_price > 0.0 || s.market.buy_orders <> [] in
   if has_resting_buy
@@ -348,15 +348,15 @@ let selectable_assets ~strategies ~balances =
   let strat_keys =
     List.map
       (fun (_sym, s) ->
-         let base = if s.market.base_asset = "" then s.symbol else s.market.base_asset in
-         (s.exchange, s.symbol), (s.exchange, base))
+        let base = if s.market.base_asset = "" then s.symbol else s.market.base_asset in
+        (s.exchange, s.symbol), (s.exchange, base))
       strategies
   in
   let is_strat_asset (b : balance) =
     List.exists
       (fun ((ex1, s1), (ex2, b2)) ->
-         (ex1 = b.exchange && (s1 = b.symbol || s1 = b.asset))
-         || (ex2 = b.exchange && b2 = b.asset))
+        (ex1 = b.exchange && (s1 = b.symbol || s1 = b.asset))
+        || (ex2 = b.exchange && b2 = b.asset))
       strat_keys
   in
   let valid_balances =
@@ -381,14 +381,14 @@ let selectable_assets ~strategies ~balances =
   let inactive_items =
     List.map
       (fun (b : balance) ->
-         { key = "bal:" ^ b.exchange ^ ":" ^ b.asset
-         ; display_name = Printf.sprintf "%s (%s)" b.asset (exch_tag_of b.exchange)
-         ; exchange = b.exchange
-         ; symbol = b.symbol
-         ; asset = b.asset
-         ; is_strategy = false
-         ; kind = Balance b
-         })
+        { key = "bal:" ^ b.exchange ^ ":" ^ b.asset
+        ; display_name = Printf.sprintf "%s (%s)" b.asset (exch_tag_of b.exchange)
+        ; exchange = b.exchange
+        ; symbol = b.symbol
+        ; asset = b.asset
+        ; is_strategy = false
+        ; kind = Balance b
+        })
       inactive_jsons
   in
   active_items @ paused_items @ inactive_items

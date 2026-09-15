@@ -2,21 +2,21 @@ open Alcotest
 
 (* Trading-config fixture. *)
 let create_test_asset
-      ?(exchange = "kraken")
-      ?(symbol = "BTC/USD")
-      ?(qty = "0.001")
-      ?(strategy = "MM")
-      ?(min_usd_balance = None)
-      ?(max_exposure = None)
-      ?(maker_fee = None)
-      ?(taker_fee = None)
-      ?(grid_interval = 1.0, 1.0)
-      ?(sell_mult = "1.0")
-      ?(testnet = false)
-      ?(hedge = false)
-      ?(accumulation_buffer = 0.01, 0.01)
-      ?(data_feed = None)
-      ()
+  ?(exchange = "kraken")
+  ?(symbol = "BTC/USD")
+  ?(qty = "0.001")
+  ?(strategy = "MM")
+  ?(min_usd_balance = None)
+  ?(max_exposure = None)
+  ?(maker_fee = None)
+  ?(taker_fee = None)
+  ?(grid_interval = 1.0, 1.0)
+  ?(sell_mult = "1.0")
+  ?(testnet = false)
+  ?(hedge = false)
+  ?(accumulation_buffer = 0.01, 0.01)
+  ?(data_feed = None)
+  ()
   : Dio_strategies.Strategy_common.trading_config
   =
   { exchange
@@ -248,14 +248,12 @@ let test_duplicate_cancellation () =
     [ "order1", 50000.0, 0.001, "buy", Some 2
     ; "order2", 50000.0, 0.001, "buy", Some 2
     ; (* Same price: duplicate, cancelled. *)
-      "order3", 51000.0, 0.001, "buy", Some 2
-      (* Different price: kept. *)
+      "order3", 51000.0, 0.001, "buy", Some 2 (* Different price: kept. *)
     ]
   in
   let state = Dio_strategies.Market_maker.get_strategy_state "TEST/USD" in
   (* order1 already cancelled. *)
   state.cancelled_orders <- [ "order1", Unix.time () ];
-
   let open_orders_list =
     List.map (fun (oid, price, qty, _, _) -> oid, price, qty) open_orders
   in
@@ -317,7 +315,6 @@ let test_fee_cache_integration () =
 let test_fee_cache_stats () =
   Dio_strategies.Fee_cache.init ();
   Dio_strategies.Fee_cache.clear ();
-
   (* Empty cache: zero totals. *)
   let total, valid = Dio_strategies.Fee_cache.stats () in
   check bool "empty stats returns integers" true (total = 0 && valid = 0);
@@ -373,9 +370,8 @@ let test_post_only_checks () =
   check bool "post-only checks handled" true true
 ;;
 
-(* ---- Inflight flag lifecycle tests ----
-   inflight_buy/inflight_sell are set on Place; ack/fill/cancel must clear
-   them or re-placement is blocked after the first cycle. *)
+(* ---- Inflight flag lifecycle tests ---- inflight_buy/inflight_sell are set on Place;
+   ack/fill/cancel must clear them or re-placement is blocked after the first cycle. *)
 
 (** Helper: get or create a fresh state for a unique test symbol. *)
 let fresh_state prefix =
@@ -565,9 +561,8 @@ let test_inflight_cancel_replace_preserves_flag () =
   check bool "inflight_buy preserved during cancel-replace" true state.inflight_buy
 ;;
 
-(* ---- InFlightAmendments cleanup tests ----
-   handle_order_amended and handle_order_amendment_skipped must release
-   InFlightAmendments entries. *)
+(* ---- InFlightAmendments cleanup tests ---- handle_order_amended and
+   handle_order_amendment_skipped must release InFlightAmendments entries. *)
 
 let test_amendment_clears_inflight_amendment () =
   let symbol, state = fresh_state "AMEND_IFA" in

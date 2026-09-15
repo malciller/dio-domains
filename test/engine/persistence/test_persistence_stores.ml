@@ -1,9 +1,9 @@
-(* Tests for the split persistence stores: base_accumulation_store and
-   sell_levels_store (pure decision logic, JSON round-trips, corrupt-file
-   handling, legacy migration). Hermetic via DIO_DATA_DIR. *)
+(* Tests for the split persistence stores: base_accumulation_store and sell_levels_store
+   (pure decision logic, JSON round-trips, corrupt-file handling, legacy migration).
+   Hermetic via DIO_DATA_DIR. *)
 
-(* Test-only [Unix.putenv] to point stores at a temp dir; single-threaded test
-   process. OxCaml [unsafe_multidomain] alert acknowledged. *)
+(* Test-only [Unix.putenv] to point stores at a temp dir; single-threaded test process.
+   OxCaml [unsafe_multidomain] alert acknowledged. *)
 [@@@alert "-unsafe_multidomain"]
 
 let temp_dir () =
@@ -24,14 +24,18 @@ let with_hermetic_dir f =
   Unix.putenv "DIO_DATA_DIR" dir;
   Fun.protect
     ~finally:(fun () ->
-      (* Best-effort cleanup: background writers may leave .tmp artifacts,
-         so sweep every file before removing the dir. *)
+      (* Best-effort cleanup: background writers may leave .tmp artifacts, so sweep every
+         file before removing the dir. *)
       (try
          Array.iter
-           (fun f -> try Sys.remove (Filename.concat dir f) with _ -> ())
+           (fun f ->
+             try Sys.remove (Filename.concat dir f) with
+             | _ -> ())
            (Sys.readdir dir)
-       with _ -> ());
-      (try Unix.rmdir dir with _ -> ()))
+       with
+       | _ -> ());
+      try Unix.rmdir dir with
+      | _ -> ())
     (fun () -> f dir)
 ;;
 
@@ -55,11 +59,10 @@ let test_apply_buy_fill () =
 
 let test_apply_sell_fill_profit_and_reserve () =
   let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"o1" in
-  (* Profitable sell: profit = (110 - 100) * 0.5 = 5.0.
-     oracle_qty = 0.1, sell_mult = 0.8 -> accrued_base = 0.1 * (1.0 - 0.8) = 0.02.
-     base_cost = 0.02 * 100.0 = 2.0.
-     With buffer 2.0, threshold = base_cost + buffer = 4.0.
-     Since profit 5.0 >= 4.0 -> reserve 0.02 base and debit profit by cost (5.0 - 2.0 = 3.0). *)
+  (* Profitable sell: profit = (110 - 100) * 0.5 = 5.0. oracle_qty = 0.1, sell_mult = 0.8
+     -> accrued_base = 0.1 * (1.0 - 0.8) = 0.02. base_cost = 0.02 * 100.0 = 2.0. With
+     buffer 2.0, threshold = base_cost + buffer = 4.0. Since profit 5.0 >= 4.0 -> reserve
+     0.02 base and debit profit by cost (5.0 - 2.0 = 3.0). *)
   let t =
     A.apply_sell_fill
       t
@@ -186,15 +189,16 @@ let test_sell_levels_round_trip_and_adopt () =
 ;;
 
 let test_salvage_recovers_hand_edited_double_document () =
-  (* The exact prod corruption: a manual XMR entry appended as a SECOND
-     top-level document joined by a comma instead of being added as another
-     key inside the single object. The store must salvage every intact
-     key/object pair into memory, rewrite the live file as valid JSON, and
-     quarantine the original - never silently zero the accruals. *)
+  (* The exact prod corruption: a manual XMR entry appended as a SECOND top-level document
+     joined by a comma instead of being added as another key inside the single object. The
+     store must salvage every intact key/object pair into memory, rewrite the live file as
+     valid JSON, and quarantine the original - never silently zero the accruals. *)
   with_hermetic_dir (fun dir ->
     let path = Filename.concat dir "accumulation_state.json" in
     let oc = open_out path in
-    output_string oc {|
+    output_string
+      oc
+      {|
 {
   "Ladder:XMR/USD:kraken": {
    "reserved_base": 0.0,
@@ -221,10 +225,7 @@ let test_salvage_recovers_hand_edited_double_document () =
       "salvaged XMR buy fill price"
       (Some 410.2)
       xmr.A.last_buy_fill_price;
-    Alcotest.(check (float 1e-12))
-      "salvaged XMR reserved_base"
-      0.0
-      xmr.A.reserved_base;
+    Alcotest.(check (float 1e-12)) "salvaged XMR reserved_base" 0.0 xmr.A.reserved_base;
     let btc = A.load ~key:"Ladder:BTC/USDC:hyperliquid" in
     Alcotest.(check (float 1e-12))
       "salvaged BTC accumulated_profit"
@@ -238,27 +239,27 @@ let test_salvage_recovers_hand_edited_double_document () =
         (Array.to_list (Sys.readdir dir))
     in
     Alcotest.(check bool) "original quarantined for audit" true backup_exists)
-
 ;;
 
 (* -- Corrupt-file handling & legacy migration --------------------------- *)
 
 let test_corrupt_file_backed_up () =
   with_hermetic_dir (fun dir ->
-     let path = Filename.concat dir "accumulation_state.json" in
-     let oc = open_out path in
-     output_string oc "{ this is not json";
-     close_out oc;
-     (* load triggers the lazy read; the corrupt file must be backed up, not
-        discarded, and the store must start fresh. *)
-     let t = A.load ~key:"Ladder:X:kraken" in
-     let entries = Array.to_list (Sys.readdir dir) in
-     let backup_exists =
-       List.exists (fun f -> String.starts_with ~prefix:"accumulation_state.json.corrupt." f)
-         entries
-     in
-     Alcotest.(check bool) "corrupt file backed up" true backup_exists;
-     Alcotest.(check (float 1e-12)) "store starts fresh" 0.0 t.A.reserved_base)
+    let path = Filename.concat dir "accumulation_state.json" in
+    let oc = open_out path in
+    output_string oc "{ this is not json";
+    close_out oc;
+    (* load triggers the lazy read; the corrupt file must be backed up, not discarded, and
+       the store must start fresh. *)
+    let t = A.load ~key:"Ladder:X:kraken" in
+    let entries = Array.to_list (Sys.readdir dir) in
+    let backup_exists =
+      List.exists
+        (fun f -> String.starts_with ~prefix:"accumulation_state.json.corrupt." f)
+        entries
+    in
+    Alcotest.(check bool) "corrupt file backed up" true backup_exists;
+    Alcotest.(check (float 1e-12)) "store starts fresh" 0.0 t.A.reserved_base)
 ;;
 
 let test_legacy_migration_split () =
@@ -282,8 +283,8 @@ let test_legacy_migration_split () =
     let oc = open_out legacy_path in
     output_string oc legacy;
     close_out oc;
-    (* Exactly one configured strategy matches the symbol -> auto-mapped to
-        the full strategy key. *)
+    (* Exactly one configured strategy matches the symbol -> auto-mapped to the full
+       strategy key. *)
     Dio_persistence.Persistence_orchestrator.register_configured_strategies
       [ "Ladder", "SPCX", "alpaca", true, true ];
     Dio_persistence.Persistence_orchestrator.migrate_if_legacy ();

@@ -108,14 +108,12 @@ let test_wait_for_balance_data () =
   Alcotest.(check bool) "succeeds with all data" true result3
 ;;
 
-
 let test_tradeable_balance_nets_open_order_holds () =
-  (* Kraken snapshots report TOTAL balances; the tradeable figure must net out
-     what is locked in resting orders (total - hold), as Hyperliquid's store
-     does. Otherwise sell sizing counts inventory committed to a resting sell
-     and the exchange rejects with EOrder:Insufficient funds. XMR startup case:
-     0.08004 total - 0.04 resting sell = 0.04004 tradeable; for a quote asset,
-     resting buys lock quote value. *)
+  (* Kraken snapshots report TOTAL balances; the tradeable figure must net out what is
+     locked in resting orders (total - hold), as Hyperliquid's store does. Otherwise sell
+     sizing counts inventory committed to a resting sell and the exchange rejects with
+     EOrder:Insufficient funds. XMR startup case: 0.08004 total - 0.04 resting sell =
+     0.04004 tradeable; for a quote asset, resting buys lock quote value. *)
   let base = "XMR_HOLD_TEST" in
   let quote = "USD_HOLD_TEST" in
   let pair = base ^ "/" ^ quote in
@@ -220,13 +218,13 @@ let test_concurrent_balance_updates () =
   let update_thread balance_value delay =
     Thread.create
       (fun () ->
-         Thread.delay delay;
-         Kraken.Kraken_balances_feed.BalanceStore.update_wallet
-           store
-           balance_value
-           "concurrent"
-           "thread_test"
-           asset)
+        Thread.delay delay;
+        Kraken.Kraken_balances_feed.BalanceStore.update_wallet
+          store
+          balance_value
+          "concurrent"
+          "thread_test"
+          asset)
       ()
   in
   let thread1 = update_thread 100.0 0.01 in

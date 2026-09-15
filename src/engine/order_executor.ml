@@ -1,22 +1,21 @@
 (** Order Execution Engine
 
-    Facade for executing trading orders through the generic [Exchange] interface.
-    Handles order placement, amendment, and cancellation with request validation,
-    duplicate detection via in-flight caches, retry logic for transient transport
-    errors, and per-symbol latency profiling. All requests are routed to the
-    concrete exchange implementation resolved from [Exchange.Registry].
-*)
+    Facade for executing trading orders through the generic [Exchange] interface. Handles
+    order placement, amendment, and cancellation with request validation, duplicate
+    detection via in-flight caches, retry logic for transient transport errors, and
+    per-symbol latency profiling. All requests are routed to the concrete exchange
+    implementation resolved from [Exchange.Registry]. *)
 
 open Lwt.Infix
 
 let section = "order_executor"
 
-(** Atomic flag set to [true] when graceful shutdown is requested.
-    Checked before order placement and amendment to reject new requests. *)
+(** Atomic flag set to [true] when graceful shutdown is requested. Checked before order
+    placement and amendment to reject new requests. *)
 let shutdown_requested = Atomic.make false
 
-(** Sets [shutdown_requested] to [true]. Subsequent place and amend calls
-    return [Error] immediately. Cancellations remain permitted. *)
+(** Sets [shutdown_requested] to [true]. Subsequent place and amend calls return [Error]
+    immediately. Cancellations remain permitted. *)
 let signal_shutdown () = Atomic.set shutdown_requested true
 
 (** Mutex-guarded hashtable of in-flight order keys for duplicate detection. *)
@@ -30,11 +29,11 @@ module StringMap = Map.Make (String)
 let profilers : Latency_profiler.t StringMap.t Atomic.t = Atomic.make StringMap.empty
 let profilers_mutex = Mutex.create ()
 
-(** Hard cap on the profiler cache. [snapshot_symbol_profilers] creates three
-    profilers ("place"/"amend"/"cancel") per symbol, so without a bound the
-    map grows for every symbol a domain is ever spawned for. On overflow the
-    least-sampled entry is evicted, keeping telemetry for the hottest symbols
-    (the pre-Atomic implementation applied the same cap). *)
+(** Hard cap on the profiler cache. [snapshot_symbol_profilers] creates three profilers
+    ("place"/"amend"/"cancel") per symbol, so without a bound the map grows for every
+    symbol a domain is ever spawned for. On overflow the least-sampled entry is evicted,
+    keeping telemetry for the hottest symbols (the pre-Atomic implementation applied the
+    same cap). *)
 let max_profilers = 64
 
 let profiler_samples (p : Latency_profiler.t) =
@@ -47,11 +46,11 @@ let evict_least_sampled map =
   match
     StringMap.fold
       (fun key p best ->
-         let count = profiler_samples p in
-         match best with
-         | None -> Some (key, count)
-         | Some (_, min_count) when count < min_count -> Some (key, count)
-         | some -> some)
+        let count = profiler_samples p in
+        match best with
+        | None -> Some (key, count)
+        | Some (_, min_count) when count < min_count -> Some (key, count)
+        | some -> some)
       map
       None
   with
@@ -88,32 +87,32 @@ let get_profiler symbol operation =
     p
 ;;
 
-(* Window-cadence snapshot+reset of this symbol's place/amend/cancel profilers.
-   Called by the domain worker's rolling-window publish; keeps the
-   snapshot/sort/log work out of the order hot path. *)
+(* Window-cadence snapshot+reset of this symbol's place/amend/cancel profilers. Called by
+   the domain worker's rolling-window publish; keeps the snapshot/sort/log work out of the
+   order hot path. *)
 let snapshot_symbol_profilers symbol =
   List.iter
     (fun op ->
-       let profiler = get_profiler symbol op in
-       let snap = Latency_profiler.snapshot_and_reset profiler in
-       if snap.Latency_profiler.samples > 0
-       then
-         Logging.debug_f
-           ~section
-           "Latency [%s]: samples=%d p50=%s p99=%s overflow=%d"
-           snap.Latency_profiler.name
-           snap.Latency_profiler.samples
-           (Latency_profiler.format_us snap.Latency_profiler.p50)
-           (Latency_profiler.format_us snap.Latency_profiler.p99)
-           snap.Latency_profiler.overflow)
+      let profiler = get_profiler symbol op in
+      let snap = Latency_profiler.snapshot_and_reset profiler in
+      if snap.Latency_profiler.samples > 0
+      then
+        Logging.debug_f
+          ~section
+          "Latency [%s]: samples=%d p50=%s p99=%s overflow=%d"
+          snap.Latency_profiler.name
+          snap.Latency_profiler.samples
+          (Latency_profiler.format_us snap.Latency_profiler.p50)
+          (Latency_profiler.format_us snap.Latency_profiler.p99)
+          snap.Latency_profiler.overflow)
     [ "place"; "amend"; "cancel" ]
 ;;
 
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
-(** String aliases for order type and side.
-    Parsed into [Types.order_type] and [Types.side] before exchange dispatch. *)
+(** String aliases for order type and side. Parsed into [Types.order_type] and
+    [Types.side] before exchange dispatch. *)
 type order_type = string
 
 type order_side = string
@@ -153,7 +152,7 @@ type amend_request =
   ; new_display_qty : float option
   ; deadline : string option (** Reserved; unused by generic interface. *)
   ; symbol : string option
-    (** Required by some exchanges for price rounding and routing. *)
+  (** Required by some exchanges for price rounding and routing. *)
   }
 
 (** Parameters for cancelling one or more orders via [cancel_orders]. *)
@@ -165,12 +164,12 @@ type cancel_request =
   ; symbol : string option
   }
 
-(** Alias for [Strategy_common.generate_duplicate_key]. Produces a hash key
-    from order parameters for [InFlightOrders] duplicate detection. *)
+(** Alias for [Strategy_common.generate_duplicate_key]. Produces a hash key from order
+    parameters for [InFlightOrders] duplicate detection. *)
 let generate_duplicate_key = Dio_strategies.Strategy_common.generate_duplicate_key
 
-(** Validates required fields and type-specific constraints on an [order_request].
-    Returns [Error msg] on the first violated constraint. *)
+(** Validates required fields and type-specific constraints on an [order_request]. Returns
+    [Error msg] on the first violated constraint. *)
 let validate_order_request (request : order_request) : (unit, string) result =
   if request.exchange = ""
   then Error "Exchange name cannot be empty"
@@ -219,17 +218,17 @@ let validate_cancel_request (request : cancel_request) : (unit, string) result =
     else Ok ())
 ;;
 
-(** Returns [true] if [exn_str] matches a transport-level connection failure.
-    Delegates to centralized [Error_handling.classify]. *)
+(** Returns [true] if [exn_str] matches a transport-level connection failure. Delegates to
+    centralized [Error_handling.classify]. *)
 let is_connection_error exn_str =
   match Error_handling.classify exn_str with
   | Error_handling.Connection -> true
   | _ -> false
 ;;
 
-(** Converts exceptions raised by [f] into [Error] results. Does not retry: the
-    executor passes [retry_config] to the exchange modules, which own retries
-    via [Error_handling.retry_with_backoff]; a second layer here would double the
+(** Converts exceptions raised by [f] into [Error] results. Does not retry: the executor
+    passes [retry_config] to the exchange modules, which own retries via
+    [Error_handling.retry_with_backoff]; a second layer here would double the
     sleep-on-error path. *)
 let with_error_handling ~operation_name ?(max_retries = 1) ?(retry_delay = 1.0) f =
   Error_handling.retry_with_backoff
@@ -244,10 +243,10 @@ let with_error_handling ~operation_name ?(max_retries = 1) ?(retry_delay = 1.0) 
       Lwt.catch
         (fun () -> f ())
         (fun exn ->
-           let exn_str = Printexc.to_string exn in
-           let err = Printf.sprintf "%s failed: %s" operation_name exn_str in
-           Logging.error_f ~section "%s" err;
-           Lwt.return (Error err)))
+          let exn_str = Printexc.to_string exn in
+          let err = Printf.sprintf "%s failed: %s" operation_name exn_str in
+          Logging.error_f ~section "%s" err;
+          Lwt.return (Error err)))
     ~is_retriable_override:is_connection_error
     ()
 ;;
@@ -284,15 +283,14 @@ let parse_time_in_force = function
   | _ -> Types.GTC
 ;;
 
-(* Return types use [Exchange.Types]. Strategies must depend on [Exchange.Types],
-   not exchange-specific types (nominal typing). *)
+(* Return types use [Exchange.Types]. Strategies must depend on [Exchange.Types], not
+   exchange-specific types (nominal typing). *)
 
 (** Places a new order on the target exchange.
 
-    Flow: shutdown check, in-flight cleanup, validation, duplicate detection
-    via [InFlightOrders], exchange dispatch, latency profiling.
-    Returns [Error] if shutdown is active, validation fails, or a duplicate
-    key is already in-flight. *)
+    Flow: shutdown check, in-flight cleanup, validation, duplicate detection via
+    [InFlightOrders], exchange dispatch, latency profiling. Returns [Error] if shutdown is
+    active, validation fails, or a duplicate key is already in-flight. *)
 let place_order ~token ?retry_config ?(check_duplicate = true) (request : order_request) =
   (* Block new placements during graceful shutdown. *)
   if Atomic.get shutdown_requested
@@ -343,32 +341,32 @@ let place_order ~token ?retry_config ?(check_duplicate = true) (request : order_
             Lwt.return (Error e)
           | Ok (module Ex) ->
             let ex_retry_config = retry_config in
-            (* Token semantics are exchange-dependent; each module interprets the
-               value per its authentication mechanism. *)
+            (* Token semantics are exchange-dependent; each module interprets the value
+               per its authentication mechanism. *)
             let profiler = get_profiler request.symbol "place" in
             let start_time = Mtime_clock.now_ns () in
             Lwt.catch
               (fun () ->
-                 Ex.place_order
-                   ~token
-                   ~order_type:(parse_order_type request.order_type)
-                   ~side:(parse_side request.side)
-                   ~qty:request.quantity
-                   ~symbol:request.symbol
-                   ?limit_price:request.limit_price
-                   ?time_in_force:(Option.map parse_time_in_force request.time_in_force)
-                   ?post_only:request.post_only
-                   ?reduce_only:request.reduce_only
-                   ?order_userref:request.order_userref
-                   ?cl_ord_id:request.cl_ord_id
-                   ?trigger_price:request.trigger_price
-                   ?display_qty:request.display_qty
-                   ?retry_config:ex_retry_config
-                   ())
+                Ex.place_order
+                  ~token
+                  ~order_type:(parse_order_type request.order_type)
+                  ~side:(parse_side request.side)
+                  ~qty:request.quantity
+                  ~symbol:request.symbol
+                  ?limit_price:request.limit_price
+                  ?time_in_force:(Option.map parse_time_in_force request.time_in_force)
+                  ?post_only:request.post_only
+                  ?reduce_only:request.reduce_only
+                  ?order_userref:request.order_userref
+                  ?cl_ord_id:request.cl_ord_id
+                  ?trigger_price:request.trigger_price
+                  ?display_qty:request.display_qty
+                  ?retry_config:ex_retry_config
+                  ())
               (fun exn ->
-                 (* Clear duplicate key from in-flight cache on exception. *)
-                 let _ = InFlightOrders.remove_in_flight_order request.duplicate_key in
-                 Lwt.fail exn)
+                (* Clear duplicate key from in-flight cache on exception. *)
+                let _ = InFlightOrders.remove_in_flight_order request.duplicate_key in
+                Lwt.fail exn)
             >>= fun result ->
             let stop_time = Mtime_clock.now_ns () in
             let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
@@ -378,10 +376,10 @@ let place_order ~token ?retry_config ?(check_duplicate = true) (request : order_
 
 (** Amends an existing order on the target exchange.
 
-    Performs no-op suppression: if the new price rounds to the same value
-    as the current price (per exchange tick size), the amendment is skipped
-    and a sentinel [amend_id = "skipped_no_change"] is returned.
-    Manages [InFlightAmendments] lifecycle and profiles latency. *)
+    Performs no-op suppression: if the new price rounds to the same value as the current
+    price (per exchange tick size), the amendment is skipped and a sentinel
+    [amend_id = "skipped_no_change"] is returned. Manages [InFlightAmendments] lifecycle
+    and profiles latency. *)
 let amend_order ~token ?retry_config (request : amend_request) =
   (* Block amendments during graceful shutdown. *)
   if Atomic.get shutdown_requested
@@ -398,8 +396,8 @@ let amend_order ~token ?retry_config (request : amend_request) =
            Logging.error_f ~section "%s" e;
            Lwt.return (Error e)
          | Ok (module Ex) ->
-           (* No-op suppression: skip if exchange-rounded prices match.
-               Log full-precision requested price for diagnostics. *)
+           (* No-op suppression: skip if exchange-rounded prices match. Log full-precision
+              requested price for diagnostics. *)
            (match request.new_limit_price with
             | Some p ->
               Logging.debug_f
@@ -421,11 +419,11 @@ let amend_order ~token ?retry_config (request : amend_request) =
                        Ex.round_price ~symbol ~price:current_price
                      in
                      let diff = abs_float (rounded_new_price -. rounded_current_price) in
-                      (* A qty-only amendment (e.g. grid re-sizing at unchanged
-                         price) must not be suppressed: the change would be
-                         dropped while the strategy re-pushes it every cycle.
-                         Compare against the order's original qty; a difference
-                         only in remaining/partial fill is still a change. *)
+                     (* A qty-only amendment (e.g. grid re-sizing at unchanged price) must
+                        not be suppressed: the change would be dropped while the strategy
+                        re-pushes it every cycle. Compare against the order's original
+                        qty; a difference only in remaining/partial fill is still a
+                        change. *)
                      let qty_matches =
                        match request.new_quantity with
                        | Some nq -> abs_float (nq -. current_order.qty) < 1e-9
@@ -435,11 +433,10 @@ let amend_order ~token ?retry_config (request : amend_request) =
                      diff < 0.000000001 && qty_matches
                    | None -> false)
                 | None ->
-                  (* Order absent from the local WS cache does not imply invalid:
-                          WS lag or cache churn during a prior amend can cause
-                          temporary absence. Proceed; the exchange rejects if the
-                          order no longer exists. Skipping here caused Kraken buy
-                          orders to fail trailing upward. *)
+                  (* Order absent from the local WS cache does not imply invalid: WS lag
+                     or cache churn during a prior amend can cause temporary absence.
+                     Proceed; the exchange rejects if the order no longer exists. Skipping
+                     here caused Kraken buy orders to fail trailing upward. *)
                   Logging.debug_f
                     ~section
                     "Order %s not found in open orders cache, proceeding with amendment \
@@ -452,11 +449,10 @@ let amend_order ~token ?retry_config (request : amend_request) =
            then (
              (* Amendment suppressed as a no-op: terminal lifecycle state. *)
              InFlightAmendments.note_amendment_skipped ~old_id:request.order_id;
-             (* No-op suppression is an expected logical outcome, not an
-                 execution event: log it at DEBUG so the INFO stream stays
-                 free of per-tick amendment chatter, while still letting
-                 `logging_level = debug` reveal it when a hung order is
-                 suspected. *)
+             (* No-op suppression is an expected logical outcome, not an execution event:
+                log it at DEBUG so the INFO stream stays free of per-tick amendment
+                chatter, while still letting `logging_level = debug` reveal it when a hung
+                order is suspected. *)
              let reason =
                match request.new_quantity with
                | Some nq ->
@@ -474,9 +470,9 @@ let amend_order ~token ?retry_config (request : amend_request) =
                "Amendment suppressed for order %s (no-op: %s unchanged)"
                request.order_id
                reason;
-             (* Return sentinel [amend_id = "skipped_no_change"] so the
-                 supervisor routes to [handle_order_amendment_skipped] rather
-                 than [handle_order_amended], preserving tracking state. *)
+             (* Return sentinel [amend_id = "skipped_no_change"] so the supervisor routes
+                to [handle_order_amendment_skipped] rather than [handle_order_amended],
+                preserving tracking state. *)
              Lwt.return
                (Ok
                   { Types.original_order_id = request.order_id
@@ -502,34 +498,33 @@ let amend_order ~token ?retry_config (request : amend_request) =
              let start_time = Mtime_clock.now_ns () in
              Lwt.catch
                (fun () ->
-                  Ex.amend_order
-                    ~token
-                    ~order_id:request.order_id
-                    ?cl_ord_id:request.cl_ord_id
-                    ?qty:request.new_quantity
-                    ?limit_price:request.new_limit_price
-                    ?post_only:request.post_only
-                    ?trigger_price:request.new_trigger_price
-                    ?display_qty:request.new_display_qty
-                    ?symbol:request.symbol
-                    ?retry_config:ex_retry_config
-                    ())
+                 Ex.amend_order
+                   ~token
+                   ~order_id:request.order_id
+                   ?cl_ord_id:request.cl_ord_id
+                   ?qty:request.new_quantity
+                   ?limit_price:request.new_limit_price
+                   ?post_only:request.post_only
+                   ?trigger_price:request.new_trigger_price
+                   ?display_qty:request.new_display_qty
+                   ?symbol:request.symbol
+                   ?retry_config:ex_retry_config
+                   ())
                (fun exn ->
-                  (* Amend lifecycle failed: terminal (entry dropped). *)
-                  InFlightAmendments.note_amendment_failed
-                    ~old_id:request.order_id
-                    ~reason:(Printexc.to_string exn);
-                  Lwt.fail exn)
+                 (* Amend lifecycle failed: terminal (entry dropped). *)
+                 InFlightAmendments.note_amendment_failed
+                   ~old_id:request.order_id
+                   ~reason:(Printexc.to_string exn);
+                 Lwt.fail exn)
              >>= fun result ->
              let stop_time = Mtime_clock.now_ns () in
              let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
              Latency_profiler.record profiler span;
-             (* Resolve the amend lifecycle with the exchange's verdict: a
-                same-id amend (Kraken) drops the entry; a replace
-                (Hyperliquid/Alpaca cancel+create) keeps the OLD id registered
-                as [Replaced] for the cleanup window, so a late cancel event
-                for the old id - the replace's side effect - is recognized by
-                the strategies and cannot reset the replacement order's
+             (* Resolve the amend lifecycle with the exchange's verdict: a same-id amend
+                (Kraken) drops the entry; a replace (Hyperliquid/Alpaca cancel+create)
+                keeps the OLD id registered as [Replaced] for the cleanup window, so a
+                late cancel event for the old id - the replace's side effect - is
+                recognized by the strategies and cannot reset the replacement order's
                 tracking. *)
              (match result with
               | Ok r ->
@@ -545,9 +540,9 @@ let amend_order ~token ?retry_config (request : amend_request) =
 
 (** Cancels one or more orders on the target exchange.
 
-    At least one identifier list ([order_ids], [cl_ord_ids], or
-    [order_userrefs]) must be non-empty. Triggers [InFlightOrders]
-    cleanup and profiles latency. Not blocked by shutdown. *)
+    At least one identifier list ([order_ids], [cl_ord_ids], or [order_userrefs]) must be
+    non-empty. Triggers [InFlightOrders] cleanup and profiles latency. Not blocked by
+    shutdown. *)
 let cancel_orders ~token ?retry_config (request : cancel_request) =
   with_error_handling ~operation_name:"cancel_orders" (fun () ->
     match validate_cancel_request request with
@@ -588,9 +583,9 @@ let cancel_orders ~token ?retry_config (request : cancel_request) =
          Lwt.return result))
 ;;
 
-(** Closes all underlying trading client connections (Kraken and Hyperliquid).
-    Invoked during graceful shutdown to tear down WebSocket transports,
-    fail pending request waiters, and release subscriber streams. *)
+(** Closes all underlying trading client connections (Kraken and Hyperliquid). Invoked
+    during graceful shutdown to tear down WebSocket transports, fail pending request
+    waiters, and release subscriber streams. *)
 let close () : unit Lwt.t =
   Logging.info ~section "Closing order executor";
   Lwt.join [ Kraken.Kraken_trading_client.close (); Hyperliquid.Ws.close () ]
@@ -598,8 +593,8 @@ let close () : unit Lwt.t =
 
 let periodic_cleanup_started = Atomic.make false
 
-(** Background periodic cleanup for in-flight orders and amendments registries.
-    Offloads 64-shard iteration from the critical order submission path. *)
+(** Background periodic cleanup for in-flight orders and amendments registries. Offloads
+    64-shard iteration from the critical order submission path. *)
 let start_periodic_inflight_cleanup () =
   if Atomic.compare_and_set periodic_cleanup_started false true
   then
@@ -610,27 +605,27 @@ let start_periodic_inflight_cleanup () =
         if Atomic.get shutdown_requested
         then Lwt.return_unit
         else
-          (* Guard the sweep: an exception escaping [Lwt.async] would kill
-             this fiber silently and permanently, and the in-flight registry
-             leak this fiber exists to prevent would come back. *)
+          (* Guard the sweep: an exception escaping [Lwt.async] would kill this fiber
+             silently and permanently, and the in-flight registry leak this fiber exists
+             to prevent would come back. *)
           Lwt.catch
             (fun () ->
-               let _drift1, trimmed1 = InFlightOrders.cleanup () in
-               let _drift2, trimmed2 = InFlightAmendments.cleanup () in
-               if trimmed1 > 0 || trimmed2 > 0
-               then
-                 Logging.debug_f
-                   ~section
-                   "Periodic in-flight cleanup: removed %d orders, %d amendments"
-                   trimmed1
-                   trimmed2;
-               loop ())
+              let _drift1, trimmed1 = InFlightOrders.cleanup () in
+              let _drift2, trimmed2 = InFlightAmendments.cleanup () in
+              if trimmed1 > 0 || trimmed2 > 0
+              then
+                Logging.debug_f
+                  ~section
+                  "Periodic in-flight cleanup: removed %d orders, %d amendments"
+                  trimmed1
+                  trimmed2;
+              loop ())
             (fun exn ->
-               Logging.error_f
-                 ~section
-                 "Periodic in-flight cleanup sweep failed: %s (continuing)"
-                 (Printexc.to_string exn);
-               loop ())
+              Logging.error_f
+                ~section
+                "Periodic in-flight cleanup sweep failed: %s (continuing)"
+                (Printexc.to_string exn);
+              loop ())
       in
       loop ())
 ;;

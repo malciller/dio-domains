@@ -1,7 +1,6 @@
-(** Level 2 order book feed: routes reqMktDepth updates into per-symbol
-    sorted bid/ask arrays and publishes snapshots to lock-free ring
-    buffers. Falls back to L1 tickPrice/tickSize for symbols without
-    depth data. *)
+(** Level 2 order book feed: routes reqMktDepth updates into per-symbol sorted bid/ask
+    arrays and publishes snapshots to lock-free ring buffers. Falls back to L1
+    tickPrice/tickSize for symbols without depth data. *)
 
 let section = "ibkr_orderbook"
 
@@ -67,8 +66,8 @@ let notify_ready store =
     | _ -> ())
 ;;
 
-(** Copies the current levels into a snapshot, writes it to the ring
-    buffer, and signals readiness and exchange sleepers. *)
+(** Copies the current levels into a snapshot, writes it to the ring buffer, and signals
+    readiness and exchange sleepers. *)
 let flush_orderbook symbol store =
   let ob =
     { bids = Array.copy store.bids
@@ -81,9 +80,8 @@ let flush_orderbook symbol store =
   Concurrency.Exchange_wakeup.signal ~symbol
 ;;
 
-(** updateMktDepth handler. Fields: version, reqId, position, operation,
-    side, price, size. Applies insert/update/delete to the level array
-    and flushes a snapshot. *)
+(** updateMktDepth handler. Fields: version, reqId, position, operation, side, price,
+    size. Applies insert/update/delete to the level array and flushes a snapshot. *)
 let handle_market_depth fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let req_id, fields = Ibkr_codec.read_int fields in
@@ -106,8 +104,7 @@ let handle_market_depth fields =
       flush_orderbook symbol store)
 ;;
 
-(** tickPrice handler (L1 fallback). Updates the top-of-book quote and
-    flushes. *)
+(** tickPrice handler (L1 fallback). Updates the top-of-book quote and flushes. *)
 let handle_tick_price fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let req_id, fields = Ibkr_codec.read_int fields in
@@ -136,17 +133,16 @@ let handle_tick_price fields =
       let curr_size = if size > 0.0 then size else store.asks.(0).size in
       store.asks.(0) <- { price; size = curr_size };
       updated := true)
-    else if
-      tick_type = Ibkr_types.tick_last
-      || tick_type = Ibkr_types.tick_delayed_last
-      || tick_type = Ibkr_types.tick_close
-      || tick_type = 75 (* delayed close *)
-      || tick_type = 14
-      (* open *) || tick_type = 76 (* delayed open *)
-      || tick_type = 37 (* mark price *)
+    else if tick_type = Ibkr_types.tick_last
+            || tick_type = Ibkr_types.tick_delayed_last
+            || tick_type = Ibkr_types.tick_close
+            || tick_type = 75 (* delayed close *)
+            || tick_type = 14
+            (* open *) || tick_type = 76 (* delayed open *)
+            || tick_type = 37 (* mark price *)
     then (
-      (* Pre-market / delayed-frozen: seed last/close into both sides
-         as a zero-spread approximation when quotes are missing. *)
+      (* Pre-market / delayed-frozen: seed last/close into both sides as a zero-spread
+         approximation when quotes are missing. *)
       if store.bids.(0).price = 0.0 && price > 0.0
       then (
         store.bids.(0) <- { price; size = store.bids.(0).size };
@@ -165,8 +161,7 @@ let handle_tick_price fields =
     if !updated then flush_orderbook symbol store
 ;;
 
-(** tickSize handler (L1 fallback). Updates the top-of-book size and
-    flushes. *)
+(** tickSize handler (L1 fallback). Updates the top-of-book size and flushes. *)
 let handle_tick_size fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let req_id, fields = Ibkr_codec.read_int fields in
@@ -183,13 +178,13 @@ let handle_tick_size fields =
   | Some symbol ->
     let store = ensure_store symbol in
     let updated = ref false in
-    if
-      tick_type = Ibkr_types.tick_bid_size || tick_type = Ibkr_types.tick_delayed_bid_size
+    if tick_type = Ibkr_types.tick_bid_size
+       || tick_type = Ibkr_types.tick_delayed_bid_size
     then (
       store.bids.(0) <- { price = store.bids.(0).price; size };
       updated := true)
-    else if
-      tick_type = Ibkr_types.tick_ask_size || tick_type = Ibkr_types.tick_delayed_ask_size
+    else if tick_type = Ibkr_types.tick_ask_size
+            || tick_type = Ibkr_types.tick_delayed_ask_size
     then (
       store.asks.(0) <- { price = store.asks.(0).price; size };
       updated := true);
@@ -224,9 +219,8 @@ let request_snapshot conn ~contract =
   Ibkr_connection.send conn msg_fields
 ;;
 
-(** Subscribes to market data for [contract]. STK/ETF via SMART has no
-    L2 depth, so those get an L1 reqMktData ticker instead; other
-    security types get reqMktDepth. *)
+(** Subscribes to market data for [contract]. STK/ETF via SMART has no L2 depth, so those
+    get an L1 reqMktData ticker instead; other security types get reqMktDepth. *)
 let subscribe conn ~contract =
   let symbol = contract.Ibkr_types.symbol in
   let _store = ensure_store symbol in
@@ -326,9 +320,8 @@ let[@inline always] get_current_position_fast symbol =
   fun () -> RingBuffer.get_position store.buffer
 ;;
 
-(** [true] once a market-depth or L1 tick has populated the book for
-    [symbol]. Ignores freshness, so an illiquid book that has not ticked
-    recently still reports present. *)
+(** [true] once a market-depth or L1 tick has populated the book for [symbol]. Ignores
+    freshness, so an illiquid book that has not ticked recently still reports present. *)
 let has_orderbook_data symbol =
   match store_opt symbol with
   | Some store -> Atomic.get store.ready
@@ -343,8 +336,8 @@ let initialize symbols =
     (List.length symbols);
   List.iter
     (fun symbol ->
-       let _ = ensure_store symbol in
-       ())
+      let _ = ensure_store symbol in
+      ())
     symbols;
   register_handlers ();
   Logging.info ~section "Orderbook feed initialized"

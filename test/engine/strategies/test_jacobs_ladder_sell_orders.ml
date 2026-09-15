@@ -1,10 +1,7 @@
 module SO = Dio_strategies.Jacobs_ladder_sell_orders
 
 let id_check = Alcotest.(list (triple string (float 1e-9) (float 1e-9)))
-
-let sample =
-  [ "a", 100.0, 1.0; "b", 99.0, 2.5; "c", 98.0, 0.25 ]
-;;
+let sample = [ "a", 100.0, 1.0; "b", 99.0, 2.5; "c", 98.0, 0.25 ]
 
 let test_empty () =
   let t = SO.create 4 in
@@ -32,11 +29,21 @@ let test_growth () =
   Alcotest.(check int) "length after growth" n (SO.length t);
   let l = SO.to_list t in
   Alcotest.(check int) "to_list length" n (List.length l);
-  Alcotest.(check string) "first id" "o1" (let a, _, _ = List.nth l 0 in a);
-  Alcotest.(check string) "last id" (Printf.sprintf "o%d" n)
-    (let a, _, _ = List.nth l (n - 1) in a);
-  Alcotest.(check (float 1e-9)) "last price" (float_of_int n)
-    (let _, p, _ = List.nth l (n - 1) in p)
+  Alcotest.(check string)
+    "first id"
+    "o1"
+    (let a, _, _ = List.nth l 0 in
+     a);
+  Alcotest.(check string)
+    "last id"
+    (Printf.sprintf "o%d" n)
+    (let a, _, _ = List.nth l (n - 1) in
+     a);
+  Alcotest.(check (float 1e-9))
+    "last price"
+    (float_of_int n)
+    (let _, p, _ = List.nth l (n - 1) in
+     p)
 ;;
 
 let test_clear () =
@@ -53,7 +60,9 @@ let test_iter_fold () =
   let t = SO.of_list sample in
   let seen = ref [] in
   SO.iter t (fun id _ _ -> seen := id :: !seen);
-  Alcotest.(check (list string)) "iter visits all in order" [ "a"; "b"; "c" ]
+  Alcotest.(check (list string))
+    "iter visits all in order"
+    [ "a"; "b"; "c" ]
     (List.rev !seen);
   let total = SO.fold t 0.0 (fun acc _ _ q -> acc +. q) in
   Alcotest.(check (float 1e-9)) "fold sums qty" 3.75 total
@@ -88,7 +97,9 @@ let test_find_first () =
      Alcotest.(check (float 1e-9)) "found price" 99.0 p;
      Alcotest.(check (float 1e-9)) "found qty" 2.5 q
    | None -> Alcotest.fail "expected Some");
-  Alcotest.(check bool) "no match -> None" true
+  Alcotest.(check bool)
+    "no match -> None"
+    true
     (SO.find_first t (fun id _ _ -> id = "nope") = None)
 ;;
 
@@ -134,8 +145,8 @@ let test_roundtrip () =
 ;;
 
 let test_blit () =
-  (* Copy into an undersized, previously-used destination: it must grow and
-     replace (not append to) the destination contents. *)
+  (* Copy into an undersized, previously-used destination: it must grow and replace (not
+     append to) the destination contents. *)
   let src = SO.of_list sample in
   let dst = SO.of_list [ "old", 1.0, 9.0 ] in
   SO.blit ~src ~dst;
@@ -153,7 +164,8 @@ let test_remove_prefix () =
       [ "pending_sell_1", 1.0, 1.0; "real", 2.0, 2.0; "pending_sell_2", 3.0, 3.0 ]
   in
   SO.remove_prefix t "pending_sell_";
-  Alcotest.(check id_check) "prefix entries removed, order kept"
+  Alcotest.(check id_check)
+    "prefix entries removed, order kept"
     [ "real", 2.0, 2.0 ]
     (SO.to_list t)
 ;;
