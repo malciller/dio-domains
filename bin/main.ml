@@ -518,6 +518,11 @@ let () =
   Arg.parse speclist (fun _ -> ()) usage_msg;
   (* Initialize the logging subsystem. *)
   Logging.init ();
+  (* Load .env before anything reads the environment (e.g. DIO_CANARY for the canary,
+     credentials for feeds). Previously the first load happened lazily inside the feed
+     initializers, which run after [Canary.start], so an env kill switch in .env was
+     ignored. Never overwrites an already-set variable. *)
+  Logging.load_dotenv ~path:".env" ();
   (* Load engine configuration from config.json. *)
   let config = Dio_engine.Config.read_config () in
   (* Apply log level and section filters from configuration. *)
