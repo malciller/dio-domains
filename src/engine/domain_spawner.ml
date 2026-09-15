@@ -113,6 +113,25 @@ let log_latency_window ~key ~window_seconds ~threshold_us ~ob ~exec ~prep ~strat
   | Some msg -> Logging.info_f ~section "%s" msg
 ;;
 
+(** Path of the strategy file bound to an entry by name convention
+    ([strategies/<strategy>.json]). *)
+let strategy_file_path (asset : trading_config) =
+  Printf.sprintf "strategies/%s.json" asset.strategy
+;;
+
+(** The compiled strategy file bound to an entry, if any. Data-driven dispatch: an asset's
+    behaviour is selected by its bound file, never by the strategy name. *)
+let load_bound_strategy (asset : trading_config) : Dio_strategies.Strategy_file.t option =
+  match Dio_strategies.Strategy_file.parse_file (strategy_file_path asset) with
+  | Ok f -> Some f
+  | Error _ -> None
+;;
+
+(** Whether an entry is backed by a strategy file (i.e. runs the config-driven engine). *)
+let is_strategy_file_asset (asset : trading_config) =
+  Option.is_some (load_bound_strategy asset)
+;;
+
 (** Core worker function executed by each OCaml domain for a trading asset. Runs the
     event-driven loop: consumes ring buffer events, executes strategy, and blocks on
     Exchange_wakeup between cycles. *)
@@ -148,6 +167,11 @@ let asset_domain_worker
       suffix
   in
   let trace_cycles = ref 0 in
+  (* Strategy-file binding (data-driven dispatch): an entry whose [strategy] names a
+     parsable [strategies/<name>.json] is a strategy-file asset. The engine selects the
+     interpreter/handler by the bound file, never by the strategy name. *)
+  let bound_strategy_file = load_bound_strategy asset_with_fees in
+  let is_file_bound_strategy = Option.is_some bound_strategy_file in
   (* Resolves accumulation_buffer from Fear & Greed on every venue (Kraken runs the same
      reserved_base accrual; see jacobs_ladder_config.kraken_config). Only a live F&G
      reading resolves it; without one the grid places no orders. *)
@@ -160,9 +184,7 @@ let asset_domain_worker
       | Hyperliquid | Ibkr | Lighter | Alpaca | Kraken -> true
       | Custom _ -> false
     in
-    if is_accumulation_exch
-       && (asset_with_fees.strategy = "jacobs_ladder"
-           || asset_with_fees.strategy = "Ladder")
+    if is_accumulation_exch && is_file_bound_strategy
     then (
       match Fear_and_greed.get_cached () with
       | None -> None
@@ -282,11 +304,9 @@ let asset_domain_worker
        INACTIVE. No F&G or config fallback sizing exists: an ACTIVE startup decision sizes
        it here; an INACTIVE one is materialized by the decision handler below so the sell
        leg can run under halt. *)
-    (* TODO(milestone-3): temporary bridge. Strategy names are user-defined and opaque;
-       this hardcoded name dispatch is replaced by compiled-instance dispatch once the
-       interpreter is wired. See docs/strategy-engine-design.md §9.5. Do not extend. *)
+    (* Data-driven dispatch: a strategy-file asset (bound file above). No name matching. *)
     let grid_strategy_asset_ref =
-      if asset_with_fees.strategy = "jacobs_ladder" || asset_with_fees.strategy = "Ladder"
+      if is_file_bound_strategy
       then (
         match oracle_decision_at_startup with
         | Some d when d.active ->
@@ -306,9 +326,7 @@ let asset_domain_worker
        While gated the domain clears its execute flag and blocks on
        [Exchange_wakeup.wait_since]. [oracle_gate_deadline] bounds when the warning may
        fire; it is checked on wakeups, never polled. *)
-    let is_grid_strategy =
-      asset_with_fees.strategy = "jacobs_ladder" || asset_with_fees.strategy = "Ladder"
-    in
+    let is_grid_strategy = is_file_bound_strategy in
     let oracle_tracks_asset =
       Oracle_runtime.tracks_asset
         ~exchange:asset_with_fees.exchange
@@ -579,11 +597,9 @@ let asset_domain_worker
            on the engine startup path). *)
         Dio_strategies.Strategy_actions_builtin.register_all ();
         let path = Printf.sprintf "strategies/%s.json" asset_with_fees.strategy in
-        match Dio_strategies.Strategy_file.parse_file path with
-        | Error msg ->
-          Logging.critical_f ~section "config_strategy: cannot load %s: %s" path msg;
-          None
-        | Ok file ->
+        match bound_strategy_file with
+        | None -> None
+        | Some file ->
           let diags = Dio_strategies.Strategy_compile.validate file in
           if Dio_strategies.Strategy_compile.has_errors diags
           then (
@@ -1917,13 +1933,15 @@ let stop_domain state =
   Atomic.set state.is_running false;
   (* Release strategy state for this symbol *)
   let symbol = state.asset.symbol in
-  (* TODO(milestone-3): temporary bridge — dispatch on the compiled instance, not the
-     user's strategy name. See docs/strategy-engine-design.md §9.5. *)
-  (match state.asset.strategy with
-   | "Ladder" | "jacobs_ladder" ->
-     Dio_strategies.Jacobs_ladder.Strategy.cleanup_strategy_state symbol
-   | "MM" -> Dio_strategies.Market_maker.Strategy.cleanup_strategy_state symbol
-   | _ -> ());
+  (* Data-driven dispatch: clean up grid state for a strategy-file asset; MM is still
+     name-detected until it is ported. *)
+  if is_strategy_file_asset state.asset
+  then Dio_strategies.Jacobs_ladder.Strategy.cleanup_strategy_state symbol
+  else (
+    match state.asset.strategy with
+    | "MM" | "market_maker" ->
+      Dio_strategies.Market_maker.Strategy.cleanup_strategy_state symbol
+    | _ -> ());
   (* Unblock workers in Exchange_wakeup.wait_since so they observe is_running=false and
      exit the main loop. *)
   Concurrency.Exchange_wakeup.signal_all ();
@@ -2129,8 +2147,7 @@ let stop_all_domains () =
      is queued. Domains are stopped, so this cannot race a cycle. *)
   List.iter
     (fun state ->
-      let strategy = state.asset.strategy in
-      if strategy = "jacobs_ladder" || strategy = "Ladder"
+      if is_strategy_file_asset state.asset
       then Dio_strategies.Jacobs_ladder.Strategy.flush_persistence state.asset.symbol)
     all_states
 ;;
