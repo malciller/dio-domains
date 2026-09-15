@@ -25,6 +25,7 @@ type class_ =
   | Read
 
 type value =
+  | V_none
   | V_float of float
   | V_int of int
   | V_bool of bool

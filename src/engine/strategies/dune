@@ -32,4 +32,6 @@
   Strategy_expr
   Strategy_file
   Strategy_compile
+  Strategy_guard
+  Strategy_runtime
   Strategy_cli))
