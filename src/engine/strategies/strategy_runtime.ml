@@ -151,38 +151,63 @@ let expand_params (file : Strategy_file.t) (overrides : (string * value) list) =
   tbl
 ;;
 
-let create ?(handlers = noop_handler) ?(params = []) (file : Strategy_file.t) =
-  let state = Hashtbl.create 16 in
-  List.iter
-    (fun (s : Strategy_file.state_decl) ->
-      Hashtbl.replace state s.s_name (default_of_kind s.s_kind))
-    file.state;
-  { file
-  ; state
-  ; params = expand_params file params
-  ; signals = Hashtbl.create 8
-  ; platform = Hashtbl.create 8
-  ; locals = Hashtbl.create 8
-  ; guard_cache = Hashtbl.create 32
-  ; handlers
-  ; caps = default_caps
-  ; event = None
-  ; price = nan
-  ; now = 0.0
-  }
-;;
-
 (** Memoized guard-expression parser. Expression guards carry their source string; parsing
     it once per guard (instead of once per evaluation) removes the dominant per-tick cost
     of a file with many [expr] guards. The cache is per-runtime, hence thread-confined to
     the owning domain. *)
-let parse_guard t s =
+let parse_guard_expr t s =
   match Hashtbl.find_opt t.guard_cache s with
   | Some r -> r
   | None ->
     let r = parse s in
     Hashtbl.replace t.guard_cache s r;
     r
+;;
+
+(** Parse every [expr] guard's source once, at load, so no cycle pays the parse. *)
+let rec prewarm_guard t (g : Strategy_file.guard) =
+  let open Strategy_file in
+  match g with
+  | G_expr s -> ignore (parse_guard_expr t s : (Strategy_expr.expr, string) result)
+  | G_all gs | G_any gs -> List.iter (prewarm_guard t) gs
+  | G_not g -> prewarm_guard t g
+  | G_event _
+  | G_side _
+  | G_is_none _
+  | G_is_some _
+  | G_capacity _
+  | G_pending _
+  | G_order _
+  | G_signal _
+  | G_engine _
+  | G_cooldown _ -> ()
+;;
+
+let create ?(handlers = noop_handler) ?(params = []) (file : Strategy_file.t) =
+  let state = Hashtbl.create 16 in
+  List.iter
+    (fun (s : Strategy_file.state_decl) ->
+      Hashtbl.replace state s.s_name (default_of_kind s.s_kind))
+    file.state;
+  let t =
+    { file
+    ; state
+    ; params = expand_params file params
+    ; signals = Hashtbl.create 8
+    ; platform = Hashtbl.create 8
+    ; locals = Hashtbl.create 8
+    ; guard_cache = Hashtbl.create 32
+    ; handlers
+    ; caps = default_caps
+    ; event = None
+    ; price = nan
+    ; now = 0.0
+    }
+  in
+  List.iter
+    (fun (st : Strategy_file.step) -> Option.iter (prewarm_guard t) st.st_when)
+    file.steps;
+  t
 ;;
 
 let set_state t k v = Hashtbl.replace t.state k v
@@ -305,6 +330,7 @@ let run_cycle t ~(price : float) ~(now : float) ~(event : event) : action_call l
   t.event <- Some event;
   let e = env_of t in
   let facts = facts_of t in
+  let parse_expr = parse_guard_expr t in
   let calls = ref [] in
   let stop = ref false in
   List.iter
@@ -322,7 +348,7 @@ let run_cycle t ~(price : float) ~(now : float) ~(event : event) : action_call l
           match step.st_when with
           | None -> true
           | Some g ->
-            (match Strategy_guard.eval ~parse_expr:(parse_guard t) e facts g with
+            (match Strategy_guard.eval ~parse_expr e facts g with
              | Ok b -> b
              | Error _ -> false)
         in
