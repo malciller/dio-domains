@@ -178,7 +178,10 @@ let asset_domain_worker
      trace per busy cycle and persist it periodically. *)
   let trace_recorder =
     if config.strategy_trace
-    then Some (Dio_strategies.Strategy_event_recorder.create ())
+    then (
+      let r = Dio_strategies.Strategy_event_recorder.create () in
+      Dio_strategies.Strategy_event_recorder.register asset_with_fees.symbol r;
+      Some r)
     else None
   in
   let trace_path =
@@ -1625,6 +1628,12 @@ let asset_domain_worker
            [ "price", Dio_strategies.Strategy_expr.V_float !current_price
            ; "asset_balance", Dio_strategies.Strategy_expr.V_float (base_balance_fn ())
            ; "quote_balance", Dio_strategies.Strategy_expr.V_float (quote_balance_fn ())
+           ; "bid", Dio_strategies.Strategy_expr.V_float !tob_bid
+           ; "ask", Dio_strategies.Strategy_expr.V_float !tob_ask
+           ; ( "generation"
+             , Dio_strategies.Strategy_expr.V_int
+                 (Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol) )
+           ; "cycle", Dio_strategies.Strategy_expr.V_int !cycle_count
            ; ( "balance_age"
              , match base_balance_age_fn () with
                | Some a -> Dio_strategies.Strategy_expr.V_float a

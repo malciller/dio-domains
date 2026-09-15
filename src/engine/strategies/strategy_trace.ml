@@ -14,8 +14,21 @@ type order_intent =
   ; oi_tif : string option
   }
 
+(** An order the strategy emitted (its decision), as opposed to the venue's open-order
+    feed. This is the primary observable for differential equivalence. *)
+type emitted =
+  { em_op : string (* place / amend / cancel *)
+  ; em_symbol : string
+  ; em_side : string
+  ; em_qty : float
+  ; em_price : float
+  ; em_post_only : bool
+  ; em_order_id : string option
+  }
+
 type obs =
   | Order_intent of order_intent
+  | Emitted of emitted
   | State of (string * Strategy_expr.value) list
   | Persistence of string * string
 
@@ -50,6 +63,30 @@ let string_of_order_intent o =
      | None -> "-")
 ;;
 
+let emitted_eq a b =
+  String.equal a.em_op b.em_op
+  && String.equal a.em_symbol b.em_symbol
+  && String.equal a.em_side b.em_side
+  && Float.equal a.em_qty b.em_qty
+  && Float.equal a.em_price b.em_price
+  && Bool.equal a.em_post_only b.em_post_only
+  && a.em_order_id = b.em_order_id
+;;
+
+let string_of_emitted e =
+  Printf.sprintf
+    "emitted(op=%s symbol=%s side=%s qty=%.8g price=%.8g post_only=%b id=%s)"
+    e.em_op
+    e.em_symbol
+    e.em_side
+    e.em_qty
+    e.em_price
+    e.em_post_only
+    (match e.em_order_id with
+     | Some id -> id
+     | None -> "-")
+;;
+
 let state_eq a b =
   let sort = List.sort (fun (x, _) (y, _) -> String.compare x y) in
   let a = sort a
@@ -64,6 +101,7 @@ let state_eq a b =
 let obs_eq a b =
   match a, b with
   | Order_intent x, Order_intent y -> order_intent_eq x y
+  | Emitted x, Emitted y -> emitted_eq x y
   | State x, State y -> state_eq x y
   | Persistence (k1, v1), Persistence (k2, v2) -> String.equal k1 k2 && String.equal v1 v2
   | _ -> false
@@ -71,6 +109,7 @@ let obs_eq a b =
 
 let string_of_obs = function
   | Order_intent o -> string_of_order_intent o
+  | Emitted e -> string_of_emitted e
   | State entries -> "state(" ^ String.concat "," (List.map fst entries) ^ ")"
   | Persistence (k, _) -> "persistence(" ^ k ^ ")"
 ;;
@@ -170,8 +209,40 @@ let order_intent_of_json j =
   }
 ;;
 
+let emitted_to_json e =
+  `Assoc
+    [ "op", `String e.em_op
+    ; "symbol", `String e.em_symbol
+    ; "side", `String e.em_side
+    ; "qty", `Float e.em_qty
+    ; "price", `Float e.em_price
+    ; "post_only", `Bool e.em_post_only
+    ; ( "order_id"
+      , match e.em_order_id with
+        | Some id -> `String id
+        | None -> `Null )
+    ]
+;;
+
+let emitted_of_json j =
+  let open Yojson.Basic.Util in
+  let opt_str = function
+    | `String s -> Some s
+    | _ -> None
+  in
+  { em_op = j |> member "op" |> to_string
+  ; em_symbol = j |> member "symbol" |> to_string
+  ; em_side = j |> member "side" |> to_string
+  ; em_qty = j |> member "qty" |> to_float
+  ; em_price = j |> member "price" |> to_float
+  ; em_post_only = j |> member "post_only" |> to_bool
+  ; em_order_id = opt_str (j |> member "order_id")
+  }
+;;
+
 let obs_to_json = function
   | Order_intent o -> `Assoc [ "kind", `String "order"; "order", order_intent_to_json o ]
+  | Emitted e -> `Assoc [ "kind", `String "emitted"; "emitted", emitted_to_json e ]
   | State entries ->
     `Assoc
       [ "kind", `String "state"
@@ -185,6 +256,7 @@ let obs_of_json j =
   let open Yojson.Basic.Util in
   match j |> member "kind" |> to_string with
   | "order" -> Order_intent (order_intent_of_json (member "order" j))
+  | "emitted" -> Emitted (emitted_of_json (member "emitted" j))
   | "state" ->
     State (member "entries" j |> to_assoc |> List.map (fun (k, v) -> k, value_of_json v))
   | "persistence" ->

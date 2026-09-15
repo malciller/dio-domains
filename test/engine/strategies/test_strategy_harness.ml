@@ -103,6 +103,92 @@ let test_roundtrip () =
   Alcotest.(check bool) "roundtrip equal" true (Strategy_trace.equal t loaded)
 ;;
 
+let replay_strategy =
+  {|{"name":"r","version":1,"triggers":["book_update"],"steps":[
+     {"id":"s","when":{"event":"book_update"},"then":[
+       {"action":"track_buy","args":{"token":"t","price":"100.0"}}]}]}|}
+;;
+
+let replay_inputs =
+  [ { Strategy_equivalence.ri_price = 100.0
+    ; ri_now = 0.0
+    ; ri_kind = "book_update"
+    ; ri_fields = []
+    }
+  ; { Strategy_equivalence.ri_price = 101.0
+    ; ri_now = 1.0
+    ; ri_kind = "book_update"
+    ; ri_fields = []
+    }
+  ]
+;;
+
+let mk_rt json () =
+  match Strategy_file.parse_string json with
+  | Error e -> failwith e
+  | Ok f -> Strategy_runtime.create ~handlers:Strategy_actions_grid.handler f
+;;
+
+let replay_step rt (input : Strategy_equivalence.input) r =
+  let calls =
+    Strategy_runtime.run_cycle
+      rt
+      ~price:input.ri_price
+      ~now:input.ri_now
+      ~event:(Strategy_runtime.make_event input.ri_kind input.ri_fields)
+  in
+  Strategy_event_recorder.record_state
+    r
+    [ ( "actions"
+      , Strategy_expr.V_string
+          (String.concat
+             ","
+             (List.map (fun (c : Strategy_runtime.action_call) -> c.ac_action) calls)) )
+    ];
+  Strategy_event_recorder.end_cycle r
+;;
+
+let test_replay_equiv () =
+  let reference =
+    Strategy_equivalence.replay
+      ~inputs:replay_inputs
+      ~setup:(mk_rt replay_strategy)
+      ~step:replay_step
+  in
+  let candidate =
+    Strategy_equivalence.replay
+      ~inputs:replay_inputs
+      ~setup:(mk_rt replay_strategy)
+      ~step:replay_step
+  in
+  Alcotest.(check bool)
+    "same inputs, same run -> equivalent"
+    true
+    (Strategy_equivalence.is_equiv
+       (Strategy_equivalence.compare_traces ~reference ~candidate))
+;;
+
+let test_replay_divergence () =
+  let reference =
+    Strategy_equivalence.replay
+      ~inputs:replay_inputs
+      ~setup:(mk_rt replay_strategy)
+      ~step:replay_step
+  in
+  let empty = {|{"name":"r","version":1,"triggers":["book_update"],"steps":[]}|} in
+  let result =
+    Strategy_equivalence.check_replay
+      ~reference
+      ~inputs:replay_inputs
+      ~setup:(mk_rt empty)
+      ~step:replay_step
+  in
+  Alcotest.(check bool)
+    "different run -> divergence"
+    false
+    (Strategy_equivalence.is_equiv result)
+;;
+
 let () =
   Alcotest.run
     "strategy_harness"
@@ -113,5 +199,9 @@ let () =
         ; Alcotest.test_case "divergence: cycle count" `Quick test_divergence_cycle_count
         ] )
     ; "persistence", [ Alcotest.test_case "json round-trip" `Quick test_roundtrip ]
+    ; ( "replay"
+      , [ Alcotest.test_case "same inputs equivalent" `Quick test_replay_equiv
+        ; Alcotest.test_case "different run divergence" `Quick test_replay_divergence
+        ] )
     ]
 ;;

@@ -12,6 +12,26 @@ let order_buffer = LockFreeQueue.create ()
 (** Accessor for the shared order ringbuffer. *)
 let get_order_buffer () = order_buffer
 
+(** Records an emitted order into the active trace recorder (no-op when tracing is off). *)
+let record_emitted order =
+  Strategy_event_recorder.record_emitted_if_active
+    { Strategy_trace.em_op =
+        (match order.operation with
+         | Place -> "place"
+         | Amend -> "amend"
+         | Cancel -> "cancel")
+    ; em_symbol = order.symbol
+    ; em_side =
+        (match order.side with
+         | Buy -> "buy"
+         | Sell -> "sell")
+    ; em_qty = order.qty
+    ; em_price = Option.value order.price ~default:nan
+    ; em_post_only = order.post_only
+    ; em_order_id = order.order_id
+    }
+;;
+
 let create_place_order dup_key asset_symbol side qty price post_only strategy exchange =
   let ecfg = get_exchange_config exchange in
   { operation = Place
@@ -97,6 +117,7 @@ let push_order ~now ?state order =
           Order_actions.incr order.symbol;
           state.last_order_time <- now;
           if order.side = Buy then state.inflight_cancel_buy <- true;
+          record_emitted order;
           true
         | None ->
           Logging.warn_f
@@ -127,6 +148,7 @@ let push_order ~now ?state order =
       | Some () ->
         OrderSignal.broadcast ();
         Order_actions.incr order.symbol;
+        record_emitted order;
         let state =
           match state with
           | Some s -> s

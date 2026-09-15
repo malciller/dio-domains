@@ -13,8 +13,28 @@ type t =
 let create () = { cycles = []; obs = []; index = 0 }
 let record t o = t.obs <- o :: t.obs
 let record_order_intent t oi = record t (Strategy_trace.Order_intent oi)
+let record_emitted t e = record t (Strategy_trace.Emitted e)
 let record_state t entries = record t (Strategy_trace.State entries)
 let record_persistence t key value = record t (Strategy_trace.Persistence (key, value))
+
+(** Per-symbol active recorders for hot-path emission hooks (e.g. the shared order
+    buffer). Empty when tracing is off, so the hook is a single hashtable lookup. The
+    order buffer is shared across domains, so routing is by the emitted order's symbol. *)
+let active_by_symbol : (string, t) Hashtbl.t = Hashtbl.create 8
+
+let active_mutex = Mutex.create ()
+
+let register symbol t =
+  Mutex.lock active_mutex;
+  Hashtbl.replace active_by_symbol symbol t;
+  Mutex.unlock active_mutex
+;;
+
+let record_emitted_if_active e =
+  match Hashtbl.find_opt active_by_symbol e.Strategy_trace.em_symbol with
+  | Some t -> record_emitted t e
+  | None -> ()
+;;
 
 let end_cycle t =
   t.cycles <- { Strategy_trace.c_index = t.index; c_obs = List.rev t.obs } :: t.cycles;
