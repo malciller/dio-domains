@@ -119,3 +119,96 @@ let compare (a : t) (b : t) : string option =
 ;;
 
 let equal a b = compare a b = None
+
+let value_to_json (v : Strategy_expr.value) : Yojson.Basic.t =
+  match v with
+  | V_none -> `Null
+  | V_float f -> `Float f
+  | V_int i -> `Int i
+  | V_bool b -> `Bool b
+  | V_string s -> `String s
+;;
+
+let value_of_json (j : Yojson.Basic.t) : Strategy_expr.value =
+  match j with
+  | `Null -> V_none
+  | `Float f -> V_float f
+  | `Int i -> V_int i
+  | `Bool b -> V_bool b
+  | `String s -> V_string s
+  | _ -> V_none
+;;
+
+let order_intent_to_json o =
+  `Assoc
+    [ "symbol", `String o.oi_symbol
+    ; "side", `String o.oi_side
+    ; "qty", `Float o.oi_qty
+    ; "price", `Float o.oi_price
+    ; "post_only", `Bool o.oi_post_only
+    ; "reduce_only", `Bool o.oi_reduce_only
+    ; ( "tif"
+      , match o.oi_tif with
+        | Some t -> `String t
+        | None -> `Null )
+    ]
+;;
+
+let order_intent_of_json j =
+  let open Yojson.Basic.Util in
+  let opt_str = function
+    | `String s -> Some s
+    | _ -> None
+  in
+  { oi_symbol = j |> member "symbol" |> to_string
+  ; oi_side = j |> member "side" |> to_string
+  ; oi_qty = j |> member "qty" |> to_float
+  ; oi_price = j |> member "price" |> to_float
+  ; oi_post_only = j |> member "post_only" |> to_bool
+  ; oi_reduce_only = j |> member "reduce_only" |> to_bool
+  ; oi_tif = opt_str (j |> member "tif")
+  }
+;;
+
+let obs_to_json = function
+  | Order_intent o -> `Assoc [ "kind", `String "order"; "order", order_intent_to_json o ]
+  | State entries ->
+    `Assoc
+      [ "kind", `String "state"
+      ; "entries", `Assoc (List.map (fun (k, v) -> k, value_to_json v) entries)
+      ]
+  | Persistence (k, v) ->
+    `Assoc [ "kind", `String "persistence"; "key", `String k; "value", `String v ]
+;;
+
+let obs_of_json j =
+  let open Yojson.Basic.Util in
+  match j |> member "kind" |> to_string with
+  | "order" -> Order_intent (order_intent_of_json (member "order" j))
+  | "state" ->
+    State (member "entries" j |> to_assoc |> List.map (fun (k, v) -> k, value_of_json v))
+  | "persistence" ->
+    Persistence (member "key" j |> to_string, member "value" j |> to_string)
+  | other -> failwith ("unknown observation kind: " ^ other)
+;;
+
+let to_json (t : t) : Yojson.Basic.t =
+  `List
+    (List.map
+       (fun c ->
+         `Assoc [ "index", `Int c.c_index; "obs", `List (List.map obs_to_json c.c_obs) ])
+       t)
+;;
+
+let of_json (j : Yojson.Basic.t) : t =
+  let open Yojson.Basic.Util in
+  j
+  |> to_list
+  |> List.map (fun c ->
+    { c_index = c |> member "index" |> to_int
+    ; c_obs = c |> member "obs" |> to_list |> List.map obs_of_json
+    })
+;;
+
+let save path t = Yojson.Basic.to_file path (to_json t)
+let load path = of_json (Yojson.Basic.from_file path)

@@ -75,6 +75,10 @@ type config =
       [latency_spike_threshold_us] because network metrics (ws ping/feed, REST, signer)
       are millisecond-scale and would flag every window at 10us. *)
   ; theme : string option (** Optional UI theme name for the terminal dashboard. *)
+  ; strategy_trace : bool
+  (** When true, the domain loop records per-cycle observable traces for the
+      behavioral-equivalence harness. Default false: production behavior is unchanged
+      unless explicitly enabled. *)
   }
 
 (** Logging section identifier for this module. *)
@@ -134,6 +138,7 @@ let known_top_level_keys =
   ; "oracle"
   ; "fng_check_threshold"
   ; "theme"
+  ; "strategy_trace"
   ]
 ;;
 
@@ -543,6 +548,9 @@ let read_config () : config =
       |> Option.value ~default:20_000.0
     in
     let theme = json |> member "theme" |> to_string_option in
+    let strategy_trace =
+      json |> member "strategy_trace" |> to_bool_option |> Option.value ~default:false
+    in
     { cycle_mod
     ; logging
     ; gc
@@ -555,6 +563,7 @@ let read_config () : config =
     ; latency_spike_report_seconds
     ; latency_network_spike_threshold_us
     ; theme
+    ; strategy_trace
     }
   with
   | Yojson.Json_error msg ->
@@ -574,6 +583,7 @@ let read_config () : config =
     ; latency_spike_report_seconds = 30.0
     ; latency_network_spike_threshold_us = 20_000.0
     ; theme = None
+    ; strategy_trace = false
     }
 ;;
 

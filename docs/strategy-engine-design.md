@@ -542,9 +542,9 @@ Concrete module and integration work, with per-module status. Milestone 1's firs
 | `strategy_protocol.ml` | implements `Strategy_common.S` over a compiled instance | protocol | pending |
 | `platform_accounting.ml` | central accounting: grace, ghost, freshness, ceilings, pending, reservation | platform | pending |
 | `exchange_capabilities.ml` | per-venue capability descriptors (extracted from the grid flag matrix) | platform | done |
-| `strategy_event_recorder.ml` | record per-cycle observations (order intents/state/persistence) into a trace | test | skeleton (loop instrumentation pending) |
-| `strategy_equivalence.ml` | trace diff / equivalence decision | test | skeleton (ref-vs-ref test passes) |
-| `strategy_trace.ml` | observable trace types + comparison | test | done |
+| `strategy_event_recorder.ml` | record per-cycle observations (order intents/state/persistence) into a trace | test | done |
+| `strategy_equivalence.ml` | trace diff / equivalence decision | test | done |
+| `strategy_trace.ml` | observable trace types + comparison + JSON persistence | test | done |
 
 ### 9.2 Existing modules to touch
 
@@ -586,7 +586,7 @@ Dependency order is strict: 1 before 3; 2 before 3 (the accounting module is wha
 
 **Remaining for milestone 1:** the `Strategy_common.S` protocol adapter (`strategy_protocol.ml`) and wiring a compiled instance into the domain loop behind the default-off feature flag. Milestones 0 and 2–5 are not started.
 
-**Milestone 0 skeleton (branch `composer`):** `strategy_trace.ml` (observable trace types + comparison), `strategy_event_recorder.ml` (per-cycle recording), and `strategy_equivalence.ml` (trace diff) are implemented with a ref-vs-ref identity test, a state order-insensitivity test, and divergence-detection tests (`test_strategy_harness.ml`). Live-loop instrumentation and dual-run capture remain.
+**Milestone 0 (in progress):** `strategy_trace.ml` (observable trace types + comparison + JSON persistence), `strategy_event_recorder.ml` (per-cycle recording), and `strategy_equivalence.ml` (trace diff) are implemented with ref-vs-ref identity, state order-insensitivity, divergence, and JSON round-trip tests (`test_strategy_harness.ml`). The domain loop records per-cycle open orders + price under the default-off `strategy_trace` config flag (`config.ml`, `domain_spawner.ml`) and persists every 50 busy cycles to `data/strategy_trace_<exchange>_<symbol>.json`; `dio strategy diff <a.json> <b.json>` compares two traces. Remaining: dual-run capture of a candidate alongside the reference, and balance snapshots in the recorded state.
 
 **Milestone 2 (in progress):** `exchange_capabilities.ml` extracts the grid's per-venue flag matrix (`jacobs_ladder_config.ml`) into capability descriptors for hyperliquid/kraken/ibkr/lighter/alpaca. The central accounting module (`platform_accounting.ml`), migration of the grid overlay, and the refactor-equivalence gate remain.
 

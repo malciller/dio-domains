@@ -121,6 +121,21 @@ let asset_domain_worker
   Random.self_init ();
   (* Fetch exchange fee schedule at domain startup *)
   let asset_with_fees = fee_fetcher asset in
+  (* Behavioral-equivalence tracing (default off): when enabled, record an observable
+     trace per busy cycle and persist it periodically. *)
+  let trace_recorder =
+    if config.strategy_trace
+    then Some (Dio_strategies.Strategy_event_recorder.create ())
+    else None
+  in
+  let trace_path =
+    let sanitize s = String.map (fun c -> if Char.equal c '/' then '_' else c) s in
+    Printf.sprintf
+      "data/strategy_trace_%s_%s.json"
+      (sanitize asset_with_fees.exchange)
+      (sanitize asset_with_fees.symbol)
+  in
+  let trace_cycles = ref 0 in
   (* Resolves accumulation_buffer from Fear & Greed on every venue (Kraken runs the same
      reserved_base accrual; see jacobs_ladder_config.kraken_config). Only a live F&G
      reading resolves it; without one the grid places no orders. *)
@@ -1437,6 +1452,39 @@ let asset_domain_worker
             iter_orders
             !cycle_count
         | _ -> ());
+      (match trace_recorder with
+       | Some r when did_ob || did_exec || should_execute ->
+         List.iter
+           (fun (o : Types.open_order) ->
+             let open Dio_strategies.Strategy_trace in
+             Dio_strategies.Strategy_event_recorder.record_order_intent
+               r
+               { oi_symbol = asset_with_fees.symbol
+               ; oi_side =
+                   (match o.side with
+                    | Types.Buy -> "buy"
+                    | Types.Sell -> "sell")
+               ; oi_qty = o.qty
+               ; oi_price =
+                   (match o.limit_price with
+                    | Some p -> p
+                    | None -> nan)
+               ; oi_post_only = false
+               ; oi_reduce_only = false
+               ; oi_tif = None
+               })
+           (Ex.get_open_orders ~symbol:asset_with_fees.symbol);
+         Dio_strategies.Strategy_event_recorder.record_state
+           r
+           [ "price", Dio_strategies.Strategy_expr.V_float !current_price ];
+         Dio_strategies.Strategy_event_recorder.end_cycle r;
+         incr trace_cycles;
+         if !trace_cycles mod 50 = 0
+         then
+           Dio_strategies.Strategy_trace.save
+             trace_path
+             (Dio_strategies.Strategy_event_recorder.snapshot r)
+       | _ -> ());
       let t4 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
       let alloc_at_t4 =
         if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0

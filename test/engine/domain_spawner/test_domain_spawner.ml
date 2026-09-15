@@ -56,6 +56,7 @@ let test_spawn_domains_basic () =
     ; latency_network_spike_threshold_us = 20_000.0
     ; fng_check_threshold = 1.5
     ; theme = None
+    ; strategy_trace = false
     }
   in
   let _supervisor_thread =
@@ -87,6 +88,7 @@ let test_spawn_domains_empty () =
     ; latency_network_spike_threshold_us = 20_000.0
     ; fng_check_threshold = 1.5
     ; theme = None
+    ; strategy_trace = false
     }
   in
   let _supervisor_thread =
@@ -177,6 +179,7 @@ let test_domain_error_handling () =
     ; latency_network_spike_threshold_us = 20_000.0
     ; fng_check_threshold = 1.5
     ; theme = None
+    ; strategy_trace = false
     }
   in
   let _supervisor_thread =
