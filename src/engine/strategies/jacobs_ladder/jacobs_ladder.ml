@@ -71,6 +71,7 @@ let venue_lot_qty = Jacobs_ladder_config.venue_lot_qty
 let parse_config_float = Jacobs_ladder_config.parse_config_float
 let get_min_move_threshold = Jacobs_ladder_config.get_min_move_threshold
 let calculate_grid_price = Jacobs_ladder_config.calculate_grid_price
+let grid_price = Jacobs_ladder_config.grid_price
 let get_strategy_state = Jacobs_ladder_types.get_strategy_state
 let total_reserved_by_exchange = Jacobs_ladder_reservation.total_reserved_by_exchange
 let get_exchange_reserved_atomic = Jacobs_ladder_reservation.get_exchange_reserved_atomic
