@@ -138,7 +138,7 @@ let test_strategy_initialization () =
   Alcotest.(check unit)
     "jacobs_ladder init"
     ()
-    (Dio_strategies.Jacobs_ladder.Strategy.init ())
+    (Dio_strategies.Strategy_api.Strategy.init ())
 ;;
 
 let test_domain_error_handling () =

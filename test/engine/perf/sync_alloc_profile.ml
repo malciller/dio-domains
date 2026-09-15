@@ -1,4 +1,4 @@
-(* Allocation profile for [Jacobs_ladder.sync_open_orders].
+(* Allocation profile for [Strategy_api.sync_open_orders].
 
    Build with the release profile (`dune build --profile release
    test/engine/perf/sync_alloc_profile.exe`). Under the dev profile there is no
@@ -20,7 +20,7 @@
    [remaintain_expired_sells] is the Alpaca flag that gates the persisted-ladder
    reconcile. *)
 
-module JL = Dio_strategies.Jacobs_ladder
+module JL = Dio_strategies.Strategy_api
 module Sell_orders = Dio_strategies.Strategy_sell_orders
 
 let alpaca_asset symbol =

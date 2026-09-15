@@ -42,18 +42,18 @@ let platform_float t key default =
 ;;
 
 (** The buy-leg reference price: the last bid, else the ask
-    ([Jacobs_ladder_execution.compute_buy_ref_price]). *)
+    ([Strategy_lifecycle.compute_buy_ref_price]). *)
 let compute_buy_ref_price args =
   [ ( "price"
     , V_float
-        (Jacobs_ladder.compute_buy_ref_price
+        (Strategy_lifecycle.compute_buy_ref_price
            ~bid_price:(float_arg args "bid")
            ~ask_price:(float_arg args "ask")) )
   ]
 ;;
 
 (** Price at which a newly-owed sell would be placed. Ports
-    [Jacobs_ladder_execution.owed_sell_price]: the same base-price selection, the shared
+    [Strategy_decision.owed_sell_price]: the same base-price selection, the shared
     [grid_price] formula, and the ask-side floor (non-Alpaca). Inputs the reference takes
     from the per-asset config/caps: [grid_interval] (live blended value) from the platform
     fact table; [exchange] / [remaintain_expired_sells] / [round_price] from
@@ -83,7 +83,7 @@ let owed_sell_price t args =
       | None -> bid)
   in
   let raw_sell_price =
-    Jacobs_ladder.grid_price
+    Strategy_venue.grid_price
       ~round_price:t.Strategy_runtime.caps.round_price
       ~current:base_price_for_sell
       ~grid_interval_pct:grid_interval
@@ -122,7 +122,7 @@ let available_base _t args =
 let grid_price t args =
   [ ( "price"
     , V_float
-        (Jacobs_ladder.grid_price
+        (Strategy_venue.grid_price
            ~round_price:t.Strategy_runtime.caps.round_price
            ~current:(float_arg args "current")
            ~grid_interval_pct:(float_arg args "grid_interval_pct")

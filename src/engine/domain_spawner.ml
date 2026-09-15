@@ -268,8 +268,8 @@ let asset_domain_worker
        [reclaim_cancel_issued]/[reclaim_cancel_at] rather than issued every cycle, and
        retried while the decision persists and eligible buys remain. The latch re-arms
        when the store shows no eligible buy (cancel landed) or the decision stops being a
-       cascade; see [Dio_strategies.Jacobs_ladder.reclaim_step]. Without the retry a
-       single failed cancel leaves the pool permanently short. *)
+       cascade; see [Dio_strategies.Strategy_api.reclaim_step]. Without the retry a single
+       failed cancel leaves the pool permanently short. *)
     let reclaim_cancel_issued = ref false in
     let reclaim_cancel_at = ref 0.0 in
     let reclaim_retry_seconds = 15.0 in
@@ -287,7 +287,7 @@ let asset_domain_worker
       ~(grid_interval : float)
       ()
       =
-      { Dio_strategies.Jacobs_ladder.exchange = asset_with_fees.exchange
+      { Dio_strategies.Strategy_api.exchange = asset_with_fees.exchange
       ; symbol = asset_with_fees.symbol
       ; qty
       ; grid_interval
@@ -343,7 +343,7 @@ let asset_domain_worker
        zero defaults. *)
     if is_grid_strategy
     then (
-      let st = Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol in
+      let st = Dio_strategies.Strategy_api.get_strategy_state asset_with_fees.symbol in
       st.exchange_id <- asset_with_fees.exchange;
       let initial_qty =
         match oracle_decision_at_startup with
@@ -357,7 +357,7 @@ let asset_domain_worker
       <- (try float_of_string asset_with_fees.sell_mult with
           | Failure _ -> 1.0);
       st.cached_ecfg
-      <- Dio_strategies.Jacobs_ladder.get_exchange_config asset_with_fees.exchange;
+      <- Dio_strategies.Strategy_api.get_exchange_config asset_with_fees.exchange;
       st.cached_round_price
       <- (fun p -> Ex.round_price ~symbol:asset_with_fees.symbol ~price:p);
       st.cached_price_increment
@@ -369,7 +369,7 @@ let asset_domain_worker
       st.cached_venue_min_qty
       <- Option.value (Ex.get_qty_min ~symbol:asset_with_fees.symbol) ~default:0.01;
       st.cached_venue_min_notional
-      <- Dio_strategies.Jacobs_ladder.get_min_notional_val
+      <- Dio_strategies.Strategy_api.get_min_notional_val
            asset_with_fees.symbol
            asset_with_fees.exchange;
       st.persistence_dirty <- false;
@@ -565,7 +565,7 @@ let asset_domain_worker
        References are stable while is_running is true. *)
     let cached_grid_state =
       if is_grid_strategy
-      then Some (Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol)
+      then Some (Dio_strategies.Strategy_api.get_strategy_state asset_with_fees.symbol)
       else None
     in
     let cached_fng_check_threshold = config.fng_check_threshold in
@@ -704,7 +704,7 @@ let asset_domain_worker
           ctx.cg_now <- now_ev;
           lifecycle_events
           := !lifecycle_events
-             + Dio_strategies.Jacobs_ladder.Strategy.drain_events_with
+             + Dio_strategies.Strategy_api.Strategy.drain_events_with
                  asset_with_fees.symbol
                  (fun ev ->
                     ignore
@@ -713,11 +713,11 @@ let asset_domain_worker
                          ~price:!current_price
                          ~now:now_ev
                          ~event:
-                           (Dio_strategies.Jacobs_ladder.runtime_event_of_lifecycle ev)))
+                           (Dio_strategies.Strategy_api.runtime_event_of_lifecycle ev)))
         | None ->
           lifecycle_events
           := !lifecycle_events
-             + Dio_strategies.Jacobs_ladder.Strategy.drain_events asset_with_fees.symbol);
+             + Dio_strategies.Strategy_api.Strategy.drain_events asset_with_fees.symbol);
       (* === ORDERBOOK HOT PATH === *)
       let ob_pos = get_ob_pos_fn () in
       let did_ob =
@@ -775,7 +775,7 @@ let asset_domain_worker
                  in
                  if is_grid_strategy
                  then
-                   Dio_strategies.Jacobs_ladder.Strategy.record_exec_event
+                   Dio_strategies.Strategy_api.Strategy.record_exec_event
                      asset_with_fees.symbol
                      ~kind:"cancelled"
                      ~now:now_exec
@@ -798,7 +798,7 @@ let asset_domain_worker
                         | Dio_strategies.Strategy_common.Sell -> "sell")
                      ~cl_ord_id:event.cl_ord_id
                      ~ref_call:(fun () ->
-                       Dio_strategies.Jacobs_ladder.Strategy.handle_order_cancelled
+                       Dio_strategies.Strategy_api.Strategy.handle_order_cancelled
                          ~now:now_exec
                          asset_with_fees.symbol
                          event.order_id
@@ -829,7 +829,7 @@ let asset_domain_worker
                  in
                  if is_grid_strategy
                  then
-                   Dio_strategies.Jacobs_ladder.Strategy.record_exec_event
+                   Dio_strategies.Strategy_api.Strategy.record_exec_event
                      asset_with_fees.symbol
                      ~kind:"filled"
                      ~now:now_exec
@@ -856,7 +856,7 @@ let asset_domain_worker
                      ~qty:event.filled_qty
                      ~cl_ord_id:event.cl_ord_id
                      ~ref_call:(fun () ->
-                       Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+                       Dio_strategies.Strategy_api.Strategy.handle_order_filled
                          ~now:now_exec
                          asset_with_fees.symbol
                          event.order_id
@@ -892,7 +892,7 @@ let asset_domain_worker
                      in
                      if is_grid_strategy
                      then
-                       Dio_strategies.Jacobs_ladder.Strategy.record_exec_event
+                       Dio_strategies.Strategy_api.Strategy.record_exec_event
                          asset_with_fees.symbol
                          ~kind:"amended"
                          ~now:now_exec
@@ -917,7 +917,7 @@ let asset_domain_worker
                             | Dio_strategies.Strategy_common.Sell -> "sell")
                          ~price
                          ~ref_call:(fun () ->
-                           Dio_strategies.Jacobs_ladder.Strategy.handle_order_amended
+                           Dio_strategies.Strategy_api.Strategy.handle_order_amended
                              ~now:now_exec
                              asset_with_fees.symbol
                              event.order_id
@@ -936,7 +936,7 @@ let asset_domain_worker
                      in
                      if is_grid_strategy
                      then
-                       Dio_strategies.Jacobs_ladder.Strategy.record_exec_event
+                       Dio_strategies.Strategy_api.Strategy.record_exec_event
                          asset_with_fees.symbol
                          ~kind:"acknowledged"
                          ~now:now_exec
@@ -959,7 +959,7 @@ let asset_domain_worker
                             | Dio_strategies.Strategy_common.Sell -> "sell")
                          ~price
                          ~ref_call:(fun () ->
-                           Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+                           Dio_strategies.Strategy_api.Strategy.handle_order_acknowledged
                              ~now:now_exec
                              asset_with_fees.symbol
                              event.order_id
@@ -979,7 +979,7 @@ let asset_domain_worker
             exec_ready_cycle := !cycle_count;
             if is_grid_strategy
             then
-              Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done
+              Dio_strategies.Strategy_api.Strategy.set_startup_replay_done
                 asset_with_fees.symbol;
             Logging.debug_f
               ~section
@@ -1036,7 +1036,7 @@ let asset_domain_worker
                       | Dio_strategies.Strategy_common.Sell -> "sell")
                    ~price
                    ~ref_call:(fun () ->
-                     Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+                     Dio_strategies.Strategy_api.Strategy.handle_order_acknowledged
                        ~now:now_inject
                        asset_with_fees.symbol
                        oid
@@ -1048,7 +1048,7 @@ let asset_domain_worker
           (* Mark startup replay complete to ungate profit calculation *)
           if is_grid_strategy
           then
-            Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done
+            Dio_strategies.Strategy_api.Strategy.set_startup_replay_done
               asset_with_fees.symbol;
           Logging.debug_f
             ~section
@@ -1124,9 +1124,7 @@ let asset_domain_worker
          in
          grid_strategy_asset_ref
          := Some (grid_asset_of ~qty:qty_str ~grid_interval:d.grid_interval ());
-         let st =
-           Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol
-         in
+         let st = Dio_strategies.Strategy_api.get_strategy_state asset_with_fees.symbol in
          (try st.grid_qty <- float_of_string qty_str with
           | Failure _ -> ());
          (* Re-check any resting buy against the decision's spacing: it amends DOWN only
@@ -1167,7 +1165,7 @@ let asset_domain_worker
              { asset with qty = qty_str; grid_interval = d.grid_interval }
            in
            grid_strategy_asset_ref := Some new_asset;
-           let st = Dio_strategies.Jacobs_ladder.get_strategy_state asset.symbol in
+           let st = Dio_strategies.Strategy_api.get_strategy_state asset.symbol in
            (try st.grid_qty <- float_of_string qty_str with
             | Failure _ -> ());
            (* A qty-only change is adopted without forcing a buy re-anchor: the grid's
@@ -1203,7 +1201,7 @@ let asset_domain_worker
           if is_grid_strategy
           then (
             let st =
-              Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol
+              Dio_strategies.Strategy_api.get_strategy_state asset_with_fees.symbol
             in
             st.capital_low <- false;
             st.capital_low_logged <- false;
@@ -1242,9 +1240,7 @@ let asset_domain_worker
       (match oracle_decision with
        | Some d when d.cancel_resting_buys ->
          let now = Unix.gettimeofday () in
-         let st =
-           Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol
-         in
+         let st = Dio_strategies.Strategy_api.get_strategy_state asset_with_fees.symbol in
          Mutex.lock st.mutex;
          Fun.protect
            ~finally:(fun () -> Mutex.unlock st.mutex)
@@ -1267,7 +1263,7 @@ let asset_domain_worker
                             oid)
                     then incr eligible));
              match
-               Dio_strategies.Jacobs_ladder.reclaim_step
+               Dio_strategies.Strategy_api.reclaim_step
                  ~now
                  ~retry_seconds:reclaim_retry_seconds
                  ~issued:!reclaim_cancel_issued
@@ -1275,14 +1271,14 @@ let asset_domain_worker
                  ~eligible:!eligible
                  ~any_buy:!any_buy
              with
-             | Dio_strategies.Jacobs_ladder.Reclaim_rearm ->
+             | Dio_strategies.Strategy_api.Reclaim_rearm ->
                (* No buy remains: the cancel(s) landed or were never needed. Re-arm the
                   latch so a later reclaim re-triggers cleanly, and wake the oracle so it
                   re-sizes with the released capital. *)
                reclaim_cancel_issued := false;
                reclaim_cancel_at := 0.0;
                Oracle_runtime.request_pass ()
-             | Dio_strategies.Jacobs_ladder.Reclaim_cancel _ ->
+             | Dio_strategies.Strategy_api.Reclaim_cancel _ ->
                let n = ref 0 in
                Ex.iter_open_orders_fast
                  ~symbol:asset_with_fees.symbol
@@ -1295,13 +1291,13 @@ let asset_domain_worker
                                oid)
                     then (
                       let cancel =
-                        Dio_strategies.Jacobs_ladder.create_cancel_order
+                        Dio_strategies.Strategy_api.create_cancel_order
                           oid
                           asset_with_fees.symbol
                           Dio_strategies.Strategy_common.Ladder
                           asset_with_fees.exchange
                       in
-                      ignore (Dio_strategies.Jacobs_ladder.push_order ~now cancel);
+                      ignore (Dio_strategies.Strategy_api.push_order ~now cancel);
                       incr n));
                reclaim_cancel_issued := true;
                reclaim_cancel_at := now;
@@ -1315,7 +1311,7 @@ let asset_domain_worker
                  asset_with_fees.exchange
                  asset_with_fees.symbol
                  !n
-             | Dio_strategies.Jacobs_ladder.Reclaim_deferred -> ())
+             | Dio_strategies.Strategy_api.Reclaim_deferred -> ())
        | _ ->
          reclaim_cancel_issued := false;
          reclaim_cancel_at := 0.0);
@@ -1512,7 +1508,7 @@ let asset_domain_worker
                 | Some asset ->
                   let new_asset =
                     { asset with
-                      Dio_strategies.Jacobs_ladder.accumulation_buffer = new_ab
+                      Dio_strategies.Strategy_api.accumulation_buffer = new_ab
                     }
                   in
                   grid_strategy_asset_ref := Some new_asset
@@ -1721,8 +1717,7 @@ let asset_domain_worker
       if should_execute
       then
         if is_grid_strategy
-        then
-          Dio_strategies.Jacobs_ladder.Strategy.flush_persistence asset_with_fees.symbol;
+        then Dio_strategies.Strategy_api.Strategy.flush_persistence asset_with_fees.symbol;
       (* Records active cycle work time before blocking, excluding
          Exchange_wakeup.wait_since sleep. Only busy cycles are recorded; idle wakeups
          would pin cycle p50/p99 at 0us. *)
@@ -1921,7 +1916,7 @@ let stop_domain state =
   let symbol = state.asset.symbol in
   (* Data-driven dispatch: clean up grid state for a strategy-file asset. *)
   if is_strategy_file_asset state.asset
-  then Dio_strategies.Jacobs_ladder.Strategy.cleanup_strategy_state symbol;
+  then Dio_strategies.Strategy_api.Strategy.cleanup_strategy_state symbol;
   (* Unblock workers in Exchange_wakeup.wait_since so they observe is_running=false and
      exit the main loop. *)
   Concurrency.Exchange_wakeup.signal_all ();
@@ -2026,7 +2021,7 @@ let spawn_supervised_domains_for_assets
   : Thread.t
   =
   (* Initialize strategy module state *)
-  Dio_strategies.Jacobs_ladder.Strategy.init ();
+  Dio_strategies.Strategy_api.Strategy.init ();
   (* Register each asset in the domain registry *)
   List.iter (fun asset -> ignore (register_domain asset)) assets;
   (* Pre-force the shared cached_gc_config Lazy before spawning domains: OCaml 5 domains
@@ -2127,6 +2122,6 @@ let stop_all_domains () =
   List.iter
     (fun state ->
       if is_strategy_file_asset state.asset
-      then Dio_strategies.Jacobs_ladder.Strategy.flush_persistence state.asset.symbol)
+      then Dio_strategies.Strategy_api.Strategy.flush_persistence state.asset.symbol)
     all_states
 ;;

@@ -1,6 +1,6 @@
 module LP = Latency_profiler
 module SC = Dio_strategies.Strategy_common
-module SG = Dio_strategies.Jacobs_ladder
+module SG = Dio_strategies.Strategy_api
 module FC = Dio_strategies.Fee_cache
 
 (* ── helpers ──────────────────────────────────────────────────────────────── *)

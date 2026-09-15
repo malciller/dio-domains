@@ -13,7 +13,7 @@ let set_sell_commitments tbl entries =
       Hashtbl.replace
         tbl
         id
-        { Dio_strategies.Jacobs_ladder.sc_price = price
+        { Dio_strategies.Strategy_api.sc_price = price
         ; sc_qty = qty
         ; sc_seen = seen
         ; sc_acked = acked
@@ -24,12 +24,12 @@ let set_sell_commitments tbl entries =
 ;;
 
 let test_initialization () =
-  check unit "jacobs_ladder init" () (Dio_strategies.Jacobs_ladder.Strategy.init ())
+  check unit "jacobs_ladder init" () (Dio_strategies.Strategy_api.Strategy.init ())
 ;;
 
 let test_order_creation_place () =
   let order =
-    Dio_strategies.Jacobs_ladder.create_place_order
+    Dio_strategies.Strategy_api.create_place_order
       "BTC/USD|buy|grid"
       "BTC/USD"
       Dio_strategies.Strategy_common.Buy
@@ -58,7 +58,7 @@ let test_order_creation_place () =
 
 let test_order_creation_amend () =
   let order =
-    Dio_strategies.Jacobs_ladder.create_amend_order
+    Dio_strategies.Strategy_api.create_amend_order
       "order123"
       "BTC/USD"
       Dio_strategies.Strategy_common.Sell
@@ -88,7 +88,7 @@ let test_order_creation_amend () =
 
 let test_order_creation_cancel () =
   let order =
-    Dio_strategies.Jacobs_ladder.create_cancel_order
+    Dio_strategies.Strategy_api.create_cancel_order
       "order456"
       "BTC/USD"
       Dio_strategies.Strategy_common.Ladder
@@ -119,7 +119,7 @@ let test_duplicate_key_per_side () =
   (* Duplicate key is per asset+side, not price/qty. *)
   let open Dio_strategies in
   let buy1 =
-    Jacobs_ladder.create_place_order
+    Strategy_api.create_place_order
       "BTC/USD|buy|grid"
       "BTC/USD"
       Strategy_common.Buy
@@ -130,7 +130,7 @@ let test_duplicate_key_per_side () =
       "kraken"
   in
   let buy2 =
-    Jacobs_ladder.create_place_order
+    Strategy_api.create_place_order
       "BTC/USD|buy|grid"
       "BTC/USD"
       Strategy_common.Buy
@@ -141,7 +141,7 @@ let test_duplicate_key_per_side () =
       "kraken"
   in
   let sell1 =
-    Jacobs_ladder.create_place_order
+    Strategy_api.create_place_order
       "BTC/USD|sell|grid"
       "BTC/USD"
       Strategy_common.Sell
@@ -163,7 +163,7 @@ let test_config_parsing () =
   (* parse_config_float: parses valid floats, falls back on invalid/empty input. *)
   let test_parse str default expected =
     let result =
-      Dio_strategies.Jacobs_ladder.parse_config_float
+      Dio_strategies.Strategy_api.parse_config_float
         str
         "test_param"
         default
@@ -179,25 +179,25 @@ let test_config_parsing () =
 
 let test_price_rounding () =
   (* Price rounding depends on the Kraken instruments feed; asserts only non-negativity. *)
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state "BTC/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state "BTC/USD" in
   let rounded = state.cached_round_price 50000.12345678 in
   check bool "price rounding non-negative" true (rounded >= 0.0)
 ;;
 
 let test_price_increment () =
   (* Price increment depends on the Kraken instruments feed; asserts positivity. *)
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state "BTC/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state "BTC/USD" in
   let increment = state.cached_price_increment in
   check bool "price increment positive" true (increment > 0.0)
 ;;
 
 let test_grid_price_calculation () =
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state "TEST/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state "TEST/USD" in
   let above_price =
-    Dio_strategies.Jacobs_ladder.calculate_grid_price 50000.0 1.0 true state
+    Dio_strategies.Strategy_api.calculate_grid_price 50000.0 1.0 true state
   in
   let below_price =
-    Dio_strategies.Jacobs_ladder.calculate_grid_price 50000.0 1.0 false state
+    Dio_strategies.Strategy_api.calculate_grid_price 50000.0 1.0 false state
   in
   (* 1% grid: above 50500, below 49500. *)
   check bool "above price correct" true (above_price >= 50499.0 && above_price <= 50501.0);
@@ -205,8 +205,8 @@ let test_grid_price_calculation () =
 ;;
 
 let test_state_management () =
-  let state1 = Dio_strategies.Jacobs_ladder.get_strategy_state "BTC/USD" in
-  let state2 = Dio_strategies.Jacobs_ladder.get_strategy_state "BTC/USD" in
+  let state1 = Dio_strategies.Strategy_api.get_strategy_state "BTC/USD" in
+  let state2 = Dio_strategies.Strategy_api.get_strategy_state "BTC/USD" in
   (* Same symbol returns the identical state object. *)
   check bool "same state for same symbol" true (state1 == state2)
 ;;
@@ -235,7 +235,7 @@ let test_blocked_placement_sell_retries () =
      0.0005. *)
   let symbol = "PLACE_RETRY/BTC/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.5;
   state.maker_fee <- 0.0004;
@@ -248,7 +248,7 @@ let test_blocked_placement_sell_retries () =
   state.last_buy_fill_price <- Some 62369.0;
   state.last_buy_fill_qty <- Some 0.5;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.5"
     ; grid_interval = 0.75
@@ -261,8 +261,8 @@ let test_blocked_placement_sell_retries () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -270,9 +270,9 @@ let test_blocked_placement_sell_retries () =
   in
   drain ();
   let run_leg buy_attempted =
-    Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    Dio_strategies.Strategy_api.evaluate_sell_leg
       ~persisted_reconcile:
-        (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+        (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
       ~state
       ~now:100.0
       ~asset
@@ -292,7 +292,7 @@ let test_blocked_placement_sell_retries () =
     bool
     "no sell pushed while on cooldown"
     true
-    (Dio_strategies.Jacobs_ladder.get_pending_orders 100 = []);
+    (Dio_strategies.Strategy_api.get_pending_orders 100 = []);
   check
     bool
     "placement-triggered sell stays owed (latch armed)"
@@ -301,7 +301,7 @@ let test_blocked_placement_sell_retries () =
   (* Tick 2: cooldown expired; owed sell retries and places with no buy placement or fill. *)
   Hashtbl.remove state.amend_cooldowns "place_Sell";
   run_leg false;
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let found =
     List.exists
       (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -321,7 +321,7 @@ let test_hl_buy_fill_accrues_reserve () =
      the credit uses net landed qty: 0.5 fill, maker_fee 0.0004 -> 0.5*(1-0.0004) =
      0.4998, not 0.5 (gross would overstate inventory and let sells dip into the reserve). *)
   let symbol = "HL_ACCRUAL/BTC/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.5;
   state.maker_fee <- 0.0004;
@@ -329,8 +329,8 @@ let test_hl_buy_fill_accrues_reserve () =
   state.reserved_base <- 0.0;
   state.position_base <- 0.0;
   state.buy_credits_since_balance <- [];
-  Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done symbol;
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done symbol;
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
     ~now:0.0
     symbol
     "hlacc1"
@@ -360,13 +360,13 @@ let test_hl_buy_fill_accrues_reserve () =
      < 1e-9);
   (* Kraken: buy fill updates refs only, no reserve. *)
   let kr_symbol = "KR_ACCRUAL/XMR/USD" in
-  let kr_state = Dio_strategies.Jacobs_ladder.get_strategy_state kr_symbol in
+  let kr_state = Dio_strategies.Strategy_api.get_strategy_state kr_symbol in
   kr_state.exchange_id <- "kraken";
   kr_state.grid_qty <- 0.04;
   kr_state.cached_sell_mult <- 0.999;
   kr_state.reserved_base <- 0.0;
-  Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done kr_symbol;
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done kr_symbol;
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
     ~now:0.0
     kr_symbol
     "kracc1"
@@ -391,7 +391,7 @@ let test_hl_buy_fill_accrues_reserve () =
 let test_unnetted_sell_hold_gates_second_sizing () =
   let symbol = "UNNET1/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.18;
   state.maker_fee <- 0.0004;
@@ -407,7 +407,7 @@ let test_unnetted_sell_hold_gates_second_sizing () =
   state.last_buy_fill_price <- Some 88.6;
   state.last_buy_fill_qty <- Some 0.18;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.18"
     ; grid_interval = 0.36
@@ -420,8 +420,8 @@ let test_unnetted_sell_hold_gates_second_sizing () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -429,9 +429,9 @@ let test_unnetted_sell_hold_gates_second_sizing () =
   in
   drain ();
   let run_leg ~now ~bal ~age =
-    Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    Dio_strategies.Strategy_api.evaluate_sell_leg
       ~persisted_reconcile:
-        (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+        (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
       ~state
       ~now
       ~asset
@@ -447,7 +447,7 @@ let test_unnetted_sell_hold_gates_second_sizing () =
   (* Tick 1: balance 0.4024, reserved 0.0224 -> sell sizes the full 0.38 free float; venue
      holds it. Balance message is current (age 0.1). *)
   run_leg ~now:100.0 ~bal:0.4024 ~age:0.1;
-  let pushed1 = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed1 = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let sell1 =
     List.find_opt
       (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -474,7 +474,7 @@ let test_unnetted_sell_hold_gates_second_sizing () =
     (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
        state.duplicate_key_sell);
   run_leg ~now:102.0 ~bal:0.4024 ~age:3.0;
-  let pushed2 = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed2 = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let sell2_qty =
     List.fold_left
       (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -503,13 +503,13 @@ let test_unnetted_sell_hold_gates_second_sizing () =
   ignore
     (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
        state.duplicate_key_sell);
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:103.0
     ~base_balance_age:(Some 0.2)
     ~asset_balance:(0.4024 -. qty1);
   run_leg ~now:103.0 ~bal:(0.4024 -. qty1) ~age:0.2;
-  let pushed3 = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed3 = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let sell3_qty =
     List.fold_left
       (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -530,7 +530,7 @@ let test_unnetted_sell_hold_gates_second_sizing () =
 let test_unnetted_sell_hold_expires_after_grace () =
   let symbol = "UNNET2/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.18;
   state.maker_fee <- 0.0004;
@@ -551,7 +551,7 @@ let test_unnetted_sell_hold_expires_after_grace () =
      exercised. *)
   state.sell_holds_since_balance <- [ 0.0, 0.38 ];
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.18"
     ; grid_interval = 0.36
@@ -564,17 +564,17 @@ let test_unnetted_sell_hold_expires_after_grace () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:20.0
     ~asset
@@ -600,7 +600,7 @@ let test_unnetted_sell_hold_capped_even_with_age () =
      No new placement is triggered. *)
   let symbol = "UNNET3/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.18;
   state.maker_fee <- 0.0004;
@@ -619,7 +619,7 @@ let test_unnetted_sell_hold_capped_even_with_age () =
   (* Placed 100s ago; newest balance message equally old. *)
   state.sell_holds_since_balance <- [ now -. 100.0, 0.38 ];
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.18"
     ; grid_interval = 0.36
@@ -632,17 +632,17 @@ let test_unnetted_sell_hold_capped_even_with_age () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now
     ~asset
@@ -672,7 +672,7 @@ let test_unnetted_sell_hold_releases_on_newer_message () =
      increase case is test_unnetted_sell_hold_ignores_buy_increase. *)
   let symbol = "UNNET4/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.15;
   state.maker_fee <- 0.0004;
@@ -695,7 +695,7 @@ let test_unnetted_sell_hold_releases_on_newer_message () =
      the placement. *)
   state.sell_holds_since_balance <- [ 100.0, 0.15 ];
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.15"
     ; grid_interval = 0.4
@@ -708,17 +708,17 @@ let test_unnetted_sell_hold_releases_on_newer_message () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:110.0
     ~asset
@@ -730,7 +730,7 @@ let test_unnetted_sell_hold_releases_on_newer_message () =
     ~ecfg
     ~locked_in_sells:0.0
     ~base_balance_age:(Some 1.0);
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let sell_qty =
     List.fold_left
       (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -767,7 +767,7 @@ let test_unnetted_sell_hold_burst_downmove () =
      single lot size. *)
   let symbol = "BURST_HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.15;
   (* Zero fee: buy credit equals the lot qty; a fee would perturb arithmetic but not the
@@ -789,9 +789,9 @@ let test_unnetted_sell_hold_burst_downmove () =
   state.sell_holds_since_balance <- [];
   state.last_buy_fill_price <- None;
   state.last_buy_fill_qty <- None;
-  Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done symbol;
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done symbol;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.15"
     ; grid_interval = 0.4
@@ -804,8 +804,8 @@ let test_unnetted_sell_hold_burst_downmove () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -821,7 +821,7 @@ let test_unnetted_sell_hold_burst_downmove () =
     let fill_now = 100.0 +. (float_of_int i *. 1.0) in
     (* 1) a buy fills at the falling price, crediting base. *)
     venue_total := !venue_total +. lot;
-    Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+    Dio_strategies.Strategy_api.Strategy.handle_order_filled
       ~now:fill_now
       symbol
       (Printf.sprintf "burst_buy_%d" i)
@@ -832,15 +832,15 @@ let test_unnetted_sell_hold_burst_downmove () =
     (* 2) Balance snapshot after both the new fill and the previous resting sell's hold:
        tradeable net unchanged (no drop), message newer than the armed hold. *)
     let msg_now = fill_now +. 0.5 in
-    Dio_strategies.Jacobs_ladder.reconcile_position
+    Dio_strategies.Strategy_api.reconcile_position
       ~state
       ~now:msg_now
       ~base_balance_age:(Some 0.0)
       ~asset_balance:(!venue_total -. !venue_hold);
     (* 3) Sell leg runs; the owed 1:1 sell must place at the single lot. *)
-    Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    Dio_strategies.Strategy_api.evaluate_sell_leg
       ~persisted_reconcile:
-        (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+        (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
       ~state
       ~now:(msg_now +. 0.5)
       ~asset
@@ -859,7 +859,7 @@ let test_unnetted_sell_hold_burst_downmove () =
           | Place, Sell when o.symbol = symbol -> acc +. o.qty
           | _ -> acc)
         0.0
-        (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+        (Dio_strategies.Strategy_api.get_pending_orders 100)
     in
     sold := (i, qty) :: !sold;
     (* A blocked rung places nothing and locks nothing (the guarded pile-up). *)
@@ -895,7 +895,7 @@ let test_unnetted_sell_hold_ignores_buy_increase () =
      cannot have applied a sell hold: the guard stays until a flat/down message or grace. *)
   let symbol = "UNNET5/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.15;
   state.maker_fee <- 0.0004;
@@ -920,7 +920,7 @@ let test_unnetted_sell_hold_ignores_buy_increase () =
   (* The sell hold was armed at t=100 for one lot. *)
   state.sell_holds_since_balance <- [ 100.0, 0.15 ];
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.15"
     ; grid_interval = 0.16
@@ -933,8 +933,8 @@ let test_unnetted_sell_hold_ignores_buy_increase () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -946,12 +946,12 @@ let test_unnetted_sell_hold_ignores_buy_increase () =
         o.operation = Dio_strategies.Strategy_common.Place
         && o.side = Dio_strategies.Strategy_common.Sell
         && o.symbol = symbol)
-      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
   in
   drain ();
   (* Message t=110 (age 1.0): tradeable 0.05 -> 0.20, a +0.15 buy-fill increase not yet
      carrying the sell's hold. *)
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:110.0
     ~base_balance_age:(Some 1.0)
@@ -966,9 +966,9 @@ let test_unnetted_sell_hold_ignores_buy_increase () =
     "the increasing message is recorded as positive for the guard"
     true
     (state.last_balance_delta > 0.0);
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:110.0
     ~asset
@@ -993,7 +993,7 @@ let test_unnetted_sell_hold_ignores_buy_increase () =
   ignore
     (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
        state.duplicate_key_sell);
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:111.0
     ~base_balance_age:(Some 1.0)
@@ -1003,9 +1003,9 @@ let test_unnetted_sell_hold_ignores_buy_increase () =
     "the flat message is recorded as non-increasing"
     true
     (state.last_balance_delta <= 0.0);
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:111.0
     ~asset
@@ -1028,9 +1028,9 @@ let test_ghost_buy_suppressed_within_ack_grace () =
      rapid-fill cascade that over-sized a sell. A buy acked within the grace survives the
      feed lag; after the grace a still-absent buy is a genuine ghost. *)
   let symbol = "GHOST1/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "kraken";
-  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "kraken";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "kraken";
   Sell_orders.clear state.open_sell_orders;
   state.pending_orders <- [];
   Hashtbl.clear state.sell_commitments;
@@ -1042,7 +1042,7 @@ let test_ghost_buy_suppressed_within_ack_grace () =
   state.last_buy_order_price <- Some 100.0;
   state.reserved_quote <- 5.0;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    { Dio_strategies.Strategy_api.exchange = "kraken"
     ; symbol
     ; qty = "0.1"
     ; grid_interval = 0.5
@@ -1055,13 +1055,13 @@ let test_ghost_buy_suppressed_within_ack_grace () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
   let now = Unix.gettimeofday () in
   let feed = ref [] in
   let iter_open_orders f = List.iter (fun (a, b, c, d, e) -> f a b c d e) !feed in
   let run_scan () =
     ignore
-      (Dio_strategies.Jacobs_ladder.sync_open_orders
+      (Dio_strategies.Strategy_api.sync_open_orders
          ~state
          ~now
          ~asset
@@ -1107,7 +1107,7 @@ let test_position_ledger_bridges_unreflected_fill () =
      sizes against the fill while the feed is still pre-fill. *)
   let symbol = "LEDGER1/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.2;
   state.maker_fee <- 0.0004;
@@ -1130,7 +1130,7 @@ let test_position_ledger_bridges_unreflected_fill () =
   state.buy_credits_since_balance <- [ 999.5, 0.2 ];
   state.sell_holds_since_balance <- [];
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.2"
     ; grid_interval = 0.16
@@ -1143,8 +1143,8 @@ let test_position_ledger_bridges_unreflected_fill () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -1158,9 +1158,9 @@ let test_position_ledger_bridges_unreflected_fill () =
     "stale venue snapshot alone is below the venue floor"
     true
     (0.1936 -. state.reserved_base < state.cached_qty_increment);
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:1000.0
     ~asset
@@ -1172,7 +1172,7 @@ let test_position_ledger_bridges_unreflected_fill () =
     ~ecfg
     ~locked_in_sells:0.0
     ~base_balance_age:(Some 0.5);
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let sell_qty =
     List.fold_left
       (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -1196,7 +1196,7 @@ let test_position_reconcile_freshness_gate () =
      leaves the ledger and overlay untouched. *)
   let symbol = "LEDGER2/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.reserved_base <- 0.19117916;
   state.position_base <- 0.4;
@@ -1205,7 +1205,7 @@ let test_position_reconcile_freshness_gate () =
   state.buy_credits_since_balance <- [ 998.5, 0.2 ];
   (* Message generated at 999 (now 1000.5, age 1.5): adopt the figure and prune the credit
      it covers. *)
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:1000.5
     ~base_balance_age:(Some 1.5)
@@ -1223,7 +1223,7 @@ let test_position_reconcile_freshness_gate () =
   (* Later fill, then a message that does not advance the feed timestamp: neither the
      adopted value nor the fresh credit changes. *)
   state.buy_credits_since_balance <- [ 999.7, 0.15 ];
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:1000.1
     ~base_balance_age:(Some 1.4)
@@ -1239,7 +1239,7 @@ let test_position_reconcile_freshness_gate () =
     true
     (List.length state.buy_credits_since_balance = 1);
   (* Feed catches up (generated 1001.5): adopt the value and prune. *)
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:1002.0
     ~base_balance_age:(Some 0.5)
@@ -1262,14 +1262,14 @@ let test_position_reconcile_lower_balance_cannot_dip_reserve () =
      own free inventory. *)
   let symbol = "LEDGER3/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.reserved_base <- 0.19117916;
   state.position_base <- 0.9;
   state.position_initialized <- true;
   state.position_venue_ts <- 500.0;
   state.buy_credits_since_balance <- [];
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:501.0
     ~base_balance_age:(Some 0.5)
@@ -1295,7 +1295,7 @@ let test_position_seed_prunes_covered_credit () =
      reach reserved_base. *)
   let symbol = "LEDGER4/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.reserved_base <- 0.19117916;
   state.position_initialized <- false;
@@ -1303,7 +1303,7 @@ let test_position_seed_prunes_covered_credit () =
   state.position_venue_ts <- 0.0;
   state.buy_credits_since_balance <- [ 998.5, 0.2 ];
   (* First message generated at 999 (after the fill at 998.5). *)
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:1000.5
     ~base_balance_age:(Some 1.5)
@@ -1330,14 +1330,14 @@ let test_position_seed_keeps_newer_credit () =
      it. The credit survives the seed so the just-filled buy remains sellable. *)
   let symbol = "LEDGER5/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.reserved_base <- 0.19117916;
   state.position_initialized <- false;
   state.position_base <- 0.0;
   state.position_venue_ts <- 0.0;
   state.buy_credits_since_balance <- [ 999.5, 0.2 ];
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:1000.5
     ~base_balance_age:(Some 1.5)
@@ -1359,13 +1359,13 @@ let test_position_stale_message_does_not_regress_ledger () =
      (WS reconnect replay, clock skew). *)
   let symbol = "LEDGER6/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.position_base <- 0.4;
   state.position_initialized <- true;
   state.position_venue_ts <- 1000.0;
   state.buy_credits_since_balance <- [];
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:1000.1
     ~base_balance_age:(Some 10.0)
@@ -1382,14 +1382,14 @@ let test_position_partial_credit_prune () =
      newer credit survives. *)
   let symbol = "LEDGER7/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.position_base <- 0.2;
   state.position_initialized <- true;
   state.position_venue_ts <- 998.0;
   state.buy_credits_since_balance <- [ 998.5, 0.1; 999.5, 0.2 ];
   (* Message generated at 999.5; fill at 998.5 covered, fill at 999.5 not. *)
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:1000.0
     ~base_balance_age:(Some 0.5)
@@ -1412,7 +1412,7 @@ let test_position_balance_before_fill_no_double_credit () =
      (production over-sell: fill 0.2, adopted 0.4, sell 0.4, insufficient-balance reject). *)
   let symbol = "LEDGER17/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.2;
   state.maker_fee <- 0.0004;
@@ -1431,7 +1431,7 @@ let test_position_balance_before_fill_no_double_credit () =
   state.startup_replay <- false;
   state.last_fill_oid <- None;
   (* Balance message already includes the 0.2 fill. *)
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:1001.0
     ~base_balance_age:(Some 0.0)
@@ -1447,7 +1447,7 @@ let test_position_balance_before_fill_no_double_credit () =
     true
     (state.attributed_balance_increase > 0.19);
   (* Execution event for the same fill arrives after the balance message. *)
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
     ~now:1001.2
     symbol
     "542258992352"
@@ -1466,7 +1466,7 @@ let test_position_balance_before_fill_no_double_credit () =
     true
     (abs_float state.attributed_balance_increase < 1e-9);
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.2"
     ; grid_interval = 0.16
@@ -1479,17 +1479,17 @@ let test_position_balance_before_fill_no_double_credit () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:1001.3
     ~asset
@@ -1501,7 +1501,7 @@ let test_position_balance_before_fill_no_double_credit () =
     ~ecfg
     ~locked_in_sells:0.0
     ~base_balance_age:(Some 0.3);
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let sell_qty =
     List.fold_left
       (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -1524,13 +1524,13 @@ let test_position_upward_reconcile_adopts_venue () =
      so adopt upward rather than keeping the stale ledger. *)
   let symbol = "LEDGER8/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.position_base <- 0.1;
   state.position_initialized <- true;
   state.position_venue_ts <- 1000.0;
   state.buy_credits_since_balance <- [];
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:1001.0
     ~base_balance_age:(Some 0.5)
@@ -1547,13 +1547,13 @@ let test_position_nan_balance_does_not_seed () =
      credits. *)
   let symbol = "LEDGER9/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.position_initialized <- false;
   state.position_base <- 0.0;
   state.position_venue_ts <- 0.0;
   state.buy_credits_since_balance <- [ 999.5, 0.2 ];
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:1000.0
     ~base_balance_age:(Some 0.5)
@@ -1572,7 +1572,7 @@ let test_position_buy_credit_and_sell_hold_cancel () =
      base committed to the resting sell. *)
   let symbol = "LEDGER10/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.2;
   state.maker_fee <- 0.0004;
@@ -1592,7 +1592,7 @@ let test_position_buy_credit_and_sell_hold_cancel () =
   state.buy_credits_since_balance <- [ 999.5, 0.2 ];
   state.sell_holds_since_balance <- [ 999.5, 0.2 ];
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.2"
     ; grid_interval = 0.16
@@ -1605,17 +1605,17 @@ let test_position_buy_credit_and_sell_hold_cancel () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:1000.0
     ~asset
@@ -1627,7 +1627,7 @@ let test_position_buy_credit_and_sell_hold_cancel () =
     ~ecfg
     ~locked_in_sells:0.0
     ~base_balance_age:(Some 0.5);
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let sell_qty =
     List.fold_left
       (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -1650,7 +1650,7 @@ let test_position_dead_feed_credit_expires () =
      against base the feed never confirmed. *)
   let symbol = "LEDGER11/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.2;
   state.maker_fee <- 0.0004;
@@ -1670,7 +1670,7 @@ let test_position_dead_feed_credit_expires () =
   state.buy_credits_since_balance <- [ 900.0, 0.2 ];
   state.sell_holds_since_balance <- [];
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.2"
     ; grid_interval = 0.16
@@ -1683,17 +1683,17 @@ let test_position_dead_feed_credit_expires () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:1000.0
     ~asset
@@ -1710,7 +1710,7 @@ let test_position_dead_feed_credit_expires () =
     "stale credit decays after the grace"
     true
     (state.buy_credits_since_balance = []);
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   check
     bool
     "expired credit cannot size a sale"
@@ -1729,7 +1729,7 @@ let test_position_reserved_exceeds_ledger_clamps () =
   (* Over-reserved dust: ledger below reserved_base -> nothing sellable, no negative size. *)
   let symbol = "LEDGER12/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.2;
   state.maker_fee <- 0.0004;
@@ -1749,7 +1749,7 @@ let test_position_reserved_exceeds_ledger_clamps () =
   state.buy_credits_since_balance <- [];
   state.sell_holds_since_balance <- [];
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.2"
     ; grid_interval = 0.16
@@ -1762,17 +1762,17 @@ let test_position_reserved_exceeds_ledger_clamps () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:1000.0
     ~asset
@@ -1784,7 +1784,7 @@ let test_position_reserved_exceeds_ledger_clamps () =
     ~ecfg
     ~locked_in_sells:0.0
     ~base_balance_age:(Some 0.5);
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   check
     bool
     "reserved-exceeding ledger places nothing and never sizes negative"
@@ -1804,7 +1804,7 @@ let test_position_startup_replay_records_no_credit () =
      create live pending credits: the venue already holds that base and the seed will
      count it. *)
   let symbol = "LEDGER13/BTC/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.0002;
   state.maker_fee <- 0.0004;
@@ -1813,7 +1813,7 @@ let test_position_startup_replay_records_no_credit () =
   state.buy_credits_since_balance <- [];
   state.startup_replay <- true;
   state.last_fill_oid <- Some "1";
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
     ~now:500.0
     symbol
     "2"
@@ -1832,9 +1832,9 @@ let test_position_gross_venue_sell_fill_decrements () =
   (* Gross-balance venues (Alpaca) report the full holding, so the ledger falls by the
      sold qty at fill, clamped at zero. *)
   let symbol = "LEDGER14/QQQ" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "alpaca";
-  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "alpaca";
   state.grid_qty <- 0.5;
   state.cached_sell_mult <- 0.9;
   state.reserved_base <- 0.0;
@@ -1847,7 +1847,7 @@ let test_position_gross_venue_sell_fill_decrements () =
   state.base_accumulation_enabled <- false;
   state.startup_replay <- false;
   state.last_fill_oid <- None;
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
     ~now:600.0
     symbol
     "gross-sell-1"
@@ -1867,9 +1867,9 @@ let test_position_accumulation_sell_fill_keeps_ledger () =
      the ledger - does not move on a sell fill; the reconciliation absorbs the netting.
      Decrementing here would double-count. *)
   let symbol = "LEDGER15/HYPE/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
-  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "hyperliquid";
   state.grid_qty <- 0.2;
   state.cached_sell_mult <- 0.98;
   state.reserved_base <- 0.0;
@@ -1882,7 +1882,7 @@ let test_position_accumulation_sell_fill_keeps_ledger () =
   state.base_accumulation_enabled <- false;
   state.startup_replay <- false;
   state.last_fill_oid <- None;
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
     ~now:600.0
     symbol
     "accum-sell-1"
@@ -1902,9 +1902,9 @@ let test_position_asset_low_recovery_sees_pending_credit () =
      fill tick and sells stay wedged after a burst rejection. *)
   let symbol = "LEDGER16/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
-  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "hyperliquid";
   state.reserved_base <- 0.19117916;
   state.position_base <- 0.1936;
   state.position_initialized <- true;
@@ -1913,7 +1913,7 @@ let test_position_asset_low_recovery_sees_pending_credit () =
   state.asset_low <- true;
   state.last_seen_asset_balance <- 0.1936;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.2"
     ; grid_interval = 0.16
@@ -1926,8 +1926,8 @@ let test_position_asset_low_recovery_sees_pending_credit () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  Dio_strategies.Jacobs_ladder.evaluate_asset_low_recovery
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  Dio_strategies.Strategy_api.evaluate_asset_low_recovery
     ~state
     ~now:1000.0
     ~base_balance_age:(Some 0.5)
@@ -1956,7 +1956,7 @@ let test_position_sell_hold_releases_fifo_on_netting () =
      a hold. *)
   let symbol = "LEDGER18/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.buy_credits_since_balance <- [];
   state.attributed_balance_increase <- 0.0;
@@ -1966,7 +1966,7 @@ let test_position_sell_hold_releases_fifo_on_netting () =
   state.position_venue_ts <- 999.0;
   (* A 0.15 tradeable drop (the older hold netting) must retire only the oldest hold,
      leaving the newer one outstanding. *)
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:1002.0
     ~base_balance_age:(Some 0.5)
@@ -1985,7 +1985,7 @@ let test_position_sell_hold_releases_fifo_on_netting () =
   state.sell_holds_since_balance <- [ 1003.0, 0.2 ];
   state.position_base <- 0.35;
   state.position_venue_ts <- 1002.0;
-  Dio_strategies.Jacobs_ladder.reconcile_position
+  Dio_strategies.Strategy_api.reconcile_position
     ~state
     ~now:1004.0
     ~base_balance_age:(Some 0.5)
@@ -2005,7 +2005,7 @@ let test_sell_never_offers_locked_inventory () =
      resting sell 0.0388 + gross holding 0.0836 (incl. just-filled 0.04 buy): only 0.04
      sellable, not 0.0788. *)
   let symbol = "LEDGER19/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "kraken";
   state.grid_qty <- 0.04;
   state.maker_fee <- 0.0;
@@ -2030,7 +2030,7 @@ let test_sell_never_offers_locked_inventory () =
   state.last_buy_fill_price <- Some 528.83;
   state.last_buy_fill_qty <- Some 0.04;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    { Dio_strategies.Strategy_api.exchange = "kraken"
     ; symbol
     ; qty = "0.04"
     ; grid_interval = 0.16
@@ -2043,17 +2043,17 @@ let test_sell_never_offers_locked_inventory () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:1000.0
     ~asset
@@ -2063,9 +2063,9 @@ let test_sell_never_offers_locked_inventory () =
     ~buy_attempted:false
     ~oracle_halted:false
     ~ecfg
-    ~locked_in_sells:(Dio_strategies.Jacobs_ladder.committed_sell_base state)
+    ~locked_in_sells:(Dio_strategies.Strategy_api.committed_sell_base state)
     ~base_balance_age:(Some 0.5);
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let sell_qty =
     List.fold_left
       (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -2090,7 +2090,7 @@ let test_sell_never_offers_locked_inventory () =
     bool
     "the dispatched sell is added to the commitment ledger"
     true
-    (abs_float (Dio_strategies.Jacobs_ladder.committed_sell_base state -. 0.0788) < 1e-6);
+    (abs_float (Dio_strategies.Strategy_api.committed_sell_base state -. 0.0788) < 1e-6);
   drain ()
 ;;
 
@@ -2103,9 +2103,9 @@ let test_inflight_sell_commitment_survives_feed_gap () =
      from its own state, so it trusts the feed and evicts instead (see
      test_sell_commitment_lifecycle_all_venues). *)
   let symbol = "LEDGER20/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "kraken";
-  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "kraken";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "kraken";
   Sell_orders.clear state.open_sell_orders;
   Hashtbl.clear state.sell_commitments;
   state.pending_orders <- [];
@@ -2113,7 +2113,7 @@ let test_inflight_sell_commitment_survives_feed_gap () =
   state.last_buy_order_price <- None;
   state.inflight_sell <- false;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    { Dio_strategies.Strategy_api.exchange = "kraken"
     ; symbol
     ; qty = "0.2"
     ; grid_interval = 0.16
@@ -2126,13 +2126,13 @@ let test_inflight_sell_commitment_survives_feed_gap () =
     ; sell_levels_persistence = false
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
   let now = Unix.gettimeofday () in
   let feed = ref [] in
   let iter_open_orders f = List.iter (fun (a, b, c, d, e) -> f a b c d e) !feed in
   let locked () =
     let _, _, _, locked, _, _, _ =
-      Dio_strategies.Jacobs_ladder.sync_open_orders
+      Dio_strategies.Strategy_api.sync_open_orders
         ~state
         ~now
         ~asset
@@ -2145,7 +2145,7 @@ let test_inflight_sell_commitment_survives_feed_gap () =
     locked
   in
   (* 1) Dispatched, not yet acked/listed: the base is already committed. *)
-  Dio_strategies.Jacobs_ladder.arm_sell_commitment
+  Dio_strategies.Strategy_api.arm_sell_commitment
     ~state
     ~id:"pending_sell_100.00"
     ~price:100.0
@@ -2162,7 +2162,7 @@ let test_inflight_sell_commitment_survives_feed_gap () =
     true
     (Sell_orders.exists_id state.open_sell_orders "pending_sell_100.00");
   (* 2) Ack re-keys to the venue id; still not listed. *)
-  Dio_strategies.Jacobs_ladder.rekey_sell_commitment
+  Dio_strategies.Strategy_api.rekey_sell_commitment
     ~state
     ~old_id:"pending_sell_100.00"
     ~new_id:"venue-1"
@@ -2196,7 +2196,7 @@ let test_inflight_sell_commitment_survives_feed_gap () =
     true
     (abs_float (l5 -. 0.12) < 1e-9);
   (* 5) Only a terminal event releases it. *)
-  Dio_strategies.Jacobs_ladder.remove_sell_commitment ~state ~id:"venue-1";
+  Dio_strategies.Strategy_api.remove_sell_commitment ~state ~id:"venue-1";
   let l6 = locked () in
   check bool "a terminal event releases the commitment" true (l6 < 1e-12)
 ;;
@@ -2209,7 +2209,7 @@ let test_sub_minimum_qty_sell_places () =
      $1-style floor. *)
   let symbol = "SUBMINQTY/BTC/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.5;
   state.maker_fee <- 0.0004;
@@ -2224,7 +2224,7 @@ let test_sub_minimum_qty_sell_places () =
   state.last_buy_fill_price <- Some 62369.0;
   state.last_buy_fill_qty <- Some 0.5;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.5"
     ; grid_interval = 0.75
@@ -2237,17 +2237,17 @@ let test_sub_minimum_qty_sell_places () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -2259,7 +2259,7 @@ let test_sub_minimum_qty_sell_places () =
     ~locked_in_sells:0.0
     ~base_balance_age:None
     ~oracle_halted:false;
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let sell_qty =
     List.find_map
       (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -2285,30 +2285,30 @@ let test_balance_checking () =
     bool
     "sufficient buy balance"
     true
-    (Dio_strategies.Jacobs_ladder.can_place_buy_order 0.001 100.0 50.0);
+    (Dio_strategies.Strategy_api.can_place_buy_order 0.001 100.0 50.0);
   check
     bool
     "insufficient buy balance"
     false
-    (Dio_strategies.Jacobs_ladder.can_place_buy_order 0.001 10.0 50.0);
+    (Dio_strategies.Strategy_api.can_place_buy_order 0.001 10.0 50.0);
   check
     bool
     "sufficient sell balance"
     true
-    (Dio_strategies.Jacobs_ladder.can_place_sell_order 0.001 1.0 0.001);
+    (Dio_strategies.Strategy_api.can_place_sell_order 0.001 1.0 0.001);
   check
     bool
     "insufficient sell balance"
     false
-    (Dio_strategies.Jacobs_ladder.can_place_sell_order 0.001 0.0005 0.001)
+    (Dio_strategies.Strategy_api.can_place_sell_order 0.001 0.0005 0.001)
 ;;
 
 let test_order_acknowledgment () =
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state "TEST/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state "TEST/USD" in
   state.pending_orders
   <- ("test123", Dio_strategies.Strategy_common.Buy, 50000.0, Unix.time ())
      :: state.pending_orders;
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+  Dio_strategies.Strategy_api.Strategy.handle_order_acknowledged
     ~now:0.0
     "TEST/USD"
     "order456"
@@ -2318,12 +2318,12 @@ let test_order_acknowledgment () =
 ;;
 
 let test_order_cancellation () =
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state "TEST2/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state "TEST2/USD" in
   state.last_buy_order_id <- Some "buy123";
   state.last_buy_order_price <- Some 49000.0;
   state.open_sell_orders
   <- Sell_orders.of_list [ "sell456", 51000.0, 1.0; "sell789", 52000.0, 1.0 ];
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_cancelled
+  Dio_strategies.Strategy_api.Strategy.handle_order_cancelled
     ~now:0.0
     "TEST2/USD"
     "buy123"
@@ -2336,10 +2336,10 @@ let test_order_cancellation () =
 let test_order_cancellation_matches_client_order_id () =
   (* Lighter (and similar): strategy may still track client index while the execution feed
      reports exchange order_index on cancel. *)
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state "TEST_CLID/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state "TEST_CLID/USD" in
   state.last_buy_order_id <- Some "1";
   state.last_buy_order_price <- Some 2200.0;
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_cancelled
+  Dio_strategies.Strategy_api.Strategy.handle_order_cancelled
     ~now:0.0
     "TEST_CLID/USD"
     "577023702126926647"
@@ -2350,10 +2350,10 @@ let test_order_cancellation_matches_client_order_id () =
 ;;
 
 let test_order_rejection () =
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state "TEST3/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state "TEST3/USD" in
   state.pending_orders
   <- [ "test123", Dio_strategies.Strategy_common.Sell, 51000.0, Unix.time () ];
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_rejected
+  Dio_strategies.Strategy_api.Strategy.handle_order_rejected
     ~now:0.0
     "TEST3/USD"
     Dio_strategies.Strategy_common.Sell
@@ -2368,17 +2368,17 @@ let test_order_rejection () =
    insufficient-balance or stale-cancel paths. *)
 let test_tif_recovery_armed_on_amendment_failed () =
   let symbol = "TIFREC1/HYPE/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.tif_recovery_pending <- false;
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_amendment_failed
+  Dio_strategies.Strategy_api.Strategy.handle_order_amendment_failed
     ~now:100.0
     symbol
     "tiford1"
@@ -2395,17 +2395,17 @@ let test_tif_recovery_armed_on_amendment_failed () =
 
 let test_tif_recovery_not_armed_on_non_tif_amend_failure () =
   let symbol = "TIFREC2/HYPE/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.tif_recovery_pending <- false;
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_amendment_failed
+  Dio_strategies.Strategy_api.Strategy.handle_order_amendment_failed
     ~now:100.0
     symbol
     "tiford2"
@@ -2426,20 +2426,20 @@ let test_tif_recovery_not_armed_on_non_tif_amend_failure () =
    failed cancel+replace every cooldown. *)
 let test_alpaca_filled_amend_failure_clears_tracking () =
   let symbol = "TERM1/SMH/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "alpaca";
   state.tif_recovery_pending <- false;
   state.last_buy_order_id <- Some "ab4f2af3";
   state.last_buy_order_price <- Some 566.63;
   Hashtbl.remove state.evicted_orders "ab4f2af3";
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_amendment_failed
+  Dio_strategies.Strategy_api.Strategy.handle_order_amendment_failed
     ~now:100.0
     symbol
     "ab4f2af3"
@@ -2465,11 +2465,11 @@ let test_alpaca_filled_amend_failure_clears_tracking () =
 
 let test_tif_recovery_not_armed_on_insufficient_failed () =
   let symbol = "TIFREC3/HYPE/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.tif_recovery_pending <- false;
   state.last_buy_attempted_insufficient <- false;
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_failed
+  Dio_strategies.Strategy_api.Strategy.handle_order_failed
     ~now:100.0
     symbol
     Dio_strategies.Strategy_common.Buy
@@ -2483,10 +2483,10 @@ let test_tif_recovery_not_armed_on_insufficient_failed () =
 
 let test_tif_recovery_armed_on_transient_failed () =
   let symbol = "TIFREC4/HYPE/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.tif_recovery_pending <- false;
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_failed
+  Dio_strategies.Strategy_api.Strategy.handle_order_failed
     ~now:100.0
     symbol
     Dio_strategies.Strategy_common.Buy
@@ -2500,10 +2500,10 @@ let test_tif_recovery_armed_on_transient_failed () =
 
 let test_tif_recovery_cleared_on_buy_ack () =
   let symbol = "TIFREC5/HYPE/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.tif_recovery_pending <- true;
   state.tif_recovery_since <- Unix.gettimeofday ();
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+  Dio_strategies.Strategy_api.Strategy.handle_order_acknowledged
     ~now:200.0
     symbol
     "tifack1"
@@ -2518,12 +2518,12 @@ let test_tif_recovery_cleared_on_buy_ack () =
 
 let test_tif_recovery_armed_on_ghost_buy_ws_kill () =
   let symbol = "TIFREC6/HYPE/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.tif_recovery_pending <- false;
   state.last_buy_order_id <- None;
   Sell_orders.clear state.open_sell_orders;
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -2533,7 +2533,7 @@ let test_tif_recovery_armed_on_ghost_buy_ws_kill () =
   (* Dispatch a fresh buy placement: push_order registers the pending_buy_ token and the
      in-flight guard. *)
   let order =
-    Dio_strategies.Jacobs_ladder.create_place_order
+    Dio_strategies.Strategy_api.create_place_order
       state.duplicate_key_buy
       symbol
       Dio_strategies.Strategy_common.Buy
@@ -2547,7 +2547,7 @@ let test_tif_recovery_armed_on_ghost_buy_ws_kill () =
     bool
     "placement dispatched"
     true
-    (Dio_strategies.Jacobs_ladder.push_order ~now:100.0 ~state order);
+    (Dio_strategies.Strategy_api.push_order ~now:100.0 ~state order);
   let has_token =
     List.exists
       (fun (id, _, _, _) -> String.starts_with ~prefix:"pending_buy_" id)
@@ -2557,7 +2557,7 @@ let test_tif_recovery_armed_on_ghost_buy_ws_kill () =
   (* Venue WS rejects the never-acked placement: a cancel event for an untracked id
      arrives and the ghost purge removes the token; this is a buy-placement kill and must
      arm recovery. *)
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_cancelled
+  Dio_strategies.Strategy_api.Strategy.handle_order_cancelled
     ~now:101.0
     symbol
     "ws_rejected_untracked_id"
@@ -2581,12 +2581,12 @@ let test_tif_recovery_armed_on_ghost_buy_ws_kill () =
 
 let test_tif_recovery_not_armed_on_stale_cancel () =
   let symbol = "TIFREC7/HYPE/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.tif_recovery_pending <- false;
   state.last_buy_order_id <- None;
   Sell_orders.clear state.open_sell_orders;
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -2596,7 +2596,7 @@ let test_tif_recovery_not_armed_on_stale_cancel () =
   (* Previously tracked (acked) buy: its id is in the ever-tracked set. A late WS cancel
      arrives after tracking was wiped (ghost-buy sync): the cancel is stale and must not
      arm recovery, since no placement died. *)
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+  Dio_strategies.Strategy_api.Strategy.handle_order_acknowledged
     ~now:100.0
     symbol
     "stale_cancel_id"
@@ -2605,7 +2605,7 @@ let test_tif_recovery_not_armed_on_stale_cancel () =
   check bool "ack cleared the latch" false state.tif_recovery_pending;
   state.last_buy_order_id <- None;
   state.last_buy_order_price <- None;
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_cancelled
+  Dio_strategies.Strategy_api.Strategy.handle_order_cancelled
     ~now:110.0
     symbol
     "stale_cancel_id"
@@ -2624,7 +2624,7 @@ let test_accumulation_profit_tracking () =
      39.90, maker_fee 0.0004: gross = (39.90 - 39.50) * 0.35 = 0.14 fees = (39.90*0.35 +
      39.50*0.35) * 0.0004 = 0.011116 net = 0.14 - 0.011116 = 0.128884 *)
   let symbol = "ACCUM_TEST/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.accumulated_profit <- 0.0;
   state.grid_qty <- 0.35;
   state.maker_fee <- 0.0004;
@@ -2632,10 +2632,10 @@ let test_accumulation_profit_tracking () =
      accumulation. *)
   state.accumulation_buffer <- 5.0;
   (* Clear startup replay gate so fills are processed normally *)
-  Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done symbol;
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done symbol;
   state.last_buy_order_id <- Some "buy001";
   state.last_buy_order_price <- Some 39.50;
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
     ~now:0.0
     symbol
     "buy001"
@@ -2649,7 +2649,7 @@ let test_accumulation_profit_tracking () =
     (Some 39.50)
     state.last_buy_fill_price;
   state.open_sell_orders <- Sell_orders.of_list [ "sell001", 39.90, 1.0 ];
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
     ~now:0.0
     symbol
     "sell001"
@@ -2677,7 +2677,7 @@ let test_accumulation_full_lifecycle () =
   let symbol = "LIFECYCLE_HYPE/USDC" in
   (* Register instrument with HYPE's real lot size: 2 decimal places *)
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.accumulated_profit <- 0.0;
   state.grid_qty <- 0.35;
   (* 0.35 asset *)
@@ -2686,7 +2686,7 @@ let test_accumulation_full_lifecycle () =
      the buffer-reserve path is covered by the store tests. *)
   state.accumulation_buffer <- 2.0;
   (* Clear startup replay gate so fills are processed normally *)
-  Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done symbol;
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done symbol;
   let buy_price = 39.50 in
   (* USDC per asset *)
   let sell_price = 39.90 in
@@ -2697,7 +2697,7 @@ let test_accumulation_full_lifecycle () =
     let sell_id = Printf.sprintf "sell_%d" i in
     state.last_buy_order_id <- Some buy_id;
     state.last_buy_order_price <- Some buy_price;
-    Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+    Dio_strategies.Strategy_api.Strategy.handle_order_filled
       ~now:0.0
       symbol
       buy_id
@@ -2706,7 +2706,7 @@ let test_accumulation_full_lifecycle () =
       ~fill_qty:0.35
       None;
     state.open_sell_orders <- Sell_orders.of_list [ sell_id, sell_price, 1.0 ];
-    Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+    Dio_strategies.Strategy_api.Strategy.handle_order_filled
       ~now:0.0
       symbol
       sell_id
@@ -2730,8 +2730,8 @@ let test_accumulation_multi_strategy_isolation () =
   (* Register instruments with real lot sizes *)
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol:btc_sym ~sz_decimals:5;
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol:hype_sym ~sz_decimals:2;
-  let btc = Dio_strategies.Jacobs_ladder.get_strategy_state btc_sym in
-  let hype = Dio_strategies.Jacobs_ladder.get_strategy_state hype_sym in
+  let btc = Dio_strategies.Strategy_api.get_strategy_state btc_sym in
+  let hype = Dio_strategies.Strategy_api.get_strategy_state hype_sym in
   check bool "distinct state objects" true (btc != hype);
   btc.accumulated_profit <- 0.0;
   btc.grid_qty <- 0.0002;
@@ -2746,8 +2746,8 @@ let test_accumulation_multi_strategy_isolation () =
      observe pure accumulation + gating isolation. *)
   hype.accumulation_buffer <- 5.0;
   (* Clear startup replay gate so fills are processed normally *)
-  Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done btc_sym;
-  Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done hype_sym;
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done btc_sym;
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done hype_sym;
   (* --- BTC cycles: buy@84000 → sell@84336 USDC (+0.4%) --- *)
   (* net = (84336 - 84000) * 0.0002 - fees = 0.0672 - 0.01345 ≈ 0.054 USDC per cycle *)
   for i = 1 to 30 do
@@ -2755,7 +2755,7 @@ let test_accumulation_multi_strategy_isolation () =
     let sell_id = Printf.sprintf "btc_sell_%d" i in
     btc.last_buy_order_id <- Some buy_id;
     btc.last_buy_order_price <- Some 84000.0;
-    Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+    Dio_strategies.Strategy_api.Strategy.handle_order_filled
       ~now:0.0
       btc_sym
       buy_id
@@ -2764,7 +2764,7 @@ let test_accumulation_multi_strategy_isolation () =
       ~fill_qty:0.0002
       None;
     btc.open_sell_orders <- Sell_orders.of_list [ sell_id, 84336.0, 1.0 ];
-    Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+    Dio_strategies.Strategy_api.Strategy.handle_order_filled
       ~now:0.0
       btc_sym
       sell_id
@@ -2787,7 +2787,7 @@ let test_accumulation_multi_strategy_isolation () =
     let sell_id = Printf.sprintf "hype_sell_%d" i in
     hype.last_buy_order_id <- Some buy_id;
     hype.last_buy_order_price <- Some 39.50;
-    Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+    Dio_strategies.Strategy_api.Strategy.handle_order_filled
       ~now:0.0
       hype_sym
       buy_id
@@ -2796,7 +2796,7 @@ let test_accumulation_multi_strategy_isolation () =
       ~fill_qty:0.35
       None;
     hype.open_sell_orders <- Sell_orders.of_list [ sell_id, 39.90, 1.0 ];
-    Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+    Dio_strategies.Strategy_api.Strategy.handle_order_filled
       ~now:0.0
       hype_sym
       sell_id
@@ -2816,23 +2816,23 @@ let test_accumulation_multi_strategy_isolation () =
   (* --- Test reserved_quote (USDC) isolation --- *)
   btc.exchange_id <- "hyperliquid";
   hype.exchange_id <- "hyperliquid";
-  Dio_strategies.Jacobs_ladder.set_asset_reserved_quote btc 16.80;
+  Dio_strategies.Strategy_api.set_asset_reserved_quote btc 16.80;
   (* 0.0002 * 84000 = 16.80 USDC *)
-  Dio_strategies.Jacobs_ladder.set_asset_reserved_quote hype 13.80;
+  Dio_strategies.Strategy_api.set_asset_reserved_quote hype 13.80;
   (* 0.35 * 39.42 ≈ 13.80 USDC *)
-  let total_reserved = Dio_strategies.Jacobs_ladder.get_total_reserved_quote btc in
+  let total_reserved = Dio_strategies.Strategy_api.get_total_reserved_quote btc in
   check bool "total reserved USDC includes both domains" true (total_reserved >= 30.0)
 ;;
 
 let test_virtual_gtc_sell_grid_maintenance () =
   let symbol = "VIRTUAL_GTC/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.persisted_sell_levels <- [ 101.00, 1.0; 98.98, 1.0; 96.96, 1.0 ];
   state.last_buy_fill_price <- Some 96.0;
   Sell_orders.clear state.open_sell_orders;
   (* Expired or missing DAY orders *)
   let asset_alpaca =
-    { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+    { Dio_strategies.Strategy_api.exchange = "alpaca"
     ; symbol
     ; qty = "1.0"
     ; grid_interval = 1.0
@@ -2845,11 +2845,11 @@ let test_virtual_gtc_sell_grid_maintenance () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg_alpaca = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
+  let ecfg_alpaca = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
   (* evaluate_sell_leg on Alpaca during a drop to 90.0 (death spiral). *)
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset:asset_alpaca
@@ -2862,7 +2862,7 @@ let test_virtual_gtc_sell_grid_maintenance () =
     ~base_balance_age:None
     ~oracle_halted:false;
   (* Missing persisted rung is re-pushed at 101.00. *)
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let popped = Dio_strategies.Strategy_common.LockFreeQueue.read buffer in
   check
     bool
@@ -2887,15 +2887,13 @@ let test_virtual_gtc_sell_grid_maintenance () =
       | None -> failwith "missing sell price")
     popped;
   (* Offline fill reconciliation: asset_balance 0.0 -> persisted levels pruned. *)
-  let state_offline =
-    Dio_strategies.Jacobs_ladder.get_strategy_state "OFFLINE_TEST/USD"
-  in
+  let state_offline = Dio_strategies.Strategy_api.get_strategy_state "OFFLINE_TEST/USD" in
   state_offline.persisted_sell_levels <- [ 105.00, 1.0 ];
   Sell_orders.clear state_offline.open_sell_orders;
   let asset_offline = { asset_alpaca with symbol = "OFFLINE_TEST/USD" } in
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state:state_offline)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state:state_offline)
     ~state:state_offline
     ~now:100.0
     ~asset:asset_offline
@@ -2913,11 +2911,11 @@ let test_virtual_gtc_sell_grid_maintenance () =
     true
     (state_offline.persisted_sell_levels = []);
   (* sync_open_orders adopts a pre-existing exchange sell. *)
-  let state_adopt = Dio_strategies.Jacobs_ladder.get_strategy_state "ADOPT_TEST/USD" in
+  let state_adopt = Dio_strategies.Strategy_api.get_strategy_state "ADOPT_TEST/USD" in
   state_adopt.persisted_sell_levels <- [];
   let iter_orders f = f "oid_ex_1" 105.0 1.0 "sell" (Some 1) in
   let _ =
-    Dio_strategies.Jacobs_ladder.sync_open_orders
+    Dio_strategies.Strategy_api.sync_open_orders
       ~state:state_adopt
       ~now:100.0
       ~asset:{ asset_alpaca with symbol = "ADOPT_TEST/USD" }
@@ -2934,10 +2932,10 @@ let test_virtual_gtc_sell_grid_maintenance () =
     (List.exists (fun (p, q) -> p = 105.0 && q = 1.0) state_adopt.persisted_sell_levels);
   (* Venue isolation: Kraken has remaintain_expired_sells = false. *)
   let kraken_symbol = "KRAKEN_TEST/USD" in
-  let state_kraken = Dio_strategies.Jacobs_ladder.get_strategy_state kraken_symbol in
+  let state_kraken = Dio_strategies.Strategy_api.get_strategy_state kraken_symbol in
   Sell_orders.clear state_kraken.open_sell_orders;
   let asset_kraken =
-    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    { Dio_strategies.Strategy_api.exchange = "kraken"
     ; symbol = kraken_symbol
     ; qty = "1.0"
     ; grid_interval = 1.0
@@ -2950,15 +2948,15 @@ let test_virtual_gtc_sell_grid_maintenance () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg_kraken = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
+  let ecfg_kraken = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
   check
     bool
     "Kraken remaintain_expired_sells is false"
     false
     ecfg_kraken.remaintain_expired_sells;
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state:state_kraken)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state:state_kraken)
     ~state:state_kraken
     ~now:100.0
     ~asset:asset_kraken
@@ -2986,7 +2984,7 @@ let test_halted_ladders_second_sell_beside_resting_one () =
      excess rises by its qty and the base stays committed (see
      test_inflight_sell_commitment_survives_feed_gap). *)
   let symbol = "LADDER2/XMR/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "kraken";
   state.grid_qty <- 0.05;
   state.maker_fee <- 0.0026;
@@ -3002,7 +3000,7 @@ let test_halted_ladders_second_sell_beside_resting_one () =
   state.last_buy_fill_price <- None;
   state.last_buy_fill_qty <- None;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    { Dio_strategies.Strategy_api.exchange = "kraken"
     ; symbol
     ; qty = "0.05"
     ; grid_interval = 5.0
@@ -3015,17 +3013,17 @@ let test_halted_ladders_second_sell_beside_resting_one () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -3037,7 +3035,7 @@ let test_halted_ladders_second_sell_beside_resting_one () =
     ~ecfg
     ~locked_in_sells:0.04
     ~base_balance_age:None;
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let placed =
     List.find_opt
       (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -3062,7 +3060,7 @@ let test_halted_startup_places_inventory_sell () =
      trigger is the halted state plus placeable inventory, anchored at the bid when no
      buy-fill price is known. *)
   let symbol = "STARTUP_SELL/XMR/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "kraken";
   state.grid_qty <- 0.05;
   state.maker_fee <- 0.0026;
@@ -3077,7 +3075,7 @@ let test_halted_startup_places_inventory_sell () =
   state.last_buy_fill_price <- None;
   state.last_buy_fill_qty <- None;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    { Dio_strategies.Strategy_api.exchange = "kraken"
     ; symbol
     ; qty = "0.05"
     ; grid_interval = 5.0
@@ -3090,17 +3088,17 @@ let test_halted_startup_places_inventory_sell () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -3112,7 +3110,7 @@ let test_halted_startup_places_inventory_sell () =
     ~ecfg
     ~locked_in_sells:0.0
     ~base_balance_age:None;
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let found =
     List.exists
       (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -3125,9 +3123,9 @@ let test_halted_startup_places_inventory_sell () =
   (* No inventory -> no sell: the halt check requires a placeable balance. *)
   drain ();
   Sell_orders.clear state.open_sell_orders;
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:101.0
     ~asset
@@ -3139,7 +3137,7 @@ let test_halted_startup_places_inventory_sell () =
     ~ecfg
     ~locked_in_sells:0.0
     ~base_balance_age:None;
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   check bool "no inventory -> no halt-triggered sell" true (pushed = [])
 ;;
 
@@ -3151,7 +3149,7 @@ let test_halted_path_still_places_sell () =
      just_filled_buy). *)
   let symbol = "HALT_SELL/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.35;
   state.maker_fee <- 0.0004;
@@ -3165,7 +3163,7 @@ let test_halted_path_still_places_sell () =
   state.last_buy_fill_price <- Some 39.50;
   state.last_buy_fill_qty <- Some 0.35;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.35"
     ; grid_interval = 1.0
@@ -3178,9 +3176,9 @@ let test_halted_path_still_places_sell () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
   (* Drain any orders left in the shared buffer by prior tests. *)
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -3188,9 +3186,9 @@ let test_halted_path_still_places_sell () =
   in
   drain ();
   (* The halted path: the buy leg was skipped, so buy_attempted = false. *)
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -3202,7 +3200,7 @@ let test_halted_path_still_places_sell () =
     ~locked_in_sells:0.0
     ~base_balance_age:None
     ~oracle_halted:false;
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let found =
     List.exists
       (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -3222,7 +3220,7 @@ let test_capital_low_still_places_bottom_rung_sell () =
      inventory and over-accumulates. Inputs mirror the domain: buy_attempted=false,
      just_filled_buy=false, oracle_halted=false, capital_low=true. *)
   let symbol = "CAPLOW/XMR/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "kraken";
   state.grid_qty <- 0.05;
   state.maker_fee <- 0.0026;
@@ -3241,7 +3239,7 @@ let test_capital_low_still_places_bottom_rung_sell () =
   state.last_buy_fill_qty <- Some 0.05;
   state.capital_low <- true;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    { Dio_strategies.Strategy_api.exchange = "kraken"
     ; symbol
     ; qty = "0.05"
     ; grid_interval = 5.0
@@ -3254,17 +3252,17 @@ let test_capital_low_still_places_bottom_rung_sell () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -3276,7 +3274,7 @@ let test_capital_low_still_places_bottom_rung_sell () =
     ~ecfg
     ~locked_in_sells:0.0
     ~base_balance_age:None;
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let placed =
     List.find_opt
       (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -3302,7 +3300,7 @@ let test_burst_tracked_venue_no_reserved_dip () =
      dump reserved_base. The unnetted-hold guard applies here too: a fresh balance message
      that predates the first placement clamps the second sell to zero. *)
   let symbol = "BURSTTRACK/XMR/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "kraken";
   state.grid_qty <- 0.05;
   state.maker_fee <- 0.0026;
@@ -3320,7 +3318,7 @@ let test_burst_tracked_venue_no_reserved_dip () =
   state.last_buy_fill_price <- Some 462.0;
   state.last_buy_fill_qty <- Some 0.05;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    { Dio_strategies.Strategy_api.exchange = "kraken"
     ; symbol
     ; qty = "0.05"
     ; grid_interval = 5.0
@@ -3333,17 +3331,17 @@ let test_burst_tracked_venue_no_reserved_dip () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   let run_leg ~now ~age =
-    Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    Dio_strategies.Strategy_api.evaluate_sell_leg
       ~persisted_reconcile:
-        (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+        (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
       ~state
       ~now
       ~asset
@@ -3366,7 +3364,7 @@ let test_burst_tracked_venue_no_reserved_dip () =
         | Place, Sell -> acc +. o.qty
         | _ -> acc)
       0.0
-      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
   in
   check bool "first sell placed" true (qty1 > 0.0);
   drain ();
@@ -3386,7 +3384,7 @@ let test_burst_tracked_venue_no_reserved_dip () =
         | Place, Sell -> acc +. o.qty
         | _ -> acc)
       0.0
-      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
   in
   check
     bool
@@ -3400,7 +3398,7 @@ let test_sell_ack_releases_inflight_latch () =
      sell rests. has_active_sell then means only "a sell placement is in flight", so a
      resting sell no longer gates the next sell for new inventory. *)
   let symbol = "LATCH_TEST/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "kraken";
   state.grid_qty <- 1.0;
   state.cached_sell_mult <- 0.999;
@@ -3417,9 +3415,9 @@ let test_sell_ack_releases_inflight_latch () =
     bool
     "has_active_sell true while the placement is in flight"
     true
-    (Dio_strategies.Jacobs_ladder.has_active_sell state);
+    (Dio_strategies.Strategy_api.has_active_sell state);
   (* The placement acks: the key must be released. *)
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+  Dio_strategies.Strategy_api.Strategy.handle_order_acknowledged
     ~now:100.0
     symbol
     "sell1"
@@ -3434,14 +3432,14 @@ let test_sell_ack_releases_inflight_latch () =
     bool
     "has_active_sell false while a sell rests on the book"
     false
-    (Dio_strategies.Jacobs_ladder.has_active_sell state);
+    (Dio_strategies.Strategy_api.has_active_sell state);
   (* A new buy fills while the first sell rests: the new inventory's sell places (1-buy x
      multi-sell ladder), no longer gated by a stale latch. *)
   state.just_filled_buy <- true;
   state.last_buy_fill_price <- Some 99.0;
   state.last_buy_fill_qty <- Some 1.0;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    { Dio_strategies.Strategy_api.exchange = "kraken"
     ; symbol
     ; qty = "1.0"
     ; grid_interval = 1.0
@@ -3454,8 +3452,8 @@ let test_sell_ack_releases_inflight_latch () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -3464,9 +3462,9 @@ let test_sell_ack_releases_inflight_latch () =
   drain ();
   (* The resting sell locks its inventory: pass its qty as locked_in_sells so the new sell
      only consumes the new fill's inventory. *)
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -3478,7 +3476,7 @@ let test_sell_ack_releases_inflight_latch () =
     ~locked_in_sells:1.0
     ~base_balance_age:None
     ~oracle_halted:false;
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let found =
     List.exists
       (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -3505,7 +3503,7 @@ let test_sell_retry_until_placed () =
      next tick and places the sell with no replacement buy (buy_attempted = false). *)
   let symbol = "RETRY_TEST/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.35;
   state.maker_fee <- 0.0004;
@@ -3518,7 +3516,7 @@ let test_sell_retry_until_placed () =
   state.last_buy_fill_price <- Some 39.50;
   state.last_buy_fill_qty <- Some 0.35;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.35"
     ; grid_interval = 1.0
@@ -3531,8 +3529,8 @@ let test_sell_retry_until_placed () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -3540,9 +3538,9 @@ let test_sell_retry_until_placed () =
   in
   drain ();
   let run_leg () =
-    Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    Dio_strategies.Strategy_api.evaluate_sell_leg
       ~persisted_reconcile:
-        (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+        (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
       ~state
       ~now:100.0
       ~asset
@@ -3562,13 +3560,13 @@ let test_sell_retry_until_placed () =
     bool
     "no sell pushed while on cooldown"
     true
-    (Dio_strategies.Jacobs_ladder.get_pending_orders 100 = []);
+    (Dio_strategies.Strategy_api.get_pending_orders 100 = []);
   check bool "just_filled_buy survives the blocked attempt" true state.just_filled_buy;
   (* Tick 2: cooldown expired; buy leg cannot place (buy_attempted = false) but the sell
      goes out. *)
   Hashtbl.remove state.amend_cooldowns "place_Sell";
   run_leg ();
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let found =
     List.exists
       (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -3597,7 +3595,7 @@ let test_accumulation_sells_non_accrued_inventory () =
      keeps the base committed if the feed later drops the order. *)
   let symbol = "FLOOR_FALLBACK/BTC/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.5;
   state.maker_fee <- 0.0004;
@@ -3613,7 +3611,7 @@ let test_accumulation_sells_non_accrued_inventory () =
   state.last_buy_fill_price <- Some 62369.0;
   state.last_buy_fill_qty <- Some 0.5;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.5"
     ; grid_interval = 0.75
@@ -3626,8 +3624,8 @@ let test_accumulation_sells_non_accrued_inventory () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -3637,9 +3635,9 @@ let test_accumulation_sells_non_accrued_inventory () =
   (* A resting sell of 0.4 locks inventory and the feed listed it, so the tradeable
      balance already nets it: ledger excess over the feed is zero and sellable is
      1.00112 - 0.5 = 0.50, not the double-counted 0.10. *)
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -3651,7 +3649,7 @@ let test_accumulation_sells_non_accrued_inventory () =
     ~locked_in_sells:0.4
     ~base_balance_age:None
     ~oracle_halted:false;
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let sell =
     List.find_opt
       (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -3686,7 +3684,7 @@ let test_nothing_placeable_clears_latch () =
      pushed. *)
   let symbol = "NOTHING_PLACEABLE/BTC/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:5;
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
   state.grid_qty <- 0.0005;
   state.maker_fee <- 0.0004;
@@ -3701,7 +3699,7 @@ let test_nothing_placeable_clears_latch () =
   state.last_buy_fill_price <- Some 62369.0;
   state.last_buy_fill_qty <- Some 0.0005;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "hyperliquid"
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
     ; symbol
     ; qty = "0.0005"
     ; grid_interval = 0.75
@@ -3714,17 +3712,17 @@ let test_nothing_placeable_clears_latch () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -3740,7 +3738,7 @@ let test_nothing_placeable_clears_latch () =
     bool
     "no sell pushed with no sellable inventory"
     true
-    (Dio_strategies.Jacobs_ladder.get_pending_orders 100 = []);
+    (Dio_strategies.Strategy_api.get_pending_orders 100 = []);
   check
     bool
     "just_filled_buy cleared (verified nothing placeable)"
@@ -3753,7 +3751,7 @@ let test_kraken_partial_sell_clamp () =
      existing non-accrued inventory (lot-rounded down) instead of blocking the whole sell,
      freeing capital and keeping the ladder running. *)
   let symbol = "KRAKEN_CLAMP/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "kraken";
   state.grid_qty <- 1.0;
   state.cached_sell_mult <- 0.999;
@@ -3765,7 +3763,7 @@ let test_kraken_partial_sell_clamp () =
   state.last_buy_fill_price <- Some 100.0;
   state.last_buy_fill_qty <- Some 1.0;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    { Dio_strategies.Strategy_api.exchange = "kraken"
     ; symbol
     ; qty = "1.0"
     ; grid_interval = 1.0
@@ -3778,17 +3776,17 @@ let test_kraken_partial_sell_clamp () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "kraken" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
     | None -> ()
   in
   drain ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -3800,7 +3798,7 @@ let test_kraken_partial_sell_clamp () =
     ~locked_in_sells:0.0
     ~base_balance_age:None
     ~oracle_halted:false;
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let sell =
     List.find_opt
       (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -3819,7 +3817,7 @@ let test_alpaca_dollar_floor_gate () =
      non-accrued inventory is worth at least $1. Below the floor the leg withholds the
      order and keeps the latch (re-checked every tick); at/above it the sell is placed. *)
   let symbol = "ALPACA_FLOOR/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "alpaca";
   state.grid_qty <- 0.25;
   state.cached_sell_mult <- 1.0;
@@ -3831,7 +3829,7 @@ let test_alpaca_dollar_floor_gate () =
   state.last_buy_fill_price <- Some 142.0;
   state.last_buy_fill_qty <- Some 0.25;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+    { Dio_strategies.Strategy_api.exchange = "alpaca"
     ; symbol
     ; qty = "0.25"
     ; grid_interval = 1.0
@@ -3844,8 +3842,8 @@ let test_alpaca_dollar_floor_gate () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -3853,9 +3851,9 @@ let test_alpaca_dollar_floor_gate () =
   in
   drain ();
   (* Below the dollar floor: 0.005 shares x 142 = 0.71 < $1. *)
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -3871,11 +3869,11 @@ let test_alpaca_dollar_floor_gate () =
     bool
     "no sell below the dollar floor"
     true
-    (Dio_strategies.Jacobs_ladder.get_pending_orders 100 = []);
+    (Dio_strategies.Strategy_api.get_pending_orders 100 = []);
   (* At/above the floor: 0.5 shares x 142 = $71 >= $1. *)
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -3887,7 +3885,7 @@ let test_alpaca_dollar_floor_gate () =
     ~locked_in_sells:0.0
     ~base_balance_age:None
     ~oracle_halted:false;
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   let found =
     List.exists
       (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
@@ -3909,7 +3907,7 @@ let test_alpaca_verified_nothing_to_sell_consumes_latch () =
      persistent grid-maintenance clause must still place the sell on inventory recovery -
      no owed sell is lost. *)
   let symbol = "ALPACA_LIT_WEDGE/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "alpaca";
   state.grid_qty <- 0.26;
   state.cached_sell_mult <- 1.0;
@@ -3924,7 +3922,7 @@ let test_alpaca_verified_nothing_to_sell_consumes_latch () =
   state.last_buy_fill_price <- Some 73.95;
   state.last_buy_fill_qty <- Some 0.26;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+    { Dio_strategies.Strategy_api.exchange = "alpaca"
     ; symbol
     ; qty = "0.26"
     ; grid_interval = 0.5
@@ -3937,8 +3935,8 @@ let test_alpaca_verified_nothing_to_sell_consumes_latch () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -3946,9 +3944,9 @@ let test_alpaca_verified_nothing_to_sell_consumes_latch () =
   in
   let evaluate ~now ~balance ~buy_attempted =
     drain ();
-    Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    Dio_strategies.Strategy_api.evaluate_sell_leg
       ~persisted_reconcile:
-        (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+        (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
       ~state
       ~now
       ~asset
@@ -3967,7 +3965,7 @@ let test_alpaca_verified_nothing_to_sell_consumes_latch () =
         o.operation = Dio_strategies.Strategy_common.Place
         && o.side = Dio_strategies.Strategy_common.Sell
         && o.symbol = symbol)
-      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
   in
   (* Tick 1: ghost-buy placement tick arms the latch; dust balance verified below the $1
      floor -> consumed, nothing placed, no warn loop. *)
@@ -4006,7 +4004,7 @@ let test_alpaca_persistence_never_hijacks_owed_sell () =
      restoration level is pruned rather than wedging the maintenance path (the
      SMH/REMX/LIT accumulate-only failure). *)
   let symbol = "ALPACA_PERSIST/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "alpaca";
   state.grid_qty <- 0.26;
   state.cached_sell_mult <- 1.0;
@@ -4023,7 +4021,7 @@ let test_alpaca_persistence_never_hijacks_owed_sell () =
   (* Dust persisted level from legacy clamped sizing. *)
   state.persisted_sell_levels <- [ 75.98, 1e-09 ];
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+    { Dio_strategies.Strategy_api.exchange = "alpaca"
     ; symbol
     ; qty = "0.26"
     ; grid_interval = 0.5
@@ -4036,8 +4034,8 @@ let test_alpaca_persistence_never_hijacks_owed_sell () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -4045,9 +4043,9 @@ let test_alpaca_persistence_never_hijacks_owed_sell () =
   in
   let evaluate ~now =
     drain ();
-    Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+    Dio_strategies.Strategy_api.evaluate_sell_leg
       ~persisted_reconcile:
-        (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+        (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
       ~state
       ~now
       ~asset
@@ -4066,7 +4064,7 @@ let test_alpaca_persistence_never_hijacks_owed_sell () =
         o.operation = Dio_strategies.Strategy_common.Place
         && o.side = Dio_strategies.Strategy_common.Sell
         && o.symbol = symbol)
-      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
   in
   (* 1. The buy fill's owed sell is strategy-sized (fill + gi = 77.25, 1:1 qty) even
         though a dust level sits in the file. *)
@@ -4096,7 +4094,7 @@ let test_alpaca_persistence_never_hijacks_owed_sell () =
        state.duplicate_key_sell);
   state.open_sell_orders <- Sell_orders.of_list [ "rest1", 77.25, 0.26 ];
   evaluate ~now:160.0;
-  let pending2 = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pending2 = Dio_strategies.Strategy_api.get_pending_orders 100 in
   check bool "nothing pushed while pruning the dust level" true (pending2 = []);
   (* 3. A real dropped rung is restored at its recorded price/qty. *)
   state.persisted_sell_levels <- [ 80.0, 0.26 ];
@@ -4116,7 +4114,7 @@ let test_alpaca_persistence_never_hijacks_owed_sell () =
 
 (* Shared Alpaca asset for the excess-inventory sweep tests. *)
 let alpaca_excess_asset ~symbol =
-  { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+  { Dio_strategies.Strategy_api.exchange = "alpaca"
   ; symbol
   ; qty = "1.0"
   ; grid_interval = 1.0
@@ -4131,7 +4129,7 @@ let alpaca_excess_asset ~symbol =
 ;;
 
 let drain_order_buffer () =
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec go () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> go ()
@@ -4141,7 +4139,7 @@ let drain_order_buffer () =
 ;;
 
 let reset_alpaca_excess_state symbol =
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "alpaca";
   state.grid_qty <- 1.0;
   state.cached_sell_mult <- 1.0;
@@ -4171,7 +4169,7 @@ let pushed_sell_for symbol =
       o.operation = Dio_strategies.Strategy_common.Place
       && o.side = Dio_strategies.Strategy_common.Sell
       && o.symbol = symbol)
-    (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+    (Dio_strategies.Strategy_api.get_pending_orders 100)
 ;;
 
 let test_alpaca_excess_refills_before_dumping () =
@@ -4182,10 +4180,10 @@ let test_alpaca_excess_refills_before_dumping () =
   let state = reset_alpaca_excess_state symbol in
   state.persisted_sell_levels <- [ 101.0, 1.0; 99.0, 1.0 ];
   let asset = alpaca_excess_asset ~symbol in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -4222,10 +4220,10 @@ let test_alpaca_excess_amends_open_top_rung () =
   state.open_sell_orders
   <- Sell_orders.of_list [ "top-oid", 101.0, 1.0; "low-oid", 99.0, 1.0 ];
   let asset = alpaca_excess_asset ~symbol in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -4243,7 +4241,7 @@ let test_alpaca_excess_amends_open_top_rung () =
         o.operation = Dio_strategies.Strategy_common.Amend
         && o.side = Dio_strategies.Strategy_common.Sell
         && o.symbol = symbol)
-      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
   in
   match amends with
   | [ o ] ->
@@ -4271,10 +4269,10 @@ let test_alpaca_excess_excludes_reserved_base () =
   state.persisted_sell_levels <- [ 101.0, 1.0 ];
   state.open_sell_orders <- Sell_orders.of_list [ "top-oid", 101.0, 1.0 ];
   let asset = alpaca_excess_asset ~symbol in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -4292,7 +4290,7 @@ let test_alpaca_excess_excludes_reserved_base () =
         o.operation = Dio_strategies.Strategy_common.Amend
         && o.side = Dio_strategies.Strategy_common.Sell
         && o.symbol = symbol)
-      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
   in
   check bool "reserved_base is excluded from the excess (no amend)" true (amends = [])
 ;;
@@ -4313,10 +4311,10 @@ let test_alpaca_venue_available_blocks_reserve_dip () =
   state.last_buy_fill_qty <- Some 1.0;
   Alpaca.Balances.set_available_balance_for_test symbol 0.00234;
   let asset = alpaca_excess_asset ~symbol in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -4346,10 +4344,10 @@ let test_alpaca_excess_sweep_takes_full_excess () =
   state.persisted_sell_levels <- [ 101.0, 1.0 ];
   state.open_sell_orders <- Sell_orders.of_list [ "full-top-oid", 101.0, 1.0 ];
   let asset = alpaca_excess_asset ~symbol in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -4367,7 +4365,7 @@ let test_alpaca_excess_sweep_takes_full_excess () =
         o.operation = Dio_strategies.Strategy_common.Amend
         && o.side = Dio_strategies.Strategy_common.Sell
         && o.symbol = symbol)
-      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
   in
   match amends with
   | [ o ] ->
@@ -4395,10 +4393,10 @@ let test_alpaca_restore_excludes_reserved_base () =
   state.persisted_sell_levels <- [ 101.0, 1.0 ];
   Sell_orders.clear state.open_sell_orders;
   let asset = alpaca_excess_asset ~symbol in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -4443,10 +4441,10 @@ let test_alpaca_restore_partial_headroom_clamped () =
   state.persisted_sell_levels <- [ 101.0, 2.0 ];
   Sell_orders.clear state.open_sell_orders;
   let asset = alpaca_excess_asset ~symbol in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -4489,10 +4487,10 @@ let test_alpaca_sweep_skips_dust_delta () =
   state.persisted_sell_levels <- [ 101.0, 1.0 ];
   state.open_sell_orders <- Sell_orders.of_list [ "dust-top-oid", 101.0, 1.0 ];
   let asset = alpaca_excess_asset ~symbol in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -4510,7 +4508,7 @@ let test_alpaca_sweep_skips_dust_delta () =
         o.operation = Dio_strategies.Strategy_common.Amend
         && o.side = Dio_strategies.Strategy_common.Sell
         && o.symbol = symbol)
-      (Dio_strategies.Jacobs_ladder.get_pending_orders 100)
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
   in
   check bool "dust excess does not spin a sweep amend" true (amends = [])
 ;;
@@ -4521,7 +4519,7 @@ let test_alpaca_sell_anchors_on_fill_not_ask () =
      sells piling at 138.50) instead of laddering down. The fill anchor keeps rungs
      equidistant and never places below fill + gi, preserving fill-anchored profitability. *)
   let symbol = "ALPACA_ANCHOR/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "alpaca";
   state.grid_qty <- 1.0;
   state.cached_sell_mult <- 1.0;
@@ -4533,7 +4531,7 @@ let test_alpaca_sell_anchors_on_fill_not_ask () =
   state.last_buy_fill_price <- Some 100.0;
   state.last_buy_fill_qty <- Some 1.0;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+    { Dio_strategies.Strategy_api.exchange = "alpaca"
     ; symbol
     ; qty = "1.0"
     ; grid_interval = 1.0
@@ -4546,8 +4544,8 @@ let test_alpaca_sell_anchors_on_fill_not_ask () =
     ; sell_levels_persistence = true
     }
   in
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config "alpaca" in
-  let buffer = Dio_strategies.Jacobs_ladder.get_order_buffer () in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
   let rec drain () =
     match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
     | Some _ -> drain ()
@@ -4556,9 +4554,9 @@ let test_alpaca_sell_anchors_on_fill_not_ask () =
   drain ();
   (* Market above fill + gi: fill 100.00 + 1% = 101.00, ask 105.00. Sell lands at 101.00
      (fill-anchored), not 105.00. *)
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:100.0
     ~asset
@@ -4570,7 +4568,7 @@ let test_alpaca_sell_anchors_on_fill_not_ask () =
     ~locked_in_sells:0.0
     ~base_balance_age:None
     ~oracle_halted:false;
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 100 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   match pushed with
   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
     check
@@ -4590,12 +4588,12 @@ let test_new_buy_respects_2x_gi_closest_sell () =
      exact_target (sell_price - 2*gi). Without it a new buy can land within ~1x rung of
      the lowest sell. *)
   let symbol = "SPACE_SELL/USD" in
-  let st = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let st = Dio_strategies.Strategy_api.get_strategy_state symbol in
   st.exchange_id <- "kraken";
   st.grid_qty <- 1.0;
   let grid_interval = 0.5 in
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    { Dio_strategies.Strategy_api.exchange = "kraken"
     ; symbol
     ; qty = "1.0"
     ; grid_interval
@@ -4610,13 +4608,13 @@ let test_new_buy_respects_2x_gi_closest_sell () =
   in
   let iter_open_orders _ = () in
   let now = Unix.gettimeofday () in
-  let drain () = ignore (Dio_strategies.Jacobs_ladder.get_pending_orders 100) in
+  let drain () = ignore (Dio_strategies.Strategy_api.get_pending_orders 100) in
   drain ();
   (* Closest sell 100.40, bid 100.00, gi 0.5%: the 2*gi cap anchors on the sell price, so
      the buy must not exceed 100.40 - 2*gi(100.40) = 99.396. The raw grid buy (0.5% below
      bid) is 99.50, above the cap, so the cap pulls it to 99.396. *)
   ignore
-    (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+    (Dio_strategies.Strategy_decision.evaluate_buy_leg
        ~oracle_halted:false
        ~state:st
        ~now
@@ -4631,7 +4629,7 @@ let test_new_buy_respects_2x_gi_closest_sell () =
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
        ~closest_sell_order_initial:(Some ("sell1", 100.40)));
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 10 in
   match pushed with
   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
     check
@@ -4663,7 +4661,7 @@ let test_fresh_buy_clamps_against_companion_sell () =
      sell = 101.00 -> old floor 99.99 (does not bind) raw grid buy = 100.40 * 0.995 =
      99.90 (the churn price) *)
   let symbol = "SPACE_COMPANION/USD" in
-  let st = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let st = Dio_strategies.Strategy_api.get_strategy_state symbol in
   st.exchange_id <- "kraken";
   st.grid_qty <- 1.0;
   st.last_buy_fill_price <- Some 100.00;
@@ -4673,7 +4671,7 @@ let test_fresh_buy_clamps_against_companion_sell () =
   st.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
   let grid_interval = 0.5 in
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    { Dio_strategies.Strategy_api.exchange = "kraken"
     ; symbol
     ; qty = "1.0"
     ; grid_interval
@@ -4688,9 +4686,9 @@ let test_fresh_buy_clamps_against_companion_sell () =
   in
   let iter_open_orders _ = () in
   let now = Unix.gettimeofday () in
-  ignore (Dio_strategies.Jacobs_ladder.get_pending_orders 100);
+  ignore (Dio_strategies.Strategy_api.get_pending_orders 100);
   ignore
-    (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+    (Dio_strategies.Strategy_decision.evaluate_buy_leg
        ~oracle_halted:false
        ~state:st
        ~now
@@ -4705,7 +4703,7 @@ let test_fresh_buy_clamps_against_companion_sell () =
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
        ~closest_sell_order_initial:(Some ("stale_sell", 101.00)));
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 10 in
   match pushed with
   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
     (match o.price with
@@ -4729,7 +4727,7 @@ let test_reclaim_step_cancels_when_not_issued () =
   (* Reclaim self-healing: the first cycle with a reclaim decision and an eligible resting
      buy issues the cancel (arm the latch). *)
   let step =
-    Dio_strategies.Jacobs_ladder.reclaim_step
+    Dio_strategies.Strategy_api.reclaim_step
       ~now:100.0
       ~retry_seconds:15.0
       ~issued:false
@@ -4741,14 +4739,14 @@ let test_reclaim_step_cancels_when_not_issued () =
     bool
     "first reclaim issues the cancel"
     true
-    (step = Dio_strategies.Jacobs_ladder.Reclaim_cancel 1)
+    (step = Dio_strategies.Strategy_api.Reclaim_cancel 1)
 ;;
 
 let test_reclaim_step_throttles_in_flight_cancel () =
   (* A cancel issued 5s ago is still in flight (retry window 15s): do not re-issue -
      avoids cancel spam against a cancel that is dispatching. *)
   let step =
-    Dio_strategies.Jacobs_ladder.reclaim_step
+    Dio_strategies.Strategy_api.reclaim_step
       ~now:105.0
       ~retry_seconds:15.0
       ~issued:true
@@ -4760,7 +4758,7 @@ let test_reclaim_step_throttles_in_flight_cancel () =
     bool
     "in-flight cancel deferred"
     true
-    (step = Dio_strategies.Jacobs_ladder.Reclaim_deferred)
+    (step = Dio_strategies.Strategy_api.Reclaim_deferred)
 ;;
 
 let test_reclaim_step_retries_failed_cancel () =
@@ -4771,7 +4769,7 @@ let test_reclaim_step_retries_failed_cancel () =
      priority asset never resumes on unreleased capital. Once the retry interval elapses
      with the eligible buy still in the store, the cancel must be re-issued. *)
   let step =
-    Dio_strategies.Jacobs_ladder.reclaim_step
+    Dio_strategies.Strategy_api.reclaim_step
       ~now:116.0
       ~retry_seconds:15.0
       ~issued:true
@@ -4783,7 +4781,7 @@ let test_reclaim_step_retries_failed_cancel () =
     bool
     "stale failed cancel is retried"
     true
-    (step = Dio_strategies.Jacobs_ladder.Reclaim_cancel 1)
+    (step = Dio_strategies.Strategy_api.Reclaim_cancel 1)
 ;;
 
 let test_reclaim_step_rearms_when_store_clean () =
@@ -4791,7 +4789,7 @@ let test_reclaim_step_rearms_when_store_clean () =
      re-arms so a later reclaim decision re-triggers cleanly - and the released capital is
      recognized by the next oracle pass (the committed value it reads is zero). *)
   let step =
-    Dio_strategies.Jacobs_ladder.reclaim_step
+    Dio_strategies.Strategy_api.reclaim_step
       ~now:100.0
       ~retry_seconds:15.0
       ~issued:true
@@ -4803,7 +4801,7 @@ let test_reclaim_step_rearms_when_store_clean () =
     bool
     "clean store re-arms the latch"
     true
-    (step = Dio_strategies.Jacobs_ladder.Reclaim_rearm)
+    (step = Dio_strategies.Strategy_api.Reclaim_rearm)
 ;;
 
 let test_reclaim_step_waits_for_mid_amend_buy () =
@@ -4813,7 +4811,7 @@ let test_reclaim_step_waits_for_mid_amend_buy () =
      spamming the exchange or re-arming (the capital is still committed, so the reclaim
      decision stays correct). *)
   let step =
-    Dio_strategies.Jacobs_ladder.reclaim_step
+    Dio_strategies.Strategy_api.reclaim_step
       ~now:100.0
       ~retry_seconds:15.0
       ~issued:false
@@ -4825,7 +4823,7 @@ let test_reclaim_step_waits_for_mid_amend_buy () =
     bool
     "mid-amend buy defers the cancel"
     true
-    (step = Dio_strategies.Jacobs_ladder.Reclaim_deferred)
+    (step = Dio_strategies.Strategy_api.Reclaim_deferred)
 ;;
 
 let test_buy_placement_balance_guard () =
@@ -4836,11 +4834,11 @@ let test_buy_placement_balance_guard () =
        verdict is truth); the foreordained flag is set so the expected rejection does not
        re-latch capital_low. *)
   let symbol = "TESTBAL/USD" in
-  let st = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let st = Dio_strategies.Strategy_api.get_strategy_state symbol in
   st.exchange_id <- "kraken";
   st.grid_qty <- 1.0;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "kraken"
+    { Dio_strategies.Strategy_api.exchange = "kraken"
     ; symbol
     ; qty = "1.0"
     ; grid_interval = 0.5
@@ -4859,14 +4857,14 @@ let test_buy_placement_balance_guard () =
     fun _ -> ()
   in
   let now = Unix.gettimeofday () in
-  let drain () = ignore (Dio_strategies.Jacobs_ladder.get_pending_orders 100) in
+  let drain () = ignore (Dio_strategies.Strategy_api.get_pending_orders 100) in
   let pending_count () =
-    List.length (Dio_strategies.Jacobs_ladder.get_pending_orders 10)
+    List.length (Dio_strategies.Strategy_api.get_pending_orders 10)
   in
   drain ();
   (* 1. Fresh balance, insufficient -> no order pushed, capital_low latched. *)
   ignore
-    (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+    (Dio_strategies.Strategy_decision.evaluate_buy_leg
        ~oracle_halted:false
        ~state:st
        ~now
@@ -4895,7 +4893,7 @@ let test_buy_placement_balance_guard () =
   st.capital_low_at_balance <- 0.0;
   Hashtbl.remove st.amend_cooldowns "place_Buy";
   ignore
-    (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+    (Dio_strategies.Strategy_decision.evaluate_buy_leg
        ~oracle_halted:false
        ~state:st
        ~now:(now +. 1.0)
@@ -4929,7 +4927,7 @@ let test_buy_placement_balance_guard () =
        st.duplicate_key_buy);
   Hashtbl.remove st.amend_cooldowns "place_Buy";
   ignore
-    (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+    (Dio_strategies.Strategy_decision.evaluate_buy_leg
        ~oracle_halted:false
        ~state:st
        ~now:(now +. 2.0)
@@ -4958,7 +4956,7 @@ let test_reconcile_cross_boundary_tolerance () =
      neighbor-bucket probe. Matching semantics are unchanged for prices straddling a
      4-decimal bucket boundary: sync_open_orders matches the persisted level rather than
      adopting a duplicate. *)
-  let open Dio_strategies.Jacobs_ladder in
+  let open Dio_strategies.Strategy_api in
   let symbol = "BOUNDARY_TEST/USD" in
   let state = get_strategy_state symbol in
   (* 100.00004 vs the open order's 100.00005: within the 1e-4 tolerance but straddles the
@@ -5007,7 +5005,7 @@ let test_sync_open_orders_price_keyed_index () =
   (* sync_open_orders indexes persisted sell levels by price key instead of rescanning per
      order (the O(n*m) hotpath). Observable behavior preserved: qty update on a matching
      open sell, adoption of a new sell, and 1-to-1 matching across duplicate prices. *)
-  let open Dio_strategies.Jacobs_ladder in
+  let open Dio_strategies.Strategy_api in
   let symbol = "IDX_MATCH/USD" in
   let state = get_strategy_state symbol in
   state.persisted_sell_levels <- [ 100.00, 1.0; 98.00, 1.0 ];
@@ -5103,7 +5101,7 @@ let test_sync_open_orders_reconcile_agreement () =
      replacing a second O(n+m) partition_persisted_sell_levels pass. The threaded split
      must agree exactly with the reference partition over the same persisted list and
      open-sell set, across duplicates, boundary floats, adoptions, and qty updates. *)
-  let open Dio_strategies.Jacobs_ladder in
+  let open Dio_strategies.Strategy_api in
   let ecfg = get_exchange_config "alpaca" in
   let mk_asset symbol =
     { exchange = "alpaca"
@@ -5188,7 +5186,7 @@ let test_sync_open_orders_generation_skip () =
   (* Unchanged open-orders generation: sync_open_orders skips the O(open-orders) scan and
      reuses cached derived state while still running the ledger reconcile (so a lost
      placement ages out). A generation bump forces a rescan. *)
-  let open Dio_strategies.Jacobs_ladder in
+  let open Dio_strategies.Strategy_api in
   let symbol = "GEN_SKIP/USD" in
   let state = get_strategy_state symbol in
   state.exchange_id <- "kraken";
@@ -5275,7 +5273,7 @@ let test_sync_open_orders_generation_skip () =
 
 let eval_buy_trail ~symbol ~grid_qty ~bid ~ask ~resting_price ~resting_qty:_ ~sell_opt =
   let buy_id = symbol ^ "_buy" in
-  let st = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let st = Dio_strategies.Strategy_api.get_strategy_state symbol in
   st.exchange_id <- "alpaca";
   st.grid_qty <- grid_qty;
   st.last_buy_order_id <- Some buy_id;
@@ -5287,7 +5285,7 @@ let eval_buy_trail ~symbol ~grid_qty ~bid ~ask ~resting_price ~resting_qty:_ ~se
   ignore
     (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment buy_id);
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+    { Dio_strategies.Strategy_api.exchange = "alpaca"
     ; symbol
     ; qty = Printf.sprintf "%.8g" grid_qty
     ; grid_interval = 1.0
@@ -5302,9 +5300,9 @@ let eval_buy_trail ~symbol ~grid_qty ~bid ~ask ~resting_price ~resting_qty:_ ~se
   in
   let iter_open_orders _ = () in
   let now = Unix.gettimeofday () in
-  ignore (Dio_strategies.Jacobs_ladder.get_pending_orders 100);
+  ignore (Dio_strategies.Strategy_api.get_pending_orders 100);
   ignore
-    (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+    (Dio_strategies.Strategy_decision.evaluate_buy_leg
        ~oracle_halted:false
        ~state:st
        ~now
@@ -5319,7 +5317,7 @@ let eval_buy_trail ~symbol ~grid_qty ~bid ~ask ~resting_price ~resting_qty:_ ~se
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
        ~closest_sell_order_initial:sell_opt);
-  Dio_strategies.Jacobs_ladder.get_pending_orders 10
+  Dio_strategies.Strategy_api.get_pending_orders 10
 ;;
 
 let test_pure_trailing_no_amend_when_target_below () =
@@ -5346,7 +5344,7 @@ let test_buy_trail_fires_on_single_tick_move () =
      trailing jumpy. *)
   let symbol = "TRAIL_TICK/USD" in
   let buy_id = symbol ^ "_buy" in
-  let st = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let st = Dio_strategies.Strategy_api.get_strategy_state symbol in
   st.exchange_id <- "alpaca";
   st.grid_qty <- 1.0;
   st.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
@@ -5357,7 +5355,7 @@ let test_buy_trail_fires_on_single_tick_move () =
   ignore
     (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment buy_id);
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+    { Dio_strategies.Strategy_api.exchange = "alpaca"
     ; symbol
     ; qty = "1.0"
     ; grid_interval = 1.0
@@ -5372,9 +5370,9 @@ let test_buy_trail_fires_on_single_tick_move () =
   in
   let iter_open_orders _ = () in
   let now = Unix.gettimeofday () in
-  ignore (Dio_strategies.Jacobs_ladder.get_pending_orders 100);
+  ignore (Dio_strategies.Strategy_api.get_pending_orders 100);
   ignore
-    (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+    (Dio_strategies.Strategy_decision.evaluate_buy_leg
        ~oracle_halted:false
        ~state:st
        ~now
@@ -5389,7 +5387,7 @@ let test_buy_trail_fires_on_single_tick_move () =
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
        ~closest_sell_order_initial:(Some ("sell1", 105.0)));
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 10 in
   match pushed with
   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
     check
@@ -5407,7 +5405,7 @@ let test_buy_trail_2xgi_anchored_on_sell () =
      bid). *)
   let symbol = "TRAIL_SELL_ANCHOR/USD" in
   let buy_id = symbol ^ "_buy" in
-  let st = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let st = Dio_strategies.Strategy_api.get_strategy_state symbol in
   st.exchange_id <- "alpaca";
   st.grid_qty <- 1.0;
   st.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
@@ -5418,7 +5416,7 @@ let test_buy_trail_2xgi_anchored_on_sell () =
   ignore
     (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment buy_id);
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+    { Dio_strategies.Strategy_api.exchange = "alpaca"
     ; symbol
     ; qty = "1.0"
     ; grid_interval = 1.0
@@ -5433,9 +5431,9 @@ let test_buy_trail_2xgi_anchored_on_sell () =
   in
   let iter_open_orders _ = () in
   let now = Unix.gettimeofday () in
-  ignore (Dio_strategies.Jacobs_ladder.get_pending_orders 100);
+  ignore (Dio_strategies.Strategy_api.get_pending_orders 100);
   ignore
-    (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+    (Dio_strategies.Strategy_decision.evaluate_buy_leg
        ~oracle_halted:false
        ~state:st
        ~now
@@ -5450,7 +5448,7 @@ let test_buy_trail_2xgi_anchored_on_sell () =
        ~has_recent_amend_buy:false
        ~locked_in_buys:0.0
        ~closest_sell_order_initial:(Some ("sell1", 103.50)));
-  let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 10 in
   match pushed with
   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
     check
@@ -5469,7 +5467,7 @@ let test_buy_trail_respects_sell_zone_while_tracked () =
      tracked. *)
   let run_case ~symbol ~sell_opt =
     let buy_id = symbol ^ "_buy" in
-    let st = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+    let st = Dio_strategies.Strategy_api.get_strategy_state symbol in
     st.exchange_id <- "alpaca";
     st.grid_qty <- 1.0;
     st.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
@@ -5481,7 +5479,7 @@ let test_buy_trail_respects_sell_zone_while_tracked () =
       (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment
          buy_id);
     let asset =
-      { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+      { Dio_strategies.Strategy_api.exchange = "alpaca"
       ; symbol
       ; qty = "1.0"
       ; grid_interval = 1.0
@@ -5496,9 +5494,9 @@ let test_buy_trail_respects_sell_zone_while_tracked () =
     in
     let iter_open_orders _ = () in
     let now = Unix.gettimeofday () in
-    ignore (Dio_strategies.Jacobs_ladder.get_pending_orders 100);
+    ignore (Dio_strategies.Strategy_api.get_pending_orders 100);
     ignore
-      (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+      (Dio_strategies.Strategy_decision.evaluate_buy_leg
          ~oracle_halted:false
          ~state:st
          ~now
@@ -5513,7 +5511,7 @@ let test_buy_trail_respects_sell_zone_while_tracked () =
          ~has_recent_amend_buy:false
          ~locked_in_buys:0.0
          ~closest_sell_order_initial:sell_opt);
-    let pushed = Dio_strategies.Jacobs_ladder.get_pending_orders 10 in
+    let pushed = Dio_strategies.Strategy_api.get_pending_orders 10 in
     match pushed with
     | [ (o : Dio_strategies.Strategy_common.strategy_order) ] -> o.price
     | _ -> failwith "expected exactly one buy amend"
@@ -5543,7 +5541,7 @@ let test_buy_trail_never_enters_sell_zone_until_removed () =
      at bid - gi. *)
   let symbol = "TRAIL_ZONE_PROOF/USD" in
   let buy_id = symbol ^ "_buy" in
-  let st = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let st = Dio_strategies.Strategy_api.get_strategy_state symbol in
   st.exchange_id <- "alpaca";
   st.grid_qty <- 1.0;
   st.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
@@ -5552,7 +5550,7 @@ let test_buy_trail_never_enters_sell_zone_until_removed () =
   st.pending_orders <- [];
   st.inflight_amend_buy <- false;
   let asset =
-    { Dio_strategies.Jacobs_ladder.exchange = "alpaca"
+    { Dio_strategies.Strategy_api.exchange = "alpaca"
     ; symbol
     ; qty = "1.0"
     ; grid_interval = 1.0
@@ -5568,7 +5566,7 @@ let test_buy_trail_never_enters_sell_zone_until_removed () =
   let iter_open_orders _ = () in
   let now = Unix.gettimeofday () in
   let eval_step ~bid ~sell_opt =
-    ignore (Dio_strategies.Jacobs_ladder.get_pending_orders 100);
+    ignore (Dio_strategies.Strategy_api.get_pending_orders 100);
     (* Each push_order for an amend leaves a pending_amend entry, the in-flight amendment
        latch and the inflight_amend_buy flag: clear all three so the next step trails from
        the freshly amended resting price. *)
@@ -5578,7 +5576,7 @@ let test_buy_trail_never_enters_sell_zone_until_removed () =
       (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment
          buy_id);
     ignore
-      (Dio_strategies.Jacobs_ladder_execution.evaluate_buy_leg
+      (Dio_strategies.Strategy_decision.evaluate_buy_leg
          ~oracle_halted:false
          ~state:st
          ~now
@@ -5593,7 +5591,7 @@ let test_buy_trail_never_enters_sell_zone_until_removed () =
          ~has_recent_amend_buy:false
          ~locked_in_buys:0.0
          ~closest_sell_order_initial:sell_opt);
-    Dio_strategies.Jacobs_ladder.get_pending_orders 10
+    Dio_strategies.Strategy_api.get_pending_orders 10
   in
   (* 1. Bid 101.50, sell 103.00 tracked: buy trails to bid - gi = 100.49, below the zone
         boundary sell - 2*gi = 100.94. *)
@@ -5640,7 +5638,7 @@ let test_buy_trail_never_enters_sell_zone_until_removed () =
 (* ------------------------------------------------------------------ *)
 
 let sell_matrix_asset ~exchange ~symbol ~qty =
-  { Dio_strategies.Jacobs_ladder.exchange
+  { Dio_strategies.Strategy_api.exchange
   ; symbol
   ; qty
   ; grid_interval = 0.16
@@ -5664,7 +5662,7 @@ let sell_matrix_feed_and_size
   ~free
   ~feed_healthy
   =
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- exchange;
   state.grid_qty <- free;
   state.maker_fee <- 0.0;
@@ -5697,12 +5695,12 @@ let sell_matrix_feed_and_size
   (* Alpaca's authoritative free figure already excludes resting holds. *)
   if exchange = "alpaca"
   then Alpaca.Balances.set_available_balance_for_test symbol (reserved +. free);
-  let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config exchange in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config exchange in
   let asset = sell_matrix_asset ~exchange ~symbol ~qty:(Printf.sprintf "%.4f" free) in
   drain_order_buffer ();
-  Dio_strategies.Jacobs_ladder.evaluate_sell_leg
+  Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
-      (Dio_strategies.Jacobs_ladder.reconcile_persisted_sell_levels ~state)
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
     ~now:1000.0
     ~asset
@@ -5712,7 +5710,7 @@ let sell_matrix_feed_and_size
     ~buy_attempted:false
     ~oracle_halted:false
     ~ecfg
-    ~locked_in_sells:(Dio_strategies.Jacobs_ladder.committed_sell_base state)
+    ~locked_in_sells:(Dio_strategies.Strategy_api.committed_sell_base state)
     ~base_balance_age:None;
   let sell = pushed_sell_for symbol in
   drain_order_buffer ();
@@ -5777,9 +5775,9 @@ let test_sell_commitment_lifecycle_all_venues () =
   List.iter
     (fun exchange ->
       let symbol = Printf.sprintf "LIFECYCLE_%s/USD" (String.uppercase_ascii exchange) in
-      let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+      let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
       state.exchange_id <- exchange;
-      state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config exchange;
+      state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config exchange;
       state.cached_qty_increment <- 0.01;
       state.cached_price_increment <- 0.01;
       state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
@@ -5810,12 +5808,12 @@ let test_sell_commitment_lifecycle_all_venues () =
       state.last_buy_fill_qty <- Some 0.2;
       drain_order_buffer ();
       let asset = sell_matrix_asset ~exchange ~symbol ~qty:"0.2" in
-      let ecfg = Dio_strategies.Jacobs_ladder.get_exchange_config exchange in
+      let ecfg = Dio_strategies.Strategy_api.get_exchange_config exchange in
       let now = Unix.gettimeofday () in
       let label msg = Printf.sprintf "%s: %s" exchange msg in
       (* 1. Dispatch arms the ledger before any confirmation. *)
       let order =
-        Dio_strategies.Jacobs_ladder.create_place_order
+        Dio_strategies.Strategy_api.create_place_order
           state.duplicate_key_sell
           symbol
           Dio_strategies.Strategy_common.Sell
@@ -5825,14 +5823,14 @@ let test_sell_commitment_lifecycle_all_venues () =
           Dio_strategies.Strategy_common.Ladder
           exchange
       in
-      ignore (Dio_strategies.Jacobs_ladder.push_order ~now ~state order);
+      ignore (Dio_strategies.Strategy_api.push_order ~now ~state order);
       check
         (float 1e-9)
         (label "dispatch arms the ledger")
         0.2
-        (Dio_strategies.Jacobs_ladder.committed_sell_base state);
+        (Dio_strategies.Strategy_api.committed_sell_base state);
       (* 2. Ack re-keys to the venue id and marks it acked. *)
-      Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged
+      Dio_strategies.Strategy_api.Strategy.handle_order_acknowledged
         ~now:(now +. 0.1)
         symbol
         "life-oid"
@@ -5842,7 +5840,7 @@ let test_sell_commitment_lifecycle_all_venues () =
         (float 1e-9)
         (label "ack keeps the base committed")
         0.2
-        (Dio_strategies.Jacobs_ladder.committed_sell_base state);
+        (Dio_strategies.Strategy_api.committed_sell_base state);
       check
         bool
         (label "ack re-keys to the venue order id")
@@ -5853,7 +5851,7 @@ let test_sell_commitment_lifecycle_all_venues () =
       let iter_open_orders f = List.iter (fun (a, b, c, d, e) -> f a b c d e) !feed in
       let sync () =
         let _, _, _, locked, _, _, _ =
-          Dio_strategies.Jacobs_ladder.sync_open_orders
+          Dio_strategies.Strategy_api.sync_open_orders
             ~state
             ~now
             ~asset
@@ -5870,7 +5868,7 @@ let test_sell_commitment_lifecycle_all_venues () =
         (float 1e-9)
         (label "a listed sell stays committed")
         0.2
-        (Dio_strategies.Jacobs_ladder.committed_sell_base state);
+        (Dio_strategies.Strategy_api.committed_sell_base state);
       feed := [];
       ignore (sync ());
       (* A feed absence is venue-specific: venues whose balance nets holds from their own
@@ -5885,7 +5883,7 @@ let test_sell_commitment_lifecycle_all_venues () =
             then "a feed-dropped sell is evicted (venue nets from own state)"
             else "a feed-dropped live sell stays committed"))
         (if trust_feed then 0.0 else 0.2)
-        (Dio_strategies.Jacobs_ladder.committed_sell_base state);
+        (Dio_strategies.Strategy_api.committed_sell_base state);
       check
         bool
         (label
@@ -5895,9 +5893,9 @@ let test_sell_commitment_lifecycle_all_venues () =
         (not trust_feed)
         (Sell_orders.exists_id state.open_sell_orders "life-oid");
       let effective =
-        Dio_strategies.Jacobs_ladder.effective_committed_sell_base
+        Dio_strategies.Strategy_api.effective_committed_sell_base
           ~ecfg
-          ~ledger_total:(Dio_strategies.Jacobs_ladder.committed_sell_base state)
+          ~ledger_total:(Dio_strategies.Strategy_api.committed_sell_base state)
           ~feed_total:state.feed_locked_sell_base
           ~unnetted_hold:0.0
       in
@@ -5907,7 +5905,7 @@ let test_sell_commitment_lifecycle_all_venues () =
         (if trust_feed then 0.0 else 0.2)
         effective;
       (* 5. A full fill releases the commitment. *)
-      Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+      Dio_strategies.Strategy_api.Strategy.handle_order_filled
         ~now:(now +. 1.0)
         symbol
         "life-oid"
@@ -5919,7 +5917,7 @@ let test_sell_commitment_lifecycle_all_venues () =
         (float 1e-9)
         (label "a sell fill releases the commitment")
         0.0
-        (Dio_strategies.Jacobs_ladder.committed_sell_base state))
+        (Dio_strategies.Strategy_api.committed_sell_base state))
     venues
 ;;
 
@@ -5932,9 +5930,9 @@ let test_terminal_sell_fill_releases_full_commitment () =
      closest-sell distance) and the under-counted sellable balance that buys into the
      phantom reservation. *)
   let symbol = "TERMINAL_FILL/USDC" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
-  state.cached_ecfg <- Dio_strategies.Jacobs_ladder.get_exchange_config "hyperliquid";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "hyperliquid";
   state.cached_qty_increment <- 0.01;
   state.cached_price_increment <- 0.01;
   state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
@@ -5960,7 +5958,7 @@ let test_terminal_sell_fill_releases_full_commitment () =
   state.startup_replay <- false;
   state.last_fill_oid <- None;
   Hashtbl.reset state.processed_fills;
-  Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
     ~now:1000.0
     symbol
     "part-oid"
@@ -5972,7 +5970,7 @@ let test_terminal_sell_fill_releases_full_commitment () =
     (float 1e-9)
     "terminal fill releases the whole commitment"
     0.0
-    (Dio_strategies.Jacobs_ladder.committed_sell_base state);
+    (Dio_strategies.Strategy_api.committed_sell_base state);
   check
     bool
     "the filled sell is dropped from the open-order view"
