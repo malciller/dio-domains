@@ -116,6 +116,12 @@ let reconcile_persisted_sell_levels =
 ;;
 
 let evaluate_sell_leg = Jacobs_ladder_execution.evaluate_sell_leg
+
+type sell_pre = Jacobs_ladder_execution.sell_pre
+
+let sell_leg_prepare = Jacobs_ladder_execution.sell_leg_prepare
+let sell_leg_place = Jacobs_ladder_execution.sell_leg_place
+let sell_leg_finalize = Jacobs_ladder_execution.sell_leg_finalize
 let evaluate_buy_leg = Jacobs_ladder_execution.evaluate_buy_leg
 let buy_leg_facts = Jacobs_ladder_execution.buy_leg_facts
 let buy_cancel_excess = Jacobs_ladder_execution.buy_cancel_excess

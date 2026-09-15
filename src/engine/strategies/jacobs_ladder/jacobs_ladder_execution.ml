@@ -1401,39 +1401,32 @@ let evaluate_excess_sweep
   | _ -> ()
 ;;
 
-(** Buy-triggered and Alpaca-exclusive inventory-maintenance sell placement leg.
-    [persisted_reconcile] is the (open_levels, missing_levels) split that
-    [sync_open_orders] computed during its scan, so the Alpaca virtual-GTC reconcile never
-    re-partitions the persisted-vs-open multiset.
+(** Derived sell-leg state shared between the prepare/place/finalize phases.
+    ([evaluate_sell_leg] below recombines the three phases, so the reference entry point
+    is unchanged. The trigger/latch/sizing contract is documented on its sub-phases.) *)
+type sell_pre =
+  { sp_is_alpaca : bool
+  ; sp_is_accumulation : bool
+  ; sp_ledger_balance : float
+  ; sp_alpaca_available : float
+  ; sp_available_base : float
+  ; sp_committed_sell : float
+  ; sp_reserve_headroom : float
+  ; sp_inventory_basis : float
+  ; sp_inventory_ok : bool
+  ; sp_min_notional : float
+  ; sp_base_ref_price : float
+  ; sp_capital_exhausted : bool
+  ; sp_halt_inventory_check : bool
+  ; sp_should_trigger_sell : bool
+  ; sp_is_sell_on_cooldown : bool
+  ; sp_missing_after_reconcile : (float * float) list ref
+  ; sp_sell_pushed : bool ref
+  ; sp_nothing_placeable : bool ref
+  }
 
-    Sell trigger: a sell is attempted when a buy is placed ([buy_attempted]) or filled
-    ([just_filled_buy] - the 1-buy x multi-sell ladder), and the trigger is owed until the
-    sell is actually placed. Only a placed sell or a verified nothing-to-sell (known
-    balance below the venue floor) consumes it - transient blockers (cooldown, asset_low,
-    NaN balance, in-flight sell) do not, so the sell retries every tick even with no
-    capital to replace the buy (exhausted / oracle-halted) or when the buy tick itself was
-    blocked. For remaintain venues (Alpaca) the placement block can never consume on a
-    below-floor balance, so the verified nothing-to-sell consumption is applied explicitly
-    at the end of the leg.
-
-    Sell sizing: base committed to a resting or in-flight sell is never sellable on any
-    venue. The formula is
-
-    available = spot_holding - reserved_base - committed_sell_base
-
-    where [committed_sell_base] is the base the venue has not already removed from its
-    reported figure (see [effective_committed_sell_base]): the ledger's excess over the
-    venue feed on net-balance venues (never below the short [unnetted_hold] overlay), and
-    the whole in-flight ledger on gross-balance venues. Venue differences live only in how
-    the spot holding is obtained: accumulation venues use the reported figure (tradeable
-    on Hyperliquid, gross on Kraken/IBKR/Lighter); Alpaca uses the venue's [qty_available]
-    (free of resting holds). The ledger keeps this correct when a venue's open-order feed
-    drops a live order. The result must clear the venue's quote-notional minimum
-    ([cached_venue_min_notional]; Alpaca dollar notional, Hyperliquid 10 USDC spot floor).
-    Sells are deliberately not floored at [cached_venue_min_qty]: accrual sells (sell_mult
-    x qty) and residual inventory size below the lot minimum. The notional minimum is the
-    exchange's reject threshold, separate from the grid's [qty]. *)
-let evaluate_sell_leg
+(** Sell leg phase 1: derived sizing/gate facts and the persisted-level reconcile. *)
+let sell_leg_prepare
   ~persisted_reconcile
   ~state
   ~now
@@ -1708,11 +1701,52 @@ let evaluate_sell_leg
   (match skip_reason with
    | Some reason -> log_sell_block ~state ~now ~symbol:asset.symbol reason
    | None -> ());
-  (* Hoisted outside the gated block so a placement-tick sell attempt that is blocked by a
-     transient gate (cooldown / asset_low / NaN balance / an in-flight sell placement) can
-     still arm the retry latch below. *)
   let sell_pushed = ref false in
   let nothing_placeable = ref false in
+  { sp_is_alpaca = is_alpaca
+  ; sp_is_accumulation = is_accumulation_basis
+  ; sp_ledger_balance = ledger_balance
+  ; sp_alpaca_available = alpaca_available
+  ; sp_available_base = available_base
+  ; sp_committed_sell = committed_sell
+  ; sp_reserve_headroom = reserve_headroom
+  ; sp_inventory_basis = inventory_basis
+  ; sp_inventory_ok = inventory_ok
+  ; sp_min_notional = min_notional
+  ; sp_base_ref_price = base_ref_price
+  ; sp_capital_exhausted = capital_exhausted
+  ; sp_halt_inventory_check = halt_inventory_check
+  ; sp_should_trigger_sell = should_trigger_sell
+  ; sp_is_sell_on_cooldown = is_sell_on_cooldown
+  ; sp_missing_after_reconcile = missing_after_reconcile
+  ; sp_sell_pushed = sell_pushed
+  ; sp_nothing_placeable = nothing_placeable
+  }
+;;
+
+(** Sell leg phase 2: the gated placement block. *)
+let sell_leg_place
+  ~state
+  ~now
+  ~(asset : trading_config)
+  ~bid_price
+  ~ask_price
+  ~asset_balance
+  ~buy_attempted
+  ~ecfg
+  ~pre
+  =
+  let is_alpaca = pre.sp_is_alpaca in
+  let alpaca_available = pre.sp_alpaca_available in
+  let ledger_balance = pre.sp_ledger_balance in
+  let committed_sell = pre.sp_committed_sell in
+  let capital_exhausted = pre.sp_capital_exhausted in
+  let halt_inventory_check = pre.sp_halt_inventory_check in
+  let should_trigger_sell = pre.sp_should_trigger_sell in
+  let is_sell_on_cooldown = pre.sp_is_sell_on_cooldown in
+  let missing_after_reconcile = pre.sp_missing_after_reconcile in
+  let sell_pushed = pre.sp_sell_pushed in
+  let nothing_placeable = pre.sp_nothing_placeable in
   if should_trigger_sell
      && (not (Float.is_nan asset_balance))
      && (not (has_active_sell state))
@@ -2000,7 +2034,30 @@ let evaluate_sell_leg
                 sell_price
                 effective_sell_qty));
         nothing_placeable := true))
-    else nothing_placeable := true);
+    else nothing_placeable := true)
+;;
+
+(** Sell leg phase 3: retry-latch bookkeeping, nothing-to-sell consumption, excess sweep. *)
+let sell_leg_finalize
+  ~state
+  ~now
+  ~(asset : trading_config)
+  ~asset_balance
+  ~buy_attempted
+  ~ecfg
+  ~base_balance_age
+  ~pre
+  =
+  let is_alpaca = pre.sp_is_alpaca in
+  let inventory_ok = pre.sp_inventory_ok in
+  let inventory_basis = pre.sp_inventory_basis in
+  let min_notional = pre.sp_min_notional in
+  let base_ref_price = pre.sp_base_ref_price in
+  let missing_after_reconcile = pre.sp_missing_after_reconcile in
+  let available_base = pre.sp_available_base in
+  let reserve_headroom = pre.sp_reserve_headroom in
+  let sell_pushed = pre.sp_sell_pushed in
+  let nothing_placeable = pre.sp_nothing_placeable in
   (* Retry semantics: the sell for a completed buy (or a buy placement) is OWED until it
      is actually placed. Transient blockers (sell cooldown, asset_low, a NaN balance
      snapshot, an in-flight sell placement) do NOT consume the trigger, so the leg retries
@@ -2073,6 +2130,56 @@ let evaluate_sell_leg
       ~min_notional
       ~ecfg);
   state.resuming_after_balance_flag <- false
+;;
+
+let evaluate_sell_leg
+  ~persisted_reconcile
+  ~state
+  ~now
+  ~(asset : trading_config)
+  ~bid_price
+  ~ask_price
+  ~asset_balance
+  ~buy_attempted
+  ~(oracle_halted : bool)
+  ~ecfg
+  ~locked_in_sells
+  ~base_balance_age
+  =
+  let pre =
+    sell_leg_prepare
+      ~persisted_reconcile
+      ~state
+      ~now
+      ~asset
+      ~bid_price
+      ~ask_price
+      ~asset_balance
+      ~buy_attempted
+      ~oracle_halted
+      ~ecfg
+      ~locked_in_sells
+      ~base_balance_age
+  in
+  sell_leg_place
+    ~state
+    ~now
+    ~asset
+    ~bid_price
+    ~ask_price
+    ~asset_balance
+    ~buy_attempted
+    ~ecfg
+    ~pre;
+  sell_leg_finalize
+    ~state
+    ~now
+    ~asset
+    ~asset_balance
+    ~buy_attempted
+    ~ecfg
+    ~base_balance_age
+    ~pre
 ;;
 
 (** Main strategy execution loop. [quote_balance_stale] is set by the caller (domain

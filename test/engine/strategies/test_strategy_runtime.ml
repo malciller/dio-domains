@@ -333,6 +333,9 @@ module Stub_engine = struct
   let buy_place _ = ()
   let buy_amend _ = ()
   let sell _ = ()
+  let sell_prepare _ = ()
+  let sell_place _ = ()
+  let sell_finalize _ = ()
 end
 
 module Stub_grid = Strategy_actions_grid.Make (Stub_engine)
