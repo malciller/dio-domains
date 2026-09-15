@@ -29,6 +29,7 @@
   Strategy_actions
   Strategy_actions_builtin
   Strategy_actions_cycle
+  Strategy_cycle_engine
   Strategy_expr
   Strategy_file
   Strategy_compile
