@@ -328,6 +328,7 @@ module Stub_engine = struct
   let buy_gate _ = true
   let expire_tif_recovery _ = ()
   let cycle_facts _ = []
+  let mark_stale _ = ()
   let buy_facts _ = false, 0, false
   let buy_cancel _ = ()
   let buy_place _ = ()
