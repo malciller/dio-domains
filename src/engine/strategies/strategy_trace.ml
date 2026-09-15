@@ -13,6 +13,7 @@ type order_intent =
   ; oi_reduce_only : bool
   ; oi_tif : string option
   ; oi_order_id : string option
+  ; oi_userref : int option
   }
 
 (** An order the strategy emitted (its decision), as opposed to the venue's open-order
@@ -65,12 +66,13 @@ let order_intent_eq a b =
   && Bool.equal a.oi_reduce_only b.oi_reduce_only
   && a.oi_tif = b.oi_tif
   && a.oi_order_id = b.oi_order_id
+  && a.oi_userref = b.oi_userref
 ;;
 
 let string_of_order_intent o =
   Printf.sprintf
     "order(symbol=%s side=%s qty=%.8g price=%.8g post_only=%b reduce_only=%b tif=%s \
-     id=%s)"
+     id=%s userref=%s)"
     o.oi_symbol
     o.oi_side
     o.oi_qty
@@ -82,6 +84,9 @@ let string_of_order_intent o =
      | None -> "-")
     (match o.oi_order_id with
      | Some i -> i
+     | None -> "-")
+    (match o.oi_userref with
+     | Some u -> string_of_int u
      | None -> "-")
 ;;
 
@@ -261,6 +266,10 @@ let order_intent_to_json o =
       , match o.oi_order_id with
         | Some i -> `String i
         | None -> `Null )
+    ; ( "userref"
+      , match o.oi_userref with
+        | Some u -> `Int u
+        | None -> `Null )
     ]
 ;;
 
@@ -268,6 +277,10 @@ let order_intent_of_json j =
   let open Yojson.Basic.Util in
   let opt_str = function
     | `String s -> Some s
+    | _ -> None
+  in
+  let opt_int = function
+    | `Int i -> Some i
     | _ -> None
   in
   { oi_symbol = j |> member "symbol" |> to_string
@@ -278,6 +291,7 @@ let order_intent_of_json j =
   ; oi_reduce_only = j |> member "reduce_only" |> to_bool
   ; oi_tif = opt_str (j |> member "tif")
   ; oi_order_id = opt_str (j |> member "order_id")
+  ; oi_userref = opt_int (j |> member "userref")
   }
 ;;
 

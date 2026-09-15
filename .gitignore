@@ -63,6 +63,7 @@ out/
 config.json
 config.reference.json
 config.candidate.json
+config.trace.json
 *.pem
 *.key
 *.crt

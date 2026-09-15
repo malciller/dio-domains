@@ -43,28 +43,39 @@
       "then": [{ "action": "grid_buy_facts", "args": {} }]
     },
     {
-      "id": "buy_pending",
-      "when": { "all": [ { "engine": { "buy_active": true } }, { "engine": { "buy_pending": true } } ] },
-      "then": [],
-      "stop": true
-    },
-    {
       "id": "buy_cancel",
-      "when": { "all": [ { "engine": { "buy_active": true } }, { "engine": { "buy_should_cancel": true } } ] },
-      "then": [{ "action": "grid_buy_cancel", "args": {} }],
-      "stop": true
+      "when": {
+        "all": [
+          { "engine": { "buy_active": true } },
+          { "not": { "engine": { "buy_pending": true } } },
+          { "engine": { "buy_should_cancel": true } }
+        ]
+      },
+      "then": [{ "action": "grid_buy_cancel", "args": {} }]
     },
     {
       "id": "buy_place",
-      "when": { "all": [ { "engine": { "buy_active": true } }, { "engine": { "buy_count_zero": true } } ] },
-      "then": [{ "action": "grid_buy_place", "args": {} }],
-      "stop": true
+      "when": {
+        "all": [
+          { "engine": { "buy_active": true } },
+          { "not": { "engine": { "buy_pending": true } } },
+          { "not": { "engine": { "buy_should_cancel": true } } },
+          { "engine": { "buy_count_zero": true } }
+        ]
+      },
+      "then": [{ "action": "grid_buy_place", "args": {} }]
     },
     {
       "id": "buy_amend",
-      "when": { "all": [ { "engine": { "buy_active": true } }, { "engine": { "buy_count_positive": true } } ] },
-      "then": [{ "action": "grid_buy_amend", "args": {} }],
-      "stop": true
+      "when": {
+        "all": [
+          { "engine": { "buy_active": true } },
+          { "not": { "engine": { "buy_pending": true } } },
+          { "not": { "engine": { "buy_should_cancel": true } } },
+          { "engine": { "buy_count_positive": true } }
+        ]
+      },
+      "then": [{ "action": "grid_buy_amend", "args": {} }]
     },
     {
       "id": "sell",

@@ -1643,6 +1643,7 @@ let asset_domain_worker
                    ; oi_reduce_only = false
                    ; oi_tif = None
                    ; oi_order_id = Some o.order_id
+                   ; oi_userref = o.user_ref
                    })
                (Ex.get_open_orders ~symbol:asset_with_fees.symbol);
              let grid_interval =
@@ -1652,7 +1653,8 @@ let asset_domain_worker
              in
              Dio_strategies.Strategy_event_recorder.record_state
                r
-               [ "price", Dio_strategies.Strategy_expr.V_float !current_price
+               [ "symbol", Dio_strategies.Strategy_expr.V_string asset_with_fees.symbol
+               ; "price", Dio_strategies.Strategy_expr.V_float !current_price
                ; "bid", Dio_strategies.Strategy_expr.V_float !tob_bid
                ; "ask", Dio_strategies.Strategy_expr.V_float !tob_ask
                ; "asset_balance", Dio_strategies.Strategy_expr.V_float asset_bal_val
