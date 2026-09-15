@@ -302,6 +302,23 @@ let cycle_facts c =
     | Some s -> s.tif_recovery_pending, s.tif_recovery_since
     | None -> false, 0.0
   in
+  let has_pending_buy =
+    match state with
+    | Some s ->
+      List.exists
+        (fun (_, side, _, _) -> side = Dio_strategies.Strategy_common.Buy)
+        s.pending_orders
+    | None -> false
+  in
+  let has_tracked_buy, inflight_cancel_buy, inflight_amend_buy, maker_fee_set =
+    match state with
+    | Some s ->
+      ( s.last_buy_order_id <> None
+      , s.inflight_cancel_buy
+      , s.inflight_amend_buy
+      , s.maker_fee > 0.0 )
+    | None -> false, false, false, false
+  in
   let check_stale_balance =
     match c.cg_ecfg with
     | Some ecfg -> ecfg.check_stale_balance
@@ -311,15 +328,17 @@ let cycle_facts c =
   ; "tif_recovery_pending", Dio_strategies.Strategy_expr.V_bool pending
   ; "tif_recovery_since", Dio_strategies.Strategy_expr.V_float since
   ; "price_nan", Dio_strategies.Strategy_expr.V_bool (Float.is_nan c.cg_price)
-  ; ( "maker_fee_set"
-    , Dio_strategies.Strategy_expr.V_bool
-        (match state with
-         | Some s -> s.maker_fee > 0.0
-         | None -> false) )
+  ; "maker_fee_set", Dio_strategies.Strategy_expr.V_bool maker_fee_set
   ; "fee_refresh_due", Dio_strategies.Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0)
   ; "check_stale_balance", Dio_strategies.Strategy_expr.V_bool check_stale_balance
   ; "asset_balance_nan", Dio_strategies.Strategy_expr.V_bool (Float.is_nan c.cg_abal)
   ; "quote_balance_nan", Dio_strategies.Strategy_expr.V_bool (Float.is_nan c.cg_qbal)
+  ; "has_pending_buy", Dio_strategies.Strategy_expr.V_bool has_pending_buy
+  ; "has_tracked_buy", Dio_strategies.Strategy_expr.V_bool has_tracked_buy
+  ; "inflight_cancel_buy", Dio_strategies.Strategy_expr.V_bool inflight_cancel_buy
+  ; "inflight_amend_buy", Dio_strategies.Strategy_expr.V_bool inflight_amend_buy
+  ; "open_buy_count", Dio_strategies.Strategy_expr.V_int c.cg_open_buy_count
+  ; "has_recent_amend_buy", Dio_strategies.Strategy_expr.V_bool c.cg_has_recent_amend_buy
   ]
 ;;
 
@@ -357,13 +376,19 @@ let buy_facts c =
 let buy_cancel c =
   match c.cg_state, c.cg_asset with
   | Some state, Some asset ->
+    let effective_buy_count =
+      if state.last_buy_order_id <> None && c.cg_open_buy_count = 0
+      then 1
+      else c.cg_open_buy_count
+    in
+    c.cg_buy_effective_count <- effective_buy_count;
     Jac.buy_cancel_excess
       ~state
       ~now:c.cg_now
       ~asset
       ~iter_open_orders:c.cg_iter
       ~cycle:c.cg_cycle
-      ~effective_buy_count:c.cg_buy_effective_count
+      ~effective_buy_count
   | _ -> ()
 ;;
 

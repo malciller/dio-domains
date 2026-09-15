@@ -1,178 +1,338 @@
 {
   "name": "jacobs_ladder",
   "version": 1,
-  "triggers": ["book_update", "fill", "order_lifecycle"],
+  "triggers": [
+    "book_update",
+    "fill",
+    "order_lifecycle"
+  ],
   "params": {},
   "state": {},
   "steps": [
     {
       "id": "ev_filled",
-      "when": { "event": "filled" },
-      "then": [{ "action": "on_event", "args": {} }],
+      "when": {
+        "event": "filled"
+      },
+      "then": [
+        {
+          "action": "on_event",
+          "args": {}
+        }
+      ],
       "stop": true
     },
     {
       "id": "ev_cancelled",
-      "when": { "event": "cancelled" },
-      "then": [{ "action": "on_event", "args": {} }],
+      "when": {
+        "event": "cancelled"
+      },
+      "then": [
+        {
+          "action": "on_event",
+          "args": {}
+        }
+      ],
       "stop": true
     },
     {
       "id": "ev_acknowledged",
-      "when": { "event": "acknowledged" },
-      "then": [{ "action": "on_event", "args": {} }],
+      "when": {
+        "event": "acknowledged"
+      },
+      "then": [
+        {
+          "action": "on_event",
+          "args": {}
+        }
+      ],
       "stop": true
     },
     {
       "id": "ev_amended",
-      "when": { "event": "amended" },
-      "then": [{ "action": "on_event", "args": {} }],
+      "when": {
+        "event": "amended"
+      },
+      "then": [
+        {
+          "action": "on_event",
+          "args": {}
+        }
+      ],
       "stop": true
     },
     {
       "id": "ev_failed",
-      "when": { "event": "failed" },
-      "then": [{ "action": "on_event", "args": {} }],
+      "when": {
+        "event": "failed"
+      },
+      "then": [
+        {
+          "action": "on_event",
+          "args": {}
+        }
+      ],
       "stop": true
     },
     {
       "id": "ev_rejected",
-      "when": { "event": "rejected" },
-      "then": [{ "action": "on_event", "args": {} }],
+      "when": {
+        "event": "rejected"
+      },
+      "then": [
+        {
+          "action": "on_event",
+          "args": {}
+        }
+      ],
       "stop": true
     },
     {
       "id": "ev_amendment_skipped",
-      "when": { "event": "amendment_skipped" },
-      "then": [{ "action": "on_event", "args": {} }],
+      "when": {
+        "event": "amendment_skipped"
+      },
+      "then": [
+        {
+          "action": "on_event",
+          "args": {}
+        }
+      ],
       "stop": true
     },
     {
       "id": "ev_amendment_failed",
-      "when": { "event": "amendment_failed" },
-      "then": [{ "action": "on_event", "args": {} }],
+      "when": {
+        "event": "amendment_failed"
+      },
+      "then": [
+        {
+          "action": "on_event",
+          "args": {}
+        }
+      ],
       "stop": true
     },
     {
       "id": "ev_cancel_cleanup",
-      "when": { "event": "cancel_cleanup" },
-      "then": [{ "action": "on_event", "args": {} }],
+      "when": {
+        "event": "cancel_cleanup"
+      },
+      "then": [
+        {
+          "action": "on_event",
+          "args": {}
+        }
+      ],
       "stop": true
     },
     {
       "id": "prepare",
-      "when": { "event": "book_update" },
+      "when": {
+        "event": "book_update"
+      },
       "then": [
-        { "action": "cycle_prepare", "args": {} },
-        { "action": "cycle_facts", "args": {} }
+        {
+          "action": "cycle_prepare",
+          "args": {}
+        },
+        {
+          "action": "cycle_facts",
+          "args": {}
+        }
       ]
     },
     {
       "id": "skip_nan_price",
-      "when": { "event": "book_update", "expr": "$platform.price_nan" },
+      "when": {
+        "event": "book_update",
+        "expr": "$platform.price_nan"
+      },
       "then": [],
       "stop": true
     },
     {
       "id": "cleanup",
-      "when": { "event": "book_update" },
-      "then": [{ "action": "cycle_cleanup", "args": {} }]
+      "when": {
+        "event": "book_update"
+      },
+      "then": [
+        {
+          "action": "cycle_cleanup",
+          "args": {}
+        }
+      ]
     },
     {
       "id": "sync",
-      "when": { "event": "book_update" },
-      "then": [{ "action": "cycle_sync", "args": {} }]
+      "when": {
+        "event": "book_update"
+      },
+      "then": [
+        {
+          "action": "cycle_sync",
+          "args": {}
+        }
+      ]
     },
     {
       "id": "fee",
-      "when": { "event": "book_update", "expr": "not $platform.maker_fee_set or $platform.fee_refresh_due" },
-      "then": [{ "action": "cycle_refresh_fee", "args": {} }]
+      "when": {
+        "event": "book_update",
+        "expr": "not $platform.maker_fee_set or $platform.fee_refresh_due"
+      },
+      "then": [
+        {
+          "action": "cycle_refresh_fee",
+          "args": {}
+        }
+      ]
     },
     {
       "id": "mark_stale",
       "when": {
         "all": [
-          { "event": "book_update" },
-          { "expr": "not $platform.price_nan and $platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan)" }
-        ]
-      },
-      "then": [{ "action": "mark_stale_cycle", "args": {} }]
-    },
-    {
-      "id": "buy_gate",
-      "when": { "event": "book_update", "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))" },
-      "then": [
-        { "action": "expire_tif_recovery", "args": {} },
-        { "action": "cycle_facts", "args": {} }
-      ]
-    },
-    {
-      "id": "buy_facts",
-      "when": {
-        "all": [
-          { "event": "book_update" },
-          { "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))" },
           {
-            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+            "event": "book_update"
+          },
+          {
+            "expr": "not $platform.price_nan and $platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan)"
           }
         ]
       },
-      "then": [{ "action": "buy_facts", "args": {} }]
+      "then": [
+        {
+          "action": "mark_stale_cycle",
+          "args": {}
+        }
+      ]
+    },
+    {
+      "id": "buy_gate",
+      "when": {
+        "event": "book_update",
+        "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+      },
+      "then": [
+        {
+          "action": "expire_tif_recovery",
+          "args": {}
+        },
+        {
+          "action": "cycle_facts",
+          "args": {}
+        }
+      ]
     },
     {
       "id": "buy_cancel",
       "when": {
         "all": [
-          { "event": "book_update" },
-          { "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))" },
+          {
+            "event": "book_update"
+          },
+          {
+            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+          },
           {
             "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
           },
-          { "not": { "engine": { "buy_pending": true } } },
-          { "engine": { "buy_should_cancel": true } }
+          {
+            "expr": "not $platform.has_pending_buy"
+          },
+          {
+            "expr": "$platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy"
+          }
         ]
       },
-      "then": [{ "action": "buy_cancel", "args": {} }]
+      "then": [
+        {
+          "action": "buy_cancel",
+          "args": {}
+        }
+      ]
     },
     {
       "id": "buy_place",
       "when": {
         "all": [
-          { "event": "book_update" },
-          { "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))" },
+          {
+            "event": "book_update"
+          },
+          {
+            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+          },
           {
             "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
           },
-          { "not": { "engine": { "buy_pending": true } } },
-          { "not": { "engine": { "buy_should_cancel": true } } },
-          { "engine": { "buy_count_zero": true } }
+          {
+            "expr": "not $platform.has_pending_buy"
+          },
+          {
+            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+          },
+          {
+            "expr": "not ($platform.open_buy_count > 0 or $platform.has_tracked_buy)"
+          }
         ]
       },
-      "then": [{ "action": "buy_place", "args": {} }]
+      "then": [
+        {
+          "action": "buy_place",
+          "args": {}
+        }
+      ]
     },
     {
       "id": "buy_amend",
       "when": {
         "all": [
-          { "event": "book_update" },
-          { "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))" },
+          {
+            "event": "book_update"
+          },
+          {
+            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+          },
           {
             "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
           },
-          { "not": { "engine": { "buy_pending": true } } },
-          { "not": { "engine": { "buy_should_cancel": true } } },
-          { "engine": { "buy_count_positive": true } }
+          {
+            "expr": "not $platform.has_pending_buy"
+          },
+          {
+            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+          },
+          {
+            "expr": "$platform.open_buy_count > 0 or $platform.has_tracked_buy"
+          }
         ]
       },
-      "then": [{ "action": "buy_amend", "args": {} }]
+      "then": [
+        {
+          "action": "buy_amend",
+          "args": {}
+        }
+      ]
     },
     {
       "id": "sell",
-      "when": { "event": "book_update", "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))" },
+      "when": {
+        "event": "book_update",
+        "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+      },
       "then": [
-        { "action": "sell_prepare", "args": {} },
-        { "action": "sell_place", "args": {} },
-        { "action": "sell_finalize", "args": {} }
+        {
+          "action": "sell_prepare",
+          "args": {}
+        },
+        {
+          "action": "sell_place",
+          "args": {}
+        },
+        {
+          "action": "sell_finalize",
+          "args": {}
+        }
       ],
       "stop": true
     }
