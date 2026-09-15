@@ -117,6 +117,10 @@ let reconcile_persisted_sell_levels =
 
 let evaluate_sell_leg = Jacobs_ladder_execution.evaluate_sell_leg
 let evaluate_buy_leg = Jacobs_ladder_execution.evaluate_buy_leg
+let buy_leg_facts = Jacobs_ladder_execution.buy_leg_facts
+let buy_cancel_excess = Jacobs_ladder_execution.buy_cancel_excess
+let buy_place_initial = Jacobs_ladder_execution.buy_place_initial
+let buy_amend = Jacobs_ladder_execution.buy_amend
 let cleanup_pending_and_cooldowns = Jacobs_ladder_execution.cleanup_pending_and_cooldowns
 let reconcile_position = Jacobs_ladder_execution.reconcile_position
 let evaluate_asset_low_recovery = Jacobs_ladder_execution.evaluate_asset_low_recovery

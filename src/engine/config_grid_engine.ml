@@ -43,6 +43,10 @@ type ctx =
   ; mutable cg_open_persisted : (float * float) list
   ; mutable cg_missing_persisted : (float * float) list
   ; mutable cg_buy_attempted : bool
+  ; mutable cg_buy_active : bool
+  ; mutable cg_buy_pending : bool
+  ; mutable cg_buy_effective_count : int
+  ; mutable cg_buy_should_cancel : bool
   }
 
 let create () =
@@ -73,6 +77,10 @@ let create () =
   ; cg_open_persisted = []
   ; cg_missing_persisted = []
   ; cg_buy_attempted = false
+  ; cg_buy_active = false
+  ; cg_buy_pending = false
+  ; cg_buy_effective_count = 0
+  ; cg_buy_should_cancel = false
   }
 ;;
 
@@ -305,6 +313,107 @@ let buy c =
   | _ ->
     c.cg_buy_attempted <- false;
     false
+;;
+
+(** Fine path step 6a: TIF-recovery bookkeeping and the oracle-halt buy gate. Returns
+    whether the buy branches should run (false halts buy placement but the sell leg still
+    runs). Resets [buy_attempted] for the cycle. *)
+let buy_gate c =
+  c.cg_buy_attempted <- false;
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    let recovery_expired =
+      state.tif_recovery_pending && c.cg_now -. state.tif_recovery_since >= 900.0
+    in
+    if recovery_expired
+    then (
+      state.tif_recovery_pending <- false;
+      Logging.info_f
+        ~section:"config_grid_engine"
+        "TIF recovery window expired for %s - resuming normal oracle-gated buying"
+        asset.symbol);
+    let tif_recovery_active =
+      state.tif_recovery_pending && c.cg_now -. state.tif_recovery_since < 900.0
+    in
+    let active = not (c.cg_oracle_halted && not tif_recovery_active) in
+    c.cg_buy_active <- active;
+    active
+  | _ ->
+    c.cg_buy_active <- false;
+    false
+;;
+
+(** Fine path step 6b: publish the buy-leg branch facts. Returns
+    [(pending, effective_count, should_cancel)]. *)
+let buy_facts c =
+  match c.cg_state with
+  | Some state ->
+    let pending, effective, should_cancel =
+      Jac.buy_leg_facts
+        ~state
+        ~open_buy_count_from_scan:c.cg_open_buy_count
+        ~has_recent_amend_buy:c.cg_has_recent_amend_buy
+    in
+    c.cg_buy_pending <- pending;
+    c.cg_buy_effective_count <- effective;
+    c.cg_buy_should_cancel <- should_cancel;
+    pending, effective, should_cancel
+  | None ->
+    c.cg_buy_pending <- false;
+    c.cg_buy_effective_count <- 0;
+    c.cg_buy_should_cancel <- false;
+    false, 0, false
+;;
+
+(** Fine path branch: cancel every resting buy (single-buy policy). *)
+let buy_cancel c =
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    Jac.buy_cancel_excess
+      ~state
+      ~now:c.cg_now
+      ~asset
+      ~iter_open_orders:c.cg_iter
+      ~cycle:c.cg_cycle
+      ~effective_buy_count:c.cg_buy_effective_count
+  | _ -> ()
+;;
+
+(** Fine path branch: place the initial buy; sets [buy_attempted]. *)
+let buy_place c =
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    c.cg_buy_attempted
+    <- Jac.buy_place_initial
+         ~state
+         ~now:c.cg_now
+         ~asset
+         ~bid_price:c.cg_bid_r
+         ~ask_price:c.cg_ask_r
+         ~quote_balance:c.cg_qbal
+         ~quote_balance_stale:c.cg_quote_stale
+         ~oracle_halted:c.cg_oracle_halted
+         ~cycle:c.cg_cycle
+         ~locked_in_buys:c.cg_locked_in_buys
+         ~closest_sell_order_initial:c.cg_closest_sell_order
+  | _ -> c.cg_buy_attempted <- false
+;;
+
+(** Fine path branch: trail/amend the single resting buy. *)
+let buy_amend c =
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    Jac.buy_amend
+      ~state
+      ~now:c.cg_now
+      ~asset
+      ~bid_price:c.cg_bid_r
+      ~ask_price:c.cg_ask_r
+      ~quote_balance:c.cg_qbal
+      ~cycle:c.cg_cycle
+      ~locked_in_buys:c.cg_locked_in_buys
+      ~closest_sell_order_initial:c.cg_closest_sell_order
+  | _ -> ()
 ;;
 
 (** Fine path step 6: sell leg. *)

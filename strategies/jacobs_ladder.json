@@ -33,12 +33,43 @@
       "then": [{ "action": "grid_guard", "args": {} }]
     },
     {
-      "id": "trade",
+      "id": "buy_gate",
       "when": { "engine": { "continue": true } },
-      "then": [
-        { "action": "grid_buy", "args": {} },
-        { "action": "grid_sell", "args": {} }
-      ],
+      "then": [{ "action": "grid_buy_gate", "args": {} }]
+    },
+    {
+      "id": "buy_facts",
+      "when": { "all": [ { "engine": { "buy_active": true } } ] },
+      "then": [{ "action": "grid_buy_facts", "args": {} }]
+    },
+    {
+      "id": "buy_pending",
+      "when": { "all": [ { "engine": { "buy_active": true } }, { "engine": { "buy_pending": true } } ] },
+      "then": [],
+      "stop": true
+    },
+    {
+      "id": "buy_cancel",
+      "when": { "all": [ { "engine": { "buy_active": true } }, { "engine": { "buy_should_cancel": true } } ] },
+      "then": [{ "action": "grid_buy_cancel", "args": {} }],
+      "stop": true
+    },
+    {
+      "id": "buy_place",
+      "when": { "all": [ { "engine": { "buy_active": true } }, { "engine": { "buy_count_zero": true } } ] },
+      "then": [{ "action": "grid_buy_place", "args": {} }],
+      "stop": true
+    },
+    {
+      "id": "buy_amend",
+      "when": { "all": [ { "engine": { "buy_active": true } }, { "engine": { "buy_count_positive": true } } ] },
+      "then": [{ "action": "grid_buy_amend", "args": {} }],
+      "stop": true
+    },
+    {
+      "id": "sell",
+      "when": { "engine": { "continue": true } },
+      "then": [{ "action": "grid_sell", "args": {} }],
       "stop": true
     }
   ]
