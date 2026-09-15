@@ -22,6 +22,7 @@
   Strategy_venue
   Strategy_reservation
   Strategy_lifecycle
+  Strategy_decision
   Strategy_orders
   Strategy_sell_orders
   Jacobs_ladder_execution
