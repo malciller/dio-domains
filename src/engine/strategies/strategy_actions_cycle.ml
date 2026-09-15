@@ -209,8 +209,13 @@ module Make (E : ENGINE) = struct
       []
     in
     { run =
-        (fun t name _args ->
+        (fun t name args ->
           match name with
+          | "set_gate" ->
+            (match List.assoc_opt "name" args, List.assoc_opt "value" args with
+             | Some (V_string k), Some v -> Strategy_runtime.set_state t k v
+             | _ -> ());
+            []
           | "cycle_prepare" -> ph Preamble (fun () -> ignore (E.prepare ctx))
           | "init_venue_state" -> ph Preamble (fun () -> E.prepare_init ctx)
           | "prepare_recovery" -> ph Preamble (fun () -> E.prepare_recovery ctx)

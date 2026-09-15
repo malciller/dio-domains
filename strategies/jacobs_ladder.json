@@ -7,7 +7,26 @@
     "order_lifecycle"
   ],
   "params": {},
-  "state": {},
+  "state": {
+    "cycle_ok": {
+      "type": "bool"
+    },
+    "buy_active": {
+      "type": "bool"
+    },
+    "buy_pending": {
+      "type": "bool"
+    },
+    "buy_should_cancel": {
+      "type": "bool"
+    },
+    "buy_count_zero": {
+      "type": "bool"
+    },
+    "buy_count_positive": {
+      "type": "bool"
+    }
+  },
   "steps": [
     {
       "id": "ev_filled",
@@ -147,6 +166,13 @@
         {
           "action": "cycle_facts",
           "args": {}
+        },
+        {
+          "action": "set_gate",
+          "args": {
+            "name": "cycle_ok",
+            "value": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+          }
         }
       ]
     },
@@ -223,7 +249,7 @@
       "id": "buy_gate",
       "when": {
         "event": "book_update",
-        "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+        "expr": "$state.cycle_ok"
       },
       "then": [
         {
@@ -233,6 +259,41 @@
         {
           "action": "cycle_facts",
           "args": {}
+        },
+        {
+          "action": "set_gate",
+          "args": {
+            "name": "buy_active",
+            "value": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+          }
+        },
+        {
+          "action": "set_gate",
+          "args": {
+            "name": "buy_pending",
+            "value": "not $platform.has_pending_buy"
+          }
+        },
+        {
+          "action": "set_gate",
+          "args": {
+            "name": "buy_should_cancel",
+            "value": "$platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy"
+          }
+        },
+        {
+          "action": "set_gate",
+          "args": {
+            "name": "buy_count_zero",
+            "value": "not ($platform.open_buy_count > 0 or $platform.has_tracked_buy)"
+          }
+        },
+        {
+          "action": "set_gate",
+          "args": {
+            "name": "buy_count_positive",
+            "value": "$platform.open_buy_count > 0 or $platform.has_tracked_buy"
+          }
         }
       ]
     },
@@ -244,16 +305,16 @@
             "event": "book_update"
           },
           {
-            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+            "expr": "$state.cycle_ok"
           },
           {
-            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+            "expr": "$state.buy_active"
           },
           {
-            "expr": "not $platform.has_pending_buy"
+            "expr": "$state.buy_pending"
           },
           {
-            "expr": "$platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy"
+            "expr": "$state.buy_should_cancel"
           }
         ]
       },
@@ -272,19 +333,19 @@
             "event": "book_update"
           },
           {
-            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+            "expr": "$state.cycle_ok"
           },
           {
-            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+            "expr": "$state.buy_active"
           },
           {
-            "expr": "not $platform.has_pending_buy"
+            "expr": "$state.buy_pending"
           },
           {
-            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+            "expr": "not $state.buy_should_cancel"
           },
           {
-            "expr": "not ($platform.open_buy_count > 0 or $platform.has_tracked_buy)"
+            "expr": "$state.buy_count_zero"
           }
         ]
       },
@@ -303,19 +364,19 @@
             "event": "book_update"
           },
           {
-            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+            "expr": "$state.cycle_ok"
           },
           {
-            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+            "expr": "$state.buy_active"
           },
           {
-            "expr": "not $platform.has_pending_buy"
+            "expr": "$state.buy_pending"
           },
           {
-            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+            "expr": "not $state.buy_should_cancel"
           },
           {
-            "expr": "not ($platform.open_buy_count > 0 or $platform.has_tracked_buy)"
+            "expr": "$state.buy_count_zero"
           },
           {
             "expr": "not $platform.buy_capital_low"
@@ -352,19 +413,19 @@
             "event": "book_update"
           },
           {
-            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+            "expr": "$state.cycle_ok"
           },
           {
-            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+            "expr": "$state.buy_active"
           },
           {
-            "expr": "not $platform.has_pending_buy"
+            "expr": "$state.buy_pending"
           },
           {
-            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+            "expr": "not $state.buy_should_cancel"
           },
           {
-            "expr": "not ($platform.open_buy_count > 0 or $platform.has_tracked_buy)"
+            "expr": "$state.buy_count_zero"
           },
           {
             "expr": "not $platform.buy_capital_low"
@@ -404,19 +465,19 @@
             "event": "book_update"
           },
           {
-            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+            "expr": "$state.cycle_ok"
           },
           {
-            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+            "expr": "$state.buy_active"
           },
           {
-            "expr": "not $platform.has_pending_buy"
+            "expr": "$state.buy_pending"
           },
           {
-            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+            "expr": "not $state.buy_should_cancel"
           },
           {
-            "expr": "not ($platform.open_buy_count > 0 or $platform.has_tracked_buy)"
+            "expr": "$state.buy_count_zero"
           },
           {
             "expr": "not $platform.buy_capital_low"
@@ -456,19 +517,19 @@
             "event": "book_update"
           },
           {
-            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+            "expr": "$state.cycle_ok"
           },
           {
-            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+            "expr": "$state.buy_active"
           },
           {
-            "expr": "not $platform.has_pending_buy"
+            "expr": "$state.buy_pending"
           },
           {
-            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+            "expr": "not $state.buy_should_cancel"
           },
           {
-            "expr": "not ($platform.open_buy_count > 0 or $platform.has_tracked_buy)"
+            "expr": "$state.buy_count_zero"
           },
           {
             "expr": "not $platform.buy_capital_low"
@@ -496,19 +557,19 @@
             "event": "book_update"
           },
           {
-            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+            "expr": "$state.cycle_ok"
           },
           {
-            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+            "expr": "$state.buy_active"
           },
           {
-            "expr": "not $platform.has_pending_buy"
+            "expr": "$state.buy_pending"
           },
           {
-            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+            "expr": "not $state.buy_should_cancel"
           },
           {
-            "expr": "$platform.open_buy_count > 0 or $platform.has_tracked_buy"
+            "expr": "$state.buy_count_positive"
           }
         ]
       },
@@ -527,19 +588,19 @@
             "event": "book_update"
           },
           {
-            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+            "expr": "$state.cycle_ok"
           },
           {
-            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+            "expr": "$state.buy_active"
           },
           {
-            "expr": "not $platform.has_pending_buy"
+            "expr": "$state.buy_pending"
           },
           {
-            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+            "expr": "not $state.buy_should_cancel"
           },
           {
-            "expr": "$platform.open_buy_count > 0 or $platform.has_tracked_buy"
+            "expr": "$state.buy_count_positive"
           },
           {
             "expr": "$platform.amend_has_sell"
@@ -561,19 +622,19 @@
             "event": "book_update"
           },
           {
-            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+            "expr": "$state.cycle_ok"
           },
           {
-            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+            "expr": "$state.buy_active"
           },
           {
-            "expr": "not $platform.has_pending_buy"
+            "expr": "$state.buy_pending"
           },
           {
-            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+            "expr": "not $state.buy_should_cancel"
           },
           {
-            "expr": "$platform.open_buy_count > 0 or $platform.has_tracked_buy"
+            "expr": "$state.buy_count_positive"
           },
           {
             "expr": "not $platform.amend_has_sell"
@@ -591,7 +652,7 @@
       "id": "sell_prepare",
       "when": {
         "event": "book_update",
-        "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+        "expr": "$state.cycle_ok"
       },
       "then": [
         {
@@ -604,7 +665,7 @@
       "id": "sell_place_should",
       "when": {
         "event": "book_update",
-        "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+        "expr": "$state.cycle_ok"
       },
       "then": [
         {
@@ -619,7 +680,7 @@
         "all": [
           {
             "event": "book_update",
-            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+            "expr": "$state.cycle_ok"
           },
           {
             "expr": "$platform.sell_place_should"
@@ -637,7 +698,7 @@
       "id": "sell_finalize_latch",
       "when": {
         "event": "book_update",
-        "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+        "expr": "$state.cycle_ok"
       },
       "then": [
         {
@@ -657,7 +718,7 @@
         "all": [
           {
             "event": "book_update",
-            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+            "expr": "$state.cycle_ok"
           },
           {
             "expr": "$platform.remaintain_expired_sells and $platform.sell_missing_empty and not $platform.just_filled_buy and not $platform.resuming_after_balance and not $platform.buy_attempted and not $platform.sell_pushed and not $platform.has_active_sell and not $platform.asset_balance_nan and $platform.balance_fresh"
@@ -675,7 +736,7 @@
       "id": "sell_finalize_end",
       "when": {
         "event": "book_update",
-        "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+        "expr": "$state.cycle_ok"
       },
       "then": [
         {
