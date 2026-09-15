@@ -4,7 +4,7 @@ open Strategy_common
 open Jacobs_ladder_types
 open Strategy_venue
 open Strategy_reservation
-open Jacobs_ladder_orders
+open Strategy_orders
 module Sell_orders = Strategy_sell_orders
 
 (* Per-symbol lock-free lifecycle event queue. The Lwt supervisor thread (REST callbacks,
