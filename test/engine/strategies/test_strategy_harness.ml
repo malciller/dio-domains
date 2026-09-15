@@ -104,6 +104,48 @@ let test_roundtrip () =
   Alcotest.(check bool) "roundtrip equal" true (Strategy_trace.equal t loaded)
 ;;
 
+let sample_event () =
+  { Strategy_trace.ev_kind = "filled"
+  ; ev_now = 12.5
+  ; ev_order_id = "o1"
+  ; ev_new_order_id = ""
+  ; ev_side = "buy"
+  ; ev_price = 100.0
+  ; ev_qty = 2.0
+  ; ev_cl_ord_id = Some "cl1"
+  ; ev_reason = ""
+  }
+;;
+
+let record_event_run r =
+  Strategy_event_recorder.record_event r (sample_event ());
+  Strategy_event_recorder.record_state r [ "after_event", Strategy_expr.V_bool true ];
+  Strategy_event_recorder.end_cycle r
+;;
+
+let test_event_roundtrip () =
+  let t = Strategy_equivalence.capture record_event_run in
+  let path = Filename.temp_file "strategy_trace_event" ".json" in
+  Strategy_trace.save path t;
+  let loaded = Strategy_trace.load path in
+  Alcotest.(check bool) "event round-trip equal" true (Strategy_trace.equal t loaded)
+;;
+
+let test_event_observed () =
+  let t = Strategy_equivalence.capture record_event_run in
+  match t with
+  | [ { Strategy_trace.c_obs; _ } ] ->
+    Alcotest.(check bool)
+      "event captured in first cycle"
+      true
+      (List.exists
+         (function
+           | Strategy_trace.Event _ -> true
+           | _ -> false)
+         c_obs)
+  | _ -> Alcotest.fail "expected one cycle"
+;;
+
 let replay_strategy =
   {|{"name":"r","version":1,"triggers":["book_update"],"steps":[
      {"id":"s","when":{"event":"book_update"},"then":[
@@ -200,6 +242,10 @@ let () =
         ; Alcotest.test_case "divergence: cycle count" `Quick test_divergence_cycle_count
         ] )
     ; "persistence", [ Alcotest.test_case "json round-trip" `Quick test_roundtrip ]
+    ; ( "events"
+      , [ Alcotest.test_case "event json round-trip" `Quick test_event_roundtrip
+        ; Alcotest.test_case "event observed" `Quick test_event_observed
+        ] )
     ; ( "replay"
       , [ Alcotest.test_case "same inputs equivalent" `Quick test_replay_equiv
         ; Alcotest.test_case "different run divergence" `Quick test_replay_divergence
