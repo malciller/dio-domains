@@ -61,6 +61,8 @@ out/
 !.env.example
 # Local runtime configuration (use config.example.json as the template)
 config.json
+config.reference.json
+config.candidate.json
 *.pem
 *.key
 *.crt
