@@ -83,7 +83,6 @@ let reconcile_persisted_sell_levels ~state =
    next. *)
 let sell_hold_netting_grace_s = Platform_accounting.sell_hold_netting_grace_s
 let unreflected_cutoff = Platform_accounting.unreflected_cutoff
-let buy_ack_ghost_grace_s = Platform_accounting.buy_ack_ghost_grace_s
 let sweep_max_balance_age_s = Platform_accounting.sweep_max_balance_age_s
 
 (* Moved to Platform_accounting (milestone 2). Thin adapter keeps the grid's state field
@@ -639,14 +638,16 @@ let sync_open_orders
         | None -> false)
     | None -> false
   in
-  if !open_buy_count_from_scan = 0
-     && (not state.inflight_cancel_buy)
-     && (not state.inflight_buy)
-     && (not is_amend_active)
-     (* A freshly acked buy is not listed by the open-orders feed yet; do not mistake that
-        lag for a vanished order. After the grace, a buy still absent with no terminal
-        event is a genuine ghost and is recovered. *)
-     && now_time -. state.last_buy_ack_ts >= buy_ack_ghost_grace_s
+  (* Ghost-buy grace predicate moved to Platform_accounting (milestone 2). A freshly acked
+     buy is not listed by the open-orders feed yet; after the grace, a buy still absent
+     with no terminal event is recovered. *)
+  if Platform_accounting.is_ghost_buy
+       ~open_buy_count:!open_buy_count_from_scan
+       ~inflight_cancel_buy:state.inflight_cancel_buy
+       ~inflight_buy:state.inflight_buy
+       ~is_amend_active
+       ~now:now_time
+       ~last_buy_ack_ts:state.last_buy_ack_ts
   then (
     if Option.is_some state.last_buy_order_id || Option.is_some state.last_buy_order_price
     then (
