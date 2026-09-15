@@ -1627,6 +1627,9 @@ let asset_domain_worker
               s.alloc_buy_words <- 0;
               s.alloc_sell_words <- 0;
               s.alloc_cleanup_words <- 0;
+              s.alloc_preamble_words <- 0;
+              s.alloc_facts_words <- 0;
+              s.time_facts_ns <- 0;
               s.sync_orders_seen <- 0
             | None -> ());
            ctx.cg_profile <- latency_this_cycle;
@@ -1797,10 +1800,12 @@ let asset_domain_worker
             | Some cs when should_execute ->
               let us ns = Latency_profiler.format_us (float ns /. 1000.0) in
               Printf.sprintf
-                " strat[pre=%dw/%s sync=%dw/%s(scan %s rec %s n %d) ledger=%d buy=%dw/%s \
-                 sell=%dw/%s cln=%dw/%s]"
+                " strat[pre=%dw/%s facts=%dw/%s sync=%dw/%s(scan %s rec %s n %d) \
+                 ledger=%d buy=%dw/%s sell=%dw/%s cln=%dw/%s]"
                 cs.alloc_preamble_words
                 (us cs.time_preamble_ns)
+                cs.alloc_facts_words
+                (us cs.time_facts_ns)
                 cs.alloc_sync_words
                 (us cs.time_sync_ns)
                 (us cs.time_sync_scan_ns)

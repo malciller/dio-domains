@@ -153,6 +153,7 @@ let handler : Strategy_runtime.handler = { run }
     breakdown). *)
 type phase =
   | Preamble
+  | Facts
   | Cleanup
   | Sync
   | Buy
@@ -213,7 +214,7 @@ module Make (E : ENGINE) = struct
         (fun t name args ->
           match name with
           | "set_gate" ->
-            ph Preamble (fun () ->
+            ph Facts (fun () ->
               match List.assoc_opt "name" args, List.assoc_opt "value" args with
               | Some (V_string k), Some v -> Strategy_runtime.set_state t k v
               | _ -> ())
@@ -237,12 +238,12 @@ module Make (E : ENGINE) = struct
             []
           | "expire_tif_recovery" -> ph Preamble (fun () -> E.expire_tif_recovery ctx)
           | "cycle_facts" ->
-            ph Preamble (fun () ->
+            ph Facts (fun () ->
               List.iter
                 (fun (k, v) -> Strategy_runtime.set_platform t k v)
                 (E.cycle_facts ctx))
           | "early_facts" ->
-            ph Preamble (fun () ->
+            ph Facts (fun () ->
               List.iter
                 (fun (k, v) -> Strategy_runtime.set_platform t k v)
                 (E.early_facts ctx))
