@@ -79,6 +79,9 @@ type config =
   (** When true, the domain loop records per-cycle observable traces for the
       behavioral-equivalence harness. Default false: production behavior is unchanged
       unless explicitly enabled. *)
+  ; config_strategy : bool
+  (** When true, a trading entry bound to a strategy file runs through the config-driven
+      interpreter instead of the hardcoded dispatch. Default false. *)
   }
 
 (** Logging section identifier for this module. *)
@@ -139,6 +142,7 @@ let known_top_level_keys =
   ; "fng_check_threshold"
   ; "theme"
   ; "strategy_trace"
+  ; "config_strategy"
   ]
 ;;
 
@@ -581,6 +585,9 @@ let read_config () : config =
     let strategy_trace =
       json |> member "strategy_trace" |> to_bool_option |> Option.value ~default:false
     in
+    let config_strategy =
+      json |> member "config_strategy" |> to_bool_option |> Option.value ~default:false
+    in
     { cycle_mod
     ; logging
     ; gc
@@ -594,6 +601,7 @@ let read_config () : config =
     ; latency_network_spike_threshold_us
     ; theme
     ; strategy_trace
+    ; config_strategy
     }
   with
   | Yojson.Json_error msg ->
@@ -614,6 +622,7 @@ let read_config () : config =
     ; latency_network_spike_threshold_us = 20_000.0
     ; theme = None
     ; strategy_trace = false
+    ; config_strategy = false
     }
 ;;
 

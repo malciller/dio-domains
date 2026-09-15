@@ -75,12 +75,12 @@ Responsibility split (see §5.2 for the precise ownership rule):
 
 ### 2.1 Illustrative example — a Jacobs Ladder-style decision as a strategy file
 
-> Illustrative only. The authoritative behavior specification is the reference-action mapping table in §8.2; the syntax, control flow, token bindings, and platform-owned capacity queries shown here are what matter.
+> Illustrative only. The authoritative behavior specification is the reference-action mapping table in §8.2; the syntax, control flow, token bindings, and platform-owned capacity queries shown here are what matter. The grid's *shipped* file (`strategies/jacobs_ladder.json`) is currently the coarse orchestration (`book_update → grid_cycle`, §9.4); this fine-grained example is the target shape for the later decomposition.
 
 ```jsonc
-// strategies/jacobs_ladder.json  — decision procedure (abridged)
+// strategies/example.json  — decision procedure (abridged)
 {
-  "name": "jacobs_ladder",
+  "name": "example",
   "version": 1,
   "triggers": ["book_update", "fill", "order_lifecycle", "oracle_publish"],
   "params": {
@@ -158,10 +158,11 @@ Responsibility split (see §5.2 for the precise ownership rule):
 And `config.json` shrinks to bindings:
 
 ```jsonc
-{ "instances": [
-    { "strategy_file": "strategies/jacobs_ladder.json",
-      "exchange": "hyperliquid", "symbol": "BTC/USDC",
-      "params": { "grid_interval": [0.16, 0.16] }, "mode": "live" }
+{ "trading": [
+    { "exchange": "hyperliquid", "symbol": "BTC/USDC"
+    , "strategy": "jacobs_ladder"
+    , "strategy_file": "strategies/jacobs_ladder.json"
+    , "qty": "0.00025", "grid_interval": [0.16, 0.16] }
 ] }
 ```
 
@@ -593,7 +594,7 @@ Concrete module and integration work, with per-module status. Milestone 1's firs
 |---|---|---|---|
 | `strategy_actions.ml` | registry, `t`, schema types, `register`/`find` | protocol | done |
 | `strategy_actions_builtin.ml` | declares the §4.3 inventory (schemas) | actions | done (metadata; handlers pending) |
-| `strategy_actions_grid.ml` | grid decision-action handlers (faithful wrappers of reference grid functions) | actions | started (`compute_buy_ref_price`, `owed_sell_price`, `available_base`, `grid_price`) |
+| `strategy_actions_grid.ml` | grid decision-action handlers (faithful wrappers of reference grid functions) + coarse `grid_cycle`/`sync_open_orders`/`evaluate_buy_leg`/`evaluate_sell_leg` via `Make` | actions | coarse port wired (`config_strategy`) |
 | `strategy_file.ml` | JSON → AST (triggers/params/state/steps) | protocol | done |
 | `strategy_expr.ml` | expression engine: `$ref` scanning + tokenizer/parser/evaluator (arithmetic, comparison, boolean) and string templates | protocol | done |
 | `strategy_compile.ml` | static validation against the registry | protocol | done (validation); compile-to-closures pending |
@@ -649,7 +650,7 @@ Dependency order is strict: 1 before 3; 2 before 3 (the accounting module is wha
 
 **Milestone 0 (in progress):** `strategy_trace.ml` (observable trace types + comparison + JSON persistence), `strategy_event_recorder.ml` (per-cycle recording), and `strategy_equivalence.ml` (trace diff) are implemented with ref-vs-ref identity, state order-insensitivity, divergence, and JSON round-trip tests (`test_strategy_harness.ml`). The domain loop records per-cycle open orders + state (price, base/quote tradeable balances, base balance age) under the default-off `strategy_trace` config flag (`config.ml`, `domain_spawner.ml`) and persists every 50 busy cycles to `data/strategy_trace_<exchange>_<symbol>.json`; `dio strategy diff <a.json> <b.json>` compares two traces. Remaining: dual-run capture of a candidate alongside the reference (needs milestone 3).
 
-**Milestone 3 (in progress):** decision handlers ported (`compute_buy_ref_price`, `owed_sell_price`, `available_base`, `grid_price`) and a coarse-wrapper seam (`Strategy_actions_grid.Make`) exposing `grid_cycle` / `sync_open_orders` / `evaluate_buy_leg` / `evaluate_sell_leg` actions that call the reference grid functions through an engine context (chosen hybrid: coarse now, decompose later). Remaining: provide the real engine context (domain-loop wiring behind the flag), author the grid strategy file, then the differential harness + canary.
+**Milestone 3 (in progress):** decision handlers ported (`compute_buy_ref_price`, `owed_sell_price`, `available_base`, `grid_price`); a coarse-wrapper seam (`Strategy_actions_grid.Make`) plus the real engine context in `domain_spawner` (`Config_grid_engine`) behind a default-off `config_strategy` flag. The grid's shipped strategy file (`strategies/jacobs_ladder.json`) is now the coarse orchestration (`book_update → grid_cycle`); when `config_strategy` is on, the loop feeds the engine context and dispatches to the interpreter, whose handler calls the same reference `execute_strategy`. Remaining: run on the alpaca testnet with `strategy_trace` for a first differential, then the harness + canary.
 
 **Milestone 2 (in progress):** `exchange_capabilities.ml` extracts the grid's per-venue flag matrix (`jacobs_ladder_config.ml`) into capability descriptors for hyperliquid/kraken/ibkr/lighter/alpaca. `platform_accounting.ml` now holds the pure overlay constants, the freshness cutoff, the sell-hold overlays (`unnetted_sell_hold`, `consume_sell_hold_netting`, `arm_sell_hold`), the credit overlay (`unreflected_credit`), the committed-sell ceiling (`effective_committed_sell_base`), the reserve-dip availability (`available_base`, `alpaca_available_base`), the persisted-sell-level matching helpers (`price_key`, `price_within_tolerance`, `partition_persisted_sell_levels`, `dedupe_persisted_sell_levels`), and the reservation atomics (`total_reserved_by_exchange`, `get_exchange_reserved_atomic`, `atomic_add`), and the ghost-buy grace predicate (`is_ghost_buy`), parameterized over lists/flags so the module is strategy-state-independent; the grid keeps thin adapters and its state fields as the store, so behavior is unchanged (grid suite + `test_platform_accounting.ml` pass). Remaining: ghost-buy recovery (clear/re-track) and the refactor-equivalence gate.
 
