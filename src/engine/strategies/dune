@@ -26,7 +26,7 @@
   Strategy_orders
   Strategy_sell_orders
   Jacobs_ladder_execution
-  Jacobs_ladder_events
+  Strategy_events
   Fee_cache
   Strategy_actions
   Strategy_actions_builtin
