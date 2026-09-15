@@ -25,3 +25,7 @@
 (test
  (name test_strategy_runtime)
  (libraries dio.strategies alcotest))
+
+(test
+ (name test_strategy_harness)
+ (libraries dio.strategies alcotest))

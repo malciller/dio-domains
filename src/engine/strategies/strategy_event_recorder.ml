@@ -1,0 +1,29 @@
+(** Builds a {!Strategy_trace.t} from observations recorded during a run.
+
+    The domain loop (once instrumented) calls [record_*] as it emits order intents,
+    finishes a cycle with [end_cycle], and reads the accumulated trace with [finish]. Kept
+    dependency-free so it can run on the hot path when enabled. *)
+
+type t =
+  { mutable cycles : Strategy_trace.cycle list (* reversed *)
+  ; mutable obs : Strategy_trace.obs list (* reversed within the current cycle *)
+  ; mutable index : int
+  }
+
+let create () = { cycles = []; obs = []; index = 0 }
+let record t o = t.obs <- o :: t.obs
+let record_order_intent t oi = record t (Strategy_trace.Order_intent oi)
+let record_state t entries = record t (Strategy_trace.State entries)
+let record_persistence t key value = record t (Strategy_trace.Persistence (key, value))
+
+let end_cycle t =
+  t.cycles <- { Strategy_trace.c_index = t.index; c_obs = List.rev t.obs } :: t.cycles;
+  t.obs <- [];
+  t.index <- t.index + 1
+;;
+
+(** Ends the in-progress cycle if it has observations, then returns the trace. *)
+let finish t =
+  if t.obs <> [] then end_cycle t;
+  List.rev t.cycles
+;;
