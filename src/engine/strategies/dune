@@ -27,6 +27,7 @@
   Fee_cache
   Strategy_actions
   Strategy_actions_builtin
+  Strategy_actions_trade
   Strategy_actions_grid
   Strategy_expr
   Strategy_file
