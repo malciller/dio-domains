@@ -95,6 +95,14 @@ let test_divergence_cycle_count () =
        loop 0)
 ;;
 
+let test_roundtrip () =
+  let t = Strategy_equivalence.capture record_buy_run in
+  let path = Filename.temp_file "strategy_trace" ".json" in
+  Strategy_trace.save path t;
+  let loaded = Strategy_trace.load path in
+  Alcotest.(check bool) "roundtrip equal" true (Strategy_trace.equal t loaded)
+;;
+
 let () =
   Alcotest.run
     "strategy_harness"
@@ -104,5 +112,6 @@ let () =
         ; Alcotest.test_case "divergence: order field" `Quick test_divergence_order
         ; Alcotest.test_case "divergence: cycle count" `Quick test_divergence_cycle_count
         ] )
+    ; "persistence", [ Alcotest.test_case "json round-trip" `Quick test_roundtrip ]
     ]
 ;;

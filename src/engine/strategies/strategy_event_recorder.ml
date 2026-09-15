@@ -27,3 +27,14 @@ let finish t =
   if t.obs <> [] then end_cycle t;
   List.rev t.cycles
 ;;
+
+(** Non-mutating view of the trace so far (the current cycle is included without ending
+    it). Safe to call mid-run for periodic persistence. *)
+let snapshot t =
+  let cycles =
+    if t.obs = []
+    then t.cycles
+    else { Strategy_trace.c_index = t.index; c_obs = List.rev t.obs } :: t.cycles
+  in
+  List.rev cycles
+;;
