@@ -38,4 +38,5 @@
   Strategy_event_recorder
   Strategy_equivalence
   Exchange_capabilities
+  Platform_accounting
   Strategy_cli))
