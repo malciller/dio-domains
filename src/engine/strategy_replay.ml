@@ -167,6 +167,150 @@ let seed
   <- getb "s_last_buy_attempted_insufficient" st.last_buy_attempted_insufficient
 ;;
 
+(** Snapshot the collection state (JSON-encoded in string entries) for replay seeding. *)
+let snapshot_collections (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
+  : (string * Expr.value) list
+  =
+  let module S = Dio_strategies.Jacobs_ladder_sell_orders in
+  let open_sells =
+    `List
+      (List.map
+         (fun (id, p, q) -> `List [ `String id; `Float p; `Float q ])
+         (S.to_list st.open_sell_orders))
+  in
+  let commitments =
+    `List
+      (Hashtbl.fold
+         (fun id (c : Dio_strategies.Jacobs_ladder_types.sell_commitment) acc ->
+           `List
+             [ `String id
+             ; `Float c.sc_price
+             ; `Float c.sc_qty
+             ; `Bool c.sc_seen
+             ; `Bool c.sc_acked
+             ; `Bool c.sc_listed
+             ; `Float c.sc_armed
+             ]
+           :: acc)
+         st.sell_commitments
+         [])
+  in
+  let pending =
+    `List
+      (List.map
+         (fun (id, side, p, ts) ->
+           `List
+             [ `String id
+             ; `String
+                 (match side with
+                  | Order.Buy -> "buy"
+                  | Order.Sell -> "sell")
+             ; `Float p
+             ; `Float ts
+             ])
+         st.pending_orders)
+  in
+  let persisted =
+    `List (List.map (fun (p, q) -> `List [ `Float p; `Float q ]) st.persisted_sell_levels)
+  in
+  let cooldowns =
+    `List
+      (Hashtbl.fold
+         (fun id v acc -> `List [ `String id; `Float v ] :: acc)
+         st.amend_cooldowns
+         [])
+  in
+  [ "s_open_sell_orders", Expr.V_string (Yojson.Basic.to_string open_sells)
+  ; "s_sell_commitments", Expr.V_string (Yojson.Basic.to_string commitments)
+  ; "s_pending_orders", Expr.V_string (Yojson.Basic.to_string pending)
+  ; "s_persisted_sell_levels", Expr.V_string (Yojson.Basic.to_string persisted)
+  ; "s_amend_cooldowns", Expr.V_string (Yojson.Basic.to_string cooldowns)
+  ]
+;;
+
+(** Restore the collection state from a {!snapshot_collections} snapshot. *)
+let seed_collections
+  (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
+  (entries : (string * Expr.value) list)
+  =
+  let module S = Dio_strategies.Jacobs_ladder_sell_orders in
+  let j k =
+    match List.assoc_opt k entries with
+    | Some (Expr.V_string s) -> Some (Yojson.Basic.from_string s)
+    | _ -> None
+  in
+  (match j "s_open_sell_orders" with
+   | Some (`List l) ->
+     S.clear st.open_sell_orders;
+     List.iter
+       (function
+         | `List [ `String id; `Float p; `Float q ] -> S.push st.open_sell_orders id p q
+         | _ -> ())
+       l
+   | _ -> ());
+  (match j "s_sell_commitments" with
+   | Some (`List l) ->
+     Hashtbl.reset st.sell_commitments;
+     List.iter
+       (function
+         | `List
+             [ `String id
+             ; `Float p
+             ; `Float q
+             ; `Bool seen
+             ; `Bool acked
+             ; `Bool listed
+             ; `Float armed
+             ] ->
+           Hashtbl.replace
+             st.sell_commitments
+             id
+             { Dio_strategies.Jacobs_ladder_types.sc_price = p
+             ; sc_qty = q
+             ; sc_seen = seen
+             ; sc_acked = acked
+             ; sc_listed = listed
+             ; sc_armed = armed
+             }
+         | _ -> ())
+       l
+   | _ -> ());
+  (match j "s_pending_orders" with
+   | Some (`List l) ->
+     st.pending_orders
+     <- List.filter_map
+          (function
+            | `List [ `String id; `String side; `Float p; `Float ts ] ->
+              Some
+                ( id
+                , (match side with
+                   | "sell" -> Order.Sell
+                   | _ -> Order.Buy)
+                , p
+                , ts )
+            | _ -> None)
+          l
+   | _ -> ());
+  (match j "s_persisted_sell_levels" with
+   | Some (`List l) ->
+     st.persisted_sell_levels
+     <- List.filter_map
+          (function
+            | `List [ `Float p; `Float q ] -> Some (p, q)
+            | _ -> None)
+          l
+   | _ -> ());
+  match j "s_amend_cooldowns" with
+  | Some (`List l) ->
+    Hashtbl.reset st.amend_cooldowns;
+    List.iter
+      (function
+        | `List [ `String id; `Float v ] -> Hashtbl.replace st.amend_cooldowns id v
+        | _ -> ())
+      l
+  | _ -> ()
+;;
+
 (** Replay [trace] through the reference strategy for [asset], returning an emitted-only
     trace. *)
 let replay ~(asset : Jac.trading_config) ~(trace : Trace.t) : Trace.t =
@@ -181,7 +325,8 @@ let replay ~(asset : Jac.trading_config) ~(trace : Trace.t) : Trace.t =
            | _ -> [])
          c.c_obs
      in
-     seed state entries
+     seed state entries;
+     seed_collections state entries
    | [] -> ());
   (* Drain any pre-existing buffer so only this replay's intents are captured. *)
   ignore (Jac.get_pending_orders 1_000_000 : Order.strategy_order list);

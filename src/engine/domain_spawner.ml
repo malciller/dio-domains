@@ -618,7 +618,7 @@ let asset_domain_worker
      | Some r, Some st ->
        Dio_strategies.Strategy_event_recorder.record_state
          r
-         (Strategy_replay.snapshot_entries st)
+         (Strategy_replay.snapshot_entries st @ Strategy_replay.snapshot_collections st)
      | _ -> ());
     let wakeup_sync =
       Concurrency.Exchange_wakeup.get_sync_handle asset_with_fees.symbol
