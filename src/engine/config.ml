@@ -363,47 +363,8 @@ let parse_config json =
          symbol;
        exit 1));
   let strategy = json |> member "strategy" |> to_string in
-  (* The strategy file is located by convention, [strategies/<strategy>.json]. The file is
-     the strategy: it must exist, parse, and its "name" must equal the entry's "strategy".
-     A missing or invalid file, or a name mismatch, would leave the domain with no
-     strategy bound and trading nothing - so it is fatal (log and exit 1) rather than
-     skipped. *)
-  (let path = Printf.sprintf "strategies/%s.json" strategy in
-   if not (Sys.file_exists path)
-   then (
-     Logging.critical_f
-       ~section
-       "Strategy file '%s' for %s/%s does not exist. Strategy files must be deployed \
-        alongside config.json (e.g. /app/strategies); refusing to start with no strategy \
-        bound."
-       path
-       exchange
-       symbol;
-     exit 1)
-   else (
-     match Dio_strategies.Strategy_file.parse_file path with
-     | Error msg ->
-       Logging.critical_f
-         ~section
-         "Strategy file '%s' for %s/%s is invalid: %s"
-         path
-         exchange
-         symbol
-         msg;
-       exit 1
-     | Ok file ->
-       if not (String.equal file.name strategy)
-       then (
-         Logging.critical_f
-           ~section
-           "Strategy name mismatch for %s/%s: config.json declares '%s' but strategy \
-            file '%s' declares '%s'"
-           exchange
-           symbol
-           strategy
-           path
-           file.name;
-         exit 1)));
+  (* The strategy file convention is validated by [read_config] (not here) so the pure
+     per-entry parser stays side-effect free for tests and tooling. *)
   (* grid_interval carries the hardened search bounds (gi_min, gi_max) walked by the
      oracle's parameter search. *)
   let testnet =
@@ -564,6 +525,49 @@ let read_config () : config =
     let gc = parse_gc_config json in
     let oracle = parse_oracle_config json in
     let trading = json |> member "trading" |> to_list |> List.map parse_config in
+    (* Fail fast if any entry's strategy file is missing/invalid/name-mismatched: without
+       it the domain starts but binds no strategy and trades nothing. Checked here (engine
+       config load) rather than in [parse_config] so the pure parser stays side-effect
+       free for tests and tooling. *)
+    List.iter
+      (fun (t : trading_config) ->
+        let path = Printf.sprintf "strategies/%s.json" t.strategy in
+        if not (Sys.file_exists path)
+        then (
+          Logging.critical_f
+            ~section
+            "Strategy file '%s' for %s/%s does not exist. Strategy files must be \
+             deployed alongside config.json (e.g. /app/strategies); refusing to start \
+             with no strategy bound."
+            path
+            t.exchange
+            t.symbol;
+          exit 1)
+        else (
+          match Dio_strategies.Strategy_file.parse_file path with
+          | Error msg ->
+            Logging.critical_f
+              ~section
+              "Strategy file '%s' for %s/%s is invalid: %s"
+              path
+              t.exchange
+              t.symbol
+              msg;
+            exit 1
+          | Ok file ->
+            if not (String.equal file.name t.strategy)
+            then (
+              Logging.critical_f
+                ~section
+                "Strategy name mismatch for %s/%s: config.json declares '%s' but \
+                 strategy file '%s' declares '%s'"
+                t.exchange
+                t.symbol
+                t.strategy
+                path
+                file.name;
+              exit 1)))
+      trading;
     let fng_check_threshold =
       json |> member "fng_check_threshold" |> to_float_opt |> Option.value ~default:1.5
     in
