@@ -98,6 +98,7 @@ let snapshot_entries (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
   ; "s_reserved_quote", Expr.V_float st.reserved_quote
   ; "s_accumulated_profit", Expr.V_float st.accumulated_profit
   ; "s_position_base", Expr.V_float st.position_base
+  ; "s_attributed_balance_increase", Expr.V_float st.attributed_balance_increase
   ; "s_position_initialized", Expr.V_bool st.position_initialized
   ; "s_last_buy_fill_price", optf st.last_buy_fill_price
   ; "s_last_sell_fill_price", optf st.last_sell_fill_price
@@ -116,6 +117,7 @@ let snapshot_entries (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
   ; "s_capital_low", Expr.V_bool st.capital_low
   ; "s_resuming_after_balance_flag", Expr.V_bool st.resuming_after_balance_flag
   ; "s_just_filled_buy", Expr.V_bool st.just_filled_buy
+  ; "s_startup_replay", Expr.V_bool st.startup_replay
   ; "s_force_buy_reanchor", Expr.V_bool st.force_buy_reanchor
   ; "s_tif_recovery_pending", Expr.V_bool st.tif_recovery_pending
   ; "s_inflight_buy", Expr.V_bool st.inflight_buy
@@ -158,6 +160,8 @@ let seed
   st.reserved_quote <- getf "s_reserved_quote" st.reserved_quote;
   st.accumulated_profit <- getf "s_accumulated_profit" st.accumulated_profit;
   st.position_base <- getf "s_position_base" st.position_base;
+  st.attributed_balance_increase
+  <- getf "s_attributed_balance_increase" st.attributed_balance_increase;
   st.position_initialized <- getb "s_position_initialized" st.position_initialized;
   st.last_buy_fill_price <- getfo "s_last_buy_fill_price";
   st.last_sell_fill_price <- getfo "s_last_sell_fill_price";
@@ -182,6 +186,8 @@ let seed
   st.resuming_after_balance_flag
   <- getb "s_resuming_after_balance_flag" st.resuming_after_balance_flag;
   st.just_filled_buy <- getb "s_just_filled_buy" st.just_filled_buy;
+  (* Default false when absent: a recorded run is past startup replay. *)
+  st.startup_replay <- getb "s_startup_replay" false;
   st.force_buy_reanchor <- getb "s_force_buy_reanchor" st.force_buy_reanchor;
   st.tif_recovery_pending <- getb "s_tif_recovery_pending" st.tif_recovery_pending;
   st.inflight_buy <- getb "s_inflight_buy" st.inflight_buy;
@@ -378,13 +384,15 @@ let drive
   ~(state : Dio_strategies.Jacobs_ladder_types.strategy_state)
   ~(set_venue_available : (string -> float -> unit) option)
   ~(execute :
-      price:float
+      asset:Jac.trading_config
+      -> price:float
       -> bid:float
       -> ask:float
       -> abal:float
       -> qbal:float
       -> now:float
       -> cycle:int
+      -> generation:int
       -> oracle_halted:bool
       -> quote_stale:bool
       -> base_age:float option
@@ -408,6 +416,7 @@ let drive
       let qbal = f_entry entries "quote_balance" nan in
       let now = f_entry entries "now" 0.0 in
       let cycle = i_entry entries "cycle" idx in
+      let generation = i_entry entries "generation" 0 in
       let oracle_halted = b_entry entries "oracle_halted" false in
       let quote_stale = b_entry entries "quote_balance_stale" false in
       let base_age = age_entry entries in
@@ -441,10 +450,11 @@ let drive
               oi.oi_price
               oi.oi_qty
               oi.oi_side
-              None)
+              oi.oi_userref)
           orders
       in
       execute
+        ~asset
         ~price
         ~bid
         ~ask
@@ -452,6 +462,7 @@ let drive
         ~qbal
         ~now
         ~cycle
+        ~generation
         ~oracle_halted
         ~quote_stale
         ~base_age
@@ -478,6 +489,7 @@ let replay
     ~set_venue_available
     ~execute:
       (fun
+        ~asset
         ~price
         ~bid
         ~ask
@@ -485,6 +497,7 @@ let replay
         ~qbal
         ~now
         ~cycle
+        ~generation
         ~oracle_halted
         ~quote_stale
         ~base_age
@@ -494,7 +507,7 @@ let replay
         ~cached_state:state
         ~quote_balance_stale:quote_stale
         ~oracle_halted
-        ~get_open_orders_generation:(fun () -> 0)
+        ~get_open_orders_generation:(fun () -> generation)
         ~base_balance_age:base_age
         ~now
         asset
@@ -531,6 +544,7 @@ let replay_candidate
     ~set_venue_available
     ~execute:
       (fun
+        ~asset
         ~price
         ~bid
         ~ask
@@ -538,6 +552,7 @@ let replay_candidate
         ~qbal
         ~now
         ~cycle
+        ~generation
         ~oracle_halted
         ~quote_stale
         ~base_age
@@ -554,7 +569,7 @@ let replay_candidate
       ctx.cg_quote_stale <- quote_stale;
       ctx.cg_oracle_halted <- oracle_halted;
       ctx.cg_base_age <- base_age;
-      ctx.cg_gen <- 0;
+      ctx.cg_gen <- generation;
       ctx.cg_iter <- iter;
       ignore
         (Strategy_runtime.run_cycle
@@ -589,6 +604,10 @@ let symbol_of_trace (trace : Trace.t) : string option =
            (function
              | Trace.Emitted e -> Some e.em_symbol
              | Trace.Order_intent oi -> Some oi.oi_symbol
+             | Trace.State entries ->
+               (match List.assoc_opt "symbol" entries with
+                | Some (Expr.V_string s) -> Some s
+                | _ -> None)
              | _ -> None)
            c.c_obs
        with
@@ -596,6 +615,25 @@ let symbol_of_trace (trace : Trace.t) : string option =
        | None -> go rest)
   in
   go trace
+;;
+
+(** Fallback for traces with no orders/emitted and no recorded symbol (e.g. a quiet
+    asset): match the config entry whose sanitized [exchange_symbol] prefixes the
+    filename. *)
+let symbol_of_path (config : Config.config) (path : string) : string option =
+  let sanitize s = String.map (fun c -> if Char.equal c '/' then '_' else c) s in
+  let base = Filename.basename path in
+  let has_prefix p =
+    let n = String.length p in
+    String.length base >= n && String.equal (String.sub base 0 n) p
+  in
+  List.find_map
+    (fun (tc : Config.trading_config) ->
+      let p =
+        Printf.sprintf "strategy_trace_%s_%s" (sanitize tc.exchange) (sanitize tc.symbol)
+      in
+      if has_prefix p then Some tc.symbol else None)
+    config.trading
 ;;
 
 (** Load a recorded trace, replay it (through the reference grid, or the config-driven
@@ -612,12 +650,16 @@ let run
     Printf.eprintf "replay: cannot load %s: %s\n" path (Printexc.to_string exn);
     1
   | trace ->
-    (match symbol_of_trace trace with
+    let config = Config.read_config () in
+    (match
+       match symbol_of_trace trace with
+       | Some s -> Some s
+       | None -> symbol_of_path config path
+     with
      | None ->
        Printf.eprintf "replay: no symbol found in %s\n" path;
        1
      | Some symbol ->
-       let config = Config.read_config () in
        (match
           List.find_opt
             (fun (tc : Config.trading_config) -> String.equal tc.symbol symbol)

@@ -9,6 +9,7 @@ let oi ?(side = "buy") ?(qty = 1.0) ?(price = 100.0) () =
   ; oi_reduce_only = false
   ; oi_tif = None
   ; oi_order_id = None
+  ; oi_userref = None
   }
 ;;
 
