@@ -140,3 +140,40 @@ let run t name args =
 ;;
 
 let handler : Strategy_runtime.handler = { run }
+
+(** Coarse grid operations (milestone 3, hybrid: coarse now, decompose later).
+
+    The engine provides a per-instance context whose functions call the reference grid
+    ([execute_strategy] / [sync_open_orders] / [evaluate_buy_leg] / [evaluate_sell_leg]),
+    so a coarse port replicates behavior by construction. The strategy file orchestrates
+    them; the legs are split into fine actions in a later pass, verified by the harness. *)
+module type ENGINE = sig
+  type ctx
+
+  val run_cycle : ctx -> unit
+  val sync_open_orders : ctx -> unit
+  val evaluate_buy_leg : ctx -> unit
+  val evaluate_sell_leg : ctx -> unit
+end
+
+module Make (E : ENGINE) = struct
+  let handler (ctx : E.ctx) : Strategy_runtime.handler =
+    { run =
+        (fun _t name _args ->
+          match name with
+          | "grid_cycle" ->
+            E.run_cycle ctx;
+            []
+          | "sync_open_orders" ->
+            E.sync_open_orders ctx;
+            []
+          | "evaluate_buy_leg" ->
+            E.evaluate_buy_leg ctx;
+            []
+          | "evaluate_sell_leg" ->
+            E.evaluate_sell_leg ctx;
+            []
+          | _ -> [])
+    }
+  ;;
+end

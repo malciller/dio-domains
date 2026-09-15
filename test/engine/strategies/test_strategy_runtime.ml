@@ -317,6 +317,37 @@ let test_grid_grid_price () =
      | _ -> Alcotest.fail "no price")
 ;;
 
+module Stub_engine = struct
+  type ctx = int ref
+
+  let run_cycle c = incr c
+  let sync_open_orders _ = ()
+  let evaluate_buy_leg _ = ()
+  let evaluate_sell_leg _ = ()
+end
+
+module Stub_grid = Strategy_actions_grid.Make (Stub_engine)
+
+let test_coarse_dispatch () =
+  let ctx = ref 0 in
+  let handler = Stub_grid.handler ctx in
+  let json =
+    {|{"name":"p","version":1,"triggers":["book_update"],"steps":[
+       {"id":"s","then":[{"action":"grid_cycle","args":{}}]}]}|}
+  in
+  match Strategy_file.parse_string json with
+  | Error e -> Alcotest.fail e
+  | Ok f ->
+    let rt = Strategy_runtime.create ~handlers:handler f in
+    ignore
+      (Strategy_runtime.run_cycle
+         rt
+         ~price:1.0
+         ~now:0.0
+         ~event:(Strategy_runtime.make_event "book_update" []));
+    Alcotest.(check int) "run_cycle invoked" 1 !ctx
+;;
+
 let () =
   Alcotest.run
     "strategy_runtime"
@@ -335,6 +366,7 @@ let () =
             test_grid_owed_sell_price
         ; Alcotest.test_case "grid available base handler" `Quick test_grid_available_base
         ; Alcotest.test_case "grid grid price handler" `Quick test_grid_grid_price
+        ; Alcotest.test_case "coarse grid dispatch" `Quick test_coarse_dispatch
         ] )
     ]
 ;;
