@@ -363,14 +363,24 @@ let parse_config json =
          symbol;
        exit 1));
   let strategy = json |> member "strategy" |> to_string in
-  (* The strategy file is located by convention, [strategies/<strategy>.json]. Strategy
-     names are user-defined and the file is the strategy: its "name" must match the
-     entry's "strategy" exactly. No file (a name with no matching file) is allowed - it
-     simply binds no interpreter. A present-but-invalid file, or a name mismatch, is the
-     user's to fix: log and exit 1. *)
+  (* The strategy file is located by convention, [strategies/<strategy>.json]. The file is
+     the strategy: it must exist, parse, and its "name" must equal the entry's "strategy".
+     A missing or invalid file, or a name mismatch, would leave the domain with no
+     strategy bound and trading nothing - so it is fatal (log and exit 1) rather than
+     skipped. *)
   (let path = Printf.sprintf "strategies/%s.json" strategy in
-   if Sys.file_exists path
+   if not (Sys.file_exists path)
    then (
+     Logging.critical_f
+       ~section
+       "Strategy file '%s' for %s/%s does not exist. Strategy files must be deployed \
+        alongside config.json (e.g. /app/strategies); refusing to start with no strategy \
+        bound."
+       path
+       exchange
+       symbol;
+     exit 1)
+   else (
      match Dio_strategies.Strategy_file.parse_file path with
      | Error msg ->
        Logging.critical_f
