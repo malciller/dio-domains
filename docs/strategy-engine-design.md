@@ -704,6 +704,13 @@ The design doc's four layers and the ownership rule (§5.2) already state this: 
 3. Once the file uses no `jacobs_ladder` code, delete `jacobs_ladder/` and drop `Config_grid_engine`/`grid_*` actions.
 4. The `MM` order tag (`strategy_common`) remains a model enum; the MM *strategy module* is removed (done) and will be re-expressed as config if/when needed.
 
+**Action-layer contract — feeds, persistence, HFT invariants (binding on every generic action).** The engine stays event-driven and single-threaded per symbol; actions must never introduce polling, blocking, or cross-thread mutation.
+- *Inputs are feeds.* Reads (`read_book`/TOB, balances, open orders, capacity, available-base, oracle decision) pull from **in-memory feed snapshots already drained at cycle top** — the lock-free book ring (`get_ob_pos_fn`/`get_tob_fn`), the exec-event ring (`iter_execution_events`), the per-symbol REST lifecycle queue (`LockFreeQueue` + `Exchange_wakeup`), the cached balance accessors (`*_fast`), and the lock-free oracle snapshot. No action performs a network syscall or blocks; the domain blocks only in `Exchange_wakeup.wait_since`.
+- *Outputs are intents.* Emission actions build an order and push it to the lock-free order buffer (`order_buffer` ring + `OrderSignal`); they never call the exchange. The supervisor drains and dispatches.
+- *Persistence is asynchronous.* Actions mutate in-memory state and set the dirty flag; the domain flushes via the save queue outside the STRAT span (§6.4). No action does file I/O on the hot path; declared state maps to the §3.3.1 store keys.
+- *No hot-path interpretation cost.* The file is compiled once at load (steps/guards/args lowered to closures); the cycle walks the compiled form. Cycle budget/timing parity is the §6.4 gate.
+- *Ownership.* Per §5.2 the platform owns capacity/integrity/pending/reservation (in `platform_accounting`, in-memory, no I/O); the file owns policy. Actions expose feed facts and accounting verbs; they do not re-derive invariants.
+
 **Status:** M1, M2, M3 **done and verified** (corpus: reference + candidate equivalent on all 10 traces; 18 test binaries). **Market Maker removed** from the engine (reimplement via config later). The **generic-action refactor above is not started** — it is the remaining work. M5 optional. M6 post-canary.
 
 **Important framing.** Today the fine actions are *wrappers* that call the reference `jacobs_ladder_execution` sub-functions (`grid_prepare`→`evaluate_asset_low_recovery`, `grid_buy_place`→`buy_place_initial`, `grid_sell_*`→the sell phases, …). So the reference grid is **not dead code yet** — it is the implementation. "Removing old functionality" therefore has two distinct meanings, and the plan must pick one per step:
