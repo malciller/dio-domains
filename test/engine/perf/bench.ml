@@ -2,6 +2,10 @@ module LP = Latency_profiler
 module SC = Dio_strategies.Strategy_common
 module SG = Dio_strategies.Strategy_api
 module FC = Dio_strategies.Fee_cache
+module SR = Dio_strategies.Strategy_runtime
+module SF = Dio_strategies.Strategy_file
+module SA = Dio_strategies.Strategy_actions_cycle
+module SCE = Dio_strategies.Strategy_cycle_engine
 
 (* ── helpers ──────────────────────────────────────────────────────────────── *)
 
@@ -221,6 +225,33 @@ let bench_duplicate_key_gen () =
   name, n, LP.percentile p 0.50, LP.percentile p 0.90, LP.percentile p 0.99, total_ms
 ;;
 
+(* Per-cycle interpreter overhead for the real strategy file: the file's steps, guards,
+   gate/fact publication and dispatch, with a no-op engine context (the stateful action
+   bodies need live state and are measured separately via the dashboard phases). *)
+let bench_strategy_cycle () =
+  let name = "strategy_run_cycle_real_file" in
+  match SF.parse_file "strategies/jacobs_ladder.json" with
+  | Error e ->
+    Printf.eprintf "bench: %s\n%!" e;
+    name, 0, 0.0, 0.0, 0.0, 0.0
+  | Ok file ->
+    let ctx = SCE.create () in
+    let module H = SA.Make (SCE) in
+    let handlers = H.handler ctx in
+    let rt = SR.create ~handlers file in
+    let event = SR.make_event "book_update" [] in
+    let n = 200_000 in
+    let p = LP.create ~max_latency_us:100_000 name in
+    let w0 = Gc.minor_words () in
+    let total_ms =
+      wall_ms (fun () ->
+        run_bench p n (fun () -> ignore (SR.run_cycle rt ~price:100.0 ~now:1.0 ~event)))
+    in
+    let words = (Gc.minor_words () -. w0) /. float n in
+    Printf.eprintf "  %s: %.1f words/cycle (interpreter core)\n%!" name words;
+    name, n, LP.percentile p 0.50, LP.percentile p 0.90, LP.percentile p 0.99, total_ms
+;;
+
 (* ── entry point ──────────────────────────────────────────────────────────── *)
 
 let () =
@@ -243,6 +274,7 @@ let () =
     ; bench_grid_price_calc ()
     ; bench_state_warmup ()
     ; bench_duplicate_key_gen ()
+    ; bench_strategy_cycle ()
     ]
   in
   (* Restore stderr so benchmark output is not suppressed by the test runner. *)
