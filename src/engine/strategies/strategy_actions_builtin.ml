@@ -23,6 +23,7 @@ let declarations =
       ; se "side" (enum [ "below"; "above" ])
       ; se ~required:false "snap" e
       ]
+  ; act "compute_buy_ref_price" decision [ se "bid" e; se "ask" e ]
   ; act "compute_sell_price" decision [ se "base" e; se "mult" e ]
   ; act
       "compute_amend_price"

@@ -118,6 +118,7 @@ let evaluate_sell_leg = Jacobs_ladder_execution.evaluate_sell_leg
 let reconcile_position = Jacobs_ladder_execution.reconcile_position
 let evaluate_asset_low_recovery = Jacobs_ladder_execution.evaluate_asset_low_recovery
 let execute_strategy = Jacobs_ladder_execution.execute_strategy
+let compute_buy_ref_price = Jacobs_ladder_execution.compute_buy_ref_price
 
 (* ------------------------------------------------------------------ *)
 (* Priority-reclamation step (pure decision). *)
