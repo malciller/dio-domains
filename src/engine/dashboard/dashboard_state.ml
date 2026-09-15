@@ -159,38 +159,6 @@ let json_of_grid_strategy exchange symbol =
     ]
 ;;
 
-(* Strategy state: Market Maker *)
-
-let json_of_mm_strategy exchange symbol =
-  let state = Dio_strategies.Market_maker.get_strategy_state symbol in
-  let exch = Exchange.Types.exchange_of_string exchange in
-  let market_is_closed =
-    match exch with
-    | Ibkr -> not (Ibkr.Market_hours.is_regular_market_open ())
-    | Alpaca -> not (Alpaca.Market_hours.is_market_open ())
-    | _ -> false
-  in
-  `Assoc
-    [ "type", `String "MM"
-    ; "buy_price", json_of_float_opt state.last_buy_order_price
-    ; "buy_qty", `Float 0.0
-    ; "buy_id", json_of_string_opt state.last_buy_order_id
-    ; ( "sell_orders"
-      , `List
-          (List.map
-             (fun (oid, price, qty) ->
-               `Assoc [ "id", `String oid; "price", `Float price; "qty", `Float qty ])
-             state.open_sell_orders) )
-    ; "sell_count", `Int (List.length state.open_sell_orders)
-    ; "capital_low", `Bool state.capital_low
-    ; "market_is_closed", `Bool market_is_closed
-    ; "asset_low", `Bool state.asset_low
-    ; "inflight_buy", `Bool state.inflight_buy
-    ; "inflight_sell", `Bool state.inflight_sell
-    ; "pending_count", `Int (List.length state.pending_orders)
-    ]
-;;
-
 (* Per-symbol market data *)
 
 (** Split a trading symbol on '/' into (base_asset, quote_currency); quote defaults to
@@ -631,7 +599,6 @@ let build_snapshot () =
         let strategy_json =
           match tc.strategy with
           | "Ladder" | "jacobs_ladder" -> json_of_grid_strategy tc.exchange tc.symbol
-          | "MM" -> json_of_mm_strategy tc.exchange tc.symbol
           | other -> `Assoc [ "type", `String other ]
         in
         let base_asset, quote_currency = split_symbol tc.symbol in

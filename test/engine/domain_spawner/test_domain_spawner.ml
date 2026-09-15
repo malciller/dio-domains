@@ -31,7 +31,7 @@ let test_spawn_domains_basic () =
       ; sell_mult = "1.1"
       ; min_usd_balance = Some "100.0"
       ; max_exposure = Some "500.0"
-      ; strategy = "MM"
+      ; strategy = "jacobs_ladder"
       ; maker_fee = None
       ; taker_fee = None
       ; testnet = false
@@ -138,11 +138,7 @@ let test_strategy_initialization () =
   Alcotest.(check unit)
     "jacobs_ladder init"
     ()
-    (Dio_strategies.Jacobs_ladder.Strategy.init ());
-  Alcotest.(check unit)
-    "market_maker init"
-    ()
-    (Dio_strategies.Market_maker.Strategy.init ())
+    (Dio_strategies.Jacobs_ladder.Strategy.init ())
 ;;
 
 let test_domain_error_handling () =

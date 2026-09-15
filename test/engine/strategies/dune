@@ -1,8 +1,4 @@
 (test
- (name test_market_maker)
- (libraries dio.strategies dio.engine alcotest))
-
-(test
  (name test_strategy_common)
  (libraries dio.strategies dio.engine alcotest))
 
