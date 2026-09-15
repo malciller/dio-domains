@@ -70,10 +70,22 @@ let get_conduit_ctx () =
     raise exn
 ;;
 
-(** Generates a monotonically increasing nonce string from the current Unix time in
-    milliseconds. Used as a replay-prevention token in authenticated Kraken API requests. *)
+(** Generates a strictly increasing nonce string from the current Unix time in
+    milliseconds. Kraken rejects any nonce not greater than the last one seen for the API
+    key, so concurrent REST calls (open orders, balances, fees, oracle, token) must never
+    observe the same or a lower value: a plain [gettimeofday] does, within a millisecond
+    and across threads, which surfaced as EAPI:Invalid nonce retries. An atomic
+    compare-and-set keeps the sequence strictly monotonic across threads and clock skew. *)
+let last_nonce = Atomic.make 0L
+
 let nonce () : string =
-  Unix.gettimeofday () *. nonce_ms_multiplier |> Int64.of_float |> Int64.to_string
+  let now = Int64.of_float (Unix.gettimeofday () *. nonce_ms_multiplier) in
+  let rec bump () =
+    let prev = Atomic.get last_nonce in
+    let next = if Int64.compare now prev > 0 then now else Int64.add prev 1L in
+    if Atomic.compare_and_set last_nonce prev next then next else bump ()
+  in
+  Int64.to_string (bump ())
 ;;
 
 (** Normalizes a base64 or base64url encoded secret string. Strips whitespace, converts
