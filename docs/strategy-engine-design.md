@@ -217,14 +217,22 @@ State is scoped per instance and compiled 1:1 to the current strategy state fiel
 
 #### 3.3.1 Persistence mapping
 
-Every persisted field maps to a concrete store key so the equivalence harness can compare persistence writes against the reference:
+Two stores, both keyed `"{strategy}:{symbol}:{venue}"` (so the config's strategy name is part of the key):
 
-- `reserved_base` → `Base_accumulation_store.reserved_base`
-- `accumulated_profit` → `Base_accumulation_store.accumulated_profit`
-- `tracked_buy` → the reference's `last_fill_oid` / tracked-buy slot
-- bootstrapping follows the reference's boot sequence (`last_fill_oid`, streak self-heal, reserved_base bootstrap).
+| Store (file) | Store field | Strategy-file `state` declaration | Notes |
+|---|---|---|---|
+| `Base_accumulation_store` (`accumulation_state.json`) | `reserved_base : float` | `reserved_base : float, persist` | base accumulated via `sell_mult`; excluded from sellable balance |
+| | `accumulated_profit : float` | `accumulated_profit : float, persist` | realized local PnL in quote |
+| | `last_fill_oid : string option` | part of `tracked_buy` / last-fill state | most recent fill ref; **boot key** |
+| | `last_buy_fill_price/qty : float option` | `tracked_buy` | |
+| | `last_sell_fill_price/qty : float option` | `tracked_sell` | |
+| `Sell_levels_store` (`sell_levels_state.json`) | `levels : (price, qty) list` | `persisted_sell_levels` | pending-sell levels (Alpaca remaintain) |
 
-A **persistence mapping table** is maintained alongside the reference-action mapping table (§8.2) and is bidirectional: every current store key has a declared field, and every persisted field has a store key. Mismatch fails validation.
+Per-entry opt-ins: `base_accumulation` (default true) and `sell_levels` (default false) gate whether these stores are read/written at all.
+
+Bootstrapping must reproduce the reference's boot sequence exactly (`last_fill_oid`, streak self-heal, `reserved_base` bootstrap), since the harness compares persistence writes.
+
+The mapping is **bidirectional**: every current store key has a declared field, and every persisted field has a store key. Mismatch fails validation.
 
 ### 3.4 Steps and control flow
 
@@ -491,21 +499,70 @@ The loop's engine gates and invocation cadence (§6.4) are held identical for re
 
 ### 8.2 Reference-action mapping table (authoritative behavior spec)
 
-Before porting, each reference's behavior is enumerated exhaustively: every code path → (trigger, guard, action sequence, state effect, persistence effect). Required grid coverage:
+Before porting, each reference's behavior is enumerated: every code path → (trigger, guard, action sequence, state effect, persistence effect). This is the **function-level inventory** for the grid; per-branch guards are pinned against the frozen reference during porting (the harness catches any omission). A row with no registered action is a hard blocker; an action not referenced by a row must be marked as a user-facing extension.
 
-| Current path | Trigger | Guard (abridged) | Action sequence |
-|---|---|---|---|
-| Initial/next buy placement | book_update | no tracked buy, no pending, quote capacity, not capital-halted | compute_grid_price → place_buy → track_buy |
-| Buy amendment | book_update | trail_up or zone_violation, cooldown elapsed | compute_amend_price → amend_buy → set_time |
-| Buy-fill → sell placement | fill(buy) | — | compute_sell_price → place_sell → track_sell |
-| Sell-fill profit accrual | fill(sell) | — | settle_hold → accumulate → update_reserved_base |
-| Position reconcile | lifecycle/balance | balance fresh | reconcile_position |
-| Ghost detection/recovery | order_lifecycle | ghost grace expired, no ack pending | is_ghost → recover |
-| Sell-stack merge/nesting | sell placement fill | merge_preserved_sells (descriptor) | merge_sell_levels |
-| Exhaust-buy cancel sweep | order_lifecycle | excess buys | cancel_excess_buys |
-| Reserved-base dip guard | sell sizing | capacity ceiling | gate_balance |
+**Entry / orchestration** (`jacobs_ladder_execution.ml`, `jacobs_ladder_events.ml`)
 
-This table is a starting skeleton. The grid's execution module is ~2000 lines and every branch must appear. A row with no registered action is a hard blocker; an action not referenced by a row must be marked as a user-facing extension. An equivalent table is produced for Market Maker. The persistence mapping table (§3.3.1) is maintained alongside.
+| Current path | Trigger | Guard (abridged) | Action sequence | State / persistence effect |
+|---|---|---|---|---|
+| `Strategy.execute` → `execute_strategy` | book_update (snapshot phase) | loop `should_execute` gate | sync → buy leg → sell leg → cleanup | orchestration |
+| `sync_open_orders` | order_lifecycle / each execute | open-orders generation changed | read_open_orders → reconcile ledgers → ghost-buy check | open-buy tracking, `sell_commitments`, `feed_locked_sell_base`, position ledger |
+| `cleanup_pending_and_cooldowns` | each execute | — | expire cooldowns/in-flight; arm reclaims | clears stale tokens |
+| `enqueue_event` / `drain_events` / `dispatch_event` | each execute / fill | — | drain lifecycle queue | — |
+| `flush_persistence` | each execute (dirty) | `base_accumulation` / `sell_levels` | persist | `accumulation_state.json`, `sell_levels_state.json` |
+
+**Position ledger** (`jacobs_ladder_execution.ml`)
+
+| Current path | Trigger | Guard (abridged) | Action sequence | State / persistence effect |
+|---|---|---|---|---|
+| `reconcile_position` | balance_update | non-NaN asset balance | reconcile_position | adopt venue figure; `last_seen_asset_balance`, credit/hold lists |
+| `unreflected_buy_credit` | each execute | credits non-empty | (platform) prune/sum credits | `buy_credits_since_balance` |
+| `unnetted_sell_hold` / `consume_sell_hold_netting` / `arm_sell_hold` | place / balance drop / place sell | hold outstanding | (platform) | `sell_holds_since_balance` |
+| `effective_committed_sell_base` | sell sizing | — | (platform) | committed-sell ceiling |
+
+**Buy leg**
+
+| Current path | Trigger | Guard (abridged) | Action sequence | State / persistence effect |
+|---|---|---|---|---|
+| `compute_buy_ref_price` | book_update | — | compute_grid_price | (pure) |
+| initial / next buy placement | book_update | no tracked buy, no pending, `can_place_buy_order`, not capital-halted | compute_grid_price → place_buy → track_buy | `last_buy_order_id`/`_price`, reserved quote |
+| buy amendment | book_update | trail-up / zone-violation, cooldown elapsed | compute_amend_price → create_amend_order → push_order | in-flight amend, `amend_cooldowns` |
+| buy capacity | buy placement | `use_reserved_base_guard` | atomic_check_and_reserve / gate_balance | per-exchange reserved atomic |
+| ghost-buy detection/recovery | order_lifecycle (sync) | no open buy, not in-flight/amend-active, `buy_ack_ghost_grace_s` elapsed | is_ghost → recover | clear buy tracking, release reserved quote |
+
+**Sell leg** (`evaluate_sell_leg` and result builders)
+
+| Current path | Trigger | Guard (abridged) | Action sequence | State / persistence effect |
+|---|---|---|---|---|
+| `available_base` / `reserve_headroom` | each execute | venue vs ledger basis | gate_balance | reserve-dip ceiling |
+| `owed_sell_price` | fill(buy) | — | compute_sell_price | (pure) |
+| sell placement | fill(buy) / execute | `effective_sell_qty` ≥ min, `use_reserved_base_guard` | place_sell → track_sell | `open_sell_orders`, `sell_commitments`, arm hold |
+| `can_place_sell_order` | sell placement | — | gate_balance | — |
+| persisted-level reconcile (`partition`/`persisted_rebuild_needed`/`dedupe`/`reconcile_persisted_sell_levels`) | execute | `remaintain_expired_sells` | reconcile_persisted_sell_levels | `persisted_sell_levels` |
+| sell-stack merge/nesting | sell placement | `merge_preserved_sells` (descriptor) | merge_sell_levels | commitment/feed merge |
+
+**Reservation**
+
+| Current path | Trigger | Guard (abridged) | Action sequence | State / persistence effect |
+|---|---|---|---|---|
+| `atomic_check_and_reserve` | buy placement | — | reserve | per-exchange reserved atomic |
+| `set_asset_reserved_quote` | fills/cancels/recovery | — | update_reserved_base | `reserved_quote` + atomic |
+| `upsert`/`arm`/`rekey`/`remove_sell_commitment`, `remove_pending_sell_commitments` | lifecycle | — | track_sell | `sell_commitments` |
+
+**Fills / lifecycle** (`jacobs_ladder_events.ml`)
+
+| Current path | Trigger | Guard (abridged) | Action sequence | State / persistence effect |
+|---|---|---|---|---|
+| `handle_order_filled` | fill | not already processed (`add_processed_fill`) | accumulate → update_reserved_base → place_sell (sell leg) | position, `reserved_base`, accumulated profit |
+| `handle_order_acknowledged` | order_lifecycle (ack) | — | track_buy / track_sell | `last_buy_order_id`, ack timestamp |
+| `handle_order_rejected` / `handle_order_failed` | order_lifecycle | — | release reservation | in-flight, reserved quote |
+| `handle_order_cancelled` | order_lifecycle (cancel) | ghost semantics (`buy_tracking_matches_exchange_event`) | is_ghost → recover | tracking, commitments |
+| `handle_order_amended` / `_skipped` / `_failed` | order_lifecycle | — | amend-result handling | `amend_cooldowns`, in-flight |
+| `cleanup_pending_cancellation` | order_lifecycle | — | cleanup | in-flight tokens |
+
+**Support (not behaviors; provided by the engine, no mapping needed):** `Sell_orders` ring buffer, `price_key`, `price_within_tolerance`, `dedupe_persisted_sell_levels` internals, `create_place/amend/cancel_order` constructors.
+
+An equivalent table is produced for Market Maker. The persistence mapping table (§3.3.1) is maintained alongside.
 
 ### 8.3 Differential replay harness
 
