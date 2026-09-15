@@ -115,6 +115,9 @@ let buy_leg_facts = Strategy_decision.buy_leg_facts
 let buy_cancel_excess = Strategy_decision.buy_cancel_excess
 let buy_place_initial = Strategy_decision.buy_place_initial
 let buy_amend = Strategy_decision.buy_amend
+let buy_amend_has_sell = Strategy_decision.buy_amend_has_sell
+let buy_amend_with_sell = Strategy_decision.buy_amend_with_sell
+let buy_amend_no_sell = Strategy_decision.buy_amend_no_sell
 
 type buy_plan = Strategy_decision.buy_plan
 

@@ -57,6 +57,7 @@ let known_platform_caps =
   ; "buy_quote_nan"
   ; "buy_cooldown"
   ; "buy_inflight"
+  ; "amend_has_sell"
   ]
 ;;
 

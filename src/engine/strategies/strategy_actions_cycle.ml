@@ -170,6 +170,9 @@ module type ENGINE = sig
   val buy_place_latch_capital_low : ctx -> unit
   val buy_place_warn_quote : ctx -> unit
   val buy_amend : ctx -> unit
+  val buy_amend_has_sell : ctx -> bool
+  val buy_amend_with_sell : ctx -> unit
+  val buy_amend_no_sell : ctx -> unit
   val sell_prepare : ctx -> unit
   val sell_place : ctx -> unit
   val sell_finalize : ctx -> unit
@@ -243,6 +246,18 @@ module Make (E : ENGINE) = struct
             []
           | "buy_amend" ->
             E.buy_amend ctx;
+            []
+          | "buy_amend_has_sell" ->
+            Strategy_runtime.set_platform
+              t
+              "amend_has_sell"
+              (V_bool (E.buy_amend_has_sell ctx));
+            []
+          | "buy_amend_with_sell" ->
+            E.buy_amend_with_sell ctx;
+            []
+          | "buy_amend_no_sell" ->
+            E.buy_amend_no_sell ctx;
             []
           | "sell_prepare" ->
             E.sell_prepare ctx;
