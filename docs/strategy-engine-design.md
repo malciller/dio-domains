@@ -171,6 +171,8 @@ A new strategy = a new file picking from the action library.
 
 One file per strategy definition. Distinct from `config.json`, which only binds files to instances.
 
+Strategy names are **user-defined and opaque to the engine** — the engine never canonicalizes, aliases, or matches on a built-in name. A `config.json` entry binds a strategy file via `strategy_file`, and at startup the engine requires the entry's `strategy` to equal the file's `name` exactly. A mismatch (or an invalid/unreadable file) logs `CRITICAL` and exits `1` (§7). Keeping the two in sync is the user's responsibility.
+
 ### 3.1 Triggers and the event model
 
 The engine reads ordered events from ring-buffer cursors; the protocol presents that stream to a compiled instance in event form:
@@ -461,6 +463,7 @@ The equivalence gate (§8) holds these gates and the invocation cadence identica
 ## 7. Validation & safety
 
 - **Static validation** at load (fail-fast): action names registered; args satisfy schemas; `$ref` resolve; guard predicates/expressions type-check; triggers ⊆ known events; dedup keys present on effectful actions; persisted fields have store mappings (§3.3.1); no undeclared state/property.
+- **Config ↔ strategy-file name match** at startup: each `config.json` entry's `strategy` must equal the bound strategy file's `name`. A mismatch (or an invalid/unreadable file) logs `CRITICAL` and exits `1`. Names are user-defined; the engine does not canonicalize them.
 - **`dio strategy validate <file>`**: static validation plus a compile + single synthetic event, no exchange connection.
 - **Paper mode**: step runner executes against a simulated venue using the same platform queries; no real orders.
 - **Dry-run on stored history**: replay recorded history through the compiled instance in shadow mode; log would-have-done actions.
@@ -550,7 +553,7 @@ Concrete module and integration work, with per-module status. Milestone 1's firs
 
 | File | Change |
 |---|---|
-| `config.ml` | instance binding to `strategy_file` + param overrides + descriptor flags; keep `trading_config`, shift `strategy` tag semantics (`config.ml:504` `read_config`) |
+| `config.ml` | instance binding to `strategy_file` + param overrides + descriptor flags; keep `trading_config`, shift `strategy` tag semantics (`config.ml:504` `read_config`) — **binding + name-match check done**; param overrides/descriptor flags pending |
 | `domain_spawner.ml` | replace `is_grid_strategy`/`is_mm_strategy` and dispatch branches (290-308, 589-798, 1425-1467, 1786-1795) with compiled-instance dispatch; add dual-run mode |
 | `supervisor_orders.ml` | generalise callbacks/drains (151-412, 802-808) to the protocol; expose pending/dedup + reservation to `platform_accounting` |
 | `strategy_common.ml` | finalize the `S` signature (572) to the compiled-instance contract; retain in-flight caches/ring buffer as platform-owned |
