@@ -202,6 +202,13 @@ let test_persisted_levels () =
   Alcotest.(check bool) "dedupe within tolerance" true (holds_eq deduped [ 100.005, 2.0 ])
 ;;
 
+let test_reserved_atomic () =
+  let a = Platform_accounting.get_exchange_reserved_atomic "unittest-venue" in
+  Platform_accounting.atomic_add a 2.5;
+  Platform_accounting.atomic_add a 1.0;
+  Alcotest.(check (float 0.0001)) "reserved atomic accumulates" 3.5 (Atomic.get a)
+;;
+
 let () =
   Alcotest.run
     "platform_accounting"
@@ -225,5 +232,7 @@ let () =
         ] )
     ; ( "persisted_levels"
       , [ Alcotest.test_case "matching helpers" `Quick test_persisted_levels ] )
+    ; ( "reserved_atomic"
+      , [ Alcotest.test_case "atomic registry" `Quick test_reserved_atomic ] )
     ]
 ;;
