@@ -94,6 +94,13 @@ let snapshot_entries (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
   ; "s_position_initialized", Expr.V_bool st.position_initialized
   ; "s_last_buy_fill_price", optf st.last_buy_fill_price
   ; "s_last_sell_fill_price", optf st.last_sell_fill_price
+  ; "s_last_buy_fill_qty", optf st.last_buy_fill_qty
+  ; "s_last_sell_fill_qty", optf st.last_sell_fill_qty
+  ; "s_last_fill_oid", opts st.last_fill_oid
+  ; "s_feed_locked_sell_base", Expr.V_float st.feed_locked_sell_base
+  ; "s_cached_qty_increment", Expr.V_float st.cached_qty_increment
+  ; "s_duplicate_key_buy", Expr.V_string st.duplicate_key_buy
+  ; "s_duplicate_key_sell", Expr.V_string st.duplicate_key_sell
   ; "s_last_buy_ack_ts", Expr.V_float st.last_buy_ack_ts
   ; "s_last_seen_asset_balance", Expr.V_float st.last_seen_asset_balance
   ; "s_last_balance_delta", Expr.V_float st.last_balance_delta
@@ -147,6 +154,17 @@ let seed
   st.position_initialized <- getb "s_position_initialized" st.position_initialized;
   st.last_buy_fill_price <- getfo "s_last_buy_fill_price";
   st.last_sell_fill_price <- getfo "s_last_sell_fill_price";
+  st.last_buy_fill_qty <- getfo "s_last_buy_fill_qty";
+  st.last_sell_fill_qty <- getfo "s_last_sell_fill_qty";
+  st.last_fill_oid <- gets "s_last_fill_oid";
+  st.feed_locked_sell_base <- getf "s_feed_locked_sell_base" st.feed_locked_sell_base;
+  st.cached_qty_increment <- getf "s_cached_qty_increment" st.cached_qty_increment;
+  (match List.assoc_opt "s_duplicate_key_buy" entries with
+   | Some (Expr.V_string s) -> st.duplicate_key_buy <- s
+   | _ -> ());
+  (match List.assoc_opt "s_duplicate_key_sell" entries with
+   | Some (Expr.V_string s) -> st.duplicate_key_sell <- s
+   | _ -> ());
   st.last_buy_ack_ts <- getf "s_last_buy_ack_ts" st.last_buy_ack_ts;
   st.last_seen_asset_balance
   <- getf "s_last_seen_asset_balance" st.last_seen_asset_balance;
@@ -220,11 +238,16 @@ let snapshot_collections (st : Dio_strategies.Jacobs_ladder_types.strategy_state
          st.amend_cooldowns
          [])
   in
+  let pairs xs = `List (List.map (fun (a, b) -> `List [ `Float a; `Float b ]) xs) in
   [ "s_open_sell_orders", Expr.V_string (Yojson.Basic.to_string open_sells)
   ; "s_sell_commitments", Expr.V_string (Yojson.Basic.to_string commitments)
   ; "s_pending_orders", Expr.V_string (Yojson.Basic.to_string pending)
   ; "s_persisted_sell_levels", Expr.V_string (Yojson.Basic.to_string persisted)
   ; "s_amend_cooldowns", Expr.V_string (Yojson.Basic.to_string cooldowns)
+  ; ( "s_sell_holds_since_balance"
+    , Expr.V_string (Yojson.Basic.to_string (pairs st.sell_holds_since_balance)) )
+  ; ( "s_buy_credits_since_balance"
+    , Expr.V_string (Yojson.Basic.to_string (pairs st.buy_credits_since_balance)) )
   ]
 ;;
 
@@ -300,20 +323,38 @@ let seed_collections
             | _ -> None)
           l
    | _ -> ());
-  match j "s_amend_cooldowns" with
-  | Some (`List l) ->
-    Hashtbl.reset st.amend_cooldowns;
-    List.iter
+  (match j "s_amend_cooldowns" with
+   | Some (`List l) ->
+     Hashtbl.reset st.amend_cooldowns;
+     List.iter
+       (function
+         | `List [ `String id; `Float v ] -> Hashtbl.replace st.amend_cooldowns id v
+         | _ -> ())
+       l
+   | _ -> ());
+  let pairs_of l =
+    List.filter_map
       (function
-        | `List [ `String id; `Float v ] -> Hashtbl.replace st.amend_cooldowns id v
-        | _ -> ())
+        | `List [ `Float a; `Float b ] -> Some (a, b)
+        | _ -> None)
       l
+  in
+  (match j "s_sell_holds_since_balance" with
+   | Some (`List l) -> st.sell_holds_since_balance <- pairs_of l
+   | _ -> ());
+  match j "s_buy_credits_since_balance" with
+  | Some (`List l) -> st.buy_credits_since_balance <- pairs_of l
   | _ -> ()
 ;;
 
 (** Replay [trace] through the reference strategy for [asset], returning an emitted-only
     trace. *)
-let replay ~(asset : Jac.trading_config) ~(trace : Trace.t) : Trace.t =
+let replay
+  ~(asset : Jac.trading_config)
+  ~(set_venue_available : (string -> float -> unit) option)
+  ~(trace : Trace.t)
+  : Trace.t
+  =
   let state = Jac.get_strategy_state asset.symbol in
   (* Seed the decision-relevant state from the recorded pre-run snapshot. *)
   (match trace with
@@ -345,11 +386,35 @@ let replay ~(asset : Jac.trading_config) ~(trace : Trace.t) : Trace.t =
       let base_age = age_entry entries in
       let grid_qty = f_entry entries "grid_qty" nan in
       if Float.is_finite grid_qty then state.grid_qty <- grid_qty;
+      (* Effective grid interval comes from the capital-oracle blend, not config. *)
+      let gi = f_entry entries "grid_interval" nan in
+      let asset =
+        if Float.is_finite gi then { asset with grid_interval = gi } else asset
+      in
+      (* Accumulation buffer comes from the resolved Fear & Greed blend, not config. *)
+      let ab = f_entry entries "accumulation_buffer" nan in
+      let asset =
+        if Float.is_finite ab then { asset with accumulation_buffer = ab } else asset
+      in
+      (* Domain-provided knobs the oracle re-sets outside the strategy call. *)
+      if b_entry entries "force_buy_reanchor" false then state.force_buy_reanchor <- true;
+      if b_entry entries "capital_low" false then state.capital_low <- true;
+      (* Restore the venue's immediately-sellable base snapshot for this cycle. *)
+      (match set_venue_available with
+       | Some f ->
+         let va = f_entry entries "venue_available" nan in
+         if Float.is_finite va then f asset.symbol va
+       | None -> ());
       let orders = Array.of_list open_orders in
       let iter f =
         Array.iter
           (fun (oi : Trace.order_intent) ->
-            f "replay" oi.oi_price oi.oi_qty oi.oi_side None)
+            f
+              (Option.value oi.oi_order_id ~default:"replay")
+              oi.oi_price
+              oi.oi_qty
+              oi.oi_side
+              None)
           orders
       in
       Jac.Strategy.execute
@@ -411,7 +476,7 @@ let symbol_of_trace (trace : Trace.t) : string option =
 
 (** Load a recorded trace, replay it through the reference grid, and report equivalence
     between the recorded and replayed emitted intents. Writes [<path>.replayed.json]. *)
-let run (path : string) : int =
+let run ~(set_venue_available : (string -> float -> unit) option) (path : string) : int =
   match Trace.load path with
   | exception exn ->
     Printf.eprintf "replay: cannot load %s: %s\n" path (Printexc.to_string exn);
@@ -433,7 +498,7 @@ let run (path : string) : int =
           1
         | Some tc ->
           let asset = asset_of tc in
-          let replayed = replay ~asset ~trace in
+          let replayed = replay ~asset ~set_venue_available ~trace in
           Trace.save (path ^ ".replayed.json") replayed;
           (match Trace.compare (Trace.emitted_only trace) replayed with
            | None ->

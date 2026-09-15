@@ -8,6 +8,7 @@ let oi ?(side = "buy") ?(qty = 1.0) ?(price = 100.0) () =
   ; oi_post_only = true
   ; oi_reduce_only = false
   ; oi_tif = None
+  ; oi_order_id = None
   }
 ;;
 

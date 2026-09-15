@@ -613,13 +613,6 @@ let asset_domain_worker
       else None
     in
     let cached_fng_check_threshold = config.fng_check_threshold in
-    (* Record the pre-run strategy-state snapshot so a replay can seed identical state. *)
-    (match trace_recorder, cached_grid_state with
-     | Some r, Some st ->
-       Dio_strategies.Strategy_event_recorder.record_state
-         r
-         (Strategy_replay.snapshot_entries st @ Strategy_replay.snapshot_collections st)
-     | _ -> ());
     let wakeup_sync =
       Concurrency.Exchange_wakeup.get_sync_handle asset_with_fees.symbol
     in
@@ -1539,6 +1532,35 @@ let asset_domain_worker
            call is STRAT. *)
         t3_strategy := if latency_this_cycle then Monotonic_clock.now_ns () else 0;
         alloc_at_t3s := if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0;
+        (* Pre-execute domain-provided strategy knobs, recorded as replay inputs (the
+           oracle sets these outside the strategy call; the strategy may clear them during
+           execute, so the input value must be captured before execute runs). *)
+        let trace_input_force_reanchor =
+          match cached_grid_state with
+          | Some s -> s.force_buy_reanchor
+          | None -> false
+        in
+        let trace_input_capital_low =
+          match cached_grid_state with
+          | Some s -> s.capital_low
+          | None -> false
+        in
+        (* Venue immediately-sellable base (Alpaca qty_available), distinct from the
+           tradeable balance above; the strategy reads it via [get_available_balance_fast]
+           and it must be recorded to replay the sell leg. *)
+        let trace_input_venue_available =
+          try Ex.get_available_balance_fast ~asset:asset_with_fees.symbol () with
+          | _ -> nan
+        in
+        (* Snapshot the strategy state entering the FIRST traced cycle, so a replay seeds
+           the exact state (earlier untraced startup cycles would otherwise be lost). *)
+        (match trace_recorder, cached_grid_state with
+         | Some r, Some st when !trace_cycles = 0 ->
+           Dio_strategies.Strategy_event_recorder.record_state
+             r
+             (Strategy_replay.snapshot_entries st
+              @ Strategy_replay.snapshot_collections st)
+         | _ -> ());
         (match config_grid with
          | Some (ctx, rt) ->
            (* Config-driven grid (milestone 3, coarse wrapper): feed the engine context
@@ -1629,6 +1651,7 @@ let asset_domain_worker
                    ; oi_post_only = false
                    ; oi_reduce_only = false
                    ; oi_tif = None
+                   ; oi_order_id = Some o.order_id
                    })
                (Ex.get_open_orders ~symbol:asset_with_fees.symbol);
              let grid_interval =
@@ -1647,6 +1670,16 @@ let asset_domain_worker
                ; ( "quote_balance_stale"
                  , Dio_strategies.Strategy_expr.V_bool quote_balance_stale )
                ; "grid_interval", Dio_strategies.Strategy_expr.V_float grid_interval
+               ; ( "accumulation_buffer"
+                 , match resolved_accumulation_buffer with
+                   | Some f -> Dio_strategies.Strategy_expr.V_float f
+                   | None -> Dio_strategies.Strategy_expr.V_none )
+               ; ( "force_buy_reanchor"
+                 , Dio_strategies.Strategy_expr.V_bool trace_input_force_reanchor )
+               ; ( "capital_low"
+                 , Dio_strategies.Strategy_expr.V_bool trace_input_capital_low )
+               ; ( "venue_available"
+                 , Dio_strategies.Strategy_expr.V_float trace_input_venue_available )
                ; ( "grid_qty"
                  , Dio_strategies.Strategy_expr.V_float
                      (match cached_grid_state with
