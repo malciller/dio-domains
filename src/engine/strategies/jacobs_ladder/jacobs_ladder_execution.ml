@@ -1406,7 +1406,6 @@ let evaluate_excess_sweep
     is unchanged. The trigger/latch/sizing contract is documented on its sub-phases.) *)
 type sell_pre =
   { sp_is_alpaca : bool
-  ; sp_is_accumulation : bool
   ; sp_ledger_balance : float
   ; sp_alpaca_available : float
   ; sp_available_base : float
@@ -1704,7 +1703,6 @@ let sell_leg_prepare
   let sell_pushed = ref false in
   let nothing_placeable = ref false in
   { sp_is_alpaca = is_alpaca
-  ; sp_is_accumulation = is_accumulation_basis
   ; sp_ledger_balance = ledger_balance
   ; sp_alpaca_available = alpaca_available
   ; sp_available_base = available_base
