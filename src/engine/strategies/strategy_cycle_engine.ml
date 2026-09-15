@@ -109,6 +109,9 @@ let measure c (phase : Strategy_actions_cycle.phase) f =
        | Strategy_actions_cycle.Preamble ->
          st.alloc_preamble_words <- st.alloc_preamble_words + da;
          st.time_preamble_ns <- st.time_preamble_ns + dt
+       | Strategy_actions_cycle.Facts ->
+         st.alloc_facts_words <- st.alloc_facts_words + da;
+         st.time_facts_ns <- st.time_facts_ns + dt
        | Strategy_actions_cycle.Cleanup ->
          st.alloc_cleanup_words <- st.alloc_cleanup_words + da;
          st.time_cleanup_ns <- st.time_cleanup_ns + dt

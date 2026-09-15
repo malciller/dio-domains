@@ -236,6 +236,8 @@ type strategy_state =
          list always differs and is indexed on the first execution. *)
   ; mutable alloc_cleanup_words : int
   ; mutable alloc_preamble_words : int
+  ; mutable alloc_facts_words : int
+  ; mutable time_facts_ns : int
   ; mutable alloc_sync_words : int
   ; mutable alloc_buy_words : int
   ; mutable alloc_sell_words : int
@@ -548,6 +550,8 @@ let rec get_strategy_state asset_symbol =
       ; alloc_cleanup_words = 0
       ; alloc_sync_words = 0
       ; alloc_preamble_words = 0
+      ; alloc_facts_words = 0
+      ; time_facts_ns = 0
       ; alloc_buy_words = 0
       ; alloc_sell_words = 0
       ; time_preamble_ns = 0
