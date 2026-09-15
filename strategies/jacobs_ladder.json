@@ -162,7 +162,11 @@
       },
       "then": [
         {
-          "action": "cycle_cleanup",
+          "action": "expire_amend_cooldowns",
+          "args": {}
+        },
+        {
+          "action": "evict_ghost_orders",
           "args": {}
         }
       ]

@@ -366,7 +366,7 @@ let evaluate_capital_low_recovery
     the request (Alpaca amends exceed 5s under SSL degradation), so a mid-flight cancel
     event was no longer recognized as the amend's side effect and wrongly reset buy
     tracking. *)
-let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
+let expire_amend_cooldowns ~state ~now ~(asset : trading_config) =
   if Hashtbl.length state.amend_cooldowns > 0
   then (
     let to_remove = ref [] in
@@ -380,7 +380,10 @@ let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
       Logging.warn_f
         ~section
         "amend_cooldowns exceeded 100 entries for %s, reset"
-        asset.symbol));
+        asset.symbol))
+;;
+
+let evict_ghost_orders ~state ~now =
   if Hashtbl.length state.evicted_orders > 0
   then (
     let to_remove = ref [] in
@@ -388,6 +391,11 @@ let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
       (fun k v -> if now > v then to_remove := k :: !to_remove)
       state.evicted_orders;
     List.iter (Hashtbl.remove state.evicted_orders) !to_remove)
+;;
+
+let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
+  expire_amend_cooldowns ~state ~now ~asset;
+  evict_ghost_orders ~state ~now
 ;;
 
 let sync_open_orders

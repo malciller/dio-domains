@@ -155,6 +155,8 @@ module type ENGINE = sig
   val prepare_init : ctx -> unit
   val prepare_recovery : ctx -> bool
   val cleanup : ctx -> unit
+  val expire_amend_cooldowns : ctx -> unit
+  val evict_ghost_orders : ctx -> unit
   val sync : ctx -> unit
   val refresh_fee : ctx -> unit
   val guard : ctx -> bool
@@ -199,6 +201,12 @@ module Make (E : ENGINE) = struct
             []
           | "cycle_cleanup" ->
             E.cleanup ctx;
+            []
+          | "expire_amend_cooldowns" ->
+            E.expire_amend_cooldowns ctx;
+            []
+          | "evict_ghost_orders" ->
+            E.evict_ghost_orders ctx;
             []
           | "cycle_sync" ->
             E.sync ctx;
