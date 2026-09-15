@@ -287,6 +287,36 @@ let test_grid_available_base () =
      | _ -> Alcotest.fail "no available")
 ;;
 
+let test_grid_grid_price () =
+  let json =
+    {|{"name":"p","version":1,"triggers":["book_update"],"steps":[
+       {"id":"s","then":[
+         {"action":"grid_price","args":{"current":"100.0","grid_interval_pct":"1.0","is_above":false},"bind":{"px":"$out.price"}},
+         {"action":"echo","args":{"price":"$local.px"}}
+       ]}]}|}
+  in
+  match Strategy_file.parse_string json with
+  | Error e -> Alcotest.fail e
+  | Ok f ->
+    let rt = Strategy_runtime.create ~handlers:Strategy_actions_grid.handler f in
+    let calls =
+      Strategy_runtime.run_cycle
+        rt
+        ~price:100.0
+        ~now:0.0
+        ~event:(Strategy_runtime.make_event "book_update" [])
+    in
+    let echo =
+      List.find
+        (fun (c : Strategy_runtime.action_call) -> String.equal c.ac_action "echo")
+        calls
+    in
+    (match List.assoc_opt "price" echo.ac_args with
+     | Some (Strategy_expr.V_float p) ->
+       Alcotest.(check (float 0.0001)) "grid price (below)" 99.0 p
+     | _ -> Alcotest.fail "no price")
+;;
+
 let () =
   Alcotest.run
     "strategy_runtime"
@@ -304,6 +334,7 @@ let () =
             `Quick
             test_grid_owed_sell_price
         ; Alcotest.test_case "grid available base handler" `Quick test_grid_available_base
+        ; Alcotest.test_case "grid grid price handler" `Quick test_grid_grid_price
         ] )
     ]
 ;;
