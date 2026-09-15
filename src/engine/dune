@@ -15,4 +15,4 @@
   dio.exchange
   dio.error_handling
   dio.oracle)
- (modules Config Domain_spawner Order_executor))
+ (modules Config Domain_spawner Order_executor Strategy_replay))

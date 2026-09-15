@@ -1600,53 +1600,69 @@ let asset_domain_worker
             0
             iter_orders
             !cycle_count
-        | _ -> ());
-      (match trace_recorder with
-       | Some r when did_ob || did_exec || should_execute ->
-         List.iter
-           (fun (o : Types.open_order) ->
-             let open Dio_strategies.Strategy_trace in
-             Dio_strategies.Strategy_event_recorder.record_order_intent
+        | _ ->
+          ();
+          (match trace_recorder with
+           | Some r ->
+             List.iter
+               (fun (o : Types.open_order) ->
+                 let open Dio_strategies.Strategy_trace in
+                 Dio_strategies.Strategy_event_recorder.record_order_intent
+                   r
+                   { oi_symbol = asset_with_fees.symbol
+                   ; oi_side =
+                       (match o.side with
+                        | Types.Buy -> "buy"
+                        | Types.Sell -> "sell")
+                   ; oi_qty = o.qty
+                   ; oi_price =
+                       (match o.limit_price with
+                        | Some p -> p
+                        | None -> nan)
+                   ; oi_post_only = false
+                   ; oi_reduce_only = false
+                   ; oi_tif = None
+                   })
+               (Ex.get_open_orders ~symbol:asset_with_fees.symbol);
+             let grid_interval =
+               match !grid_strategy_asset_ref with
+               | Some a -> a.grid_interval
+               | None -> nan
+             in
+             Dio_strategies.Strategy_event_recorder.record_state
                r
-               { oi_symbol = asset_with_fees.symbol
-               ; oi_side =
-                   (match o.side with
-                    | Types.Buy -> "buy"
-                    | Types.Sell -> "sell")
-               ; oi_qty = o.qty
-               ; oi_price =
-                   (match o.limit_price with
-                    | Some p -> p
-                    | None -> nan)
-               ; oi_post_only = false
-               ; oi_reduce_only = false
-               ; oi_tif = None
-               })
-           (Ex.get_open_orders ~symbol:asset_with_fees.symbol);
-         Dio_strategies.Strategy_event_recorder.record_state
-           r
-           [ "price", Dio_strategies.Strategy_expr.V_float !current_price
-           ; "asset_balance", Dio_strategies.Strategy_expr.V_float (base_balance_fn ())
-           ; "quote_balance", Dio_strategies.Strategy_expr.V_float (quote_balance_fn ())
-           ; "bid", Dio_strategies.Strategy_expr.V_float !tob_bid
-           ; "ask", Dio_strategies.Strategy_expr.V_float !tob_ask
-           ; ( "generation"
-             , Dio_strategies.Strategy_expr.V_int
-                 (Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol) )
-           ; "cycle", Dio_strategies.Strategy_expr.V_int !cycle_count
-           ; ( "balance_age"
-             , match base_balance_age_fn () with
-               | Some a -> Dio_strategies.Strategy_expr.V_float a
-               | None -> Dio_strategies.Strategy_expr.V_none )
-           ];
-         Dio_strategies.Strategy_event_recorder.end_cycle r;
-         incr trace_cycles;
-         if !trace_cycles mod 50 = 0
-         then
-           Dio_strategies.Strategy_trace.save
-             trace_path
-             (Dio_strategies.Strategy_event_recorder.snapshot r)
-       | _ -> ());
+               [ "price", Dio_strategies.Strategy_expr.V_float !current_price
+               ; "bid", Dio_strategies.Strategy_expr.V_float !tob_bid
+               ; "ask", Dio_strategies.Strategy_expr.V_float !tob_ask
+               ; "asset_balance", Dio_strategies.Strategy_expr.V_float asset_bal_val
+               ; "quote_balance", Dio_strategies.Strategy_expr.V_float quote_bal_val
+               ; "oracle_halted", Dio_strategies.Strategy_expr.V_bool oracle_halted
+               ; ( "quote_balance_stale"
+                 , Dio_strategies.Strategy_expr.V_bool quote_balance_stale )
+               ; "grid_interval", Dio_strategies.Strategy_expr.V_float grid_interval
+               ; ( "grid_qty"
+                 , Dio_strategies.Strategy_expr.V_float
+                     (match cached_grid_state with
+                      | Some s -> s.grid_qty
+                      | None -> nan) )
+               ; "now", Dio_strategies.Strategy_expr.V_float now
+               ; ( "generation"
+                 , Dio_strategies.Strategy_expr.V_int
+                     (Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol) )
+               ; "cycle", Dio_strategies.Strategy_expr.V_int !cycle_count
+               ; ( "balance_age"
+                 , match base_balance_age_fn () with
+                   | Some a -> Dio_strategies.Strategy_expr.V_float a
+                   | None -> Dio_strategies.Strategy_expr.V_none )
+               ];
+             Dio_strategies.Strategy_event_recorder.end_cycle r;
+             incr trace_cycles;
+             if !trace_cycles mod 50 = 0
+             then
+               Dio_strategies.Strategy_trace.save
+                 trace_path
+                 (Dio_strategies.Strategy_event_recorder.snapshot r)
+           | _ -> ()));
       let t4 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
       let alloc_at_t4 =
         if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
