@@ -250,6 +250,20 @@ type strategy_state =
   ; mutable time_sell_place_ns : int
   ; mutable alloc_sell_finalize_words : int
   ; mutable time_sell_finalize_ns : int
+  ; mutable alloc_sfin_latch_words : int
+  ; mutable time_sfin_latch_ns : int
+  ; mutable alloc_sfin_sweep_words : int
+  ; mutable time_sfin_sweep_ns : int
+  ; mutable alloc_sfin_end_words : int
+  ; mutable time_sfin_end_ns : int
+      (* Sub-phase timers inside sell_leg_prepare / buy_place_plan. [profiling] is set
+         once per cycle from the sampled-cycle flag; when false every sub-timer start
+         returns 0 and records nothing, so the hot path pays only a field read + branch. *)
+  ; mutable profiling : bool
+  ; mutable time_splan_overlays_ns : int
+  ; mutable time_splan_reconcile_ns : int
+  ; mutable time_bplan_price_ns : int
+  ; mutable time_bplan_sells_ns : int
   ; mutable alloc_sell_words : int
   ; mutable time_preamble_ns : int
   ; mutable time_cleanup_ns : int
@@ -573,6 +587,17 @@ let rec get_strategy_state asset_symbol =
       ; time_sell_place_ns = 0
       ; alloc_sell_finalize_words = 0
       ; time_sell_finalize_ns = 0
+      ; alloc_sfin_latch_words = 0
+      ; time_sfin_latch_ns = 0
+      ; alloc_sfin_sweep_words = 0
+      ; time_sfin_sweep_ns = 0
+      ; alloc_sfin_end_words = 0
+      ; time_sfin_end_ns = 0
+      ; profiling = false
+      ; time_splan_overlays_ns = 0
+      ; time_splan_reconcile_ns = 0
+      ; time_bplan_price_ns = 0
+      ; time_bplan_sells_ns = 0
       ; alloc_sell_words = 0
       ; time_preamble_ns = 0
       ; time_cleanup_ns = 0
@@ -646,4 +671,28 @@ let add_tracked_order_id state order_id =
         Hashtbl.remove state.tracked_order_ids oldest
       with
       | _ -> ()))
+;;
+
+(** Sub-phase timing for the strategy decision bodies. [start] returns 0 (and records
+    nothing) unless the runtime marked this cycle profiled, so the disabled path is a bool
+    read + branch with no clock call. [stop] is a no-op for t0 = 0. *)
+type sub_timer =
+  | Splan_overlays
+  | Splan_reconcile
+  | Bplan_price
+  | Bplan_sells
+
+let[@inline] sub_start (s : strategy_state) =
+  if s.profiling then Monotonic_clock.now_ns () else 0
+;;
+
+let sub_stop (s : strategy_state) (which : sub_timer) t0 =
+  if t0 > 0
+  then (
+    let dt = Monotonic_clock.now_ns () - t0 in
+    match which with
+    | Splan_overlays -> s.time_splan_overlays_ns <- s.time_splan_overlays_ns + dt
+    | Splan_reconcile -> s.time_splan_reconcile_ns <- s.time_splan_reconcile_ns + dt
+    | Bplan_price -> s.time_bplan_price_ns <- s.time_bplan_price_ns + dt
+    | Bplan_sells -> s.time_bplan_sells_ns <- s.time_bplan_sells_ns + dt)
 ;;

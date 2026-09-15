@@ -1803,7 +1803,8 @@ let asset_domain_worker
               Printf.sprintf
                 " strat[pre=%dw/%s facts=%dw/%s sync=%dw/%s(scan %s rec %s n %d) \
                  ledger=%d buy=%dw/%s bplan=%dw/%s bamend=%dw/%s sell=%dw/%s \
-                 splan=%dw/%s splace=%dw/%s sfin=%dw/%s cln=%dw/%s]"
+                 splan=%dw/%s splace=%dw/%s sfin=%dw/%s sfinL=%dw/%s sfinS=%dw/%s \
+                 sfinE=%dw/%s cln=%dw/%s] sp[ov=%s rec=%s] bp[px=%s sells=%s]"
                 cs.alloc_preamble_words
                 (us cs.time_preamble_ns)
                 cs.alloc_facts_words
@@ -1828,8 +1829,18 @@ let asset_domain_worker
                 (us cs.time_sell_place_ns)
                 cs.alloc_sell_finalize_words
                 (us cs.time_sell_finalize_ns)
+                cs.alloc_sfin_latch_words
+                (us cs.time_sfin_latch_ns)
+                cs.alloc_sfin_sweep_words
+                (us cs.time_sfin_sweep_ns)
+                cs.alloc_sfin_end_words
+                (us cs.time_sfin_end_ns)
                 cs.alloc_cleanup_words
                 (us cs.time_cleanup_ns)
+                (us cs.time_splan_overlays_ns)
+                (us cs.time_splan_reconcile_ns)
+                (us cs.time_bplan_price_ns)
+                (us cs.time_bplan_sells_ns)
             | _ -> ""
           in
           Latency_profiler.set_cause

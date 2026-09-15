@@ -130,6 +130,15 @@ let measure c (phase : Strategy_actions_cycle.phase) f =
        | Strategy_actions_cycle.SellPlace ->
          st.alloc_sell_place_words <- st.alloc_sell_place_words + da;
          st.time_sell_place_ns <- st.time_sell_place_ns + dt
+       | Strategy_actions_cycle.SfinLatch ->
+         st.alloc_sfin_latch_words <- st.alloc_sfin_latch_words + da;
+         st.time_sfin_latch_ns <- st.time_sfin_latch_ns + dt
+       | Strategy_actions_cycle.SfinSweep ->
+         st.alloc_sfin_sweep_words <- st.alloc_sfin_sweep_words + da;
+         st.time_sfin_sweep_ns <- st.time_sfin_sweep_ns + dt
+       | Strategy_actions_cycle.SfinEnd ->
+         st.alloc_sfin_end_words <- st.alloc_sfin_end_words + da;
+         st.time_sfin_end_ns <- st.time_sfin_end_ns + dt
        | Strategy_actions_cycle.SellFinalize ->
          st.alloc_sell_finalize_words <- st.alloc_sell_finalize_words + da;
          st.time_sell_finalize_ns <- st.time_sell_finalize_ns + dt
