@@ -209,6 +209,49 @@ let test_reserved_atomic () =
   Alcotest.(check (float 0.0001)) "reserved atomic accumulates" 3.5 (Atomic.get a)
 ;;
 
+let test_ghost_buy () =
+  let base =
+    Platform_accounting.is_ghost_buy
+      ~open_buy_count:0
+      ~inflight_cancel_buy:false
+      ~inflight_buy:false
+      ~is_amend_active:false
+      ~now:100.0
+      ~last_buy_ack_ts:80.0
+  in
+  Alcotest.(check bool) "ghost after grace, nothing open/in-flight" true base;
+  Alcotest.(check bool)
+    "not ghost while an open buy exists"
+    false
+    (Platform_accounting.is_ghost_buy
+       ~open_buy_count:1
+       ~inflight_cancel_buy:false
+       ~inflight_buy:false
+       ~is_amend_active:false
+       ~now:100.0
+       ~last_buy_ack_ts:80.0);
+  Alcotest.(check bool)
+    "not ghost within ack grace"
+    false
+    (Platform_accounting.is_ghost_buy
+       ~open_buy_count:0
+       ~inflight_cancel_buy:false
+       ~inflight_buy:false
+       ~is_amend_active:false
+       ~now:100.0
+       ~last_buy_ack_ts:95.0);
+  Alcotest.(check bool)
+    "not ghost while amending"
+    false
+    (Platform_accounting.is_ghost_buy
+       ~open_buy_count:0
+       ~inflight_cancel_buy:false
+       ~inflight_buy:false
+       ~is_amend_active:true
+       ~now:100.0
+       ~last_buy_ack_ts:80.0)
+;;
+
 let () =
   Alcotest.run
     "platform_accounting"
@@ -234,5 +277,6 @@ let () =
       , [ Alcotest.test_case "matching helpers" `Quick test_persisted_levels ] )
     ; ( "reserved_atomic"
       , [ Alcotest.test_case "atomic registry" `Quick test_reserved_atomic ] )
+    ; "ghost_buy", [ Alcotest.test_case "grace predicate" `Quick test_ghost_buy ]
     ]
 ;;

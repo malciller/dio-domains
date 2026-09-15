@@ -335,3 +335,22 @@ let rec atomic_add a diff =
   let old_val = Atomic.get a in
   if not (Atomic.compare_and_set a old_val (old_val +. diff)) then atomic_add a diff
 ;;
+
+(** Ghost-buy grace predicate: the open-orders feed listed no buy, nothing is in flight or
+    amend-active, and the ack grace has elapsed. A freshly acked buy is not listed by the
+    feed yet - within the grace that lag is not a ghost; after it, a buy still absent with
+    no terminal event is recovered. *)
+let is_ghost_buy
+  ~open_buy_count
+  ~inflight_cancel_buy
+  ~inflight_buy
+  ~is_amend_active
+  ~now
+  ~last_buy_ack_ts
+  =
+  open_buy_count = 0
+  && (not inflight_cancel_buy)
+  && (not inflight_buy)
+  && (not is_amend_active)
+  && now -. last_buy_ack_ts >= buy_ack_ghost_grace_s
+;;
