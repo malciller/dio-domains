@@ -99,10 +99,28 @@ let owed_sell_price t args =
   [ "price", V_float price ]
 ;;
 
+(** Sellable base without dipping into the reserve (venue vs ledger basis). Ports
+    {!Platform_accounting.available_base}. *)
+let available_base _t args =
+  [ ( "available"
+    , V_float
+        (Platform_accounting.available_base
+           ~is_venue_authoritative:(bool_arg args "venue_authoritative")
+           ~asset_balance_nan:(bool_arg args "asset_balance_nan")
+           ~venue_available:(float_arg args "venue_available")
+           ~ledger_balance:(float_arg args "ledger_balance")
+           ~unreflected_credit:(float_arg args "unreflected_credit")
+           ~reserved_base:(float_arg args "reserved_base")
+           ~committed_sell:(float_arg args "committed_sell")
+           ~unnetted_hold:(float_arg args "unnetted_hold")) )
+  ]
+;;
+
 let run t name args =
   match name with
   | "compute_buy_ref_price" -> compute_buy_ref_price args
   | "owed_sell_price" -> owed_sell_price t args
+  | "available_base" -> available_base t args
   | _ -> []
 ;;
 
