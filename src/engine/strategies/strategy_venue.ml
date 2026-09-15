@@ -1,6 +1,6 @@
-(* Jacobs Ladder: exchange configuration and dynamic helpers. *)
+(* Venue configuration, precision helpers and grid pricing (strategy-agnostic). *)
 
-open Jacobs_ladder_types
+open Strategy_state
 
 (* Kraken matches HL/Lighter/IBKR: 1:1 sells and persistence-layer reserved_base accrual
    on profitable sell fills (Base_accumulation_store). *)

@@ -2,7 +2,7 @@
 
 open Strategy_common
 open Jacobs_ladder_types
-open Jacobs_ladder_config
+open Strategy_venue
 open Strategy_reservation
 module Sell_orders = Strategy_sell_orders
 
