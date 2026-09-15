@@ -1,10 +1,64 @@
 {
   "name": "jacobs_ladder",
   "version": 1,
-  "triggers": ["book_update"],
+  "triggers": ["book_update", "fill", "order_lifecycle"],
   "params": {},
   "state": {},
   "steps": [
+    {
+      "id": "ev_filled",
+      "when": { "event": "filled" },
+      "then": [{ "action": "grid_on_event", "args": {} }],
+      "stop": true
+    },
+    {
+      "id": "ev_cancelled",
+      "when": { "event": "cancelled" },
+      "then": [{ "action": "grid_on_event", "args": {} }],
+      "stop": true
+    },
+    {
+      "id": "ev_acknowledged",
+      "when": { "event": "acknowledged" },
+      "then": [{ "action": "grid_on_event", "args": {} }],
+      "stop": true
+    },
+    {
+      "id": "ev_amended",
+      "when": { "event": "amended" },
+      "then": [{ "action": "grid_on_event", "args": {} }],
+      "stop": true
+    },
+    {
+      "id": "ev_failed",
+      "when": { "event": "failed" },
+      "then": [{ "action": "grid_on_event", "args": {} }],
+      "stop": true
+    },
+    {
+      "id": "ev_rejected",
+      "when": { "event": "rejected" },
+      "then": [{ "action": "grid_on_event", "args": {} }],
+      "stop": true
+    },
+    {
+      "id": "ev_amendment_skipped",
+      "when": { "event": "amendment_skipped" },
+      "then": [{ "action": "grid_on_event", "args": {} }],
+      "stop": true
+    },
+    {
+      "id": "ev_amendment_failed",
+      "when": { "event": "amendment_failed" },
+      "then": [{ "action": "grid_on_event", "args": {} }],
+      "stop": true
+    },
+    {
+      "id": "ev_cancel_cleanup",
+      "when": { "event": "cancel_cleanup" },
+      "then": [{ "action": "grid_on_event", "args": {} }],
+      "stop": true
+    },
     {
       "id": "prepare",
       "when": { "event": "book_update" },
@@ -12,40 +66,50 @@
     },
     {
       "id": "skip_nan_price",
-      "when": { "engine": { "continue": false } },
+      "when": { "event": "book_update", "engine": { "continue": false } },
       "then": [],
       "stop": true
     },
     {
       "id": "cleanup",
+      "when": { "event": "book_update" },
       "then": [{ "action": "grid_cleanup", "args": {} }]
     },
     {
       "id": "sync",
+      "when": { "event": "book_update" },
       "then": [{ "action": "grid_sync", "args": {} }]
     },
     {
       "id": "fee",
+      "when": { "event": "book_update" },
       "then": [{ "action": "grid_refresh_fee", "args": {} }]
     },
     {
       "id": "stale_guard",
+      "when": { "event": "book_update" },
       "then": [{ "action": "grid_guard", "args": {} }]
     },
     {
       "id": "buy_gate",
-      "when": { "engine": { "continue": true } },
+      "when": { "event": "book_update", "engine": { "continue": true } },
       "then": [{ "action": "grid_buy_gate", "args": {} }]
     },
     {
       "id": "buy_facts",
-      "when": { "all": [ { "engine": { "buy_active": true } } ] },
+      "when": {
+        "all": [
+          { "event": "book_update" },
+          { "engine": { "buy_active": true } }
+        ]
+      },
       "then": [{ "action": "grid_buy_facts", "args": {} }]
     },
     {
       "id": "buy_cancel",
       "when": {
         "all": [
+          { "event": "book_update" },
           { "engine": { "buy_active": true } },
           { "not": { "engine": { "buy_pending": true } } },
           { "engine": { "buy_should_cancel": true } }
@@ -57,6 +121,7 @@
       "id": "buy_place",
       "when": {
         "all": [
+          { "event": "book_update" },
           { "engine": { "buy_active": true } },
           { "not": { "engine": { "buy_pending": true } } },
           { "not": { "engine": { "buy_should_cancel": true } } },
@@ -69,6 +134,7 @@
       "id": "buy_amend",
       "when": {
         "all": [
+          { "event": "book_update" },
           { "engine": { "buy_active": true } },
           { "not": { "engine": { "buy_pending": true } } },
           { "not": { "engine": { "buy_should_cancel": true } } },
@@ -79,7 +145,7 @@
     },
     {
       "id": "sell",
-      "when": { "engine": { "continue": true } },
+      "when": { "event": "book_update", "engine": { "continue": true } },
       "then": [
         { "action": "grid_sell_prepare", "args": {} },
         { "action": "grid_sell_place", "args": {} },

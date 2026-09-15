@@ -1537,3 +1537,71 @@ let drain_events symbol =
   loop ();
   !n
 ;;
+
+(** Like [drain_events] but hands each event to [f] instead of dispatching it. Used when a
+    file-bound asset routes lifecycle events through the interpreter. *)
+let drain_events_with symbol (f : lifecycle_event -> unit) =
+  let q = get_event_queue symbol in
+  let n = ref 0 in
+  let rec loop () =
+    match LockFreeQueue.read q with
+    | Some ev ->
+      incr n;
+      f ev;
+      loop ()
+    | None -> ()
+  in
+  loop ();
+  !n
+;;
+
+(** Normalize a lifecycle event to an interpreter event (kind + fields) so a strategy file
+    can own the lifecycle surface. Field names mirror {!Strategy_trace.event_obs}. *)
+let runtime_event_of_lifecycle (ev : lifecycle_event) : Strategy_runtime.event =
+  let open Strategy_expr in
+  let side_v s = V_string (side_to_str s) in
+  match ev with
+  | Ack { now; order_id; side; price } ->
+    Strategy_runtime.make_event
+      "acknowledged"
+      [ "now", V_float now
+      ; "order_id", V_string order_id
+      ; "side", side_v side
+      ; "price", V_float price
+      ]
+  | Failed { now; side; reason } ->
+    Strategy_runtime.make_event
+      "failed"
+      [ "now", V_float now; "side", side_v side; "reason", V_string reason ]
+  | Rejected { now; side; price } ->
+    Strategy_runtime.make_event
+      "rejected"
+      [ "now", V_float now; "side", side_v side; "price", V_float price ]
+  | Amended { now; old_id; new_id; side; price } ->
+    Strategy_runtime.make_event
+      "amended"
+      [ "now", V_float now
+      ; "order_id", V_string old_id
+      ; "new_order_id", V_string new_id
+      ; "side", side_v side
+      ; "price", V_float price
+      ]
+  | Amendment_skipped { now; order_id; side; price } ->
+    Strategy_runtime.make_event
+      "amendment_skipped"
+      [ "now", V_float now
+      ; "order_id", V_string order_id
+      ; "side", side_v side
+      ; "price", V_float price
+      ]
+  | Amendment_failed { now; order_id; side; reason } ->
+    Strategy_runtime.make_event
+      "amendment_failed"
+      [ "now", V_float now
+      ; "order_id", V_string order_id
+      ; "side", side_v side
+      ; "reason", V_string reason
+      ]
+  | Cancel_cleanup { order_id } ->
+    Strategy_runtime.make_event "cancel_cleanup" [ "order_id", V_string order_id ]
+;;

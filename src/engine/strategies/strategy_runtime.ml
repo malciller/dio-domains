@@ -176,6 +176,7 @@ let set_platform t k v = Hashtbl.replace t.platform k v
 let set_signal t k v = Hashtbl.replace t.signals k v
 let set_caps t c = t.caps <- c
 let make_event kind fields = { ev_kind = kind; ev_fields = fields }
+let current_event t = t.event
 
 let env_of t : env =
   { price = (fun () -> Ok (V_float t.price))

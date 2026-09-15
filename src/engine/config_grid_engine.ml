@@ -46,6 +46,7 @@ type ctx =
   ; mutable cg_buy_effective_count : int
   ; mutable cg_buy_should_cancel : bool
   ; mutable cg_sell_pre : Jac.sell_pre option
+  ; mutable cg_symbol : string
   }
 
 let create () =
@@ -81,6 +82,7 @@ let create () =
   ; cg_buy_effective_count = 0
   ; cg_buy_should_cancel = false
   ; cg_sell_pre = None
+  ; cg_symbol = ""
   }
 ;;
 
@@ -401,4 +403,71 @@ let sell_finalize c =
       ~base_balance_age:c.cg_base_age
       ~pre
   | _ -> ()
+;;
+
+let value_string = function
+  | Dio_strategies.Strategy_expr.V_string s -> s
+  | V_int i -> string_of_int i
+  | V_float f -> string_of_float f
+  | _ -> ""
+;;
+
+let value_float = function
+  | Dio_strategies.Strategy_expr.V_float f -> f
+  | V_int i -> float_of_int i
+  | _ -> 0.0
+;;
+
+let value_string_opt = function
+  | Dio_strategies.Strategy_expr.V_string s -> Some s
+  | _ -> None
+;;
+
+(** Fine path: dispatch an order-lifecycle event to the reference handlers. The
+    interpreter routes fill/cancel/ack/amend (and the REST-path variants) through this
+    when the entry is file-bound, so the strategy file owns the event surface. The
+    reference handlers remain the bodies; they lock [state.mutex] themselves, so this must
+    run OUTSIDE [with_lock]. *)
+let on_event c (ev : Dio_strategies.Strategy_runtime.event) =
+  match c.cg_state with
+  | Some _ ->
+    let f k = List.assoc_opt k ev.Dio_strategies.Strategy_runtime.ev_fields in
+    let obs =
+      { Dio_strategies.Strategy_trace.ev_kind = ev.Dio_strategies.Strategy_runtime.ev_kind
+      ; ev_now =
+          (match f "now" with
+           | Some v -> value_float v
+           | None -> c.cg_now)
+      ; ev_order_id =
+          (match f "order_id" with
+           | Some v -> value_string v
+           | None -> "")
+      ; ev_new_order_id =
+          (match f "new_order_id" with
+           | Some v -> value_string v
+           | None -> "")
+      ; ev_side =
+          (match f "side" with
+           | Some v -> value_string v
+           | None -> "")
+      ; ev_price =
+          (match f "price" with
+           | Some v -> value_float v
+           | None -> 0.0)
+      ; ev_qty =
+          (match f "qty" with
+           | Some v -> value_float v
+           | None -> 0.0)
+      ; ev_cl_ord_id =
+          (match f "cl_ord_id" with
+           | Some v -> value_string_opt v
+           | None -> None)
+      ; ev_reason =
+          (match f "reason" with
+           | Some v -> value_string v
+           | None -> "")
+      }
+    in
+    Jac.apply_event c.cg_symbol obs
+  | None -> ()
 ;;
