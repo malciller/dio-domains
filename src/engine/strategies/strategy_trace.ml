@@ -159,6 +159,22 @@ let compare (a : t) (b : t) : string option =
 
 let equal a b = compare a b = None
 
+(** Keep only the emitted order intents per cycle. Used to compare a replayed run (which
+    produces only emitted intents) against a recorded run (which also has inputs). *)
+let emitted_only (t : t) : t =
+  List.map
+    (fun c ->
+      { c_index = c.c_index
+      ; c_obs =
+          List.filter
+            (function
+              | Emitted _ -> true
+              | _ -> false)
+            c.c_obs
+      })
+    t
+;;
+
 let value_to_json (v : Strategy_expr.value) : Yojson.Basic.t =
   match v with
   | V_none -> `Null
