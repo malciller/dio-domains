@@ -251,10 +251,17 @@ let get_min_move_threshold price_increment =
   price_increment
 ;;
 
+(** Pure grid price: [current] moved by [grid_interval_pct] percent (up when [is_above]),
+    snapped by [round_price]. Shared by the grid and the config-driven interpreter. *)
+let grid_price ~round_price ~current ~grid_interval_pct ~is_above =
+  let interval = current *. (grid_interval_pct /. 100.0) in
+  round_price (if is_above then current +. interval else current -. interval)
+;;
+
 let calculate_grid_price current_price grid_interval_pct is_above state =
-  let interval = current_price *. (grid_interval_pct /. 100.0) in
-  let raw_price =
-    if is_above then current_price +. interval else current_price -. interval
-  in
-  state.cached_round_price raw_price
+  grid_price
+    ~round_price:state.cached_round_price
+    ~current:current_price
+    ~grid_interval_pct
+    ~is_above
 ;;

@@ -593,13 +593,13 @@ Concrete module and integration work, with per-module status. Milestone 1's firs
 |---|---|---|---|
 | `strategy_actions.ml` | registry, `t`, schema types, `register`/`find` | protocol | done |
 | `strategy_actions_builtin.ml` | declares the §4.3 inventory (schemas) | actions | done (metadata; handlers pending) |
-| `strategy_actions_grid.ml` | grid decision-action handlers (faithful wrappers of reference grid functions) | actions | started (`compute_buy_ref_price`) |
+| `strategy_actions_grid.ml` | grid decision-action handlers (faithful wrappers of reference grid functions) | actions | started (`compute_buy_ref_price`, `owed_sell_price`) |
 | `strategy_file.ml` | JSON → AST (triggers/params/state/steps) | protocol | done |
 | `strategy_expr.ml` | expression engine: `$ref` scanning + tokenizer/parser/evaluator (arithmetic, comparison, boolean) and string templates | protocol | done |
 | `strategy_compile.ml` | static validation against the registry | protocol | done (validation); compile-to-closures pending |
 | `strategy_cli.ml` | `dio strategy validate <file>` | tooling | done |
 | `strategy_guard.ml` | guard evaluation over an expression `env` + facts (event/side/capacity/pending/engine/cooldown) | protocol | done (closure compile pending) |
-| `strategy_runtime.ml` | per-instance state, env, cycle runner, action dispatch, step-local bindings | protocol | done (synthetic; exchange handlers pending) |
+| `strategy_runtime.ml` | per-instance state, env, cycle runner, action dispatch, step-local bindings, engine caps | protocol | done (synthetic; engine caps + exchange handlers pending) |
 | `strategy_protocol.ml` | implements `Strategy_common.S` over a compiled instance | protocol | pending |
 | `platform_accounting.ml` | central accounting: grace, ghost, freshness, ceilings, pending, reservation | platform | partial (constants, freshness cutoff, sell-hold overlays; ghost/recovery, reserve-dip ceiling, reservation pending) |
 | `exchange_capabilities.ml` | per-venue capability descriptors (extracted from the grid flag matrix) | platform | done |

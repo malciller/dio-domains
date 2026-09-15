@@ -18,6 +18,19 @@ type action_call =
   ; ac_args : (string * value) list
   }
 
+(** Engine-provided capabilities for handlers that call reference functions (e.g. price
+    rounding, venue identity, venue flag matrix). The engine sets these per instance; the
+    defaults are identity/empty so synthetic runs work without an exchange. *)
+type caps =
+  { round_price : float -> float
+  ; exchange : string
+  ; remaintain_expired_sells : bool
+  }
+
+let default_caps =
+  { round_price = (fun x -> x); exchange = ""; remaintain_expired_sells = false }
+;;
+
 type handler = { run : t -> string -> (string * value) list -> (string * value) list }
 
 and t =
@@ -28,6 +41,7 @@ and t =
   ; platform : (string, value) Hashtbl.t
   ; locals : (string, value) Hashtbl.t
   ; handlers : handler
+  ; mutable caps : caps
   ; mutable event : event option
   ; mutable price : float
   ; mutable now : float
@@ -149,6 +163,7 @@ let create ?(handlers = noop_handler) ?(params = []) (file : Strategy_file.t) =
   ; platform = Hashtbl.create 8
   ; locals = Hashtbl.create 8
   ; handlers
+  ; caps = default_caps
   ; event = None
   ; price = nan
   ; now = 0.0
@@ -159,6 +174,7 @@ let set_state t k v = Hashtbl.replace t.state k v
 let get_state t k = Hashtbl.find_opt t.state k
 let set_platform t k v = Hashtbl.replace t.platform k v
 let set_signal t k v = Hashtbl.replace t.signals k v
+let set_caps t c = t.caps <- c
 let make_event kind fields = { ev_kind = kind; ev_fields = fields }
 
 let env_of t : env =

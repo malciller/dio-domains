@@ -215,6 +215,48 @@ let test_grid_buy_ref_price () =
      | _ -> Alcotest.fail "no price")
 ;;
 
+let test_grid_owed_sell_price () =
+  let json =
+    {|{"name":"p","version":1,"triggers":["book_update"],"steps":[
+       {"id":"s","then":[
+         {"action":"owed_sell_price","args":{"bid":"100.0","ask":"100.5"},"bind":{"px":"$out.price"}},
+         {"action":"echo","args":{"price":"$local.px"}}
+       ]}]}|}
+  in
+  match Strategy_file.parse_string json with
+  | Error e -> Alcotest.fail e
+  | Ok f ->
+    let rt = Strategy_runtime.create ~handlers:Strategy_actions_grid.handler f in
+    Strategy_runtime.set_state rt "last_buy_fill_price" (Strategy_expr.V_float 100.0);
+    Strategy_runtime.set_state
+      rt
+      "resuming_after_balance_flag"
+      (Strategy_expr.V_bool false);
+    Strategy_runtime.set_platform rt "grid_interval" (Strategy_expr.V_float 1.0);
+    Strategy_runtime.set_caps
+      rt
+      { Strategy_runtime.round_price = (fun x -> x)
+      ; exchange = "hyperliquid"
+      ; remaintain_expired_sells = false
+      };
+    let calls =
+      Strategy_runtime.run_cycle
+        rt
+        ~price:100.0
+        ~now:0.0
+        ~event:(Strategy_runtime.make_event "book_update" [])
+    in
+    let echo =
+      List.find
+        (fun (c : Strategy_runtime.action_call) -> String.equal c.ac_action "echo")
+        calls
+    in
+    (match List.assoc_opt "price" echo.ac_args with
+     | Some (Strategy_expr.V_float p) ->
+       Alcotest.(check (float 0.0001)) "owed sell price" 101.0 p
+     | _ -> Alcotest.fail "no price")
+;;
+
 let () =
   Alcotest.run
     "strategy_runtime"
@@ -227,6 +269,10 @@ let () =
       , [ Alcotest.test_case "buy then no repeat" `Quick test_runtime_buy_then_no_repeat
         ; Alcotest.test_case "sell on fill" `Quick test_runtime_fill
         ; Alcotest.test_case "grid buy ref price handler" `Quick test_grid_buy_ref_price
+        ; Alcotest.test_case
+            "grid owed sell price handler"
+            `Quick
+            test_grid_owed_sell_price
         ] )
     ]
 ;;
