@@ -157,7 +157,12 @@ type phase =
   | Cleanup
   | Sync
   | Buy
+  | BuyPlan
+  | BuyAmend
   | Sell
+  | SellPlan
+  | SellPlace
+  | SellFinalize
 
 module type ENGINE = sig
   type ctx
@@ -245,43 +250,44 @@ module Make (E : ENGINE) = struct
           | "cancel_excess_buys" -> ph Buy (fun () -> E.buy_cancel ctx)
           | "buy_place" -> ph Buy (fun () -> E.buy_place ctx)
           | "buy_place_plan" ->
-            ph Buy (fun () ->
+            ph BuyPlan (fun () ->
               List.iter
                 (fun (k, v) -> Strategy_runtime.set_platform t k v)
                 (E.buy_place_plan ctx))
-          | "buy_place_send" -> ph Buy (fun () -> E.buy_place_send ctx)
+          | "buy_place_send" -> ph BuyPlan (fun () -> E.buy_place_send ctx)
           | "buy_place_send_insufficient" ->
-            ph Buy (fun () -> E.buy_place_send_insufficient ctx)
+            ph BuyPlan (fun () -> E.buy_place_send_insufficient ctx)
           | "buy_place_latch_capital_low" ->
-            ph Buy (fun () -> E.buy_place_latch_capital_low ctx)
-          | "buy_place_warn_quote" -> ph Buy (fun () -> E.buy_place_warn_quote ctx)
-          | "buy_amend" -> ph Buy (fun () -> E.buy_amend ctx)
+            ph BuyPlan (fun () -> E.buy_place_latch_capital_low ctx)
+          | "buy_place_warn_quote" -> ph BuyPlan (fun () -> E.buy_place_warn_quote ctx)
+          | "buy_amend" -> ph BuyAmend (fun () -> E.buy_amend ctx)
           | "buy_amend_has_sell" ->
-            ph Buy (fun () ->
+            ph BuyAmend (fun () ->
               Strategy_runtime.set_platform
                 t
                 "amend_has_sell"
                 (V_bool (E.buy_amend_has_sell ctx)))
-          | "buy_amend_with_sell" -> ph Buy (fun () -> E.buy_amend_with_sell ctx)
-          | "buy_amend_no_sell" -> ph Buy (fun () -> E.buy_amend_no_sell ctx)
-          | "plan_sell_order" -> ph Sell (fun () -> E.sell_prepare ctx)
-          | "sell_place" -> ph Sell (fun () -> E.sell_place ctx)
+          | "buy_amend_with_sell" -> ph BuyAmend (fun () -> E.buy_amend_with_sell ctx)
+          | "buy_amend_no_sell" -> ph BuyAmend (fun () -> E.buy_amend_no_sell ctx)
+          | "plan_sell_order" -> ph SellPlan (fun () -> E.sell_prepare ctx)
+          | "sell_place" -> ph SellPlace (fun () -> E.sell_place ctx)
           | "sell_place_should" ->
-            ph Sell (fun () ->
+            ph SellPlace (fun () ->
               Strategy_runtime.set_platform
                 t
                 "sell_place_should"
                 (V_bool (E.sell_place_should ctx)))
-          | "sell_place_body" -> ph Sell (fun () -> E.sell_place_body ctx)
-          | "sell_finalize" -> ph Sell (fun () -> E.sell_finalize ctx)
+          | "sell_place_body" -> ph SellPlace (fun () -> E.sell_place_body ctx)
+          | "sell_finalize" -> ph SellFinalize (fun () -> E.sell_finalize ctx)
           | "sell_finalize_facts" ->
-            ph Sell (fun () ->
+            ph SellFinalize (fun () ->
               List.iter
                 (fun (k, v) -> Strategy_runtime.set_platform t k v)
                 (E.sell_finalize_facts ctx))
-          | "sell_finalize_latch" -> ph Sell (fun () -> E.sell_finalize_latch ctx)
-          | "sell_excess_sweep_phase" -> ph Sell (fun () -> E.sell_excess_sweep_phase ctx)
-          | "sell_finalize_end" -> ph Sell (fun () -> E.sell_finalize_end ctx)
+          | "sell_finalize_latch" -> ph SellFinalize (fun () -> E.sell_finalize_latch ctx)
+          | "sell_excess_sweep_phase" ->
+            ph SellFinalize (fun () -> E.sell_excess_sweep_phase ctx)
+          | "sell_finalize_end" -> ph SellFinalize (fun () -> E.sell_finalize_end ctx)
           | "apply_order_event" ->
             (match Strategy_runtime.current_event t with
              | Some ev -> E.on_event ctx ev

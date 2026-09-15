@@ -1802,7 +1802,8 @@ let asset_domain_worker
               let us ns = Latency_profiler.format_us (float ns /. 1000.0) in
               Printf.sprintf
                 " strat[pre=%dw/%s facts=%dw/%s sync=%dw/%s(scan %s rec %s n %d) \
-                 ledger=%d buy=%dw/%s sell=%dw/%s cln=%dw/%s]"
+                 ledger=%d buy=%dw/%s bplan=%dw/%s bamend=%dw/%s sell=%dw/%s \
+                 splan=%dw/%s splace=%dw/%s sfin=%dw/%s cln=%dw/%s]"
                 cs.alloc_preamble_words
                 (us cs.time_preamble_ns)
                 cs.alloc_facts_words
@@ -1815,8 +1816,18 @@ let asset_domain_worker
                 (Hashtbl.length cs.sell_commitments)
                 cs.alloc_buy_words
                 (us cs.time_buy_ns)
+                cs.alloc_buy_plan_words
+                (us cs.time_buy_plan_ns)
+                cs.alloc_buy_amend_words
+                (us cs.time_buy_amend_ns)
                 cs.alloc_sell_words
                 (us cs.time_sell_ns)
+                cs.alloc_sell_plan_words
+                (us cs.time_sell_plan_ns)
+                cs.alloc_sell_place_words
+                (us cs.time_sell_place_ns)
+                cs.alloc_sell_finalize_words
+                (us cs.time_sell_finalize_ns)
                 cs.alloc_cleanup_words
                 (us cs.time_cleanup_ns)
             | _ -> ""

@@ -118,6 +118,21 @@ let measure c (phase : Strategy_actions_cycle.phase) f =
        | Strategy_actions_cycle.Sync ->
          st.alloc_sync_words <- st.alloc_sync_words + da;
          st.time_sync_ns <- st.time_sync_ns + dt
+       | Strategy_actions_cycle.BuyPlan ->
+         st.alloc_buy_plan_words <- st.alloc_buy_plan_words + da;
+         st.time_buy_plan_ns <- st.time_buy_plan_ns + dt
+       | Strategy_actions_cycle.BuyAmend ->
+         st.alloc_buy_amend_words <- st.alloc_buy_amend_words + da;
+         st.time_buy_amend_ns <- st.time_buy_amend_ns + dt
+       | Strategy_actions_cycle.SellPlan ->
+         st.alloc_sell_plan_words <- st.alloc_sell_plan_words + da;
+         st.time_sell_plan_ns <- st.time_sell_plan_ns + dt
+       | Strategy_actions_cycle.SellPlace ->
+         st.alloc_sell_place_words <- st.alloc_sell_place_words + da;
+         st.time_sell_place_ns <- st.time_sell_place_ns + dt
+       | Strategy_actions_cycle.SellFinalize ->
+         st.alloc_sell_finalize_words <- st.alloc_sell_finalize_words + da;
+         st.time_sell_finalize_ns <- st.time_sell_finalize_ns + dt
        | Strategy_actions_cycle.Buy ->
          st.alloc_buy_words <- st.alloc_buy_words + da;
          st.time_buy_ns <- st.time_buy_ns + dt
