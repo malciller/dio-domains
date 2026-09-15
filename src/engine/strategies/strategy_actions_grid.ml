@@ -118,7 +118,7 @@ let available_base _t args =
 
 (** Grid price for the buy/sell legs: [current] moved by [grid_interval_pct] percent (up
     when [is_above]), snapped by the engine clock round_price. Ports
-    [Jacobs_ladder_config.grid_price] (the buy leg passes [is_above] = false). *)
+    [Strategy_venue.grid_price] (the buy leg passes [is_above] = false). *)
 let grid_price t args =
   [ ( "price"
     , V_float

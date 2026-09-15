@@ -2,8 +2,8 @@
 
    Grid trading with a single-buy, multi-sell order model. Sub-components under
    jacobs_ladder/: types and state (Jacobs_ladder_types), exchange configuration and
-   precision (Jacobs_ladder_config), reservation and accumulation (Strategy_reservation),
-   order construction and dispatch (Jacobs_ladder_orders), execution loop
+   precision (Strategy_venue), reservation and accumulation (Strategy_reservation), order
+   construction and dispatch (Jacobs_ladder_orders), execution loop
    (Jacobs_ladder_execution), lifecycle event handlers (Jacobs_ladder_events). *)
 
 open Strategy_common
@@ -53,24 +53,24 @@ type sell_commitment = Jacobs_ladder_types.sell_commitment =
 let section = Jacobs_ladder_types.section
 let take = Jacobs_ladder_types.take
 let contains_fragment = Jacobs_ladder_types.contains_fragment
-let kraken_config = Jacobs_ladder_config.kraken_config
-let hyperliquid_config = Jacobs_ladder_config.hyperliquid_config
-let ibkr_config = Jacobs_ladder_config.ibkr_config
-let lighter_config = Jacobs_ladder_config.lighter_config
-let get_exchange_config = Jacobs_ladder_config.get_exchange_config
-let hl_like_spot_fee_exchange = Jacobs_ladder_config.hl_like_spot_fee_exchange
-let ibkr_commission = Jacobs_ladder_config.ibkr_commission
-let get_exchange_module = Jacobs_ladder_config.get_exchange_module
-let get_round_price_fn = Jacobs_ladder_config.get_round_price_fn
-let get_price_increment = Jacobs_ladder_config.get_price_increment
-let get_qty_increment_val = Jacobs_ladder_config.get_qty_increment_val
-let get_min_notional_val = Jacobs_ladder_config.get_min_notional_val
-let round_qty = Jacobs_ladder_config.round_qty
-let venue_lot_qty = Jacobs_ladder_config.venue_lot_qty
-let parse_config_float = Jacobs_ladder_config.parse_config_float
-let get_min_move_threshold = Jacobs_ladder_config.get_min_move_threshold
-let calculate_grid_price = Jacobs_ladder_config.calculate_grid_price
-let grid_price = Jacobs_ladder_config.grid_price
+let kraken_config = Strategy_venue.kraken_config
+let hyperliquid_config = Strategy_venue.hyperliquid_config
+let ibkr_config = Strategy_venue.ibkr_config
+let lighter_config = Strategy_venue.lighter_config
+let get_exchange_config = Strategy_venue.get_exchange_config
+let hl_like_spot_fee_exchange = Strategy_venue.hl_like_spot_fee_exchange
+let ibkr_commission = Strategy_venue.ibkr_commission
+let get_exchange_module = Strategy_venue.get_exchange_module
+let get_round_price_fn = Strategy_venue.get_round_price_fn
+let get_price_increment = Strategy_venue.get_price_increment
+let get_qty_increment_val = Strategy_venue.get_qty_increment_val
+let get_min_notional_val = Strategy_venue.get_min_notional_val
+let round_qty = Strategy_venue.round_qty
+let venue_lot_qty = Strategy_venue.venue_lot_qty
+let parse_config_float = Strategy_venue.parse_config_float
+let get_min_move_threshold = Strategy_venue.get_min_move_threshold
+let calculate_grid_price = Strategy_venue.calculate_grid_price
+let grid_price = Strategy_venue.grid_price
 let get_strategy_state = Jacobs_ladder_types.get_strategy_state
 let total_reserved_by_exchange = Strategy_reservation.total_reserved_by_exchange
 let get_exchange_reserved_atomic = Strategy_reservation.get_exchange_reserved_atomic
