@@ -16,7 +16,7 @@
       },
       "then": [
         {
-          "action": "on_event",
+          "action": "apply_order_event",
           "args": {}
         }
       ],
@@ -29,7 +29,7 @@
       },
       "then": [
         {
-          "action": "on_event",
+          "action": "apply_order_event",
           "args": {}
         }
       ],
@@ -42,7 +42,7 @@
       },
       "then": [
         {
-          "action": "on_event",
+          "action": "apply_order_event",
           "args": {}
         }
       ],
@@ -55,7 +55,7 @@
       },
       "then": [
         {
-          "action": "on_event",
+          "action": "apply_order_event",
           "args": {}
         }
       ],
@@ -68,7 +68,7 @@
       },
       "then": [
         {
-          "action": "on_event",
+          "action": "apply_order_event",
           "args": {}
         }
       ],
@@ -81,7 +81,7 @@
       },
       "then": [
         {
-          "action": "on_event",
+          "action": "apply_order_event",
           "args": {}
         }
       ],
@@ -94,7 +94,7 @@
       },
       "then": [
         {
-          "action": "on_event",
+          "action": "apply_order_event",
           "args": {}
         }
       ],
@@ -107,7 +107,7 @@
       },
       "then": [
         {
-          "action": "on_event",
+          "action": "apply_order_event",
           "args": {}
         }
       ],
@@ -120,7 +120,7 @@
       },
       "then": [
         {
-          "action": "on_event",
+          "action": "apply_order_event",
           "args": {}
         }
       ],
@@ -133,7 +133,7 @@
       },
       "then": [
         {
-          "action": "prepare_init",
+          "action": "init_venue_state",
           "args": {}
         },
         {
@@ -182,7 +182,7 @@
       },
       "then": [
         {
-          "action": "cycle_sync",
+          "action": "scan_open_orders",
           "args": {}
         }
       ]
@@ -195,7 +195,7 @@
       },
       "then": [
         {
-          "action": "cycle_refresh_fee",
+          "action": "refresh_maker_fee",
           "args": {}
         }
       ]
@@ -259,7 +259,7 @@
       },
       "then": [
         {
-          "action": "buy_cancel",
+          "action": "cancel_excess_buys",
           "args": {}
         }
       ]
@@ -595,7 +595,7 @@
       },
       "then": [
         {
-          "action": "sell_prepare",
+          "action": "plan_sell_order",
           "args": {}
         }
       ]

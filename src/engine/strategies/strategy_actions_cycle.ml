@@ -196,7 +196,7 @@ module Make (E : ENGINE) = struct
           | "cycle_prepare" ->
             ignore (E.prepare ctx);
             []
-          | "prepare_init" ->
+          | "init_venue_state" ->
             E.prepare_init ctx;
             []
           | "prepare_recovery" ->
@@ -214,10 +214,10 @@ module Make (E : ENGINE) = struct
           | "evict_ghost_orders" ->
             E.evict_ghost_orders ctx;
             []
-          | "cycle_sync" ->
+          | "scan_open_orders" ->
             E.sync ctx;
             []
-          | "cycle_refresh_fee" ->
+          | "refresh_maker_fee" ->
             E.refresh_fee ctx;
             []
           | "cycle_guard" ->
@@ -239,7 +239,7 @@ module Make (E : ENGINE) = struct
           | "mark_stale_cycle" ->
             E.mark_stale ctx;
             []
-          | "buy_cancel" ->
+          | "cancel_excess_buys" ->
             E.buy_cancel ctx;
             []
           | "buy_place" ->
@@ -277,7 +277,7 @@ module Make (E : ENGINE) = struct
           | "buy_amend_no_sell" ->
             E.buy_amend_no_sell ctx;
             []
-          | "sell_prepare" ->
+          | "plan_sell_order" ->
             E.sell_prepare ctx;
             []
           | "sell_place" ->
@@ -309,7 +309,7 @@ module Make (E : ENGINE) = struct
           | "sell_finalize_end" ->
             E.sell_finalize_end ctx;
             []
-          | "on_event" ->
+          | "apply_order_event" ->
             (match Strategy_runtime.current_event t with
              | Some ev -> E.on_event ctx ev
              | None -> ());

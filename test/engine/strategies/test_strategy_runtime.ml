@@ -364,7 +364,7 @@ let test_fine_dispatch () =
   let handler = Stub_grid.handler ctx in
   let json =
     {|{"name":"p","version":1,"triggers":["book_update"],"steps":[
-       {"id":"s","then":[{"action":"cycle_sync","args":{}}]}]}|}
+       {"id":"s","then":[{"action":"scan_open_orders","args":{}}]}]}|}
   in
   match Strategy_file.parse_string json with
   | Error e -> Alcotest.fail e
