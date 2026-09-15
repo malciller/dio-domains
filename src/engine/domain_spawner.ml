@@ -679,6 +679,9 @@ let asset_domain_worker
          [Mtime_clock.now_ns] (3 boxed words per read), so the profiler's clock does not
          pollute the allocation counts it measures. *)
       let t1 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
+      let cpu_at_t1 =
+        if latency_this_cycle then Monotonic_clock.thread_cpu_ns () else 0
+      in
       let alloc_start =
         if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
       in
@@ -1403,6 +1406,7 @@ let asset_domain_worker
          tracing (config strategy_trace) does not distort STRAT/TOTAL. *)
       let strat_end_ns = ref 0 in
       let alloc_strat_end = ref 0 in
+      let cpu_strat_end = ref 0 in
       if should_execute
       then (
         should_execute_strategy := false;
@@ -1640,6 +1644,8 @@ let asset_domain_worker
         strat_end_ns := if latency_this_cycle then Monotonic_clock.now_ns () else 0;
         alloc_strat_end
         := if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0;
+        cpu_strat_end
+        := if latency_this_cycle then Monotonic_clock.thread_cpu_ns () else 0;
         match trace_recorder with
         | Some r ->
           List.iter
@@ -1746,6 +1752,27 @@ let asset_domain_worker
            Latency_profiler.record_max_ns prof_cycle (t4 - t1)
         then (
           let alloc_diff = alloc_at_t4 - alloc_start in
+          (* Wall vs thread-CPU over the cycle span: a large wall-minus-CPU gap means the
+             thread was descheduled or caught in a stop-the-world pause, not doing work. *)
+          let wall_ns = t4 - t1 in
+          let cpu_ns = !cpu_strat_end - cpu_at_t1 in
+          let stall_ns = wall_ns - cpu_ns in
+          let wall_us = wall_ns / 1000 in
+          let cpu_us = cpu_ns / 1000 in
+          let stall_us = stall_ns / 1000 in
+          let sched_str =
+            if stall_us <= 0
+            then Printf.sprintf " cpu=%dus stall=0us" cpu_us
+            else if wall_us > 0 && stall_us * 100 / wall_us >= 50
+            then
+              Printf.sprintf
+                " cpu=%dus wall=%dus STALLED=%dus<%d%%>"
+                cpu_us
+                wall_us
+                stall_us
+                (stall_us * 100 / wall_us)
+            else Printf.sprintf " cpu=%dus wall=%dus stall=%dus" cpu_us wall_us stall_us
+          in
           let gc_str =
             if gc_sampled
             then Gc_monitor.diff_to_string stats_start (Gc_monitor.get_stats ())
@@ -1778,7 +1805,7 @@ let asset_domain_worker
           Latency_profiler.set_cause
             prof_cycle
             (Printf.sprintf
-               "ob:%B ex:%d lev:%d st:%B al:%dw[ob:%d ex:%d prep:%d strat:%d]%s%s"
+               "ob:%B ex:%d lev:%d st:%B al:%dw[ob:%d ex:%d prep:%d strat:%d]%s%s%s"
                did_ob
                !cycle_events
                !lifecycle_events
@@ -1789,6 +1816,7 @@ let asset_domain_worker
                (!alloc_at_t3s - alloc_at_t3)
                (alloc_at_t4 - !alloc_at_t3s)
                gc_str
+               sched_str
                phase_str));
       (* Roll the latency window on a fixed time cadence, not a cycle count: the old
          cycle_mod gate (10000 cycles) accumulated minutes before a wipe. *)
