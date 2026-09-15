@@ -38,6 +38,13 @@ let env_float name default =
      | None -> default)
 ;;
 
+(** Most recent window's maximum observed gap, in nanoseconds. Written by the canary
+    domain at each window roll, read by the per-domain spike reporter to distinguish a
+    global stop-the-world pause from a single thread being descheduled. *)
+let last_max_cell = Atomic.make 0
+
+let last_window_max_ns () = Atomic.get last_max_cell
+
 (** [run ~threshold_us ~window_seconds] never returns. Records the gap between consecutive
     clock reads into a latency histogram and logs a summary every [window_seconds], on the
     same cadence as the per-domain windows so a global pause can be matched to the domain
@@ -58,6 +65,7 @@ let run ~threshold_us ~window_seconds =
       let snap =
         Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us prof
       in
+      Atomic.set last_max_cell (int_of_float (snap.max_us *. 1000.0));
       Logging.info_f
         ~section
         "STW canary p50=%s p99=%s max=%s spikes=%d/%d (threshold %s)"

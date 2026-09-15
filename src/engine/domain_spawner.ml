@@ -1761,17 +1761,24 @@ let asset_domain_worker
           let cpu_us = cpu_ns / 1000 in
           let stall_us = stall_ns / 1000 in
           let sched_str =
-            if stall_us <= 0
-            then Printf.sprintf " cpu=%dus stall=0us" cpu_us
-            else if wall_us > 0 && stall_us * 100 / wall_us >= 50
-            then
+            let stw =
               Printf.sprintf
-                " cpu=%dus wall=%dus STALLED=%dus<%d%%>"
-                cpu_us
-                wall_us
-                stall_us
-                (stall_us * 100 / wall_us)
-            else Printf.sprintf " cpu=%dus wall=%dus stall=%dus" cpu_us wall_us stall_us
+                " stw=%s"
+                (Latency_profiler.format_us
+                   (float (Canary.last_window_max_ns ()) /. 1000.0))
+            in
+            (if stall_us <= 0
+             then Printf.sprintf " cpu=%dus stall=0us" cpu_us
+             else if wall_us > 0 && stall_us * 100 / wall_us >= 50
+             then
+               Printf.sprintf
+                 " cpu=%dus wall=%dus STALLED=%dus<%d%%>"
+                 cpu_us
+                 wall_us
+                 stall_us
+                 (stall_us * 100 / wall_us)
+             else Printf.sprintf " cpu=%dus wall=%dus stall=%dus" cpu_us wall_us stall_us)
+            ^ stw
           in
           let gc_str =
             if gc_sampled
