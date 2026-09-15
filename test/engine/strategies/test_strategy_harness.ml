@@ -170,7 +170,7 @@ let replay_inputs =
 let mk_rt json () =
   match Strategy_file.parse_string json with
   | Error e -> failwith e
-  | Ok f -> Strategy_runtime.create ~handlers:Strategy_actions_grid.handler f
+  | Ok f -> Strategy_runtime.create ~handlers:Strategy_actions_cycle.handler f
 ;;
 
 let replay_step rt (input : Strategy_equivalence.input) r =

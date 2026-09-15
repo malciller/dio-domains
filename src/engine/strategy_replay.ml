@@ -14,7 +14,7 @@ module Expr = Dio_strategies.Strategy_expr
 module Jac = Dio_strategies.Strategy_api
 module Order = Dio_strategies.Strategy_common
 module Strategy_file = Dio_strategies.Strategy_file
-module Strategy_actions_grid = Dio_strategies.Strategy_actions_grid
+module Strategy_actions_cycle = Dio_strategies.Strategy_actions_cycle
 module Strategy_actions_builtin = Dio_strategies.Strategy_actions_builtin
 module Strategy_compile = Dio_strategies.Strategy_compile
 module Strategy_runtime = Dio_strategies.Strategy_runtime
@@ -561,7 +561,7 @@ let replay_candidate
   let ctx = Config_grid_engine.create () in
   ctx.cg_symbol <- asset.symbol;
   ctx.cg_state <- Some state;
-  let module Handlers = Strategy_actions_grid.Make (Config_grid_engine) in
+  let module Handlers = Strategy_actions_cycle.Make (Config_grid_engine) in
   let rt = Strategy_runtime.create ~handlers:(Handlers.handler ctx) file in
   drive
     ~asset
