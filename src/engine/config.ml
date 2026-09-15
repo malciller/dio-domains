@@ -80,8 +80,9 @@ type config =
       behavioral-equivalence harness. Default false: production behavior is unchanged
       unless explicitly enabled. *)
   ; config_strategy : bool
-  (** When true, a trading entry bound to a strategy file runs through the config-driven
-      interpreter instead of the hardcoded dispatch. Default false. *)
+  (** Deprecated / ignored: an entry bound to a strategy file always runs through the
+      config-driven interpreter (M3). The key is still accepted so existing configs parse;
+      it no longer changes behavior. *)
   }
 
 (** Logging section identifier for this module. *)
