@@ -1,13 +1,12 @@
-(**
-   Root namespace for the Kraken exchange integration.
-   Re-exports all submodules that implement WebSocket feed subscriptions,
-   REST API clients, authentication, and shared type definitions.
-*)
+(** Root namespace for the Kraken exchange integration. Re-exports all submodules that
+    implement WebSocket feed subscriptions, REST API clients, authentication, and shared
+    type definitions. *)
 
 (** Shared type definitions and JSON codec utilities used across all Kraken submodules. *)
 module Kraken_common_types = Kraken_common_types
 
-(** Defines the set of exchange actions (order placement, cancellation) dispatched to Kraken. *)
+(** Defines the set of exchange actions (order placement, cancellation) dispatched to
+    Kraken. *)
 module Kraken_actions = Kraken_actions
 
 (** WebSocket feed subscription for real-time account balance updates. *)
@@ -34,9 +33,10 @@ module Kraken_open_orders = Kraken_open_orders
 (** WebSocket client for submitting and managing orders via the Kraken trading channel. *)
 module Kraken_trading_client = Kraken_trading_client
 
-(** Top-level lifecycle manager that initializes connections, authenticates, and orchestrates all Kraken feeds. *)
+(** Top-level lifecycle manager that initializes connections, authenticates, and
+    orchestrates all Kraken feeds. *)
 module Kraken_module = Kraken_module
 
-(** Oracle data-venue adapter (historical bars, fees, balances, instruments
-    for the capital oracle; implements [Exchange_intf.Oracle.S]). *)
+(** Oracle data-venue adapter (historical bars, fees, balances, instruments for the
+    capital oracle; implements [Exchange_intf.Oracle.S]). *)
 module Kraken_oracle = Kraken_oracle

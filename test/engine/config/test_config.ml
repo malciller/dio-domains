@@ -167,8 +167,8 @@ let test_parse_oracle_config_assets () =
 ;;
 
 let test_oracle_asset_keys_validation () =
-  (* Asset override entries accept only the three per-asset knobs; global
-     cadence knobs and unknown keys are rejected. *)
+  (* Asset override entries accept only the three per-asset knobs; global cadence knobs
+     and unknown keys are rejected. *)
   let allowed = Dio_engine.Config.known_oracle_asset_keys in
   let good = Yojson.Basic.from_string {|{"target_survival": 0.98}|} in
   let bad = Yojson.Basic.from_string {|{"refresh_seconds": 60.0}|} in
@@ -217,9 +217,8 @@ let test_latency_spike_report_parse () =
 ;;
 
 let test_to_float_opt_accepts_int () =
-  (* Regression: integer JSON literals ("latency_spike_threshold_us": 10) must
-     not crash startup via an uncaught Yojson Type_error from
-     [to_float_option]. *)
+  (* Regression: integer JSON literals ("latency_spike_threshold_us": 10) must not crash
+     startup via an uncaught Yojson Type_error from [to_float_option]. *)
   let open Dio_engine.Config in
   Alcotest.(check (option (float 1e-9)))
     "int accepted"

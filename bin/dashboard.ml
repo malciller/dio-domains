@@ -1,11 +1,11 @@
 (** Terminal dashboard for the Dio trading engine.
 
-    Out-of-process binary (crash isolation). Connects to the engine over a Unix
-    domain socket using a length-prefixed JSON protocol in watch mode: the engine
-    pushes snapshot frames on each tick.
+    Out-of-process binary (crash isolation). Connects to the engine over a Unix domain
+    socket using a length-prefixed JSON protocol in watch mode: the engine pushes snapshot
+    frames on each tick.
 
-    Usage: ./dio-dashboard [--socket /tmp/dio-<pid>.sock] [--config config.json] [--theme <id>]
-*)
+    Usage: ./dio-dashboard [--socket /tmp/dio-<pid>.sock] [--config config.json]
+    [--theme <id>] *)
 
 let () =
   let theme_override = ref "" in
@@ -26,7 +26,7 @@ let () =
               Printf.printf "Available dashboard themes:\n";
               List.iter
                 (fun (t : Dashboard_ui.Theme.theme_palette) ->
-                   Printf.printf "  %-16s %s\n" t.id t.name)
+                  Printf.printf "  %-16s %s\n" t.id t.name)
                 (Dashboard_ui.Theme.all_themes ());
               exit 0)
             else theme_override := s_clean)

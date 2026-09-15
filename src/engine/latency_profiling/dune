@@ -3,5 +3,7 @@
  (public_name dio.latency_profiling)
  (wrapped false)
  (libraries logging mtime mtime.clock.os lwt lwt.unix)
- (foreign_stubs (language c) (names monotonic_clock_stubs))
+ (foreign_stubs
+  (language c)
+  (names monotonic_clock_stubs))
  (modules Latency_profiler Gc_monitor Monotonic_clock Network_latency Canary))

@@ -1,7 +1,6 @@
-(* Alpaca REST submission guards: the venue rejects limit prices off the
-   valid tick band with HTTP 422 ("sub-penny increment does not fulfill
-   minimum pricing criteria"). Prices >= $1.00 must land on penny increments;
-   sub-penny ($0.0001) is only valid below $1.00. *)
+(* Alpaca REST submission guards: the venue rejects limit prices off the valid tick band
+   with HTTP 422 ("sub-penny increment does not fulfill minimum pricing criteria"). Prices
+   >= $1.00 must land on penny increments; sub-penny ($0.0001) is only valid below $1.00. *)
 
 let near ?(eps = 1e-9) a b = Alcotest.(check (float eps)) "approx" a b
 

@@ -1,7 +1,6 @@
 (** ctypes FFI bindings to the precompiled Lighter signer shared library
-    (EdDSA/BabyJubJub/Poseidon signing implemented in Go). All FFI calls are
-    serialized through [signer_mutex] because the Go library is not thread
-    safe. *)
+    (EdDSA/BabyJubJub/Poseidon signing implemented in Go). All FFI calls are serialized
+    through [signer_mutex] because the Go library is not thread safe. *)
 
 let section = "lighter_signer"
 
@@ -80,8 +79,8 @@ let str_or_err_str = field str_or_err "str" (ptr_opt char)
 let str_or_err_err = field str_or_err "err" (ptr_opt char)
 let () = seal str_or_err
 
-(** Signed tx response: tx type, tx info payload, tx hash, raw message to sign,
-    optional error. *)
+(** Signed tx response: tx type, tx info payload, tx hash, raw message to sign, optional
+    error. *)
 type signed_tx_response
 
 let signed_tx_response : signed_tx_response structure typ = structure "SignedTxResponse"
@@ -119,8 +118,8 @@ let read_c_string_and_free p_opt =
     s
 ;;
 
-(** Reads the [tx_info] string out of a signed tx response, frees every
-    returned C string, and raises if the signer reported an error. *)
+(** Reads the [tx_info] string out of a signed tx response, frees every returned C string,
+    and raises if the signer reported an error. *)
 let extract_signed_tx (resp : signed_tx_response structure) : string =
   let err_ptr = getf resp stx_err in
   let info_ptr = getf resp stx_tx_info in
@@ -138,9 +137,8 @@ let extract_signed_tx (resp : signed_tx_response structure) : string =
 (* Lighter mainnet chain id; fixed because all traffic targets mainnet. *)
 let chain_id = ref 304
 
-(** CreateClient FFI: builds the Go signer client from URL, private key, chain
-    id, api key index, and account index (Go int64). Returns an error string
-    pointer or NULL. *)
+(** CreateClient FFI: builds the Go signer client from URL, private key, chain id, api key
+    index, and account index (Go int64). Returns an error string pointer or NULL. *)
 let create_client =
   lazy
     (let ffi_fn =
@@ -156,8 +154,8 @@ let create_client =
        read_c_string_and_free err_ptr)
 ;;
 
-(** CheckClient FFI: verifies the initialized client for the given api
-    key/account indices; returns an error string or NULL. *)
+(** CheckClient FFI: verifies the initialized client for the given api key/account
+    indices; returns an error string or NULL. *)
 let check_client =
   lazy
     (let ffi_fn =
@@ -171,8 +169,8 @@ let check_client =
        read_c_string_and_free err_ptr)
 ;;
 
-(** CreateAuthToken FFI: mints an auth token valid until the given deadline;
-    returns a str/err structure. *)
+(** CreateAuthToken FFI: mints an auth token valid until the given deadline; returns a
+    str/err structure. *)
 let create_auth_token_ffi =
   lazy
     (let ffi_fn =
@@ -191,8 +189,8 @@ let create_auth_token_ffi =
 ;;
 
 (** SignCreateOrder FFI (17 args per the Go ABI). Integrator fields
-    (accountIndex/takerFee/makerFee) pass zero and skipNonce=0; nonce supply
-    and sync are handled on the OCaml side. *)
+    (accountIndex/takerFee/makerFee) pass zero and skipNonce=0; nonce supply and sync are
+    handled on the OCaml side. *)
 let sign_create_order_ffi =
   lazy
     (let ffi_fn =
@@ -282,8 +280,8 @@ let sign_cancel_order_ffi =
        extract_signed_tx resp)
 ;;
 
-(** SignModifyOrder FFI: changes qty/price of an existing order. Zero-fills
-    trigger price and integrator fields; nonce is passed explicitly. *)
+(** SignModifyOrder FFI: changes qty/price of an existing order. Zero-fills trigger price
+    and integrator fields; nonce is passed explicitly. *)
 let sign_modify_order_ffi =
   lazy
     (let ffi_fn =
@@ -329,8 +327,7 @@ let sign_modify_order_ffi =
        extract_signed_tx resp)
 ;;
 
-(** SignCancelAllOrders FFI: signs a cancel-all using the supplied time and
-    nonce. *)
+(** SignCancelAllOrders FFI: signs a cancel-all using the supplied time and nonce. *)
 let sign_cancel_all_orders_ffi =
   lazy
     (let ffi_fn =
@@ -380,8 +377,8 @@ let nonce_counter = Atomic.make 0
 let get_and_increment_nonce () = Atomic.fetch_and_add nonce_counter 1
 let set_nonce n = Atomic.set nonce_counter n
 
-(** Fetches the next nonce from [/api/v1/nextNonce] and resets the local atomic
-    counter to match the exchange. Races a 10s timeout. *)
+(** Fetches the next nonce from [/api/v1/nextNonce] and resets the local atomic counter to
+    match the exchange. Races a 10s timeout. *)
 let initialize_nonce ~base_url ~api_key_index ~account_index =
   let url =
     Printf.sprintf
@@ -394,25 +391,25 @@ let initialize_nonce ~base_url ~api_key_index ~account_index =
   let fetch =
     Lwt.catch
       (fun () ->
-         let uri = Uri.of_string url in
-         let%lwt _resp, body = Cohttp_lwt_unix.Client.get uri in
-         let%lwt body_str = Cohttp_lwt.Body.to_string body in
-         let json = Yojson.Safe.from_string body_str in
-         let nonce = Yojson.Safe.Util.(member "nonce" json |> to_int) in
-         set_nonce nonce;
-         Logging.info_f
-           ~section
-           "Initialized nonce to %d for account %d, api_key %d"
-           nonce
-           account_index
-           api_key_index;
-         Lwt.return_unit)
+        let uri = Uri.of_string url in
+        let%lwt _resp, body = Cohttp_lwt_unix.Client.get uri in
+        let%lwt body_str = Cohttp_lwt.Body.to_string body in
+        let json = Yojson.Safe.from_string body_str in
+        let nonce = Yojson.Safe.Util.(member "nonce" json |> to_int) in
+        set_nonce nonce;
+        Logging.info_f
+          ~section
+          "Initialized nonce to %d for account %d, api_key %d"
+          nonce
+          account_index
+          api_key_index;
+        Lwt.return_unit)
       (fun exn ->
-         Logging.error_f
-           ~section
-           "Failed to fetch initial nonce: %s"
-           (Printexc.to_string exn);
-         Lwt.return_unit)
+        Logging.error_f
+          ~section
+          "Failed to fetch initial nonce: %s"
+          (Printexc.to_string exn);
+        Lwt.return_unit)
   in
   let timeout =
     Lwt_unix.sleep 10.0
@@ -428,14 +425,14 @@ let initialize_nonce ~base_url ~api_key_index ~account_index =
 let api_key_index = ref 0
 let account_index = ref 0
 
-(** Accessors for the cached api key/account indices, e.g. used by the nonce
-    resync path in [lighter_actions.ml]. *)
+(** Accessors for the cached api key/account indices, e.g. used by the nonce resync path
+    in [lighter_actions.ml]. *)
 let get_api_key_index () = !api_key_index
 
 let get_account_index () = !account_index
 
-(** Creates the Go signer client ([CreateClient]) with the given credentials
-    and verifies it with [CheckClient]. Must run before any signing call. *)
+(** Creates the Go signer client ([CreateClient]) with the given credentials and verifies
+    it with [CheckClient]. Must run before any signing call. *)
 let initialize ~base_url ~private_key ~key_index ~acct_index =
   api_key_index := key_index;
   account_index := acct_index;
@@ -482,8 +479,7 @@ let initialize ~base_url ~private_key ~key_index ~acct_index =
 let cached_auth_token : string option ref = ref None
 let auth_token_expiry = ref 0.0
 
-(** Mints an auth token with a 7h deadline and caches it for 6.5h. Returns ""
-    on failure. *)
+(** Mints an auth token with a 7h deadline and caches it for 6.5h. Returns "" on failure. *)
 let refresh_auth_token () =
   let deadline = Int64.of_float (Unix.gettimeofday () +. (7.0 *. 3600.0)) in
   try
@@ -514,9 +510,8 @@ let get_auth_token () =
 
 (* Signing entry points *)
 
-(** Times a signing operation and records it in the "lighter" signer profiler:
-    local FFI work (hash + ECDSA over the nonce) shown on the dashboard's
-    NETWORK page. *)
+(** Times a signing operation and records it in the "lighter" signer profiler: local FFI
+    work (hash + ECDSA over the nonce) shown on the dashboard's NETWORK page. *)
 let time_signer f =
   let start_ns = Mtime_clock.now_ns () in
   let r = f () in
@@ -527,15 +522,15 @@ let time_signer f =
 ;;
 
 let sign_create_order
-      ~market_index
-      ~client_order_index
-      ~base_amount
-      ~price
-      ~is_ask
-      ~order_type
-      ~tif
-      ~reduce_only
-      ~expiry
+  ~market_index
+  ~client_order_index
+  ~base_amount
+  ~price
+  ~is_ask
+  ~order_type
+  ~tif
+  ~reduce_only
+  ~expiry
   =
   let nonce = get_and_increment_nonce () in
   let result =

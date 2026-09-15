@@ -1,17 +1,15 @@
-(** US equity market-hours evaluation for the Alpaca connection manager and
-    order router.
+(** US equity market-hours evaluation for the Alpaca connection manager and order router.
 
-    Sessions (US/Eastern): 24/5 window Sunday 20:00 to Friday 20:00
-    (extended + overnight + regular, continuous); regular session 09:30-16:00.
-    Outside the 24/5 window (weekend) Alpaca runs no session - orders rest
-    unfilled and data feeds stop - so the market is closed regardless of
-    account mode. Handles after-hours order flags and market-data management. *)
+    Sessions (US/Eastern): 24/5 window Sunday 20:00 to Friday 20:00 (extended +
+    overnight + regular, continuous); regular session 09:30-16:00. Outside the 24/5 window
+    (weekend) Alpaca runs no session - orders rest unfilled and data feeds stop - so the
+    market is closed regardless of account mode. Handles after-hours order flags and
+    market-data management. *)
 
 let section = "alpaca_market_hours"
 
-(** Clock seam: when set (tests), overrides the wall clock for every time-based
-    evaluation here, making the session schedule deterministic. Production must
-    leave it unset. *)
+(** Clock seam: when set (tests), overrides the wall clock for every time-based evaluation
+    here, making the session schedule deterministic. Production must leave it unset. *)
 let now_override : float option ref = ref None
 
 let now () =
@@ -20,9 +18,8 @@ let now () =
   | None -> Unix.gettimeofday ()
 ;;
 
-(** Uncached US Eastern UTC offset, DST-adjusted. Cost: five [gmtime], three
-    [mktime], three [tm] allocations; [mktime] alone ~100us, so do not call per
-    session evaluation. *)
+(** Uncached US Eastern UTC offset, DST-adjusted. Cost: five [gmtime], three [mktime],
+    three [tm] allocations; [mktime] alone ~100us, so do not call per session evaluation. *)
 let compute_eastern_offset () =
   let t = now () in
   let tm = Unix.gmtime t in
@@ -93,12 +90,12 @@ let compute_eastern_offset () =
   if t >= dst_start && t < dst_end then -4 else -5
 ;;
 
-(** Cached Eastern UTC offset. Constant between the two yearly DST transitions;
-    callers (market-hours gate, WS per-message RTH check) otherwise run the
-    uncached [mktime] math per evaluation, producing 300-560us PREP spikes.
-    TTL 1h. Staleness is possible only near a transition; both US transitions
-    occur Sunday 02:00 ET inside the weekend closure, when no session is
-    evaluated. [now_override] bypasses the cache for deterministic tests. *)
+(** Cached Eastern UTC offset. Constant between the two yearly DST transitions; callers
+    (market-hours gate, WS per-message RTH check) otherwise run the uncached [mktime] math
+    per evaluation, producing 300-560us PREP spikes. TTL 1h. Staleness is possible only
+    near a transition; both US transitions occur Sunday 02:00 ET inside the weekend
+    closure, when no session is evaluated. [now_override] bypasses the cache for
+    deterministic tests. *)
 let eastern_offset_cache : (float * int) Atomic.t = Atomic.make (0.0, -5)
 
 let us_eastern_offset_hours () =
@@ -129,9 +126,8 @@ let extended_open_min = 0
 let extended_close_hour = 20
 let extended_close_min = 0
 
-(** Regular Trading Hours (09:30-16:00 ET), cached with 1s TTL. Full evaluation
-    costs ~10-100us (gmtime/mktime); the WS feed handler calls it per trade
-    message. *)
+(** Regular Trading Hours (09:30-16:00 ET), cached with 1s TTL. Full evaluation costs
+    ~10-100us (gmtime/mktime); the WS feed handler calls it per trade message. *)
 let regular_open_cache : (float * bool) Atomic.t = Atomic.make (0.0, false)
 
 let is_regular_market_open () =
@@ -165,9 +161,9 @@ let is_overnight_hours () =
   | _ -> false
 ;;
 
-(** Alpaca trading schedule: 24/5, Sunday 20:00 ET to Friday 20:00 ET. Live and
-    paper share the calendar. Weekend: no simulated session - orders rest
-    unfilled and feeds stop - so closed Friday 20:00 ET to Sunday 20:00 ET. *)
+(** Alpaca trading schedule: 24/5, Sunday 20:00 ET to Friday 20:00 ET. Live and paper
+    share the calendar. Weekend: no simulated session - orders rest unfilled and feeds
+    stop - so closed Friday 20:00 ET to Sunday 20:00 ET. *)
 let is_market_open () =
   let wday, hour, _min = current_eastern_time () in
   match wday with
@@ -177,7 +173,8 @@ let is_market_open () =
   | _ -> false
 ;;
 
-(** Extended session: pre-market 04:00-09:30, after-hours 16:00-20:00, or overnight 20:00-04:00 ET. *)
+(** Extended session: pre-market 04:00-09:30, after-hours 16:00-20:00, or overnight
+    20:00-04:00 ET. *)
 let is_extended_hours () = is_market_open () && not (is_regular_market_open ())
 
 (** Seconds until the next 24/5 market open (Sunday 20:00 ET); 0.0 while open. *)

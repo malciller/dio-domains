@@ -121,12 +121,11 @@ let test_staked_zero_without_staking () =
 ;;
 
 let test_staking_poll_does_not_refresh_spendable_freshness () =
-  (* The staking poller updates an excluded wallet every ~10s and bumps the
-     store-wide timestamp without changing the tradeable figure. Freshness
-     consumers (the sell-hold netting guard) must key on the spendable
-     wallets' own timestamp, or a staking poll certifies a stale spot figure
-     as current and releases placed-sell holds before spotState netting
-     arrives. *)
+  (* The staking poller updates an excluded wallet every ~10s and bumps the store-wide
+     timestamp without changing the tradeable figure. Freshness consumers (the sell-hold
+     netting guard) must key on the spendable wallets' own timestamp, or a staking poll
+     certifies a stale spot figure as current and releases placed-sell holds before
+     spotState netting arrives. *)
   let asset = "STAKEFRESH/USDC" in
   let now = Unix.gettimeofday () in
   let store = Hyperliquid.Balances.get_balance_store asset in
@@ -172,11 +171,10 @@ let test_staking_poll_does_not_refresh_spendable_freshness () =
 ;;
 
 let test_unchanged_resend_does_not_refresh_freshness () =
-  (* Hyperliquid pushes one spotState snapshot for the whole account, so a
-     fill on another coin re-sends this asset's unchanged entry. This asset's
-     freshness must not advance on that, or another asset's activity clears
-     this asset's sell-hold guard and the strategy sells committed
-     reserved_base. *)
+  (* Hyperliquid pushes one spotState snapshot for the whole account, so a fill on another
+     coin re-sends this asset's unchanged entry. This asset's freshness must not advance
+     on that, or another asset's activity clears this asset's sell-hold guard and the
+     strategy sells committed reserved_base. *)
   let asset = "XFILL/USDC" in
   let now = Unix.gettimeofday () in
   let store = Hyperliquid.Balances.get_balance_store asset in

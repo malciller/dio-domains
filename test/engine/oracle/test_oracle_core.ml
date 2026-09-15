@@ -7,7 +7,7 @@ let bar ~date ~high ~low ~close =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* references_of                                                      *)
+(* references_of *)
 (* ------------------------------------------------------------------ *)
 
 let test_references () =
@@ -16,8 +16,8 @@ let test_references () =
     "empty series has no references"
     (Dio_oracle.Oracle_core.references_of ~bars:[||] = None)
     true;
-  (* ATH 100k (intrabar high), ATL 8k (intrabar low), worst peak-to-trough:
-     close-peak 100k -> low 10k = 90% decline, recovery irrelevant. *)
+  (* ATH 100k (intrabar high), ATL 8k (intrabar low), worst peak-to-trough: close-peak
+     100k -> low 10k = 90% decline, recovery irrelevant. *)
   let bars =
     [| bar ~date:"1" ~high:50.0 ~low:48.0 ~close:49.0
      ; bar ~date:"2" ~high:100.0 ~low:95.0 ~close:99.0
@@ -30,8 +30,8 @@ let test_references () =
   | Some r ->
     near "ath is the intrabar high" r.ath 100.0;
     near "atl is the intrabar low" r.atl 8.0;
-    (* Worst fall: close-peak 99 -> later low 8 (bar 4's trough counts even
-       though bar 3 already bounced). *)
+    (* Worst fall: close-peak 99 -> later low 8 (bar 4's trough counts even though bar 3
+       already bounced). *)
     near
       "max drawdown = close-peak to subsequent low"
       r.max_drawdown_pct
@@ -41,7 +41,7 @@ let test_references () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* runway_of - the spec's worked example                              *)
+(* runway_of - the spec's worked example *)
 (* ------------------------------------------------------------------ *)
 
 let spec_refs : Dio_oracle.Oracle_core.references =
@@ -49,9 +49,8 @@ let spec_refs : Dio_oracle.Oracle_core.references =
 ;;
 
 let test_runway_worked_example () =
-  (* Spec: ATH 100k, max_drawdown_pct 92%, target_survival 0.80
-     -> runway 73.6%, floor 26.4k.
-     At current 70k: realized_dd 30%, remaining_drop 43.6%. *)
+  (* Spec: ATH 100k, max_drawdown_pct 92%, target_survival 0.80 -> runway 73.6%, floor
+     26.4k. At current 70k: realized_dd 30%, remaining_drop 43.6%. *)
   let rw =
     Dio_oracle.Oracle_core.runway_of
       ~current:70_000.0
@@ -90,8 +89,8 @@ let test_regimes () =
     (rw2.regime = Dio_oracle.Oracle_core.Floor_extension)
     true;
   near "funded down to atl" rw2.funded_floor 7_000.0;
-  (* Unprecedented lows: at the deepest recorded drawdown AND <= ATL.
-     Deepest-drawdown price level = ath * (1 - mdd) = 8k; atl is 7k. *)
+  (* Unprecedented lows: at the deepest recorded drawdown AND <= ATL. Deepest-drawdown
+     price level = ath * (1 - mdd) = 8k; atl is 7k. *)
   let rw3 =
     Dio_oracle.Oracle_core.runway_of
       ~current:6_500.0
@@ -105,14 +104,14 @@ let test_regimes () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* d_surv_of                                                          *)
+(* d_surv_of *)
 (* ------------------------------------------------------------------ *)
 
 let test_d_surv () =
   let fees = Dio_oracle.Oracle_core.{ maker_fee = 0.0; fee_in_base_buy = false } in
-  (* current 100, floor 50 (depth 50), gi 10%: rungs at 90, 81, ..., 54ish.
-     quote 500, qty 1, no fee: costs 90+81+72.9+65.61+59.049+53.14 = 421.7 -
-     all rungs down to >= 50 fund: full depth survived. *)
+  (* current 100, floor 50 (depth 50), gi 10%: rungs at 90, 81, ..., 54ish. quote 500, qty
+     1, no fee: costs 90+81+72.9+65.61+59.049+53.14 = 421.7 - all rungs down to >= 50
+     fund: full depth survived. *)
   let d =
     Dio_oracle.Oracle_core.d_surv_of
       ~current:100.0
@@ -123,8 +122,8 @@ let test_d_surv () =
       ~fees
   in
   Alcotest.(check bool) "fully funded depth" (d >= 1.0) true;
-  (* Same ladder, quote 200: buys 90 + 81 = 171 affordable, next rung 72.9
-     not: last surviving rung 81 -> fraction (100 - 81)/50 = 0.38. *)
+  (* Same ladder, quote 200: buys 90 + 81 = 171 affordable, next rung 72.9 not: last
+     surviving rung 81 -> fraction (100 - 81)/50 = 0.38. *)
   let d2 =
     Dio_oracle.Oracle_core.d_surv_of
       ~current:100.0
@@ -146,10 +145,10 @@ let test_d_surv () =
       ~fees
   in
   near "first-rung failure is zero" d3 0.0;
-  (* Fees make each rung costlier: pick a quote that funds the whole depth
-     fee-free (cumulative 421.70 <= 423) but falls one rung short with a 1%
-     maker fee (cumulative 372.24, next rung costs 53.68 > 50.76 left):
-     survival stops at the 59.049 rung -> (100 - 59.049) / 50. *)
+  (* Fees make each rung costlier: pick a quote that funds the whole depth fee-free
+     (cumulative 421.70 <= 423) but falls one rung short with a 1% maker fee (cumulative
+     372.24, next rung costs 53.68 > 50.76 left): survival stops at the 59.049 rung ->
+     (100 - 59.049) / 50. *)
   let dfree =
     Dio_oracle.Oracle_core.d_surv_of
       ~current:100.0
@@ -173,13 +172,13 @@ let test_d_surv () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* exhaustion_price_of                                                *)
+(* exhaustion_price_of *)
 (* ------------------------------------------------------------------ *)
 
 let test_exhaustion_price () =
   let ep = Dio_oracle.Oracle_core.exhaustion_price_of in
-  (* Inverts the survival fraction: the 0.38 partial walk from the d_surv
-     test bottoms out at its last funded rung (81 on the 100 -> 50 ladder). *)
+  (* Inverts the survival fraction: the 0.38 partial walk from the d_surv test bottoms out
+     at its last funded rung (81 on the 100 -> 50 ladder). *)
   near
     "partial survival lands on last funded rung"
     (ep ~current:100.0 ~funded_floor:50.0 ~d_surv:0.38)
@@ -212,7 +211,7 @@ let test_exhaustion_price () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* resolve                                                            *)
+(* resolve *)
 (* ------------------------------------------------------------------ *)
 
 let bounds =
@@ -243,8 +242,8 @@ let test_resolve_unreachable () =
 ;;
 
 let test_resolve_surplus () =
-  (* Deep quote pool on a shallow depth: the most aggressive corner funds
-     everything with leftover. *)
+  (* Deep quote pool on a shallow depth: the most aggressive corner funds everything with
+     leftover. *)
   let fees = Dio_oracle.Oracle_core.default_fees in
   let r =
     Dio_oracle.Oracle_core.resolve
@@ -288,12 +287,12 @@ let test_resolve_reachable_bias () =
     "deep resolves reachable"
     (deep.branch = Dio_oracle.Oracle_core.Reachable)
     true;
-  (* Shallow bias picks the unique most conservative feasible corner:
-     minimum size, widest spacing (score is maximal there). *)
+  (* Shallow bias picks the unique most conservative feasible corner: minimum size, widest
+     spacing (score is maximal there). *)
   near "shallow takes min qty" shallow.buy_qty 1.0;
   near "shallow takes max grid interval" shallow.grid_interval 5.0;
-  (* Deeper position accumulates harder: strictly larger size and tighter
-     spacing than the conservative pick, while still funding full depth. *)
+  (* Deeper position accumulates harder: strictly larger size and tighter spacing than the
+     conservative pick, while still funding full depth. *)
   Alcotest.(check bool)
     "deeper prefers tighter grid"
     (deep.grid_interval < shallow.grid_interval)
@@ -306,7 +305,7 @@ let test_resolve_reachable_bias () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* decision_of                                                        *)
+(* decision_of *)
 (* ------------------------------------------------------------------ *)
 
 let test_decision_activity_gating () =
@@ -369,7 +368,7 @@ let test_decision_activity_gating () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* pipeline                                                           *)
+(* pipeline *)
 (* ------------------------------------------------------------------ *)
 
 let test_current_price_of_series () =
@@ -395,9 +394,9 @@ let test_current_price_of_series () =
 ;;
 
 let test_pipeline_decide () =
-  (* History: close-peak 95 -> later low 47.5 gives mdd exactly 0.5;
-     ath 100 (intrabar), atl 40. Current = last close 80.
-     ts 0.8 -> runway 0.4 -> floor 60: Normal regime, aggressiveness 1.0. *)
+  (* History: close-peak 95 -> later low 47.5 gives mdd exactly 0.5; ath 100 (intrabar),
+     atl 40. Current = last close 80. ts 0.8 -> runway 0.4 -> floor 60: Normal regime,
+     aggressiveness 1.0. *)
   let bars =
     [| bar ~date:"1" ~high:60.0 ~low:40.0 ~close:50.0
      ; bar ~date:"2" ~high:100.0 ~low:90.0 ~close:95.0

@@ -70,10 +70,9 @@ let test_set_testnet_flips_is_paper () =
 
 (* ── market hours: the 24/5 calendar closes over the weekend in every mode ── *)
 
-(* Fixed UTC instants whose US/Eastern conversion is stable (August 2026,
-   EDT = UTC-4): Fri Aug 21, Sat Aug 22, Sun Aug 23, Wed Aug 26. The clock
-   seam makes the session boundaries deterministic regardless of when the
-   suite runs. *)
+(* Fixed UTC instants whose US/Eastern conversion is stable (August 2026, EDT = UTC-4):
+   Fri Aug 21, Sat Aug 22, Sun Aug 23, Wed Aug 26. The clock seam makes the session
+   boundaries deterministic regardless of when the suite runs. *)
 let fri_1959_et = 1787356740.0
 let fri_2001_et = 1787356860.0
 let sat_noon_et = 1787414400.0
@@ -146,13 +145,13 @@ let test_weekday_overnight_open () =
 (* ── effective_tif_and_extended (session-aware TIF) ──────────────────────── *)
 
 let tif
-      ?(crypto = false)
-      ?(fractional = false)
-      ?(order_type = "limit")
-      ?(time_in_force = Some "GTC")
-      ?(in_extended = false)
-      ?(use_extended = true)
-      ()
+  ?(crypto = false)
+  ?(fractional = false)
+  ?(order_type = "limit")
+  ?(time_in_force = Some "GTC")
+  ?(in_extended = false)
+  ?(use_extended = true)
+  ()
   =
   Alpaca.Rest.effective_tif_and_extended
     ~is_crypto:crypto
@@ -211,9 +210,8 @@ let test_regular_session_default_whole () =
   Alcotest.(check bool) "regular whole no extended flag" false ext
 ;;
 
-(* No virtual-GTC: the requested TIF passes through in extended sessions
-   too; acceptance is the account's GTC-for-extended setting, not a silent
-   rewrite here. *)
+(* No virtual-GTC: the requested TIF passes through in extended sessions too; acceptance
+   is the account's GTC-for-extended setting, not a silent rewrite here. *)
 let test_extended_session_gtc_preserved () =
   let tif_str, ext = tif ~in_extended:true () in
   Alcotest.(check string) "extended GTC preserved" "gtc" tif_str;

@@ -1,16 +1,15 @@
 (** TWS API message dispatcher.
 
-    Routes inbound messages to handlers registered by integer message id,
-    and correlates multi-message responses by request id (contract
-    details, executions). *)
+    Routes inbound messages to handlers registered by integer message id, and correlates
+    multi-message responses by request id (contract details, executions). *)
 
 let section = "ibkr_dispatcher"
 
 (** Message handler: receives the fields after the message id. *)
 type handler = string list -> unit
 
-(** ReqId-correlated handler: data callback, end callback, and the
-    condition signaled when the sequence terminates. *)
+(** ReqId-correlated handler: data callback, end callback, and the condition signaled when
+    the sequence terminates. *)
 type req_handler =
   { on_data : string list -> unit
   ; on_end : unit -> unit
@@ -29,25 +28,24 @@ let connection : Ibkr_connection.t option ref = ref None
 (** Registers a handler for [msg_id], replacing any existing one. *)
 let register_handler ~msg_id ~handler:h = Hashtbl.replace handlers msg_id h
 
-(** Registers a reqId-correlated handler and returns the condition that
-    is signaled when the response sequence ends. *)
+(** Registers a reqId-correlated handler and returns the condition that is signaled when
+    the response sequence ends. *)
 let register_req_handler ~req_id ~on_data ~on_end =
   let condition = Lwt_condition.create () in
   Hashtbl.replace req_handlers req_id { on_data; on_end; condition };
   condition
 ;;
 
-(** Removes the reqId-correlated handler; call after completion to avoid
-    leaking entries. *)
+(** Removes the reqId-correlated handler; call after completion to avoid leaking entries. *)
 let remove_req_handler ~req_id = Hashtbl.remove req_handlers req_id
 
-(** Callback fired when the initial open-order snapshot ends. Set via this
-    reference (rather than a module dependency) so the executions feed can
-    finalize state without a dispatcher cycle. *)
+(** Callback fired when the initial open-order snapshot ends. Set via this reference
+    (rather than a module dependency) so the executions feed can finalize state without a
+    dispatcher cycle. *)
 let on_open_orders_end : (unit -> unit) option ref = ref None
 
-(** Clears all handlers and connection state. Called before connecting
-    so stale registrations do not survive a reconnect. *)
+(** Clears all handlers and connection state. Called before connecting so stale
+    registrations do not survive a reconnect. *)
 let reset () =
   Hashtbl.clear handlers;
   Hashtbl.clear req_handlers;
@@ -65,8 +63,8 @@ let get_connection () =
   | None -> failwith "IBKR dispatcher: connection not initialized"
 ;;
 
-(** Routes one message: first by message id in [handlers], otherwise by
-    treating the leading field as a reqId into [req_handlers]. *)
+(** Routes one message: first by message id in [handlers], otherwise by treating the
+    leading field as a reqId into [req_handlers]. *)
 let dispatch ~msg_id ~fields =
   Logging.debug_f ~section "<<< msg_id=%d fields=%d" msg_id (List.length fields);
   match Hashtbl.find_opt handlers msg_id with
@@ -105,8 +103,8 @@ let dispatch ~msg_id ~fields =
      | [] -> Logging.debug_f ~section "Unhandled msg_id=%d (no fields)" msg_id)
 ;;
 
-(** nextValidOrderIds handler: stores the server-supplied starting order
-    id on the connection; later placements increment it. *)
+(** nextValidOrderIds handler: stores the server-supplied starting order id on the
+    connection; later placements increment it. *)
 let handle_next_valid_id fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let order_id, _fields = Ibkr_codec.read_int fields in
@@ -130,9 +128,9 @@ let handle_managed_accounts fields =
   Logging.info_f ~section "Managed account: %s" account
 ;;
 
-(** error/errMsg handler. Classifies by code for logging; for errors
-    tied to a pending reqId, signals its condition so waiters fail fast.
-    Fields: version, id, code, message, advancedOrderReject. *)
+(** error/errMsg handler. Classifies by code for logging; for errors tied to a pending
+    reqId, signals its condition so waiters fail fast. Fields: version, id, code, message,
+    advancedOrderReject. *)
 let handle_error fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let id, fields = Ibkr_codec.read_int fields in
@@ -164,9 +162,8 @@ let handle_error fields =
     | None -> ())
 ;;
 
-(** Ends a reqId-correlated sequence: runs the end callback, signals the
-    condition, and removes the handler. [req_id_index] locates the reqId
-    within the marker payload. *)
+(** Ends a reqId-correlated sequence: runs the end callback, signals the condition, and
+    removes the handler. [req_id_index] locates the reqId within the marker payload. *)
 let handle_end_marker ~req_id_index fields =
   match List.nth_opt fields req_id_index with
   | Some req_id_str ->
@@ -183,17 +180,15 @@ let handle_end_marker ~req_id_index fields =
   | None -> ()
 ;;
 
-(** Registers connection-lifecycle handlers. Called once from
-    [initialize]. *)
+(** Registers connection-lifecycle handlers. Called once from [initialize]. *)
 let register_core_handlers () =
   register_handler ~msg_id:Ibkr_types.msg_in_next_valid_id ~handler:handle_next_valid_id;
   register_handler
     ~msg_id:Ibkr_types.msg_in_managed_accounts
     ~handler:handle_managed_accounts;
   register_handler ~msg_id:Ibkr_types.msg_in_error ~handler:handle_error;
-  (* ContractDetails routes to the reqId table. For server versions
-     >= 164 there is no version field: fields after the message id are
-     reqId, symbol, secType, ... *)
+  (* ContractDetails routes to the reqId table. For server versions >= 164 there is no
+     version field: fields after the message id are reqId, symbol, secType, ... *)
   register_handler ~msg_id:Ibkr_types.msg_in_contract_data ~handler:(fun fields ->
     match fields with
     | req_id_str :: _ ->
@@ -220,8 +215,8 @@ let register_core_handlers () =
     handle_end_marker ~req_id_index:0 fields);
   register_handler ~msg_id:Ibkr_types.msg_in_open_order_end ~handler:(fun _fields ->
     Logging.debug ~section "Open orders end";
-    (* Invoked via the [on_open_orders_end] reference so the executions
-       feed can finalize the snapshot without a module cycle. *)
+    (* Invoked via the [on_open_orders_end] reference so the executions feed can finalize
+       the snapshot without a module cycle. *)
     match !on_open_orders_end with
     | Some f -> f ()
     | None -> ());
@@ -234,12 +229,12 @@ let register_core_handlers () =
     Logging.debug ~section "Position data end")
 ;;
 
-(** Hooks that re-register feed handlers after [reset]; set by the
-    supervisor to avoid module cycles. *)
+(** Hooks that re-register feed handlers after [reset]; set by the supervisor to avoid
+    module cycles. *)
 let on_initialize_hooks : (unit -> unit) list ref = ref []
 
-(** Stores the connection, registers core handlers, and runs the
-    initialization hooks to restore feed handlers cleared by [reset]. *)
+(** Stores the connection, registers core handlers, and runs the initialization hooks to
+    restore feed handlers cleared by [reset]. *)
 let initialize conn =
   set_connection conn;
   register_core_handlers ();

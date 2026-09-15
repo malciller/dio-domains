@@ -4,7 +4,6 @@ open Strategy_common
 open Jacobs_ladder_types
 open Jacobs_ladder_config
 open Jacobs_ladder_reservation
-
 module Sell_orders = Jacobs_ladder_sell_orders
 
 (** Shared order ringbuffer across all strategy domains. *)
@@ -73,8 +72,8 @@ let create_order dup_key asset_symbol side qty price post_only exchange =
   create_place_order dup_key asset_symbol side qty price post_only Ladder exchange
 ;;
 
-(** Pushes [order] to the ringbuffer. Returns true on success, false on
-    duplicate key or full buffer. *)
+(** Pushes [order] to the ringbuffer. Returns true on success, false on duplicate key or
+    full buffer. *)
 let push_order ~now ?state order =
   let operation_str =
     match order.operation with
@@ -148,10 +147,10 @@ let push_order ~now ?state order =
                (string_of_order_side order.side)
                order_price
            in
-           (* Arm the in-flight sell ledger at dispatch for every venue
-              (including track_pending_sells=false): base leaves the sellable
-              pool when the order is pushed, before any ack or feed visibility,
-              and is released only on a terminal event. *)
+           (* Arm the in-flight sell ledger at dispatch for every venue (including
+              track_pending_sells=false): base leaves the sellable pool when the order is
+              pushed, before any ack or feed visibility, and is released only on a
+              terminal event. *)
            (match order.side with
             | Sell ->
               arm_sell_commitment

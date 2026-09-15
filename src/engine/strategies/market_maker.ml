@@ -1,15 +1,13 @@
-(**
-   Market making strategy (strategy: MM).
+(** Market making strategy (strategy: MM).
 
-   Maintains a single buy/sell order pair around the top of book. Buy price
-   is derived from the ask minus a fee-based backoff, clamped at the best bid.
-   Sell price targets the best ask. Orders are written to a shared ring buffer
-   for asynchronous execution by the order executor.
+    Maintains a single buy/sell order pair around the top of book. Buy price is derived
+    from the ask minus a fee-based backoff, clamped at the best bid. Sell price targets
+    the best ask. Orders are written to a shared ring buffer for asynchronous execution by
+    the order executor.
 
-   Supports per-symbol balance limits (min_usd_balance, max_exposure) and
-   pauses order placement when limits are breached or the exchange rejects
-   orders due to insufficient funds.
-*)
+    Supports per-symbol balance limits (min_usd_balance, max_exposure) and pauses order
+    placement when limits are breached or the exchange rejects orders due to insufficient
+    funds. *)
 
 let section = "market_maker"
 let log_interval = 10000
@@ -32,26 +30,26 @@ type strategy_state =
   ; mutable last_buy_order_id : string option
   ; mutable open_sell_orders : (string * float * float) list (** (order_id, price, qty) *)
   ; mutable pending_orders : (string * order_side * float * float) list
-    (** (order_id, side, price, timestamp) unacknowledged orders *)
+  (** (order_id, side, price, timestamp) unacknowledged orders *)
   ; mutable last_cycle : int
   ; mutable cancelled_orders : (string * float) list
-    (** (order_id, timestamp) blacklist of recently cancelled orders *)
+  (** (order_id, timestamp) blacklist of recently cancelled orders *)
   ; mutable pending_cancellations : (string, float) Hashtbl.t
-    (** order_id -> timestamp for pending cancel operations *)
+  (** order_id -> timestamp for pending cancel operations *)
   ; mutable last_cleanup_time : float (** Unix timestamp of last cleanup pass *)
   ; mutable inflight_buy : bool (** true while a buy Place is unacknowledged *)
   ; mutable inflight_sell : bool (** true while a sell Place is unacknowledged *)
   ; mutable capital_low : bool
-    (** true when quote balance is insufficient; pauses placement *)
+  (** true when quote balance is insufficient; pauses placement *)
   ; mutable asset_low : bool
-    (** true when asset balance is insufficient; pauses sell placement *)
+  (** true when asset balance is insufficient; pauses sell placement *)
   ; mutable capital_low_logged : bool (** suppresses repeated capital_low warnings *)
   ; mutable last_seen_asset_balance : float
-    (** last observed balance; used to detect genuine recovery *)
+  (** last observed balance; used to detect genuine recovery *)
   ; mutable startup_replay : bool
-    (** true during startup; suppresses logging/metrics if needed *)
+  (** true during startup; suppresses logging/metrics if needed *)
   ; mutable cached_qty : float
-    (** parsed [asset.qty]; avoids float_of_string on every execution  *)
+  (** parsed [asset.qty]; avoids float_of_string on every execution *)
   ; mutex : Mutex.t (** guards concurrent access from callback handlers *)
   }
 
@@ -109,7 +107,8 @@ let parse_config_float config value_name default exchange symbol =
     default
 ;;
 
-(** Parses an optional string config value to [float option]. Returns [None] for empty or invalid input. *)
+(** Parses an optional string config value to [float option]. Returns [None] for empty or
+    invalid input. *)
 let parse_config_float_opt config value_name exchange symbol =
   if config = ""
   then None
@@ -161,8 +160,8 @@ let round_qty qty symbol exchange ~max_qty =
     Float.min rounded max_qty
 ;;
 
-(** Rounds [price] down (floor) to the instrument tick size. Applies a relative
-    epsilon to correct floating-point drift at exact increment boundaries. *)
+(** Rounds [price] down (floor) to the instrument tick size. Applies a relative epsilon to
+    correct floating-point drift at exact increment boundaries. *)
 let round_price_down price symbol exchange =
   let increment =
     match Exchange.Registry.get exchange with
@@ -187,7 +186,8 @@ let round_price_down price symbol exchange =
     Float.floor (price *. 100.0) /. 100.0
 ;;
 
-(** Returns the applicable fee rate from config. Prefers maker_fee; falls back to taker_fee or 0.0026. *)
+(** Returns the applicable fee rate from config. Prefers maker_fee; falls back to
+    taker_fee or 0.0026. *)
 let get_fee_for_asset (asset : trading_config) =
   let fee =
     match asset.maker_fee with
@@ -277,9 +277,9 @@ let create_cancel_order order_id asset_symbol strategy exchange =
   }
 ;;
 
-(** Writes an order to the ring buffer after deduplication.
-    Returns true on success, false if duplicate or buffer full.
-    Updates in-flight flags, pending order tracking, and broadcasts OrderSignal. *)
+(** Writes an order to the ring buffer after deduplication. Returns true on success, false
+    if duplicate or buffer full. Updates in-flight flags, pending order tracking, and
+    broadcasts OrderSignal. *)
 let push_order ~state ?(now = Unix.time ()) order =
   let operation_str =
     match order.operation with
@@ -344,9 +344,9 @@ let push_order ~state ?(now = Unix.time ()) order =
         (match order.operation with
          | Place ->
            (* Hyperliquid: skip pending tracking for sells. Sell orders are
-                   fire-and-forget; tracking creates ghost entries that trigger
-                   re-placement loops during cancel-replace amendments.
-                   Kraken retains pending sell tracking. *)
+              fire-and-forget; tracking creates ghost entries that trigger re-placement
+              loops during cancel-replace amendments. Kraken retains pending sell
+              tracking. *)
            let skip_pending =
              match Exchange.Types.exchange_of_string order.exchange with
              | Hyperliquid -> order.side = Sell
@@ -408,27 +408,27 @@ let push_order ~state ?(now = Unix.time ()) order =
 
 (** Cancels all open orders at [target_price] for [target_side]. Returns count cancelled. *)
 let cancel_duplicate_orders
-      ~state
-      asset_symbol
-      target_price
-      _target_side
-      (open_orders_list : (string * float * float) list)
-      strategy
-      exchange
+  ~state
+  asset_symbol
+  target_price
+  _target_side
+  (open_orders_list : (string * float * float) list)
+  strategy
+  exchange
   =
   let count = ref 0 in
   let duplicates = ref [] in
   List.iter
     (fun (order_id, order_price, _) ->
-       if abs_float (order_price -. target_price) < 0.00001
-       then (
-         incr count;
-         if !count > 1 then duplicates := order_id :: !duplicates))
+      if abs_float (order_price -. target_price) < 0.00001
+      then (
+        incr count;
+        if !count > 1 then duplicates := order_id :: !duplicates))
     open_orders_list;
   List.iter
     (fun order_id ->
-       let cancel_order = create_cancel_order order_id asset_symbol strategy exchange in
-       ignore (push_order ~state cancel_order))
+      let cancel_order = create_cancel_order order_id asset_symbol strategy exchange in
+      ignore (push_order ~state cancel_order))
     !duplicates;
   List.length !duplicates
 ;;
@@ -437,18 +437,17 @@ let cancel_duplicate_orders
     pending/cancelled order cleanup, enforces balance and exposure limits, and
     places/amends/cancels buy and sell orders to maintain one active pair. *)
 let execute_strategy
-      ?cached_state
-      ?precounted_orders
-      (asset : trading_config)
-      (current_price : float option)
-      (top_of_book : (float * float * float * float) option)
-      (asset_balance : float option)
-      (quote_balance : float option)
-      (_open_buy_count : int)
-      (_open_sell_count : int)
-      (iter_open_orders :
-        (string -> float -> float -> string -> int option -> unit) -> unit)
-      (cycle : int)
+  ?cached_state
+  ?precounted_orders
+  (asset : trading_config)
+  (current_price : float option)
+  (top_of_book : (float * float * float * float) option)
+  (asset_balance : float option)
+  (quote_balance : float option)
+  (_open_buy_count : int)
+  (_open_sell_count : int)
+  (iter_open_orders : (string -> float -> float -> string -> int option -> unit) -> unit)
+  (cycle : int)
   =
   (* Throttle logging to every log_interval cycles *)
   let should_log = cycle mod log_interval = 0 in
@@ -457,19 +456,18 @@ let execute_strategy
     | Some s -> s
     | None -> get_strategy_state asset.symbol
   in
-  (* parse asset.qty once per strategy lifetime; the config string is
-     immutable, so cached_qty replaces float_of_string on every cycle. *)
+  (* parse asset.qty once per strategy lifetime; the config string is immutable, so
+     cached_qty replaces float_of_string on every cycle. *)
   if state.cached_qty <= 0.0
   then
     state.cached_qty
     <- (try float_of_string asset.qty with
         | Failure _ -> 0.001);
   let qty_f = state.cached_qty in
-  (* Asset-low recovery: clear flag when asset balance recovers.
-     Kraken: only clear when balance has genuinely increased (fill, deposit).
-     Kraken "Insufficient funds" on sells may reflect USD collateral, not asset
-     balance. Clearing on every cycle would cause a tight retry loop.
-     Hyperliquid: clear whenever available balance meets the threshold. *)
+  (* Asset-low recovery: clear flag when asset balance recovers. Kraken: only clear when
+     balance has genuinely increased (fill, deposit). Kraken "Insufficient funds" on sells
+     may reflect USD collateral, not asset balance. Clearing on every cycle would cause a
+     tight retry loop. Hyperliquid: clear whenever available balance meets the threshold. *)
   (match asset_balance with
    | Some asset_bal ->
      let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
@@ -494,14 +492,13 @@ let execute_strategy
          qty_f);
      state.last_seen_asset_balance <- asset_bal
    | None -> ());
-  (* Capital-low fast path: skip strategy body when quote balance is insufficient
-     for a buy order. Clears flag and resumes when balance recovers. *)
+  (* Capital-low fast path: skip strategy body when quote balance is insufficient for a
+     buy order. Clears flag and resumes when balance recovers. *)
   (match quote_balance, current_price with
    | Some quote_bal, Some price ->
      let quote_needed_fast = price *. qty_f in
      if state.capital_low && quote_bal < quote_needed_fast
-     then
-       (* Still insufficient; skip strategy body to prevent order spam *)
+     then (* Still insufficient; skip strategy body to prevent order spam *)
        ()
      else if state.capital_low && quote_bal >= quote_needed_fast
      then (
@@ -520,19 +517,18 @@ let execute_strategy
          quote_needed_fast)
      (* capital_low=false: proceed normally *)
    | _ -> () (* No balance or price data available; proceed *));
-  (* Proceed only when capital_low is clear.
-     asset_low is checked separately for sell and buy placement; order sync,
-     cleanup, and cancellation detection always execute regardless. *)
+  (* Proceed only when capital_low is clear. asset_low is checked separately for sell and
+     buy placement; order sync, cleanup, and cancellation detection always execute
+     regardless. *)
   if not state.capital_low
   then (
     let now = Unix.time () in
-    (* Pending order/amendment tokens are resolved purely by events: every
-       dispatched place/amend yields exactly one terminal event (Ack/Failed or
-       Amended/Amendment_skipped/Amendment_failed) and each handler removes the
-       token, the in-flight flag, and the registry entry. No age-based sweep:
-       resolving state while the exchange still executes the request would
-       cause a mid-flight cancel for the old order to be dropped instead of
-       tuned. *)
+    (* Pending order/amendment tokens are resolved purely by events: every dispatched
+       place/amend yields exactly one terminal event (Ack/Failed or
+       Amended/Amendment_skipped/Amendment_failed) and each handler removes the token, the
+       in-flight flag, and the registry entry. No age-based sweep: resolving state while
+       the exchange still executes the request would cause a mid-flight cancel for the old
+       order to be dropped instead of tuned. *)
     (* Evict cancelled order blacklist entries older than 15s; cap at 20 *)
     let rec filter_cancelled kept removed lst =
       match lst with
@@ -545,14 +541,15 @@ let execute_strategy
           if tl == new_tl then lst else entry :: new_tl)
     in
     state.cancelled_orders <- filter_cancelled 0 0 state.cancelled_orders;
-    (* Evict stale pending cancellations (older than 30s). Throttled to 1s to prevent cycle allocations. *)
+    (* Evict stale pending cancellations (older than 30s). Throttled to 1s to prevent
+       cycle allocations. *)
     if now -. state.last_cleanup_time >= 1.0
     then (
       state.last_cleanup_time <- now;
       let to_remove = ref [] in
       Hashtbl.iter
         (fun order_id timestamp ->
-           if now -. timestamp > 30.0 then to_remove := order_id :: !to_remove)
+          if now -. timestamp > 30.0 then to_remove := order_id :: !to_remove)
         state.pending_cancellations;
       match !to_remove with
       | [] -> ()
@@ -560,11 +557,10 @@ let execute_strategy
         List.iter
           (fun order_id -> Hashtbl.remove state.pending_cancellations order_id)
           ids);
-    (* state.mutex is intentionally not locked here: the strategy runs in its
-       own OCaml domain while handler callbacks run via Lwt.async in the Lwt
-       domain. Locking the non-recursive Mutex.t here would EDEADLK on
-       concurrent callbacks. Handlers lock state.mutex for inter-domain
-       safety. *)
+    (* state.mutex is intentionally not locked here: the strategy runs in its own OCaml
+       domain while handler callbacks run via Lwt.async in the Lwt domain. Locking the
+       non-recursive Mutex.t here would EDEADLK on concurrent callbacks. Handlers lock
+       state.mutex for inter-domain safety. *)
     match current_price, top_of_book with
     | Some _, Some (bid, _bid_size, ask, _ask_size) ->
       (* Parse config values *)
@@ -588,7 +584,8 @@ let execute_strategy
         | None -> get_fee_for_asset asset
       in
       let mid_price = (bid +. ask) /. 2.0 in
-      (* Single pass to compute available balances, counts, and active orders net of cancellations *)
+      (* Single pass to compute available balances, counts, and active orders net of
+         cancellations *)
       let locked_in_sells = ref 0.0 in
       let locked_in_buys = ref 0.0 in
       let sync_open_buy_count = ref 0 in
@@ -640,32 +637,32 @@ let execute_strategy
          locked_in_sells := raw_global_locked_sells;
          List.iter
            (fun (oid, price, qty, side_str) ->
-              let is_cancelled =
-                List.exists
-                  (fun (cancelled_id, _) -> cancelled_id = oid)
-                  state.cancelled_orders
-              in
-              if is_cancelled
-              then (
-                if side_str = "buy"
-                then locked_in_buys := !locked_in_buys -. (price *. qty)
-                else if side_str = "sell"
-                then locked_in_sells := !locked_in_sells -. qty)
-              else (
-                if side_str = "buy"
-                then (
-                  incr sync_open_buy_count;
-                  let current_best =
-                    match !best_buy_price with
-                    | Some p -> p
-                    | None -> -1.0
-                  in
-                  if price > current_best && price > 0.0
-                  then (
-                    best_buy_price := Some price;
-                    best_buy_id := Some oid))
-                else incr sync_open_sell_count;
-                mm_open_orders := (oid, price, qty, side_str) :: !mm_open_orders))
+             let is_cancelled =
+               List.exists
+                 (fun (cancelled_id, _) -> cancelled_id = oid)
+                 state.cancelled_orders
+             in
+             if is_cancelled
+             then (
+               if side_str = "buy"
+               then locked_in_buys := !locked_in_buys -. (price *. qty)
+               else if side_str = "sell"
+               then locked_in_sells := !locked_in_sells -. qty)
+             else (
+               if side_str = "buy"
+               then (
+                 incr sync_open_buy_count;
+                 let current_best =
+                   match !best_buy_price with
+                   | Some p -> p
+                   | None -> -1.0
+                 in
+                 if price > current_best && price > 0.0
+                 then (
+                   best_buy_price := Some price;
+                   best_buy_id := Some oid))
+               else incr sync_open_sell_count;
+               mm_open_orders := (oid, price, qty, side_str) :: !mm_open_orders))
            mm_orders_list
        | None ->
          iter_open_orders (fun order_id order_price remaining_qty side_str userref_opt ->
@@ -711,11 +708,12 @@ let execute_strategy
           ask
           exposure_ok
           usd_balance_ok;
-      (* Exposure or balance limit breach: cancel buys, place emergency sell for free balance *)
+      (* Exposure or balance limit breach: cancel buys, place emergency sell for free
+         balance *)
       if (not exposure_ok) || not usd_balance_ok
       then (
         (* Pending orders not cleared here; managed by order response handlers.
-             Hyperliquid: preserve buy tracking across sync. kraken clears. *)
+           Hyperliquid: preserve buy tracking across sync. kraken clears. *)
         let exch_id = Exchange.Types.exchange_of_string asset.exchange in
         if exch_id <> Hyperliquid
         then (
@@ -724,13 +722,13 @@ let execute_strategy
         (* Cancel all active buy orders mapped locally *)
         List.iter
           (fun (order_id, _order_price, _qty, side_str) ->
-             if side_str = "buy"
-             then (
-               let cancel_order =
-                 create_cancel_order order_id asset.symbol MM asset.exchange
-               in
-               ignore (push_order ~state ~now cancel_order);
-               ()))
+            if side_str = "buy"
+            then (
+              let cancel_order =
+                create_cancel_order order_id asset.symbol MM asset.exchange
+              in
+              ignore (push_order ~state ~now cancel_order);
+              ()))
           !mm_open_orders;
         (* Also cancel the actively tracked buy if it wasn't caught by iter_open_orders *)
         (match state.last_buy_order_id with
@@ -744,8 +742,8 @@ let execute_strategy
         (* Clear buy tracking after cancellation *)
         state.last_buy_order_price <- None;
         state.last_buy_order_id <- None;
-        (* Place emergency sell for free asset balance at best ask.
-             Skipped if a sell order is already in-flight to prevent duplicates. *)
+        (* Place emergency sell for free asset balance at best ask. Skipped if a sell
+           order is already in-flight to prevent duplicates. *)
         if state.inflight_sell
         then ()
         else (
@@ -788,9 +786,9 @@ let execute_strategy
         then (
           state.last_buy_order_price <- !best_buy_price;
           state.last_buy_order_id <- !best_buy_id)
-        else if
-          (* Hyperliquid: trust internal tracking when open_orders is empty but a tracker is active. *)
-          !sync_open_buy_count > 0
+        else if (* Hyperliquid: trust internal tracking when open_orders is empty but a
+                   tracker is active. *)
+                !sync_open_buy_count > 0
         then (
           state.last_buy_order_price <- !best_buy_price;
           state.last_buy_order_id <- !best_buy_id);
@@ -806,27 +804,26 @@ let execute_strategy
           (* Multiple open buys: cancel all; next trigger re-places a single order *)
           List.iter
             (fun (order_id, _order_price, _qty, side_str) ->
-               if side_str = "buy"
-               then (
-                 let cancel_order =
-                   create_cancel_order order_id asset.symbol MM asset.exchange
-                 in
-                 ignore (push_order ~state ~now cancel_order)))
+              if side_str = "buy"
+              then (
+                let cancel_order =
+                  create_cancel_order order_id asset.symbol MM asset.exchange
+                in
+                ignore (push_order ~state ~now cancel_order)))
             !mm_open_orders;
           state.last_buy_order_price <- None;
           state.last_buy_order_id <- None;
           state.last_cycle <- cycle)
         else if actual_open_buy_count = 0
         then (
-          (* 0 open buys: place new buy+sell pair.
-               Guarded: skip if a buy order is already in-flight. *)
+          (* 0 open buys: place new buy+sell pair. Guarded: skip if a buy order is already
+             in-flight. *)
           if state.inflight_buy
           then ()
           else (
-            (* Buy price derivation:
-               fee == 0: buy at best bid.
-               fee > 0: buy at ask * (1 - (2*fee + 0.0001)), clamped at bid.
-               Clamping captures wider spreads when the book is favorable. *)
+            (* Buy price derivation: fee == 0: buy at best bid. fee > 0: buy at ask * (1 -
+               (2*fee + 0.0001)), clamped at bid. Clamping captures wider spreads when the
+               book is favorable. *)
             let buy_price_raw =
               if fee = 0.0 then bid else min bid (ask *. (1.0 -. ((fee *. 2.0) +. 0.0001)))
             in
@@ -840,9 +837,8 @@ let execute_strategy
             in
             if profitability_ok
             then (
-              if
-                (* Post-only safety: verify prices remain within the book *)
-                buy_price <= bid +. 0.0000001 && sell_price >= ask -. 0.0000001
+              if (* Post-only safety: verify prices remain within the book *)
+                 buy_price <= bid +. 0.0000001 && sell_price >= ask -. 0.0000001
               then (
                 let can_place_sell = meets_min_qty asset.symbol qty asset.exchange in
                 let can_place_buy =
@@ -932,8 +928,8 @@ let execute_strategy
           (* Defer further action to next event trigger *)
           state.last_cycle <- cycle)
         else (
-          (* Exactly 1 open buy: verify price matches required level.
-               is_being_amended and is_in_flight guards prevent duplicate amendments. *)
+          (* Exactly 1 open buy: verify price matches required level. is_being_amended and
+             is_in_flight guards prevent duplicate amendments. *)
           match state.last_buy_order_price, state.last_buy_order_id with
           | Some current_buy_price, Some buy_order_id ->
             let required_buy_price_raw =
@@ -961,16 +957,15 @@ let execute_strategy
             let is_being_amended =
               List.exists
                 (fun (id, _, _, _) ->
-                   String.starts_with ~prefix:"pending_amend_" id
-                   && String.sub id 14 (String.length id - 14) = buy_order_id)
+                  String.starts_with ~prefix:"pending_amend_" id
+                  && String.sub id 14 (String.length id - 14) = buy_order_id)
                 state.pending_orders
             in
             let is_in_flight = InFlightAmendments.is_in_flight buy_order_id in
             if is_being_amended || is_in_flight
             then ()
-            else if
-              price_diff_rounded >= min_move_threshold
-              && required_buy_price <> current_buy_price_rounded
+            else if price_diff_rounded >= min_move_threshold
+                    && required_buy_price <> current_buy_price_rounded
             then (
               (* Price mismatch detected: amend buy to required price *)
               (* Profitability guard *)
@@ -992,10 +987,9 @@ let execute_strategy
                 | None, _ -> true
               in
               (* Proceed only if profitable, post-only safe, and balance is sufficient *)
-              if
-                profitability_ok
-                && required_buy_price <= bid +. 0.0000001
-                && amendment_balance_ok
+              if profitability_ok
+                 && required_buy_price <= bid +. 0.0000001
+                 && amendment_balance_ok
               then (
                 let synthetic_list = [ buy_order_id, required_buy_price, qty ] in
                 let _ =
@@ -1034,8 +1028,7 @@ let execute_strategy
                   create_cancel_order buy_order_id asset.symbol MM asset.exchange
                 in
                 ignore (push_order ~state ~now cancel_order)))
-            else
-              (* Price already correct: no action required *)
+            else (* Price already correct: no action required *)
               ()
           | _ ->
             Logging.warn_f ~section "Buy order tracking inconsistent for %s" asset.symbol));
@@ -1046,178 +1039,176 @@ let execute_strategy
     | _ -> state.last_cycle <- cycle)
 ;;
 
-(** Duplicate key generator for InFlightOrders. The key format must match
-    the usage in [create_place_order] and [push_order]. *)
+(** Duplicate key generator for InFlightOrders. The key format must match the usage in
+    [create_place_order] and [push_order]. *)
 let generate_side_duplicate_key asset_symbol side =
   Printf.sprintf "%s|%s|mm" asset_symbol (string_of_order_side side)
 ;;
 
-(** Handles a successful order placement acknowledgment.
-    Removes matching pending entries and updates buy order tracking. *)
+(** Handles a successful order placement acknowledgment. Removes matching pending entries
+    and updates buy order tracking. *)
 let handle_order_acknowledged ~now:_ asset_symbol order_id side price =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
-       (* Remove from pending orders by matching placement prefix, amend ID, or fallback *)
-       state.pending_orders
-       <- List.filter
-            (fun (pending_id, s, p, _) ->
-               (* Match regular placements by side *)
-               let is_placement_prefix =
-                 String.starts_with ~prefix:"pending_buy_" pending_id
-                 || String.starts_with ~prefix:"pending_sell_" pending_id
-               in
-               let matches_side_placement = is_placement_prefix && s = side in
-               (* Match amendments by target order_id *)
-               let matches_amend =
-                 String.starts_with ~prefix:"pending_amend_" pending_id
-                 && String.length pending_id > 14
-                 && String.sub pending_id 14 (String.length pending_id - 14) = order_id
-               in
-               (* Fallback for test or legacy IDs without prefix *)
-               let matches_fallback =
-                 (not (String.starts_with ~prefix:"pending_" pending_id))
-                 && s = side
-                 && abs_float (p -. price) < 0.01
-               in
-               not (matches_side_placement || matches_amend || matches_fallback))
-            state.pending_orders;
-       (* InFlightOrders key intentionally retained here. The guard persists while
-     the order is active; cleanup occurs in handle_order_cancelled/filled or on timeout. *)
+      (* Remove from pending orders by matching placement prefix, amend ID, or fallback *)
+      state.pending_orders
+      <- List.filter
+           (fun (pending_id, s, p, _) ->
+             (* Match regular placements by side *)
+             let is_placement_prefix =
+               String.starts_with ~prefix:"pending_buy_" pending_id
+               || String.starts_with ~prefix:"pending_sell_" pending_id
+             in
+             let matches_side_placement = is_placement_prefix && s = side in
+             (* Match amendments by target order_id *)
+             let matches_amend =
+               String.starts_with ~prefix:"pending_amend_" pending_id
+               && String.length pending_id > 14
+               && String.sub pending_id 14 (String.length pending_id - 14) = order_id
+             in
+             (* Fallback for test or legacy IDs without prefix *)
+             let matches_fallback =
+               (not (String.starts_with ~prefix:"pending_" pending_id))
+               && s = side
+               && abs_float (p -. price) < 0.01
+             in
+             not (matches_side_placement || matches_amend || matches_fallback))
+           state.pending_orders;
+      (* InFlightOrders key intentionally retained here. The guard persists while the
+         order is active; cleanup occurs in handle_order_cancelled/filled or on timeout. *)
 
-       (* Update buy order tracking on buy acknowledgment *)
-       (match side with
-        | Buy ->
-          state.last_buy_order_id <- Some order_id;
-          state.last_buy_order_price <- Some price;
-          state.inflight_buy <- false;
-          ()
-        | Sell ->
-          state.inflight_sell <- false;
-          ());
-       ())
+      (* Update buy order tracking on buy acknowledgment *)
+      (match side with
+       | Buy ->
+         state.last_buy_order_id <- Some order_id;
+         state.last_buy_order_price <- Some price;
+         state.inflight_buy <- false;
+         ()
+       | Sell ->
+         state.inflight_sell <- false;
+         ());
+      ())
 ;;
 
-(** Handles an order placement failure. Clears in-flight trackers and sets
-    capital_low or asset_low flags when the exchange reports insufficient funds. *)
+(** Handles an order placement failure. Clears in-flight trackers and sets capital_low or
+    asset_low flags when the exchange reports insufficient funds. *)
 let handle_order_failed ~now:_ asset_symbol side reason =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
-       (* Remove from pending orders *)
-       state.pending_orders
-       <- List.filter (fun (_, s, _, _) -> s <> side) state.pending_orders;
-       (* Clear inflight flags and clean up pending sells from tracking on sell failures *)
-       (match side with
-        | Buy -> state.inflight_buy <- false
-        | Sell ->
-          state.inflight_sell <- false;
-          state.open_sell_orders
-          <- List.filter
-               (fun (oid, _, _) -> not (String.starts_with ~prefix:"pending_sell_" oid))
-               state.open_sell_orders);
-       (* Clear global in-flight trackers *)
-       let duplicate_key = generate_side_duplicate_key asset_symbol side in
-       ignore (InFlightOrders.remove_in_flight_order duplicate_key);
-       (* Detect insufficient balance errors in the exchange response *)
-       let lower_reason = String.lowercase_ascii reason in
-       let contains_fragment s fragment =
-         let sl = String.length s
-         and fl = String.length fragment in
-         let rec loop i =
-           i + fl <= sl && (String.sub s i fl = fragment || loop (i + 1))
-         in
-         loop 0
-       in
-       let is_insufficient_balance =
-         contains_fragment lower_reason "insufficient funds"
-         || contains_fragment lower_reason "insufficient spot balance"
-         || contains_fragment lower_reason "not enough asset balance"
-       in
-       (* Set balance flags on insufficient funds.
-       capital_low (buy) and asset_low (sell) halt further placement
-       until balance recovers. Recovery is event-driven, no timers. *)
-       (match side with
-        | Buy when is_insufficient_balance ->
-          if not state.capital_low
-          then (
-            state.capital_low <- true;
-            state.capital_low_logged <- true;
-            Logging.warn_f
-              ~section
-              "Exchange rejected buy for %s with insufficient funds - setting \
-               capital_low flag"
-              asset_symbol)
-        | Sell when is_insufficient_balance ->
-          (* Kraken sell failures are fire-and-forget. "Insufficient funds"
-             on sells reflects USD collateral, not asset balance.
-             asset_low is not set; the sell fails and strategy continues. *)
-          Logging.warn_f
-            ~section
-            "Exchange rejected sell for %s with insufficient balance (ignored, sell is \
-             fire-and-forget)"
-            asset_symbol
-        | _ -> ());
-       Logging.warn_f
-         ~section
-         "Order failed for %s (%s): %s. Cleared in-flight tracker."
-         asset_symbol
-         (string_of_order_side side)
-         reason)
+      (* Remove from pending orders *)
+      state.pending_orders
+      <- List.filter (fun (_, s, _, _) -> s <> side) state.pending_orders;
+      (* Clear inflight flags and clean up pending sells from tracking on sell failures *)
+      (match side with
+       | Buy -> state.inflight_buy <- false
+       | Sell ->
+         state.inflight_sell <- false;
+         state.open_sell_orders
+         <- List.filter
+              (fun (oid, _, _) -> not (String.starts_with ~prefix:"pending_sell_" oid))
+              state.open_sell_orders);
+      (* Clear global in-flight trackers *)
+      let duplicate_key = generate_side_duplicate_key asset_symbol side in
+      ignore (InFlightOrders.remove_in_flight_order duplicate_key);
+      (* Detect insufficient balance errors in the exchange response *)
+      let lower_reason = String.lowercase_ascii reason in
+      let contains_fragment s fragment =
+        let sl = String.length s
+        and fl = String.length fragment in
+        let rec loop i = i + fl <= sl && (String.sub s i fl = fragment || loop (i + 1)) in
+        loop 0
+      in
+      let is_insufficient_balance =
+        contains_fragment lower_reason "insufficient funds"
+        || contains_fragment lower_reason "insufficient spot balance"
+        || contains_fragment lower_reason "not enough asset balance"
+      in
+      (* Set balance flags on insufficient funds. capital_low (buy) and asset_low (sell)
+         halt further placement until balance recovers. Recovery is event-driven, no
+         timers. *)
+      (match side with
+       | Buy when is_insufficient_balance ->
+         if not state.capital_low
+         then (
+           state.capital_low <- true;
+           state.capital_low_logged <- true;
+           Logging.warn_f
+             ~section
+             "Exchange rejected buy for %s with insufficient funds - setting capital_low \
+              flag"
+             asset_symbol)
+       | Sell when is_insufficient_balance ->
+         (* Kraken sell failures are fire-and-forget. "Insufficient funds" on sells
+            reflects USD collateral, not asset balance. asset_low is not set; the sell
+            fails and strategy continues. *)
+         Logging.warn_f
+           ~section
+           "Exchange rejected sell for %s with insufficient balance (ignored, sell is \
+            fire-and-forget)"
+           asset_symbol
+       | _ -> ());
+      Logging.warn_f
+        ~section
+        "Order failed for %s (%s): %s. Cleared in-flight tracker."
+        asset_symbol
+        (string_of_order_side side)
+        reason)
 ;;
 
-(** Handles an order rejection. Removes pending entries and clears in-flight
-    trackers to permit immediate re-placement on the next cycle. *)
+(** Handles an order rejection. Removes pending entries and clears in-flight trackers to
+    permit immediate re-placement on the next cycle. *)
 let handle_order_rejected ~now:_ asset_symbol side price =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
-       (* Remove matching pending entries by side or price fallback *)
-       state.pending_orders
-       <- List.filter
-            (fun (pending_id, s, p, _) ->
-               let is_placement_prefix =
-                 String.starts_with ~prefix:"pending_buy_" pending_id
-                 || String.starts_with ~prefix:"pending_sell_" pending_id
-               in
-               let matches_side_placement = is_placement_prefix && s = side in
-               (* Amend rejections: match by ID or fall back to price *)
-               let matches_amend_prefix =
-                 String.starts_with ~prefix:"pending_amend_" pending_id
-               in
-               let matches_fallback =
-                 ((not (String.starts_with ~prefix:"pending_" pending_id))
-                  || matches_amend_prefix)
-                 && s = side
-                 && abs_float (p -. price) < 0.01
-               in
-               not (matches_side_placement || matches_fallback))
-            state.pending_orders;
-       (* Clear inflight flags and clean up pending sells from tracking on sell rejections *)
-       (match side with
-        | Buy -> state.inflight_buy <- false
-        | Sell ->
-          state.inflight_sell <- false;
-          state.open_sell_orders
-          <- List.filter
-               (fun (oid, _, _) -> not (String.starts_with ~prefix:"pending_sell_" oid))
-               state.open_sell_orders);
-       (* Release global trackers to permit immediate re-placement *)
-       let duplicate_key = generate_side_duplicate_key asset_symbol side in
-       ignore (InFlightOrders.remove_in_flight_order duplicate_key);
-       ())
+      (* Remove matching pending entries by side or price fallback *)
+      state.pending_orders
+      <- List.filter
+           (fun (pending_id, s, p, _) ->
+             let is_placement_prefix =
+               String.starts_with ~prefix:"pending_buy_" pending_id
+               || String.starts_with ~prefix:"pending_sell_" pending_id
+             in
+             let matches_side_placement = is_placement_prefix && s = side in
+             (* Amend rejections: match by ID or fall back to price *)
+             let matches_amend_prefix =
+               String.starts_with ~prefix:"pending_amend_" pending_id
+             in
+             let matches_fallback =
+               ((not (String.starts_with ~prefix:"pending_" pending_id))
+                || matches_amend_prefix)
+               && s = side
+               && abs_float (p -. price) < 0.01
+             in
+             not (matches_side_placement || matches_fallback))
+           state.pending_orders;
+      (* Clear inflight flags and clean up pending sells from tracking on sell rejections *)
+      (match side with
+       | Buy -> state.inflight_buy <- false
+       | Sell ->
+         state.inflight_sell <- false;
+         state.open_sell_orders
+         <- List.filter
+              (fun (oid, _, _) -> not (String.starts_with ~prefix:"pending_sell_" oid))
+              state.open_sell_orders);
+      (* Release global trackers to permit immediate re-placement *)
+      let duplicate_key = generate_side_duplicate_key asset_symbol side in
+      ignore (InFlightOrders.remove_in_flight_order duplicate_key);
+      ())
 ;;
 
 (* Buy rejections leave no active order; strategy re-evaluates on the next cycle *)
 
-(** Returns true if [tracked] equals [order_id] or, when present, the
-    exchange-level client order id [cl_ord_id]. *)
+(** Returns true if [tracked] equals [order_id] or, when present, the exchange-level
+    client order id [cl_ord_id]. *)
 let order_or_client_matches tracked order_id cl_ord_id =
   tracked = order_id
   ||
@@ -1226,302 +1217,298 @@ let order_or_client_matches tracked order_id cl_ord_id =
   | None -> false
 ;;
 
-(** Handles a full order fill. Clears all tracking (pending amends, sell
-    orders, buy order state) and releases in-flight guards. *)
+(** Handles a full order fill. Clears all tracking (pending amends, sell orders, buy order
+    state) and releases in-flight guards. *)
 let handle_order_filled
-      ~now:_
-      asset_symbol
-      order_id
-      side
-      ~fill_price:_
-      ~fill_qty:_
-      cl_ord_id
+  ~now:_
+  asset_symbol
+  order_id
+  side
+  ~fill_price:_
+  ~fill_qty:_
+  cl_ord_id
   =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
-       (* Remove any pending amend referencing this order ID *)
-       state.pending_orders
-       <- List.filter
-            (fun (pending_id, _, _, _) ->
-               not
-                 (String.starts_with ~prefix:"pending_amend_" pending_id
-                  && String.length pending_id > 14
-                  && String.sub pending_id 14 (String.length pending_id - 14) = order_id))
-            state.pending_orders;
-       (* Remove from sell orders tracking *)
-       state.open_sell_orders
-       <- List.filter (fun (sell_id, _, _) -> sell_id <> order_id) state.open_sell_orders;
-       (* Clear buy order tracking if this was the tracked buy *)
-       let was_tracked_buy =
-         match state.last_buy_order_id with
-         | Some id when order_or_client_matches id order_id cl_ord_id -> true
-         | _ -> false
-       in
-       if was_tracked_buy
-       then (
-         state.last_buy_order_id <- None;
-         state.last_buy_order_price <- None;
-         ());
-       (* Clear inflight flags *)
-       (match side with
-        | Buy -> state.inflight_buy <- false
-        | Sell -> state.inflight_sell <- false);
-       (* Release global placement trackers to permit immediate re-placement *)
-       ignore
-         (InFlightOrders.remove_in_flight_order
-            (generate_side_duplicate_key asset_symbol side));
-       ())
+      (* Remove any pending amend referencing this order ID *)
+      state.pending_orders
+      <- List.filter
+           (fun (pending_id, _, _, _) ->
+             not
+               (String.starts_with ~prefix:"pending_amend_" pending_id
+                && String.length pending_id > 14
+                && String.sub pending_id 14 (String.length pending_id - 14) = order_id))
+           state.pending_orders;
+      (* Remove from sell orders tracking *)
+      state.open_sell_orders
+      <- List.filter (fun (sell_id, _, _) -> sell_id <> order_id) state.open_sell_orders;
+      (* Clear buy order tracking if this was the tracked buy *)
+      let was_tracked_buy =
+        match state.last_buy_order_id with
+        | Some id when order_or_client_matches id order_id cl_ord_id -> true
+        | _ -> false
+      in
+      if was_tracked_buy
+      then (
+        state.last_buy_order_id <- None;
+        state.last_buy_order_price <- None;
+        ());
+      (* Clear inflight flags *)
+      (match side with
+       | Buy -> state.inflight_buy <- false
+       | Sell -> state.inflight_sell <- false);
+      (* Release global placement trackers to permit immediate re-placement *)
+      ignore
+        (InFlightOrders.remove_in_flight_order
+           (generate_side_duplicate_key asset_symbol side));
+      ())
 ;;
 
-(** Handles an order cancellation. Distinguishes cancel-replace (amendment)
-    from genuine cancellation. Applies cleanup accordingly. *)
+(** Handles an order cancellation. Distinguishes cancel-replace (amendment) from genuine
+    cancellation. Applies cleanup accordingly. *)
 let handle_order_cancelled ~now asset_symbol order_id side cl_ord_id =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
-       (* Detect cancel-replace amendments: if pending_amend_<order_id> exists,
-     a replacement order is incoming. Preserve InFlightOrders guard and buy tracking. *)
-       let is_cancel_replace =
-         List.exists
-           (fun (pending_id, _, _, _) ->
-              String.starts_with ~prefix:"pending_amend_" pending_id
-              &&
-              let target_id = String.sub pending_id 14 (String.length pending_id - 14) in
-              target_id = order_id)
-           state.pending_orders
-       in
-       if is_cancel_replace
-       then (
-         (* Cancel-replace: remove pending_amend entry; keep in-flight guards active *)
-         state.pending_orders
-         <- List.filter
-              (fun (pending_id, _, _, _) ->
-                 not
-                   (String.starts_with ~prefix:"pending_amend_" pending_id
-                    && String.sub pending_id 14 (String.length pending_id - 14) = order_id
-                   ))
-              state.pending_orders;
-         (* Remove old order from sell tracking *)
-         state.open_sell_orders
-         <- List.filter
-              (fun (sell_id, _, _) -> sell_id <> order_id)
-              state.open_sell_orders)
-       else (
-         (* Genuine cancellation: full cleanup *)
-         (* Blacklist order ID to prevent re-addition during sync *)
-         state.cancelled_orders
-         <- (order_id, now)
-            ::
-            (match cl_ord_id with
-             | Some c when c <> order_id -> (c, now) :: state.cancelled_orders
-             | _ -> state.cancelled_orders);
-         let cancelled_side = side in
-         (* Remove from pending orders by order_id or by side for ghost placements *)
-         state.pending_orders
-         <- List.filter
-              (fun (pending_id, s, _, _) ->
-                 let matches_id =
-                   pending_id = order_id
-                   ||
-                   match cl_ord_id with
-                   | Some c -> pending_id = c
-                   | None -> false
-                 in
-                 let is_ghost_placement =
-                   s = cancelled_side
-                   && (String.starts_with ~prefix:"pending_buy_" pending_id
-                       || String.starts_with ~prefix:"pending_sell_" pending_id)
-                 in
-                 not (matches_id || is_ghost_placement))
-              state.pending_orders;
-         (* Clear buy tracking if this was the tracked buy order *)
-         let was_tracked_buy =
-           match state.last_buy_order_id with
-           | Some id when order_or_client_matches id order_id cl_ord_id -> true
-           | _ -> false
-         in
-         if was_tracked_buy
-         then (
-           state.last_buy_order_id <- None;
-           state.last_buy_order_price <- None;
-           ());
-         (* Remove from sell order tracking *)
-         state.open_sell_orders
-         <- List.filter
-              (fun (sell_id, _, _) ->
-                 sell_id <> order_id
-                 &&
+      (* Detect cancel-replace amendments: if pending_amend_<order_id> exists, a
+         replacement order is incoming. Preserve InFlightOrders guard and buy tracking. *)
+      let is_cancel_replace =
+        List.exists
+          (fun (pending_id, _, _, _) ->
+            String.starts_with ~prefix:"pending_amend_" pending_id
+            &&
+            let target_id = String.sub pending_id 14 (String.length pending_id - 14) in
+            target_id = order_id)
+          state.pending_orders
+      in
+      if is_cancel_replace
+      then (
+        (* Cancel-replace: remove pending_amend entry; keep in-flight guards active *)
+        state.pending_orders
+        <- List.filter
+             (fun (pending_id, _, _, _) ->
+               not
+                 (String.starts_with ~prefix:"pending_amend_" pending_id
+                  && String.sub pending_id 14 (String.length pending_id - 14) = order_id))
+             state.pending_orders;
+        (* Remove old order from sell tracking *)
+        state.open_sell_orders
+        <- List.filter (fun (sell_id, _, _) -> sell_id <> order_id) state.open_sell_orders)
+      else (
+        (* Genuine cancellation: full cleanup *)
+        (* Blacklist order ID to prevent re-addition during sync *)
+        state.cancelled_orders
+        <- (order_id, now)
+           ::
+           (match cl_ord_id with
+            | Some c when c <> order_id -> (c, now) :: state.cancelled_orders
+            | _ -> state.cancelled_orders);
+        let cancelled_side = side in
+        (* Remove from pending orders by order_id or by side for ghost placements *)
+        state.pending_orders
+        <- List.filter
+             (fun (pending_id, s, _, _) ->
+               let matches_id =
+                 pending_id = order_id
+                 ||
                  match cl_ord_id with
-                 | Some c -> sell_id <> c
-                 | None -> true)
-              state.open_sell_orders;
-         (* Clear inflight flags *)
-         (match cancelled_side with
-          | Buy -> state.inflight_buy <- false
-          | Sell -> state.inflight_sell <- false);
-         (* Release global placement trackers to permit immediate re-placement *)
-         ignore
-           (InFlightOrders.remove_in_flight_order
-              (generate_side_duplicate_key asset_symbol cancelled_side));
-         ()))
+                 | Some c -> pending_id = c
+                 | None -> false
+               in
+               let is_ghost_placement =
+                 s = cancelled_side
+                 && (String.starts_with ~prefix:"pending_buy_" pending_id
+                     || String.starts_with ~prefix:"pending_sell_" pending_id)
+               in
+               not (matches_id || is_ghost_placement))
+             state.pending_orders;
+        (* Clear buy tracking if this was the tracked buy order *)
+        let was_tracked_buy =
+          match state.last_buy_order_id with
+          | Some id when order_or_client_matches id order_id cl_ord_id -> true
+          | _ -> false
+        in
+        if was_tracked_buy
+        then (
+          state.last_buy_order_id <- None;
+          state.last_buy_order_price <- None;
+          ());
+        (* Remove from sell order tracking *)
+        state.open_sell_orders
+        <- List.filter
+             (fun (sell_id, _, _) ->
+               sell_id <> order_id
+               &&
+               match cl_ord_id with
+               | Some c -> sell_id <> c
+               | None -> true)
+             state.open_sell_orders;
+        (* Clear inflight flags *)
+        (match cancelled_side with
+         | Buy -> state.inflight_buy <- false
+         | Sell -> state.inflight_sell <- false);
+        (* Release global placement trackers to permit immediate re-placement *)
+        ignore
+          (InFlightOrders.remove_in_flight_order
+             (generate_side_duplicate_key asset_symbol cancelled_side));
+        ()))
 ;;
 
-(** Handles a successful cancel-replace amendment. Swaps old order ID
-    for new order ID in tracking. Blacklists old ID when IDs differ. *)
+(** Handles a successful cancel-replace amendment. Swaps old order ID for new order ID in
+    tracking. Blacklists old ID when IDs differ. *)
 let handle_order_amended ~now asset_symbol old_order_id new_order_id side price =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
-       (* Remove pending amend entries matching old or new order ID *)
-       state.pending_orders
-       <- List.filter
-            (fun (pending_id, _s, _p, _) ->
-               let matches_amend =
-                 String.starts_with ~prefix:"pending_amend_" pending_id
-                 && (String.sub pending_id 14 (String.length pending_id - 14)
-                     = old_order_id
-                     || String.sub pending_id 14 (String.length pending_id - 14)
-                        = new_order_id)
-               in
-               not matches_amend)
-            state.pending_orders;
-       (* Blacklist old order ID to prevent ghost orders
-       in lagging data feeds (e.g., Hyperliquid webData2).
-       Skipped when IDs are identical because Kraken amendments often reuse the original order ID. *)
-       if old_order_id <> new_order_id
-       then state.cancelled_orders <- (old_order_id, now) :: state.cancelled_orders;
-       (* Swap old ID to new ID in active order tracking *)
-       (match side with
-        | Buy ->
-          (match state.last_buy_order_id with
-           | Some target_id when target_id = old_order_id ->
-             state.last_buy_order_id <- Some new_order_id;
-             state.last_buy_order_price <- Some price;
-             Logging.info_f
-               ~section
-               "Amended buy order ID in tracking: %s -> %s @ %.2f for %s"
-               old_order_id
-               new_order_id
-               price
-               asset_symbol
-           | _ ->
-             (* Fallback: state was wiped or order ID mismatched *)
-             state.last_buy_order_id <- Some new_order_id;
-             state.last_buy_order_price <- Some price;
-             ())
-        | Sell ->
-          let original_sell_count = List.length state.open_sell_orders in
-          let old_qty =
-            match
-              List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders
-            with
-            | Some (_, _, q) -> q
-            | None -> 0.0
-          in
-          state.open_sell_orders
-          <- (new_order_id, price, old_qty)
-             :: List.filter
-                  (fun (sell_id, _, _) -> sell_id <> old_order_id)
-                  state.open_sell_orders;
-          if List.length state.open_sell_orders = original_sell_count
-          then
+      (* Remove pending amend entries matching old or new order ID *)
+      state.pending_orders
+      <- List.filter
+           (fun (pending_id, _s, _p, _) ->
+             let matches_amend =
+               String.starts_with ~prefix:"pending_amend_" pending_id
+               && (String.sub pending_id 14 (String.length pending_id - 14) = old_order_id
+                   || String.sub pending_id 14 (String.length pending_id - 14)
+                      = new_order_id)
+             in
+             not matches_amend)
+           state.pending_orders;
+      (* Blacklist old order ID to prevent ghost orders in lagging data feeds (e.g.,
+         Hyperliquid webData2). Skipped when IDs are identical because Kraken amendments
+         often reuse the original order ID. *)
+      if old_order_id <> new_order_id
+      then state.cancelled_orders <- (old_order_id, now) :: state.cancelled_orders;
+      (* Swap old ID to new ID in active order tracking *)
+      (match side with
+       | Buy ->
+         (match state.last_buy_order_id with
+          | Some target_id when target_id = old_order_id ->
+            state.last_buy_order_id <- Some new_order_id;
+            state.last_buy_order_price <- Some price;
             Logging.info_f
               ~section
-              "Amended sell order ID in tracking: %s -> %s @ %.2f for %s"
+              "Amended buy order ID in tracking: %s -> %s @ %.2f for %s"
               old_order_id
               new_order_id
               price
               asset_symbol
-          else ());
-       (* Release in-flight amendment guard *)
-       ignore (InFlightAmendments.remove_in_flight_amendment old_order_id);
-       ())
+          | _ ->
+            (* Fallback: state was wiped or order ID mismatched *)
+            state.last_buy_order_id <- Some new_order_id;
+            state.last_buy_order_price <- Some price;
+            ())
+       | Sell ->
+         let original_sell_count = List.length state.open_sell_orders in
+         let old_qty =
+           match
+             List.find_opt (fun (id, _, _) -> id = old_order_id) state.open_sell_orders
+           with
+           | Some (_, _, q) -> q
+           | None -> 0.0
+         in
+         state.open_sell_orders
+         <- (new_order_id, price, old_qty)
+            :: List.filter
+                 (fun (sell_id, _, _) -> sell_id <> old_order_id)
+                 state.open_sell_orders;
+         if List.length state.open_sell_orders = original_sell_count
+         then
+           Logging.info_f
+             ~section
+             "Amended sell order ID in tracking: %s -> %s @ %.2f for %s"
+             old_order_id
+             new_order_id
+             price
+             asset_symbol
+         else ());
+      (* Release in-flight amendment guard *)
+      ignore (InFlightAmendments.remove_in_flight_amendment old_order_id);
+      ())
 ;;
 
-(** Handles a no-op amendment (price unchanged). Removes the pending
-    amend entry to release the amendment guard. *)
+(** Handles a no-op amendment (price unchanged). Removes the pending amend entry to
+    release the amendment guard. *)
 let handle_order_amendment_skipped ~now:_ asset_symbol order_id _ _ =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
-       (* Remove pending amend entry for this order_id *)
-       state.pending_orders
-       <- List.filter
-            (fun (pending_id, _s, _p, _) ->
-               let matches_amend =
-                 String.starts_with ~prefix:"pending_amend_" pending_id
-                 && String.sub pending_id 14 (String.length pending_id - 14) = order_id
-               in
-               not matches_amend)
-            state.pending_orders;
-       (* Release in-flight amendment guard *)
-       ignore (InFlightAmendments.remove_in_flight_amendment order_id);
-       ())
+      (* Remove pending amend entry for this order_id *)
+      state.pending_orders
+      <- List.filter
+           (fun (pending_id, _s, _p, _) ->
+             let matches_amend =
+               String.starts_with ~prefix:"pending_amend_" pending_id
+               && String.sub pending_id 14 (String.length pending_id - 14) = order_id
+             in
+             not matches_amend)
+           state.pending_orders;
+      (* Release in-flight amendment guard *)
+      ignore (InFlightAmendments.remove_in_flight_amendment order_id);
+      ())
 ;;
 
-(** Handles an amendment failure. Clears tracking for the affected order
-    and releases in-flight guards to permit recovery on the next cycle. *)
+(** Handles an amendment failure. Clears tracking for the affected order and releases
+    in-flight guards to permit recovery on the next cycle. *)
 let handle_order_amendment_failed ~now asset_symbol order_id side reason =
   let state = get_strategy_state asset_symbol in
   Mutex.lock state.mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock state.mutex)
     (fun () ->
-       (* Remove pending amend entry *)
-       state.pending_orders
-       <- List.filter
-            (fun (pending_id, _s, _p, _) ->
-               let matches_amend =
-                 String.starts_with ~prefix:"pending_amend_" pending_id
-                 && String.length pending_id > 14
-                 && String.sub pending_id 14 (String.length pending_id - 14) = order_id
-               in
-               not matches_amend)
-            state.pending_orders;
-       (* Clear tracking on amendment failure. The inflight_buy guard prevents
-       false-positive amend-before-index scenarios, so reaching this point
-       indicates the order is dead or unreachable, so clearing enables recovery. *)
-       (match side with
-        | Buy ->
-          (match state.last_buy_order_id with
-           | Some target_id when target_id = order_id ->
-             state.last_buy_order_id <- None;
-             state.last_buy_order_price <- None;
-             state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
-             Logging.info_f
-               ~section
-               "Amendment failed for buy order %s: cleared tracking (%s)"
-               order_id
-               reason
-           | _ -> ())
-        | Sell ->
-          let original = List.length state.open_sell_orders in
-          state.open_sell_orders
-          <- List.filter
-               (fun (sell_id, _, _) -> sell_id <> order_id)
-               state.open_sell_orders;
-          if List.length state.open_sell_orders < original
-          then (
+      (* Remove pending amend entry *)
+      state.pending_orders
+      <- List.filter
+           (fun (pending_id, _s, _p, _) ->
+             let matches_amend =
+               String.starts_with ~prefix:"pending_amend_" pending_id
+               && String.length pending_id > 14
+               && String.sub pending_id 14 (String.length pending_id - 14) = order_id
+             in
+             not matches_amend)
+           state.pending_orders;
+      (* Clear tracking on amendment failure. The inflight_buy guard prevents
+         false-positive amend-before-index scenarios, so reaching this point indicates the
+         order is dead or unreachable, so clearing enables recovery. *)
+      (match side with
+       | Buy ->
+         (match state.last_buy_order_id with
+          | Some target_id when target_id = order_id ->
+            state.last_buy_order_id <- None;
+            state.last_buy_order_price <- None;
             state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
             Logging.info_f
               ~section
-              "Amendment failed for sell order %s: cleared tracking (%s)"
+              "Amendment failed for buy order %s: cleared tracking (%s)"
               order_id
-              reason));
-       (* Release global in-flight trackers to prevent resource deadlock *)
-       ignore (InFlightAmendments.remove_in_flight_amendment order_id);
-       ignore
-         (InFlightOrders.remove_in_flight_order
-            (generate_side_duplicate_key asset_symbol side)))
+              reason
+          | _ -> ())
+       | Sell ->
+         let original = List.length state.open_sell_orders in
+         state.open_sell_orders
+         <- List.filter
+              (fun (sell_id, _, _) -> sell_id <> order_id)
+              state.open_sell_orders;
+         if List.length state.open_sell_orders < original
+         then (
+           state.cancelled_orders <- (order_id, now) :: state.cancelled_orders;
+           Logging.info_f
+             ~section
+             "Amendment failed for sell order %s: cleared tracking (%s)"
+             order_id
+             reason));
+      (* Release global in-flight trackers to prevent resource deadlock *)
+      ignore (InFlightAmendments.remove_in_flight_amendment order_id);
+      ignore
+        (InFlightOrders.remove_in_flight_order
+           (generate_side_duplicate_key asset_symbol side)))
 ;;
 
 (** Removes a completed order from the pending_cancellations tracking table. *)
@@ -1545,8 +1532,8 @@ let init () =
   Random.self_init ()
 ;;
 
-(** Clears the startup_replay flag so telemetry profiling activates. 
-    Called by domain_spawner once the first exec event batch has been consumed. *)
+(** Clears the startup_replay flag so telemetry profiling activates. Called by
+    domain_spawner once the first exec event batch has been consumed. *)
 let set_startup_replay_done symbol =
   let state = get_strategy_state symbol in
   Mutex.lock state.mutex;
@@ -1557,13 +1544,12 @@ let set_startup_replay_done symbol =
   Mutex.unlock state.mutex
 ;;
 
-(** Per-symbol lock-free lifecycle event queue. The Lwt supervisor thread
-    (REST callbacks in supervisor_orders.ml) enqueues lifecycle events; the
-    symbol's domain worker drains the queue at the top of every cycle. All
-    handler execution therefore happens on the domain thread, so [state.mutex]
-    is never taken cross-thread against [execute_strategy] (which mutates the
-    same record without the mutex). LockFreeQueue is MPSC-safe; enqueue signals
-    Exchange_wakeup so an idle domain wakes to drain promptly. *)
+(** Per-symbol lock-free lifecycle event queue. The Lwt supervisor thread (REST callbacks
+    in supervisor_orders.ml) enqueues lifecycle events; the symbol's domain worker drains
+    the queue at the top of every cycle. All handler execution therefore happens on the
+    domain thread, so [state.mutex] is never taken cross-thread against [execute_strategy]
+    (which mutates the same record without the mutex). LockFreeQueue is MPSC-safe; enqueue
+    signals Exchange_wakeup so an idle domain wakes to drain promptly. *)
 type mm_lifecycle_event =
   | Failed of
       { now : float
@@ -1598,8 +1584,8 @@ type mm_lifecycle_event =
 
 module SymbolMap = Map.Make (String)
 
-(** Immutable per-symbol queue map published through one atomic cell:
-    lock-free reads on the hot path, CAS inserts on first use. *)
+(** Immutable per-symbol queue map published through one atomic cell: lock-free reads on
+    the hot path, CAS inserts on first use. *)
 let event_queues : mm_lifecycle_event LockFreeQueue.t SymbolMap.t Atomic.t =
   Atomic.make SymbolMap.empty
 ;;
@@ -1621,8 +1607,8 @@ let get_event_queue symbol =
     insert ()
 ;;
 
-(** Dropped-event counter: a full ring silently loses lifecycle events,
-    leaving stuck inflight_* state until stale-pending cleanup rescues it. *)
+(** Dropped-event counter: a full ring silently loses lifecycle events, leaving stuck
+    inflight_* state until stale-pending cleanup rescues it. *)
 let dropped_events = Atomic.make 0
 
 (** Enqueue a lifecycle event from any thread (supervisor REST path). *)
@@ -1633,8 +1619,8 @@ let enqueue_event symbol (ev : mm_lifecycle_event) =
   Concurrency.Exchange_wakeup.signal ~symbol
 ;;
 
-(** Dispatch one drained event to its handler. Runs on the domain thread;
-    handlers take state.mutex as before. *)
+(** Dispatch one drained event to its handler. Runs on the domain thread; handlers take
+    state.mutex as before. *)
 let dispatch_event asset_symbol (ev : mm_lifecycle_event) =
   match ev with
   | Failed { now; side; reason } -> handle_order_failed ~now asset_symbol side reason
@@ -1648,8 +1634,8 @@ let dispatch_event asset_symbol (ev : mm_lifecycle_event) =
   | Cancel_cleanup { order_id } -> cleanup_pending_cancellation asset_symbol order_id
 ;;
 
-(** Drain all queued lifecycle events for [symbol]. Called by the symbol's
-    domain worker at the top of every cycle. *)
+(** Drain all queued lifecycle events for [symbol]. Called by the symbol's domain worker
+    at the top of every cycle. *)
 let drain_events symbol =
   let q = get_event_queue symbol in
   let n = ref 0 in
@@ -1704,10 +1690,9 @@ module Strategy = struct
   let set_startup_replay_done = set_startup_replay_done
   let init = init
 
-  (* lifecycle-event queue surface. Cross-thread callers (supervisor
-     REST callbacks) MUST use [enqueue_event]; the handle_* functions are
-     retained public for same-thread callers (the domain worker's WS exec
-     replay) and for unit tests. *)
+  (* lifecycle-event queue surface. Cross-thread callers (supervisor REST callbacks) MUST
+     use [enqueue_event]; the handle_* functions are retained public for same-thread
+     callers (the domain worker's WS exec replay) and for unit tests. *)
   type lifecycle_event = mm_lifecycle_event =
     | Failed of
         { now : float

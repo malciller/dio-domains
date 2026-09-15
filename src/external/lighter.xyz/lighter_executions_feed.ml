@@ -1,8 +1,7 @@
-(** Processes Lighter execution events from the account WS subscriptions into
-    per-symbol open order tables and event histories. Each symbol has its own
-    store (ring buffer + orders hashtable) guarded by a mutex, with an atomic
-    snapshot of open orders for lock-free reads; ordering guarantees are per
-    symbol only. *)
+(** Processes Lighter execution events from the account WS subscriptions into per-symbol
+    open order tables and event histories. Each symbol has its own store (ring buffer +
+    orders hashtable) guarded by a mutex, with an atomic snapshot of open orders for
+    lock-free reads; ordering guarantees are per symbol only. *)
 
 let section = "lighter_executions_feed"
 
@@ -53,15 +52,14 @@ type execution_event =
 (** Lock-free ring buffer of execution events, one per symbol. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Per-symbol store: execution event ring buffer, open orders hashtable,
-    atomic snapshot of open orders for lock-free reads, ready flag gating
-    downstream consumers until bootstrap completes. Writers take
-    [orders_mutex]. *)
+(** Per-symbol store: execution event ring buffer, open orders hashtable, atomic snapshot
+    of open orders for lock-free reads, ready flag gating downstream consumers until
+    bootstrap completes. Writers take [orders_mutex]. *)
 type store =
   { events_buffer : execution_event RingBuffer.t
   ; open_orders : (string, open_order) Hashtbl.t
   ; open_orders_cache : open_order list Atomic.t
-    (** Lock-free atomic snapshot cache of active open orders for the domain hotpath. *)
+  (** Lock-free atomic snapshot cache of active open orders for the domain hotpath. *)
   ; ready : bool Atomic.t
   ; orders_mutex : Mutex.t
   }
@@ -70,15 +68,15 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Global order_id -> symbol index. FIFO eviction once capped; writers must
-    hold [initialization_mutex]. *)
+(** Global order_id -> symbol index. FIFO eviction once capped; writers must hold
+    [initialization_mutex]. *)
 let order_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 64
 
 (** Insertion order backing the FIFO eviction above. *)
 let order_to_symbol_queue : string Queue.t = Queue.create ()
 
-(** Index capacity: uncapped during startup ingestion, then fixed from the
-    observed startup volume. *)
+(** Index capacity: uncapped during startup ingestion, then fixed from the observed
+    startup volume. *)
 let order_to_symbol_cap : int ref = ref max_int
 
 let order_to_symbol_startup_done = Atomic.make false
@@ -86,8 +84,7 @@ let order_to_symbol_startup_done = Atomic.make false
 (** Set once the initial open-orders snapshot has been ingested. *)
 let _startup_snapshot_done : bool Atomic.t = Atomic.make false
 
-(** Fixes the index cap from startup volume; idempotent. Requires
-    [initialization_mutex]. *)
+(** Fixes the index cap from startup volume; idempotent. Requires [initialization_mutex]. *)
 let mark_startup_complete () =
   if not (Atomic.exchange order_to_symbol_startup_done true)
   then (
@@ -105,17 +102,17 @@ let mark_startup_complete () =
 let set_startup_snapshot_done () =
   if not (Atomic.exchange _startup_snapshot_done true)
   then (
-    (* Mark every store ready even if it holds no open orders, so readiness
-       does not depend on having positions. *)
+    (* Mark every store ready even if it holds no open orders, so readiness does not
+       depend on having positions. *)
     Mutex.lock initialization_mutex;
     Fun.protect
       ~finally:(fun () -> Mutex.unlock initialization_mutex)
       (fun () ->
-         Hashtbl.iter
-           (fun _symbol store ->
-              if not (Atomic.get store.ready) then Atomic.set store.ready true)
-           stores;
-         mark_startup_complete ());
+        Hashtbl.iter
+          (fun _symbol store ->
+            if not (Atomic.get store.ready) then Atomic.set store.ready true)
+          stores;
+        mark_startup_complete ());
     Logging.debug_f
       ~section
       "Lighter open-order snapshot injected. Core execution domains may now activate";
@@ -124,8 +121,8 @@ let set_startup_snapshot_done () =
 
 let is_startup_snapshot_done () = Atomic.get _startup_snapshot_done
 
-(** Adds order_id -> symbol to the global index, evicting the oldest entries
-    once past the cap. Caller must hold [initialization_mutex]. *)
+(** Adds order_id -> symbol to the global index, evicting the oldest entries once past the
+    cap. Caller must hold [initialization_mutex]. *)
 let add_to_order_to_symbol order_id symbol =
   if not (Hashtbl.mem order_to_symbol order_id)
   then Queue.push order_id order_to_symbol_queue;
@@ -160,32 +157,32 @@ let get_symbol_store symbol =
     Fun.protect
       ~finally:(fun () -> Mutex.unlock initialization_mutex)
       (fun () ->
-         match Hashtbl.find_opt stores symbol with
-         | Some store -> store
-         | None ->
-           let store =
-             { events_buffer =
-                 (* Capacity sized for execution bursts. *)
-                 RingBuffer.create 512
-             ; open_orders = Hashtbl.create 32
-             ; open_orders_cache = Atomic.make []
-             ; ready = Atomic.make (Atomic.get _startup_snapshot_done)
-             ; orders_mutex = Mutex.create ()
-             }
-           in
-           Hashtbl.add stores symbol store;
-           store)
+        match Hashtbl.find_opt stores symbol with
+        | Some store -> store
+        | None ->
+          let store =
+            { events_buffer =
+                (* Capacity sized for execution bursts. *)
+                RingBuffer.create 512
+            ; open_orders = Hashtbl.create 32
+            ; open_orders_cache = Atomic.make []
+            ; ready = Atomic.make (Atomic.get _startup_snapshot_done)
+            ; orders_mutex = Mutex.create ()
+            }
+          in
+          Hashtbl.add stores symbol store;
+          store)
 ;;
 
-(** Account-wide generation, bumped whenever any symbol's open-orders snapshot
-    is republished. Lets the grid strategy's [sync_open_orders] skip its
-    O(open-orders) rescan when nothing changed. *)
+(** Account-wide generation, bumped whenever any symbol's open-orders snapshot is
+    republished. Lets the grid strategy's [sync_open_orders] skip its O(open-orders)
+    rescan when nothing changed. *)
 let orders_generation = Atomic.make 0
 
 let[@inline] get_orders_generation () = Atomic.get orders_generation
 
-(** Publishes an immutable snapshot of open_orders to the atomic cache.
-    Must be called by writers under store.orders_mutex. *)
+(** Publishes an immutable snapshot of open_orders to the atomic cache. Must be called by
+    writers under store.orders_mutex. *)
 let[@inline] publish_open_orders_cache store =
   let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
   Atomic.set store.open_orders_cache snapshot;
@@ -198,67 +195,66 @@ let notify_ready store =
   | _ -> ()
 ;;
 
-(** Applies an execution event to the open-orders table and event buffer:
-    terminal statuses remove the order, otherwise it is upserted (preserving
-    cl_ord_id and stored expiry), the snapshot cache is republished, and the
-    global index is updated. *)
+(** Applies an execution event to the open-orders table and event buffer: terminal
+    statuses remove the order, otherwise it is upserted (preserving cl_ord_id and stored
+    expiry), the snapshot cache is republished, and the global index is updated. *)
 let update_orders_internal store (event : execution_event) =
   let now = Unix.gettimeofday () in
   Mutex.lock store.orders_mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock store.orders_mutex)
     (fun () ->
-       let existing_opt = Hashtbl.find_opt store.open_orders event.order_id in
-       let resolved_cl_ord_id =
-         match event.cl_ord_id with
-         | Some _ as c -> c
-         | None ->
-           (match existing_opt with
-            | Some o -> o.cl_ord_id
-            | None -> None)
-       in
-       let is_terminal =
-         match event.order_status with
-         | FilledStatus | CanceledStatus | RejectedStatus | ExpiredStatus -> true
-         | _ -> false
-       in
-       if is_terminal
-       then (
-         Hashtbl.remove store.open_orders event.order_id;
-         publish_open_orders_cache store;
-         Mutex.lock initialization_mutex;
-         Fun.protect
-           ~finally:(fun () -> Mutex.unlock initialization_mutex)
-           (fun () -> Hashtbl.remove order_to_symbol event.order_id))
-       else (
-         (* Delta updates carry no expiry; keep the stored one. *)
-         let preserved_expiry =
-           match existing_opt with
-           | Some o -> o.order_expiry
-           | None -> None
-         in
-         let order : open_order =
-           { order_id = event.order_id
-           ; symbol = event.symbol
-           ; side = event.side
-           ; order_qty = event.order_qty
-           ; cum_qty = event.cum_qty
-           ; remaining_qty = event.order_qty -. event.cum_qty
-           ; limit_price = event.limit_price
-           ; avg_price = event.avg_price
-           ; order_status = event.order_status
-           ; order_userref = None
-           ; cl_ord_id = resolved_cl_ord_id
-           ; last_updated = now
-           ; order_expiry = preserved_expiry
-           }
-         in
-         Hashtbl.replace store.open_orders event.order_id order;
-         publish_open_orders_cache store;
-         Mutex.lock initialization_mutex;
-         Fun.protect
-           ~finally:(fun () -> Mutex.unlock initialization_mutex)
-           (fun () -> add_to_order_to_symbol event.order_id event.symbol)));
+      let existing_opt = Hashtbl.find_opt store.open_orders event.order_id in
+      let resolved_cl_ord_id =
+        match event.cl_ord_id with
+        | Some _ as c -> c
+        | None ->
+          (match existing_opt with
+           | Some o -> o.cl_ord_id
+           | None -> None)
+      in
+      let is_terminal =
+        match event.order_status with
+        | FilledStatus | CanceledStatus | RejectedStatus | ExpiredStatus -> true
+        | _ -> false
+      in
+      if is_terminal
+      then (
+        Hashtbl.remove store.open_orders event.order_id;
+        publish_open_orders_cache store;
+        Mutex.lock initialization_mutex;
+        Fun.protect
+          ~finally:(fun () -> Mutex.unlock initialization_mutex)
+          (fun () -> Hashtbl.remove order_to_symbol event.order_id))
+      else (
+        (* Delta updates carry no expiry; keep the stored one. *)
+        let preserved_expiry =
+          match existing_opt with
+          | Some o -> o.order_expiry
+          | None -> None
+        in
+        let order : open_order =
+          { order_id = event.order_id
+          ; symbol = event.symbol
+          ; side = event.side
+          ; order_qty = event.order_qty
+          ; cum_qty = event.cum_qty
+          ; remaining_qty = event.order_qty -. event.cum_qty
+          ; limit_price = event.limit_price
+          ; avg_price = event.avg_price
+          ; order_status = event.order_status
+          ; order_userref = None
+          ; cl_ord_id = resolved_cl_ord_id
+          ; last_updated = now
+          ; order_expiry = preserved_expiry
+          }
+        in
+        Hashtbl.replace store.open_orders event.order_id order;
+        publish_open_orders_cache store;
+        Mutex.lock initialization_mutex;
+        Fun.protect
+          ~finally:(fun () -> Mutex.unlock initialization_mutex)
+          (fun () -> add_to_order_to_symbol event.order_id event.symbol)));
   RingBuffer.write store.events_buffer event;
   notify_ready store;
   Concurrency.Exchange_wakeup.signal ~symbol:event.symbol
@@ -345,8 +341,8 @@ let get_all_symbols () =
   symbols
 ;;
 
-(** Drops all open orders and resets readiness/snapshot state; used after a
-    hard disconnect so the next snapshot rebuilds from scratch. *)
+(** Drops all open orders and resets readiness/snapshot state; used after a hard
+    disconnect so the next snapshot rebuilds from scratch. *)
 let clear_all_open_orders () =
   Mutex.lock initialization_mutex;
   let all_symbols =
@@ -357,31 +353,31 @@ let clear_all_open_orders () =
   let total_removed = ref 0 in
   List.iter
     (fun symbol ->
-       let store = get_symbol_store symbol in
-       Mutex.lock store.orders_mutex;
-       Fun.protect
-         ~finally:(fun () -> Mutex.unlock store.orders_mutex)
-         (fun () ->
-            let count = Hashtbl.length store.open_orders in
-            total_removed := !total_removed + count;
-            Hashtbl.clear store.open_orders;
-            publish_open_orders_cache store;
-            Atomic.set store.ready false))
+      let store = get_symbol_store symbol in
+      Mutex.lock store.orders_mutex;
+      Fun.protect
+        ~finally:(fun () -> Mutex.unlock store.orders_mutex)
+        (fun () ->
+          let count = Hashtbl.length store.open_orders in
+          total_removed := !total_removed + count;
+          Hashtbl.clear store.open_orders;
+          publish_open_orders_cache store;
+          Atomic.set store.ready false))
     all_symbols;
   Mutex.lock initialization_mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock initialization_mutex)
     (fun () ->
-       Hashtbl.clear order_to_symbol;
-       Queue.clear order_to_symbol_queue);
+      Hashtbl.clear order_to_symbol;
+      Queue.clear order_to_symbol_queue);
   Atomic.set _startup_snapshot_done false;
   if !total_removed > 0
   then
     Logging.debug_f ~section "Cleared %d stale open orders on reconnection" !total_removed
 ;;
 
-(** Pre-registers a locally placed order before exchange confirmation arrives,
-    so strategies see it immediately. *)
+(** Pre-registers a locally placed order before exchange confirmation arrives, so
+    strategies see it immediately. *)
 let inject_order ~symbol ~order_id ~side ~qty ~price ?cl_ord_id () =
   let store = get_symbol_store symbol in
   let now = Unix.gettimeofday () in
@@ -413,8 +409,8 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?cl_ord_id () =
      | None -> "none")
 ;;
 
-(** Ingests one account_all_orders broadcast: parses each order entry, maps
-    statuses, and applies them via [update_orders_internal]. *)
+(** Ingests one account_all_orders broadcast: parses each order entry, maps statuses, and
+    applies them via [update_orders_internal]. *)
 let process_account_orders_update json =
   let open Yojson.Safe.Util in
   try
@@ -462,17 +458,16 @@ let process_account_orders_update json =
          | _ -> "?");
       ())
     else (
-      (* Normalize object-of-lists or plain list forms into a flat order
-         list. *)
+      (* Normalize object-of-lists or plain list forms into a flat order list. *)
       let orders =
         match orders_json with
         | `Assoc pairs ->
           List.concat_map
             (fun (_key, v) ->
-               match v with
-               | `Assoc _ -> [ v ]
-               | `List items -> items
-               | _ -> [])
+              match v with
+              | `Assoc _ -> [ v ]
+              | `List items -> items
+              | _ -> [])
             pairs
         | `List items -> items
         | _ ->
@@ -485,318 +480,317 @@ let process_account_orders_update json =
       in
       List.iter
         (fun order_json ->
-           try
-             match order_json with
-             | `Assoc _ ->
-               let order_index = member "order_index" order_json in
-               let order_id =
-                 match order_index with
-                 | `String s -> s
-                 | `Int i -> string_of_int i
-                 | _ -> Lighter_types.parse_json_int64 order_index |> Int64.to_string
-               in
-               let market_index =
-                 Lighter_types.parse_json_int (member "market_index" order_json)
-               in
-               let symbol =
-                 match Lighter_instruments_feed.get_symbol ~market_index with
-                 | Some s -> s
-                 | None -> string_of_int market_index
-               in
-               (* Status may arrive as int, numeric string, or name string.
-            Parse strings rather than coercing unknown alphanumerics to 0
-            (= Pending), which would misclassify orders. *)
-               let status_json = member "status" order_json in
-               let map_int status_int =
-                 match Lighter_types.status_of_lighter_int status_int with
-                 | Dio_exchange.Exchange_intf.Types.Pending -> PendingStatus
-                 | Dio_exchange.Exchange_intf.Types.New -> NewStatus
-                 | Dio_exchange.Exchange_intf.Types.PartiallyFilled ->
-                   PartiallyFilledStatus
-                 | Dio_exchange.Exchange_intf.Types.Filled -> FilledStatus
-                 | Dio_exchange.Exchange_intf.Types.Canceled -> CanceledStatus
-                 | Dio_exchange.Exchange_intf.Types.Expired -> ExpiredStatus
-                 | Dio_exchange.Exchange_intf.Types.Rejected -> RejectedStatus
-                 | Dio_exchange.Exchange_intf.Types.Unknown s -> UnknownStatus s
-               in
-               let order_status =
-                 match status_json with
-                 | `Int _ | `Float _ -> map_int (Lighter_types.parse_json_int status_json)
-                 | `String s ->
-                   (match int_of_string_opt s with
-                    | Some n -> map_int n
-                    | None ->
-                      (match String.lowercase_ascii s with
-                       | "open" | "new" | "active" -> NewStatus
-                       | "partially_filled" | "partial" -> PartiallyFilledStatus
-                       | "filled" -> FilledStatus
-                       | "cancelled" | "canceled" -> CanceledStatus
-                       | "expired" -> ExpiredStatus
-                       | "rejected" -> RejectedStatus
-                       | "pending" -> PendingStatus
-                       | "" ->
-                         let remaining =
-                           try
-                             Lighter_types.parse_json_float
-                               (member "remaining_base_amount" order_json)
-                           with
-                           | _ -> -1.0
-                         in
-                         let filled =
-                           try
-                             Lighter_types.parse_json_float
-                               (member "filled_base_amount" order_json)
-                           with
-                           | _ -> 0.0
-                         in
-                         if remaining = 0.0 && filled > 0.0
-                         then FilledStatus
-                         else if remaining > 0.0
-                         then NewStatus
-                         else UnknownStatus "no_status"
-                       | low -> UnknownStatus low))
-                 | _ ->
-                   let status_str =
-                     try to_string status_json with
-                     | _ -> ""
-                   in
-                   (match String.lowercase_ascii status_str with
-                    | "open" | "new" | "active" -> NewStatus
-                    | "partially_filled" | "partial" -> PartiallyFilledStatus
-                    | "filled" -> FilledStatus
-                    | "cancelled" | "canceled" -> CanceledStatus
-                    | "expired" -> ExpiredStatus
-                    | "rejected" -> RejectedStatus
-                    | "pending" -> PendingStatus
-                    | "" ->
-                      let remaining =
-                        try
-                          Lighter_types.parse_json_float
-                            (member "remaining_base_amount" order_json)
-                        with
-                        | _ -> -1.0
-                      in
-                      let filled =
-                        try
-                          Lighter_types.parse_json_float
-                            (member "filled_base_amount" order_json)
-                        with
-                        | _ -> 0.0
-                      in
-                      if remaining = 0.0 && filled > 0.0
-                      then FilledStatus
-                      else if remaining > 0.0
-                      then NewStatus
-                      else UnknownStatus "no_status"
-                    | s -> UnknownStatus s)
-               in
-               let is_ask =
-                 let is_ask_val =
-                   try
-                     let v = member "is_ask" order_json in
-                     if v <> `Null then v else member "isAsk" order_json
-                   with
-                   | _ -> `Null
-                 in
-                 match is_ask_val with
-                 | `Bool b -> b
-                 | `Int i -> i <> 0
-                 | `String s -> String.lowercase_ascii s = "true" || s = "1"
-                 | _ ->
-                   (try
-                      let side_str =
-                        member "side" order_json |> to_string |> String.lowercase_ascii
-                      in
-                      side_str = "sell" || side_str = "ask"
-                    with
-                    | _ -> false)
-               in
-               let side = if is_ask then Sell else Buy in
-               let price =
-                 try Lighter_types.parse_json_float (member "price" order_json) with
-                 | _ -> 0.0
-               in
-               let base_amount =
-                 try
-                   Lighter_types.parse_json_float
-                     (member "initial_base_amount" order_json)
-                 with
-                 | _ ->
-                   (try
-                      Lighter_types.parse_json_float (member "base_amount" order_json)
-                    with
-                    | _ -> 0.0)
-               in
-               let filled_base_amount =
-                 try
-                   Lighter_types.parse_json_float (member "filled_base_amount" order_json)
-                 with
-                 | _ -> 0.0
-               in
-               let remaining = base_amount -. filled_base_amount in
-               let avg_price =
-                 try
-                   Lighter_types.parse_json_float (member "avg_fill_price" order_json)
-                 with
-                 | _ -> price
-               in
-               (* Expiry: try ["e"], ["expiry"], then ["order_expiry"];
-            values > 1e12 are milliseconds, convert to epoch seconds. *)
-               let order_expiry =
-                 let try_field key =
-                   try
-                     let v = member key order_json in
-                     if v <> `Null
-                     then (
-                       let raw = Lighter_types.parse_json_float v in
-                       (* Values > 1e12 are milliseconds; convert to seconds *)
-                       if raw > 1e12 then Some (raw /. 1000.0) else Some raw)
-                     else None
-                   with
-                   | _ -> None
-                 in
-                 match try_field "e" with
-                 | Some _ as v -> v
-                 | None ->
-                   (match try_field "expiry" with
-                    | Some _ as v -> v
-                    | None -> try_field "order_expiry")
-               in
-               let store = get_symbol_store symbol in
-               let is_amended =
-                 try member "is_amended" order_json |> to_bool with
-                 | _ -> false
-               in
-               let now = Unix.gettimeofday () in
-               (* When the exchange order_index differs from the client-id
-            key, drop the stale client-id-keyed entry so tracking does not
-            diverge or double-report. *)
-               let client_order_id =
-                 try member "client_order_id" order_json |> to_string with
-                 | _ -> ""
-               in
-               let cl_ord_id =
-                 if client_order_id <> "" then Some client_order_id else None
-               in
-               if client_order_id <> "" && client_order_id <> order_id
-               then (
-                 Mutex.lock store.orders_mutex;
-                 let had_stale = Hashtbl.mem store.open_orders client_order_id in
-                 Hashtbl.remove store.open_orders client_order_id;
-                 Mutex.unlock store.orders_mutex;
-                 if had_stale
-                 then (
-                   Mutex.lock initialization_mutex;
-                   Hashtbl.remove order_to_symbol client_order_id;
-                   Mutex.unlock initialization_mutex;
-                   Logging.info_f
-                     ~section
-                     "Replaced local order %s with exchange order %s [%s]"
-                     client_order_id
-                     order_id
-                     symbol));
-               let event : execution_event =
-                 { order_id
-                 ; symbol
-                 ; order_status
-                 ; limit_price = Some price
-                 ; side
-                 ; order_qty = base_amount
-                 ; cum_qty = filled_base_amount
-                 ; avg_price
-                 ; timestamp = now
-                 ; is_amended
-                 ; cl_ord_id
-                 }
-               in
-               update_orders_internal store event;
-               (* Re-stamp expiry on the stored order; delta updates omit it. *)
-               let is_terminal_status =
-                 match order_status with
-                 | FilledStatus | CanceledStatus | RejectedStatus | ExpiredStatus -> true
-                 | _ -> false
-               in
-               (match order_expiry with
-                | Some exp when not is_terminal_status ->
-                  Mutex.lock store.orders_mutex;
-                  (match Hashtbl.find_opt store.open_orders event.order_id with
-                   | Some o ->
-                     Hashtbl.replace
-                       store.open_orders
-                       event.order_id
-                       { o with order_expiry = Some exp }
-                   | None -> ());
-                  Mutex.unlock store.orders_mutex
-                | _ -> ());
-               (match order_status with
-                | FilledStatus ->
-                  Logging.info_f
-                    ~section
-                    "Order FILLED: %s [%s] %.8f @ %.2f"
-                    order_id
-                    symbol
-                    base_amount
-                     price;
-                   let fill_value = filled_base_amount *. avg_price in
-                  let maker_fee_rate =
-                    match Dio_exchange.Exchange_intf.Registry.get "lighter" with
-                    | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
-                      (match Ex.get_fees ~symbol with
-                       | Some f, _ -> f
-                       | _ -> 0.0)
-                    | None -> 0.0
+          try
+            match order_json with
+            | `Assoc _ ->
+              let order_index = member "order_index" order_json in
+              let order_id =
+                match order_index with
+                | `String s -> s
+                | `Int i -> string_of_int i
+                | _ -> Lighter_types.parse_json_int64 order_index |> Int64.to_string
+              in
+              let market_index =
+                Lighter_types.parse_json_int (member "market_index" order_json)
+              in
+              let symbol =
+                match Lighter_instruments_feed.get_symbol ~market_index with
+                | Some s -> s
+                | None -> string_of_int market_index
+              in
+              (* Status may arrive as int, numeric string, or name string. Parse strings
+                 rather than coercing unknown alphanumerics to 0 (= Pending), which would
+                 misclassify orders. *)
+              let status_json = member "status" order_json in
+              let map_int status_int =
+                match Lighter_types.status_of_lighter_int status_int with
+                | Dio_exchange.Exchange_intf.Types.Pending -> PendingStatus
+                | Dio_exchange.Exchange_intf.Types.New -> NewStatus
+                | Dio_exchange.Exchange_intf.Types.PartiallyFilled ->
+                  PartiallyFilledStatus
+                | Dio_exchange.Exchange_intf.Types.Filled -> FilledStatus
+                | Dio_exchange.Exchange_intf.Types.Canceled -> CanceledStatus
+                | Dio_exchange.Exchange_intf.Types.Expired -> ExpiredStatus
+                | Dio_exchange.Exchange_intf.Types.Rejected -> RejectedStatus
+                | Dio_exchange.Exchange_intf.Types.Unknown s -> UnknownStatus s
+              in
+              let order_status =
+                match status_json with
+                | `Int _ | `Float _ -> map_int (Lighter_types.parse_json_int status_json)
+                | `String s ->
+                  (match int_of_string_opt s with
+                   | Some n -> map_int n
+                   | None ->
+                     (match String.lowercase_ascii s with
+                      | "open" | "new" | "active" -> NewStatus
+                      | "partially_filled" | "partial" -> PartiallyFilledStatus
+                      | "filled" -> FilledStatus
+                      | "cancelled" | "canceled" -> CanceledStatus
+                      | "expired" -> ExpiredStatus
+                      | "rejected" -> RejectedStatus
+                      | "pending" -> PendingStatus
+                      | "" ->
+                        let remaining =
+                          try
+                            Lighter_types.parse_json_float
+                              (member "remaining_base_amount" order_json)
+                          with
+                          | _ -> -1.0
+                        in
+                        let filled =
+                          try
+                            Lighter_types.parse_json_float
+                              (member "filled_base_amount" order_json)
+                          with
+                          | _ -> 0.0
+                        in
+                        if remaining = 0.0 && filled > 0.0
+                        then FilledStatus
+                        else if remaining > 0.0
+                        then NewStatus
+                        else UnknownStatus "no_status"
+                      | low -> UnknownStatus low))
+                | _ ->
+                  let status_str =
+                    try to_string status_json with
+                    | _ -> ""
                   in
-                  let fee = fill_value *. maker_fee_rate in
-                  Concurrency.Fill_event_bus.publish_fill
-                    { venue = "lighter"
-                    ; symbol
-                    ; side = (if is_ask then "sell" else "buy")
-                    ; amount = filled_base_amount
-                    ; fill_price = avg_price
-                    ; value = fill_value
-                    ; fee
-                    ; timestamp = Unix.gettimeofday ()
-                    ; order_id
-                    ; trade_id = order_id (* no separate trade id available *)
-                    };
-                  (* Trigger a REST balance refresh after fills. The WS balance
-                channel often lags, especially for unified account USDC
-                collateral. Without this, the strategy may see stale 0.00
-                quote balance and be unable to place new orders. *)
-                  Lighter_balances.request_balance_refresh ()
-                | CanceledStatus ->
+                  (match String.lowercase_ascii status_str with
+                   | "open" | "new" | "active" -> NewStatus
+                   | "partially_filled" | "partial" -> PartiallyFilledStatus
+                   | "filled" -> FilledStatus
+                   | "cancelled" | "canceled" -> CanceledStatus
+                   | "expired" -> ExpiredStatus
+                   | "rejected" -> RejectedStatus
+                   | "pending" -> PendingStatus
+                   | "" ->
+                     let remaining =
+                       try
+                         Lighter_types.parse_json_float
+                           (member "remaining_base_amount" order_json)
+                       with
+                       | _ -> -1.0
+                     in
+                     let filled =
+                       try
+                         Lighter_types.parse_json_float
+                           (member "filled_base_amount" order_json)
+                       with
+                       | _ -> 0.0
+                     in
+                     if remaining = 0.0 && filled > 0.0
+                     then FilledStatus
+                     else if remaining > 0.0
+                     then NewStatus
+                     else UnknownStatus "no_status"
+                   | s -> UnknownStatus s)
+              in
+              let is_ask =
+                let is_ask_val =
+                  try
+                    let v = member "is_ask" order_json in
+                    if v <> `Null then v else member "isAsk" order_json
+                  with
+                  | _ -> `Null
+                in
+                match is_ask_val with
+                | `Bool b -> b
+                | `Int i -> i <> 0
+                | `String s -> String.lowercase_ascii s = "true" || s = "1"
+                | _ ->
+                  (try
+                     let side_str =
+                       member "side" order_json |> to_string |> String.lowercase_ascii
+                     in
+                     side_str = "sell" || side_str = "ask"
+                   with
+                   | _ -> false)
+              in
+              let side = if is_ask then Sell else Buy in
+              let price =
+                try Lighter_types.parse_json_float (member "price" order_json) with
+                | _ -> 0.0
+              in
+              let base_amount =
+                try
+                  Lighter_types.parse_json_float (member "initial_base_amount" order_json)
+                with
+                | _ ->
+                  (try
+                     Lighter_types.parse_json_float (member "base_amount" order_json)
+                   with
+                   | _ -> 0.0)
+              in
+              let filled_base_amount =
+                try
+                  Lighter_types.parse_json_float (member "filled_base_amount" order_json)
+                with
+                | _ -> 0.0
+              in
+              let remaining = base_amount -. filled_base_amount in
+              let avg_price =
+                try
+                  Lighter_types.parse_json_float (member "avg_fill_price" order_json)
+                with
+                | _ -> price
+              in
+              (* Expiry: try ["e"], ["expiry"], then ["order_expiry"]; values > 1e12 are
+                 milliseconds, convert to epoch seconds. *)
+              let order_expiry =
+                let try_field key =
+                  try
+                    let v = member key order_json in
+                    if v <> `Null
+                    then (
+                      let raw = Lighter_types.parse_json_float v in
+                      (* Values > 1e12 are milliseconds; convert to seconds *)
+                      if raw > 1e12 then Some (raw /. 1000.0) else Some raw)
+                    else None
+                  with
+                  | _ -> None
+                in
+                match try_field "e" with
+                | Some _ as v -> v
+                | None ->
+                  (match try_field "expiry" with
+                   | Some _ as v -> v
+                   | None -> try_field "order_expiry")
+              in
+              let store = get_symbol_store symbol in
+              let is_amended =
+                try member "is_amended" order_json |> to_bool with
+                | _ -> false
+              in
+              let now = Unix.gettimeofday () in
+              (* When the exchange order_index differs from the client-id key, drop the
+                 stale client-id-keyed entry so tracking does not diverge or
+                 double-report. *)
+              let client_order_id =
+                try member "client_order_id" order_json |> to_string with
+                | _ -> ""
+              in
+              let cl_ord_id =
+                if client_order_id <> "" then Some client_order_id else None
+              in
+              if client_order_id <> "" && client_order_id <> order_id
+              then (
+                Mutex.lock store.orders_mutex;
+                let had_stale = Hashtbl.mem store.open_orders client_order_id in
+                Hashtbl.remove store.open_orders client_order_id;
+                Mutex.unlock store.orders_mutex;
+                if had_stale
+                then (
+                  Mutex.lock initialization_mutex;
+                  Hashtbl.remove order_to_symbol client_order_id;
+                  Mutex.unlock initialization_mutex;
                   Logging.info_f
                     ~section
-                    "Order CANCELED: %s [%s] %.8f @ %.2f"
+                    "Replaced local order %s with exchange order %s [%s]"
+                    client_order_id
                     order_id
-                    symbol
-                    base_amount
-                    price
-                | NewStatus ->
-                  Logging.debug_f
-                    ~section
-                    "Order ACTIVE: %s [%s] %.8f @ %.2f remaining=%.8f"
-                    order_id
-                    symbol
-                    base_amount
-                    price
-                    remaining
-                | PartiallyFilledStatus ->
-                  Logging.info_f
-                    ~section
-                    "Order PARTIAL: %s [%s] filled=%.8f/%.8f"
-                    order_id
-                    symbol
-                    filled_base_amount
-                    base_amount
-                | _ -> ())
-             | _ -> ()
-           with
-           | exn ->
-             Logging.warn_f
-               ~section
-               "Failed to parse order entry: %s"
-               (Printexc.to_string exn))
+                    symbol));
+              let event : execution_event =
+                { order_id
+                ; symbol
+                ; order_status
+                ; limit_price = Some price
+                ; side
+                ; order_qty = base_amount
+                ; cum_qty = filled_base_amount
+                ; avg_price
+                ; timestamp = now
+                ; is_amended
+                ; cl_ord_id
+                }
+              in
+              update_orders_internal store event;
+              (* Re-stamp expiry on the stored order; delta updates omit it. *)
+              let is_terminal_status =
+                match order_status with
+                | FilledStatus | CanceledStatus | RejectedStatus | ExpiredStatus -> true
+                | _ -> false
+              in
+              (match order_expiry with
+               | Some exp when not is_terminal_status ->
+                 Mutex.lock store.orders_mutex;
+                 (match Hashtbl.find_opt store.open_orders event.order_id with
+                  | Some o ->
+                    Hashtbl.replace
+                      store.open_orders
+                      event.order_id
+                      { o with order_expiry = Some exp }
+                  | None -> ());
+                 Mutex.unlock store.orders_mutex
+               | _ -> ());
+              (match order_status with
+               | FilledStatus ->
+                 Logging.info_f
+                   ~section
+                   "Order FILLED: %s [%s] %.8f @ %.2f"
+                   order_id
+                   symbol
+                   base_amount
+                   price;
+                 let fill_value = filled_base_amount *. avg_price in
+                 let maker_fee_rate =
+                   match Dio_exchange.Exchange_intf.Registry.get "lighter" with
+                   | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+                     (match Ex.get_fees ~symbol with
+                      | Some f, _ -> f
+                      | _ -> 0.0)
+                   | None -> 0.0
+                 in
+                 let fee = fill_value *. maker_fee_rate in
+                 Concurrency.Fill_event_bus.publish_fill
+                   { venue = "lighter"
+                   ; symbol
+                   ; side = (if is_ask then "sell" else "buy")
+                   ; amount = filled_base_amount
+                   ; fill_price = avg_price
+                   ; value = fill_value
+                   ; fee
+                   ; timestamp = Unix.gettimeofday ()
+                   ; order_id
+                   ; trade_id = order_id (* no separate trade id available *)
+                   };
+                 (* Trigger a REST balance refresh after fills. The WS balance channel
+                    often lags, especially for unified account USDC collateral. Without
+                    this, the strategy may see stale 0.00 quote balance and be unable to
+                    place new orders. *)
+                 Lighter_balances.request_balance_refresh ()
+               | CanceledStatus ->
+                 Logging.info_f
+                   ~section
+                   "Order CANCELED: %s [%s] %.8f @ %.2f"
+                   order_id
+                   symbol
+                   base_amount
+                   price
+               | NewStatus ->
+                 Logging.debug_f
+                   ~section
+                   "Order ACTIVE: %s [%s] %.8f @ %.2f remaining=%.8f"
+                   order_id
+                   symbol
+                   base_amount
+                   price
+                   remaining
+               | PartiallyFilledStatus ->
+                 Logging.info_f
+                   ~section
+                   "Order PARTIAL: %s [%s] filled=%.8f/%.8f"
+                   order_id
+                   symbol
+                   filled_base_amount
+                   base_amount
+               | _ -> ())
+            | _ -> ()
+          with
+          | exn ->
+            Logging.warn_f
+              ~section
+              "Failed to parse order entry: %s"
+              (Printexc.to_string exn))
         orders)
   with
   | exn ->
@@ -804,13 +798,13 @@ let process_account_orders_update json =
       ~section
       "Failed to process account orders update: %s"
       (Printexc.to_string exn);
-    (* Even a failed/unparseable update marks the snapshot done so downstream
-      components do not wait on readiness forever. *)
+    (* Even a failed/unparseable update marks the snapshot done so downstream components
+       do not wait on readiness forever. *)
     set_startup_snapshot_done ()
 ;;
 
-(** Reconciles local open orders against a full snapshot: ingests it, then
-    emits [CanceledStatus] for any locally tracked order absent from it. *)
+(** Reconciles local open orders against a full snapshot: ingests it, then emits
+    [CanceledStatus] for any locally tracked order absent from it. *)
 let handle_snapshot json =
   Logging.debug_f ~section "Processing Lighter execution snapshot...";
   process_account_orders_update json;
@@ -837,30 +831,30 @@ let handle_snapshot json =
        | `Assoc pairs ->
          List.concat_map
            (fun (_, v) ->
-              match v with
-              | `Assoc _ -> [ v ]
-              | `List items -> items
-              | _ -> [])
+             match v with
+             | `Assoc _ -> [ v ]
+             | `List items -> items
+             | _ -> [])
            pairs
        | `List items -> items
        | _ -> []
      in
      List.iter
        (fun order_json ->
-          try
-            match order_json with
-            | `Assoc _ ->
-              let order_index = member "order_index" order_json in
-              let order_id =
-                match order_index with
-                | `String s -> s
-                | `Int i -> string_of_int i
-                | _ -> Lighter_types.parse_json_int64 order_index |> Int64.to_string
-              in
-              Hashtbl.replace snapshot_order_ids order_id ()
-            | _ -> ()
-          with
-          | _ -> ())
+         try
+           match order_json with
+           | `Assoc _ ->
+             let order_index = member "order_index" order_json in
+             let order_id =
+               match order_index with
+               | `String s -> s
+               | `Int i -> string_of_int i
+               | _ -> Lighter_types.parse_json_int64 order_index |> Int64.to_string
+             in
+             Hashtbl.replace snapshot_order_ids order_id ()
+           | _ -> ()
+         with
+         | _ -> ())
        orders
    with
    | exn ->
@@ -875,39 +869,39 @@ let handle_snapshot json =
   Mutex.unlock initialization_mutex;
   List.iter
     (fun symbol ->
-       let store = get_symbol_store symbol in
-       Mutex.lock store.orders_mutex;
-       Fun.protect
-         ~finally:(fun () -> Mutex.unlock store.orders_mutex)
-         (fun () ->
-            Hashtbl.iter
-              (fun order_id (cached_order : open_order) ->
-                 if not (Hashtbl.mem snapshot_order_ids order_id)
-                 then stale_orders := (symbol, store, cached_order) :: !stale_orders)
-              store.open_orders))
+      let store = get_symbol_store symbol in
+      Mutex.lock store.orders_mutex;
+      Fun.protect
+        ~finally:(fun () -> Mutex.unlock store.orders_mutex)
+        (fun () ->
+          Hashtbl.iter
+            (fun order_id (cached_order : open_order) ->
+              if not (Hashtbl.mem snapshot_order_ids order_id)
+              then stale_orders := (symbol, store, cached_order) :: !stale_orders)
+            store.open_orders))
     all_symbols;
   List.iter
     (fun (symbol, store, (cached_order : open_order)) ->
-       let event : execution_event =
-         { order_id = cached_order.order_id
-         ; symbol
-         ; order_status = CanceledStatus
-         ; limit_price = cached_order.limit_price
-         ; side = cached_order.side
-         ; order_qty = cached_order.order_qty
-         ; cum_qty = cached_order.cum_qty
-         ; avg_price = cached_order.avg_price
-         ; timestamp = Unix.gettimeofday ()
-         ; is_amended = false
-         ; cl_ord_id = cached_order.cl_ord_id
-         }
-       in
-       update_orders_internal store event;
-       Logging.info_f
-         ~section
-         "Reconciled stale order: emitted CanceledStatus for %s [%s]"
-         cached_order.order_id
-         symbol)
+      let event : execution_event =
+        { order_id = cached_order.order_id
+        ; symbol
+        ; order_status = CanceledStatus
+        ; limit_price = cached_order.limit_price
+        ; side = cached_order.side
+        ; order_qty = cached_order.order_qty
+        ; cum_qty = cached_order.cum_qty
+        ; avg_price = cached_order.avg_price
+        ; timestamp = Unix.gettimeofday ()
+        ; is_amended = false
+        ; cl_ord_id = cached_order.cl_ord_id
+        }
+      in
+      update_orders_internal store event;
+      Logging.info_f
+        ~section
+        "Reconciled stale order: emitted CanceledStatus for %s [%s]"
+        cached_order.order_id
+        symbol)
     !stale_orders;
   if !stale_orders <> []
   then
@@ -917,8 +911,8 @@ let handle_snapshot json =
       (List.length !stale_orders)
 ;;
 
-(** Removes open orders untouched for over 24h and purges orphaned entries
-    from the global index and its FIFO queue. *)
+(** Removes open orders untouched for over 24h and purges orphaned entries from the global
+    index and its FIFO queue. *)
 let cleanup_stale_orders () =
   let now = Unix.gettimeofday () in
   let stale_threshold = 24.0 *. 3600.0 in
@@ -927,74 +921,74 @@ let cleanup_stale_orders () =
   Mutex.unlock initialization_mutex;
   List.iter
     (fun symbol ->
-       let store = get_symbol_store symbol in
-       let stale = ref [] in
-       Mutex.lock store.orders_mutex;
-       Fun.protect
-         ~finally:(fun () -> Mutex.unlock store.orders_mutex)
-         (fun () ->
-            Hashtbl.iter
-              (fun order_id (order : open_order) ->
-                 if now -. order.last_updated > stale_threshold
-                 then stale := order_id :: !stale)
-              store.open_orders;
-            List.iter
-              (fun oid ->
-                 Hashtbl.remove store.open_orders oid;
-                 Mutex.lock initialization_mutex;
-                 Fun.protect
-                   ~finally:(fun () -> Mutex.unlock initialization_mutex)
-                   (fun () -> Hashtbl.remove order_to_symbol oid))
-              !stale;
-            if !stale <> [] then publish_open_orders_cache store);
-       if !stale <> []
-       then
-         Logging.info_f
-           ~section
-           "Cleaned %d stale orders for %s"
-           (List.length !stale)
-           symbol)
+      let store = get_symbol_store symbol in
+      let stale = ref [] in
+      Mutex.lock store.orders_mutex;
+      Fun.protect
+        ~finally:(fun () -> Mutex.unlock store.orders_mutex)
+        (fun () ->
+          Hashtbl.iter
+            (fun order_id (order : open_order) ->
+              if now -. order.last_updated > stale_threshold
+              then stale := order_id :: !stale)
+            store.open_orders;
+          List.iter
+            (fun oid ->
+              Hashtbl.remove store.open_orders oid;
+              Mutex.lock initialization_mutex;
+              Fun.protect
+                ~finally:(fun () -> Mutex.unlock initialization_mutex)
+                (fun () -> Hashtbl.remove order_to_symbol oid))
+            !stale;
+          if !stale <> [] then publish_open_orders_cache store);
+      if !stale <> []
+      then
+        Logging.info_f
+          ~section
+          "Cleaned %d stale orders for %s"
+          (List.length !stale)
+          symbol)
     all_symbols;
-  (* Queue removals are lazy (no O(1) delete), so rebuild the FIFO queue
-      keeping only ids still present in the hashtable. *)
+  (* Queue removals are lazy (no O(1) delete), so rebuild the FIFO queue keeping only ids
+     still present in the hashtable. *)
   Mutex.lock initialization_mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock initialization_mutex)
     (fun () ->
-       let original_queue_len = Queue.length order_to_symbol_queue in
-       if original_queue_len > 0
-       then (
-         let temp = Queue.create () in
-         Queue.iter
-           (fun order_id ->
-              if Hashtbl.mem order_to_symbol order_id then Queue.push order_id temp)
-           order_to_symbol_queue;
-         Queue.clear order_to_symbol_queue;
-         Queue.transfer temp order_to_symbol_queue;
-         let removed = original_queue_len - Queue.length order_to_symbol_queue in
-         if removed > 0
-         then
-           Logging.debug_f
-             ~section
-             "Purged %d orphaned entries from order_to_symbol_queue (was %d, now %d)"
-             removed
-             original_queue_len
-             (Queue.length order_to_symbol_queue)))
+      let original_queue_len = Queue.length order_to_symbol_queue in
+      if original_queue_len > 0
+      then (
+        let temp = Queue.create () in
+        Queue.iter
+          (fun order_id ->
+            if Hashtbl.mem order_to_symbol order_id then Queue.push order_id temp)
+          order_to_symbol_queue;
+        Queue.clear order_to_symbol_queue;
+        Queue.transfer temp order_to_symbol_queue;
+        let removed = original_queue_len - Queue.length order_to_symbol_queue in
+        if removed > 0
+        then
+          Logging.debug_f
+            ~section
+            "Purged %d orphaned entries from order_to_symbol_queue (was %d, now %d)"
+            removed
+            original_queue_len
+            (Queue.length order_to_symbol_queue)))
 ;;
 
 let request_cleanup () =
   Lwt.async (fun () ->
     Lwt.catch
       (fun () ->
-         Logging.debug_f ~section "Running Lighter executions cleanup (requested)";
-         cleanup_stale_orders ();
-         Lwt.return_unit)
+        Logging.debug_f ~section "Running Lighter executions cleanup (requested)";
+        cleanup_stale_orders ();
+        Lwt.return_unit)
       (fun exn ->
-         Logging.error_f
-           ~section
-           "Failed immediate cleanup task: %s"
-           (Printexc.to_string exn);
-         Lwt.return_unit))
+        Logging.error_f
+          ~section
+          "Failed immediate cleanup task: %s"
+          (Printexc.to_string exn);
+        Lwt.return_unit))
 ;;
 
 let periodic_tasks_started = Atomic.make false
@@ -1007,19 +1001,19 @@ let start_periodic_tasks () =
          ~interval:120.0
          ~stop:(fun () -> false)
          (fun () ->
-            Lwt.catch
-              (fun () ->
-                 Logging.debug_f
-                   ~section
-                   "Running Lighter executions cleanup (120s fallback)";
-                 cleanup_stale_orders ();
-                 Lwt.return_unit)
-              (fun exn ->
-                 Logging.error_f
-                   ~section
-                   "Lighter executions cleanup task crashed: %s"
-                   (Printexc.to_string exn);
-                 Lwt.return_unit)))
+           Lwt.catch
+             (fun () ->
+               Logging.debug_f
+                 ~section
+                 "Running Lighter executions cleanup (120s fallback)";
+               cleanup_stale_orders ();
+               Lwt.return_unit)
+             (fun exn ->
+               Logging.error_f
+                 ~section
+                 "Lighter executions cleanup task crashed: %s"
+                 (Printexc.to_string exn);
+               Lwt.return_unit)))
 ;;
 
 (** Snapshot of all open orders across symbols; callers filter by expiry. *)
@@ -1033,14 +1027,14 @@ let get_all_open_orders_with_expiry () =
   let result = ref [] in
   List.iter
     (fun symbol ->
-       let store = get_symbol_store symbol in
-       Mutex.lock store.orders_mutex;
-       Fun.protect
-         ~finally:(fun () -> Mutex.unlock store.orders_mutex)
-         (fun () ->
-            Hashtbl.iter
-              (fun _order_id (order : open_order) -> result := order :: !result)
-              store.open_orders))
+      let store = get_symbol_store symbol in
+      Mutex.lock store.orders_mutex;
+      Fun.protect
+        ~finally:(fun () -> Mutex.unlock store.orders_mutex)
+        (fun () ->
+          Hashtbl.iter
+            (fun _order_id (order : open_order) -> result := order :: !result)
+            store.open_orders))
     all_symbols;
   !result
 ;;
@@ -1053,7 +1047,7 @@ let initialize symbols =
     (List.length symbols);
   List.iter
     (fun symbol ->
-       let _ = get_symbol_store symbol in
-       Logging.debug_f ~section "Created Lighter execution store for %s" symbol)
+      let _ = get_symbol_store symbol in
+      Logging.debug_f ~section "Created Lighter execution store for %s" symbol)
     symbols
 ;;

@@ -1,7 +1,6 @@
-(* Tests for the rewritten Dio_oracle.Oracle_runtime: the pure decision-path
-   pieces - effective knob resolution (assets overrides keyed by symbol),
-   symbol splitting, sell sizing from base pools, and the changed-only
-   publish set feeding decision_for. *)
+(* Tests for the rewritten Dio_oracle.Oracle_runtime: the pure decision-path pieces -
+   effective knob resolution (assets overrides keyed by symbol), symbol splitting, sell
+   sizing from base pools, and the changed-only publish set feeding decision_for. *)
 
 let near ?(eps = 1e-9) name a b = Alcotest.(check (float eps)) name a b
 
@@ -24,7 +23,7 @@ let make_decision ~active ?(buy_qty = 1.0) ?(symbol = "X/USD") () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* Effective knobs                                                    *)
+(* Effective knobs *)
 (* ------------------------------------------------------------------ *)
 
 let test_effective_knobs_defaults () =
@@ -74,7 +73,7 @@ let test_effective_knobs_asset_override () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* Symbol split                                                       *)
+(* Symbol split *)
 (* ------------------------------------------------------------------ *)
 
 let test_split_symbol () =
@@ -87,7 +86,7 @@ let test_split_symbol () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* Sell sizing                                                        *)
+(* Sell sizing *)
 (* ------------------------------------------------------------------ *)
 
 let test_sell_qty_of () =
@@ -103,7 +102,7 @@ let test_sell_qty_of () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* Publish + decision_for                                             *)
+(* Publish + decision_for *)
 (* ------------------------------------------------------------------ *)
 
 let test_publish_and_decision_for () =
@@ -126,8 +125,8 @@ let test_publish_and_decision_for () =
 ;;
 
 let test_default_config_spec_values () =
-  (* Spec defaults: qty_cap_mult 1.5, target_survival 0.95,
-     min_active_dsurv 0.0, refresh_seconds 300.0. *)
+  (* Spec defaults: qty_cap_mult 1.5, target_survival 0.95, min_active_dsurv 0.0,
+     refresh_seconds 300.0. *)
   let c = Dio_oracle.Oracle_runtime.default_config () in
   near "qty_cap_mult" 1.5 c.Dio_oracle.Oracle_runtime.qty_cap_mult;
   near "target_survival" 0.95 c.target_survival;

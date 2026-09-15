@@ -1,7 +1,7 @@
-(* Oracle_balances tests: the venue-independent snapshot aggregation. The
-   per-venue balance PARSERS now live in each venue's oracle adapter and are
-   tested there (test/external/<venue>/test_<venue>_oracle.ml); this file
-   covers the snapshot plumbing (merge, quote/asset aggregation). *)
+(* Oracle_balances tests: the venue-independent snapshot aggregation. The per-venue
+   balance PARSERS now live in each venue's oracle adapter and are tested there
+   (test/external/<venue>/test_<venue>_oracle.ml); this file covers the snapshot plumbing
+   (merge, quote/asset aggregation). *)
 
 let near a b = Alcotest.(check (float 1e-9)) "approx" a b
 

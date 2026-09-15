@@ -1,23 +1,21 @@
 (** US equity market session state.
 
-    Reports whether the extended session (4:00 AM to 8:00 PM ET,
-    Monday-Friday) is open; the supervisor gates connection and contract
-    resolution attempts on this status so it does not spin against a
-    closed gateway.
+    Reports whether the extended session (4:00 AM to 8:00 PM ET, Monday-Friday) is open;
+    the supervisor gates connection and contract resolution attempts on this status so it
+    does not spin against a closed gateway.
 
-    Exchange holidays are not tracked; on a holiday the gateway rejects
-    once and the supervisor defers until the next window. *)
+    Exchange holidays are not tracked; on a holiday the gateway rejects once and the
+    supervisor defers until the next window. *)
 
 let section = "ibkr_market_hours"
 
-(** When true, narrows [is_market_open] to regular trading hours (9:30 AM to 4 PM)
-    because IB Gateway in paper mode does not serve useful data during
-    pre-market or after-hours. Set by [Ibkr_module.Config.set_testnet]. *)
+(** When true, narrows [is_market_open] to regular trading hours (9:30 AM to 4 PM) because
+    IB Gateway in paper mode does not serve useful data during pre-market or after-hours.
+    Set by [Ibkr_module.Config.set_testnet]. *)
 let paper_mode = ref false
 
-(** Current US Eastern UTC offset: -4 (EDT) from 2:00 AM on the second
-    Sunday of March to 2:00 AM on the first Sunday of November, -5
-    (EST) otherwise. *)
+(** Current US Eastern UTC offset: -4 (EDT) from 2:00 AM on the second Sunday of March to
+    2:00 AM on the first Sunday of November, -5 (EST) otherwise. *)
 let us_eastern_offset_hours () =
   let t = Unix.gettimeofday () in
   let tm = Unix.gmtime t in
@@ -110,8 +108,8 @@ let extended_open_min = 0
 let extended_close_hour = 20
 let extended_close_min = 0
 
-(** Regular trading hours: [true] between 9:30 AM and 4:00 PM ET on
-    weekdays. Drives the dashboard open/paused flag. *)
+(** Regular trading hours: [true] between 9:30 AM and 4:00 PM ET on weekdays. Drives the
+    dashboard open/paused flag. *)
 let is_regular_market_open () =
   let wday, hour, min = current_eastern_time () in
   let is_weekday = wday >= 1 && wday <= 5 in
@@ -124,8 +122,8 @@ let is_regular_market_open () =
     time_mins >= open_mins && time_mins < close_mins)
 ;;
 
-(** [true] within the 4:00 AM to 8:00 PM ET weekday window (extended
-    session), or RTH only when [paper_mode] is set. *)
+(** [true] within the 4:00 AM to 8:00 PM ET weekday window (extended session), or RTH only
+    when [paper_mode] is set. *)
 let is_market_open () =
   let wday, hour, min = current_eastern_time () in
   (* Monday=1 through Friday=5; Saturday=6, Sunday=0 *)
@@ -136,9 +134,9 @@ let is_market_open () =
     let time_mins = (hour * 60) + min in
     if !paper_mode
     then (
-      (* Paper mode: restrict to regular trading hours only.
-         IB Gateway paper does not support pre-market/after-hours trading
-         and may not accept connections outside RTH. *)
+      (* Paper mode: restrict to regular trading hours only. IB Gateway paper does not
+         support pre-market/after-hours trading and may not accept connections outside
+         RTH. *)
       let rth_open = (9 * 60) + 30 in
       let rth_close = 16 * 60 in
       time_mins >= rth_open && time_mins < rth_close)
@@ -148,10 +146,9 @@ let is_market_open () =
       time_mins >= open_mins && time_mins < close_mins))
 ;;
 
-(** Seconds until the next session open; 0.0 if the market is open now.
-    Targets 9:30 AM ET in paper mode, 4:00 AM ET otherwise. Handles
-    weekend rollover, but uses only the current UTC offset: a DST
-    transition inside the interval shifts the result by an hour. *)
+(** Seconds until the next session open; 0.0 if the market is open now. Targets 9:30 AM ET
+    in paper mode, 4:00 AM ET otherwise. Handles weekend rollover, but uses only the
+    current UTC offset: a DST transition inside the interval shifts the result by an hour. *)
 let seconds_until_next_open () =
   if is_market_open ()
   then 0.0
@@ -200,8 +197,8 @@ let seconds_until_next_open () =
     Float.max delta 1.0)
 ;;
 
-(** Human-readable session status (pre-market, regular, after-hours, or
-    closed) for logging and telemetry. *)
+(** Human-readable session status (pre-market, regular, after-hours, or closed) for
+    logging and telemetry. *)
 let market_status_string () =
   let wday, hour, min = current_eastern_time () in
   let is_weekday = wday >= 1 && wday <= 5 in
@@ -226,8 +223,7 @@ let market_status_string () =
     else "open (regular hours)")
 ;;
 
-(** Logs the session status and time to next open; called at startup and
-    after reconnects. *)
+(** Logs the session status and time to next open; called at startup and after reconnects. *)
 let log_market_status () =
   let status = market_status_string () in
   let secs = seconds_until_next_open () in

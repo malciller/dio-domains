@@ -220,14 +220,13 @@ let format_latency_us f =
   add_commas raw
 ;;
 
-(** [true] for a sub-microsecond latency value (< 1us, rendered as
-    nanoseconds), so callers can style nanosecond cells distinctly from
-    microsecond cells. *)
+(** [true] for a sub-microsecond latency value (< 1us, rendered as nanoseconds), so
+    callers can style nanosecond cells distinctly from microsecond cells. *)
 let is_sub_us f = f > 0.0 && f < 1.0
 
-(** Display width of a string as Notty renders it. Pure ASCII uses the byte
-    length; anything else defers to Notty's Uucp-backed grapheme width, so wide
-    glyphs and emoji align with the renderer instead of drifting. *)
+(** Display width of a string as Notty renders it. Pure ASCII uses the byte length;
+    anything else defers to Notty's Uucp-backed grapheme width, so wide glyphs and emoji
+    align with the renderer instead of drifting. *)
 let display_width s =
   let n = String.length s in
   let rec ascii i =
@@ -238,8 +237,8 @@ let display_width s =
 
 let utf8_len = display_width
 
-(** Truncate to at most [n] display columns, appending "." when shortened.
-    Cuts on UTF-8 codepoint boundaries so it never emits a partial glyph. *)
+(** Truncate to at most [n] display columns, appending "." when shortened. Cuts on UTF-8
+    codepoint boundaries so it never emits a partial glyph. *)
 let truncate_string n s =
   if display_width s <= n
   then s
@@ -276,7 +275,7 @@ let repeat_str s n =
 let repeat_char c n = repeat_str (String.make 1 c) n
 
 (* -------------------------------------------------------------------------- *)
-(* Multi-Theme Palette System                                                 *)
+(* Multi-Theme Palette System *)
 (* -------------------------------------------------------------------------- *)
 
 type theme_palette =
@@ -334,39 +333,39 @@ type theme_palette =
   }
 
 let make_theme
-      ~id
-      ~name
-      ~desc
-      ~accent_rgb
-      ~bg_rgb
-      ~c_bg
-      ~c_panel
-      ~c_section_bg
-      ~c_border
-      ~c_title
-      ~c_accent
-      ~c_label
-      ~c_text
-      ~c_bright
-      ~c_green
-      ~c_green_dark
-      ~c_red
-      ~c_yellow
-      ~c_cyan
-      ~c_dim
-      ~c_near_fill
-      ~c_near_sell
-      ~c_magenta
-      ~c_selected
-      ~c_exch_hl
-      ~c_exch_kr
-      ~c_exch_li
-      ~c_exch_ib
-      ~c_exch_alp
-      ~c_bps_tight
-      ~c_bps_norm
-      ~c_bps_wide
-      ~c_bps_xtrm
+  ~id
+  ~name
+  ~desc
+  ~accent_rgb
+  ~bg_rgb
+  ~c_bg
+  ~c_panel
+  ~c_section_bg
+  ~c_border
+  ~c_title
+  ~c_accent
+  ~c_label
+  ~c_text
+  ~c_bright
+  ~c_green
+  ~c_green_dark
+  ~c_red
+  ~c_yellow
+  ~c_cyan
+  ~c_dim
+  ~c_near_fill
+  ~c_near_sell
+  ~c_magenta
+  ~c_selected
+  ~c_exch_hl
+  ~c_exch_kr
+  ~c_exch_li
+  ~c_exch_ib
+  ~c_exch_alp
+  ~c_bps_tight
+  ~c_bps_norm
+  ~c_bps_wide
+  ~c_bps_xtrm
   =
   let a_label = A.(fg c_label ++ bg c_bg) in
   let a_text = A.(fg c_text ++ bg c_bg) in
@@ -1170,10 +1169,10 @@ let normalize_theme_str s =
   let buf = Buffer.create (String.length s) in
   String.iter
     (fun c ->
-       match c with
-       | 'a' .. 'z' | '0' .. '9' -> Buffer.add_char buf c
-       | 'A' .. 'Z' -> Buffer.add_char buf (Char.lowercase_ascii c)
-       | _ -> ())
+      match c with
+      | 'a' .. 'z' | '0' .. '9' -> Buffer.add_char buf c
+      | 'A' .. 'Z' -> Buffer.add_char buf (Char.lowercase_ascii c)
+      | _ -> ())
     s;
   Buffer.contents buf
 ;;
@@ -1190,7 +1189,7 @@ let set_theme_by_id id =
     | None ->
       List.find_opt
         (fun (t : theme_palette) ->
-           normalize_theme_str t.id = id_norm || normalize_theme_str t.name = id_norm)
+          normalize_theme_str t.id = id_norm || normalize_theme_str t.name = id_norm)
         all_themes_list
   in
   let match_opt =
@@ -1199,9 +1198,9 @@ let set_theme_by_id id =
     | None ->
       List.find_opt
         (fun (t : theme_palette) ->
-           let t_norm = normalize_theme_str t.id in
-           String.starts_with ~prefix:id_norm t_norm
-           || String.starts_with ~prefix:id_norm (normalize_theme_str t.name))
+          let t_norm = normalize_theme_str t.id in
+          String.starts_with ~prefix:id_norm t_norm
+          || String.starts_with ~prefix:id_norm (normalize_theme_str t.name))
         all_themes_list
   in
   match match_opt with
@@ -1549,12 +1548,12 @@ let render_card w title content_rows =
   let body_rows =
     List.map
       (fun row_img ->
-         let row_cropped = I.hsnap ~align:`Left inner_w row_img in
-         I.hcat
-           [ I.string A.(fg t.c_border ++ bg t.c_bg) " │ "
-           ; row_cropped
-           ; I.string A.(fg t.c_border ++ bg t.c_bg) " │"
-           ])
+        let row_cropped = I.hsnap ~align:`Left inner_w row_img in
+        I.hcat
+          [ I.string A.(fg t.c_border ++ bg t.c_bg) " │ "
+          ; row_cropped
+          ; I.string A.(fg t.c_border ++ bg t.c_bg) " │"
+          ])
       content_rows
   in
   let bot_fill = max 0 (w - 2) in
@@ -1569,7 +1568,7 @@ let render_card w title content_rows =
 ;;
 
 (* -------------------------------------------------------------------------- *)
-(* Theme Selector Modal Dialog with Windowed Scrolling                        *)
+(* Theme Selector Modal Dialog with Windowed Scrolling *)
 (* -------------------------------------------------------------------------- *)
 
 let render_theme_modal ~target_w ~target_h ~cursor_idx =
@@ -1607,55 +1606,55 @@ let render_theme_modal ~target_w ~target_h ~cursor_idx =
   let item_rows =
     List.mapi
       (fun relative_i (theme_item : theme_palette) ->
-         let abs_i = start_idx + relative_i in
-         let is_cursor = abs_i = cursor_idx in
-         let is_active = theme_item.id = t.id in
-         let row_bg = if is_cursor then t.c_selected else t.c_panel in
-         let prefix =
-           if is_cursor
-           then I.string A.(fg t.c_accent ++ bg row_bg ++ st bold) " ▶ "
-           else I.string A.(fg t.c_dim ++ bg row_bg) "   "
-         in
-         let check =
-           if is_active
-           then I.string A.(fg t.c_green ++ bg row_bg ++ st bold) "[●] "
-           else I.string A.(fg t.c_dim ++ bg row_bg) "[ ] "
-         in
-         let id_attr =
-           if is_cursor
-           then A.(fg t.c_bright ++ bg row_bg ++ st bold)
-           else if is_active
-           then A.(fg t.c_title ++ bg row_bg ++ st bold)
-           else A.(fg t.c_text ++ bg row_bg ++ st bold)
-         in
-         let id_img = I.string id_attr (Printf.sprintf "%-14s" theme_item.id) in
-         let name_attr =
-           if is_cursor then A.(fg t.c_cyan ++ bg row_bg) else A.(fg t.c_dim ++ bg row_bg)
-         in
-         let name_img =
-           I.string name_attr (Printf.sprintf "%-19s" ("(" ^ theme_item.name ^ ")"))
-         in
-         let swatches =
-           I.hcat
-             [ I.string A.(fg theme_item.c_accent ++ bg row_bg) "■ "
-             ; I.string A.(fg theme_item.c_green ++ bg row_bg) "■ "
-             ; I.string A.(fg theme_item.c_red ++ bg row_bg) "■ "
-             ; I.string A.(fg theme_item.c_cyan ++ bg row_bg) "■ "
-             ; I.string A.(fg theme_item.c_yellow ++ bg row_bg) "■ "
-             ; I.string A.(fg theme_item.c_border ++ bg row_bg) "■"
-             ]
-         in
-         let line1_content = I.hcat [ prefix; check; id_img; name_img; swatches ] in
-         let pad1 = max 0 (inner_w - I.width line1_content) in
-         let line1 =
-           I.hcat
-             [ I.string A.(fg t.c_border ++ bg t.c_panel) " │ "
-             ; line1_content
-             ; I.string A.(bg row_bg) (String.make pad1 ' ')
-             ; I.string A.(fg t.c_border ++ bg t.c_panel) " │"
-             ]
-         in
-         line1)
+        let abs_i = start_idx + relative_i in
+        let is_cursor = abs_i = cursor_idx in
+        let is_active = theme_item.id = t.id in
+        let row_bg = if is_cursor then t.c_selected else t.c_panel in
+        let prefix =
+          if is_cursor
+          then I.string A.(fg t.c_accent ++ bg row_bg ++ st bold) " ▶ "
+          else I.string A.(fg t.c_dim ++ bg row_bg) "   "
+        in
+        let check =
+          if is_active
+          then I.string A.(fg t.c_green ++ bg row_bg ++ st bold) "[●] "
+          else I.string A.(fg t.c_dim ++ bg row_bg) "[ ] "
+        in
+        let id_attr =
+          if is_cursor
+          then A.(fg t.c_bright ++ bg row_bg ++ st bold)
+          else if is_active
+          then A.(fg t.c_title ++ bg row_bg ++ st bold)
+          else A.(fg t.c_text ++ bg row_bg ++ st bold)
+        in
+        let id_img = I.string id_attr (Printf.sprintf "%-14s" theme_item.id) in
+        let name_attr =
+          if is_cursor then A.(fg t.c_cyan ++ bg row_bg) else A.(fg t.c_dim ++ bg row_bg)
+        in
+        let name_img =
+          I.string name_attr (Printf.sprintf "%-19s" ("(" ^ theme_item.name ^ ")"))
+        in
+        let swatches =
+          I.hcat
+            [ I.string A.(fg theme_item.c_accent ++ bg row_bg) "■ "
+            ; I.string A.(fg theme_item.c_green ++ bg row_bg) "■ "
+            ; I.string A.(fg theme_item.c_red ++ bg row_bg) "■ "
+            ; I.string A.(fg theme_item.c_cyan ++ bg row_bg) "■ "
+            ; I.string A.(fg theme_item.c_yellow ++ bg row_bg) "■ "
+            ; I.string A.(fg theme_item.c_border ++ bg row_bg) "■"
+            ]
+        in
+        let line1_content = I.hcat [ prefix; check; id_img; name_img; swatches ] in
+        let pad1 = max 0 (inner_w - I.width line1_content) in
+        let line1 =
+          I.hcat
+            [ I.string A.(fg t.c_border ++ bg t.c_panel) " │ "
+            ; line1_content
+            ; I.string A.(bg row_bg) (String.make pad1 ' ')
+            ; I.string A.(fg t.c_border ++ bg t.c_panel) " │"
+            ]
+        in
+        line1)
       visible_themes
   in
   let div_row =

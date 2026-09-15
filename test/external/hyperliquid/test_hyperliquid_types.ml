@@ -32,10 +32,7 @@ let test_pack_id () =
    | Msgpck.Int i -> Alcotest.(check int) "fits in int" 12345 i
    | _ -> Alcotest.fail "Expected Int");
   (* Large ID: may not fit a 63-bit int on 32-bit systems, but fits int64. *)
-  let id2 =
-    9223372036854775807L
-    (* Int64.max_int *)
-  in
+  let id2 = 9223372036854775807L (* Int64.max_int *) in
   let packed2 = Hyperliquid.Types.pack_id id2 in
   match packed2 with
   | Msgpck.Int i ->

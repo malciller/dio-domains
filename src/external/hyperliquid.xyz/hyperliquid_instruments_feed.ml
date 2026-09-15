@@ -1,6 +1,6 @@
-(** Instrument metadata cache (symbol, size decimals, max leverage, asset
-    index) built from WebSocket meta payloads. Provides lookup, rounding, and
-    subscription-identifier resolution. *)
+(** Instrument metadata cache (symbol, size decimals, max leverage, asset index) built
+    from WebSocket meta payloads. Provides lookup, rounding, and subscription-identifier
+    resolution. *)
 
 let section = "hyperliquid_instruments_feed"
 
@@ -16,10 +16,10 @@ type pair_info =
 let pair_cache : (string, pair_info) Hashtbl.t = Hashtbl.create 128
 let cache_mutex = Mutex.create ()
 
-(* Lock-free reads. [published_cache] is a copy-on-write snapshot: the single
-   writer mutates [pair_cache] under [cache_mutex], then republishes via one
-   [Atomic.set]. [lookup_info] does one [Atomic.get] + [Hashtbl.find] with no
-   mutex. The published table is never mutated. *)
+(* Lock-free reads. [published_cache] is a copy-on-write snapshot: the single writer
+   mutates [pair_cache] under [cache_mutex], then republishes via one [Atomic.set].
+   [lookup_info] does one [Atomic.get] + [Hashtbl.find] with no mutex. The published table
+   is never mutated. *)
 let published_cache : (string, pair_info) Hashtbl.t Atomic.t =
   Atomic.make (Hashtbl.create 128)
 ;;
@@ -40,114 +40,113 @@ let notify_ready () =
   Lwt_condition.broadcast ready_condition ()
 ;;
 
-(** Parses perpetual and spot instrument metadata from JSON payloads
-    received via WebSocket. Populates [pair_cache] and signals readiness
-    on completion. Spot instruments are keyed by both canonical symbol
-    and [@N] alias. *)
+(** Parses perpetual and spot instrument metadata from JSON payloads received via
+    WebSocket. Populates [pair_cache] and signals readiness on completion. Spot
+    instruments are keyed by both canonical symbol and [@N] alias. *)
 let process_meta_response payload_perp payload_spot =
   Lwt.catch
     (fun () ->
-       let open Yojson.Safe.Util in
-       let universe_perp = member "universe" payload_perp |> to_list in
-       let universe_spot = member "universe" payload_spot |> to_list in
-       let tokens_spot = member "tokens" payload_spot |> to_list in
-       let spot_info_by_token_idx = Hashtbl.create 512 in
-       List.iter
-         (fun t ->
-            try
-              let idx = member "index" t |> to_int in
-              let name = member "name" t |> to_string in
-              let sz_decimals = member "szDecimals" t |> to_int in
-              Hashtbl.replace spot_info_by_token_idx idx (name, sz_decimals)
-            with
-            | _ -> ())
-         tokens_spot;
-       Mutex.lock cache_mutex;
-       (* Iterate perpetual universe; asset_index matches list position. *)
-       List.iteri
-         (fun idx item ->
-            try
-              let symbol = member "name" item |> to_string in
-              let sz_decimals = member "szDecimals" item |> to_int in
-              let max_leverage = Some (member "maxLeverage" item |> to_int) in
-              let info = { symbol; sz_decimals; max_leverage; asset_index = idx } in
-              Hashtbl.replace pair_cache symbol info
-            with
-            | exn ->
-              Logging.warn_f
-                ~section
-                "Failed to parse perp item: %s"
-                (Printexc.to_string exn))
-         universe_perp;
-       (* Spot: resolve base/quote through the token index table. *)
-       List.iter
-         (fun item ->
-            try
-              let index = member "index" item |> to_int in
-              let tokens_arr = member "tokens" item |> to_list in
-              let base_idx, quote_idx =
-                match tokens_arr with
-                | b :: q :: _ -> to_int b, to_int q
-                | _ -> failwith "invalid tokens array"
-              in
-              let base_name, sz_decimals = Hashtbl.find spot_info_by_token_idx base_idx in
-              let quote_name, _ = Hashtbl.find spot_info_by_token_idx quote_idx in
-              (* Canonicalize wrapped token names (e.g. UBTC to BTC). *)
-              let canon_base =
-                match base_name with
-                | "UBTC" -> "BTC"
-                | "UETH" -> "ETH"
-                | "USOL" -> "SOL"
-                | _ -> base_name
-              in
-              let symbol = canon_base ^ "/" ^ quote_name in
-              let info =
-                { symbol; sz_decimals; max_leverage = None; asset_index = 10000 + index }
-              in
-              Hashtbl.replace pair_cache symbol info;
-              let alias = Printf.sprintf "@%d" index in
-              let alias_info =
-                { symbol; sz_decimals; max_leverage = None; asset_index = 10000 + index }
-              in
-              Hashtbl.replace pair_cache alias alias_info
-            with
-            | exn ->
-              Logging.warn_f
-                ~section
-                "Failed to parse spot item: %s"
-                (Printexc.to_string exn))
-         universe_spot;
-       Mutex.unlock cache_mutex;
-       publish_cache ();
-       Logging.debug_f
-         ~section
-         "Initialized Hyperliquid instrument feed via WS payload with %d perps and %d \
-          spot pairs"
-         (List.length universe_perp)
-         (List.length universe_spot);
-       notify_ready ();
-       Lwt.return_unit)
+      let open Yojson.Safe.Util in
+      let universe_perp = member "universe" payload_perp |> to_list in
+      let universe_spot = member "universe" payload_spot |> to_list in
+      let tokens_spot = member "tokens" payload_spot |> to_list in
+      let spot_info_by_token_idx = Hashtbl.create 512 in
+      List.iter
+        (fun t ->
+          try
+            let idx = member "index" t |> to_int in
+            let name = member "name" t |> to_string in
+            let sz_decimals = member "szDecimals" t |> to_int in
+            Hashtbl.replace spot_info_by_token_idx idx (name, sz_decimals)
+          with
+          | _ -> ())
+        tokens_spot;
+      Mutex.lock cache_mutex;
+      (* Iterate perpetual universe; asset_index matches list position. *)
+      List.iteri
+        (fun idx item ->
+          try
+            let symbol = member "name" item |> to_string in
+            let sz_decimals = member "szDecimals" item |> to_int in
+            let max_leverage = Some (member "maxLeverage" item |> to_int) in
+            let info = { symbol; sz_decimals; max_leverage; asset_index = idx } in
+            Hashtbl.replace pair_cache symbol info
+          with
+          | exn ->
+            Logging.warn_f
+              ~section
+              "Failed to parse perp item: %s"
+              (Printexc.to_string exn))
+        universe_perp;
+      (* Spot: resolve base/quote through the token index table. *)
+      List.iter
+        (fun item ->
+          try
+            let index = member "index" item |> to_int in
+            let tokens_arr = member "tokens" item |> to_list in
+            let base_idx, quote_idx =
+              match tokens_arr with
+              | b :: q :: _ -> to_int b, to_int q
+              | _ -> failwith "invalid tokens array"
+            in
+            let base_name, sz_decimals = Hashtbl.find spot_info_by_token_idx base_idx in
+            let quote_name, _ = Hashtbl.find spot_info_by_token_idx quote_idx in
+            (* Canonicalize wrapped token names (e.g. UBTC to BTC). *)
+            let canon_base =
+              match base_name with
+              | "UBTC" -> "BTC"
+              | "UETH" -> "ETH"
+              | "USOL" -> "SOL"
+              | _ -> base_name
+            in
+            let symbol = canon_base ^ "/" ^ quote_name in
+            let info =
+              { symbol; sz_decimals; max_leverage = None; asset_index = 10000 + index }
+            in
+            Hashtbl.replace pair_cache symbol info;
+            let alias = Printf.sprintf "@%d" index in
+            let alias_info =
+              { symbol; sz_decimals; max_leverage = None; asset_index = 10000 + index }
+            in
+            Hashtbl.replace pair_cache alias alias_info
+          with
+          | exn ->
+            Logging.warn_f
+              ~section
+              "Failed to parse spot item: %s"
+              (Printexc.to_string exn))
+        universe_spot;
+      Mutex.unlock cache_mutex;
+      publish_cache ();
+      Logging.debug_f
+        ~section
+        "Initialized Hyperliquid instrument feed via WS payload with %d perps and %d \
+         spot pairs"
+        (List.length universe_perp)
+        (List.length universe_spot);
+      notify_ready ();
+      Lwt.return_unit)
     (fun exn ->
-       Logging.error_f
-         ~section
-         "Failed to process Hyperliquid instruments: %s"
-         (Printexc.to_string exn);
-       notify_ready ();
-       Lwt.return_unit)
+      Logging.error_f
+        ~section
+        "Failed to process Hyperliquid instruments: %s"
+        (Printexc.to_string exn);
+      notify_ready ();
+      Lwt.return_unit)
 ;;
 
-(** Populates the instrument cache with synthetic entries for testing.
-    Assigns default sz_decimals of 4. Determines instrument type
-    (spot vs perpetual) by the presence of a '/' separator in the symbol. *)
+(** Populates the instrument cache with synthetic entries for testing. Assigns default
+    sz_decimals of 4. Determines instrument type (spot vs perpetual) by the presence of a
+    '/' separator in the symbol. *)
 let initialize symbols =
   Mutex.lock cache_mutex;
   List.iter
     (fun symbol ->
-       let sz_decimals = 4 in
-       let max_leverage = if String.contains symbol '/' then None else Some 50 in
-       let asset_index = if String.contains symbol '/' then 10000 else 0 in
-       let info = { symbol; sz_decimals; max_leverage; asset_index } in
-       Hashtbl.replace pair_cache symbol info)
+      let sz_decimals = 4 in
+      let max_leverage = if String.contains symbol '/' then None else Some 50 in
+      let asset_index = if String.contains symbol '/' then 10000 else 0 in
+      let info = { symbol; sz_decimals; max_leverage; asset_index } in
+      Hashtbl.replace pair_cache symbol info)
     symbols;
   Mutex.unlock cache_mutex;
   publish_cache ();
@@ -157,10 +156,9 @@ let initialize symbols =
     (List.length symbols)
 ;;
 
-(** Registers a single instrument entry with caller-specified sz_decimals.
-    Also inserts a base-asset alias for perpetual-style lookups.
-    Intended for test harnesses requiring fine-grained control over
-    instrument parameters. *)
+(** Registers a single instrument entry with caller-specified sz_decimals. Also inserts a
+    base-asset alias for perpetual-style lookups. Intended for test harnesses requiring
+    fine-grained control over instrument parameters. *)
 let register_test_instrument ~symbol ~sz_decimals =
   Mutex.lock cache_mutex;
   let max_leverage = if String.contains symbol '/' then None else Some 50 in
@@ -175,9 +173,9 @@ let register_test_instrument ~symbol ~sz_decimals =
   publish_cache ()
 ;;
 
-(** Looks up instrument info by symbol from the published snapshot (lock-free).
-    Falls back to the base name (strip "/QUOTE") to resolve perpetuals. Spot
-    pairs are keyed by full "BASE/QUOTE" with [asset_index >= 10000]. *)
+(** Looks up instrument info by symbol from the published snapshot (lock-free). Falls back
+    to the base name (strip "/QUOTE") to resolve perpetuals. Spot pairs are keyed by full
+    "BASE/QUOTE" with [asset_index >= 10000]. *)
 let lookup_info symbol =
   let cache = Atomic.get published_cache in
   let direct = Hashtbl.find_opt cache symbol in
@@ -190,47 +188,44 @@ let lookup_info symbol =
      | [] -> None)
 ;;
 
-(** Coarse price increment used when no instrument context is available.
-    Per-symbol pricing actually follows Hyperliquid's 5-significant-figure
-    rule with a (max_decimals - sz_decimals) cap; see
-    [round_price_to_tick_for_symbol]. *)
+(** Coarse price increment used when no instrument context is available. Per-symbol
+    pricing actually follows Hyperliquid's 5-significant-figure rule with a
+    (max_decimals - sz_decimals) cap; see [round_price_to_tick_for_symbol]. *)
 let get_price_increment _symbol = Some 0.01
 
-(** Fetches perp + spot metadata from REST /info into the cache. Used by
-    out-of-process consumers (e.g. the capital oracle CLI) that do not run the
-    WebSocket feed.
+(** Fetches perp + spot metadata from REST /info into the cache. Used by out-of-process
+    consumers (e.g. the capital oracle CLI) that do not run the WebSocket feed.
 
-    [~testnet] selects the endpoint. The cache is shared with the live engine,
-    so this MUST fetch the same environment the engine trades on: spot pair
-    indices differ between mainnet and testnet, and a mismatched asset id
-    routes orders to an unrelated pair. *)
+    [~testnet] selects the endpoint. The cache is shared with the live engine, so this
+    MUST fetch the same environment the engine trades on: spot pair indices differ between
+    mainnet and testnet, and a mismatched asset id routes orders to an unrelated pair. *)
 let fetch_meta_from_rest ~testnet () : unit Lwt.t =
   Lwt.catch
     (fun () ->
-       let url =
-         if testnet
-         then Uri.of_string "https://api.hyperliquid-testnet.xyz/info"
-         else Uri.of_string "https://api.hyperliquid.xyz/info"
-       in
-       let post_one typ =
-         let req_body = Yojson.Safe.to_string (`Assoc [ "type", `String typ ]) in
-         let body = Cohttp_lwt.Body.of_string req_body in
-         let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
-         Cohttp_lwt_unix.Client.post ~headers ~body url
-         >>= fun (_resp, resp_body) ->
-         Cohttp_lwt.Body.to_string resp_body
-         >>= fun body_str -> Lwt.return (Yojson.Safe.from_string body_str)
-       in
-       post_one "meta"
-       >>= fun payload_perp ->
-       post_one "spotMeta"
-       >>= fun payload_spot -> process_meta_response payload_perp payload_spot)
+      let url =
+        if testnet
+        then Uri.of_string "https://api.hyperliquid-testnet.xyz/info"
+        else Uri.of_string "https://api.hyperliquid.xyz/info"
+      in
+      let post_one typ =
+        let req_body = Yojson.Safe.to_string (`Assoc [ "type", `String typ ]) in
+        let body = Cohttp_lwt.Body.of_string req_body in
+        let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
+        Cohttp_lwt_unix.Client.post ~headers ~body url
+        >>= fun (_resp, resp_body) ->
+        Cohttp_lwt.Body.to_string resp_body
+        >>= fun body_str -> Lwt.return (Yojson.Safe.from_string body_str)
+      in
+      post_one "meta"
+      >>= fun payload_perp ->
+      post_one "spotMeta"
+      >>= fun payload_spot -> process_meta_response payload_perp payload_spot)
     (fun exn ->
-       Logging.error_f
-         ~section
-         "Failed to fetch instrument metadata from REST: %s"
-         (Printexc.to_string exn);
-       Lwt.return_unit)
+      Logging.error_f
+        ~section
+        "Failed to fetch instrument metadata from REST: %s"
+        (Printexc.to_string exn);
+      Lwt.return_unit)
 ;;
 
 let get_qty_increment symbol =
@@ -258,9 +253,9 @@ let resolve_symbol coin =
   res
 ;;
 
-(** Returns the coin identifier expected by Hyperliquid WebSocket channels
-    (l2Book). Perpetuals use the base coin name; spot pairs use
-    the "@N" format derived from asset_index. *)
+(** Returns the coin identifier expected by Hyperliquid WebSocket channels (l2Book).
+    Perpetuals use the base coin name; spot pairs use the "@N" format derived from
+    asset_index. *)
 let get_subscription_coin symbol =
   Mutex.lock cache_mutex;
   let res =
@@ -278,10 +273,9 @@ let get_subscription_coin symbol =
   res
 ;;
 
-(** Rounds price according to Hyperliquid per-symbol precision rules.
-    Step 1: round to 5 significant figures.
-    Step 2: cap decimal places at (max_decimals - sz_decimals),
-    where max_decimals is 8 for spot and 6 for perpetual instruments. *)
+(** Rounds price according to Hyperliquid per-symbol precision rules. Step 1: round to 5
+    significant figures. Step 2: cap decimal places at (max_decimals - sz_decimals), where
+    max_decimals is 8 for spot and 6 for perpetual instruments. *)
 let round_price_to_tick_for_symbol symbol price =
   if price <= 0.0
   then price
@@ -305,8 +299,8 @@ let round_price_to_tick_for_symbol symbol price =
     floor ((rounded_5sf *. dec_multiplier) +. 0.5) /. dec_multiplier)
 ;;
 
-(** Rounds price to tick without instrument context.
-    Applies 5 significant figures and a fixed 6 decimal place cap. *)
+(** Rounds price to tick without instrument context. Applies 5 significant figures and a
+    fixed 6 decimal place cap. *)
 let round_price_to_tick price =
   if price <= 0.0
   then price
@@ -320,9 +314,8 @@ let round_price_to_tick price =
     floor ((rounded *. dec_multiplier) +. 0.5) /. dec_multiplier)
 ;;
 
-(** Rounds quantity down to the instrument's sz_decimals (lot size).
-    Uses floor to prevent over-allocation. Returns qty unmodified
-    if the instrument is not found in the cache. *)
+(** Rounds quantity down to the instrument's sz_decimals (lot size). Uses floor to prevent
+    over-allocation. Returns qty unmodified if the instrument is not found in the cache. *)
 let round_qty_to_lot symbol qty =
   match lookup_info symbol with
   | Some info ->

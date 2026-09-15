@@ -35,14 +35,7 @@ let print_results results =
   Printf.eprintf "%s\n" sep;
   List.iter
     (fun (name, n, p50, p90, p99, total_ms) ->
-       Printf.eprintf
-         "%-40s %8d %10.2f %10.2f %10.2f %10.2f\n"
-         name
-         n
-         p50
-         p90
-         p99
-         total_ms)
+      Printf.eprintf "%-40s %8d %10.2f %10.2f %10.2f %10.2f\n" name n p50 p90 p99 total_ms)
     results;
   Printf.eprintf "%s\n\n" sep
 ;;
@@ -232,8 +225,7 @@ let bench_duplicate_key_gen () =
 
 let () =
   Random.self_init ();
-  (* Preserve real stderr for results; mute instrument-feed WARN spam during
-     benchmarks. *)
+  (* Preserve real stderr for results; mute instrument-feed WARN spam during benchmarks. *)
   let real_err = Unix.dup Unix.stderr in
   let devnull = Unix.openfile "/dev/null" [ Unix.O_WRONLY ] 0 in
   Unix.dup2 devnull Unix.stderr;

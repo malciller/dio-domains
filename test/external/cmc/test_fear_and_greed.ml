@@ -34,10 +34,9 @@ let test_grid_values () =
 ;;
 
 let test_fetch_fallback_not_cached () =
-  (* Failed fetch / missing API key must not populate the cache: the fallback
-     is returned to the caller only, so get_cached () = None distinguishes "no
-     live F&G signal" from a neutral reading. Grid domains withhold orders
-     without a signal. *)
+  (* Failed fetch / missing API key must not populate the cache: the fallback is returned
+     to the caller only, so get_cached () = None distinguishes "no live F&G signal" from a
+     neutral reading. Grid domains withhold orders without a signal. *)
   let module F = Cmc.Fear_and_greed in
   F.clear_cache ();
   let fallback = 42.0 in

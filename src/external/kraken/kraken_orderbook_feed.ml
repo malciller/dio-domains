@@ -1,9 +1,7 @@
-(**
-   Kraken V2 WebSocket orderbook feed.
-   Maintains per-symbol orderbook state via lock-free ring buffers.
-   Validates orderbook integrity using CRC32 checksums per Kraken specification.
-   Sequence tracking enforces strict ordering; gaps or rollbacks trigger resynchronization.
-*)
+(** Kraken V2 WebSocket orderbook feed. Maintains per-symbol orderbook state via lock-free
+    ring buffers. Validates orderbook integrity using CRC32 checksums per Kraken
+    specification. Sequence tracking enforces strict ordering; gaps or rollbacks trigger
+    resynchronization. *)
 
 open Lwt.Infix
 
@@ -19,9 +17,8 @@ let get_conduit_ctx = Kraken_common_types.get_conduit_ctx
 let orderbook_depth = Kraken_common_types.default_orderbook_depth
 let ring_buffer_size = Kraken_common_types.default_ring_buffer_size_orderbook
 
-(** TLS + WebSocket upgrade handshake timeout, seconds. Bounds a half-open TCP
-    connection that would otherwise block the main-Lwt-loop reconnect
-    indefinitely. *)
+(** TLS + WebSocket upgrade handshake timeout, seconds. Bounds a half-open TCP connection
+    that would otherwise block the main-Lwt-loop reconnect indefinitely. *)
 let ws_connect_timeout_s = 20.0
 
 (** Atomic flag indicating whether cleanup handlers have been initialized. *)
@@ -80,10 +77,10 @@ let add_normalized_to_crc crc s =
 type level =
   { price : string (** Canonical fixed-decimals rendering; used as the map key. *)
   ; price_wire : string
-    (** Price exactly as received on the wire. Kraken's CRC32 is computed over
-        wire strings (dots removed, leading zeros stripped, trailing zeros
-        preserved), not over a re-formatted value; padding or rounding here
-        changes the CRC and invalidates every check. *)
+  (** Price exactly as received on the wire. Kraken's CRC32 is computed over wire strings
+      (dots removed, leading zeros stripped, trailing zeros preserved), not over a
+      re-formatted value; padding or rounding here changes the CRC and invalidates every
+      check. *)
   ; size : string
   ; price_float : float
   ; size_float : float
@@ -98,7 +95,8 @@ type orderbook =
   ; timestamp : float
   }
 
-(** Returns the first [n] elements of a list. Returns all elements if the list has fewer than [n]. *)
+(** Returns the first [n] elements of a list. Returns all elements if the list has fewer
+    than [n]. *)
 let take n lst =
   let rec take_aux acc n = function
     | [] -> List.rev acc
@@ -150,26 +148,26 @@ let parse_checksum_level price_json qty_json =
   price_str, qty_str
 ;;
 
-(** CRC32 over the top 10 levels per side, computed from raw JSON values so
-    original string precision is preserved. *)
+(** CRC32 over the top 10 levels per side, computed from raw JSON values so original
+    string precision is preserved. *)
 let calculate_checksum_from_json symbol bids_json asks_json : int32 =
   let parse_checksum_levels json =
     match json with
     | `List entries ->
       List.filter_map
         (fun entry ->
-           match entry with
-           | `Assoc fields ->
-             (match List.assoc_opt "price" fields, List.assoc_opt "qty" fields with
-              | Some price_json, Some qty_json ->
-                let price_str, qty_str = parse_checksum_level price_json qty_json in
-                Some (price_str, qty_str)
-              | _ -> None)
-           | `List [ price_json; qty_json ] ->
-             Some (parse_checksum_level price_json qty_json)
-           | `List [ price_json; qty_json; _ ] ->
-             Some (parse_checksum_level price_json qty_json)
-           | _ -> None)
+          match entry with
+          | `Assoc fields ->
+            (match List.assoc_opt "price" fields, List.assoc_opt "qty" fields with
+             | Some price_json, Some qty_json ->
+               let price_str, qty_str = parse_checksum_level price_json qty_json in
+               Some (price_str, qty_str)
+             | _ -> None)
+          | `List [ price_json; qty_json ] ->
+            Some (parse_checksum_level price_json qty_json)
+          | `List [ price_json; qty_json; _ ] ->
+            Some (parse_checksum_level price_json qty_json)
+          | _ -> None)
         entries
     | _ -> []
   in
@@ -215,13 +213,13 @@ let calculate_checksum_from_json symbol bids_json asks_json : int32 =
   let crc = ref 0xFFFFFFFFl in
   List.iter
     (fun (price_str, qty_str) ->
-       crc := add_normalized_to_crc !crc price_str;
-       crc := add_normalized_to_crc !crc qty_str)
+      crc := add_normalized_to_crc !crc price_str;
+      crc := add_normalized_to_crc !crc qty_str)
     top_asks;
   List.iter
     (fun (price_str, qty_str) ->
-       crc := add_normalized_to_crc !crc price_str;
-       crc := add_normalized_to_crc !crc qty_str)
+      crc := add_normalized_to_crc !crc price_str;
+      crc := add_normalized_to_crc !crc qty_str)
     top_bids;
   let result = Int32.logxor !crc 0xFFFFFFFFl in
   Logging.debug_f ~section "Checksum CRC32: result=%ld (0x%08lx)" result result;
@@ -237,23 +235,24 @@ module PriceMap = Map.Make (struct
     let compare = String.compare
   end)
 
-(** Per-symbol mutable orderbook state, including bid/ask maps, ring buffer, and synchronization metadata. *)
+(** Per-symbol mutable orderbook state, including bid/ask maps, ring buffer, and
+    synchronization metadata. *)
 type store =
   { buffer : orderbook RingBuffer.t
   ; bids : (string, level) Hashtbl.t
   ; asks : (string, level) Hashtbl.t
   ; ready : bool Atomic.t
   ; has_snapshot : bool Atomic.t
-    (** True after an initial snapshot has been received. Updates are rejected until set. *)
+  (** True after an initial snapshot has been received. Updates are rejected until set. *)
   ; last_sequence : int64 option Atomic.t
-    (** Last processed sequence number. Used for gap and rollback detection. *)
+  (** Last processed sequence number. Used for gap and rollback detection. *)
   ; last_update_ns : int64 Atomic.t
-    (** Mtime_clock monotonic nanoseconds of the most recent data write.
-        Atomic: written by the parse domain, read by trading domains.
-        Monotonic: staleness is immune to wall-clock (NTP) steps. *)
+  (** Mtime_clock monotonic nanoseconds of the most recent data write. Atomic: written by
+      the parse domain, read by trading domains. Monotonic: staleness is immune to
+      wall-clock (NTP) steps. *)
   ; mutable checksum_tick : int
-    (** Increments per book update. The checksum recompute (2 extra
-        fold+sort+array passes) runs only every [checksum_every_n] ticks. *)
+  (** Increments per book update. The checksum recompute (2 extra fold+sort+array passes)
+      runs only every [checksum_every_n] ticks. *)
   }
 
 (** (pair_decimals, lot_decimals) precision tuple from AssetPairs API. *)
@@ -262,8 +261,8 @@ type decimals = int * int
 let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let decimals_tbl : (string, decimals) Hashtbl.t = Hashtbl.create 16
 
-(** All subscribed symbols (configured + dynamic), preserved across disconnects
-    and resets so dynamic subscriptions survive connection restart. *)
+(** All subscribed symbols (configured + dynamic), preserved across disconnects and resets
+    so dynamic subscriptions survive connection restart. *)
 let all_subscribed_symbols : string list ref = ref []
 
 let subscribed_mutex = Mutex.create ()
@@ -286,20 +285,20 @@ let add_subscribed_symbols symbols =
   total
 ;;
 
-(* Frame parse/dispatch runs on the Parse_worker domain; the dispatch path
-   must not touch Lwt primitives. Readiness is an Atomic flag polled by the
-   startup waiter; sequence-gap resubscribes go through [pending_resubscribes],
-   drained by an Lwt watcher on the main domain. *)
+(* Frame parse/dispatch runs on the Parse_worker domain; the dispatch path must not touch
+   Lwt primitives. Readiness is an Atomic flag polled by the startup waiter; sequence-gap
+   resubscribes go through [pending_resubscribes], drained by an Lwt watcher on the main
+   domain. *)
 let resubscribe_symbol_ref : (string -> unit Lwt.t) option ref = ref None
 
-(** Symbols awaiting a resubscribe after a sequence gap/rollback. Appended
-    from the parse domain via CAS; drained by the Lwt watcher. *)
+(** Symbols awaiting a resubscribe after a sequence gap/rollback. Appended from the parse
+    domain via CAS; drained by the Lwt watcher. *)
 let pending_resubscribes : string list Atomic.t = Atomic.make []
 
 let resubscribe_watcher_started = Atomic.make false
 
-(* Checksum-triggered resubscribe cooldown state. Written only from the parse
-   domain (single-threaded message processing), so no lock is required. *)
+(* Checksum-triggered resubscribe cooldown state. Written only from the parse domain
+   (single-threaded message processing), so no lock is required. *)
 let resubscribe_cooldown : (string, float) Hashtbl.t = Hashtbl.create 16
 let resubscribe_cooldown_s = Kraken_common_types.default_resubscribe_cooldown_s
 
@@ -315,12 +314,13 @@ let[@inline] request_resubscribe symbol =
   loop ()
 ;;
 
-(** Checksum recompute interval, in updates per symbol. The rebuild costs 2
-    extra fold+sort+array passes per tick; once per 10 updates is sufficient
-    for the exchange's drift window. *)
+(** Checksum recompute interval, in updates per symbol. The rebuild costs 2 extra
+    fold+sort+array passes per tick; once per 10 updates is sufficient for the exchange's
+    drift window. *)
 let checksum_every_n = 10
 
-(** Retrieves price and quantity precision from the instruments feed cache. Returns None on failure. *)
+(** Retrieves price and quantity precision from the instruments feed cache. Returns None
+    on failure. *)
 let get_precision_from_instruments symbol =
   try Kraken_instruments_feed.get_precision_info symbol with
   | _ -> None
@@ -341,8 +341,8 @@ let canonicalize_kraken_name s =
   in
   if String.length no_xbt >= 4 && String.sub no_xbt (String.length no_xbt - 4) 4 = "ZUSD"
   then String.sub no_xbt 0 (String.length no_xbt - 4) ^ "USD"
-  else if
-    String.length no_xbt >= 4 && String.sub no_xbt (String.length no_xbt - 4) 4 = "ZEUR"
+  else if String.length no_xbt >= 4
+          && String.sub no_xbt (String.length no_xbt - 4) 4 = "ZEUR"
   then String.sub no_xbt 0 (String.length no_xbt - 4) ^ "EUR"
   else no_xbt
 ;;
@@ -408,8 +408,7 @@ let store_opt symbol = Hashtbl.find_opt stores symbol
 let notify_ready ~symbol store =
   if not (Atomic.get store.ready)
   then
-    (* Atomic flag only: safe from the Parse_worker domain; the startup
-       waiter polls it. *)
+    (* Atomic flag only: safe from the Parse_worker domain; the startup waiter polls it. *)
     Atomic.set store.ready true;
   Concurrency.Exchange_wakeup.signal ~symbol
 ;;
@@ -459,20 +458,14 @@ let int32_of_json json =
     exponent marker), matching Yojson's lexer rule that any [. e E] token is a
     [Float]; otherwise the token is an integer ([Int] or [Intlit]). *)
 let span_contains_float_marker s i j =
-  let rec go k =
-    k < j
-    && (s.[k] = '.'
-        || s.[k] = 'e'
-        || s.[k] = 'E'
-        || go (k + 1))
-  in
+  let rec go k = k < j && (s.[k] = '.' || s.[k] = 'e' || s.[k] = 'E' || go (k + 1)) in
   go i
 ;;
 
-(** Span analogues of [int64_of_json]/[int32_of_json]: reproduce the DOM
-    classification from the raw token, including the string case and the
-    float-vs-integer split. Exactly one [String.sub]/[string_of_span] per
-    scalar, versus two variant nodes plus the token string under the DOM. *)
+(** Span analogues of [int64_of_json]/[int32_of_json]: reproduce the DOM classification
+    from the raw token, including the string case and the float-vs-integer split. Exactly
+    one [String.sub]/[string_of_span] per scalar, versus two variant nodes plus the token
+    string under the DOM. *)
 let int64_of_span s i j =
   if i >= j
   then None
@@ -503,27 +496,26 @@ let int32_of_span s i j =
   else (
     let token = String.sub s i (j - i) in
     (* Mirror the DOM split: a native-int token is [Int i] and goes through
-       [Int32.of_int], which wraps modulo 2^32. Only beyond native int does
-       Yojson emit [Intlit s], whose [Int32.of_string] raises past 2^31 and is
-       caught to [None]. Real Kraken checksums (e.g. 3310070434) fall in the
-       wrap case, so this must not raise. *)
+       [Int32.of_int], which wraps modulo 2^32. Only beyond native int does Yojson emit
+       [Intlit s], whose [Int32.of_string] raises past 2^31 and is caught to [None]. Real
+       Kraken checksums (e.g. 3310070434) fall in the wrap case, so this must not raise. *)
     match int_of_string_opt token with
     | Some n -> Some (Int32.of_int n)
-    | None -> (try Some (Int32.of_string token) with
-               | _ -> None))
+    | None ->
+      (try Some (Int32.of_string token) with
+       | _ -> None))
 ;;
 
-(** Span analogue of [to_decimal_str ~trim_trailing:false] (the hot-path call
-    shape used by the checksum inputs), with bit-identical output:
+(** Span analogue of [to_decimal_str ~trim_trailing:false] (the hot-path call shape used
+    by the checksum inputs), with bit-identical output:
     - strings pass through verbatim (unescaped, as Yojson's lexer yields);
     - float tokens re-render via [float_of_string] on the exact substring, then
-      [sprintf "%.*f"], so the rounded decimal string matches the DOM bit for
-      bit even at last-ulp boundaries ([Json_scan.float_of_span] does not);
-    - integer tokens are re-normalized through [int_of_string_opt]
-      (["-0"] -> ["0"], matching [Int 0]); a token beyond OCaml's native int
-      overflows to [None] and is passed through verbatim, exactly the
-      [Intlit] case.
-    The single slice alloc is the rendered price/qty payload itself. *)
+      [sprintf "%.*f"], so the rounded decimal string matches the DOM bit for bit even at
+      last-ulp boundaries ([Json_scan.float_of_span] does not);
+    - integer tokens are re-normalized through [int_of_string_opt] (["-0"] -> ["0"],
+      matching [Int 0]); a token beyond OCaml's native int overflows to [None] and is
+      passed through verbatim, exactly the [Intlit] case. The single slice alloc is the
+      rendered price/qty payload itself. *)
 let decimal_str_of_span ?dec s i j =
   if i >= j
   then "0"
@@ -531,7 +523,11 @@ let decimal_str_of_span ?dec s i j =
   then Json_scan.string_of_span s i j
   else if span_contains_float_marker s i j
   then (
-    let d = match dec with Some d -> d | None -> 12 in
+    let d =
+      match dec with
+      | Some d -> d
+      | None -> 12
+    in
     Printf.sprintf "%.*f" d (float_of_string (String.sub s i (j - i))))
   else (
     let token = String.sub s i (j - i) in
@@ -548,12 +544,11 @@ let parse_level symbol price_json size_json =
       (try Hashtbl.find decimals_tbl symbol with
        | Not_found -> 8, 8)
   in
-  (* No trailing-zero trimming: checksum input must be the exchange's
-     fixed-decimal representation. The live v2 feed sends numbers (not the
-     documented strings), so numeric fields are re-rendered at full pair/lot
-     precision (qty 5.1e-05 at lot_decimals=8 -> "0.00005100", normalized
-     "5100"); trimming would yield "51" and invalidate every checksum.
-     String inputs pass through verbatim. *)
+  (* No trailing-zero trimming: checksum input must be the exchange's fixed-decimal
+     representation. The live v2 feed sends numbers (not the documented strings), so
+     numeric fields are re-rendered at full pair/lot precision (qty 5.1e-05 at
+     lot_decimals=8 -> "0.00005100", normalized "5100"); trimming would yield "51" and
+     invalidate every checksum. String inputs pass through verbatim. *)
   let price_str_raw = to_decimal_str ~trim_trailing:false ~dec:pd price_json in
   let qty_str = to_decimal_str ~trim_trailing:false ~dec:ld size_json in
   let price_float =
@@ -574,41 +569,41 @@ let parse_level symbol price_json size_json =
     }
 ;;
 
-(** Parses JSON levels and applies them directly to the store's Hashtbl to avoid intermediate list allocations. *)
+(** Parses JSON levels and applies them directly to the store's Hashtbl to avoid
+    intermediate list allocations. *)
 let parse_and_apply_levels symbol tbl json =
   match json with
   | `List entries ->
     List.iter
       (fun entry ->
-         match entry with
-         (* Object format: {"price": ..., "qty": ...} *)
-         | `Assoc fields ->
-           (match List.assoc_opt "price" fields, List.assoc_opt "qty" fields with
-            | Some price_json, Some qty_json ->
-              (match parse_level symbol price_json qty_json with
-               | Some lvl ->
-                 if is_effectively_zero lvl.size
-                 then Hashtbl.remove tbl lvl.price
-                 else Hashtbl.replace tbl lvl.price lvl
-               | None -> ())
-            | _ -> ())
-         (* Array format: [price, qty] or [price, qty, timestamp] *)
-         | `List [ price_json; size_json ] | `List [ price_json; size_json; _ ] ->
-           (match parse_level symbol price_json size_json with
-            | Some lvl ->
-              if is_effectively_zero lvl.size
-              then Hashtbl.remove tbl lvl.price
-              else Hashtbl.replace tbl lvl.price lvl
-            | None -> ())
-         | _ -> ())
+        match entry with
+        (* Object format: {"price": ..., "qty": ...} *)
+        | `Assoc fields ->
+          (match List.assoc_opt "price" fields, List.assoc_opt "qty" fields with
+           | Some price_json, Some qty_json ->
+             (match parse_level symbol price_json qty_json with
+              | Some lvl ->
+                if is_effectively_zero lvl.size
+                then Hashtbl.remove tbl lvl.price
+                else Hashtbl.replace tbl lvl.price lvl
+              | None -> ())
+           | _ -> ())
+        (* Array format: [price, qty] or [price, qty, timestamp] *)
+        | `List [ price_json; size_json ] | `List [ price_json; size_json; _ ] ->
+          (match parse_level symbol price_json size_json with
+           | Some lvl ->
+             if is_effectively_zero lvl.size
+             then Hashtbl.remove tbl lvl.price
+             else Hashtbl.replace tbl lvl.price lvl
+           | None -> ())
+        | _ -> ())
       entries
   | _ -> ()
 ;;
 
-(** Span analogue of [parse_level]: renders price/qty from their value spans
-    instead of JSON values. Same precision lookup and fixed-decimal re-render,
-    so [price_wire]/[size] (the checksum inputs) are bit-identical to the DOM
-    path. *)
+(** Span analogue of [parse_level]: renders price/qty from their value spans instead of
+    JSON values. Same precision lookup and fixed-decimal re-render, so [price_wire]/[size]
+    (the checksum inputs) are bit-identical to the DOM path. *)
 let parse_level_from_span symbol s price_span size_span =
   let pd, ld =
     match get_precision_from_instruments symbol with
@@ -617,9 +612,7 @@ let parse_level_from_span symbol s price_span size_span =
       (try Hashtbl.find decimals_tbl symbol with
        | Not_found -> 8, 8)
   in
-  let price_str_raw =
-    decimal_str_of_span ~dec:pd s (fst price_span) (snd price_span)
-  in
+  let price_str_raw = decimal_str_of_span ~dec:pd s (fst price_span) (snd price_span) in
   let qty_str = decimal_str_of_span ~dec:ld s (fst size_span) (snd size_span) in
   let price_float =
     try float_of_string price_str_raw with
@@ -638,72 +631,71 @@ let parse_level_from_span symbol s price_span size_span =
   }
 ;;
 
-(** Mirror of the DOM level-array patterns `[price; qty]` and
-    `[price; qty; timestamp]`: returns the price/qty element spans only when
-    the level array holds exactly 2 or 3 elements (fewer or more are skipped,
-    as the DOM pattern match does). *)
+(** Mirror of the DOM level-array patterns `[price; qty]` and `[price; qty; timestamp]`:
+    returns the price/qty element spans only when the level array holds exactly 2 or 3
+    elements (fewer or more are skipped, as the DOM pattern match does). *)
 let level_price_qty_spans s i j =
   let i, j = Json_scan.array_interior s i j in
   let count = ref 0 in
   let pspan = ref (0, 0) in
   let qspan = ref (0, 0) in
   Json_scan.array_fold s i j () (fun () a b ->
-      (match !count with
-       | 0 -> pspan := (a, b)
-       | 1 -> qspan := (a, b)
-       | _ -> ());
-      incr count);
+    (match !count with
+     | 0 -> pspan := a, b
+     | 1 -> qspan := a, b
+     | _ -> ());
+    incr count);
   match !count with
   | 2 | 3 -> Some (!pspan, !qspan)
   | _ -> None
 ;;
 
 (** Span analogue of [parse_and_apply_levels]: applies a level array (object or
-    scalar-pair form) straight into the store's Hashtbl without building a DOM.
-    Non-array values (and malformed levels) are ignored exactly as the DOM
-    path ignores non-`List` inputs and non-matching entries. *)
+    scalar-pair form) straight into the store's Hashtbl without building a DOM. Non-array
+    values (and malformed levels) are ignored exactly as the DOM path ignores non-`List`
+    inputs and non-matching entries. *)
 let apply_levels_from_span symbol s tbl (i, j) =
   if i < j && s.[i] = '['
   then (
     let lo, hi = Json_scan.array_interior s i j in
     Json_scan.array_fold s lo hi () (fun () e0 e1 ->
-        if e0 < e1 && s.[e0] = '{'
-        then (
-          (* Object format: {"price": ..., "qty": ...} *)
-          let olo, ohi = Json_scan.object_interior s e0 e1 in
-          match
-            Json_scan.find_field s olo ohi "price", Json_scan.find_field s olo ohi "qty"
-          with
-          | Some price_span, Some qty_span ->
-            let lvl = parse_level_from_span symbol s price_span qty_span in
-            if is_effectively_zero lvl.size
-            then Hashtbl.remove tbl lvl.price
-            else Hashtbl.replace tbl lvl.price lvl
-          | _ -> ())
-        else if e0 < e1 && s.[e0] = '['
-        then (
-          (* Array format: [price, qty] or [price, qty, timestamp] *)
-          match level_price_qty_spans s e0 e1 with
-          | Some (price_span, qty_span) ->
-            let lvl = parse_level_from_span symbol s price_span qty_span in
-            if is_effectively_zero lvl.size
-            then Hashtbl.remove tbl lvl.price
-            else Hashtbl.replace tbl lvl.price lvl
-          | None -> ())
-        else ()))
+      if e0 < e1 && s.[e0] = '{'
+      then (
+        (* Object format: {"price": ..., "qty": ...} *)
+        let olo, ohi = Json_scan.object_interior s e0 e1 in
+        match
+          Json_scan.find_field s olo ohi "price", Json_scan.find_field s olo ohi "qty"
+        with
+        | Some price_span, Some qty_span ->
+          let lvl = parse_level_from_span symbol s price_span qty_span in
+          if is_effectively_zero lvl.size
+          then Hashtbl.remove tbl lvl.price
+          else Hashtbl.replace tbl lvl.price lvl
+        | _ -> ())
+      else if e0 < e1 && s.[e0] = '['
+      then (
+        (* Array format: [price, qty] or [price, qty, timestamp] *)
+        match level_price_qty_spans s e0 e1 with
+        | Some (price_span, qty_span) ->
+          let lvl = parse_level_from_span symbol s price_span qty_span in
+          if is_effectively_zero lvl.size
+          then Hashtbl.remove tbl lvl.price
+          else Hashtbl.replace tbl lvl.price lvl
+        | None -> ())
+      else ()))
   else ()
 ;;
 
-(** Converts a Hashtbl to a sorted level array truncated to [depth] entries.
-    [sort_desc] controls descending (bids) vs ascending (asks) order. *)
+(** Converts a Hashtbl to a sorted level array truncated to [depth] entries. [sort_desc]
+    controls descending (bids) vs ascending (asks) order. *)
 let levels_to_array ?(sort_desc = false) tbl depth =
   let levels_list = Hashtbl.fold (fun _ lvl acc -> lvl :: acc) tbl [] in
   let sorted_levels =
     List.sort
       (fun l1 l2 ->
-         if sort_desc
-         then Float.compare l2.price_float l1.price_float
-         else Float.compare l1.price_float l2.price_float)
+        if sort_desc
+        then Float.compare l2.price_float l1.price_float
+        else Float.compare l1.price_float l2.price_float)
       levels_list
   in
   let rec take n lst acc =
@@ -717,31 +709,32 @@ let levels_to_array ?(sort_desc = false) tbl depth =
   Array.of_list (take depth sorted_levels [])
 ;;
 
-(** Rebuilds a Hashtbl containing only the top [max_levels] entries. Used to bound map size. *)
+(** Rebuilds a Hashtbl containing only the top [max_levels] entries. Used to bound map
+    size. *)
 let truncate_hashtbl tbl sort_desc max_levels =
   let levels_array = levels_to_array ~sort_desc tbl max_levels in
   Hashtbl.clear tbl;
   Array.iter (fun lvl -> Hashtbl.replace tbl lvl.price lvl) levels_array
 ;;
 
-(** Constructs an [orderbook] record from the current store state, the parsed
-    entry sequence, and the wire checksum. The caller extracts the scalars
-    (DOM member access or span scan) so this is shared by both paths. *)
+(** Constructs an [orderbook] record from the current store state, the parsed entry
+    sequence, and the wire checksum. The caller extracts the scalars (DOM member access or
+    span scan) so this is shared by both paths. *)
 let make_orderbook store symbol ~sequence ~checksum =
   let bids = levels_to_array ~sort_desc:true store.bids orderbook_depth in
   let asks = levels_to_array ~sort_desc:false store.asks orderbook_depth in
   { symbol; bids; asks; sequence; checksum; timestamp = Unix.time () }
 ;;
 
-(** Fetch price and lot decimal precision for the given symbols.
-    Skips the AssetPairs REST call if all symbols already have precision data from the instruments feed. *)
+(** Fetch price and lot decimal precision for the given symbols. Skips the AssetPairs REST
+    call if all symbols already have precision data from the instruments feed. *)
 let fetch_decimals symbols =
   let all_have_instruments_data =
     List.for_all
       (fun symbol ->
-         match Kraken_instruments_feed.get_precision_info symbol with
-         | Some _ -> true
-         | None -> false)
+        match Kraken_instruments_feed.get_precision_info symbol with
+        | Some _ -> true
+        | None -> false)
       symbols
   in
   if all_have_instruments_data
@@ -768,26 +761,26 @@ let fetch_decimals symbols =
         let pairs = to_assoc result in
         List.iter
           (fun (_pair_name, pair_json) ->
-             let altname = to_string_option (member "altname" pair_json) in
-             let wsname = to_string_option (member "wsname" pair_json) in
-             let pd = to_int (member "pair_decimals" pair_json) in
-             let ld = to_int (member "lot_decimals" pair_json) in
-             List.iter
-               (fun sym ->
-                  let norm = sym in
-                  let no_slash = String.concat "" (String.split_on_char '/' sym) in
-                  let is_ws_match =
-                    match wsname with
-                    | Some n -> canonicalize_kraken_name n = norm || n = norm
-                    | None -> false
-                  in
-                  let is_alt_match =
-                    match altname with
-                    | Some n -> canonicalize_kraken_name n = no_slash || n = no_slash
-                    | None -> false
-                  in
-                  if is_ws_match || is_alt_match then Hashtbl.add decimals_tbl sym (pd, ld))
-               symbols)
+            let altname = to_string_option (member "altname" pair_json) in
+            let wsname = to_string_option (member "wsname" pair_json) in
+            let pd = to_int (member "pair_decimals" pair_json) in
+            let ld = to_int (member "lot_decimals" pair_json) in
+            List.iter
+              (fun sym ->
+                let norm = sym in
+                let no_slash = String.concat "" (String.split_on_char '/' sym) in
+                let is_ws_match =
+                  match wsname with
+                  | Some n -> canonicalize_kraken_name n = norm || n = norm
+                  | None -> false
+                in
+                let is_alt_match =
+                  match altname with
+                  | Some n -> canonicalize_kraken_name n = no_slash || n = no_slash
+                  | None -> false
+                in
+                if is_ws_match || is_alt_match then Hashtbl.add decimals_tbl sym (pd, ld))
+              symbols)
           pairs;
         Lwt.return ()
       | _ -> Lwt.fail_with "Error fetching asset pairs"
@@ -799,13 +792,20 @@ let fetch_decimals symbols =
 
 let notified_symbols_reusable : (string, store) Hashtbl.t = Hashtbl.create 16
 
-(** Shared per-entry book processing for the DOM and span paths. Callers
-    extract the entry scalars (symbol, sequence, checksum) their own way and
-    hand the level application in as [apply_levels]; everything from sequence
-    validation onward is path-independent: state mutation, truncation,
-    checksum validation, ring write, readiness, heartbeat. [reset] selects
-    snapshot (full replacement) vs incremental update semantics. *)
-let process_book_entry ~reset ~symbol ~sequence ~checksum ~apply_levels on_heartbeat notified_symbols =
+(** Shared per-entry book processing for the DOM and span paths. Callers extract the entry
+    scalars (symbol, sequence, checksum) their own way and hand the level application in
+    as [apply_levels]; everything from sequence validation onward is path-independent:
+    state mutation, truncation, checksum validation, ring write, readiness, heartbeat.
+    [reset] selects snapshot (full replacement) vs incremental update semantics. *)
+let process_book_entry
+  ~reset
+  ~symbol
+  ~sequence
+  ~checksum
+  ~apply_levels
+  on_heartbeat
+  notified_symbols
+  =
   try
     let store = ensure_store symbol in
     if reset
@@ -854,8 +854,7 @@ let process_book_entry ~reset ~symbol ~sequence ~checksum ~apply_levels on_heart
         let gap = Int64.sub curr_seq last_seq in
         Logging.info_f
           ~section
-          "Sequence gap for %s: current=%Ld last=%Ld (gap=%Ld), marking \
-           out-of-sync"
+          "Sequence gap for %s: current=%Ld last=%Ld (gap=%Ld), marking out-of-sync"
           symbol
           curr_seq
           last_seq
@@ -871,22 +870,19 @@ let process_book_entry ~reset ~symbol ~sequence ~checksum ~apply_levels on_heart
       | _ -> ());
     apply_levels store;
     Atomic.set store.last_update_ns (Mtime_clock.now_ns ());
-    (* Kraken v2 book contract: levels that fall out of the subscribed
-        scope never receive a qty:0 removal. Retaining entries beyond
-        [orderbook_depth] accumulates stale levels that re-enter the
-        computed top-10 during removal cascades and desync checksum
-        validation. Truncate to the subscribed depth after every
-        message. *)
+    (* Kraken v2 book contract: levels that fall out of the subscribed scope never receive
+       a qty:0 removal. Retaining entries beyond [orderbook_depth] accumulates stale
+       levels that re-enter the computed top-10 during removal cascades and desync
+       checksum validation. Truncate to the subscribed depth after every message. *)
     if Hashtbl.length store.bids > orderbook_depth
     then truncate_hashtbl store.bids true orderbook_depth;
     if Hashtbl.length store.asks > orderbook_depth
     then truncate_hashtbl store.asks false orderbook_depth;
     let orderbook = make_orderbook store symbol ~sequence ~checksum in
-    (* CRC32 from current state over the top 10 levels per side. If
-      [orderbook_depth] < 10, validation is bypassed (the map lacks the
-      requisite levels). The recompute is throttled to every
-      [checksum_every_n] updates; the book is still built and written
-      per tick, only the redundant CRC pass is slowed. *)
+    (* CRC32 from current state over the top 10 levels per side. If [orderbook_depth] <
+       10, validation is bypassed (the map lacks the requisite levels). The recompute is
+       throttled to every [checksum_every_n] updates; the book is still built and written
+       per tick, only the redundant CRC pass is slowed. *)
     store.checksum_tick <- store.checksum_tick + 1;
     let checksum_valid =
       if orderbook_depth >= 10 && store.checksum_tick mod checksum_every_n = 0
@@ -901,9 +897,9 @@ let process_book_entry ~reset ~symbol ~sequence ~checksum ~apply_levels on_heart
         | Some received_checksum ->
           if Int32.compare calculated_checksum received_checksum <> 0
           then (
-            (* Cooldown: a persistently failing validator must degrade
-                to periodic heals, not hot-loop unsub/resub. Touched
-                only from the parse domain; no locking needed. *)
+            (* Cooldown: a persistently failing validator must degrade to periodic heals,
+               not hot-loop unsub/resub. Touched only from the parse domain; no locking
+               needed. *)
             let now = Unix.gettimeofday () in
             let last =
               match Hashtbl.find_opt resubscribe_cooldown symbol with
@@ -912,8 +908,8 @@ let process_book_entry ~reset ~symbol ~sequence ~checksum ~apply_levels on_heart
             in
             Logging.warn_f
               ~section
-              "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld \
-               (0x%08lx) - book desynced, requesting resubscribe"
+              "Checksum mismatch for %s: received=%ld (0x%08lx) calculated=%ld (0x%08lx) \
+               - book desynced, requesting resubscribe"
               symbol
               received_checksum
               received_checksum
@@ -955,10 +951,10 @@ let process_book_entry ~reset ~symbol ~sequence ~checksum ~apply_levels on_heart
       (Printexc.to_string exn)
 ;;
 
-(** Process a single orderbook WebSocket message via the DOM. Kept as the
-    reference path: state parity with the span version is enforced by
-    [test_kraken_span_orderbook]. [reset] selects snapshot vs update semantics.
-    Returns [Some ()] on successful parse, [None] on failure. *)
+(** Process a single orderbook WebSocket message via the DOM. Kept as the reference path:
+    state parity with the span version is enforced by [test_kraken_span_orderbook].
+    [reset] selects snapshot vs update semantics. Returns [Some ()] on successful parse,
+    [None] on failure. *)
 let process_orderbook_message ~reset json on_heartbeat =
   let open Yojson.Safe.Util in
   try
@@ -967,38 +963,39 @@ let process_orderbook_message ~reset json on_heartbeat =
     let notified_symbols = notified_symbols_reusable in
     List.iter
       (fun entry ->
-         try
-           let symbol = member "symbol" entry |> to_string in
-           let sequence = int64_of_json (member "sequence" entry) in
-           (* Skip checksum extraction when depth < 10: validation is bypassed
-              anyway, and the DOM field allocates Int32 boxes per frame. *)
-           let checksum =
-             if orderbook_depth >= 10
-             then int32_of_json (member "checksum" entry)
-             else None
-           in
-           let bids_json = member "bids" entry in
-           let asks_json = member "asks" entry in
-           process_book_entry
-             ~reset
-             ~symbol
-             ~sequence
-             ~checksum
-             ~apply_levels:(fun store ->
-               parse_and_apply_levels symbol store.bids bids_json;
-               parse_and_apply_levels symbol store.asks asks_json)
-             on_heartbeat
-             notified_symbols
-         with
-         | Exit ->
-           () (* Control flow: entry skipped due to missing snapshot or sequence error. *)
-         | exn ->
-           Logging.warn_f
-             ~section
-             "Failed to process orderbook entry: %s"
-             (Printexc.to_string exn))
+        try
+          let symbol = member "symbol" entry |> to_string in
+          let sequence = int64_of_json (member "sequence" entry) in
+          (* Skip checksum extraction when depth < 10: validation is bypassed anyway, and
+             the DOM field allocates Int32 boxes per frame. *)
+          let checksum =
+            if orderbook_depth >= 10
+            then int32_of_json (member "checksum" entry)
+            else None
+          in
+          let bids_json = member "bids" entry in
+          let asks_json = member "asks" entry in
+          process_book_entry
+            ~reset
+            ~symbol
+            ~sequence
+            ~checksum
+            ~apply_levels:(fun store ->
+              parse_and_apply_levels symbol store.bids bids_json;
+              parse_and_apply_levels symbol store.asks asks_json)
+            on_heartbeat
+            notified_symbols
+        with
+        | Exit ->
+          () (* Control flow: entry skipped due to missing snapshot or sequence error. *)
+        | exn ->
+          Logging.warn_f
+            ~section
+            "Failed to process orderbook entry: %s"
+            (Printexc.to_string exn))
       data;
-    (* Broadcast readiness and signal exchange wakeup for each symbol that received a valid write. *)
+    (* Broadcast readiness and signal exchange wakeup for each symbol that received a
+       valid write. *)
     Hashtbl.iter (fun symbol store -> notify_ready ~symbol store) notified_symbols;
     Some ()
   with
@@ -1010,11 +1007,11 @@ let process_orderbook_message ~reset json on_heartbeat =
     None
 ;;
 
-(** Process a single orderbook WebSocket message via the allocation-light scan.
-    Same book semantics as [process_orderbook_message]; enforceable state
-    parity is verified by [test_kraken_span_orderbook]. Each data entry's
-    scalars are located as spans and the levels applied without a DOM. Returns
-    [Some ()] on successful parse, [None] on failure. *)
+(** Process a single orderbook WebSocket message via the allocation-light scan. Same book
+    semantics as [process_orderbook_message]; enforceable state parity is verified by
+    [test_kraken_span_orderbook]. Each data entry's scalars are located as spans and the
+    levels applied without a DOM. Returns [Some ()] on successful parse, [None] on
+    failure. *)
 let process_orderbook_message_span ~reset message on_heartbeat =
   try
     let dlen = String.length message in
@@ -1024,55 +1021,55 @@ let process_orderbook_message_span ~reset message on_heartbeat =
       Hashtbl.clear notified_symbols_reusable;
       let notified_symbols = notified_symbols_reusable in
       Json_scan.array_fold message ilo ihi () (fun () e0 e1 ->
-          if e0 < e1 && message.[e0] = '{'
-          then (
-            try
-              let olo, ohi = Json_scan.object_interior message e0 e1 in
-              let symbol =
-                match Json_scan.find_field message olo ohi "symbol" with
-                | Some (si, sj) when Json_scan.value_is_string message si ->
-                  Json_scan.string_of_span message si sj
-                | _ -> raise Exit
-              in
-              let sequence =
-                match Json_scan.find_field message olo ohi "sequence" with
-                | Some (si, sj) -> int64_of_span message si sj
-                | None -> None
-              in
-              let checksum =
-                if orderbook_depth >= 10
-                then (
-                  match Json_scan.find_field message olo ohi "checksum" with
-                  | Some (si, sj) -> int32_of_span message si sj
-                  | None -> None)
-                else None
-              in
-              let bids_span = Json_scan.find_field message olo ohi "bids" in
-              let asks_span = Json_scan.find_field message olo ohi "asks" in
-              process_book_entry
-                ~reset
-                ~symbol
-                ~sequence
-                ~checksum
-                ~apply_levels:(fun store ->
-                  (match bids_span with
-                   | Some bs -> apply_levels_from_span symbol message store.bids bs
-                   | None -> ());
-                  (match asks_span with
-                   | Some as_ -> apply_levels_from_span symbol message store.asks as_
-                   | None -> ()))
-                on_heartbeat
-                notified_symbols
-            with
-            | Exit ->
-              () (* Control flow: entry skipped or state reset. *)
-            | exn ->
-              Logging.warn_f
-                ~section
-                "Failed to process orderbook entry: %s"
-                (Printexc.to_string exn))
-          else ());
-      (* Broadcast readiness and signal exchange wakeup for each symbol that received a valid write. *)
+        if e0 < e1 && message.[e0] = '{'
+        then (
+          try
+            let olo, ohi = Json_scan.object_interior message e0 e1 in
+            let symbol =
+              match Json_scan.find_field message olo ohi "symbol" with
+              | Some (si, sj) when Json_scan.value_is_string message si ->
+                Json_scan.string_of_span message si sj
+              | _ -> raise Exit
+            in
+            let sequence =
+              match Json_scan.find_field message olo ohi "sequence" with
+              | Some (si, sj) -> int64_of_span message si sj
+              | None -> None
+            in
+            let checksum =
+              if orderbook_depth >= 10
+              then (
+                match Json_scan.find_field message olo ohi "checksum" with
+                | Some (si, sj) -> int32_of_span message si sj
+                | None -> None)
+              else None
+            in
+            let bids_span = Json_scan.find_field message olo ohi "bids" in
+            let asks_span = Json_scan.find_field message olo ohi "asks" in
+            process_book_entry
+              ~reset
+              ~symbol
+              ~sequence
+              ~checksum
+              ~apply_levels:(fun store ->
+                (match bids_span with
+                 | Some bs -> apply_levels_from_span symbol message store.bids bs
+                 | None -> ());
+                match asks_span with
+                | Some as_ -> apply_levels_from_span symbol message store.asks as_
+                | None -> ())
+              on_heartbeat
+              notified_symbols
+          with
+          | Exit -> () (* Control flow: entry skipped or state reset. *)
+          | exn ->
+            Logging.warn_f
+              ~section
+              "Failed to process orderbook entry: %s"
+              (Printexc.to_string exn))
+        else ());
+      (* Broadcast readiness and signal exchange wakeup for each symbol that received a
+         valid write. *)
       Hashtbl.iter (fun symbol store -> notify_ready ~symbol store) notified_symbols;
       Some ()
     | _ -> None
@@ -1091,9 +1088,9 @@ let[@inline always] get_latest_orderbook symbol =
   | None -> None
 ;;
 
-(** Max age of a ring-buffer frame before it is considered stale and rejected.
-    Without this guard a desynced/stalled feed serves its last frame forever,
-    making both the dashboard and the sizing loop act on a frozen price. *)
+(** Max age of a ring-buffer frame before it is considered stale and rejected. Without
+    this guard a desynced/stalled feed serves its last frame forever, making both the
+    dashboard and the sizing loop act on a frozen price. *)
 let max_book_age = Kraken_common_types.default_max_book_age_s
 
 let max_book_age_ns = Int64.of_float (max_book_age *. 1e9)
@@ -1135,22 +1132,24 @@ let[@inline always] get_best_bid_ask_fast symbol =
     | None -> None
 ;;
 
-(** Read all orderbook snapshots written since [last_pos]. Returns an empty list if the symbol is unknown. *)
+(** Read all orderbook snapshots written since [last_pos]. Returns an empty list if the
+    symbol is unknown. *)
 let[@inline always] read_orderbook_events symbol last_pos =
   match store_opt symbol with
   | Some store -> RingBuffer.read_since store.buffer last_pos
   | None -> []
 ;;
 
-(** Iterate over orderbook snapshots since [last_pos] without allocating an intermediate list.
-    Returns the new read position. *)
+(** Iterate over orderbook snapshots since [last_pos] without allocating an intermediate
+    list. Returns the new read position. *)
 let[@inline always] iter_orderbook_events symbol last_pos f =
   match store_opt symbol with
   | Some store -> RingBuffer.iter_since store.buffer last_pos f
   | None -> last_pos
 ;;
 
-(** Returns the current ring buffer write position for the given symbol. Returns 0 if unknown. *)
+(** Returns the current ring buffer write position for the given symbol. Returns 0 if
+    unknown. *)
 let[@inline always] get_current_position symbol =
   match store_opt symbol with
   | Some store -> RingBuffer.get_position store.buffer
@@ -1180,24 +1179,25 @@ let has_orderbook_data symbol =
   | _ -> false
 ;;
 
-(** Resets all per-symbol stores: clears bid/ask maps, replaces ring buffers, and unsets readiness flags.
-    Called on reconnection to ensure no stale data persists. *)
+(** Resets all per-symbol stores: clears bid/ask maps, replaces ring buffers, and unsets
+    readiness flags. Called on reconnection to ensure no stale data persists. *)
 let clear_all_stores () =
   Hashtbl.iter
     (fun symbol store ->
-       Logging.debug_f ~section "Clearing orderbook store for %s" symbol;
-       Hashtbl.clear store.bids;
-       Hashtbl.clear store.asks;
-       RingBuffer.clear store.buffer;
-       Atomic.set store.ready false;
-       Atomic.set store.has_snapshot false;
-       Atomic.set store.last_sequence None;
-       Atomic.set store.last_update_ns (Mtime_clock.now_ns ()))
+      Logging.debug_f ~section "Clearing orderbook store for %s" symbol;
+      Hashtbl.clear store.bids;
+      Hashtbl.clear store.asks;
+      RingBuffer.clear store.buffer;
+      Atomic.set store.ready false;
+      Atomic.set store.has_snapshot false;
+      Atomic.set store.last_sequence None;
+      Atomic.set store.last_update_ns (Mtime_clock.now_ns ()))
     stores
 ;;
 
-(** Removes stores inactive for over 30 minutes and trims oversized price maps to [max_price_levels].
-    Prevents unbounded memory growth from abandoned subscriptions or accumulated levels. *)
+(** Removes stores inactive for over 30 minutes and trims oversized price maps to
+    [max_price_levels]. Prevents unbounded memory growth from abandoned subscriptions or
+    accumulated levels. *)
 let prune_stale_data () =
   let now_ns = Mtime_clock.now_ns () in
   let stale_threshold_ns = Int64.of_float (30.0 *. 60.0 *. 1e9) in
@@ -1207,42 +1207,38 @@ let prune_stale_data () =
   let total_stores_before = Hashtbl.length stores in
   Hashtbl.iter
     (fun symbol store ->
-       let age = Int64.sub now_ns (Atomic.get store.last_update_ns) in
-       if Int64.compare age stale_threshold_ns > 0
-       then (
-         (* Never prune a store whose symbol is still subscribed: the
-            exchange-side subscription survives the prune, stranding the
-            symbol snapshot-less; the health monitor then re-subscribes every
-            15s and Kraken answers "Already subscribed" in a loop. Store count
-            stays bounded by the subscribed symbol list. *)
-         let still_subscribed =
-           Mutex.lock subscribed_mutex;
-           let sub = List.mem symbol !all_subscribed_symbols in
-           Mutex.unlock subscribed_mutex;
-           sub
-         in
-         if still_subscribed then () else stores_to_remove := symbol :: !stores_to_remove)
-       else (
-         let bids_count = Hashtbl.length store.bids in
-         let asks_count = Hashtbl.length store.asks in
-         let trimmed = ref false in
-         if bids_count > max_price_levels
-         then (
-           truncate_hashtbl store.bids true max_price_levels;
-           trimmed := true);
-         if asks_count > max_price_levels
-         then (
-           truncate_hashtbl store.asks false max_price_levels;
-           trimmed := true);
-         if !trimmed then trimmed_stores := symbol :: !trimmed_stores))
+      let age = Int64.sub now_ns (Atomic.get store.last_update_ns) in
+      if Int64.compare age stale_threshold_ns > 0
+      then (
+        (* Never prune a store whose symbol is still subscribed: the exchange-side
+           subscription survives the prune, stranding the symbol snapshot-less; the health
+           monitor then re-subscribes every 15s and Kraken answers "Already subscribed" in
+           a loop. Store count stays bounded by the subscribed symbol list. *)
+        let still_subscribed =
+          Mutex.lock subscribed_mutex;
+          let sub = List.mem symbol !all_subscribed_symbols in
+          Mutex.unlock subscribed_mutex;
+          sub
+        in
+        if still_subscribed then () else stores_to_remove := symbol :: !stores_to_remove)
+      else (
+        let bids_count = Hashtbl.length store.bids in
+        let asks_count = Hashtbl.length store.asks in
+        let trimmed = ref false in
+        if bids_count > max_price_levels
+        then (
+          truncate_hashtbl store.bids true max_price_levels;
+          trimmed := true);
+        if asks_count > max_price_levels
+        then (
+          truncate_hashtbl store.asks false max_price_levels;
+          trimmed := true);
+        if !trimmed then trimmed_stores := symbol :: !trimmed_stores))
     stores;
   List.iter
     (fun symbol ->
-       Hashtbl.remove stores symbol;
-       Logging.debug_f
-         ~section
-         "Removed stale orderbook store for %s (age > 30min)"
-         symbol)
+      Hashtbl.remove stores symbol;
+      Logging.debug_f ~section "Removed stale orderbook store for %s (age > 30min)" symbol)
     !stores_to_remove;
   if !trimmed_stores <> []
   then
@@ -1274,50 +1270,50 @@ let trigger_orderbook_cleanup ~reason () =
     Lwt.return_unit)
 ;;
 
-(* Per-connection heartbeat closure, published so the Parse_worker handler
-   can invoke it from the parse domain (domain-safe: mutex + timestamp
-   update). One orderbook connection exists at a time. *)
+(* Per-connection heartbeat closure, published so the Parse_worker handler can invoke it
+   from the parse domain (domain-safe: mutex + timestamp update). One orderbook connection
+   exists at a time. *)
 let current_on_heartbeat : (unit -> unit) option Atomic.t = Atomic.make None
 
-(** Records the clock-corrected one-way network latency of each [book] data
-    entry from its RFC3339 server [timestamp]. No-op for entries without one.
-    Recorded only on book data so heartbeats don't mask a stalled book feed. *)
+(** Records the clock-corrected one-way network latency of each [book] data entry from its
+    RFC3339 server [timestamp]. No-op for entries without one. Recorded only on book data
+    so heartbeats don't mask a stalled book feed. *)
 let record_book_latency json =
   let open Yojson.Safe.Util in
   match member "data" json with
   | `List entries ->
     List.iter
       (fun entry ->
-         match entry |> member "timestamp" |> to_string_option with
-         | Some ts ->
-           (match Network_latency.unix_of_rfc3339 ts with
-            | Some event -> Network_latency.record_feed_event_s "kraken" ~event ()
-            | None -> ())
-         | None -> ())
+        match entry |> member "timestamp" |> to_string_option with
+        | Some ts ->
+          (match Network_latency.unix_of_rfc3339 ts with
+           | Some event -> Network_latency.record_feed_event_s "kraken" ~event ()
+           | None -> ())
+        | None -> ())
       entries
   | _ -> ()
 ;;
 
-(** Span analogue of [record_book_latency]: extracts each data entry's
-    [timestamp] string directly from the frame with no DOM. *)
+(** Span analogue of [record_book_latency]: extracts each data entry's [timestamp] string
+    directly from the frame with no DOM. *)
 let record_book_latency_span message =
   let dlen = String.length message in
   match Json_scan.find_field message 1 (max 0 (dlen - 1)) "data" with
   | Some (di, dj) when di < dj && message.[di] = '[' ->
     let ilo, ihi = Json_scan.array_interior message di dj in
     Json_scan.array_fold message ilo ihi () (fun () e0 e1 ->
-        if e0 < e1 && message.[e0] = '{'
-        then (
-          let olo, ohi = Json_scan.object_interior message e0 e1 in
-          match Json_scan.find_field message olo ohi "timestamp" with
-          | Some (ti, tj) when Json_scan.value_is_string message ti ->
-            (match
-               Network_latency.unix_of_rfc3339 (Json_scan.string_of_span message ti tj)
-             with
-             | Some event -> Network_latency.record_feed_event_s "kraken" ~event ()
-             | None -> ())
-          | _ -> ())
-        else ())
+      if e0 < e1 && message.[e0] = '{'
+      then (
+        let olo, ohi = Json_scan.object_interior message e0 e1 in
+        match Json_scan.find_field message olo ohi "timestamp" with
+        | Some (ti, tj) when Json_scan.value_is_string message ti ->
+          (match
+             Network_latency.unix_of_rfc3339 (Json_scan.string_of_span message ti tj)
+           with
+           | Some event -> Network_latency.record_feed_event_s "kraken" ~event ()
+           | None -> ())
+        | _ -> ())
+      else ())
   | _ -> ()
 ;;
 
@@ -1340,9 +1336,9 @@ let extract_symbol_opt json =
         | _ -> None))
 ;;
 
-(** Dispatch of an already-parsed frame on the Parse_worker domain; no Lwt
-    primitives. Sequence-gap resubscribes go through the pending queue;
-    readiness through Atomics; logging/profiling/wakeups are domain-safe. *)
+(** Dispatch of an already-parsed frame on the Parse_worker domain; no Lwt primitives.
+    Sequence-gap resubscribes go through the pending queue; readiness through Atomics;
+    logging/profiling/wakeups are domain-safe. *)
 let handle_dispatch json on_heartbeat =
   let open Yojson.Safe.Util in
   let channel = member "channel" json |> to_string_option in
@@ -1383,20 +1379,19 @@ let handle_dispatch json on_heartbeat =
           err_msg;
       if is_already_subscribed
       then (
-        (* Kraken dedups per connection: the subscription is active but the
-           local store may be missing (pruned after 30 min) or snapshot-less.
-           No snapshot arrives on its own, deltas are discarded, and the health
-           monitor re-subscribes every 15s in a loop. Recover event-driven:
-           recreate the store if needed and force one unsubscribe+resubscribe
-           cycle to obtain a fresh snapshot. *)
+        (* Kraken dedups per connection: the subscription is active but the local store
+           may be missing (pruned after 30 min) or snapshot-less. No snapshot arrives on
+           its own, deltas are discarded, and the health monitor re-subscribes every 15s
+           in a loop. Recover event-driven: recreate the store if needed and force one
+           unsubscribe+resubscribe cycle to obtain a fresh snapshot. *)
         match symbol_opt with
         | Some sym ->
           (match store_opt sym with
            | Some store
              when (not (Atomic.get store.has_snapshot))
                   || (Hashtbl.length store.bids = 0 && Hashtbl.length store.asks = 0) ->
-             (* Snapshot-less, or a snapshot left an empty book: top-of-book
-                stays invalid and the health monitor re-subscribes every 15s. *)
+             (* Snapshot-less, or a snapshot left an empty book: top-of-book stays invalid
+                and the health monitor re-subscribes every 15s. *)
              Logging.warn_f
                ~section
                "Kraken is already subscribed to %s but local store has no usable book; \
@@ -1433,11 +1428,10 @@ let handle_dispatch json on_heartbeat =
     Logging.info_f ~section "Unhandled orderbook payload: %s" (Yojson.Safe.to_string json)
 ;;
 
-(** Parse-domain body: parse + dispatch without publishing a tick (the WS fiber
-    owns tick accounting) and with the connection's current heartbeat. Shared by
-    the legacy "kraken_ob" handler and the uniform venue decoder.
-    Book frames (the hot path) are read with the allocation-light scan;
-    heartbeats are answered without a DOM; everything else
+(** Parse-domain body: parse + dispatch without publishing a tick (the WS fiber owns tick
+    accounting) and with the connection's current heartbeat. Shared by the legacy
+    "kraken_ob" handler and the uniform venue decoder. Book frames (the hot path) are read
+    with the allocation-light scan; heartbeats are answered without a DOM; everything else
     (subscribe/unsubscribe/status/control) falls back to the DOM [handle_dispatch]. *)
 let process_parse_domain_frame message =
   try
@@ -1448,8 +1442,8 @@ let process_parse_domain_frame message =
     in
     let len = String.length message in
     let top_level_field key =
-      (* The scanner needs the top-level object interior; frames are tight
-         (no leading whitespace), matching [Kraken_impl.decode_frame]. *)
+      (* The scanner needs the top-level object interior; frames are tight (no leading
+         whitespace), matching [Kraken_impl.decode_frame]. *)
       match Json_scan.find_field message 1 (max 0 (len - 1)) key with
       | Some (i, j) when Json_scan.value_is_string message i ->
         Json_scan.string_of_span message i j
@@ -1480,10 +1474,9 @@ let process_parse_domain_frame message =
 
 (** Parse-worker entry point: parse + dispatch on the parse domain. *)
 let () = Concurrency.Parse_worker.register "kraken_ob" process_parse_domain_frame
-;;
 
-(** Synchronous path: parse + dispatch inline on the calling thread.
-    Used as the overload fallback and by tests. *)
+(** Synchronous path: parse + dispatch inline on the calling thread. Used as the overload
+    fallback and by tests. *)
 let handle_message message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
   try
@@ -1499,11 +1492,10 @@ let handle_message message on_heartbeat =
       message
 ;;
 
-(** Async path for the WS read loop: tick accounting and heartbeat stay on
-    the Lwt fiber; JSON parse and dispatch run on the Parse_worker domain.
-    Falls back to the synchronous path when the worker queue is full. Book
-    updates are deltas, so frames must never be dropped (a lost delta desyncs
-    the book until the next snapshot). *)
+(** Async path for the WS read loop: tick accounting and heartbeat stay on the Lwt fiber;
+    JSON parse and dispatch run on the Parse_worker domain. Falls back to the synchronous
+    path when the worker queue is full. Book updates are deltas, so frames must never be
+    dropped (a lost delta desyncs the book until the next snapshot). *)
 let handle_message_async message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
   Atomic.set current_on_heartbeat (Some on_heartbeat);
@@ -1521,10 +1513,9 @@ let wait_for_orderbook_data_lwt symbols timeout_seconds =
       if elapsed >= timeout_seconds
       then
         Lwt.return_false
-        (* Poll per-store ready flags; readiness is published from the
-           Parse_worker domain, which must not touch Lwt primitives. The 25ms
-           poll runs only during startup gating (bounded by the timeout),
-           never on a hot path. *)
+        (* Poll per-store ready flags; readiness is published from the Parse_worker
+           domain, which must not touch Lwt primitives. The 25ms poll runs only during
+           startup gating (bounded by the timeout), never on a hot path. *)
       else Lwt_unix.sleep 0.025 >>= fun () -> wait_loop ())
   in
   wait_loop ()
@@ -1532,8 +1523,9 @@ let wait_for_orderbook_data_lwt symbols timeout_seconds =
 
 let wait_for_orderbook_data = wait_for_orderbook_data_lwt
 
-(** Subscribe to orderbook channels and enter the asynchronous read loop.
-    Invokes [on_failure] on connection loss; resolves the returned promise when the loop terminates. *)
+(** Subscribe to orderbook channels and enter the asynchronous read loop. Invokes
+    [on_failure] on connection loss; resolves the returned promise when the loop
+    terminates. *)
 let start_message_handler conn symbols on_failure on_heartbeat =
   let subscribe_msg =
     `Assoc
@@ -1563,14 +1555,12 @@ let start_message_handler conn symbols on_failure on_heartbeat =
     then (
       failed := true;
       Lwt_mutex.with_lock state.mutex (fun () ->
-        (* Physical equality: [conn] holds closures
-           ([read_frame]/[write_frame]), so structural [=] raises
-           Invalid_argument("compare: functional value"), aborting
+        (* Physical equality: [conn] holds closures ([read_frame]/[write_frame]), so
+           structural [=] raises Invalid_argument("compare: functional value"), aborting
            [notify_failure] and leaving [active_conn] on the dead socket. *)
-        if
-          match state.active_conn with
-          | Some c -> c == conn
-          | None -> false
+        if match state.active_conn with
+           | Some c -> c == conn
+           | None -> false
         then state.active_conn <- None;
         Lwt.return_unit)
       >>= fun () ->
@@ -1583,8 +1573,8 @@ let start_message_handler conn symbols on_failure on_heartbeat =
       Logging.warn ~section "Orderbook WebSocket closed by server";
       notify_failure "Connection closed by server"
     | frame ->
-      (* parse+dispatch run on the Parse_worker domain; this returns
-         immediately (no awaiting), keeping the WS read loop tight. *)
+      (* parse+dispatch run on the Parse_worker domain; this returns immediately (no
+         awaiting), keeping the WS read loop tight. *)
       let () = handle_message_async frame.Websocket.Frame.content on_heartbeat in
       Lwt.return_unit
   in
@@ -1596,14 +1586,14 @@ let start_message_handler conn symbols on_failure on_heartbeat =
     Lwt.catch
       (fun () -> Concurrency.Lwt_util.consume_stream_s process_frame stream)
       (fun exn ->
-         match exn with
-         | Failure msg when msg = "Connection closed by server" -> Lwt.return_unit
-         | _ ->
-           Logging.error_f
-             ~section
-             "Orderbook WebSocket error during read: %s"
-             (Printexc.to_string exn);
-           notify_failure (Printf.sprintf "WebSocket error: %s" (Printexc.to_string exn)))
+        match exn with
+        | Failure msg when msg = "Connection closed by server" -> Lwt.return_unit
+        | _ ->
+          Logging.error_f
+            ~section
+            "Orderbook WebSocket error during read: %s"
+            (Printexc.to_string exn);
+          notify_failure (Printf.sprintf "WebSocket error: %s" (Printexc.to_string exn)))
   in
   let final_done_p =
     done_p
@@ -1619,8 +1609,8 @@ let start_message_handler conn symbols on_failure on_heartbeat =
   final_done_p
 ;;
 
-(* Per-symbol consecutive-failure counters for resubscribe backoff. Only
-   touched from Lwt fibers on the main domain, so no mutex is required. *)
+(* Per-symbol consecutive-failure counters for resubscribe backoff. Only touched from Lwt
+   fibers on the main domain, so no mutex is required. *)
 let resubscribe_attempts : (string, int) Hashtbl.t = Hashtbl.create 8
 
 let resubscribe_backoff_delay_s attempt =
@@ -1635,9 +1625,9 @@ let resubscribe_backoff_delay_s attempt =
 let rec subscribe_symbols symbols =
   resubscribe_symbol_ref := Some (fun s -> resubscribe_symbol s);
   let _ = add_subscribed_symbols symbols in
-  (* Drain sequence-gap resubscribe requests raised on the Parse_worker
-     domain. The watcher runs on the Lwt main domain, where [resubscribe_symbol]
-     is safe. Started once; 50ms poll. *)
+  (* Drain sequence-gap resubscribe requests raised on the Parse_worker domain. The
+     watcher runs on the Lwt main domain, where [resubscribe_symbol] is safe. Started
+     once; 50ms poll. *)
   if not (Atomic.get resubscribe_watcher_started)
   then (
     Atomic.set resubscribe_watcher_started true;
@@ -1650,10 +1640,10 @@ let rec subscribe_symbols symbols =
          then
            List.iter
              (fun s ->
-                (* [resubscribe_with_retry] owns failure handling: backoff,
-                    jitter, bounded attempts. A dropped symbol here would stay
-                    snapshot-less forever, discarding all deltas. *)
-                Lwt.async (fun () -> resubscribe_with_retry s))
+               (* [resubscribe_with_retry] owns failure handling: backoff, jitter, bounded
+                  attempts. A dropped symbol here would stay snapshot-less forever,
+                  discarding all deltas. *)
+               Lwt.async (fun () -> resubscribe_with_retry s))
              pending
          else ());
       Lwt_unix.sleep 0.05 >>= fun () -> watcher ()
@@ -1662,9 +1652,9 @@ let rec subscribe_symbols symbols =
   let missing_meta =
     List.filter
       (fun symbol ->
-         match Kraken_instruments_feed.get_precision_info symbol with
-         | Some _ -> false
-         | None -> true)
+        match Kraken_instruments_feed.get_precision_info symbol with
+        | Some _ -> false
+        | None -> true)
       symbols
   in
   (if missing_meta <> []
@@ -1675,8 +1665,8 @@ let rec subscribe_symbols symbols =
   >>= fun () ->
   List.iter
     (fun symbol ->
-       let _ = ensure_store symbol in
-       ())
+      let _ = ensure_store symbol in
+      ())
     symbols;
   Lwt_mutex.with_lock state.mutex (fun () -> Lwt.return state.active_conn)
   >>= function
@@ -1727,17 +1717,15 @@ and resubscribe_symbol symbol =
     Ws_lwt.write conn (Websocket.Frame.create ~content:msg_str ())
     >>= fun () -> Lwt_unix.sleep 0.25 >>= fun () -> subscribe_symbols [ symbol ]
   | None ->
-    (* A missing connection is a failure, not a silent success. Raising routes
-       into [resubscribe_with_retry]'s backoff loop; if the socket is dead, the
-       supervisor reconnect path owns recovery (clears stores, resubscribes all
-       symbols). *)
+    (* A missing connection is a failure, not a silent success. Raising routes into
+       [resubscribe_with_retry]'s backoff loop; if the socket is dead, the supervisor
+       reconnect path owns recovery (clears stores, resubscribes all symbols). *)
     failwith "orderbook WS not connected"
 
-(** Drives one resubscribe to completion with exponential backoff + jitter,
-    bounded by [default_max_resubscribe_attempts]. Success resets the counter;
-    exhausting attempts logs an error and stops - recovery is then owned by
-    the supervisor reconnect, which clears stores and resubscribes all
-    symbols. *)
+(** Drives one resubscribe to completion with exponential backoff + jitter, bounded by
+    [default_max_resubscribe_attempts]. Success resets the counter; exhausting attempts
+    logs an error and stops - recovery is then owned by the supervisor reconnect, which
+    clears stores and resubscribes all symbols. *)
 and resubscribe_with_retry symbol =
   let max_attempts = Kraken_common_types.default_max_resubscribe_attempts in
   let attempt =
@@ -1758,24 +1746,24 @@ and resubscribe_with_retry symbol =
   else
     Lwt.catch
       (fun () ->
-         resubscribe_symbol symbol
-         >>= fun () ->
-         Hashtbl.remove resubscribe_attempts symbol;
-         Logging.info_f ~section "Resubscribe for %s completed" symbol;
-         Lwt.return_unit)
+        resubscribe_symbol symbol
+        >>= fun () ->
+        Hashtbl.remove resubscribe_attempts symbol;
+        Logging.info_f ~section "Resubscribe for %s completed" symbol;
+        Lwt.return_unit)
       (fun exn ->
-         let next = attempt + 1 in
-         Hashtbl.replace resubscribe_attempts symbol next;
-         let delay = resubscribe_backoff_delay_s attempt in
-         Logging.warn_f
-           ~section
-           "Resubscribe for %s failed (%s) - attempt %d/%d, retrying in %.1fs"
-           symbol
-           (Printexc.to_string exn)
-           next
-           max_attempts
-           delay;
-         Lwt_unix.sleep delay >>= fun () -> resubscribe_with_retry symbol)
+        let next = attempt + 1 in
+        Hashtbl.replace resubscribe_attempts symbol next;
+        let delay = resubscribe_backoff_delay_s attempt in
+        Logging.warn_f
+          ~section
+          "Resubscribe for %s failed (%s) - attempt %d/%d, retrying in %.1fs"
+          symbol
+          (Printexc.to_string exn)
+          next
+          max_attempts
+          delay;
+        Lwt_unix.sleep delay >>= fun () -> resubscribe_with_retry symbol)
 ;;
 
 let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
@@ -1791,8 +1779,7 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   in
   let client = `TLS (`Hostname "ws.kraken.com", `IP ip, `Port 443) in
   let ctx = get_conduit_ctx () in
-  Lwt_unix.with_timeout ws_connect_timeout_s (fun () ->
-    Ws_lwt.connect ~ctx client uri)
+  Lwt_unix.with_timeout ws_connect_timeout_s (fun () -> Ws_lwt.connect ~ctx client uri)
   >>= fun conn ->
   Lwt_mutex.with_lock state.mutex (fun () ->
     state.active_conn <- Some conn;
@@ -1816,8 +1803,8 @@ let initialize symbols =
   >>= fun () ->
   List.iter
     (fun symbol ->
-       let _ = ensure_store symbol in
-       Logging.debug_f ~section "Created orderbook store for %s" symbol)
+      let _ = ensure_store symbol in
+      Logging.debug_f ~section "Created orderbook store for %s" symbol)
     symbols;
   Logging.debug_f ~section "Orderbook feed stores initialized";
   Lwt.return_unit

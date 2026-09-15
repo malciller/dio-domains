@@ -1,9 +1,8 @@
-(* OxCaml flags [Domain.spawn] as [do_not_spawn_domains] (unbounded domains
-   degrade GC) and [unsafe_multidomain]. This standalone benchmark runs a
-   fixed, small set of short-lived worker domains with private heaps to measure
-   the stop-the-world effect of concurrent allocation - the behaviour under
-   test. [Multicore] is absent on the classic toolchain this also builds under,
-   so the alerts are acknowledged. *)
+(* OxCaml flags [Domain.spawn] as [do_not_spawn_domains] (unbounded domains degrade GC)
+   and [unsafe_multidomain]. This standalone benchmark runs a fixed, small set of
+   short-lived worker domains with private heaps to measure the stop-the-world effect of
+   concurrent allocation - the behaviour under test. [Multicore] is absent on the classic
+   toolchain this also builds under, so the alerts are acknowledged. *)
 [@@@alert "-unsafe_multidomain"]
 [@@@alert "-do_not_spawn_domains"]
 
@@ -36,8 +35,8 @@ let simulate_tick local_cache profiler tick_id =
   in
   let parsed = List.map String.length msgs in
   let _sum = List.fold_left ( + ) 0 parsed in
-  (* Phase 2: write-barrier trigger; mutate the old generation with
-     new-generation pointers. *)
+  (* Phase 2: write-barrier trigger; mutate the old generation with new-generation
+     pointers. *)
   let target_index = tick_id mod 50_000 in
   let key = Printf.sprintf "order-%d" target_index in
   let new_dynamic_str = Printf.sprintf "updated-value-%Ld" span_start in
@@ -58,9 +57,9 @@ let worker_domain id total_ticks =
   LP.percentile profiler 0.99, LP.percentile profiler 0.999
 ;;
 
-(** Process-wide GC counters and total allocation, for attributing latency
-    changes to collector activity under each sweep configuration. [Gc.quick_stat]
-    is cheap and returns the same [stat] record shape as [Gc.stat]. *)
+(** Process-wide GC counters and total allocation, for attributing latency changes to
+    collector activity under each sweep configuration. [Gc.quick_stat] is cheap and
+    returns the same [stat] record shape as [Gc.stat]. *)
 type gc_counters =
   { minor : int
   ; major : int

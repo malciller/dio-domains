@@ -1,6 +1,5 @@
-(** Hyperliquid WebSocket client.
-    Manages a single persistent connection for market data and user event
-    subscriptions. Incoming frames are demultiplexed to subscriber streams
+(** Hyperliquid WebSocket client. Manages a single persistent connection for market data
+    and user event subscriptions. Incoming frames are demultiplexed to subscriber streams
     and to a request/response table keyed by integer IDs. *)
 
 open Lwt.Infix
@@ -21,18 +20,18 @@ type raw_subscription =
 let is_connected_ref = Atomic.make false
 let is_connected () = Atomic.get is_connected_ref
 
-(** TLS + WebSocket upgrade handshake timeout. Without it a half-open TCP
-    connection blocks the reconnect (on the main Lwt loop) indefinitely;
-    [Lwt_unix.with_timeout] cancels the in-flight connect and closes its fd. *)
+(** TLS + WebSocket upgrade handshake timeout. Without it a half-open TCP connection
+    blocks the reconnect (on the main Lwt loop) indefinitely; [Lwt_unix.with_timeout]
+    cancels the in-flight connect and closes its fd. *)
 let ws_connect_timeout_s = 20.0
 
-(** Mvar signaled each time a new connection is established.
-    Consumers call [wait_for_connected] to block on this rather than polling.
-    Refilled after each successful connect so subsequent callers also wake. *)
+(** Mvar signaled each time a new connection is established. Consumers call
+    [wait_for_connected] to block on this rather than polling. Refilled after each
+    successful connect so subsequent callers also wake. *)
 let connected_wakeup : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
 
-(** Returns immediately if already connected, otherwise blocks until
-    [connected_wakeup] is signaled by a successful connection. *)
+(** Returns immediately if already connected, otherwise blocks until [connected_wakeup] is
+    signaled by a successful connection. *)
 let wait_for_connected () =
   if Atomic.get is_connected_ref then Lwt.return_unit else Lwt_mvar.take connected_wakeup
 ;;
@@ -40,13 +39,13 @@ let wait_for_connected () =
 let active_connection = ref None
 let connection_mutex = Lwt_mutex.create ()
 
-(** Broadcasts to [Concurrency.Exchange_wakeup] to unblock domain workers
-    waiting on Hyperliquid data. Called on every incoming frame and on disconnect. *)
+(** Broadcasts to [Concurrency.Exchange_wakeup] to unblock domain workers waiting on
+    Hyperliquid data. Called on every incoming frame and on disconnect. *)
 let signal_new_data () = Concurrency.Exchange_wakeup.signal_all ()
 
-(** Global list of subscriber push functions.
-    Each entry accepts [Some json] to deliver a message or [None] to close
-    the stream. Returns [true] on success, [false] if the message was dropped. *)
+(** Global list of subscriber push functions. Each entry accepts [Some json] to deliver a
+    message or [None] to close the stream. Returns [true] on success, [false] if the
+    message was dropped. *)
 let pushers : (Yojson.Safe.t option -> bool) list ref = ref []
 
 let pushers_mutex = Mutex.create ()
@@ -67,23 +66,22 @@ let responses_mutex = Lwt_mutex.create ()
 let ping_failures = Atomic.make 0
 
 (* Cumulative count of messages dropped because a subscriber's bounded stream
-   (capacity 16) was full. A dropped fill frame is a silent inventory desync;
-   this counter and the throttled warn make it visible. *)
+   (capacity 16) was full. A dropped fill frame is a silent inventory desync; this counter
+   and the throttled warn make it visible. *)
 let dropped_subscriber_messages = Atomic.make 0
 let reset_ping_failures () = Atomic.set ping_failures 0
 let get_ping_failures () = Atomic.get ping_failures
 let incr_ping_failures () = Atomic.incr ping_failures
 
-(** Pong tracking. Hyperliquid pongs carry no id, so [send_request]'s
-    ID matching cannot be used; [send_ping] waits on [pong_condition], broadcast
-    when a channel "pong" frame arrives. *)
+(** Pong tracking. Hyperliquid pongs carry no id, so [send_request]'s ID matching cannot
+    be used; [send_ping] waits on [pong_condition], broadcast when a channel "pong" frame
+    arrives. *)
 let last_pong_time = ref 0.0
 
 let pong_condition = Lwt_condition.create ()
 
-(** Rejects all pending [send_request] waiters with a [Failure] exception.
-    Called on disconnect to prevent callers from blocking until their
-    individual timeouts expire. *)
+(** Rejects all pending [send_request] waiters with a [Failure] exception. Called on
+    disconnect to prevent callers from blocking until their individual timeouts expire. *)
 let fail_all_pending reason =
   Lwt.async (fun () ->
     Lwt_mutex.with_lock responses_mutex (fun () ->
@@ -97,46 +95,45 @@ let fail_all_pending reason =
           reason;
       Response_table.iter
         (fun req_id (wakener, _timestamp) ->
-           try
-             Lwt.wakeup_later_exn
-               wakener
-               (Failure (Printf.sprintf "WebSocket disconnected: %s" reason))
-           with
-           | Invalid_argument _ ->
-             Logging.debug_f
-               ~section
-               "Pending req_id %d already resolved during fail_all_pending"
-               req_id)
+          try
+            Lwt.wakeup_later_exn
+              wakener
+              (Failure (Printf.sprintf "WebSocket disconnected: %s" reason))
+          with
+          | Invalid_argument _ ->
+            Logging.debug_f
+              ~section
+              "Pending req_id %d already resolved during fail_all_pending"
+              req_id)
         responses;
       Response_table.clear responses;
       Lwt.return_unit))
 ;;
 
-(** Removes response table entries older than 30 seconds.
-    Each stale waiter is rejected with a timeout [Failure].
-    Prevents unbounded growth of the response table. *)
+(** Removes response table entries older than 30 seconds. Each stale waiter is rejected
+    with a timeout [Failure]. Prevents unbounded growth of the response table. *)
 let cleanup_stale_responses () =
   Lwt_mutex.with_lock responses_mutex (fun () ->
     let now = Unix.time () in
     let stale = ref [] in
     Response_table.iter
       (fun req_id (wakener, timestamp) ->
-         if now -. timestamp > 30.0 then stale := (req_id, wakener, timestamp) :: !stale)
+        if now -. timestamp > 30.0 then stale := (req_id, wakener, timestamp) :: !stale)
       responses;
     List.iter
       (fun (req_id, wakener, timestamp) ->
-         Response_table.remove responses req_id;
-         Logging.debug_f
-           ~section
-           "Cleaned up stale response entry for req_id=%d (age: %.1fs)"
-           req_id
-           (now -. timestamp);
-         try
-           Lwt.wakeup_later_exn
-             wakener
-             (Failure (Printf.sprintf "Request timed out after %.1fs" (now -. timestamp)))
-         with
-         | Invalid_argument _ -> ())
+        Response_table.remove responses req_id;
+        Logging.debug_f
+          ~section
+          "Cleaned up stale response entry for req_id=%d (age: %.1fs)"
+          req_id
+          (now -. timestamp);
+        try
+          Lwt.wakeup_later_exn
+            wakener
+            (Failure (Printf.sprintf "Request timed out after %.1fs" (now -. timestamp)))
+        with
+        | Invalid_argument _ -> ())
       !stale;
     if !stale <> []
     then
@@ -147,9 +144,9 @@ let cleanup_stale_responses () =
     Lwt.return_unit)
 ;;
 
-(** Pushes [None] to every subscriber stream to signal termination, then
-    clears the pushers list. Called on disconnect to unblock consumers
-    waiting in [Lwt_stream.iter] and to release push closures. *)
+(** Pushes [None] to every subscriber stream to signal termination, then clears the
+    pushers list. Called on disconnect to unblock consumers waiting in [Lwt_stream.iter]
+    and to release push closures. *)
 let close_all_subscribers () =
   Mutex.lock pushers_mutex;
   let ps = !pushers in
@@ -161,8 +158,8 @@ let close_all_subscribers () =
     Logging.debug_f ~section "Closing %d subscriber streams on disconnect" count;
     List.iter
       (fun push ->
-         try ignore (push None) with
-         | _ -> ())
+        try ignore (push None) with
+        | _ -> ())
       ps);
   Mutex.lock raw_pushers_mutex;
   let r_ps = !raw_pushers in
@@ -174,15 +171,15 @@ let close_all_subscribers () =
     Logging.debug_f ~section "Closing %d raw subscriber streams on disconnect" count_raw;
     List.iter
       (fun push ->
-         try ignore (push None) with
-         | _ -> ())
+        try ignore (push None) with
+        | _ -> ())
       r_ps)
 ;;
 
-(** Delivers a JSON message to all registered subscribers.
-    Push is non-blocking: if a subscriber's bounded stream is full, the
-    message is silently dropped for that subscriber to prevent unbounded
-    memory growth from slow consumers. Dead pushers are evicted. *)
+(** Delivers a JSON message to all registered subscribers. Push is non-blocking: if a
+    subscriber's bounded stream is full, the message is silently dropped for that
+    subscriber to prevent unbounded memory growth from slow consumers. Dead pushers are
+    evicted. *)
 let broadcast_message json =
   Mutex.lock pushers_mutex;
   let ps = !pushers in
@@ -192,25 +189,24 @@ let broadcast_message json =
   let dropped_this_frame = ref 0 in
   List.iter
     (fun push ->
-       let ok =
-         try push (Some json) with
-         | _ ->
-           dead := push :: !dead;
-           false
-       in
-       if not ok
-       then (
-         incr dropped_this_frame;
-         let n = Atomic.fetch_and_add dropped_subscriber_messages 1 + 1 in
-         (* Throttled to powers of two so a burst logs a few lines, not one
-            per frame. *)
-         if n land (n - 1) = 0
-         then
-           Logging.warn_f
-             ~section
-             "Hyperliquid subscriber stream full: %d message(s) dropped cumulative \
-              (bounded stream capacity exceeded; execution frames are at risk)"
-             n))
+      let ok =
+        try push (Some json) with
+        | _ ->
+          dead := push :: !dead;
+          false
+      in
+      if not ok
+      then (
+        incr dropped_this_frame;
+        let n = Atomic.fetch_and_add dropped_subscriber_messages 1 + 1 in
+        (* Throttled to powers of two so a burst logs a few lines, not one per frame. *)
+        if n land (n - 1) = 0
+        then
+          Logging.warn_f
+            ~section
+            "Hyperliquid subscriber stream full: %d message(s) dropped cumulative \
+             (bounded stream capacity exceeded; execution frames are at risk)"
+            n))
     ps;
   if !dropped_this_frame > 0
   then
@@ -235,8 +231,8 @@ let broadcast_raw_message msg =
     let dead = ref [] in
     List.iter
       (fun push ->
-         try ignore (push (Some msg)) with
-         | _ -> dead := push :: !dead)
+        try ignore (push (Some msg)) with
+        | _ -> dead := push :: !dead)
       ps;
     if !dead <> []
     then (
@@ -245,10 +241,9 @@ let broadcast_raw_message msg =
       Mutex.unlock raw_pushers_mutex))
 ;;
 
-(** Creates a bounded subscriber stream (capacity 16) for incoming messages.
-    Returns a [subscription] with the stream and a [close] function that
-    removes the subscriber from the global list. Messages are silently
-    dropped when the stream buffer is full. *)
+(** Creates a bounded subscriber stream (capacity 16) for incoming messages. Returns a
+    [subscription] with the stream and a [close] function that removes the subscriber from
+    the global list. Messages are silently dropped when the stream buffer is full. *)
 let subscribe_market_data () =
   let stream, push_source = Lwt_stream.create_bounded 16 in
   (* Non-blocking push wrapper. Returns true on success, false if dropped. *)
@@ -302,8 +297,8 @@ let subscribe_raw_market_data () =
   ({ stream; close } : raw_subscription)
 ;;
 
-(** Sends a JSON message over the active WebSocket connection.
-    No-op with a warning if not currently connected. *)
+(** Sends a JSON message over the active WebSocket connection. No-op with a warning if not
+    currently connected. *)
 let subscribe json =
   Lwt_mutex.with_lock connection_mutex (fun () ->
     match !active_connection with
@@ -316,12 +311,10 @@ let subscribe json =
       Lwt.return_unit)
 ;;
 
-(** Sends subscription messages for all configured channels.
-    If [wallet] is non-empty,
-    subscribes to user-specific channels: webData2, userEvents, spotState,
-    userFills, userFundings, userNonFundingLedgerUpdates, orderUpdates.
-    Subscribes to l2Book for each symbol, using the coin identifier
-    resolved via [Hyperliquid_instruments_feed]. *)
+(** Sends subscription messages for all configured channels. If [wallet] is non-empty,
+    subscribes to user-specific channels: webData2, userEvents, spotState, userFills,
+    userFundings, userNonFundingLedgerUpdates, orderUpdates. Subscribes to l2Book for each
+    symbol, using the coin identifier resolved via [Hyperliquid_instruments_feed]. *)
 let subscribe_to_feeds ~symbols ~wallet =
   let%lwt () =
     if wallet <> ""
@@ -329,79 +322,79 @@ let subscribe_to_feeds ~symbols ~wallet =
       let%lwt () =
         subscribe
           (`Assoc
-              [ "method", `String "subscribe"
-              ; ( "subscription"
-                , `Assoc [ "type", `String "webData2"; "user", `String wallet ] )
-              ])
+            [ "method", `String "subscribe"
+            ; ( "subscription"
+              , `Assoc [ "type", `String "webData2"; "user", `String wallet ] )
+            ])
       in
       let%lwt () =
         subscribe
           (`Assoc
-              [ "method", `String "subscribe"
-              ; ( "subscription"
-                , `Assoc [ "type", `String "userEvents"; "user", `String wallet ] )
-              ])
+            [ "method", `String "subscribe"
+            ; ( "subscription"
+              , `Assoc [ "type", `String "userEvents"; "user", `String wallet ] )
+            ])
       in
       let%lwt () =
         subscribe
           (`Assoc
-              [ "method", `String "subscribe"
-              ; ( "subscription"
-                , `Assoc [ "type", `String "spotState"; "user", `String wallet ] )
-              ])
+            [ "method", `String "subscribe"
+            ; ( "subscription"
+              , `Assoc [ "type", `String "spotState"; "user", `String wallet ] )
+            ])
       in
       let%lwt () =
         subscribe
           (`Assoc
-              [ "method", `String "subscribe"
-              ; ( "subscription"
-                , `Assoc [ "type", `String "userFills"; "user", `String wallet ] )
-              ])
+            [ "method", `String "subscribe"
+            ; ( "subscription"
+              , `Assoc [ "type", `String "userFills"; "user", `String wallet ] )
+            ])
       in
       let%lwt () =
         subscribe
           (`Assoc
-              [ "method", `String "subscribe"
-              ; ( "subscription"
-                , `Assoc [ "type", `String "userFundings"; "user", `String wallet ] )
-              ])
+            [ "method", `String "subscribe"
+            ; ( "subscription"
+              , `Assoc [ "type", `String "userFundings"; "user", `String wallet ] )
+            ])
       in
       let%lwt () =
         subscribe
           (`Assoc
-              [ "method", `String "subscribe"
-              ; ( "subscription"
-                , `Assoc
-                    [ "type", `String "userNonFundingLedgerUpdates"
-                    ; "user", `String wallet
-                    ] )
-              ])
+            [ "method", `String "subscribe"
+            ; ( "subscription"
+              , `Assoc
+                  [ "type", `String "userNonFundingLedgerUpdates"
+                  ; "user", `String wallet
+                  ] )
+            ])
       in
       subscribe
         (`Assoc
-            [ "method", `String "subscribe"
-            ; ( "subscription"
-              , `Assoc [ "type", `String "orderUpdates"; "user", `String wallet ] )
-            ]))
+          [ "method", `String "subscribe"
+          ; ( "subscription"
+            , `Assoc [ "type", `String "orderUpdates"; "user", `String wallet ] )
+          ]))
     else Lwt.return_unit
   in
   Lwt_list.iter_s
     (fun symbol ->
-       (* Perps use the base name (e.g. "HYPE"); spot pairs use "@N" format. *)
-       let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
-       Logging.debug_f ~section "Subscribing to l2Book for %s (coin=%s)" symbol coin;
-       subscribe
-         (`Assoc
-             [ "method", `String "subscribe"
-             ; "subscription", `Assoc [ "type", `String "l2Book"; "coin", `String coin ]
-             ]))
+      (* Perps use the base name (e.g. "HYPE"); spot pairs use "@N" format. *)
+      let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
+      Logging.debug_f ~section "Subscribing to l2Book for %s (coin=%s)" symbol coin;
+      subscribe
+        (`Assoc
+          [ "method", `String "subscribe"
+          ; "subscription", `Assoc [ "type", `String "l2Book"; "coin", `String coin ]
+          ]))
     symbols
 ;;
 
-(** Extracts a server event timestamp (milliseconds since epoch) from a raw
-    text frame by scanning for `"time":`, returning it as Unix seconds. Cheap
-    and allocation-light: no JSON parse on the l2Book hot path. [None] when the
-    frame carries no timestamp (e.g. ping/pong, subscription responses). *)
+(** Extracts a server event timestamp (milliseconds since epoch) from a raw text frame by
+    scanning for `"time":`, returning it as Unix seconds. Cheap and allocation-light: no
+    JSON parse on the l2Book hot path. [None] when the frame carries no timestamp (e.g.
+    ping/pong, subscription responses). *)
 let extract_event_time_s content =
   let key = "\"time\":" in
   let klen = String.length key in
@@ -428,8 +421,8 @@ let extract_event_time_s content =
       done;
       if !j > start
       then (
-        (* Guard against matching a non-epoch numeric field: accept only a
-           plausible epoch-ms value (2001..2286). *)
+        (* Guard against matching a non-epoch numeric field: accept only a plausible
+           epoch-ms value (2001..2286). *)
         try
           let ms = float_of_string (String.sub content start (!j - start)) in
           if ms >= 1_000_000_000_000.0 && ms < 10_000_000_000_000.0
@@ -443,17 +436,16 @@ let extract_event_time_s content =
   find 0
 ;;
 
-(** Processes a single WebSocket frame.
-    Text frames are parsed as JSON, then either matched to a pending
-    request via the response table or broadcast to all subscribers.
+(** Processes a single WebSocket frame. Text frames are parsed as JSON, then either
+    matched to a pending request via the response table or broadcast to all subscribers.
     Close frames trigger connection teardown and subscriber cleanup. *)
 let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
   match frame.Websocket.Frame.opcode with
   | Websocket.Frame.Opcode.Text ->
     Concurrency.Tick_event_bus.publish_tick ();
     on_heartbeat ();
-    (* Feed network latency: server event time -> local receive, corrected for
-       the host/exchange clock offset. *)
+    (* Feed network latency: server event time -> local receive, corrected for the
+       host/exchange clock offset. *)
     let content = frame.Websocket.Frame.content in
     (match extract_event_time_s content with
      | Some event -> Network_latency.record_feed_event_s "hyperliquid" ~event ()
@@ -488,8 +480,7 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
            if channel = "webData2"
            then Logging.debug_f ~section "webData2 received: %s" log_msg
            else Logging.debug_f ~section "Raw WS message: %s" log_msg);
-         (* Extract an integer ID, searching top-level then inside "data"
-            and "response". *)
+         (* Extract an integer ID, searching top-level then inside "data" and "response". *)
          let is_response =
            let id_opt =
              let rec find_id node =
@@ -572,11 +563,10 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
   | _ -> Lwt.return_unit
 ;;
 
-(** Establishes a TLS WebSocket connection to the Hyperliquid API.
-    Resolves the hostname, connects via TLS, then enters a read loop
-    that dispatches frames through [handle_frame]. On connection loss,
-    cleans up state, fails pending requests, closes subscribers, and
-    invokes [on_failure]. The supervisor is responsible for reconnection. *)
+(** Establishes a TLS WebSocket connection to the Hyperliquid API. Resolves the hostname,
+    connects via TLS, then enters a read loop that dispatches frames through
+    [handle_frame]. On connection loss, cleans up state, fails pending requests, closes
+    subscribers, and invokes [on_failure]. The supervisor is responsible for reconnection. *)
 let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
   let base_url =
     if testnet then "api.hyperliquid-testnet.xyz" else "api.hyperliquid.xyz"
@@ -588,109 +578,105 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
   let uri = Uri.of_string url in
   Lwt.catch
     (fun () ->
-       Lwt_unix.getaddrinfo hostname (string_of_int port) [ Unix.AI_FAMILY Unix.PF_INET ]
-       >>= fun addresses ->
-       let ip =
-         match addresses with
-         | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ ->
-           Ipaddr_unix.of_inet_addr addr
-         | _ -> failwith (Printf.sprintf "Failed to resolve %s" hostname)
-       in
-       let client = `TLS (`Hostname hostname, `IP ip, `Port port) in
-       let ctx = Ws_lwt.resolve_ctx () in
-       Lwt_unix.with_timeout ws_connect_timeout_s (fun () ->
-         Ws_lwt.connect ~ctx client uri)
-       >>= fun conn ->
-       Lwt_mutex.with_lock connection_mutex (fun () ->
-         active_connection := Some conn;
-         Atomic.set is_connected_ref true;
-         (* Signal waiters blocked in [wait_for_connected].
-         Guard on [is_empty] to avoid queuing a second value on rapid reconnect. *)
-         if Lwt_mvar.is_empty connected_wakeup
-         then Lwt.async (fun () -> Lwt_mvar.put connected_wakeup ());
-         Lwt.return_unit)
-       >>= fun () ->
-       on_connected ();
-       reset_ping_failures ();
-       (* Ping/pong monitoring is owned by the supervisor, not this module. *)
-       let stream =
-         Lwt_stream.from (fun () ->
-           if not (Atomic.get is_connected_ref)
-           then Lwt.return_none
-           else
-             Lwt.catch
-               (fun () ->
-                  Ws_lwt.read conn >>= fun frame -> Lwt.return_some frame)
-               (function
-                 | End_of_file -> Lwt.return_none
-                 | exn -> Lwt.fail exn))
-       in
-       let process_frame frame =
-         Lwt.async (fun () ->
-           Lwt.catch
-             (fun () -> handle_frame ~on_heartbeat frame)
-             (fun exn ->
-                Logging.error_f
-                  ~section
-                  "Error handling Hyperliquid frame: %s"
-                  (Printexc.to_string exn);
-                Lwt.return_unit))
-       in
-       let done_p =
-         Lwt.catch
-           (fun () -> Concurrency.Lwt_util.consume_stream process_frame stream)
-           (fun _exn -> Lwt.return_unit)
-       in
-       Lwt.catch
-         (fun () -> done_p)
-         (function
-           | End_of_file ->
-             Logging.warn
-               ~section
-               "WebSocket connection closed unexpectedly (End_of_file)";
-             Lwt_mutex.with_lock connection_mutex (fun () ->
-               active_connection := None;
-               Atomic.set is_connected_ref false;
-               Lwt.return_unit)
-             >>= fun () ->
-             fail_all_pending "Connection closed unexpectedly (End_of_file)";
-             close_all_subscribers ();
-             Lwt.fail_with "Connection closed unexpectedly (End_of_file)"
-           | exn ->
-             Logging.error_f ~section "WebSocket read error: %s" (Printexc.to_string exn);
-             Lwt_mutex.with_lock connection_mutex (fun () ->
-               active_connection := None;
-               Atomic.set is_connected_ref false;
-               Lwt.return_unit)
-             >>= fun () ->
-             fail_all_pending (Printexc.to_string exn);
-             close_all_subscribers ();
-             Lwt.fail exn)
-       >>= fun () ->
-       (* Normal read loop exit (e.g. server-initiated close frame).
-       Treated as a failure so the supervisor triggers reconnection. *)
-       Lwt_mutex.with_lock connection_mutex (fun () ->
-         active_connection := None;
-         Atomic.set is_connected_ref false;
-         Lwt.return_unit)
-       >>= fun () ->
-       fail_all_pending "WebSocket closed by server";
-       close_all_subscribers ();
-       Lwt.fail_with "WebSocket closed by server")
+      Lwt_unix.getaddrinfo hostname (string_of_int port) [ Unix.AI_FAMILY Unix.PF_INET ]
+      >>= fun addresses ->
+      let ip =
+        match addresses with
+        | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ ->
+          Ipaddr_unix.of_inet_addr addr
+        | _ -> failwith (Printf.sprintf "Failed to resolve %s" hostname)
+      in
+      let client = `TLS (`Hostname hostname, `IP ip, `Port port) in
+      let ctx = Ws_lwt.resolve_ctx () in
+      Lwt_unix.with_timeout ws_connect_timeout_s (fun () ->
+        Ws_lwt.connect ~ctx client uri)
+      >>= fun conn ->
+      Lwt_mutex.with_lock connection_mutex (fun () ->
+        active_connection := Some conn;
+        Atomic.set is_connected_ref true;
+        (* Signal waiters blocked in [wait_for_connected]. Guard on [is_empty] to avoid
+           queuing a second value on rapid reconnect. *)
+        if Lwt_mvar.is_empty connected_wakeup
+        then Lwt.async (fun () -> Lwt_mvar.put connected_wakeup ());
+        Lwt.return_unit)
+      >>= fun () ->
+      on_connected ();
+      reset_ping_failures ();
+      (* Ping/pong monitoring is owned by the supervisor, not this module. *)
+      let stream =
+        Lwt_stream.from (fun () ->
+          if not (Atomic.get is_connected_ref)
+          then Lwt.return_none
+          else
+            Lwt.catch
+              (fun () -> Ws_lwt.read conn >>= fun frame -> Lwt.return_some frame)
+              (function
+                | End_of_file -> Lwt.return_none
+                | exn -> Lwt.fail exn))
+      in
+      let process_frame frame =
+        Lwt.async (fun () ->
+          Lwt.catch
+            (fun () -> handle_frame ~on_heartbeat frame)
+            (fun exn ->
+              Logging.error_f
+                ~section
+                "Error handling Hyperliquid frame: %s"
+                (Printexc.to_string exn);
+              Lwt.return_unit))
+      in
+      let done_p =
+        Lwt.catch
+          (fun () -> Concurrency.Lwt_util.consume_stream process_frame stream)
+          (fun _exn -> Lwt.return_unit)
+      in
+      Lwt.catch
+        (fun () -> done_p)
+        (function
+          | End_of_file ->
+            Logging.warn ~section "WebSocket connection closed unexpectedly (End_of_file)";
+            Lwt_mutex.with_lock connection_mutex (fun () ->
+              active_connection := None;
+              Atomic.set is_connected_ref false;
+              Lwt.return_unit)
+            >>= fun () ->
+            fail_all_pending "Connection closed unexpectedly (End_of_file)";
+            close_all_subscribers ();
+            Lwt.fail_with "Connection closed unexpectedly (End_of_file)"
+          | exn ->
+            Logging.error_f ~section "WebSocket read error: %s" (Printexc.to_string exn);
+            Lwt_mutex.with_lock connection_mutex (fun () ->
+              active_connection := None;
+              Atomic.set is_connected_ref false;
+              Lwt.return_unit)
+            >>= fun () ->
+            fail_all_pending (Printexc.to_string exn);
+            close_all_subscribers ();
+            Lwt.fail exn)
+      >>= fun () ->
+      (* Normal read loop exit (e.g. server-initiated close frame). Treated as a failure
+         so the supervisor triggers reconnection. *)
+      Lwt_mutex.with_lock connection_mutex (fun () ->
+        active_connection := None;
+        Atomic.set is_connected_ref false;
+        Lwt.return_unit)
+      >>= fun () ->
+      fail_all_pending "WebSocket closed by server";
+      close_all_subscribers ();
+      Lwt.fail_with "WebSocket closed by server")
     (fun exn ->
-       let error_msg = Printexc.to_string exn in
-       Logging.error_f ~section "WebSocket connection error: %s" error_msg;
-       Atomic.set is_connected_ref false;
-       fail_all_pending error_msg;
-       close_all_subscribers ();
-       on_failure error_msg;
-       Lwt.return_unit)
+      let error_msg = Printexc.to_string exn in
+      Logging.error_f ~section "WebSocket connection error: %s" error_msg;
+      Atomic.set is_connected_ref false;
+      fail_all_pending error_msg;
+      close_all_subscribers ();
+      on_failure error_msg;
+      Lwt.return_unit)
 ;;
 
-(** Gracefully closes the Hyperliquid WebSocket connection.
-    Clears the active connection reference, marks the connection as
-    disconnected, fails all pending request waiters, closes all subscriber
-    streams, and tears down the underlying TLS transport. *)
+(** Gracefully closes the Hyperliquid WebSocket connection. Clears the active connection
+    reference, marks the connection as disconnected, fails all pending request waiters,
+    closes all subscriber streams, and tears down the underlying TLS transport. *)
 let close () : unit Lwt.t =
   Lwt_mutex.with_lock connection_mutex (fun () ->
     match !active_connection with
@@ -706,14 +692,12 @@ let close () : unit Lwt.t =
     fail_all_pending "Client requested close";
     close_all_subscribers ();
     signal_new_data ();
-    Lwt.catch
-      (fun () -> Ws_lwt.close_transport conn)
-      (fun _ -> Lwt.return_unit)
+    Lwt.catch (fun () -> Ws_lwt.close_transport conn) (fun _ -> Lwt.return_unit)
 ;;
 
-(** Sends a JSON request over the WebSocket and blocks until a response
-    with the matching [req_id] arrives or [timeout_ms] elapses.
-    Logs a warning when the response table exceeds 10 pending entries. *)
+(** Sends a JSON request over the WebSocket and blocks until a response with the matching
+    [req_id] arrives or [timeout_ms] elapses. Logs a warning when the response table
+    exceeds 10 pending entries. *)
 let send_request ~json ~req_id ~timeout_ms =
   let waiter, wakener = Lwt.wait () in
   Lwt_mutex.with_lock responses_mutex (fun () ->
@@ -747,42 +731,41 @@ let send_request ~json ~req_id ~timeout_ms =
     ]
 ;;
 
-(** Sends a ping and waits for a pong within [timeout_ms].
-    Returns [true] if a pong was received, [false] on timeout or send failure.
-    Uses [pong_condition] since Hyperliquid pong responses carry no id field.
-    Falls back to checking [last_pong_time] in case the condition signal
-    was delivered before this function began waiting. *)
+(** Sends a ping and waits for a pong within [timeout_ms]. Returns [true] if a pong was
+    received, [false] on timeout or send failure. Uses [pong_condition] since Hyperliquid
+    pong responses carry no id field. Falls back to checking [last_pong_time] in case the
+    condition signal was delivered before this function began waiting. *)
 let send_ping ~req_id:_ ~timeout_ms =
   let ping_msg = `Assoc [ "method", `String "ping" ] in
   let send_time = Unix.gettimeofday () in
   Lwt.catch
     (fun () ->
-       subscribe ping_msg
-       >>= fun () ->
-       let timeout = float_of_int timeout_ms /. 1000.0 in
-       Lwt.pick
-         [ (Lwt_condition.wait pong_condition
-            >>= fun () ->
-            Logging.debug ~section "Pong received";
-            reset_ping_failures ();
-            Network_latency.record_ping_s "hyperliquid" (Unix.gettimeofday () -. send_time);
-            Lwt.return true)
-         ; (Lwt_unix.sleep timeout
-            >>= fun () ->
-            if !last_pong_time > send_time
-            then (
-              reset_ping_failures ();
-              Network_latency.record_ping_s
-                "hyperliquid"
-                (Unix.gettimeofday () -. send_time);
-              Lwt.return true)
-            else (
-              Logging.warn ~section "Ping timed out (no pong received)";
-              incr_ping_failures ();
-              Lwt.return false))
-         ])
+      subscribe ping_msg
+      >>= fun () ->
+      let timeout = float_of_int timeout_ms /. 1000.0 in
+      Lwt.pick
+        [ (Lwt_condition.wait pong_condition
+           >>= fun () ->
+           Logging.debug ~section "Pong received";
+           reset_ping_failures ();
+           Network_latency.record_ping_s "hyperliquid" (Unix.gettimeofday () -. send_time);
+           Lwt.return true)
+        ; (Lwt_unix.sleep timeout
+           >>= fun () ->
+           if !last_pong_time > send_time
+           then (
+             reset_ping_failures ();
+             Network_latency.record_ping_s
+               "hyperliquid"
+               (Unix.gettimeofday () -. send_time);
+             Lwt.return true)
+           else (
+             Logging.warn ~section "Ping timed out (no pong received)";
+             incr_ping_failures ();
+             Lwt.return false))
+        ])
     (fun exn ->
-       Logging.warn_f ~section "Ping send failed: %s" (Printexc.to_string exn);
-       incr_ping_failures ();
-       Lwt.return false)
+      Logging.warn_f ~section "Ping send failed: %s" (Printexc.to_string exn);
+      incr_ping_failures ();
+      Lwt.return false)
 ;;

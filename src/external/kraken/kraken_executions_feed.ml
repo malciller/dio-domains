@@ -1,4 +1,5 @@
-(** Kraken authenticated executions WebSocket feed. Tracks open orders and execution events per symbol via lock-free ring buffers for concurrent state synchronization. *)
+(** Kraken authenticated executions WebSocket feed. Tracks open orders and execution
+    events per symbol via lock-free ring buffers for concurrent state synchronization. *)
 
 open Lwt.Infix
 open Concurrency
@@ -6,9 +7,9 @@ open Concurrency
 let section = "kraken_executions"
 let ring_buffer_size = Kraken_common_types.default_ring_buffer_size_executions
 
-(* Cumulative count of execution frames dropped (parse failure or unknown/
-   evicted order id). A dropped fill is a silent inventory desync; the count
-   surfaces it in the warn lines. *)
+(* Cumulative count of execution frames dropped (parse failure or unknown/ evicted order
+   id). A dropped fill is a silent inventory desync; the count surfaces it in the warn
+   lines. *)
 let dropped_execution_frames = Atomic.make 0
 let cleanup_handlers_started = Atomic.make false
 
@@ -157,7 +158,7 @@ type open_order =
   ; cum_cost : float
   ; order_status : order_status
   ; order_userref : int option
-    (* Optional numeric identifier used for strategy-level filtering. *)
+      (* Optional numeric identifier used for strategy-level filtering. *)
   ; cl_ord_id : string option (* Client order ID used for supplementary tracking. *)
   ; last_updated : float
   }
@@ -173,7 +174,7 @@ type symbol_store =
   { events_buffer : execution_event RingBuffer.t
   ; open_orders : (string, open_order) Hashtbl.t
   ; open_orders_cache : open_order list Atomic.t
-    (** Lock-free atomic snapshot cache of active open orders for the domain hotpath. *)
+  (** Lock-free atomic snapshot cache of active open orders for the domain hotpath. *)
   ; ready : bool Atomic.t
   ; last_event_time : float Atomic.t
   ; orders_mutex : Mutex.t
@@ -182,16 +183,16 @@ type symbol_store =
 (** Global symbol-to-store mapping. *)
 let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 64
 
-(** Monotonic counter bumped on every open-orders snapshot publish. The
-    balances feed scans every symbol store on each balance read (twice per
-    executable cycle); keying a cache on this generation makes those reads
-    allocation-free until an order changes. Every mutation path republishes
-    the cache, so this is the single choke point. *)
+(** Monotonic counter bumped on every open-orders snapshot publish. The balances feed
+    scans every symbol store on each balance read (twice per executable cycle); keying a
+    cache on this generation makes those reads allocation-free until an order changes.
+    Every mutation path republishes the cache, so this is the single choke point. *)
 let orders_generation : int Atomic.t = Atomic.make 0
 
 let[@inline] get_orders_generation () = Atomic.get orders_generation
 
-(** Global order ID to symbol mapping with adaptive cap and FIFO eviction. Requires global_orders_mutex. *)
+(** Global order ID to symbol mapping with adaptive cap and FIFO eviction. Requires
+    global_orders_mutex. *)
 let order_to_symbol : (string, string * side) Hashtbl.t = Hashtbl.create 16
 
 (** FIFO queue for O(1) oldest-entry eviction. *)
@@ -202,7 +203,8 @@ let order_to_symbol_cap : int ref = ref max_int
 
 let order_to_symbol_startup_done = Atomic.make false
 
-(** Inserts an order ID to symbol mapping. Evicts the oldest entry via FIFO when exceeding cap. Caller must hold global_orders_mutex. *)
+(** Inserts an order ID to symbol mapping. Evicts the oldest entry via FIFO when exceeding
+    cap. Caller must hold global_orders_mutex. *)
 let add_to_order_to_symbol order_id symbol side =
   if not (Hashtbl.mem order_to_symbol order_id)
   then Queue.push order_id order_to_symbol_queue;
@@ -218,7 +220,8 @@ let add_to_order_to_symbol order_id symbol side =
     done
 ;;
 
-(** Locks the adaptive cap after the startup snapshot. Cap = max(32, observed * 1.5 + 1). Executes once. *)
+(** Locks the adaptive cap after the startup snapshot. Cap = max(32, observed * 1.5 + 1).
+    Executes once. *)
 let lock_order_to_symbol_cap () =
   if not (Atomic.exchange order_to_symbol_startup_done true)
   then (
@@ -238,11 +241,12 @@ let global_orders_mutex = Mutex.create ()
 
 (** Mutex for symbol_stores table initialization. *)
 let initialization_mutex = Mutex.create ()
-(* Frame dispatch runs on the Parse_worker domain; the dispatch path must not
-   touch Lwt primitives. Readiness is published via store.ready Atomics from
-   the parse domain and consumed by polling. *)
+(* Frame dispatch runs on the Parse_worker domain; the dispatch path must not touch Lwt
+   primitives. Readiness is published via store.ready Atomics from the parse domain and
+   consumed by polling. *)
 
-(** Retrieves or lazily creates a per-symbol store. Wait-free on the hot path after initial creation. *)
+(** Retrieves or lazily creates a per-symbol store. Wait-free on the hot path after
+    initial creation. *)
 let get_symbol_store symbol =
   match Hashtbl.find_opt symbol_stores symbol with
   | Some store -> store
@@ -269,16 +273,16 @@ let get_symbol_store symbol =
     store
 ;;
 
-(** Publishes an immutable snapshot of open_orders to the atomic cache.
-    Must be called by writers under store.orders_mutex. *)
+(** Publishes an immutable snapshot of open_orders to the atomic cache. Must be called by
+    writers under store.orders_mutex. *)
 let[@inline] publish_open_orders_cache store =
   let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
   Atomic.set store.open_orders_cache snapshot;
   Atomic.incr orders_generation
 ;;
 
-(** Marks the store ready. Atomic flag only; safe from the Parse_worker
-    domain, and the startup waiter polls it. *)
+(** Marks the store ready. Atomic flag only; safe from the Parse_worker domain, and the
+    startup waiter polls it. *)
 let notify_ready store = if not (Atomic.get store.ready) then Atomic.set store.ready true
 
 let has_execution_data symbol =
@@ -294,10 +298,10 @@ let has_execution_data_fast symbol =
   fun () -> Atomic.get store.ready
 ;;
 
-(** Blocks until all specified symbols have execution data, or [timeout_seconds]
-    elapses. Polls per-store ready Atomics; readiness is published from the
-    Parse_worker domain, which must not touch Lwt primitives. The poll runs
-    only during startup gating (bounded by the timeout). *)
+(** Blocks until all specified symbols have execution data, or [timeout_seconds] elapses.
+    Polls per-store ready Atomics; readiness is published from the Parse_worker domain,
+    which must not touch Lwt primitives. The poll runs only during startup gating (bounded
+    by the timeout). *)
 let wait_for_execution_data_lwt symbols timeout_seconds =
   let deadline = Unix.gettimeofday () +. timeout_seconds in
   let rec loop () =
@@ -320,8 +324,8 @@ let[@inline always] get_open_orders symbol =
   Atomic.get store.open_orders_cache
 ;;
 
-(** Fold over open orders for a symbol using the lock-free atomic snapshot.
-    Zero mutex contention on the hot path. *)
+(** Fold over open orders for a symbol using the lock-free atomic snapshot. Zero mutex
+    contention on the hot path. *)
 let[@inline always] fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
   let snapshot = Atomic.get store.open_orders_cache in
@@ -342,7 +346,8 @@ let[@inline always] has_open_order symbol order_id =
   List.exists (fun (o : open_order) -> o.order_id = order_id) orders
 ;;
 
-(** Looks up an open order by ID across all symbols via the global order-to-symbol index. O(1) lookup. *)
+(** Looks up an open order by ID across all symbols via the global order-to-symbol index.
+    O(1) lookup. *)
 let find_order_everywhere order_id =
   Mutex.lock global_orders_mutex;
   let symbol_opt = Hashtbl.find_opt order_to_symbol order_id in
@@ -352,7 +357,9 @@ let find_order_everywhere order_id =
   | Some (symbol, _side) -> get_open_order symbol order_id
 ;;
 
-(** Eagerly updates the cached limit price of an open order after a successful amend response, closing the stale-price window before the execution update arrives. No-op if the order is not tracked. *)
+(** Eagerly updates the cached limit price of an open order after a successful amend
+    response, closing the stale-price window before the execution update arrives. No-op if
+    the order is not tracked. *)
 let update_open_order_price ~symbol ~order_id ~new_price =
   let store = get_symbol_store symbol in
   Mutex.lock store.orders_mutex;
@@ -395,7 +402,9 @@ let get_all_symbols () =
   result
 ;;
 
-(** Periodic maintenance that purges orphaned order_to_symbol_queue entries. Terminal events remove map entries but cannot efficiently remove queue entries; this rebuilds the queue retaining only entries still present in the map. *)
+(** Periodic maintenance that purges orphaned order_to_symbol_queue entries. Terminal
+    events remove map entries but cannot efficiently remove queue entries; this rebuilds
+    the queue retaining only entries still present in the map. *)
 let cleanup_stale_orders () =
   Mutex.lock global_orders_mutex;
   let original_queue_len = Queue.length order_to_symbol_queue in
@@ -404,7 +413,7 @@ let cleanup_stale_orders () =
     let temp = Queue.create () in
     Queue.iter
       (fun order_id ->
-         if Hashtbl.mem order_to_symbol order_id then Queue.push order_id temp)
+        if Hashtbl.mem order_to_symbol order_id then Queue.push order_id temp)
       order_to_symbol_queue;
     Queue.clear order_to_symbol_queue;
     Queue.transfer temp order_to_symbol_queue;
@@ -420,7 +429,8 @@ let cleanup_stale_orders () =
   Mutex.unlock global_orders_mutex
 ;;
 
-(** Idempotent Lwt_mvar cleanup signal. Prevents continuation stacking when triggers outpace consumption. *)
+(** Idempotent Lwt_mvar cleanup signal. Prevents continuation stacking when triggers
+    outpace consumption. *)
 let cleanup_mvar : unit Lwt_mvar.t = Lwt_mvar.create_empty ()
 
 let request_cleanup () =
@@ -468,9 +478,9 @@ let[@inline always] count_open_orders_by_side symbol =
   let sells = ref 0 in
   List.iter
     (fun (order : open_order) ->
-       match order.side with
-       | Buy -> incr buys
-       | Sell -> incr sells)
+      match order.side with
+      | Buy -> incr buys
+      | Sell -> incr sells)
     orders;
   !buys, !sells
 ;;
@@ -498,9 +508,9 @@ let[@inline always] get_current_position_fast symbol =
   fun () -> RingBuffer.get_position store.events_buffer
 ;;
 
-(** Reconciles the open orders table from an incoming execution event.
-    Logging is deferred until after the mutex is released to avoid holding
-    global_orders_mutex while contending on the logging output_mutex. *)
+(** Reconciles the open orders table from an incoming execution event. Logging is deferred
+    until after the mutex is released to avoid holding global_orders_mutex while
+    contending on the logging output_mutex. *)
 let update_open_orders store (event : execution_event) =
   (* Deferred log signal: captures what to log after mutex release. *)
   let log_action = ref `None in
@@ -515,10 +525,10 @@ let update_open_orders store (event : execution_event) =
     let abs_order_qty = abs_float event.order_qty in
     if abs_order_qty = 0.0 then 1e-12 else abs_order_qty *. 1e-6
   in
-  (* Guard: order_qty = 0.0 (fallback default from a minimal WS event with
-     missing quantity fields) and a non-terminal status is not a real fill.
-     Treating it as filled would remove valid orders from open_orders, breaking
-     strategy reference-price tracking. *)
+  (* Guard: order_qty = 0.0 (fallback default from a minimal WS event with missing
+     quantity fields) and a non-terminal status is not a real fill. Treating it as filled
+     would remove valid orders from open_orders, breaking strategy reference-price
+     tracking. *)
   let is_effectively_filled =
     if event.order_qty = 0.0 && not is_terminal_status
     then false
@@ -538,16 +548,14 @@ let update_open_orders store (event : execution_event) =
   in
   if is_terminal_status
   then (
-    if
-      (* Terminal: remove from open orders if present. *)
-      was_tracked
+    if (* Terminal: remove from open orders if present. *)
+       was_tracked
     then Hashtbl.remove store.open_orders event.order_id)
   else (
-    (* Non-terminal: upsert. Kraken's execution snapshot replays all open
-       orders as exec_type=new/status=new with minimal data: limit_price is
-       often absent and quantity fields may be zero. When a cached entry has
-       valid data, preserve those fields instead of overwriting with empty or
-       zero values. *)
+    (* Non-terminal: upsert. Kraken's execution snapshot replays all open orders as
+       exec_type=new/status=new with minimal data: limit_price is often absent and
+       quantity fields may be zero. When a cached entry has valid data, preserve those
+       fields instead of overwriting with empty or zero values. *)
     let ( merged_limit_price
         , merged_order_qty
         , merged_remaining_qty
@@ -556,8 +564,8 @@ let update_open_orders store (event : execution_event) =
       =
       match Hashtbl.find_opt store.open_orders event.order_id with
       | Some prev ->
-        (* Preserve the cached price when the incoming value is None or zero;
-             snapshot events arrive with limit_price = Some 0.0. *)
+        (* Preserve the cached price when the incoming value is None or zero; snapshot
+           events arrive with limit_price = Some 0.0. *)
         let lp =
           match event.limit_price with
           | Some p when p > 1e-12 -> event.limit_price
@@ -565,7 +573,8 @@ let update_open_orders store (event : execution_event) =
         in
         (* Preserve the cached order_qty if the incoming value is zero *)
         let oq = if event.order_qty > 1e-12 then event.order_qty else prev.order_qty in
-        (* Preserve the cached remaining_qty if the incoming value is zero but the previous one was not *)
+        (* Preserve the cached remaining_qty if the incoming value is zero but the
+           previous one was not *)
         let rq =
           if remaining_qty > 1e-12
           then remaining_qty
@@ -604,8 +613,8 @@ let update_open_orders store (event : execution_event) =
   (match prev_price_qty with
    | Some (prev_lp, prev_oq, prev_rq)
      when (not is_terminal_status) && not is_effectively_filled ->
-     (* Compare against the MERGED values that were actually stored,
-          not the raw event values which may have been discarded by the merge. *)
+     (* Compare against the MERGED values that were actually stored, not the raw event
+        values which may have been discarded by the merge. *)
      let stored_lp =
        match Hashtbl.find_opt store.open_orders event.order_id with
        | Some o -> o.limit_price
@@ -777,7 +786,8 @@ let parse_rfc3339_utc s =
   | _ -> Unix.gettimeofday ()
 ;;
 
-(** Parses an execution event from JSON. Handles both full and minimal (status-only) events by falling back to cached order data for missing fields. *)
+(** Parses an execution event from JSON. Handles both full and minimal (status-only)
+    events by falling back to cached order data for missing fields. *)
 let parse_execution_event json =
   try
     let open Yojson.Safe.Util in
@@ -797,10 +807,9 @@ let parse_execution_event json =
         (match s with
          | Some (sym, side) -> Some (sym, Some side)
          | None ->
-           (* Skip events with no symbol attribution (typical of pre-startup
-              orders). Warn is throttled as the count grows; a persistent flood
-              means order ids are evicted from the index while fills still
-              arrive, a silent fill loss. *)
+           (* Skip events with no symbol attribution (typical of pre-startup orders). Warn
+              is throttled as the count grows; a persistent flood means order ids are
+              evicted from the index while fills still arrive, a silent fill loss. *)
            let n = Atomic.fetch_and_add dropped_execution_frames 1 + 1 in
            if n <= 10 || n land (n - 1) = 0
            then
@@ -988,27 +997,26 @@ let parse_execution_event json =
     None
 ;;
 
-(** Hook invoked after every execution snapshot is ingested and reconciled.
-    The supervisor wires this to the REST /OpenOrders bootstrap: Kraken caps
-    the WS [snap_orders] payload, so resting orders placed before startup (or
-    beyond the cap) are absent from the snapshot and would be pruned by the
-    reconcile. A hook avoids a module cycle (the REST fetcher already depends
-    on this module). *)
+(** Hook invoked after every execution snapshot is ingested and reconciled. The supervisor
+    wires this to the REST /OpenOrders bootstrap: Kraken caps the WS [snap_orders]
+    payload, so resting orders placed before startup (or beyond the cap) are absent from
+    the snapshot and would be pruned by the reconcile. A hook avoids a module cycle (the
+    REST fetcher already depends on this module). *)
 let on_snapshot_hook : (unit -> unit) ref = ref (fun () -> ())
 
 let set_on_snapshot_hook f = on_snapshot_hook := f
 
-(** Injects authoritative open orders fetched out-of-band (REST /OpenOrders,
-    no cap) into the same cache the strategy's open-order scan reads, so
-    pre-existing resting orders are adopted instead of looking like free
-    inventory. Non-terminal events upsert; terminal events remove. *)
+(** Injects authoritative open orders fetched out-of-band (REST /OpenOrders, no cap) into
+    the same cache the strategy's open-order scan reads, so pre-existing resting orders
+    are adopted instead of looking like free inventory. Non-terminal events upsert;
+    terminal events remove. *)
 let inject_open_orders (events : execution_event list) =
   List.iter
     (fun (event : execution_event) ->
-       let store = get_symbol_store event.symbol in
-       update_open_orders store event;
-       Atomic.set store.last_event_time event.timestamp;
-       notify_ready store)
+      let store = get_symbol_store event.symbol in
+      update_open_orders store event;
+      Atomic.set store.last_event_time event.timestamp;
+      notify_ready store)
     events
 ;;
 
@@ -1025,36 +1033,37 @@ let handle_snapshot json on_heartbeat =
     let snapshot_order_ids = Hashtbl.create (List.length data) in
     List.iter
       (fun item ->
-         match parse_execution_event item with
-         | Some event ->
-           let store = get_symbol_store event.symbol in
-           (* Snapshot items are not written to events_buffer and do not trigger
-             per-item Exchange_wakeup; they reflect initial/reconnection state
-             for open-order tracking. Live updates go through handle_update. *)
-           update_open_orders store event;
-           Atomic.set store.last_event_time event.timestamp;
-           notify_ready store;
-           (* Mark order ID as active in snapshot *)
-           Hashtbl.replace snapshot_order_ids event.order_id ();
-           (* Update the heartbeat. *)
-           on_heartbeat ()
-         | None -> ())
+        match parse_execution_event item with
+        | Some event ->
+          let store = get_symbol_store event.symbol in
+          (* Snapshot items are not written to events_buffer and do not trigger per-item
+             Exchange_wakeup; they reflect initial/reconnection state for open-order
+             tracking. Live updates go through handle_update. *)
+          update_open_orders store event;
+          Atomic.set store.last_event_time event.timestamp;
+          notify_ready store;
+          (* Mark order ID as active in snapshot *)
+          Hashtbl.replace snapshot_order_ids event.order_id ();
+          (* Update the heartbeat. *)
+          on_heartbeat ()
+        | None -> ())
       data;
-    (* Reconcile: remove locally cached orders absent from the snapshot to prevent stale entries after reconnection. *)
+    (* Reconcile: remove locally cached orders absent from the snapshot to prevent stale
+       entries after reconnection. *)
     let stale_orders = ref [] in
     (* Scan all symbol stores since snapshot covers all subscribed symbols. *)
     let all_symbols = get_all_symbols () in
     List.iter
       (fun symbol ->
-         let store = get_symbol_store symbol in
-         Mutex.lock store.orders_mutex;
-         (* Collect orders not present in the snapshot. *)
-         Hashtbl.iter
-           (fun order_id _ ->
-              if not (Hashtbl.mem snapshot_order_ids order_id)
-              then stale_orders := (symbol, order_id) :: !stale_orders)
-           store.open_orders;
-         Mutex.unlock store.orders_mutex)
+        let store = get_symbol_store symbol in
+        Mutex.lock store.orders_mutex;
+        (* Collect orders not present in the snapshot. *)
+        Hashtbl.iter
+          (fun order_id _ ->
+            if not (Hashtbl.mem snapshot_order_ids order_id)
+            then stale_orders := (symbol, order_id) :: !stale_orders)
+          store.open_orders;
+        Mutex.unlock store.orders_mutex)
       all_symbols;
     (* Remove identified stale orders. *)
     let removed_count = List.length !stale_orders in
@@ -1066,33 +1075,34 @@ let handle_snapshot json on_heartbeat =
         removed_count;
       List.iter
         (fun (symbol, order_id) ->
-           let store = get_symbol_store symbol in
-           let was_present =
-             Mutex.lock store.orders_mutex;
-             let exists = Hashtbl.mem store.open_orders order_id in
-             if exists
-             then (
-               Hashtbl.remove store.open_orders order_id;
-               publish_open_orders_cache store);
-             Mutex.unlock store.orders_mutex;
-             exists
-           in
-           if was_present
-           then (
-             Mutex.lock global_orders_mutex;
-             Hashtbl.remove order_to_symbol order_id;
-             Mutex.unlock global_orders_mutex;
-             Logging.debug_f
-               ~section
-               "Removed stale order during reconciliation: %s [%s]"
-               order_id
-               symbol))
+          let store = get_symbol_store symbol in
+          let was_present =
+            Mutex.lock store.orders_mutex;
+            let exists = Hashtbl.mem store.open_orders order_id in
+            if exists
+            then (
+              Hashtbl.remove store.open_orders order_id;
+              publish_open_orders_cache store);
+            Mutex.unlock store.orders_mutex;
+            exists
+          in
+          if was_present
+          then (
+            Mutex.lock global_orders_mutex;
+            Hashtbl.remove order_to_symbol order_id;
+            Mutex.unlock global_orders_mutex;
+            Logging.debug_f
+              ~section
+              "Removed stale order during reconciliation: %s [%s]"
+              order_id
+              symbol))
         !stale_orders);
-    (* Mark all initialized stores as ready regardless of whether they received snapshot events. *)
+    (* Mark all initialized stores as ready regardless of whether they received snapshot
+       events. *)
     List.iter
       (fun symbol ->
-         let store = get_symbol_store symbol in
-         notify_ready store)
+        let store = get_symbol_store symbol in
+        notify_ready store)
       all_symbols;
     Logging.debug_f ~section "Execution snapshot processed and reconciled";
     (* Lock the adaptive order_to_symbol cap after startup snapshot ingestion. *)
@@ -1114,61 +1124,62 @@ let handle_update json on_heartbeat =
     let data = member "data" json |> to_list in
     List.iter
       (fun item ->
-         match parse_execution_event item with
-         | Some event ->
-           let store = get_symbol_store event.symbol in
-           write_execution_event store.events_buffer event;
-           update_open_orders store event;
-           Atomic.set store.last_event_time event.timestamp;
-           notify_ready store;
-           Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
-           (* The order update event bus is backed by Lwt streams
-              (single-domain), so publishing from the Parse_worker domain is
-              safe only with zero subscribers. The guard skips the publish in
-              that case and warns once if a subscriber appears; that consumer
-              must be migrated off the Lwt stream before relying on it here. *)
-           (match Atomic.get order_update_event_bus.subscribers with
-            | [] -> ()
-            | _ ->
-              if not (Atomic.get order_update_bus_warned)
-              then (
-                Atomic.set order_update_bus_warned true;
-                Logging.warn_f
-                  ~section
-                  "order_update_event_bus has subscribers but publishes are skipped on \
-                   the parse domain; migrate the consumer off the Lwt stream");
-              ());
-           (* Publish complete fills to the centralized fill event bus for Discord notifications. *)
-           if event.order_status = FilledStatus
-           then (
-             let fill_value = event.cum_qty *. event.avg_price in
-             let maker_fee_rate =
-               match Dio_exchange.Exchange_intf.Registry.get "kraken" with
-               | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
-                 (match Ex.get_fees ~symbol:event.symbol with
-                  | Some f, _ -> f
-                  | _ -> 0.0)
-               | None -> 0.0
-             in
-             let fee = fill_value *. maker_fee_rate in
-             Concurrency.Fill_event_bus.publish_fill
-               { venue = "kraken"
-               ; symbol = event.symbol
-               ; side = string_of_side event.side
-               ; amount = event.cum_qty
-               ; fill_price = event.avg_price
-               ; value = fill_value
-               ; fee
-               ; timestamp = event.timestamp
-               ; order_id = event.order_id
-               ; trade_id =
-                   (match event.trade_id with
-                    | Some tid -> Int64.to_string tid
-                    | None -> "")
-               });
-           (* Update the heartbeat. *)
-           on_heartbeat ()
-         | None -> ())
+        match parse_execution_event item with
+        | Some event ->
+          let store = get_symbol_store event.symbol in
+          write_execution_event store.events_buffer event;
+          update_open_orders store event;
+          Atomic.set store.last_event_time event.timestamp;
+          notify_ready store;
+          Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
+          (* The order update event bus is backed by Lwt streams (single-domain), so
+             publishing from the Parse_worker domain is safe only with zero subscribers.
+             The guard skips the publish in that case and warns once if a subscriber
+             appears; that consumer must be migrated off the Lwt stream before relying on
+             it here. *)
+          (match Atomic.get order_update_event_bus.subscribers with
+           | [] -> ()
+           | _ ->
+             if not (Atomic.get order_update_bus_warned)
+             then (
+               Atomic.set order_update_bus_warned true;
+               Logging.warn_f
+                 ~section
+                 "order_update_event_bus has subscribers but publishes are skipped on \
+                  the parse domain; migrate the consumer off the Lwt stream");
+             ());
+          (* Publish complete fills to the centralized fill event bus for Discord
+             notifications. *)
+          if event.order_status = FilledStatus
+          then (
+            let fill_value = event.cum_qty *. event.avg_price in
+            let maker_fee_rate =
+              match Dio_exchange.Exchange_intf.Registry.get "kraken" with
+              | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+                (match Ex.get_fees ~symbol:event.symbol with
+                 | Some f, _ -> f
+                 | _ -> 0.0)
+              | None -> 0.0
+            in
+            let fee = fill_value *. maker_fee_rate in
+            Concurrency.Fill_event_bus.publish_fill
+              { venue = "kraken"
+              ; symbol = event.symbol
+              ; side = string_of_side event.side
+              ; amount = event.cum_qty
+              ; fill_price = event.avg_price
+              ; value = fill_value
+              ; fee
+              ; timestamp = event.timestamp
+              ; order_id = event.order_id
+              ; trade_id =
+                  (match event.trade_id with
+                   | Some tid -> Int64.to_string tid
+                   | None -> "")
+              });
+          (* Update the heartbeat. *)
+          on_heartbeat ()
+        | None -> ())
       data
   with
   | exn ->
@@ -1178,7 +1189,8 @@ let handle_update json on_heartbeat =
       (Printexc.to_string exn)
 ;;
 
-(** WebSocket message handler operating on pre-parsed JSON to avoid redundant serialization. *)
+(** WebSocket message handler operating on pre-parsed JSON to avoid redundant
+    serialization. *)
 let handle_message_json json on_heartbeat =
   try
     let open Yojson.Safe.Util in
@@ -1215,7 +1227,8 @@ let handle_message_json json on_heartbeat =
   | exn -> Logging.error_f ~section "Error handling message: %s" (Printexc.to_string exn)
 ;;
 
-(** WebSocket message handler accepting raw string input. Parses JSON then delegates to handle_message_json. *)
+(** WebSocket message handler accepting raw string input. Parses JSON then delegates to
+    handle_message_json. *)
 let handle_message message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
   try
@@ -1230,15 +1243,15 @@ let handle_message message on_heartbeat =
       message
 ;;
 
-(* Per-connection heartbeat closure, published so the Parse_worker handler
-   can invoke it from the parse domain (domain-safe: mutex + timestamp
-   update). One authenticated connection exists at a time. *)
+(* Per-connection heartbeat closure, published so the Parse_worker handler can invoke it
+   from the parse domain (domain-safe: mutex + timestamp update). One authenticated
+   connection exists at a time. *)
 let current_on_heartbeat : (unit -> unit) option Atomic.t = Atomic.make None
 
-(** Parse-domain body: parse and dispatch on the parse domain with the
-    connection's current heartbeat, no tick. Shared by the legacy "kraken_exec"
-    handler and the uniform venue decoder. [handle_message_json] is
-    domain-safe: per-symbol mutexes, ring writes, Atomics, logging, wakeups. *)
+(** Parse-domain body: parse and dispatch on the parse domain with the connection's
+    current heartbeat, no tick. Shared by the legacy "kraken_exec" handler and the uniform
+    venue decoder. [handle_message_json] is domain-safe: per-symbol mutexes, ring writes,
+    Atomics, logging, wakeups. *)
 let process_parse_domain_frame message =
   let heartbeat =
     match Atomic.get current_on_heartbeat with
@@ -1258,23 +1271,23 @@ let process_parse_domain_frame message =
 ;;
 
 (** Parse-worker entry point. Executions pushes are intercepted in
-    Kraken_trading_client.handle_frame by a raw-string prefix check before the
-    central Yojson parse, so this handler owns both parse and dispatch for the
-    channel. *)
+    Kraken_trading_client.handle_frame by a raw-string prefix check before the central
+    Yojson parse, so this handler owns both parse and dispatch for the channel. *)
 let () = Concurrency.Parse_worker.register "kraken_exec" process_parse_domain_frame
-;;
 
-(** Deprecated. Superseded by the unified connection hub. Retained for interface compatibility. *)
+(** Deprecated. Superseded by the unified connection hub. Retained for interface
+    compatibility. *)
 let start_message_handler _conn _token _on_failure _on_heartbeat = Lwt.return_unit
 
-(** Subscribes to the Kraken executions channel on the authenticated WebSocket and starts the message consumption loop. *)
+(** Subscribes to the Kraken executions channel on the authenticated WebSocket and starts
+    the message consumption loop. *)
 let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
   Logging.debug
     ~section
     "Registering executions subscription on unified authenticated connection";
-  (* Publish the heartbeat closure for the parse-domain handler. Frames bypass
-     this module's buffer-drain loop and are intercepted in
-     Kraken_trading_client before reaching the buffer. *)
+  (* Publish the heartbeat closure for the parse-domain handler. Frames bypass this
+     module's buffer-drain loop and are intercepted in Kraken_trading_client before
+     reaching the buffer. *)
   Atomic.set current_on_heartbeat (Some on_heartbeat);
   let subscribe_msg =
     `Assoc
@@ -1329,8 +1342,8 @@ let initialize symbols =
   (* Pre-create symbol stores so hot-path lookups are wait-free. *)
   List.iter
     (fun symbol ->
-       let _store = get_symbol_store symbol in
-       Logging.debug_f ~section "Created lock-free execution store for %s" symbol)
+      let _store = get_symbol_store symbol in
+      Logging.debug_f ~section "Created lock-free execution store for %s" symbol)
     symbols;
   Logging.debug ~section "Execution stores initialized - now operating lock-free"
 ;;

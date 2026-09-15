@@ -8,21 +8,21 @@ let render_footer w (snapshot : Snapshot.t) =
   let t = Theme.current () in
   let uptime = snapshot.uptime_s in
   let fng = Option.value snapshot.fear_and_greed ~default:0.0 in
-  (* Per-exchange connectivity: live (green) when any strategy has bid > 0
-     and ask > 0 on that exchange, else dead (red). Deduplicated, sorted by name. *)
+  (* Per-exchange connectivity: live (green) when any strategy has bid > 0 and ask > 0 on
+     that exchange, else dead (red). Deduplicated, sorted by name. *)
   let exch_connected =
     Hashtbl.clear exch_tbl;
     List.iter
       (fun (_sym, (s : Snapshot.strategy)) ->
-         let exch = s.exchange in
-         if exch <> ""
-         then (
-           let live = s.market.bid > 0.0 && s.market.ask > 0.0 in
-           let cur =
-             try Hashtbl.find exch_tbl exch with
-             | Not_found -> false
-           in
-           Hashtbl.replace exch_tbl exch (cur || live)))
+        let exch = s.exchange in
+        if exch <> ""
+        then (
+          let live = s.market.bid > 0.0 && s.market.ask > 0.0 in
+          let cur =
+            try Hashtbl.find exch_tbl exch with
+            | Not_found -> false
+          in
+          Hashtbl.replace exch_tbl exch (cur || live)))
       snapshot.strategies;
     let pairs = Hashtbl.fold (fun k v acc -> (k, v) :: acc) exch_tbl [] in
     List.sort (fun (a, _) (b, _) -> String.compare a b) pairs
@@ -30,35 +30,35 @@ let render_footer w (snapshot : Snapshot.t) =
   let conn_imgs, _conn_w =
     List.fold_right
       (fun (exch, live) (imgs, w_acc) ->
-         let tag =
-           match exch with
-           | "kraken" -> "kraken"
-           | "hyperliquid" -> "hyperliquid"
-           | "alpaca" -> "alpaca"
-           | e -> truncate_string 10 e
-         in
-         let dot_attr =
-           if live
-           then A.(fg t.c_green ++ bg t.c_panel)
-           else A.(fg t.c_red ++ bg t.c_panel)
-         in
-         let exch_c =
-           match exch with
-           | "hyperliquid" -> t.c_exch_hl
-           | "kraken" -> t.c_exch_kr
-           | "lighter" -> t.c_exch_li
-           | "ibkr" -> t.c_exch_ib
-           | "alpaca" -> t.c_exch_alp
-           | _ -> t.c_label
-         in
-         let seg =
-           I.hcat
-             [ I.string A.(fg t.c_dim ++ bg t.c_panel) "  │  "
-             ; I.string dot_attr "◉"
-             ; I.string A.(fg exch_c ++ bg t.c_panel) (" " ^ tag)
-             ]
-         in
-         seg :: imgs, w_acc + 5 + 1 + 1 + String.length tag)
+        let tag =
+          match exch with
+          | "kraken" -> "kraken"
+          | "hyperliquid" -> "hyperliquid"
+          | "alpaca" -> "alpaca"
+          | e -> truncate_string 10 e
+        in
+        let dot_attr =
+          if live
+          then A.(fg t.c_green ++ bg t.c_panel)
+          else A.(fg t.c_red ++ bg t.c_panel)
+        in
+        let exch_c =
+          match exch with
+          | "hyperliquid" -> t.c_exch_hl
+          | "kraken" -> t.c_exch_kr
+          | "lighter" -> t.c_exch_li
+          | "ibkr" -> t.c_exch_ib
+          | "alpaca" -> t.c_exch_alp
+          | _ -> t.c_label
+        in
+        let seg =
+          I.hcat
+            [ I.string A.(fg t.c_dim ++ bg t.c_panel) "  │  "
+            ; I.string dot_attr "◉"
+            ; I.string A.(fg exch_c ++ bg t.c_panel) (" " ^ tag)
+            ]
+        in
+        seg :: imgs, w_acc + 5 + 1 + 1 + String.length tag)
       exch_connected
       ([], 0)
   in

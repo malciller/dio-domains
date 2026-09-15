@@ -1,6 +1,6 @@
-(* Dashboard render benchmark: renders a representative snapshot through the
-   main view and the asset detail view, reporting parse and per-frame render
-   costs. Optional argument: number of strategies (default 8). *)
+(* Dashboard render benchmark: renders a representative snapshot through the main view and
+   the asset detail view, reporting parse and per-frame render costs. Optional argument:
+   number of strategies (default 8). *)
 
 open Dashboard_ui
 

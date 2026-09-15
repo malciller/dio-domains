@@ -16,10 +16,10 @@
   dio.ws_lwt
   conduit-lwt-unix
   ipaddr.unix
-   concurrency
-   dio.persistence
-   dio.exchange
-   dio.error_handling
-   dio.latency_profiling)
+  concurrency
+  dio.persistence
+  dio.exchange
+  dio.error_handling
+  dio.latency_profiling)
  (preprocess
   (pps lwt_ppx)))

@@ -1,8 +1,8 @@
 (** Account collateral and position tracking for Alpaca.
 
-    Concurrency: the background refresher fiber is the single writer; it builds
-    a fresh immutable table and publishes it with one [Atomic.set]. Readers use
-    [Atomic.get] and take no mutex on the read path. *)
+    Concurrency: the background refresher fiber is the single writer; it builds a fresh
+    immutable table and publishes it with one [Atomic.set]. Readers use [Atomic.get] and
+    take no mutex on the read path. *)
 
 open Lwt.Infix
 
@@ -13,8 +13,8 @@ let balances : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 
 
 let total_balances : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
 
-(** Immediately-sellable balance per asset: Alpaca [qty_available] ([qty] minus
-    open-order holds). Published by the same poll as [balances]. *)
+(** Immediately-sellable balance per asset: Alpaca [qty_available] ([qty] minus open-order
+    holds). Published by the same poll as [balances]. *)
 let available_balances : (string, float) Hashtbl.t Atomic.t =
   Atomic.make (Hashtbl.create 16)
 ;;
@@ -25,8 +25,7 @@ let position_marks : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.c
 let initial_data_received = Atomic.make false
 let last_update = Atomic.make 0.0 (* wall clock of the last successful poll *)
 
-(** Age (seconds) of the balance snapshot, or [None] before the first
-    successful poll. *)
+(** Age (seconds) of the balance snapshot, or [None] before the first successful poll. *)
 let get_balance_age () =
   let lu = Atomic.get last_update in
   if lu > 0.0 then Some (Unix.gettimeofday () -. lu) else None
@@ -50,9 +49,8 @@ let get_total_balance asset =
      | _ -> 0.0)
 ;;
 
-(** Immediately-sellable quantity for [asset]; returns NaN when the poll
-    reported no entry, so callers fall back to their local basis rather than
-    treating unknown as zero. *)
+(** Immediately-sellable quantity for [asset]; returns NaN when the poll reported no
+    entry, so callers fall back to their local basis rather than treating unknown as zero. *)
 let get_available_balance asset =
   let t = Atomic.get available_balances in
   let key = if asset = "USDC" then "USD" else asset in
@@ -75,10 +73,9 @@ let get_position_price asset =
   Hashtbl.find_opt t asset
 ;;
 
-let get_position_price_fast asset =
-  fun () ->
-    let t = Atomic.get position_marks in
-    Hashtbl.find_opt t asset
+let get_position_price_fast asset () =
+  let t = Atomic.get position_marks in
+  Hashtbl.find_opt t asset
 ;;
 
 let get_all_balances () =
@@ -119,25 +116,24 @@ let update_balances () =
            ~section
            "Alpaca loaded %d active position(s)"
            (List.length positions);
-       (* Mark prices are a fallback reference when the WS quote stream is quiet
-          (e.g. IEX closed pre/after-market). Live WS quotes in
-          Alpaca_orderbook take precedence. *)
+       (* Mark prices are a fallback reference when the WS quote stream is quiet (e.g. IEX
+          closed pre/after-market). Live WS quotes in Alpaca_orderbook take precedence. *)
        List.iter
          (fun (p : Alpaca_types.position_record) ->
-            Hashtbl.replace new_balances p.symbol p.qty;
-            Hashtbl.replace new_total p.symbol p.qty;
-            Hashtbl.replace new_available p.symbol p.qty_available;
-            if p.current_price > 0.0
-            then Hashtbl.replace new_marks p.symbol p.current_price;
-            Logging.debug_f
-              ~section
-              "Alpaca Position [%s]: qty=%.4f, avg_entry=%.2f, current_price=%.2f, \
-               mkt_val=%.2f"
-              p.symbol
-              p.qty
-              p.avg_entry_price
-              p.current_price
-              p.market_value)
+           Hashtbl.replace new_balances p.symbol p.qty;
+           Hashtbl.replace new_total p.symbol p.qty;
+           Hashtbl.replace new_available p.symbol p.qty_available;
+           if p.current_price > 0.0
+           then Hashtbl.replace new_marks p.symbol p.current_price;
+           Logging.debug_f
+             ~section
+             "Alpaca Position [%s]: qty=%.4f, avg_entry=%.2f, current_price=%.2f, \
+              mkt_val=%.2f"
+             p.symbol
+             p.qty
+             p.avg_entry_price
+             p.current_price
+             p.market_value)
          positions
      | Error err ->
        Logging.warn_f ~section "Failed to fetch positions during balance poll: %s" err);

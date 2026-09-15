@@ -1,17 +1,13 @@
-(** Interactive Brokers TWS API integration: root namespace re-exporting
-    the specialized modules.
+(** Interactive Brokers TWS API integration: root namespace re-exporting the specialized
+    modules.
 
-    * Types: orders, contracts, order status.
-    * Codec: wire format encode/decode.
-    * Connection: TCP transport, handshake, reconnect.
-    * Dispatcher: message routing and request correlation.
-    * Contracts: symbol-to-contract resolution.
-    * Orderbook_feed: depth subscription and order book snapshots.
-    * Executions_feed: order status and fill tracking.
-    * Balances: account balances and positions.
-    * Actions: order placement, modification, cancellation.
-    * Module: [Exchange_intf.S] adapter.
-    * Market_hours: US equity session state. *)
+    * Types: orders, contracts, order status. * Codec: wire format encode/decode. *
+    Connection: TCP transport, handshake, reconnect. * Dispatcher: message routing and
+    request correlation. * Contracts: symbol-to-contract resolution. * Orderbook_feed:
+    depth subscription and order book snapshots. * Executions_feed: order status and fill
+    tracking. * Balances: account balances and positions. * Actions: order placement,
+    modification, cancellation. * Module: [Exchange_intf.S] adapter. * Market_hours: US
+    equity session state. *)
 
 module Types = Ibkr_types
 module Codec = Ibkr_codec

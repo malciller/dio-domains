@@ -1,22 +1,21 @@
 (** Alpaca trade execution stream via the Events API over Server-Sent Events
-    ([GET /v2/events/trades]). Manages open-order state and execution-event
-    ring buffers. The legacy v1 [wss://.../stream] trade_updates WebSocket is
-    deprecated (HTTP 500); do not reinstate. *)
+    ([GET /v2/events/trades]). Manages open-order state and execution-event ring buffers.
+    The legacy v1 [wss://.../stream] trade_updates WebSocket is deprecated (HTTP 500); do
+    not reinstate. *)
 
 open Lwt.Infix
 open Dio_exchange.Exchange_intf.Types
 
 let section = "alpaca_executions"
 
-(* Cumulative count of fill-class trade updates dropped for unusable money
-   fields (price <= 0, filled_qty <= 0, unparseable side, empty order
-   id/symbol). Logged on every drop so venue API drift is visible rather than
-   silently desyncing inventory. *)
+(* Cumulative count of fill-class trade updates dropped for unusable money fields (price
+   <= 0, filled_qty <= 0, unparseable side, empty order id/symbol). Logged on every drop
+   so venue API drift is visible rather than silently desyncing inventory. *)
 let dropped_fill_events = Atomic.make 0
 
-(** Account-wide generation, bumped when any symbol's open-orders snapshot is
-    republished. Lets the grid strategy's [sync_open_orders] skip its
-    O(open-orders) rescan when nothing changed. *)
+(** Account-wide generation, bumped when any symbol's open-orders snapshot is republished.
+    Lets the grid strategy's [sync_open_orders] skip its O(open-orders) rescan when
+    nothing changed. *)
 let orders_generation = Atomic.make 0
 
 let[@inline] get_orders_generation () = Atomic.get orders_generation
@@ -69,13 +68,13 @@ module SymbolExecStore = struct
     { symbol : string
     ; buffer : execution_event_internal array
     ; capacity : int
-      (* write_pos/initial_data_received are atomics: the WS writer is the
-       single writer, domains read them lock-free via the _fast closures. The
-       mutex guards the open_orders Hashtbl and full ring-buffer reads. *)
+        (* write_pos/initial_data_received are atomics: the WS writer is the single
+           writer, domains read them lock-free via the _fast closures. The mutex guards
+           the open_orders Hashtbl and full ring-buffer reads. *)
     ; write_pos : int Atomic.t
     ; open_orders : (string, open_order_internal) Hashtbl.t
     ; open_orders_cache : open_order_internal list Atomic.t
-      (** Lock-free atomic snapshot of active open orders for the domain hot path. *)
+    (** Lock-free atomic snapshot of active open orders for the domain hot path. *)
     ; initial_data_received : bool Atomic.t
     ; mutex : Mutex.t
     }
@@ -160,30 +159,30 @@ module SymbolExecStore = struct
     Hashtbl.clear t.open_orders;
     List.iter
       (fun (o : Alpaca_types.order_record) ->
-         let user_ref =
-           match o.client_order_id with
-           | Some cid ->
-             (try Some (int_of_string cid) with
-              | _ -> None)
-           | None -> None
-         in
-         let oo =
-           { order_id = o.id
-           ; symbol = t.symbol
-           ; side =
-               (match o.side with
-                | Alpaca_types.Buy -> Buy
-                | Sell -> Sell)
-           ; qty = o.qty
-           ; cum_qty = o.filled_qty
-           ; remaining_qty = max 0.0 (o.qty -. o.filled_qty)
-           ; limit_price = o.limit_price
-           ; status = status_of_alpaca_status o.status
-           ; user_ref
-           ; cl_ord_id = o.client_order_id
-           }
-         in
-         Hashtbl.replace t.open_orders o.id oo)
+        let user_ref =
+          match o.client_order_id with
+          | Some cid ->
+            (try Some (int_of_string cid) with
+             | _ -> None)
+          | None -> None
+        in
+        let oo =
+          { order_id = o.id
+          ; symbol = t.symbol
+          ; side =
+              (match o.side with
+               | Alpaca_types.Buy -> Buy
+               | Sell -> Sell)
+          ; qty = o.qty
+          ; cum_qty = o.filled_qty
+          ; remaining_qty = max 0.0 (o.qty -. o.filled_qty)
+          ; limit_price = o.limit_price
+          ; status = status_of_alpaca_status o.status
+          ; user_ref
+          ; cl_ord_id = o.client_order_id
+          }
+        in
+        Hashtbl.replace t.open_orders o.id oo)
       orders;
     publish_open_orders_cache t;
     Mutex.unlock t.mutex;
@@ -215,25 +214,25 @@ let get_or_create_store symbol =
   store
 ;;
 
-(* Trade events arrive via the Events API (SSE), not the deprecated v1
-   [wss://.../stream] trade_updates WebSocket (HTTP 500).
+(* Trade events arrive via the Events API (SSE), not the deprecated v1 [wss://.../stream]
+   trade_updates WebSocket (HTTP 500).
 
-   [sse_active]: HTTP response stream open. [last_activity]: wall-clock of the
-   most recent SSE line (data frame or comment heartbeat); backs the supervisor
-   ping probe since SSE has no protocol ping. [last_event_id]: last event ULID;
-   reconnect resumes with [since_id] with no gap. *)
+   [sse_active]: HTTP response stream open. [last_activity]: wall-clock of the most recent
+   SSE line (data frame or comment heartbeat); backs the supervisor ping probe since SSE
+   has no protocol ping. [last_event_id]: last event ULID; reconnect resumes with
+   [since_id] with no gap. *)
 let sse_active = Atomic.make false
 let last_activity = ref 0.0
 let last_event_id : string option ref = ref None
 
-(** Startup backfill window (15 min): the first connect requests events since
-    now - 15min so a short restart loses no fills; later reconnects resume from
-    [last_event_id]. Replayed fills are safe (per-order high-water guard). *)
+(** Startup backfill window (15 min): the first connect requests events since now - 15min
+    so a short restart loses no fills; later reconnects resume from [last_event_id].
+    Replayed fills are safe (per-order high-water guard). *)
 let trade_events_backfill_s = 900.0
 
-(** Idle time after which the connectivity probe reports a stalled stream
-    (60s). SSE servers emit comment heartbeats well inside this, so a
-    quiet-but-healthy stream is not torn down by the probe timeout. *)
+(** Idle time after which the connectivity probe reports a stalled stream (60s). SSE
+    servers emit comment heartbeats well inside this, so a quiet-but-healthy stream is not
+    torn down by the probe timeout. *)
 let sse_idle_failure_s = 60.0
 
 let get_open_order symbol order_id =
@@ -334,21 +333,21 @@ let bootstrap_open_orders () =
     let grouped = Hashtbl.create 8 in
     List.iter
       (fun (o : Alpaca_types.order_record) ->
-         ignore (get_or_create_store o.symbol);
-         let existing =
-           try Hashtbl.find grouped o.symbol with
-           | _ -> []
-         in
-         Hashtbl.replace grouped o.symbol (o :: existing))
+        ignore (get_or_create_store o.symbol);
+        let existing =
+          try Hashtbl.find grouped o.symbol with
+          | _ -> []
+        in
+        Hashtbl.replace grouped o.symbol (o :: existing))
       orders;
     Mutex.lock stores_mutex;
     Hashtbl.iter
       (fun sym store ->
-         let sym_orders =
-           try Hashtbl.find grouped sym with
-           | _ -> []
-         in
-         SymbolExecStore.set_open_orders_snapshot store sym_orders)
+        let sym_orders =
+          try Hashtbl.find grouped sym with
+          | _ -> []
+        in
+        SymbolExecStore.set_open_orders_snapshot store sym_orders)
       stores;
     Mutex.unlock stores_mutex;
     Logging.debug_f
@@ -364,16 +363,15 @@ let bootstrap_open_orders () =
     Lwt.return_unit
 ;;
 
-(** Period between background open-order reconciles (10s). The SSE feed is the
-    hot-path source, but a dropped/out-of-order event permanently desyncs the
-    store until reconnect; a periodic REST snapshot heals drift within one
-    interval. *)
+(** Period between background open-order reconciles (10s). The SSE feed is the hot-path
+    source, but a dropped/out-of-order event permanently desyncs the store until
+    reconnect; a periodic REST snapshot heals drift within one interval. *)
 let open_orders_resync_interval_s = 10.0
 
 let open_orders_resync_running = Atomic.make false
 
-(** Starts the periodic open-order reconcile once. Idempotent: later calls,
-    including SSE reconnects, are no-ops. *)
+(** Starts the periodic open-order reconcile once. Idempotent: later calls, including SSE
+    reconnects, are no-ops. *)
 let start_open_orders_resync () =
   if Atomic.compare_and_set open_orders_resync_running false true
   then (
@@ -400,8 +398,8 @@ let start_open_orders_resync () =
 let initialize symbols =
   List.iter
     (fun sym ->
-       let store = get_or_create_store sym in
-       SymbolExecStore.mark_ready store)
+      let store = get_or_create_store sym in
+      SymbolExecStore.mark_ready store)
     symbols;
   start_open_orders_resync ()
 ;;
@@ -441,9 +439,9 @@ let apply_trade_update json =
     }
   in
   (* Fail-closed on money fields for fill-class events: price<=0, filled_qty<=0,
-     unparseable side, or missing order id would corrupt inventory/P&L. Drop
-     loudly; the balance reconcile heals a dropped fill, while a wrong-side fill
-     corrupts. Non-fill events are unaffected. *)
+     unparseable side, or missing order id would corrupt inventory/P&L. Drop loudly; the
+     balance reconcile heals a dropped fill, while a wrong-side fill corrupts. Non-fill
+     events are unaffected. *)
   let is_fill_class = String.equal event "fill" || String.equal event "partial_fill" in
   let side_ok = String.equal ord.side_str "buy" || String.equal ord.side_str "sell" in
   let money_ok = price > 0.0 && ord.filled_qty > 0.0 in
@@ -483,9 +481,8 @@ let apply_trade_update json =
     let store = get_or_create_store ord.symbol in
     SymbolExecStore.push_event store exec_event;
     (* Publish to the fill event bus (Discord notifications) when live. *)
-    if
-      (not !Alpaca_types.Config.is_paper)
-      && (event = "fill" || exec_event.order_status = Filled)
+    if (not !Alpaca_types.Config.is_paper)
+       && (event = "fill" || exec_event.order_status = Filled)
     then (
       let fill_value = ord.filled_qty *. price in
       let maker_fee_rate =
@@ -514,12 +511,11 @@ let apply_trade_update json =
   then Lwt.async (fun () -> Alpaca_balances.update_balances ())
 ;;
 
-(** Entry point for one trade event. The Events API delivers
-    [TradeUpdateEventV2] directly (no [{stream,data}] wrapper): [event],
-    [order], and (fills) [price]/[qty] at the top level, matching
-    [apply_trade_update]. Records the monotonic [event_id] for resumable
-    reconnects. [trade_bust]/[trade_correct] reverse a prior execution; the
-    ledger has no reversal model, so they are logged and left alone. *)
+(** Entry point for one trade event. The Events API delivers [TradeUpdateEventV2] directly
+    (no [{stream,data}] wrapper): [event], [order], and (fills) [price]/[qty] at the top
+    level, matching [apply_trade_update]. Records the monotonic [event_id] for resumable
+    reconnects. [trade_bust]/[trade_correct] reverse a prior execution; the ledger has no
+    reversal model, so they are logged and left alone. *)
 let handle_trade_update json =
   let open Yojson.Safe.Util in
   (match json |> member "event_id" with
@@ -557,8 +553,8 @@ let iso8601_utc (t : float) : string =
     tm.Unix.tm_sec
 ;;
 
-(** Stream URI: resume exactly from [last_event_id] when known, else request a
-    bounded startup backfill. *)
+(** Stream URI: resume exactly from [last_event_id] when known, else request a bounded
+    startup backfill. *)
 let events_uri () =
   let base = Uri.of_string (Alpaca_types.Config.trading_events_url ()) in
   match !last_event_id with
@@ -589,9 +585,9 @@ let strip_trailing_cr s =
   if n > 0 && Char.equal s.[n - 1] '\r' then String.sub s 0 (n - 1) else s
 ;;
 
-(** Consumes the SSE body until EOF. A blank line dispatches the accumulated
-    [data:] payload; every line (including [:] comment heartbeats) refreshes
-    [last_activity] and the supervisor heartbeat. *)
+(** Consumes the SSE body until EOF. A blank line dispatches the accumulated [data:]
+    payload; every line (including [:] comment heartbeats) refreshes [last_activity] and
+    the supervisor heartbeat. *)
 let consume_event_stream ~on_heartbeat body =
   let stream = Cohttp_lwt.Body.to_stream body in
   let line_buf = Buffer.create 1024 in
@@ -656,61 +652,60 @@ let consume_event_stream ~on_heartbeat body =
   Lwt.return_unit
 ;;
 
-(** Opens the Events API SSE stream and consumes it until EOF. Supervised-feed
-    contract: [on_connected] once the response is 2xx, [on_failure] on
-    end/error; reconnection is owned by the supervisor, which resumes from
-    [last_event_id]. *)
+(** Opens the Events API SSE stream and consumes it until EOF. Supervised-feed contract:
+    [on_connected] once the response is 2xx, [on_failure] on end/error; reconnection is
+    owned by the supervisor, which resumes from [last_event_id]. *)
 let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
   Lwt.catch
     (fun () ->
-       let uri = events_uri () in
-       Logging.debug_f
-         ~section
-         "Connecting to Alpaca trade events stream at %s"
-         (Uri.to_string uri);
-       (* Bound only the TLS + response-header phase; the body is a long-lived
-          stream and must not be cancelled by a timeout. *)
-       Lwt_unix.with_timeout 20.0 (fun () ->
-         Cohttp_lwt_unix.Client.get ~headers:(event_stream_headers ()) uri)
-       >>= fun (resp, body) ->
-       let status = Cohttp.Response.status resp in
-       if not (Cohttp.Code.is_success (Cohttp.Code.code_of_status status))
-       then
-         Lwt.fail
-           (Failure
-              (Printf.sprintf
-                 "Alpaca trade events stream HTTP %s"
-                 (Cohttp.Code.string_of_status status)))
-       else (
-         Atomic.set sse_active true;
-         last_activity := Unix.gettimeofday ();
-         on_connected ();
-         Logging.info_f
-           ~section
-           "Connected to Alpaca trade events stream at %s"
-           (Uri.to_string uri);
-         bootstrap_open_orders ()
-         >>= fun () ->
-         consume_event_stream ~on_heartbeat body
-         >>= fun () ->
-         Atomic.set sse_active false;
-         Logging.warn_f ~section "Alpaca trade events stream ended; reconnecting";
-         on_failure "trade events stream ended";
-         Lwt.return_unit))
+      let uri = events_uri () in
+      Logging.debug_f
+        ~section
+        "Connecting to Alpaca trade events stream at %s"
+        (Uri.to_string uri);
+      (* Bound only the TLS + response-header phase; the body is a long-lived stream and
+         must not be cancelled by a timeout. *)
+      Lwt_unix.with_timeout 20.0 (fun () ->
+        Cohttp_lwt_unix.Client.get ~headers:(event_stream_headers ()) uri)
+      >>= fun (resp, body) ->
+      let status = Cohttp.Response.status resp in
+      if not (Cohttp.Code.is_success (Cohttp.Code.code_of_status status))
+      then
+        Lwt.fail
+          (Failure
+             (Printf.sprintf
+                "Alpaca trade events stream HTTP %s"
+                (Cohttp.Code.string_of_status status)))
+      else (
+        Atomic.set sse_active true;
+        last_activity := Unix.gettimeofday ();
+        on_connected ();
+        Logging.info_f
+          ~section
+          "Connected to Alpaca trade events stream at %s"
+          (Uri.to_string uri);
+        bootstrap_open_orders ()
+        >>= fun () ->
+        consume_event_stream ~on_heartbeat body
+        >>= fun () ->
+        Atomic.set sse_active false;
+        Logging.warn_f ~section "Alpaca trade events stream ended; reconnecting";
+        on_failure "trade events stream ended";
+        Lwt.return_unit))
     (fun exn ->
-       Atomic.set sse_active false;
-       let err = Printexc.to_string exn in
-       Logging.error_f ~section "Alpaca trade events stream disconnected: %s" err;
-       on_failure err;
-       Lwt.return_unit)
+      Atomic.set sse_active false;
+      let err = Printexc.to_string exn in
+      Logging.error_f ~section "Alpaca trade events stream disconnected: %s" err;
+      on_failure err;
+      Lwt.return_unit)
 ;;
 
-(** Connectivity probe for the supervised monitor loop. SSE has no protocol
-    ping, so there is no RTT to measure here: liveness means the stream is open
-    and produced a line (data or comment heartbeat) within [sse_idle_failure_s].
-    Returns [false] when disconnected. The idle interval is deliberately NOT
-    recorded as a ws_ping sample: it is a staleness signal, not a round trip,
-    and would pin the venue's latency histogram at the idle ceiling. *)
+(** Connectivity probe for the supervised monitor loop. SSE has no protocol ping, so there
+    is no RTT to measure here: liveness means the stream is open and produced a line (data
+    or comment heartbeat) within [sse_idle_failure_s]. Returns [false] when disconnected.
+    The idle interval is deliberately NOT recorded as a ws_ping sample: it is a staleness
+    signal, not a round trip, and would pin the venue's latency histogram at the idle
+    ceiling. *)
 let send_ping ~req_id ~timeout_ms : bool Lwt.t =
   ignore req_id;
   ignore timeout_ms;

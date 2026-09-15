@@ -1,6 +1,6 @@
-(** Per-user fee-rate retrieval for perpetual and spot markets.
-    POSTs /info with the configured wallet address and parses account-specific
-    rates, then schedule-level rates, then hardcoded tier maximums. *)
+(** Per-user fee-rate retrieval for perpetual and spot markets. POSTs /info with the
+    configured wallet address and parses account-specific rates, then schedule-level
+    rates, then hardcoded tier maximums. *)
 
 let section = "hyperliquid_get_fee"
 
@@ -12,8 +12,8 @@ type fee_info =
   ; spot_taker_fee : float option
   }
 
-(** Reads the HYPERLIQUID_WALLET_ADDRESS environment variable.
-    Fails with an Lwt exception if the variable is unset. *)
+(** Reads the HYPERLIQUID_WALLET_ADDRESS environment variable. Fails with an Lwt exception
+    if the variable is unset. *)
 let get_wallet_address_from_env () : string Lwt.t =
   match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" with
   | Some v -> Lwt.return v
@@ -98,9 +98,9 @@ let parse_fee_info body_str =
     None
 ;;
 
-(** Fetches per-user fee rates from the Hyperliquid /info endpoint via POST.
-    Selects mainnet or testnet base URL based on [~testnet].
-    Applies a 5-second timeout. Returns [None] on HTTP error, timeout, or parse failure. *)
+(** Fetches per-user fee rates from the Hyperliquid /info endpoint via POST. Selects
+    mainnet or testnet base URL based on [~testnet]. Applies a 5-second timeout. Returns
+    [None] on HTTP error, timeout, or parse failure. *)
 let get_fee_info ~testnet () : fee_info option Lwt.t =
   let open Lwt.Infix in
   let base_url =
@@ -110,40 +110,39 @@ let get_fee_info ~testnet () : fee_info option Lwt.t =
   in
   Lwt.catch
     (fun () ->
-       get_wallet_address_from_env ()
-       >>= fun wallet ->
-       let url = Uri.of_string (base_url ^ "/info") in
-       let body =
-         Cohttp_lwt.Body.of_string
-           (Printf.sprintf "{\"type\":\"userFees\",\"user\":\"%s\"}" wallet)
-       in
-       let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
-       Logging.debug_f ~section "Fetching Hyperliquid fees for wallet %s..." wallet;
-       Lwt_unix.with_timeout 5.0 (fun () ->
-         Cohttp_lwt_unix.Client.post ~headers ~body url
-         >>= fun (resp, resp_body) ->
-         if
-           Cohttp.Response.status resp
+      get_wallet_address_from_env ()
+      >>= fun wallet ->
+      let url = Uri.of_string (base_url ^ "/info") in
+      let body =
+        Cohttp_lwt.Body.of_string
+          (Printf.sprintf "{\"type\":\"userFees\",\"user\":\"%s\"}" wallet)
+      in
+      let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
+      Logging.debug_f ~section "Fetching Hyperliquid fees for wallet %s..." wallet;
+      Lwt_unix.with_timeout 5.0 (fun () ->
+        Cohttp_lwt_unix.Client.post ~headers ~body url
+        >>= fun (resp, resp_body) ->
+        if Cohttp.Response.status resp
            |> Cohttp.Code.code_of_status
            |> fun c -> c >= 200 && c < 300
-         then (
-           Cohttp_lwt.Body.to_string resp_body
-           >|= fun body_str ->
-           Logging.debug_f ~section "Raw fee response: %s" body_str;
-           parse_fee_info body_str)
-         else
-           Cohttp_lwt.Body.to_string resp_body
-           >>= fun body_str ->
-           Logging.error_f
-             ~section
-             "Hyperliquid fee request failed with status %d: %s"
-             (Cohttp.Response.status resp |> Cohttp.Code.code_of_status)
-             body_str;
-           Lwt.return None))
+        then (
+          Cohttp_lwt.Body.to_string resp_body
+          >|= fun body_str ->
+          Logging.debug_f ~section "Raw fee response: %s" body_str;
+          parse_fee_info body_str)
+        else
+          Cohttp_lwt.Body.to_string resp_body
+          >>= fun body_str ->
+          Logging.error_f
+            ~section
+            "Hyperliquid fee request failed with status %d: %s"
+            (Cohttp.Response.status resp |> Cohttp.Code.code_of_status)
+            body_str;
+          Lwt.return None))
     (fun exn ->
-       Logging.error_f
-         ~section
-         "Error fetching Hyperliquid fees: %s"
-         (Printexc.to_string exn);
-       Lwt.return None)
+      Logging.error_f
+        ~section
+        "Error fetching Hyperliquid fees: %s"
+        (Printexc.to_string exn);
+      Lwt.return None)
 ;;

@@ -1,29 +1,28 @@
-(* Internal, client-only replacement for the lwt websocket wrapper.
-   Derived from the websocket 2.17 lwt wrapper (ISC, Vincent Bernardoff);
-   framing is delegated to [Websocket.Make] over a bounded [Cohttp_lwt_unix.IO],
-   so the wire format is byte-identical. Differences from the reference:
+(* Internal, client-only replacement for the lwt websocket wrapper. Derived from the
+   websocket 2.17 lwt wrapper (ISC, Vincent Bernardoff); framing is delegated to
+   [Websocket.Make] over a bounded [Cohttp_lwt_unix.IO], so the wire format is
+   byte-identical. Differences from the reference:
    - no [Lwt_log] dependency (removed the [lwt < 6] cap);
-   - no server-side code (client connections only).
-   [set_tcp_nodelay] and [Conduit_lwt_unix.connect] are reproduced verbatim. *)
+   - no server-side code (client connections only). [set_tcp_nodelay] and
+     [Conduit_lwt_unix.connect] are reproduced verbatim. *)
 
 open Websocket
 open Lwt.Infix
 
-(* Cap the payload a single WebSocket frame may declare. The [websocket] frame
-   parser reads the whole payload with no upper bound, so a hostile endpoint
-   could force a multi-gigabyte allocation. 64 MiB is far above any exchange
-   message. *)
+(* Cap the payload a single WebSocket frame may declare. The [websocket] frame parser
+   reads the whole payload with no upper bound, so a hostile endpoint could force a
+   multi-gigabyte allocation. 64 MiB is far above any exchange message. *)
 let max_frame_bytes = 64 * 1024 * 1024
 
-(* [Cohttp_lwt_unix.IO] with a bounded [read]. [Websocket.Make] reads a frame
-   payload as a single [read ic payload_len], so refusing an over-sized read
-   rejects the frame before it is buffered. Handshake reads are small and
-   unaffected. *)
+(* [Cohttp_lwt_unix.IO] with a bounded [read]. [Websocket.Make] reads a frame payload as a
+   single [read ic payload_len], so refusing an over-sized read rejects the frame before
+   it is buffered. Handshake reads are small and unaffected. *)
 module Bounded_io = struct
   include Cohttp_lwt_unix.IO
 
   let read ic count =
-    if count > max_frame_bytes then
+    if count > max_frame_bytes
+    then
       Lwt.fail
         (Failure
            (Printf.sprintf
@@ -51,22 +50,19 @@ let set_tcp_nodelay flow =
 let fail_unless eq f = if not eq then f () else Lwt.return_unit
 let fail_if eq f = if eq then f () else Lwt.return_unit
 
-(* Close both directions. Closing an already-closed channel is a no-op; a
-   failure while closing must not mask the original error. *)
-let close_quietly ch =
-  Lwt.catch (fun () -> Lwt_io.close ch) (fun _ -> Lwt.return_unit)
-;;
-
+(* Close both directions. Closing an already-closed channel is a no-op; a failure while
+   closing must not mask the original error. *)
+let close_quietly ch = Lwt.catch (fun () -> Lwt_io.close ch) (fun _ -> Lwt.return_unit)
 let close_both ic oc = Lwt.join [ close_quietly ic; close_quietly oc ]
 
 let drain_handshake req ic oc nonce =
   Impl.Request.write (fun _writer -> Lwt.return ()) req oc
   >>= fun () ->
-  (Impl.Response.read ic
-   >>= function
-   | `Ok r -> Lwt.return r
-   | `Eof -> Lwt.fail End_of_file
-   | `Invalid s -> Lwt.fail @@ Failure s)
+  Impl.Response.read ic
+  >>= (function
+         | `Ok r -> Lwt.return r
+         | `Eof -> Lwt.fail End_of_file
+         | `Invalid s -> Lwt.fail @@ Failure s)
   >>= fun response ->
   let open Cohttp in
   let status = Response.status response in
@@ -79,8 +75,7 @@ let drain_handshake req ic oc nonce =
     (Response.version response = `HTTP_1_1)
     (fun () -> protocol_error "wrong http version")
   >>= fun () ->
-  fail_unless (status = `Switching_protocols) (fun () ->
-    protocol_error "wrong status")
+  fail_unless (status = `Switching_protocols) (fun () -> protocol_error "wrong status")
   >>= fun () ->
   (match Header.get headers "upgrade" with
    | Some a when String.lowercase_ascii a = "websocket" -> Lwt.return_unit
@@ -113,8 +108,7 @@ let open_connection ctx client url nonce extra_headers =
   Lwt.catch
     (fun () -> drain_handshake req ic oc nonce)
     (fun exn -> close_both ic oc >>= fun () -> Lwt.fail exn)
-  >>= fun () ->
-  Lwt.return (ic, oc)
+  >>= fun () -> Lwt.return (ic, oc)
 ;;
 
 type conn =
@@ -152,12 +146,10 @@ let connect
     Lwt.wrap2 (Impl.write_frame_to_buf ~mode:(Impl.Client random_string)) buf frame
     >>= fun () ->
     Lwt.catch
-      (fun () ->
-         Lwt_io.write oc (Buffer.contents buf)
-         >>= fun () -> Lwt_io.flush oc)
+      (fun () -> Lwt_io.write oc (Buffer.contents buf) >>= fun () -> Lwt_io.flush oc)
       (fun exn ->
-         Lwt.async (fun () -> close_both ic oc);
-         Lwt.fail exn)
+        Lwt.async (fun () -> close_both ic oc);
+        Lwt.fail exn)
   in
   { read_frame; write_frame; ic; oc }
 ;;

@@ -1,21 +1,18 @@
 (* Oracle_pools - pure capital-allocation engine: pooling, priority, cascade.
 
-   Pools are per venue: one quote and one base pool per venue, never crossing
-   venues. Pool equals exchange balance; quantities tied in resting orders
-   remain in the pool but are unavailable for new allocation. This module
-   owns only the arithmetic; the caller feeds balances minus tied amounts and
-   applies the returned actions.
+   Pools are per venue: one quote and one base pool per venue, never crossing venues. Pool
+   equals exchange balance; quantities tied in resting orders remain in the pool but are
+   unavailable for new allocation. This module owns only the arithmetic; the caller feeds
+   balances minus tied amounts and applies the returned actions.
 
-   Allocation walks strategies in config presentation order (first = highest
-   priority): each is funded iff its need fits remaining availability;
-   skipped strategies pass their capacity down. A lower-priority strategy is
-   never starved while quote for it exists.
+   Allocation walks strategies in config presentation order (first = highest priority):
+   each is funded iff its need fits remaining availability; skipped strategies pass their
+   capacity down. A lower-priority strategy is never starved while quote for it exists.
 
-   The cancellation cascade fires when a higher-priority need cannot fit
-   available quote: lower-priority resting buys are cancelled (many lesser
-   orders may satisfy one greater) until it fits; otherwise resolution
-   proceeds to the next-highest priority. Cancelled strategies re-evaluate on
-   the cancel event and resume iff quote covers their buy. *)
+   The cancellation cascade fires when a higher-priority need cannot fit available quote:
+   lower-priority resting buys are cancelled (many lesser orders may satisfy one greater)
+   until it fits; otherwise resolution proceeds to the next-highest priority. Cancelled
+   strategies re-evaluate on the cancel event and resume iff quote covers their buy. *)
 
 (** A strategy's claim on its venue pools, in config presentation order. *)
 type claim =
@@ -25,8 +22,8 @@ type claim =
   ; resting_buy_quote : float (** Quote currently tied in resting buys. *)
   }
 
-(** One venue's allocatable quote: exchange balance minus everything tied
-    in resting buys across the venue's strategies. *)
+(** One venue's allocatable quote: exchange balance minus everything tied in resting buys
+    across the venue's strategies. *)
 type venue_quote =
   { available : float (** Free quote right now. *)
   ; claims : claim list (** All of the venue's strategies, any order. *)
@@ -35,11 +32,10 @@ type venue_quote =
 (** Allocation result for one pass over a venue's claims. *)
 type allocation =
   { funded_ids : string list
-    (** Strategies whose next buy fits (in presentation order). *)
+  (** Strategies whose next buy fits (in presentation order). *)
   ; starved_ids : string list
-    (** Skipped strategies: need exceeds remaining availability at their
-        turn - they stay inactive awaiting reactivation and keep receiving
-        computed parameters. *)
+  (** Skipped strategies: need exceeds remaining availability at their turn - they stay
+      inactive awaiting reactivation and keep receiving computed parameters. *)
   }
 
 let allocate (vq : venue_quote) : allocation =
@@ -48,27 +44,26 @@ let allocate (vq : venue_quote) : allocation =
   let funded, starved =
     List.fold_left
       (fun (funded, starved) (c : claim) ->
-         if c.need_quote <= !remaining +. 1e-9 && c.need_quote >= 0.0
-         then (
-           remaining := !remaining -. c.need_quote;
-           c.id :: funded, starved)
-         else funded, c.id :: starved)
+        if c.need_quote <= !remaining +. 1e-9 && c.need_quote >= 0.0
+        then (
+          remaining := !remaining -. c.need_quote;
+          c.id :: funded, starved)
+        else funded, c.id :: starved)
       ([], [])
       claims
   in
   { funded_ids = List.rev funded; starved_ids = List.rev starved }
 ;;
 
-(** Resting buys to cancel so [need] fits [available]. [trigger_id]'s own
-    resting buys are never cancelled, only lower-priority ones. Cancels walk
-    from the lowest priority upward and stop as soon as the need fits.
-    Returns [] when nothing needs cancelling or no combination of others'
-    orders can satisfy the need. *)
+(** Resting buys to cancel so [need] fits [available]. [trigger_id]'s own resting buys are
+    never cancelled, only lower-priority ones. Cancels walk from the lowest priority
+    upward and stop as soon as the need fits. Returns [] when nothing needs cancelling or
+    no combination of others' orders can satisfy the need. *)
 let cascade
-      ~(available : float)
-      ~(need : float)
-      ~(trigger_id : string)
-      ~(claims : claim list)
+  ~(available : float)
+  ~(need : float)
+  ~(trigger_id : string)
+  ~(claims : claim list)
   : string list
   =
   if need <= available +. 1e-9
@@ -78,7 +73,7 @@ let cascade
     let candidates =
       List.filter
         (fun (c : claim) ->
-           c.resting_buy_quote > 0.0 && not (String.equal c.id trigger_id))
+          c.resting_buy_quote > 0.0 && not (String.equal c.id trigger_id))
         claims
       |> List.sort (fun a b ->
         compare b.priority a.priority
@@ -95,13 +90,13 @@ let cascade
     | None -> [] (* No combination fits: give up this round. *))
 ;;
 
-(** Sell size from the venue base pool: base balance minus reserved_base
-    (already excluded by the execution layer's available_trading_balance)
-    minus base tied in resting sells. Never capital-gated. *)
+(** Sell size from the venue base pool: base balance minus reserved_base (already excluded
+    by the execution layer's available_trading_balance) minus base tied in resting sells.
+    Never capital-gated. *)
 let sell_qty_of
-      ~(base_balance : float)
-      ~(reserved_base : float)
-      ~(resting_sell_base : float)
+  ~(base_balance : float)
+  ~(reserved_base : float)
+  ~(resting_sell_base : float)
   : float
   =
   Float.max 0.0 (base_balance -. reserved_base -. resting_sell_base)
@@ -117,17 +112,17 @@ type sim_strategy =
   ; maker_fee : float
   }
 
-(** One strategy's simulated outcome: survived drawdown fraction of the
-    current price (clamped 0..1) and the price of the deepest rung it funded
-    under shared capital (spec [P_funded], its ladder's exhaustion point). *)
+(** One strategy's simulated outcome: survived drawdown fraction of the current price
+    (clamped 0..1) and the price of the deepest rung it funded under shared capital (spec
+    [P_funded], its ladder's exhaustion point). *)
 type sim_outcome =
   { d_surv : float
   ; funded_price : float
   }
 
-(** Simulate a shared market drawdown across a venue's active strategies:
-    one order per strategy sequentially in priority order until quote capital
-    is exhausted. Returns (strategy_id, { d_surv; funded_price }) pairs. *)
+(** Simulate a shared market drawdown across a venue's active strategies: one order per
+    strategy sequentially in priority order until quote capital is exhausted. Returns
+    (strategy_id, [{ d_surv; funded_price }]) pairs. *)
 let simulate_drawdown_survival ~(total_quote : float) (strategies : sim_strategy list)
   : (string * sim_outcome) list
   =
@@ -140,7 +135,7 @@ let simulate_drawdown_survival ~(total_quote : float) (strategies : sim_strategy
     let valid =
       List.filter
         (fun (s : sim_strategy) ->
-           s.grid_interval > 0.0 && s.buy_qty > 0.0 && s.current > 0.0)
+          s.grid_interval > 0.0 && s.buy_qty > 0.0 && s.current > 0.0)
         strategies
     in
     let sorted = List.sort (fun a b -> compare a.priority b.priority) valid in
@@ -152,38 +147,38 @@ let simulate_drawdown_survival ~(total_quote : float) (strategies : sim_strategy
       let any_funded_this_round = ref false in
       List.iter
         (fun (s : sim_strategy) ->
-           if !keep_running
-           then (
-             let k = Hashtbl.find counts s.id in
-             if k >= 1000
-             then ()
-             else (
-               let step = Float.max 1e-6 (1.0 -. (s.grid_interval /. 100.0)) in
-               let drop_factor = step ** float_of_int (k + 1) in
-               if drop_factor <= 0.001
-               then ()
-               else (
-                 let p_next = s.current *. drop_factor in
-                 let cost = s.buy_qty *. p_next *. (1.0 +. s.maker_fee) in
-                 if cost <= !remaining +. 1e-9
-                 then (
-                   remaining := !remaining -. cost;
-                   Hashtbl.replace counts s.id (k + 1);
-                   any_funded_this_round := true)
-                 else keep_running := false))))
+          if !keep_running
+          then (
+            let k = Hashtbl.find counts s.id in
+            if k >= 1000
+            then ()
+            else (
+              let step = Float.max 1e-6 (1.0 -. (s.grid_interval /. 100.0)) in
+              let drop_factor = step ** float_of_int (k + 1) in
+              if drop_factor <= 0.001
+              then ()
+              else (
+                let p_next = s.current *. drop_factor in
+                let cost = s.buy_qty *. p_next *. (1.0 +. s.maker_fee) in
+                if cost <= !remaining +. 1e-9
+                then (
+                  remaining := !remaining -. cost;
+                  Hashtbl.replace counts s.id (k + 1);
+                  any_funded_this_round := true)
+                else keep_running := false))))
         sorted;
       if not !any_funded_this_round then keep_running := false
     done;
     List.map
       (fun (s : sim_strategy) ->
-         match Hashtbl.find_opt counts s.id with
-         | None -> s.id, { d_surv = 0.0; funded_price = s.current }
-         | Some k ->
-           let step = Float.max 1e-6 (1.0 -. (s.grid_interval /. 100.0)) in
-           let drop_factor = step ** float_of_int k in
-           let d_surv = Float.max 0.0 (Float.min 1.0 (1.0 -. drop_factor)) in
-           (* Deepest rung actually funded: k rungs down the geometric
-              ladder (k = 0 exhausts at the current price itself). *)
-           s.id, { d_surv; funded_price = s.current *. drop_factor })
+        match Hashtbl.find_opt counts s.id with
+        | None -> s.id, { d_surv = 0.0; funded_price = s.current }
+        | Some k ->
+          let step = Float.max 1e-6 (1.0 -. (s.grid_interval /. 100.0)) in
+          let drop_factor = step ** float_of_int k in
+          let d_surv = Float.max 0.0 (Float.min 1.0 (1.0 -. drop_factor)) in
+          (* Deepest rung actually funded: k rungs down the geometric ladder (k = 0
+             exhausts at the current price itself). *)
+          s.id, { d_surv; funded_price = s.current *. drop_factor })
       strategies)
 ;;

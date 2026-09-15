@@ -1,18 +1,15 @@
 (** Account balance tracking via the IB reqAccountUpdates directive.
 
-    Maintains available and total cash balances (settled vs unsettled
-    funds) plus portfolio positions pushed by updatePortfolio.
+    Maintains available and total cash balances (settled vs unsettled funds) plus
+    portfolio positions pushed by updatePortfolio.
 
-    Workstation account values tracked:
-    * TotalCashBalance: cash balance including pending settlement activity.
-    * AvailableFunds: liquid capital usable for new trades.
-    * BuyingPower: purchasing capacity after margin requirements.
-    * NetLiquidation: net liquidation value of the portfolio.
-    * GrossPositionValue: aggregate market value of all positions.
-    * SettledCash: cash with completed settlement only.
-    * UnrealizedPnL: mark-to-market PnL on open positions.
-    * RealizedPnL: closed-out PnL for the current session.
-    * ExcessLiquidity: cushion above maintenance margin. *)
+    Workstation account values tracked: * TotalCashBalance: cash balance including pending
+    settlement activity. * AvailableFunds: liquid capital usable for new trades. *
+    BuyingPower: purchasing capacity after margin requirements. * NetLiquidation: net
+    liquidation value of the portfolio. * GrossPositionValue: aggregate market value of
+    all positions. * SettledCash: cash with completed settlement only. * UnrealizedPnL:
+    mark-to-market PnL on open positions. * RealizedPnL: closed-out PnL for the current
+    session. * ExcessLiquidity: cushion above maintenance margin. *)
 
 let section = "ibkr_balances"
 
@@ -23,22 +20,20 @@ let account_values_mutex = Mutex.create ()
 let ready = Atomic.make false
 let ready_condition = Lwt_condition.create ()
 
-(** Positions keyed by symbol ->
-    (qty, market_price, market_value, avg_cost). *)
+(** Positions keyed by symbol -> (qty, market_price, market_value, avg_cost). *)
 let positions : (string, float * float * float * float) Hashtbl.t = Hashtbl.create 32
 
 let positions_mutex = Mutex.create ()
 
-(** updateAccountValue handler.
-    Fields: version, key, value, currency, account id. *)
+(** updateAccountValue handler. Fields: version, key, value, currency, account id. *)
 let handle_account_value fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let key, fields = Ibkr_codec.read_string fields in
   let value, fields = Ibkr_codec.read_float fields in
   let currency, fields = Ibkr_codec.read_string fields in
   let _account, _fields = Ibkr_codec.read_string fields in
-  (* Currency-qualified key alongside the bare key so multi-currency
-     accounts do not collide; USD queries use the bare key. *)
+  (* Currency-qualified key alongside the bare key so multi-currency accounts do not
+     collide; USD queries use the bare key. *)
   Mutex.lock account_values_mutex;
   Hashtbl.replace account_values key (value, currency);
   if currency <> ""
@@ -61,11 +56,10 @@ let handle_account_value fields =
   | _ -> Logging.debug_f ~section "Account %s = %.2f %s" key value currency
 ;;
 
-(** updatePortfolio handler.
-    Fields: version, contract id, symbol, sec type, expiry, strike, right,
-    multiplier, primary exchange, currency, local symbol, trading class,
-    position, market price, market value, avg cost, unrealized PnL,
-    realized PnL, account id. *)
+(** updatePortfolio handler. Fields: version, contract id, symbol, sec type, expiry,
+    strike, right, multiplier, primary exchange, currency, local symbol, trading class,
+    position, market price, market value, avg cost, unrealized PnL, realized PnL, account
+    id. *)
 let handle_portfolio_value fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let _con_id, fields = Ibkr_codec.read_int fields in
@@ -157,13 +151,10 @@ let get_net_liquidation () = get_account_value "NetLiquidation"
 (** Mark-to-market PnL on open positions. *)
 let get_unrealized_pnl () = get_account_value "UnrealizedPnL"
 
-(** Maps an asset name to a balance query:
-    * USD -> AvailableFunds (deployable capital)
-    * TOTAL_CASH -> TotalCashBalance
-    * SETTLED -> SettledCash
-    * NET_LIQ -> NetLiquidation
-    Other names fall back to the positions table (equities), then to a
-    raw account-value key lookup. *)
+(** Maps an asset name to a balance query: * USD -> AvailableFunds (deployable capital) *
+    TOTAL_CASH -> TotalCashBalance * SETTLED -> SettledCash * NET_LIQ -> NetLiquidation
+    Other names fall back to the positions table (equities), then to a raw account-value
+    key lookup. *)
 let get_balance ~asset =
   match asset with
   | "USD" -> get_available_funds ()
@@ -172,8 +163,8 @@ let get_balance ~asset =
   | "NET_LIQ" -> get_net_liquidation ()
   | "BUYING_POWER" -> get_buying_power ()
   | symbol ->
-    (* Equities: look up the positions table first, then account values
-         as a fallback for unmapped keys. *)
+    (* Equities: look up the positions table first, then account values as a fallback for
+       unmapped keys. *)
     Mutex.lock positions_mutex;
     let r = Hashtbl.find_opt positions symbol in
     Mutex.unlock positions_mutex;
@@ -182,10 +173,9 @@ let get_balance ~asset =
      | None -> get_account_value symbol)
 ;;
 
-(** Balance summary for supervisor asset monitoring. IBKR accounts are keyed
-    by internal parameter names rather than tradable assets, so this
-    surfaces only USD (mapped to AvailableFunds); individual positions are
-    tracked via updatePortfolio. *)
+(** Balance summary for supervisor asset monitoring. IBKR accounts are keyed by internal
+    parameter names rather than tradable assets, so this surfaces only USD (mapped to
+    AvailableFunds); individual positions are tracked via updatePortfolio. *)
 let get_all_balances () =
   let usd = get_available_funds () in
   if usd > 0.0 then [ "USD", usd ] else []
