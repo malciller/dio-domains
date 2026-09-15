@@ -21,7 +21,7 @@
   Strategy_state
   Strategy_venue
   Strategy_reservation
-  Jacobs_ladder_orders
+  Strategy_orders
   Strategy_sell_orders
   Jacobs_ladder_execution
   Jacobs_ladder_events

@@ -4,7 +4,7 @@ open Strategy_common
 open Jacobs_ladder_types
 open Strategy_venue
 open Strategy_reservation
-open Jacobs_ladder_orders
+open Strategy_orders
 module Sell_orders = Strategy_sell_orders
 
 (* Moved to Platform_accounting (milestone 2). *)

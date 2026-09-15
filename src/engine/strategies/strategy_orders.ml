@@ -1,7 +1,7 @@
-(* Jacobs Ladder: order construction and buffer management. *)
+(* Order construction and lock-free dispatch (strategy-agnostic). *)
 
 open Strategy_common
-open Jacobs_ladder_types
+open Strategy_state
 open Strategy_venue
 open Strategy_reservation
 module Sell_orders = Strategy_sell_orders

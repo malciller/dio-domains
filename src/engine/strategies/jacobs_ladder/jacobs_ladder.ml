@@ -3,8 +3,8 @@
    Grid trading with a single-buy, multi-sell order model. Sub-components under
    jacobs_ladder/: types and state (Jacobs_ladder_types), exchange configuration and
    precision (Strategy_venue), reservation and accumulation (Strategy_reservation), order
-   construction and dispatch (Jacobs_ladder_orders), execution loop
-   (Jacobs_ladder_execution), lifecycle event handlers (Jacobs_ladder_events). *)
+   construction and dispatch (Strategy_orders), execution loop (Jacobs_ladder_execution),
+   lifecycle event handlers (Jacobs_ladder_events). *)
 
 open Strategy_common
 
@@ -93,13 +93,13 @@ let remove_sell_commitment = Strategy_reservation.remove_sell_commitment
 let remove_pending_sell_commitments = Strategy_reservation.remove_pending_sell_commitments
 let committed_sell_base = Strategy_reservation.committed_sell_base
 let effective_committed_sell_base = Strategy_reservation.effective_committed_sell_base
-let order_buffer = Jacobs_ladder_orders.order_buffer
-let get_order_buffer = Jacobs_ladder_orders.get_order_buffer
-let create_place_order = Jacobs_ladder_orders.create_place_order
-let create_amend_order = Jacobs_ladder_orders.create_amend_order
-let create_cancel_order = Jacobs_ladder_orders.create_cancel_order
-let create_order = Jacobs_ladder_orders.create_order
-let push_order = Jacobs_ladder_orders.push_order
+let order_buffer = Strategy_orders.order_buffer
+let get_order_buffer = Strategy_orders.get_order_buffer
+let create_place_order = Strategy_orders.create_place_order
+let create_amend_order = Strategy_orders.create_amend_order
+let create_cancel_order = Strategy_orders.create_cancel_order
+let create_order = Strategy_orders.create_order
+let push_order = Strategy_orders.push_order
 let sync_open_orders = Jacobs_ladder_execution.sync_open_orders
 
 let reconcile_persisted_sell_levels =
