@@ -540,7 +540,14 @@ let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
 
 let read_config () : config =
   try
-    let json = Yojson.Basic.from_file "config.json" in
+    (* DIO_CONFIG overrides the config path; default "config.json". Used to run the
+       reference and config-driven candidate side by side. *)
+    let config_path =
+      match Sys.getenv_opt "DIO_CONFIG" with
+      | Some p -> p
+      | None -> "config.json"
+    in
+    let json = Yojson.Basic.from_file config_path in
     let open Yojson.Basic.Util in
     if validate_keys ~context:"top-level" ~allowed:known_top_level_keys json then exit 1;
     let cycle_mod =

@@ -183,10 +183,16 @@ let asset_domain_worker
   in
   let trace_path =
     let sanitize s = String.map (fun c -> if Char.equal c '/' then '_' else c) s in
+    let suffix =
+      match Sys.getenv_opt "DIO_TRACE_SUFFIX" with
+      | Some s -> s
+      | None -> ""
+    in
     Printf.sprintf
-      "data/strategy_trace_%s_%s.json"
+      "data/strategy_trace_%s_%s%s.json"
       (sanitize asset_with_fees.exchange)
       (sanitize asset_with_fees.symbol)
+      suffix
   in
   let trace_cycles = ref 0 in
   (* Resolves accumulation_buffer from Fear & Greed on every venue (Kraken runs the same
@@ -615,6 +621,10 @@ let asset_domain_worker
     let config_grid =
       if config.config_strategy && is_grid_strategy
       then (
+        (* Register the builtin action inventory so the validator recognizes actions
+           (idempotent; needed because the CLI/test paths that normally register are not
+           on the engine startup path). *)
+        Dio_strategies.Strategy_actions_builtin.register_all ();
         let path = Printf.sprintf "strategies/%s.json" asset_with_fees.strategy in
         match Dio_strategies.Strategy_file.parse_file path with
         | Error msg ->
