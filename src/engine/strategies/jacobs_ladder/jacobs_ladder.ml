@@ -4,7 +4,7 @@
    jacobs_ladder/: types and state (Jacobs_ladder_types), exchange configuration and
    precision (Strategy_venue), reservation and accumulation (Strategy_reservation), order
    construction and dispatch (Strategy_orders), execution loop (Jacobs_ladder_execution),
-   lifecycle event handlers (Jacobs_ladder_events). *)
+   lifecycle event handlers (Strategy_events). *)
 
 open Strategy_common
 
@@ -175,22 +175,22 @@ let reclaim_step
   else Reclaim_rearm
 ;;
 
-let flush_persistence = Jacobs_ladder_events.flush_persistence
-let handle_order_acknowledged = Jacobs_ladder_events.handle_order_acknowledged
-let record_exec_event = Jacobs_ladder_events.record_exec_event
-let apply_event = Jacobs_ladder_events.apply_event
-let handle_order_failed = Jacobs_ladder_events.handle_order_failed
-let handle_order_rejected = Jacobs_ladder_events.handle_order_rejected
-let handle_order_filled = Jacobs_ladder_events.handle_order_filled
-let handle_order_cancelled = Jacobs_ladder_events.handle_order_cancelled
-let handle_order_amended = Jacobs_ladder_events.handle_order_amended
-let handle_order_amendment_skipped = Jacobs_ladder_events.handle_order_amendment_skipped
-let handle_order_amendment_failed = Jacobs_ladder_events.handle_order_amendment_failed
-let cleanup_pending_cancellation = Jacobs_ladder_events.cleanup_pending_cancellation
-let enqueue_event = Jacobs_ladder_events.enqueue_event
-let drain_events = Jacobs_ladder_events.drain_events
-let drain_events_with = Jacobs_ladder_events.drain_events_with
-let runtime_event_of_lifecycle = Jacobs_ladder_events.runtime_event_of_lifecycle
+let flush_persistence = Strategy_events.flush_persistence
+let handle_order_acknowledged = Strategy_events.handle_order_acknowledged
+let record_exec_event = Strategy_events.record_exec_event
+let apply_event = Strategy_events.apply_event
+let handle_order_failed = Strategy_events.handle_order_failed
+let handle_order_rejected = Strategy_events.handle_order_rejected
+let handle_order_filled = Strategy_events.handle_order_filled
+let handle_order_cancelled = Strategy_events.handle_order_cancelled
+let handle_order_amended = Strategy_events.handle_order_amended
+let handle_order_amendment_skipped = Strategy_events.handle_order_amendment_skipped
+let handle_order_amendment_failed = Strategy_events.handle_order_amendment_failed
+let cleanup_pending_cancellation = Strategy_events.cleanup_pending_cancellation
+let enqueue_event = Strategy_events.enqueue_event
+let drain_events = Strategy_events.drain_events
+let drain_events_with = Strategy_events.drain_events_with
+let runtime_event_of_lifecycle = Strategy_events.runtime_event_of_lifecycle
 
 (** Reads up to [max_orders] orders from the ringbuffer. *)
 let get_pending_orders max_orders = LockFreeQueue.read_batch order_buffer max_orders
@@ -233,7 +233,7 @@ module Strategy = struct
   let drain_events_with = drain_events_with
 
   (** Supervisor REST callbacks enqueue lifecycle events of this type. *)
-  type lifecycle_event = Jacobs_ladder_events.lifecycle_event =
+  type lifecycle_event = Strategy_events.lifecycle_event =
     | Ack of
         { now : float
         ; order_id : string

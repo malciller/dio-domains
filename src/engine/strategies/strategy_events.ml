@@ -1,7 +1,7 @@
-(* Jacobs Ladder: order lifecycle event handlers and persistence. *)
+(* Order lifecycle event handlers and persistence (strategy-agnostic). *)
 
 open Strategy_common
-open Jacobs_ladder_types
+open Strategy_state
 open Strategy_venue
 open Strategy_reservation
 open Strategy_orders
