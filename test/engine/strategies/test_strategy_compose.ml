@@ -165,6 +165,16 @@ let test_unknown_event_field () =
        errors)
 ;;
 
+let test_capabilities () =
+  let hl = Exchange_capabilities.for_exchange "hyperliquid" in
+  Alcotest.(check bool) "hl nets holds" true hl.balance_nets_open_order_holds;
+  Alcotest.(check bool) "hl hold from venue" true hl.hold_netted_from_venue_state;
+  Alcotest.(check string) "hl tif" "Alo" hl.time_in_force;
+  let al = Exchange_capabilities.for_exchange "alpaca" in
+  Alcotest.(check bool) "alpaca no accumulation sells" false al.use_accumulation_sells;
+  Alcotest.(check bool) "alpaca remaintain" true al.remaintain_expired_sells
+;;
+
 let () =
   Alcotest.run
     "strategy_compose"
@@ -180,5 +190,7 @@ let () =
         ; Alcotest.test_case "missing dedup key" `Quick test_missing_dedup_key
         ; Alcotest.test_case "unknown event field" `Quick test_unknown_event_field
         ] )
+    ; ( "capabilities"
+      , [ Alcotest.test_case "per-venue descriptors" `Quick test_capabilities ] )
     ]
 ;;
