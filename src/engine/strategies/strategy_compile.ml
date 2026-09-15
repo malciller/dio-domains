@@ -37,6 +37,12 @@ let known_platform_caps =
   ; "check_stale_balance"
   ; "asset_balance_nan"
   ; "quote_balance_nan"
+  ; "has_pending_buy"
+  ; "has_tracked_buy"
+  ; "inflight_cancel_buy"
+  ; "inflight_amend_buy"
+  ; "open_buy_count"
+  ; "has_recent_amend_buy"
   ]
 ;;
 
