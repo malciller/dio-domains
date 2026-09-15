@@ -498,7 +498,12 @@ let () =
      engine. `replay` needs the engine (config + venue registry), so it is handled here. *)
   (match Array.to_list Sys.argv with
    | _ :: "strategy" :: "replay" :: path :: _ ->
-     exit (Dio_engine.Strategy_replay.run path)
+     exit
+       (Dio_engine.Strategy_replay.run
+          ~set_venue_available:
+            (Some
+               (fun symbol v -> Alpaca.Balances.set_available_balance_for_test symbol v))
+          path)
    | _ -> ());
   (match Dio_strategies.Strategy_cli.maybe_run Sys.argv with
    | Some code -> exit code
