@@ -320,19 +320,16 @@ let test_grid_grid_price () =
 module Stub_engine = struct
   type ctx = int ref
 
-  let run_cycle c = incr c
   let prepare _ = true
   let cleanup _ = ()
-  let sync _ = ()
+  let sync c = incr c
   let refresh_fee _ = ()
   let guard _ = true
-  let buy _ = false
   let buy_gate _ = true
   let buy_facts _ = false, 0, false
   let buy_cancel _ = ()
   let buy_place _ = ()
   let buy_amend _ = ()
-  let sell _ = ()
   let sell_prepare _ = ()
   let sell_place _ = ()
   let sell_finalize _ = ()
@@ -340,12 +337,12 @@ end
 
 module Stub_grid = Strategy_actions_grid.Make (Stub_engine)
 
-let test_coarse_dispatch () =
+let test_fine_dispatch () =
   let ctx = ref 0 in
   let handler = Stub_grid.handler ctx in
   let json =
     {|{"name":"p","version":1,"triggers":["book_update"],"steps":[
-       {"id":"s","then":[{"action":"grid_cycle","args":{}}]}]}|}
+       {"id":"s","then":[{"action":"grid_sync","args":{}}]}]}|}
   in
   match Strategy_file.parse_string json with
   | Error e -> Alcotest.fail e
@@ -357,7 +354,7 @@ let test_coarse_dispatch () =
          ~price:1.0
          ~now:0.0
          ~event:(Strategy_runtime.make_event "book_update" []));
-    Alcotest.(check int) "run_cycle invoked" 1 !ctx
+    Alcotest.(check int) "grid_sync invoked" 1 !ctx
 ;;
 
 let () =
@@ -378,7 +375,7 @@ let () =
             test_grid_owed_sell_price
         ; Alcotest.test_case "grid available base handler" `Quick test_grid_available_base
         ; Alcotest.test_case "grid grid price handler" `Quick test_grid_grid_price
-        ; Alcotest.test_case "coarse grid dispatch" `Quick test_coarse_dispatch
+        ; Alcotest.test_case "fine grid dispatch" `Quick test_fine_dispatch
         ] )
     ]
 ;;

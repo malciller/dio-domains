@@ -150,19 +150,16 @@ let handler : Strategy_runtime.handler = { run }
 module type ENGINE = sig
   type ctx
 
-  val run_cycle : ctx -> unit
   val prepare : ctx -> bool
   val cleanup : ctx -> unit
   val sync : ctx -> unit
   val refresh_fee : ctx -> unit
   val guard : ctx -> bool
-  val buy : ctx -> bool
   val buy_gate : ctx -> bool
   val buy_facts : ctx -> bool * int * bool
   val buy_cancel : ctx -> unit
   val buy_place : ctx -> unit
   val buy_amend : ctx -> unit
-  val sell : ctx -> unit
   val sell_prepare : ctx -> unit
   val sell_place : ctx -> unit
   val sell_finalize : ctx -> unit
@@ -173,9 +170,6 @@ module Make (E : ENGINE) = struct
     { run =
         (fun t name _args ->
           match name with
-          | "grid_cycle" ->
-            E.run_cycle ctx;
-            []
           | "grid_prepare" ->
             let cont = E.prepare ctx in
             Strategy_runtime.set_platform t "engine:continue" (V_bool cont);
@@ -199,9 +193,6 @@ module Make (E : ENGINE) = struct
           | "grid_guard" ->
             let cont = E.guard ctx in
             Strategy_runtime.set_platform t "engine:continue" (V_bool cont);
-            []
-          | "grid_buy" ->
-            ignore (E.buy ctx : bool);
             []
           | "grid_buy_gate" ->
             let active = E.buy_gate ctx in
@@ -231,9 +222,6 @@ module Make (E : ENGINE) = struct
             []
           | "grid_buy_amend" ->
             E.buy_amend ctx;
-            []
-          | "grid_sell" ->
-            E.sell ctx;
             []
           | "grid_sell_prepare" ->
             E.sell_prepare ctx;

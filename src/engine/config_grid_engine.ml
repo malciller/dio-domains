@@ -1,16 +1,14 @@
 (** Config-driven grid engine context (milestone 3; fine-orchestration decomposition).
 
-    Holds the per-cycle strategy inputs and calls the reference [execute_strategy]
-    sub-functions with them, so a config-driven grid replicates by construction. Enabled
-    only when [config_strategy] is set; the mutable fields are updated in place each cycle
-    (no per-cycle allocation). Shared by the domain loop and the offline candidate replay,
-    so the candidate interpreter is exercised on exactly the wiring the live loop uses.
-
-    The coarse path ([run_cycle]) is retained for the shipped coarse file; the fine path
-    ([prepare]/[cleanup]/[sync]/[refresh_fee]/[buy]/[sell]) mirrors [execute_strategy]'s
-    orchestration so the strategy file can express it as steps over reference actions. The
+    Holds the per-cycle strategy inputs and implements the reference actions the shipped
+    strategy file composes ([prepare]/[cleanup]/[sync]/[refresh_fee]/[guard]/[buy_*]/
+    [sell_*]), each by calling the reference [execute_strategy] sub-functions with these
+    inputs, so a config-driven grid replicates by construction. Enabled only when
+    [config_strategy] is set; the mutable fields are updated in place each cycle (no
+    per-cycle allocation). Shared by the domain loop and the offline candidate replay, so
+    the candidate interpreter is exercised on exactly the wiring the live loop uses. The
     caller holds [state.mutex] for the whole interpreter cycle (see [with_lock]); the
-    sub-functions do not lock, so this must not be combined with [run_cycle]. *)
+    sub-functions do not lock. *)
 
 module Jac = Dio_strategies.Jacobs_ladder
 module Types = Dio_strategies.Jacobs_ladder_types
@@ -93,30 +91,6 @@ let with_lock ctx f =
     Mutex.lock state.mutex;
     Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) f
   | None -> f ()
-;;
-
-(** Coarse path: run the whole reference [execute_strategy]. *)
-let run_cycle c =
-  match c.cg_asset, c.cg_state with
-  | Some asset, Some state ->
-    Jac.Strategy.execute
-      ~cached_state:state
-      ~quote_balance_stale:c.cg_quote_stale
-      ~oracle_halted:c.cg_oracle_halted
-      ~get_open_orders_generation:(fun () -> c.cg_gen)
-      ~base_balance_age:c.cg_base_age
-      ~now:c.cg_now
-      asset
-      c.cg_price
-      c.cg_bid
-      c.cg_ask
-      c.cg_abal
-      c.cg_qbal
-      0
-      0
-      c.cg_iter
-      c.cg_cycle
-  | _ -> ()
 ;;
 
 (** Fine path step 1: init, accumulation-buffer refresh, low-flag recovery, resolve
@@ -273,50 +247,6 @@ let guard c =
   c.cg_continue
 ;;
 
-(** Fine path step 6: TIF recovery bookkeeping + buy leg. Returns [buy_attempted]. *)
-let buy c =
-  match c.cg_state, c.cg_asset with
-  | Some state, Some asset ->
-    let recovery_expired =
-      state.tif_recovery_pending && c.cg_now -. state.tif_recovery_since >= 900.0
-    in
-    if recovery_expired
-    then (
-      state.tif_recovery_pending <- false;
-      Logging.info_f
-        ~section:"config_grid_engine"
-        "TIF recovery window expired for %s - resuming normal oracle-gated buying"
-        asset.symbol);
-    let tif_recovery_active =
-      state.tif_recovery_pending && c.cg_now -. state.tif_recovery_since < 900.0
-    in
-    let buy_attempted =
-      if c.cg_oracle_halted && not tif_recovery_active
-      then false
-      else
-        Jac.evaluate_buy_leg
-          ~oracle_halted:c.cg_oracle_halted
-          ~state
-          ~now:c.cg_now
-          ~asset
-          ~bid_price:c.cg_bid_r
-          ~ask_price:c.cg_ask_r
-          ~quote_balance:c.cg_qbal
-          ~quote_balance_stale:c.cg_quote_stale
-          ~cycle:c.cg_cycle
-          ~iter_open_orders:c.cg_iter
-          ~open_buy_count_from_scan:c.cg_open_buy_count
-          ~has_recent_amend_buy:c.cg_has_recent_amend_buy
-          ~locked_in_buys:c.cg_locked_in_buys
-          ~closest_sell_order_initial:c.cg_closest_sell_order
-    in
-    c.cg_buy_attempted <- buy_attempted;
-    buy_attempted
-  | _ ->
-    c.cg_buy_attempted <- false;
-    false
-;;
-
 (** Fine path step 6a: TIF-recovery bookkeeping and the oracle-halt buy gate. Returns
     whether the buy branches should run (false halts buy placement but the sell leg still
     runs). Resets [buy_attempted] for the cycle. *)
@@ -415,26 +345,6 @@ let buy_amend c =
       ~cycle:c.cg_cycle
       ~locked_in_buys:c.cg_locked_in_buys
       ~closest_sell_order_initial:c.cg_closest_sell_order
-  | _ -> ()
-;;
-
-(** Fine path step 6: sell leg. *)
-let sell c =
-  match c.cg_state, c.cg_asset, c.cg_ecfg with
-  | Some state, Some asset, Some ecfg ->
-    Jac.evaluate_sell_leg
-      ~persisted_reconcile:(c.cg_open_persisted, c.cg_missing_persisted)
-      ~state
-      ~now:c.cg_now
-      ~asset
-      ~bid_price:c.cg_bid_r
-      ~ask_price:c.cg_ask_r
-      ~asset_balance:c.cg_abal
-      ~buy_attempted:c.cg_buy_attempted
-      ~oracle_halted:c.cg_oracle_halted
-      ~ecfg
-      ~locked_in_sells:c.cg_locked_in_sells
-      ~base_balance_age:c.cg_base_age
   | _ -> ()
 ;;
 
