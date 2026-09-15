@@ -1636,6 +1636,7 @@ let asset_domain_worker
            Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
              ignore
                (Dio_strategies.Strategy_runtime.run_cycle
+                  ~collect:false
                   rt
                   ~price:!current_price
                   ~now

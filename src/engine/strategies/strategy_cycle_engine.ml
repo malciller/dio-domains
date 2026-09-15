@@ -370,7 +370,7 @@ let expire_tif_recovery c =
 (** Early path facts, published before the order-feed scan: the book/balance flags that
     [skip_nan_price], [mark_stale], the fee step and the [cycle_ok] gate need. The
     scan-dependent facts follow in [cycle_facts] after [sync]. *)
-let early_facts c =
+let early_facts c sink =
   let check_stale_balance =
     match c.cg_ecfg with
     | Some ecfg -> ecfg.check_stale_balance
@@ -381,18 +381,17 @@ let early_facts c =
     | Some s -> s.maker_fee > 0.0
     | None -> false
   in
-  [ "price_nan", Strategy_expr.V_bool (Float.is_nan c.cg_price)
-  ; "check_stale_balance", Strategy_expr.V_bool check_stale_balance
-  ; "asset_balance_nan", Strategy_expr.V_bool (Float.is_nan c.cg_abal)
-  ; "quote_balance_nan", Strategy_expr.V_bool (Float.is_nan c.cg_qbal)
-  ; "maker_fee_set", Strategy_expr.V_bool maker_fee_set
-  ; "fee_refresh_due", Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0)
-  ]
+  sink "price_nan" (Strategy_expr.V_bool (Float.is_nan c.cg_price));
+  sink "check_stale_balance" (Strategy_expr.V_bool check_stale_balance);
+  sink "asset_balance_nan" (Strategy_expr.V_bool (Float.is_nan c.cg_abal));
+  sink "quote_balance_nan" (Strategy_expr.V_bool (Float.is_nan c.cg_qbal));
+  sink "maker_fee_set" (Strategy_expr.V_bool maker_fee_set);
+  sink "fee_refresh_due" (Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0))
 ;;
 
 (** Fine path step 6a'': publish the raw gate facts the strategy file combines into the
     buy-active condition: the oracle-halt latch and the TIF-recovery latch/timestamp. *)
-let cycle_facts c =
+let cycle_facts c sink =
   let state = c.cg_state in
   let pending, since =
     match state with
@@ -419,25 +418,21 @@ let cycle_facts c =
     | Some ecfg -> ecfg.check_stale_balance
     | None -> false
   in
-  [ "oracle_halted", Strategy_expr.V_bool c.cg_oracle_halted
-  ; "tif_recovery_pending", Strategy_expr.V_bool pending
-  ; "tif_recovery_since", Strategy_expr.V_float since
-  ; "price_nan", Strategy_expr.V_bool (Float.is_nan c.cg_price)
-  ; "maker_fee_set", Strategy_expr.V_bool maker_fee_set
-  ; "fee_refresh_due", Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0)
-  ; "check_stale_balance", Strategy_expr.V_bool check_stale_balance
-  ; "asset_balance_nan", Strategy_expr.V_bool (Float.is_nan c.cg_abal)
-  ; "quote_balance_nan", Strategy_expr.V_bool (Float.is_nan c.cg_qbal)
-  ; "has_pending_buy", Strategy_expr.V_bool has_pending_buy
-  ; "has_tracked_buy", Strategy_expr.V_bool has_tracked_buy
-  ; "inflight_cancel_buy", Strategy_expr.V_bool inflight_cancel_buy
-  ; "inflight_amend_buy", Strategy_expr.V_bool inflight_amend_buy
-  ; "open_buy_count", Strategy_expr.V_int c.cg_open_buy_count
-  ; "bid", Strategy_expr.V_float c.cg_bid_r
-  ; "ask", Strategy_expr.V_float c.cg_ask_r
-  ; "lot_qty", Strategy_expr.V_float c.cg_lot_qty
-  ; "has_recent_amend_buy", Strategy_expr.V_bool c.cg_has_recent_amend_buy
-  ]
+  sink "oracle_halted" (Strategy_expr.V_bool c.cg_oracle_halted);
+  sink "tif_recovery_pending" (Strategy_expr.V_bool pending);
+  sink "tif_recovery_since" (Strategy_expr.V_float since);
+  sink "price_nan" (Strategy_expr.V_bool (Float.is_nan c.cg_price));
+  sink "maker_fee_set" (Strategy_expr.V_bool maker_fee_set);
+  sink "fee_refresh_due" (Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0));
+  sink "check_stale_balance" (Strategy_expr.V_bool check_stale_balance);
+  sink "asset_balance_nan" (Strategy_expr.V_bool (Float.is_nan c.cg_abal));
+  sink "quote_balance_nan" (Strategy_expr.V_bool (Float.is_nan c.cg_qbal));
+  sink "has_pending_buy" (Strategy_expr.V_bool has_pending_buy);
+  sink "has_tracked_buy" (Strategy_expr.V_bool has_tracked_buy);
+  sink "inflight_cancel_buy" (Strategy_expr.V_bool inflight_cancel_buy);
+  sink "inflight_amend_buy" (Strategy_expr.V_bool inflight_amend_buy);
+  sink "open_buy_count" (Strategy_expr.V_int c.cg_open_buy_count);
+  sink "has_recent_amend_buy" (Strategy_expr.V_bool c.cg_has_recent_amend_buy)
 ;;
 
 (** Fine path: the stale-balance side effect (record the cycle on the state). The file
