@@ -13,6 +13,11 @@ module Trace = Dio_strategies.Strategy_trace
 module Expr = Dio_strategies.Strategy_expr
 module Jac = Dio_strategies.Jacobs_ladder
 module Order = Dio_strategies.Strategy_common
+module Strategy_file = Dio_strategies.Strategy_file
+module Strategy_actions_grid = Dio_strategies.Strategy_actions_grid
+module Strategy_actions_builtin = Dio_strategies.Strategy_actions_builtin
+module Strategy_compile = Dio_strategies.Strategy_compile
+module Strategy_runtime = Dio_strategies.Strategy_runtime
 
 let f_entry entries key default =
   match List.assoc_opt key entries with
@@ -347,28 +352,45 @@ let seed_collections
   | _ -> ()
 ;;
 
-(** Replay [trace] through the reference strategy for [asset], returning an emitted-only
-    trace. *)
-let replay
+(** Seed the strategy state from the recorded snapshot in the first cycle. *)
+let seed_from_trace (state : Dio_strategies.Jacobs_ladder_types.strategy_state) trace =
+  match trace with
+  | (c : Trace.cycle) :: _ ->
+    let entries =
+      List.concat_map
+        (function
+          | Trace.State es -> es
+          | _ -> [])
+        c.c_obs
+    in
+    seed state entries;
+    seed_collections state entries
+  | [] -> ()
+;;
+
+(** Drive [trace] through [execute], applying the recorded per-cycle inputs (oracle/F&G
+    blend, domain knobs, venue-available snapshot) to [state] first, and capture the
+    emitted intents per cycle. Shared by the reference and candidate replays. *)
+let drive
   ~(asset : Jac.trading_config)
+  ~(state : Dio_strategies.Jacobs_ladder_types.strategy_state)
   ~(set_venue_available : (string -> float -> unit) option)
-  ~(trace : Trace.t)
+  ~(execute :
+      price:float
+      -> bid:float
+      -> ask:float
+      -> abal:float
+      -> qbal:float
+      -> now:float
+      -> cycle:int
+      -> oracle_halted:bool
+      -> quote_stale:bool
+      -> base_age:float option
+      -> iter:((string -> float -> float -> string -> int option -> unit) -> unit)
+      -> unit)
+  (trace : Trace.t)
   : Trace.t
   =
-  let state = Jac.get_strategy_state asset.symbol in
-  (* Seed the decision-relevant state from the recorded pre-run snapshot. *)
-  (match trace with
-   | (c : Trace.cycle) :: _ ->
-     let entries =
-       List.concat_map
-         (function
-           | Trace.State es -> es
-           | _ -> [])
-         c.c_obs
-     in
-     seed state entries;
-     seed_collections state entries
-   | [] -> ());
   (* Drain any pre-existing buffer so only this replay's intents are captured. *)
   ignore (Jac.get_pending_orders 1_000_000 : Order.strategy_order list);
   List.mapi
@@ -406,7 +428,7 @@ let replay
          if Float.is_finite va then f asset.symbol va
        | None -> ());
       let orders = Array.of_list open_orders in
-      let iter f =
+      let iter (f : string -> float -> float -> string -> int option -> unit) =
         Array.iter
           (fun (oi : Trace.order_intent) ->
             f
@@ -417,6 +439,52 @@ let replay
               None)
           orders
       in
+      execute
+        ~price
+        ~bid
+        ~ask
+        ~abal
+        ~qbal
+        ~now
+        ~cycle
+        ~oracle_halted
+        ~quote_stale
+        ~base_age
+        ~iter;
+      let pending = Jac.get_pending_orders 1_000_000 in
+      { Trace.c_index = idx
+      ; c_obs = List.map (fun e -> Trace.Emitted e) (List.map emitted_of_order pending)
+      })
+    trace
+;;
+
+(** Replay [trace] through the reference grid, returning an emitted-only trace. *)
+let replay
+  ~(asset : Jac.trading_config)
+  ~(set_venue_available : (string -> float -> unit) option)
+  ~(trace : Trace.t)
+  : Trace.t
+  =
+  let state = Jac.get_strategy_state asset.symbol in
+  seed_from_trace state trace;
+  drive
+    ~asset
+    ~state
+    ~set_venue_available
+    ~execute:
+      (fun
+        ~price
+        ~bid
+        ~ask
+        ~abal
+        ~qbal
+        ~now
+        ~cycle
+        ~oracle_halted
+        ~quote_stale
+        ~base_age
+        ~iter
+      ->
       Jac.Strategy.execute
         ~cached_state:state
         ~quote_balance_stale:quote_stale
@@ -433,11 +501,62 @@ let replay
         0
         0
         iter
-        cycle;
-      let pending = Jac.get_pending_orders 1_000_000 in
-      { Trace.c_index = idx
-      ; c_obs = List.map (fun e -> Trace.Emitted e) (List.map emitted_of_order pending)
-      })
+        cycle)
+    trace
+;;
+
+(** Replay [trace] through the config-driven interpreter (candidate) — the coarse
+    [grid_cycle] handler for the shipped file, fine actions once decomposed. *)
+let replay_candidate
+  ~(asset : Jac.trading_config)
+  ~(set_venue_available : (string -> float -> unit) option)
+  ~(file : Strategy_file.t)
+  ~(trace : Trace.t)
+  : Trace.t
+  =
+  let state = Jac.get_strategy_state asset.symbol in
+  seed_from_trace state trace;
+  let ctx = Config_grid_engine.create () in
+  ctx.cg_state <- Some state;
+  let module Handlers = Strategy_actions_grid.Make (Config_grid_engine) in
+  let rt = Strategy_runtime.create ~handlers:(Handlers.handler ctx) file in
+  drive
+    ~asset
+    ~state
+    ~set_venue_available
+    ~execute:
+      (fun
+        ~price
+        ~bid
+        ~ask
+        ~abal
+        ~qbal
+        ~now
+        ~cycle
+        ~oracle_halted
+        ~quote_stale
+        ~base_age
+        ~iter
+      ->
+      ctx.cg_asset <- Some asset;
+      ctx.cg_price <- price;
+      ctx.cg_bid <- bid;
+      ctx.cg_ask <- ask;
+      ctx.cg_abal <- abal;
+      ctx.cg_qbal <- qbal;
+      ctx.cg_now <- now;
+      ctx.cg_cycle <- cycle;
+      ctx.cg_quote_stale <- quote_stale;
+      ctx.cg_oracle_halted <- oracle_halted;
+      ctx.cg_base_age <- base_age;
+      ctx.cg_gen <- 0;
+      ctx.cg_iter <- iter;
+      ignore
+        (Strategy_runtime.run_cycle
+           rt
+           ~price
+           ~now
+           ~event:(Strategy_runtime.make_event "book_update" [])))
     trace
 ;;
 
@@ -474,9 +593,15 @@ let symbol_of_trace (trace : Trace.t) : string option =
   go trace
 ;;
 
-(** Load a recorded trace, replay it through the reference grid, and report equivalence
-    between the recorded and replayed emitted intents. Writes [<path>.replayed.json]. *)
-let run ~(set_venue_available : (string -> float -> unit) option) (path : string) : int =
+(** Load a recorded trace, replay it (through the reference grid, or the config-driven
+    interpreter when [candidate]), and report equivalence between the recorded and
+    replayed emitted intents. Writes [<path>.replayed.json]. *)
+let run
+  ~(set_venue_available : (string -> float -> unit) option)
+  ~(candidate : bool)
+  (path : string)
+  : int
+  =
   match Trace.load path with
   | exception exn ->
     Printf.eprintf "replay: cannot load %s: %s\n" path (Printexc.to_string exn);
@@ -498,17 +623,41 @@ let run ~(set_venue_available : (string -> float -> unit) option) (path : string
           1
         | Some tc ->
           let asset = asset_of tc in
-          let replayed = replay ~asset ~set_venue_available ~trace in
+          let replayed =
+            if not candidate
+            then replay ~asset ~set_venue_available ~trace
+            else (
+              Strategy_actions_builtin.register_all ();
+              let path_file = Printf.sprintf "strategies/%s.json" asset.strategy in
+              match Strategy_file.parse_file path_file with
+              | Error msg ->
+                Printf.eprintf "replay: cannot load %s: %s\n" path_file msg;
+                exit 1
+              | Ok file ->
+                let diags = Strategy_compile.validate file in
+                if Strategy_compile.has_errors diags
+                then (
+                  Printf.eprintf
+                    "replay: %s has errors: %s\n"
+                    path_file
+                    (Strategy_compile.format diags);
+                  exit 1)
+                else replay_candidate ~asset ~set_venue_available ~file ~trace)
+          in
           Trace.save (path ^ ".replayed.json") replayed;
           (match Trace.compare (Trace.emitted_only trace) replayed with
            | None ->
              Printf.printf
-               "replay equivalent: %s (%d cycles, %d emitted cycles)\n"
+               "replay equivalent (%s): %s (%d cycles, %d emitted cycles)\n"
+               (if candidate then "candidate" else "reference")
                path
                (List.length trace)
                (List.length replayed);
              0
            | Some msg ->
-             Printf.printf "replay divergence: %s\n" msg;
+             Printf.printf
+               "replay divergence (%s): %s\n"
+               (if candidate then "candidate" else "reference")
+               msg;
              1)))
 ;;

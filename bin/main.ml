@@ -497,13 +497,19 @@ let () =
   (* Strategy-file tooling (e.g. `dio strategy validate <file>`) runs without booting the
      engine. `replay` needs the engine (config + venue registry), so it is handled here. *)
   (match Array.to_list Sys.argv with
-   | _ :: "strategy" :: "replay" :: path :: _ ->
-     exit
-       (Dio_engine.Strategy_replay.run
-          ~set_venue_available:
-            (Some
-               (fun symbol v -> Alpaca.Balances.set_available_balance_for_test symbol v))
-          path)
+   | _ :: "strategy" :: "replay" :: rest ->
+     let candidate = List.mem "--candidate" rest in
+     (match List.filter (fun a -> not (String.equal a "--candidate")) rest with
+      | path :: _ ->
+        exit
+          (Dio_engine.Strategy_replay.run
+             ~set_venue_available:
+               (Some
+                  (fun symbol v ->
+                    Alpaca.Balances.set_available_balance_for_test symbol v))
+             ~candidate
+             path)
+      | [] -> ())
    | _ -> ());
   (match Dio_strategies.Strategy_cli.maybe_run Sys.argv with
    | Some code -> exit code
