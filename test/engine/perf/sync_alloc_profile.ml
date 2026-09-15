@@ -2,7 +2,7 @@
 
    Build with the release profile (`dune build --profile release
    test/engine/perf/sync_alloc_profile.exe`). Under the dev profile there is no
-   cross-module inlining, so reading a [float] back across the [Jacobs_ladder_sell_orders]
+   cross-module inlining, so reading a [float] back across the [Strategy_sell_orders]
    module boundary boxes it (2 words/call) and the per-order index walks look
    quadratically allocating; release (-O3) inlines them unboxed, which is what production
    builds do.
@@ -21,7 +21,7 @@
    reconcile. *)
 
 module JL = Dio_strategies.Jacobs_ladder
-module Sell_orders = Dio_strategies.Jacobs_ladder_sell_orders
+module Sell_orders = Dio_strategies.Strategy_sell_orders
 
 let alpaca_asset symbol =
   { JL.exchange = "alpaca"

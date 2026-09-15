@@ -1,4 +1,4 @@
-module SO = Dio_strategies.Jacobs_ladder_sell_orders
+module SO = Dio_strategies.Strategy_sell_orders
 
 let id_check = Alcotest.(list (triple string (float 1e-9) (float 1e-9)))
 let sample = [ "a", 100.0, 1.0; "b", 99.0, 2.5; "c", 98.0, 0.25 ]

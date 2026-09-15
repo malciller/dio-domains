@@ -1,5 +1,5 @@
 open Alcotest
-module Sell_orders = Dio_strategies.Jacobs_ladder_sell_orders
+module Sell_orders = Dio_strategies.Strategy_sell_orders
 
 (* Links Alpaca.Module.Alpaca_impl to run its registry registration so venue metadata
    resolves as in production (the 1e-9 fractional increment behind dust-level pruning). *)

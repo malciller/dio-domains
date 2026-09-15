@@ -1,5 +1,5 @@
-(** Abstract, array-backed set of live open sell orders for the Jacobs Ladder strategy: a
-    growable, reusable parallel-array store of [(order_id, price, remaining_qty)].
+(** Abstract, array-backed set of live open sell orders (strategy-agnostic): a growable,
+    reusable parallel-array store of [(order_id, price, remaining_qty)].
 
     The previous representation was a fresh [(string * float * float) list] rebuilt every
     strategy cycle. That allocated per order not only the cons cell and the tuple block

@@ -2,7 +2,7 @@
    the oracle's ACTIVE/INACTIVE verdict, sizing and capital accounting per tracked asset
    (the dashboard's pause state source). *)
 
-module Sell_orders = Dio_strategies.Jacobs_ladder_sell_orders
+module Sell_orders = Dio_strategies.Strategy_sell_orders
 
 let make_decision () =
   { Dio_oracle.Oracle_runtime.exchange = "hyperliquid"
