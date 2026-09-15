@@ -65,6 +65,7 @@ let known_platform_caps =
   ; "buy_attempted"
   ; "sell_pushed"
   ; "has_active_sell"
+  ; "sell_place_should"
   ; "balance_fresh"
   ]
 ;;

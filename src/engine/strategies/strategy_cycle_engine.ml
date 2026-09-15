@@ -616,6 +616,29 @@ let sell_prepare c =
   | _ -> c.cg_sell_pre <- None
 ;;
 
+(** Fine path sell phase 2a: whether a fresh sell is placeable this cycle. *)
+let sell_place_should c =
+  match c.cg_state, c.cg_sell_pre with
+  | Some state, Some pre -> Jac.sell_place_should ~state ~asset_balance:c.cg_abal ~pre
+  | _ -> false
+;;
+
+(** Fine path sell phase 2b: place the owed/restored sell. *)
+let sell_place_body c =
+  match c.cg_state, c.cg_asset, c.cg_ecfg, c.cg_sell_pre with
+  | Some state, Some asset, Some ecfg, Some pre ->
+    Jac.sell_place_body
+      ~state
+      ~now:c.cg_now
+      ~asset
+      ~bid_price:c.cg_bid_r
+      ~ask_price:c.cg_ask_r
+      ~buy_attempted:c.cg_buy_attempted
+      ~ecfg
+      ~pre
+  | _ -> ()
+;;
+
 (** Fine path sell phase 2: the gated placement block. *)
 let sell_place c =
   match c.cg_state, c.cg_asset, c.cg_ecfg, c.cg_sell_pre with

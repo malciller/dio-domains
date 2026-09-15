@@ -177,6 +177,8 @@ module type ENGINE = sig
   val buy_amend_no_sell : ctx -> unit
   val sell_prepare : ctx -> unit
   val sell_place : ctx -> unit
+  val sell_place_should : ctx -> bool
+  val sell_place_body : ctx -> unit
   val sell_finalize : ctx -> unit
   val sell_finalize_facts : ctx -> (string * Strategy_expr.value) list
   val sell_finalize_latch : ctx -> unit
@@ -276,6 +278,15 @@ module Make (E : ENGINE) = struct
             []
           | "sell_place" ->
             E.sell_place ctx;
+            []
+          | "sell_place_should" ->
+            Strategy_runtime.set_platform
+              t
+              "sell_place_should"
+              (V_bool (E.sell_place_should ctx));
+            []
+          | "sell_place_body" ->
+            E.sell_place_body ctx;
             []
           | "sell_finalize" ->
             E.sell_finalize ctx;
