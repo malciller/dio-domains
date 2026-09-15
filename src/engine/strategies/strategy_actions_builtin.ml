@@ -44,6 +44,10 @@ let declarations =
       "grid_price"
       decision
       [ se "current" e; se "grid_interval_pct" e; se "is_above" b ]
+  ; act "grid_cycle" decision []
+  ; act "sync_open_orders" decision []
+  ; act "evaluate_buy_leg" decision []
+  ; act "evaluate_sell_leg" decision []
   ; act "compute_sell_price" decision [ se "base" e; se "mult" e ]
   ; act
       "compute_amend_price"
