@@ -363,6 +363,29 @@ let expire_tif_recovery c =
   | _ -> ()
 ;;
 
+(** Early path facts, published before the order-feed scan: the book/balance flags that
+    [skip_nan_price], [mark_stale], the fee step and the [cycle_ok] gate need. The
+    scan-dependent facts follow in [cycle_facts] after [sync]. *)
+let early_facts c =
+  let check_stale_balance =
+    match c.cg_ecfg with
+    | Some ecfg -> ecfg.check_stale_balance
+    | None -> false
+  in
+  let maker_fee_set =
+    match c.cg_state with
+    | Some s -> s.maker_fee > 0.0
+    | None -> false
+  in
+  [ "price_nan", Strategy_expr.V_bool (Float.is_nan c.cg_price)
+  ; "check_stale_balance", Strategy_expr.V_bool check_stale_balance
+  ; "asset_balance_nan", Strategy_expr.V_bool (Float.is_nan c.cg_abal)
+  ; "quote_balance_nan", Strategy_expr.V_bool (Float.is_nan c.cg_qbal)
+  ; "maker_fee_set", Strategy_expr.V_bool maker_fee_set
+  ; "fee_refresh_due", Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0)
+  ]
+;;
+
 (** Fine path step 6a'': publish the raw gate facts the strategy file combines into the
     buy-active condition: the oracle-halt latch and the TIF-recovery latch/timestamp. *)
 let cycle_facts c =

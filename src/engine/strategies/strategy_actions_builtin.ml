@@ -57,6 +57,7 @@ let declarations =
   ; act "buy_gate" decision []
   ; act "expire_tif_recovery" decision []
   ; act "cycle_facts" read []
+  ; act "early_facts" read []
   ; act "mark_stale_cycle" decision []
   ; act "set_gate" decision [ se "name" s; se "value" s ]
   ; act "buy_facts" decision []

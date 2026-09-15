@@ -174,6 +174,7 @@ module type ENGINE = sig
   val buy_gate : ctx -> bool
   val expire_tif_recovery : ctx -> unit
   val cycle_facts : ctx -> (string * Strategy_expr.value) list
+  val early_facts : ctx -> (string * Strategy_expr.value) list
   val mark_stale : ctx -> unit
   val buy_cancel : ctx -> unit
   val buy_place : ctx -> unit
@@ -244,6 +245,11 @@ module Make (E : ENGINE) = struct
               List.iter
                 (fun (k, v) -> Strategy_runtime.set_platform t k v)
                 (E.cycle_facts ctx))
+          | "early_facts" ->
+            ph Preamble (fun () ->
+              List.iter
+                (fun (k, v) -> Strategy_runtime.set_platform t k v)
+                (E.early_facts ctx))
           | "mark_stale_cycle" ->
             E.mark_stale ctx;
             []

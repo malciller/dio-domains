@@ -46,6 +46,8 @@ and t =
   ; mutable event : event option
   ; mutable price : float
   ; mutable now : float
+  ; mutable env_cache : Strategy_expr.env option
+  ; mutable facts_cache : Strategy_guard.facts option
   }
 
 let noop_handler = { run = (fun _ _ _ -> []) }
@@ -202,6 +204,8 @@ let create ?(handlers = noop_handler) ?(params = []) (file : Strategy_file.t) =
     ; event = None
     ; price = nan
     ; now = 0.0
+    ; env_cache = None
+    ; facts_cache = None
     }
   in
   List.iter
@@ -280,6 +284,27 @@ let facts_of t : Strategy_guard.facts =
   }
 ;;
 
+(** Reuse the [env] and [facts] records across cycles. Both are closures over [t], whose
+    fields mutate per cycle, so they can be built once per runtime instead of allocating
+    ~16 closures every tick. *)
+let env_cached t =
+  match t.env_cache with
+  | Some e -> e
+  | None ->
+    let e = env_of t in
+    t.env_cache <- Some e;
+    e
+;;
+
+let facts_cached t =
+  match t.facts_cache with
+  | Some f -> f
+  | None ->
+    let f = facts_of t in
+    t.facts_cache <- Some f;
+    f
+;;
+
 let value_of_json (e : env) (j : Yojson.Basic.t) : (value, string) result =
   match j with
   | `Int i -> Ok (V_int i)
@@ -328,8 +353,8 @@ let run_cycle t ~(price : float) ~(now : float) ~(event : event) : action_call l
   t.price <- price;
   t.now <- now;
   t.event <- Some event;
-  let e = env_of t in
-  let facts = facts_of t in
+  let e = env_cached t in
+  let facts = facts_cached t in
   let parse_expr = parse_guard_expr t in
   let calls = ref [] in
   let stop = ref false in
@@ -337,7 +362,7 @@ let run_cycle t ~(price : float) ~(now : float) ~(event : event) : action_call l
     (fun (step : Strategy_file.step) ->
       if not !stop
       then (
-        Hashtbl.reset t.locals;
+        if Hashtbl.length t.locals > 0 then Hashtbl.reset t.locals;
         List.iter
           (fun (name, s) ->
             match eval_arg e s with
