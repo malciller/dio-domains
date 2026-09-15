@@ -231,7 +231,12 @@ let bench_duplicate_key_gen () =
    bodies need live state and are measured separately via the dashboard phases). *)
 let bench_strategy_cycle () =
   let name = "strategy_run_cycle_real_file" in
-  match SF.parse_file "strategies/jacobs_ladder.json" with
+  let path =
+    match Sys.getenv_opt "DUNE_SOURCEROOT" with
+    | Some root -> Filename.concat root "strategies/jacobs_ladder.json"
+    | None -> "strategies/jacobs_ladder.json"
+  in
+  match SF.parse_file path with
   | Error e ->
     Printf.eprintf "bench: %s\n%!" e;
     name, 0, 0.0, 0.0, 0.0, 0.0
