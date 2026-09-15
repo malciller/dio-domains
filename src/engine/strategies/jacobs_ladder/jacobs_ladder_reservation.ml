@@ -3,27 +3,9 @@
 open Strategy_common
 open Jacobs_ladder_types
 
-(** Total reserved quote per exchange; avoids O(N) strategy_states locking. *)
-let total_reserved_by_exchange =
-  Atomic.make
-    (List.fold_left
-       (fun acc ex -> Strategy_common.StringMap.add ex (Atomic.make 0.0) acc)
-       Strategy_common.StringMap.empty
-       [ "kraken"; "hyperliquid"; "lighter"; "ibkr" ])
-;;
-
-(** Cached total-reserved-quote atomic for [exchange]. *)
-let rec get_exchange_reserved_atomic exchange =
-  let map = Atomic.get total_reserved_by_exchange in
-  match Strategy_common.StringMap.find_opt exchange map with
-  | Some a -> a
-  | None ->
-    let a3 = Atomic.make 0.0 in
-    let new_map = Strategy_common.StringMap.add exchange a3 map in
-    if Atomic.compare_and_set total_reserved_by_exchange map new_map
-    then a3
-    else get_exchange_reserved_atomic exchange
-;;
+(* Moved to Platform_accounting (milestone 2). *)
+let total_reserved_by_exchange = Platform_accounting.total_reserved_by_exchange
+let get_exchange_reserved_atomic = Platform_accounting.get_exchange_reserved_atomic
 
 let get_total_reserved_quote state =
   let a =
@@ -37,10 +19,8 @@ let get_total_reserved_quote state =
   Atomic.get a
 ;;
 
-let rec atomic_add a diff =
-  let old_val = Atomic.get a in
-  if not (Atomic.compare_and_set a old_val (old_val +. diff)) then atomic_add a diff
-;;
+(* Moved to Platform_accounting (milestone 2). *)
+let atomic_add = Platform_accounting.atomic_add
 
 (** Sets [state.reserved_quote]; applies the delta to the exchange atomic. *)
 let set_asset_reserved_quote state v =

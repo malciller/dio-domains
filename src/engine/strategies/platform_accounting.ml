@@ -305,3 +305,33 @@ let dedupe_persisted_sell_levels levels =
     let merged = go [] sorted in
     if !changed then merged else levels)
 ;;
+
+(** Per-exchange total reserved-quote atomics. The reservation ledger is platform-owned;
+    the map is seeded with the accumulation venues and grows lazily for any other
+    exchange. Avoids O(N) strategy_states locking. *)
+let total_reserved_by_exchange =
+  Atomic.make
+    (List.fold_left
+       (fun acc ex -> Strategy_common.StringMap.add ex (Atomic.make 0.0) acc)
+       Strategy_common.StringMap.empty
+       [ "kraken"; "hyperliquid"; "lighter"; "ibkr" ])
+;;
+
+(** Cached total-reserved-quote atomic for [exchange]. *)
+let rec get_exchange_reserved_atomic exchange =
+  let map = Atomic.get total_reserved_by_exchange in
+  match Strategy_common.StringMap.find_opt exchange map with
+  | Some a -> a
+  | None ->
+    let a3 = Atomic.make 0.0 in
+    let new_map = Strategy_common.StringMap.add exchange a3 map in
+    if Atomic.compare_and_set total_reserved_by_exchange map new_map
+    then a3
+    else get_exchange_reserved_atomic exchange
+;;
+
+(** Lock-free compare-and-set add on a reserved-quote atomic. *)
+let rec atomic_add a diff =
+  let old_val = Atomic.get a in
+  if not (Atomic.compare_and_set a old_val (old_val +. diff)) then atomic_add a diff
+;;
