@@ -15,6 +15,7 @@ let record t o = t.obs <- o :: t.obs
 let record_order_intent t oi = record t (Strategy_trace.Order_intent oi)
 let record_emitted t e = record t (Strategy_trace.Emitted e)
 let record_state t entries = record t (Strategy_trace.State entries)
+let record_event t (e : Strategy_trace.event_obs) = record t (Strategy_trace.Event e)
 let record_persistence t key value = record t (Strategy_trace.Persistence (key, value))
 
 (** Per-symbol active recorders for hot-path emission hooks (e.g. the shared order
@@ -33,6 +34,13 @@ let register symbol t =
 let record_emitted_if_active e =
   match Hashtbl.find_opt active_by_symbol e.Strategy_trace.em_symbol with
   | Some t -> record_emitted t e
+  | None -> ()
+;;
+
+(** Record an order-lifecycle event against the recorder registered for [symbol]. *)
+let record_event_if_active symbol (e : Strategy_trace.event_obs) =
+  match Hashtbl.find_opt active_by_symbol symbol with
+  | Some t -> record_event t e
   | None -> ()
 ;;
 

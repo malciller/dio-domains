@@ -27,9 +27,25 @@ type emitted =
   ; em_order_id : string option
   }
 
+(** A strategy-state input that is not a book-update cycle: an order-lifecycle event
+    (fill/cancel/ack/amend/...) dispatched to the strategy between cycles. Recorded so the
+    replay driver can feed the exact same events and reproduce state transitions. *)
+type event_obs =
+  { ev_kind : string
+  ; ev_now : float
+  ; ev_order_id : string
+  ; ev_new_order_id : string
+  ; ev_side : string
+  ; ev_price : float
+  ; ev_qty : float
+  ; ev_cl_ord_id : string option
+  ; ev_reason : string
+  }
+
 type obs =
   | Order_intent of order_intent
   | Emitted of emitted
+  | Event of event_obs
   | State of (string * Strategy_expr.value) list
   | Persistence of string * string
 
@@ -93,6 +109,33 @@ let string_of_emitted e =
      | None -> "-")
 ;;
 
+let event_obs_eq a b =
+  String.equal a.ev_kind b.ev_kind
+  && Float.equal a.ev_now b.ev_now
+  && String.equal a.ev_order_id b.ev_order_id
+  && String.equal a.ev_new_order_id b.ev_new_order_id
+  && String.equal a.ev_side b.ev_side
+  && Float.equal a.ev_price b.ev_price
+  && Float.equal a.ev_qty b.ev_qty
+  && a.ev_cl_ord_id = b.ev_cl_ord_id
+  && String.equal a.ev_reason b.ev_reason
+;;
+
+let string_of_event_obs e =
+  Printf.sprintf
+    "event(%s order=%s new=%s side=%s price=%.8g qty=%.8g cl_ord_id=%s reason=%s)"
+    e.ev_kind
+    e.ev_order_id
+    e.ev_new_order_id
+    e.ev_side
+    e.ev_price
+    e.ev_qty
+    (match e.ev_cl_ord_id with
+     | Some c -> c
+     | None -> "-")
+    e.ev_reason
+;;
+
 let state_eq a b =
   let sort = List.sort (fun (x, _) (y, _) -> String.compare x y) in
   let a = sort a
@@ -108,6 +151,7 @@ let obs_eq a b =
   match a, b with
   | Order_intent x, Order_intent y -> order_intent_eq x y
   | Emitted x, Emitted y -> emitted_eq x y
+  | Event x, Event y -> event_obs_eq x y
   | State x, State y -> state_eq x y
   | Persistence (k1, v1), Persistence (k2, v2) -> String.equal k1 k2 && String.equal v1 v2
   | _ -> false
@@ -116,6 +160,7 @@ let obs_eq a b =
 let string_of_obs = function
   | Order_intent o -> string_of_order_intent o
   | Emitted e -> string_of_emitted e
+  | Event e -> string_of_event_obs e
   | State entries -> "state(" ^ String.concat "," (List.map fst entries) ^ ")"
   | Persistence (k, _) -> "persistence(" ^ k ^ ")"
 ;;
@@ -267,9 +312,45 @@ let emitted_of_json j =
   }
 ;;
 
+let event_to_json (e : event_obs) =
+  `Assoc
+    [ "kind_", `String e.ev_kind
+    ; "now", `Float e.ev_now
+    ; "order_id", `String e.ev_order_id
+    ; "new_order_id", `String e.ev_new_order_id
+    ; "side", `String e.ev_side
+    ; "price", `Float e.ev_price
+    ; "qty", `Float e.ev_qty
+    ; ( "cl_ord_id"
+      , match e.ev_cl_ord_id with
+        | Some c -> `String c
+        | None -> `Null )
+    ; "reason", `String e.ev_reason
+    ]
+;;
+
+let event_of_json j =
+  let open Yojson.Basic.Util in
+  let opt_str = function
+    | `String s -> Some s
+    | _ -> None
+  in
+  { ev_kind = j |> member "kind_" |> to_string
+  ; ev_now = j |> member "now" |> to_float
+  ; ev_order_id = j |> member "order_id" |> to_string
+  ; ev_new_order_id = j |> member "new_order_id" |> to_string
+  ; ev_side = j |> member "side" |> to_string
+  ; ev_price = j |> member "price" |> to_float
+  ; ev_qty = j |> member "qty" |> to_float
+  ; ev_cl_ord_id = opt_str (j |> member "cl_ord_id")
+  ; ev_reason = j |> member "reason" |> to_string
+  }
+;;
+
 let obs_to_json = function
   | Order_intent o -> `Assoc [ "kind", `String "order"; "order", order_intent_to_json o ]
   | Emitted e -> `Assoc [ "kind", `String "emitted"; "emitted", emitted_to_json e ]
+  | Event e -> `Assoc [ "kind", `String "event"; "event", event_to_json e ]
   | State entries ->
     `Assoc
       [ "kind", `String "state"
@@ -284,6 +365,7 @@ let obs_of_json j =
   match j |> member "kind" |> to_string with
   | "order" -> Order_intent (order_intent_of_json (member "order" j))
   | "emitted" -> Emitted (emitted_of_json (member "emitted" j))
+  | "event" -> Event (event_of_json (member "event" j))
   | "state" ->
     State (member "entries" j |> to_assoc |> List.map (fun (k, v) -> k, value_of_json v))
   | "persistence" ->

@@ -186,6 +186,8 @@ let reclaim_step
 
 let flush_persistence = Jacobs_ladder_events.flush_persistence
 let handle_order_acknowledged = Jacobs_ladder_events.handle_order_acknowledged
+let record_exec_event = Jacobs_ladder_events.record_exec_event
+let apply_event = Jacobs_ladder_events.apply_event
 let handle_order_failed = Jacobs_ladder_events.handle_order_failed
 let handle_order_rejected = Jacobs_ladder_events.handle_order_rejected
 let handle_order_filled = Jacobs_ladder_events.handle_order_filled
@@ -228,6 +230,8 @@ module Strategy = struct
   let handle_order_amendment_skipped = handle_order_amendment_skipped
   let handle_order_amendment_failed = handle_order_amendment_failed
   let handle_order_failed = handle_order_failed
+  let record_exec_event = record_exec_event
+  let apply_event = apply_event
   let cleanup_pending_cancellation = cleanup_pending_cancellation
   let cleanup_strategy_state = cleanup_strategy_state
   let init = init

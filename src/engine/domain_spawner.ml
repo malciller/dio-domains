@@ -714,6 +714,19 @@ let asset_domain_worker
                  in
                  if is_grid_strategy
                  then
+                   Dio_strategies.Jacobs_ladder.Strategy.record_exec_event
+                     asset_with_fees.symbol
+                     ~kind:"cancelled"
+                     ~now:now_exec
+                     ~order_id:event.order_id
+                     ~side:
+                       (match side with
+                        | Dio_strategies.Strategy_common.Buy -> "buy"
+                        | Dio_strategies.Strategy_common.Sell -> "sell")
+                     ~cl_ord_id:event.cl_ord_id
+                     ();
+                 if is_grid_strategy
+                 then
                    Dio_strategies.Jacobs_ladder.Strategy.handle_order_cancelled
                      ~now:now_exec
                      asset_with_fees.symbol
@@ -750,6 +763,21 @@ let asset_domain_worker
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
                    | Types.Sell -> Dio_strategies.Strategy_common.Sell
                  in
+                 if is_grid_strategy
+                 then
+                   Dio_strategies.Jacobs_ladder.Strategy.record_exec_event
+                     asset_with_fees.symbol
+                     ~kind:"filled"
+                     ~now:now_exec
+                     ~order_id:event.order_id
+                     ~side:
+                       (match side with
+                        | Dio_strategies.Strategy_common.Buy -> "buy"
+                        | Dio_strategies.Strategy_common.Sell -> "sell")
+                     ~price:event.avg_price
+                     ~qty:event.filled_qty
+                     ~cl_ord_id:event.cl_ord_id
+                     ();
                  if is_grid_strategy
                  then
                    Dio_strategies.Jacobs_ladder.Strategy.handle_order_filled
@@ -812,6 +840,20 @@ let asset_domain_worker
                      in
                      if is_grid_strategy
                      then
+                       Dio_strategies.Jacobs_ladder.Strategy.record_exec_event
+                         asset_with_fees.symbol
+                         ~kind:"amended"
+                         ~now:now_exec
+                         ~order_id:event.order_id
+                         ~new_order_id:event.order_id
+                         ~side:
+                           (match side with
+                            | Dio_strategies.Strategy_common.Buy -> "buy"
+                            | Dio_strategies.Strategy_common.Sell -> "sell")
+                         ~price
+                         ();
+                     if is_grid_strategy
+                     then
                        Dio_strategies.Jacobs_ladder.Strategy.handle_order_amended
                          ~now:now_exec
                          asset_with_fees.symbol
@@ -837,6 +879,19 @@ let asset_domain_worker
                        | Types.Buy -> Dio_strategies.Strategy_common.Buy
                        | Types.Sell -> Dio_strategies.Strategy_common.Sell
                      in
+                     if is_grid_strategy
+                     then
+                       Dio_strategies.Jacobs_ladder.Strategy.record_exec_event
+                         asset_with_fees.symbol
+                         ~kind:"acknowledged"
+                         ~now:now_exec
+                         ~order_id:event.order_id
+                         ~side:
+                           (match side with
+                            | Dio_strategies.Strategy_common.Buy -> "buy"
+                            | Dio_strategies.Strategy_common.Sell -> "sell")
+                         ~price
+                         ();
                      if is_grid_strategy
                      then
                        Dio_strategies.Jacobs_ladder.Strategy.handle_order_acknowledged

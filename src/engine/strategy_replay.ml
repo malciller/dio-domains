@@ -48,15 +48,17 @@ let age_entry entries =
 (** Split a cycle's observations into its input state entries and its venue open orders. *)
 let split_cycle (c : Trace.cycle) =
   let state = ref []
-  and orders = ref [] in
+  and orders = ref []
+  and events = ref [] in
   List.iter
     (fun o ->
       match o with
       | Trace.State es -> state := es
       | Trace.Order_intent oi -> orders := oi :: !orders
+      | Trace.Event e -> events := e :: !events
       | _ -> ())
     c.c_obs;
-  !state, List.rev !orders
+  !state, List.rev !orders, List.rev !events
 ;;
 
 let emitted_of_order (o : Order.strategy_order) : Trace.emitted =
@@ -395,7 +397,10 @@ let drive
   ignore (Jac.get_pending_orders 1_000_000 : Order.strategy_order list);
   List.mapi
     (fun idx (c : Trace.cycle) ->
-      let entries, open_orders = split_cycle c in
+      let entries, open_orders, events = split_cycle c in
+      (* Feed the recorded lifecycle events through the reference handlers first, in the
+         exact dispatch order, so state transitions match the live run before the cycle. *)
+      List.iter (Jac.apply_event asset.symbol) events;
       let price = f_entry entries "price" nan in
       let bid = f_entry entries "bid" nan in
       let ask = f_entry entries "ask" nan in

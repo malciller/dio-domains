@@ -1342,7 +1342,173 @@ let cleanup_pending_cancellation asset_symbol _order_id =
    handlers. Runs on the domain thread at the top of every cycle, so every handler
    invocation (REST- or WS-sourced) executes on the domain thread and the strategy mutex
    is never shared across threads. *)
+(** Behavioral-equivalence event capture: normalize a lifecycle or execution event into a
+    serializable {!Strategy_trace.event_obs}, and re-apply a recorded one through the same
+    handlers. The reference handlers remain the single source of behavior; this only adds
+    a record/replay seam so the differential harness can feed the exact event stream. *)
+let side_to_str (s : order_side) =
+  match s with
+  | Buy -> "buy"
+  | Sell -> "sell"
+;;
+
+let side_of_str = function
+  | "sell" -> Sell
+  | _ -> Buy
+;;
+
+let blank_event : Strategy_trace.event_obs =
+  { ev_kind = ""
+  ; ev_now = 0.0
+  ; ev_order_id = ""
+  ; ev_new_order_id = ""
+  ; ev_side = ""
+  ; ev_price = 0.0
+  ; ev_qty = 0.0
+  ; ev_cl_ord_id = None
+  ; ev_reason = ""
+  }
+;;
+
+let event_to_obs = function
+  | Ack { now; order_id; side; price } ->
+    { blank_event with
+      ev_kind = "acknowledged"
+    ; ev_now = now
+    ; ev_order_id = order_id
+    ; ev_side = side_to_str side
+    ; ev_price = price
+    }
+  | Failed { now; side; reason } ->
+    { blank_event with
+      ev_kind = "failed"
+    ; ev_now = now
+    ; ev_side = side_to_str side
+    ; ev_reason = reason
+    }
+  | Rejected { now; side; price } ->
+    { blank_event with
+      ev_kind = "rejected"
+    ; ev_now = now
+    ; ev_side = side_to_str side
+    ; ev_price = price
+    }
+  | Amended { now; old_id; new_id; side; price } ->
+    { blank_event with
+      ev_kind = "amended"
+    ; ev_now = now
+    ; ev_order_id = old_id
+    ; ev_new_order_id = new_id
+    ; ev_side = side_to_str side
+    ; ev_price = price
+    }
+  | Amendment_skipped { now; order_id; side; price } ->
+    { blank_event with
+      ev_kind = "amendment_skipped"
+    ; ev_now = now
+    ; ev_order_id = order_id
+    ; ev_side = side_to_str side
+    ; ev_price = price
+    }
+  | Amendment_failed { now; order_id; side; reason } ->
+    { blank_event with
+      ev_kind = "amendment_failed"
+    ; ev_now = now
+    ; ev_order_id = order_id
+    ; ev_side = side_to_str side
+    ; ev_reason = reason
+    }
+  | Cancel_cleanup { order_id } ->
+    { blank_event with ev_kind = "cancel_cleanup"; ev_order_id = order_id }
+;;
+
+(** Record an execution-path event (called from the domain loop before dispatching it to a
+    handler). *)
+let record_exec_event
+  symbol
+  ~kind
+  ~now
+  ?(order_id = "")
+  ?(new_order_id = "")
+  ?(side = "")
+  ?(price = 0.0)
+  ?(qty = 0.0)
+  ?(cl_ord_id = None)
+  ?(reason = "")
+  ()
+  =
+  Strategy_event_recorder.record_event_if_active
+    symbol
+    { ev_kind = kind
+    ; ev_now = now
+    ; ev_order_id = order_id
+    ; ev_new_order_id = new_order_id
+    ; ev_side = side
+    ; ev_price = price
+    ; ev_qty = qty
+    ; ev_cl_ord_id = cl_ord_id
+    ; ev_reason = reason
+    }
+;;
+
+(** Re-apply a recorded event through the reference handlers. Used by the replay driver. *)
+let apply_event symbol (e : Strategy_trace.event_obs) =
+  match e.ev_kind with
+  | "filled" ->
+    handle_order_filled
+      ~now:e.ev_now
+      symbol
+      e.ev_order_id
+      (side_of_str e.ev_side)
+      ~fill_price:e.ev_price
+      ~fill_qty:e.ev_qty
+      e.ev_cl_ord_id
+  | "cancelled" ->
+    handle_order_cancelled
+      ~now:e.ev_now
+      symbol
+      e.ev_order_id
+      (side_of_str e.ev_side)
+      e.ev_cl_ord_id
+  | "acknowledged" ->
+    handle_order_acknowledged
+      ~now:e.ev_now
+      symbol
+      e.ev_order_id
+      (side_of_str e.ev_side)
+      e.ev_price
+  | "amended" ->
+    handle_order_amended
+      ~now:e.ev_now
+      symbol
+      e.ev_order_id
+      e.ev_new_order_id
+      (side_of_str e.ev_side)
+      e.ev_price
+  | "failed" ->
+    handle_order_failed ~now:e.ev_now symbol (side_of_str e.ev_side) e.ev_reason
+  | "rejected" ->
+    handle_order_rejected ~now:e.ev_now symbol (side_of_str e.ev_side) e.ev_price
+  | "amendment_skipped" ->
+    handle_order_amendment_skipped
+      ~now:e.ev_now
+      symbol
+      e.ev_order_id
+      (side_of_str e.ev_side)
+      e.ev_price
+  | "amendment_failed" ->
+    handle_order_amendment_failed
+      ~now:e.ev_now
+      symbol
+      e.ev_order_id
+      (side_of_str e.ev_side)
+      e.ev_reason
+  | "cancel_cleanup" -> cleanup_pending_cancellation symbol e.ev_order_id
+  | _ -> ()
+;;
+
 let dispatch_event symbol (ev : lifecycle_event) =
+  Strategy_event_recorder.record_event_if_active symbol (event_to_obs ev);
   match ev with
   | Ack { now; order_id; side; price } ->
     handle_order_acknowledged ~now symbol order_id side price
