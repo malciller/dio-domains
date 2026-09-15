@@ -135,8 +135,29 @@ let prepare_init c =
   | _ -> ()
 ;;
 
-(** Fine path step 1b: low-flag recovery, lot sizing and book resolution. Returns whether
-    the cycle should continue (false on NaN price). *)
+(** Fine path step 1c: resolve the effective bid/ask (fall back to the last price).
+    Returns whether the cycle should continue. *)
+let resolve_book c =
+  if Float.is_nan c.cg_price
+  then (
+    c.cg_continue <- false;
+    false)
+  else (
+    let bid_price, ask_price =
+      if (not (Float.is_nan c.cg_bid))
+         && c.cg_bid > 0.0
+         && (not (Float.is_nan c.cg_ask))
+         && c.cg_ask > 0.0
+      then c.cg_bid, c.cg_ask
+      else c.cg_price, c.cg_price
+    in
+    c.cg_bid_r <- bid_price;
+    c.cg_ask_r <- ask_price;
+    c.cg_continue <- true;
+    true)
+;;
+
+(** Fine path step 1b: low-flag recovery and lot sizing. *)
 let prepare_recovery c =
   match c.cg_asset, c.cg_state with
   | Some asset, Some state ->
@@ -165,34 +186,15 @@ let prepare_recovery c =
       ~asset
       ~quote_balance:c.cg_qbal
       ~current_price:c.cg_price
-      ~lot_qty;
-    if Float.is_nan c.cg_price
-    then (
-      c.cg_continue <- false;
-      false)
-    else (
-      let bid_price, ask_price =
-        if (not (Float.is_nan c.cg_bid))
-           && c.cg_bid > 0.0
-           && (not (Float.is_nan c.cg_ask))
-           && c.cg_ask > 0.0
-        then c.cg_bid, c.cg_ask
-        else c.cg_price, c.cg_price
-      in
-      c.cg_bid_r <- bid_price;
-      c.cg_ask_r <- ask_price;
-      c.cg_continue <- true;
-      true)
-  | _ ->
-    c.cg_continue <- false;
-    false
+      ~lot_qty
+  | _ -> c.cg_continue <- false
 ;;
 
-(** Fine path step 1 (combined): init then recovery/book. Retained for callers that want
-    the whole preamble. *)
+(** Fine path step 1 (combined): init, recovery and book resolution. *)
 let prepare c =
   prepare_init c;
-  prepare_recovery c
+  prepare_recovery c;
+  ignore (resolve_book c)
 ;;
 
 (** Fine path step 2a: expire stale amend cooldowns. *)

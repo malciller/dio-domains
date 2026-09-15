@@ -141,6 +141,10 @@
           "args": {}
         },
         {
+          "action": "resolve_book",
+          "args": {}
+        },
+        {
           "action": "cycle_facts",
           "args": {}
         }

@@ -47,6 +47,7 @@ let declarations =
   ; act "cycle_prepare" decision []
   ; act "prepare_init" decision []
   ; act "prepare_recovery" decision []
+  ; act "resolve_book" read []
   ; act "cycle_cleanup" decision []
   ; act "expire_amend_cooldowns" decision []
   ; act "evict_ghost_orders" decision []

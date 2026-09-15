@@ -320,9 +320,10 @@ let test_grid_grid_price () =
 module Stub_engine = struct
   type ctx = int ref
 
-  let prepare _ = true
+  let prepare _ = ()
   let prepare_init _ = ()
-  let prepare_recovery _ = true
+  let prepare_recovery _ = ()
+  let resolve_book _ = true
   let cleanup _ = ()
   let expire_amend_cooldowns _ = ()
   let evict_ghost_orders _ = ()

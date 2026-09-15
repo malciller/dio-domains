@@ -151,9 +151,10 @@ let handler : Strategy_runtime.handler = { run }
 module type ENGINE = sig
   type ctx
 
-  val prepare : ctx -> bool
+  val prepare : ctx -> unit
   val prepare_init : ctx -> unit
-  val prepare_recovery : ctx -> bool
+  val prepare_recovery : ctx -> unit
+  val resolve_book : ctx -> bool
   val cleanup : ctx -> unit
   val expire_amend_cooldowns : ctx -> unit
   val evict_ghost_orders : ctx -> unit
@@ -199,7 +200,10 @@ module Make (E : ENGINE) = struct
             E.prepare_init ctx;
             []
           | "prepare_recovery" ->
-            ignore (E.prepare_recovery ctx);
+            E.prepare_recovery ctx;
+            []
+          | "resolve_book" ->
+            ignore (E.resolve_book ctx);
             []
           | "cycle_cleanup" ->
             E.cleanup ctx;
