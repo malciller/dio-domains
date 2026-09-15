@@ -213,23 +213,22 @@ let sync c =
   | _ -> ()
 ;;
 
-(** Fine path step 4: refresh the maker fee (periodic on [cycle land 0x3ff]). *)
+(** Fine path step 4: refresh the maker fee (the refresh cadence is decided by the file;
+    this only resolves the current value). *)
 let refresh_fee c =
   match c.cg_state, c.cg_asset with
   | Some state, Some asset ->
-    if state.maker_fee <= 0.0 || c.cg_cycle land 0x3ff = 0
-    then
-      state.maker_fee
-      <- (match asset.maker_fee with
-          | Some f -> f
-          | None ->
-            (match
-               Dio_strategies.Fee_cache.get_maker_fee
-                 ~exchange:asset.exchange
-                 ~symbol:asset.symbol
-             with
-             | Some cached -> cached
-             | None -> 0.0))
+    state.maker_fee
+    <- (match asset.maker_fee with
+        | Some f -> f
+        | None ->
+          (match
+             Dio_strategies.Fee_cache.get_maker_fee
+               ~exchange:asset.exchange
+               ~symbol:asset.symbol
+           with
+           | Some cached -> cached
+           | None -> 0.0))
   | _ -> ()
 ;;
 
@@ -312,6 +311,12 @@ let cycle_facts c =
   ; "tif_recovery_pending", Dio_strategies.Strategy_expr.V_bool pending
   ; "tif_recovery_since", Dio_strategies.Strategy_expr.V_float since
   ; "price_nan", Dio_strategies.Strategy_expr.V_bool (Float.is_nan c.cg_price)
+  ; ( "maker_fee_set"
+    , Dio_strategies.Strategy_expr.V_bool
+        (match state with
+         | Some s -> s.maker_fee > 0.0
+         | None -> false) )
+  ; "fee_refresh_due", Dio_strategies.Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0)
   ; "check_stale_balance", Dio_strategies.Strategy_expr.V_bool check_stale_balance
   ; "asset_balance_nan", Dio_strategies.Strategy_expr.V_bool (Float.is_nan c.cg_abal)
   ; "quote_balance_nan", Dio_strategies.Strategy_expr.V_bool (Float.is_nan c.cg_qbal)

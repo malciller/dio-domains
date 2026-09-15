@@ -85,7 +85,7 @@
     },
     {
       "id": "fee",
-      "when": { "event": "book_update" },
+      "when": { "event": "book_update", "expr": "not $platform.maker_fee_set or $platform.fee_refresh_due" },
       "then": [{ "action": "cycle_refresh_fee", "args": {} }]
     },
     {

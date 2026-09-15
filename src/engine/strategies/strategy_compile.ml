@@ -32,6 +32,8 @@ let known_platform_caps =
   ; "tif_recovery_pending"
   ; "tif_recovery_since"
   ; "price_nan"
+  ; "maker_fee_set"
+  ; "fee_refresh_due"
   ; "check_stale_balance"
   ; "asset_balance_nan"
   ; "quote_balance_nan"
