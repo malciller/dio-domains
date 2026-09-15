@@ -164,7 +164,7 @@
           "args": {}
         },
         {
-          "action": "cycle_facts",
+          "action": "early_facts",
           "args": {}
         },
         {
