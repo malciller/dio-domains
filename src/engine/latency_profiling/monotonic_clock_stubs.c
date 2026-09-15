@@ -18,3 +18,13 @@ CAMLprim value dio_monotonic_ns(value unit) {
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return Val_long((intnat)ts.tv_sec * 1000000000L + (intnat)ts.tv_nsec);
 }
+
+/* Per-thread CPU time. wall - cpu over a span isolates stalls (deschedule or
+ * stop-the-world pause) from genuine CPU work, with the same zero-allocation
+ * immediate-int return. */
+CAMLprim value dio_thread_cpu_ns(value unit) {
+  (void)unit;
+  struct timespec ts;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+  return Val_long((intnat)ts.tv_sec * 1000000000L + (intnat)ts.tv_nsec);
+}
