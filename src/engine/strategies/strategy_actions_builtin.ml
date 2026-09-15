@@ -40,6 +40,10 @@ let declarations =
       ; se "committed_sell" e
       ; se "unnetted_hold" e
       ]
+  ; act
+      "grid_price"
+      decision
+      [ se "current" e; se "grid_interval_pct" e; se "is_above" b ]
   ; act "compute_sell_price" decision [ se "base" e; se "mult" e ]
   ; act
       "compute_amend_price"

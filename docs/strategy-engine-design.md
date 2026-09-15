@@ -593,7 +593,7 @@ Concrete module and integration work, with per-module status. Milestone 1's firs
 |---|---|---|---|
 | `strategy_actions.ml` | registry, `t`, schema types, `register`/`find` | protocol | done |
 | `strategy_actions_builtin.ml` | declares the §4.3 inventory (schemas) | actions | done (metadata; handlers pending) |
-| `strategy_actions_grid.ml` | grid decision-action handlers (faithful wrappers of reference grid functions) | actions | started (`compute_buy_ref_price`, `owed_sell_price`) |
+| `strategy_actions_grid.ml` | grid decision-action handlers (faithful wrappers of reference grid functions) | actions | started (`compute_buy_ref_price`, `owed_sell_price`, `available_base`, `grid_price`) |
 | `strategy_file.ml` | JSON → AST (triggers/params/state/steps) | protocol | done |
 | `strategy_expr.ml` | expression engine: `$ref` scanning + tokenizer/parser/evaluator (arithmetic, comparison, boolean) and string templates | protocol | done |
 | `strategy_compile.ml` | static validation against the registry | protocol | done (validation); compile-to-closures pending |

@@ -116,11 +116,26 @@ let available_base _t args =
   ]
 ;;
 
+(** Grid price for the buy/sell legs: [current] moved by [grid_interval_pct] percent (up
+    when [is_above]), snapped by the engine clock round_price. Ports
+    [Jacobs_ladder_config.grid_price] (the buy leg passes [is_above] = false). *)
+let grid_price t args =
+  [ ( "price"
+    , V_float
+        (Jacobs_ladder.grid_price
+           ~round_price:t.Strategy_runtime.caps.round_price
+           ~current:(float_arg args "current")
+           ~grid_interval_pct:(float_arg args "grid_interval_pct")
+           ~is_above:(bool_arg args "is_above")) )
+  ]
+;;
+
 let run t name args =
   match name with
   | "compute_buy_ref_price" -> compute_buy_ref_price args
   | "owed_sell_price" -> owed_sell_price t args
   | "available_base" -> available_base t args
+  | "grid_price" -> grid_price t args
   | _ -> []
 ;;
 
