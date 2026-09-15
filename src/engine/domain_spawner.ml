@@ -337,13 +337,6 @@ let asset_domain_worker
     let oracle_startup_wait = 120.0 in
     let oracle_gate_open = ref (not is_grid_strategy) in
     let oracle_gate_deadline = ref (Unix.gettimeofday () +. oracle_startup_wait) in
-    (* TODO(milestone-3): temporary bridge (see above / §9.5). *)
-    let is_mm_strategy =
-      asset_with_fees.strategy = "market_maker" || asset_with_fees.strategy = "MM"
-    in
-    let mm_strategy_asset_ref =
-      if is_mm_strategy then ref (Some asset_with_fees) else ref None
-    in
     (* Pre-populate strategy state (exchange_id, grid_qty, maker_fee) so fill handlers
        invoked during exec-event consumption see correct values before the first
        execute_strategy call; otherwise profit calculations and persistence writes use
@@ -575,11 +568,6 @@ let asset_domain_worker
       then Some (Dio_strategies.Jacobs_ladder.get_strategy_state asset_with_fees.symbol)
       else None
     in
-    let cached_mm_state =
-      if is_mm_strategy
-      then Some (Dio_strategies.Market_maker.get_strategy_state asset_with_fees.symbol)
-      else None
-    in
     let cached_fng_check_threshold = config.fng_check_threshold in
     let wakeup_sync =
       Concurrency.Exchange_wakeup.get_sync_handle asset_with_fees.symbol
@@ -730,14 +718,6 @@ let asset_domain_worker
           lifecycle_events
           := !lifecycle_events
              + Dio_strategies.Jacobs_ladder.Strategy.drain_events asset_with_fees.symbol);
-      (* Drain MM lifecycle events queued by the supervisor REST path. Same discipline as
-         the grid queue: handlers run on THIS domain thread, so MM state is never mutated
-         cross-thread against execute_strategy. *)
-      if is_mm_strategy
-      then
-        lifecycle_events
-        := !lifecycle_events
-           + Dio_strategies.Market_maker.Strategy.drain_events asset_with_fees.symbol;
       (* === ORDERBOOK HOT PATH === *)
       let ob_pos = get_ob_pos_fn () in
       let did_ob =
@@ -824,15 +804,7 @@ let asset_domain_worker
                          event.order_id
                          side
                          event.cl_ord_id)
-                     ();
-                 if is_mm_strategy
-                 then
-                   Dio_strategies.Market_maker.Strategy.handle_order_cancelled
-                     ~now:now_exec
-                     asset_with_fees.symbol
-                     event.order_id
-                     side
-                     event.cl_ord_id
+                     ()
                | Types.Filled ->
                  should_execute_strategy := true;
                  (* A fill consumes/returns quote: notify the capital oracle with the pool
@@ -893,16 +865,6 @@ let asset_domain_worker
                          ~fill_qty:event.filled_qty
                          event.cl_ord_id)
                      ();
-                 if is_mm_strategy
-                 then
-                   Dio_strategies.Market_maker.Strategy.handle_order_filled
-                     ~now:now_exec
-                     asset_with_fees.symbol
-                     event.order_id
-                     side
-                     ~fill_price:event.avg_price
-                     ~fill_qty:event.filled_qty
-                     event.cl_ord_id;
                  (* Trigger Auto-Hedging module *)
                  if asset_with_fees.hedge
                  then (
@@ -977,16 +939,7 @@ let asset_domain_worker
                              event.order_id
                              side
                              price)
-                         ();
-                     if is_mm_strategy
-                     then
-                       Dio_strategies.Market_maker.Strategy.handle_order_amended
-                         ~now:now_exec
-                         asset_with_fees.symbol
-                         event.order_id
-                         event.order_id
-                         side
-                         price
+                         ()
                    | _ -> ())
                  else (
                    match event.limit_price with
@@ -1027,15 +980,7 @@ let asset_domain_worker
                              event.order_id
                              side
                              price)
-                         ();
-                     if is_mm_strategy
-                     then
-                       Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
-                         ~now:now_exec
-                         asset_with_fees.symbol
-                         event.order_id
-                         side
-                         price
+                         ()
                    | Some _ -> ()
                    | None -> ())
                | _ -> ())
@@ -1050,10 +995,6 @@ let asset_domain_worker
             if is_grid_strategy
             then
               Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done
-                asset_with_fees.symbol;
-            if is_mm_strategy
-            then
-              Dio_strategies.Market_maker.Strategy.set_startup_replay_done
                 asset_with_fees.symbol;
             Logging.debug_f
               ~section
@@ -1092,31 +1033,13 @@ let asset_domain_worker
           let now_inject = Unix.gettimeofday () in
           Ex.iter_open_orders_fast
             ~symbol:asset_with_fees.symbol
-            (fun oid price _qty side_str userref_opt ->
-               let is_mm =
-                 match userref_opt with
-                 | Some uref ->
-                   Dio_strategies.Strategy_common.is_strategy_order
-                     Dio_strategies.Strategy_common.strategy_userref_mm
-                     uref
-                 | None -> false
-               in
+            (fun oid price _qty side_str _userref_opt ->
                let order_side =
                  if side_str = "buy"
                  then Dio_strategies.Strategy_common.Buy
                  else Dio_strategies.Strategy_common.Sell
                in
-               if is_mm
-               then (
-                 if is_mm_strategy
-                 then
-                   Dio_strategies.Market_maker.Strategy.handle_order_acknowledged
-                     ~now:now_inject
-                     asset_with_fees.symbol
-                     oid
-                     order_side
-                     price)
-               else if is_grid_strategy
+               if is_grid_strategy
                then
                  route_exec
                    ~kind:"acknowledged"
@@ -1141,10 +1064,6 @@ let asset_domain_worker
           if is_grid_strategy
           then
             Dio_strategies.Jacobs_ladder.Strategy.set_startup_replay_done
-              asset_with_fees.symbol;
-          if is_mm_strategy
-          then
-            Dio_strategies.Market_maker.Strategy.set_startup_replay_done
               asset_with_fees.symbol;
           Logging.debug_f
             ~section
@@ -1721,103 +1640,79 @@ let asset_domain_worker
               grid (an unbound asset is not [is_grid_strategy]). The reference grid entry
               point is retired (M3). *)
            ());
-        match !mm_strategy_asset_ref, cached_mm_state with
-        | Some asset, Some cs when not oracle_halted ->
-          let mm_cp = if Float.is_nan !current_price then None else Some !current_price in
-          let mm_tob =
-            if Float.is_nan !tob_bid
-            then None
-            else Some (!tob_bid, !tob_bsize, !tob_ask, !tob_asize)
+        match trace_recorder with
+        | Some r ->
+          List.iter
+            (fun (o : Types.open_order) ->
+              let open Dio_strategies.Strategy_trace in
+              Dio_strategies.Strategy_event_recorder.record_order_intent
+                r
+                { oi_symbol = asset_with_fees.symbol
+                ; oi_side =
+                    (match o.side with
+                     | Types.Buy -> "buy"
+                     | Types.Sell -> "sell")
+                ; oi_qty = o.qty
+                ; oi_price =
+                    (match o.limit_price with
+                     | Some p -> p
+                     | None -> nan)
+                ; oi_post_only = false
+                ; oi_reduce_only = false
+                ; oi_tif = None
+                ; oi_order_id = Some o.order_id
+                ; oi_userref = o.user_ref
+                })
+            (Ex.get_open_orders ~symbol:asset_with_fees.symbol);
+          let grid_interval =
+            match !grid_strategy_asset_ref with
+            | Some a -> a.grid_interval
+            | None -> nan
           in
-          let mm_abal = if Float.is_nan asset_bal_val then None else Some asset_bal_val in
-          let mm_qbal = if Float.is_nan quote_bal_val then None else Some quote_bal_val in
-          Dio_strategies.Market_maker.Strategy.execute
-            ~cached_state:cs
-            asset
-            mm_cp
-            mm_tob
-            mm_abal
-            mm_qbal
-            0
-            0
-            iter_orders
-            !cycle_count
-        | _ ->
-          ();
-          (match trace_recorder with
-           | Some r ->
-             List.iter
-               (fun (o : Types.open_order) ->
-                 let open Dio_strategies.Strategy_trace in
-                 Dio_strategies.Strategy_event_recorder.record_order_intent
-                   r
-                   { oi_symbol = asset_with_fees.symbol
-                   ; oi_side =
-                       (match o.side with
-                        | Types.Buy -> "buy"
-                        | Types.Sell -> "sell")
-                   ; oi_qty = o.qty
-                   ; oi_price =
-                       (match o.limit_price with
-                        | Some p -> p
-                        | None -> nan)
-                   ; oi_post_only = false
-                   ; oi_reduce_only = false
-                   ; oi_tif = None
-                   ; oi_order_id = Some o.order_id
-                   ; oi_userref = o.user_ref
-                   })
-               (Ex.get_open_orders ~symbol:asset_with_fees.symbol);
-             let grid_interval =
-               match !grid_strategy_asset_ref with
-               | Some a -> a.grid_interval
-               | None -> nan
-             in
-             Dio_strategies.Strategy_event_recorder.record_state
-               r
-               [ "symbol", Dio_strategies.Strategy_expr.V_string asset_with_fees.symbol
-               ; "price", Dio_strategies.Strategy_expr.V_float !current_price
-               ; "bid", Dio_strategies.Strategy_expr.V_float !tob_bid
-               ; "ask", Dio_strategies.Strategy_expr.V_float !tob_ask
-               ; "asset_balance", Dio_strategies.Strategy_expr.V_float asset_bal_val
-               ; "quote_balance", Dio_strategies.Strategy_expr.V_float quote_bal_val
-               ; "oracle_halted", Dio_strategies.Strategy_expr.V_bool oracle_halted
-               ; ( "quote_balance_stale"
-                 , Dio_strategies.Strategy_expr.V_bool quote_balance_stale )
-               ; "grid_interval", Dio_strategies.Strategy_expr.V_float grid_interval
-               ; ( "accumulation_buffer"
-                 , match resolved_accumulation_buffer with
-                   | Some f -> Dio_strategies.Strategy_expr.V_float f
-                   | None -> Dio_strategies.Strategy_expr.V_none )
-               ; ( "force_buy_reanchor"
-                 , Dio_strategies.Strategy_expr.V_bool trace_input_force_reanchor )
-               ; ( "capital_low"
-                 , Dio_strategies.Strategy_expr.V_bool trace_input_capital_low )
-               ; ( "venue_available"
-                 , Dio_strategies.Strategy_expr.V_float trace_input_venue_available )
-               ; ( "grid_qty"
-                 , Dio_strategies.Strategy_expr.V_float
-                     (match cached_grid_state with
-                      | Some s -> s.grid_qty
-                      | None -> nan) )
-               ; "now", Dio_strategies.Strategy_expr.V_float now
-               ; ( "generation"
-                 , Dio_strategies.Strategy_expr.V_int
-                     (Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol) )
-               ; "cycle", Dio_strategies.Strategy_expr.V_int !cycle_count
-               ; ( "balance_age"
-                 , match base_balance_age_fn () with
-                   | Some a -> Dio_strategies.Strategy_expr.V_float a
-                   | None -> Dio_strategies.Strategy_expr.V_none )
-               ];
-             Dio_strategies.Strategy_event_recorder.end_cycle r;
-             incr trace_cycles;
-             if !trace_cycles = 1 || !trace_cycles mod 50 = 0
-             then
-               Dio_strategies.Strategy_trace.save
-                 trace_path
-                 (Dio_strategies.Strategy_event_recorder.snapshot r)
-           | _ -> ()));
+          Dio_strategies.Strategy_event_recorder.record_state
+            r
+            [ "symbol", Dio_strategies.Strategy_expr.V_string asset_with_fees.symbol
+            ; "price", Dio_strategies.Strategy_expr.V_float !current_price
+            ; "bid", Dio_strategies.Strategy_expr.V_float !tob_bid
+            ; "ask", Dio_strategies.Strategy_expr.V_float !tob_ask
+            ; "asset_balance", Dio_strategies.Strategy_expr.V_float asset_bal_val
+            ; "quote_balance", Dio_strategies.Strategy_expr.V_float quote_bal_val
+            ; "oracle_halted", Dio_strategies.Strategy_expr.V_bool oracle_halted
+            ; ( "quote_balance_stale"
+              , Dio_strategies.Strategy_expr.V_bool quote_balance_stale )
+            ; "grid_interval", Dio_strategies.Strategy_expr.V_float grid_interval
+            ; ( "accumulation_buffer"
+              , match resolved_accumulation_buffer with
+                | Some f -> Dio_strategies.Strategy_expr.V_float f
+                | None -> Dio_strategies.Strategy_expr.V_none )
+            ; ( "force_buy_reanchor"
+              , Dio_strategies.Strategy_expr.V_bool trace_input_force_reanchor )
+            ; "capital_low", Dio_strategies.Strategy_expr.V_bool trace_input_capital_low
+            ; ( "venue_available"
+              , Dio_strategies.Strategy_expr.V_float trace_input_venue_available )
+            ; ( "grid_qty"
+              , Dio_strategies.Strategy_expr.V_float
+                  (match cached_grid_state with
+                   | Some s -> s.grid_qty
+                   | None -> nan) )
+            ; "now", Dio_strategies.Strategy_expr.V_float now
+            ; ( "generation"
+              , Dio_strategies.Strategy_expr.V_int
+                  (Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol) )
+            ; "cycle", Dio_strategies.Strategy_expr.V_int !cycle_count
+            ; ( "balance_age"
+              , match base_balance_age_fn () with
+                | Some a -> Dio_strategies.Strategy_expr.V_float a
+                | None -> Dio_strategies.Strategy_expr.V_none )
+            ];
+          Dio_strategies.Strategy_event_recorder.end_cycle r;
+          incr trace_cycles;
+          if !trace_cycles = 1 || !trace_cycles mod 50 = 0
+          then
+            Dio_strategies.Strategy_trace.save
+              trace_path
+              (Dio_strategies.Strategy_event_recorder.snapshot r)
+        | _ -> ());
       let t4 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
       let alloc_at_t4 =
         if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
@@ -2039,15 +1934,9 @@ let stop_domain state =
   Atomic.set state.is_running false;
   (* Release strategy state for this symbol *)
   let symbol = state.asset.symbol in
-  (* Data-driven dispatch: clean up grid state for a strategy-file asset; MM is still
-     name-detected until it is ported. *)
+  (* Data-driven dispatch: clean up grid state for a strategy-file asset. *)
   if is_strategy_file_asset state.asset
-  then Dio_strategies.Jacobs_ladder.Strategy.cleanup_strategy_state symbol
-  else (
-    match state.asset.strategy with
-    | "MM" | "market_maker" ->
-      Dio_strategies.Market_maker.Strategy.cleanup_strategy_state symbol
-    | _ -> ());
+  then Dio_strategies.Jacobs_ladder.Strategy.cleanup_strategy_state symbol;
   (* Unblock workers in Exchange_wakeup.wait_since so they observe is_running=false and
      exit the main loop. *)
   Concurrency.Exchange_wakeup.signal_all ();
@@ -2153,7 +2042,6 @@ let spawn_supervised_domains_for_assets
   =
   (* Initialize strategy module state *)
   Dio_strategies.Jacobs_ladder.Strategy.init ();
-  Dio_strategies.Market_maker.Strategy.init ();
   (* Register each asset in the domain registry *)
   List.iter (fun asset -> ignore (register_domain asset)) assets;
   (* Pre-force the shared cached_gc_config Lazy before spawning domains: OCaml 5 domains

@@ -24,7 +24,6 @@
   Jacobs_ladder_sell_orders
   Jacobs_ladder_execution
   Jacobs_ladder_events
-  Market_maker
   Fee_cache
   Auto_hedger
   Strategy_actions

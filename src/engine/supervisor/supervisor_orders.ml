@@ -260,114 +260,6 @@ let grid_callbacks : strategy_callbacks =
   }
 ;;
 
-let mm_callbacks : strategy_callbacks =
-  { on_place_ok =
-      (fun order order_id ->
-        Logging.info_f
-          ~section
-          " Order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
-          (side_str order)
-          order.symbol
-          order.qty
-          (price_str order)
-          order_id)
-  ; on_place_fail =
-      (fun order err ->
-        Logging.error_f
-          ~section
-          " Order placement failed: %s %s %.8f @ %s - %s"
-          (side_str order)
-          order.symbol
-          order.qty
-          (price_str order)
-          err;
-        refresh_inventory_state_on_rejection order err;
-        (* Enqueue instead of calling handlers directly on this Lwt fiber: the symbol's
-           domain thread drains and executes them, so MM state is never mutated
-           cross-thread against execute_strategy. *)
-        Dio_strategies.Market_maker.Strategy.enqueue_event
-          order.symbol
-          (Failed { now = Unix.gettimeofday (); side = order.side; reason = err });
-        match order.price with
-        | Some price ->
-          Dio_strategies.Market_maker.Strategy.enqueue_event
-            order.symbol
-            (Rejected { now = Unix.gettimeofday (); side = order.side; price })
-        | None -> ())
-  ; on_amend_ok =
-      (fun order target_order_id new_order_id ->
-        Logging.info_f
-          ~section
-          "✓ Order amended successfully: %s %s %.8f @ %s New Order: %s"
-          (side_str order)
-          order.symbol
-          order.qty
-          (price_str order)
-          new_order_id;
-        match order.price with
-        | Some price ->
-          Dio_strategies.Market_maker.Strategy.enqueue_event
-            order.symbol
-            (Amended
-               { now = Unix.gettimeofday ()
-               ; old_id = target_order_id
-               ; new_id = new_order_id
-               ; side = order.side
-               ; price
-               })
-        | None ->
-          Logging.warn_f
-            ~section
-            "Amendment acknowledged but no price available for strategy update: %s"
-            new_order_id)
-  ; on_amend_skipped =
-      (fun order target_order_id ->
-        match order.price with
-        | Some price ->
-          Dio_strategies.Market_maker.Strategy.enqueue_event
-            order.symbol
-            (Amendment_skipped
-               { now = Unix.gettimeofday ()
-               ; order_id = target_order_id
-               ; side = order.side
-               ; price
-               })
-        | None ->
-          Logging.warn_f
-            ~section
-            "Amendment skipped but no price available for strategy update")
-  ; on_amend_fail =
-      (fun order target_order_id err ->
-        Logging.error_f
-          ~section
-          "✗ Order amendment failed: %s %s %.8f @ %s - %s"
-          (side_str order)
-          order.symbol
-          order.qty
-          (price_str order)
-          err;
-        Dio_strategies.Market_maker.Strategy.enqueue_event
-          order.symbol
-          (Amendment_failed
-             { now = Unix.gettimeofday ()
-             ; order_id = target_order_id
-             ; side = order.side
-             ; reason = err
-             }))
-  ; on_cancel_ok =
-      (fun order target_order_id ->
-        Logging.info_f ~section "✓ Cancelled order: %s" target_order_id;
-        Dio_strategies.Market_maker.Strategy.enqueue_event
-          order.symbol
-          (Cancel_cleanup { order_id = target_order_id }))
-  ; on_cancel_fail =
-      (fun order target_order_id ->
-        Dio_strategies.Market_maker.Strategy.enqueue_event
-          order.symbol
-          (Cancel_cleanup { order_id = target_order_id }))
-  }
-;;
-
 let hedger_callbacks : strategy_callbacks =
   { on_place_ok =
       (fun order order_id ->
@@ -398,12 +290,11 @@ let hedger_callbacks : strategy_callbacks =
   }
 ;;
 
-(** Resolves the callbacks for [order]. The MM batch handles both Grid and MM amend/cancel
-    orders, so the strategy field determines routing. *)
+(** Resolves the callbacks for [order]. *)
 let callbacks_for_strategy (order : strategy_order) =
   match order.strategy with
   | Ladder -> grid_callbacks
-  | MM -> mm_callbacks
+  | MM -> grid_callbacks (* MM strategy removed; unreachable *)
   | Hedger -> hedger_callbacks
 ;;
 
@@ -795,11 +686,8 @@ let order_processing_loop () =
       let pending_grid_orders =
         Dio_strategies.Jacobs_ladder.Strategy.get_pending_orders 100
       in
-      let pending_mm_orders =
-        Dio_strategies.Market_maker.Strategy.get_pending_orders 100
-      in
       let pending_hedge_orders = Dio_strategies.Auto_hedger.get_pending_orders 100 in
-      if pending_grid_orders = [] && pending_mm_orders = [] && pending_hedge_orders = []
+      if pending_grid_orders = [] && pending_hedge_orders = []
       then (
         (* No pending orders: block until signalled. Sever the promise chain via
            [Lwt.async] to prevent [Forward] node accumulation. *)
@@ -813,11 +701,6 @@ let order_processing_loop () =
           List.iter
             (process_single_order ~orders_placed ~order_mutex ~is_connected)
             pending_grid_orders;
-          if not (Atomic.get shutdown_requested)
-          then
-            List.iter
-              (process_single_order ~orders_placed ~order_mutex ~is_connected)
-              pending_mm_orders;
           if not (Atomic.get shutdown_requested)
           then
             List.iter
