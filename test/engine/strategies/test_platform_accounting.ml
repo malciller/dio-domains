@@ -120,6 +120,65 @@ let test_committed_sell_base () =
        10.0)
 ;;
 
+let test_available_base () =
+  (* authoritative venue with a live figure: max(0, venue + credit - reserve - hold) *)
+  Alcotest.(check bool)
+    "alpaca venue figure"
+    true
+    (approx
+       (Platform_accounting.alpaca_available_base
+          ~venue_available:100.0
+          ~ledger_balance:50.0
+          ~unreflected_credit:1.0
+          ~reserved_base:5.0
+          ~committed_sell:2.0
+          ~unnetted_hold:0.5)
+       95.5);
+  (* no venue figure: ledger basis *)
+  Alcotest.(check bool)
+    "alpaca fallback to ledger"
+    true
+    (approx
+       (Platform_accounting.alpaca_available_base
+          ~venue_available:nan
+          ~ledger_balance:50.0
+          ~unreflected_credit:1.0
+          ~reserved_base:5.0
+          ~committed_sell:2.0
+          ~unnetted_hold:0.5)
+       43.0);
+  (* NaN venue balance dominates -> 0 *)
+  Alcotest.(check bool)
+    "nan venue balance -> 0"
+    true
+    (approx
+       (Platform_accounting.available_base
+          ~is_venue_authoritative:false
+          ~asset_balance_nan:true
+          ~venue_available:100.0
+          ~ledger_balance:50.0
+          ~unreflected_credit:1.0
+          ~reserved_base:5.0
+          ~committed_sell:2.0
+          ~unnetted_hold:0.5)
+       0.0);
+  (* non-authoritative (ledger basis) *)
+  Alcotest.(check bool)
+    "ledger basis"
+    true
+    (approx
+       (Platform_accounting.available_base
+          ~is_venue_authoritative:false
+          ~asset_balance_nan:false
+          ~venue_available:100.0
+          ~ledger_balance:50.0
+          ~unreflected_credit:1.0
+          ~reserved_base:5.0
+          ~committed_sell:2.0
+          ~unnetted_hold:0.5)
+       43.0)
+;;
+
 let () =
   Alcotest.run
     "platform_accounting"
@@ -139,6 +198,7 @@ let () =
             "effective committed sell base"
             `Quick
             test_committed_sell_base
+        ; Alcotest.test_case "available base" `Quick test_available_base
         ] )
     ]
 ;;

@@ -160,3 +160,47 @@ let effective_committed_sell_base
     else Float.max (Float.max 0.0 (ledger_total -. feed_total)) unnetted_hold
   else ledger_total
 ;;
+
+(** Alpaca's sellable base: venue [qty_available] (free of resting holds) plus un-polled
+    buy credits, minus the reserve and the un-netted hold overlay; falls back to the
+    ledger basis when the venue exposes no figure. *)
+let alpaca_available_base
+  ~venue_available
+  ~ledger_balance
+  ~unreflected_credit
+  ~reserved_base
+  ~committed_sell
+  ~unnetted_hold
+  =
+  if Float.is_nan venue_available
+  then ledger_balance -. reserved_base -. committed_sell
+  else
+    Float.max 0.0 (venue_available +. unreflected_credit -. reserved_base -. unnetted_hold)
+;;
+
+(** Base available to offer without dipping into the reserve. A NaN venue balance yields
+    [0.0]; an authoritative venue (Alpaca) uses {!alpaca_available_base}; otherwise the
+    ledger basis (ledger minus reserve and committed sells). *)
+let available_base
+  ~is_venue_authoritative
+  ~asset_balance_nan
+  ~venue_available
+  ~ledger_balance
+  ~unreflected_credit
+  ~reserved_base
+  ~committed_sell
+  ~unnetted_hold
+  =
+  if asset_balance_nan
+  then 0.0
+  else if is_venue_authoritative
+  then
+    alpaca_available_base
+      ~venue_available
+      ~ledger_balance
+      ~unreflected_credit
+      ~reserved_base
+      ~committed_sell
+      ~unnetted_hold
+  else ledger_balance -. reserved_base -. committed_sell
+;;

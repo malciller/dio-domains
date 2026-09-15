@@ -1512,23 +1512,26 @@ let evaluate_sell_leg
     +. unreflected_credit
   in
   (* Alpaca's sellable base: venue [qty_available] (free of resting holds) plus un-polled
-     buy credits, minus the reserve. This replaces the [gross - reconstructed_holds]
-     computation that dipped into the reserve whenever the SSE open-order cache
-     transiently undercounted holds (amend replace windows, missed events). *)
+     buy credits, minus the reserve. Moved to Platform_accounting (milestone 2). *)
   let alpaca_available =
-    if Float.is_nan asset_available
-    then ledger_balance -. state.reserved_base -. committed_sell
-    else
-      Float.max
-        0.0
-        (asset_available +. unreflected_credit -. state.reserved_base -. unnetted_hold)
+    Platform_accounting.alpaca_available_base
+      ~venue_available:asset_available
+      ~ledger_balance
+      ~unreflected_credit
+      ~reserved_base:state.reserved_base
+      ~committed_sell
+      ~unnetted_hold
   in
   let available_base =
-    if Float.is_nan asset_balance
-    then 0.0
-    else if is_alpaca
-    then alpaca_available
-    else ledger_balance -. state.reserved_base -. committed_sell
+    Platform_accounting.available_base
+      ~is_venue_authoritative:is_alpaca
+      ~asset_balance_nan:(Float.is_nan asset_balance)
+      ~venue_available:asset_available
+      ~ledger_balance
+      ~unreflected_credit
+      ~reserved_base:state.reserved_base
+      ~committed_sell
+      ~unnetted_hold
   in
   (* Total base committed to sells, taking the larger of the in-flight ledger and the live
      open-order list. The ledger is authoritative in the running system (the scan rebuilds
