@@ -133,7 +133,11 @@
       },
       "then": [
         {
-          "action": "cycle_prepare",
+          "action": "prepare_init",
+          "args": {}
+        },
+        {
+          "action": "prepare_recovery",
           "args": {}
         },
         {

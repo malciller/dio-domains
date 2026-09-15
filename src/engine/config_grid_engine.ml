@@ -95,9 +95,9 @@ let with_lock ctx f =
   | None -> f ()
 ;;
 
-(** Fine path step 1: init, accumulation-buffer refresh, low-flag recovery, resolve
-    bid/ask. Returns whether the cycle should continue (false on NaN price). *)
-let prepare c =
+(** Fine path step 1a: one-time state init (venue config/precision caches) and the
+    per-cycle accumulation-buffer refresh. *)
+let prepare_init c =
   match c.cg_asset, c.cg_state with
   | Some asset, Some state ->
     if String.equal state.exchange_id ""
@@ -128,9 +128,22 @@ let prepare c =
     then
       state.cached_venue_min_notional
       <- Jac.get_min_notional_val asset.symbol asset.exchange;
-    let ecfg = state.cached_ecfg in
+    c.cg_ecfg <- Some state.cached_ecfg;
+    state.accumulation_buffer <- asset.accumulation_buffer
+  | _ -> ()
+;;
+
+(** Fine path step 1b: low-flag recovery, lot sizing and book resolution. Returns whether
+    the cycle should continue (false on NaN price). *)
+let prepare_recovery c =
+  match c.cg_asset, c.cg_state with
+  | Some asset, Some state ->
+    let ecfg =
+      match c.cg_ecfg with
+      | Some e -> e
+      | None -> state.cached_ecfg
+    in
     c.cg_ecfg <- Some ecfg;
-    state.accumulation_buffer <- asset.accumulation_buffer;
     let lot_qty = Jac.venue_lot_qty state.grid_qty asset.exchange state in
     c.cg_lot_qty <- lot_qty;
     let unnetted_hold =
@@ -171,6 +184,13 @@ let prepare c =
   | _ ->
     c.cg_continue <- false;
     false
+;;
+
+(** Fine path step 1 (combined): init then recovery/book. Retained for callers that want
+    the whole preamble. *)
+let prepare c =
+  prepare_init c;
+  prepare_recovery c
 ;;
 
 (** Fine path step 2: expire stale cooldowns/ghost markers. *)
@@ -338,6 +358,9 @@ let cycle_facts c =
   ; "inflight_cancel_buy", Dio_strategies.Strategy_expr.V_bool inflight_cancel_buy
   ; "inflight_amend_buy", Dio_strategies.Strategy_expr.V_bool inflight_amend_buy
   ; "open_buy_count", Dio_strategies.Strategy_expr.V_int c.cg_open_buy_count
+  ; "bid", Dio_strategies.Strategy_expr.V_float c.cg_bid_r
+  ; "ask", Dio_strategies.Strategy_expr.V_float c.cg_ask_r
+  ; "lot_qty", Dio_strategies.Strategy_expr.V_float c.cg_lot_qty
   ; "has_recent_amend_buy", Dio_strategies.Strategy_expr.V_bool c.cg_has_recent_amend_buy
   ]
 ;;

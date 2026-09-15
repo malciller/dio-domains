@@ -152,6 +152,8 @@ module type ENGINE = sig
   type ctx
 
   val prepare : ctx -> bool
+  val prepare_init : ctx -> unit
+  val prepare_recovery : ctx -> bool
   val cleanup : ctx -> unit
   val sync : ctx -> unit
   val refresh_fee : ctx -> unit
@@ -176,6 +178,12 @@ module Make (E : ENGINE) = struct
           match name with
           | "cycle_prepare" ->
             ignore (E.prepare ctx);
+            []
+          | "prepare_init" ->
+            E.prepare_init ctx;
+            []
+          | "prepare_recovery" ->
+            ignore (E.prepare_recovery ctx);
             []
           | "cycle_cleanup" ->
             E.cleanup ctx;
