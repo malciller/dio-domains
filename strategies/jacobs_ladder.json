@@ -580,7 +580,7 @@
       ]
     },
     {
-      "id": "sell",
+      "id": "sell_prepare",
       "when": {
         "event": "book_update",
         "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
@@ -589,13 +589,69 @@
         {
           "action": "sell_prepare",
           "args": {}
-        },
+        }
+      ]
+    },
+    {
+      "id": "sell_place",
+      "when": {
+        "event": "book_update",
+        "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+      },
+      "then": [
         {
           "action": "sell_place",
           "args": {}
+        }
+      ]
+    },
+    {
+      "id": "sell_finalize_latch",
+      "when": {
+        "event": "book_update",
+        "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+      },
+      "then": [
+        {
+          "action": "sell_finalize_latch",
+          "args": {}
         },
         {
-          "action": "sell_finalize",
+          "action": "sell_finalize_facts",
+          "args": {}
+        }
+      ]
+    },
+    {
+      "id": "sell_excess_sweep",
+      "when": {
+        "event": "book_update",
+        "all": [
+          {
+            "event": "book_update",
+            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+          },
+          {
+            "expr": "$platform.remaintain_expired_sells and $platform.sell_missing_empty and not $platform.just_filled_buy and not $platform.resuming_after_balance and not $platform.buy_attempted and not $platform.sell_pushed and not $platform.has_active_sell and not $platform.asset_balance_nan and $platform.balance_fresh"
+          }
+        ]
+      },
+      "then": [
+        {
+          "action": "sell_excess_sweep_phase",
+          "args": {}
+        }
+      ]
+    },
+    {
+      "id": "sell_finalize_end",
+      "when": {
+        "event": "book_update",
+        "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+      },
+      "then": [
+        {
+          "action": "sell_finalize_end",
           "args": {}
         }
       ],

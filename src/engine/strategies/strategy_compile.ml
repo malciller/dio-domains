@@ -58,6 +58,14 @@ let known_platform_caps =
   ; "buy_cooldown"
   ; "buy_inflight"
   ; "amend_has_sell"
+  ; "remaintain_expired_sells"
+  ; "sell_missing_empty"
+  ; "just_filled_buy"
+  ; "resuming_after_balance"
+  ; "buy_attempted"
+  ; "sell_pushed"
+  ; "has_active_sell"
+  ; "balance_fresh"
   ]
 ;;
 
