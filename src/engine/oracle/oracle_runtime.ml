@@ -712,9 +712,7 @@ let refresh_balance_of_task (task : Oracle_tasks.task) : unit Lwt.t =
       Oracle_balances.fetch_task_live task
       >|= function
       | Error error ->
-        Logging.debug
-          ~section
-          (Printf.sprintf "balance refresh failed for %s: %s" id error)
+        Logging.warn_f ~section "balance refresh failed for %s: %s" id error
       | Ok snapshot ->
         Atomic.incr balance_epoch;
         Hashtbl.replace
@@ -725,9 +723,11 @@ let refresh_balance_of_task (task : Oracle_tasks.task) : unit Lwt.t =
           ; fetched_at = Unix.gettimeofday ()
           })
     (fun exn ->
-      Logging.debug
+      Logging.warn_f
         ~section
-        (Printf.sprintf "balance refresh failed for %s: %s" id (Printexc.to_string exn));
+        "balance refresh failed for %s: %s"
+        id
+        (Printexc.to_string exn);
       Lwt.return ())
 ;;
 
@@ -1273,19 +1273,37 @@ let run_loop
         else Lwt.return ())
       tasks
     >>= fun () -> refresh_loop ~offline:false ~config ~tasks);
+  (* The first pass must not run cold: refresh_once warms the account balance pool and
+     sets [materialized_ref] on completion. Without this gate the very first pass can race
+     the initial balance fetch, report "no balance data", and emit no decision for the
+     account - which leaves those assets un-materialized and buying nothing until the next
+     refresh (up to refresh_seconds). *)
+  let rec wait_initial_refresh () =
+    if Option.is_some (Atomic.get materialized_ref) || is_stopped ()
+    then Lwt.return ()
+    else Lwt_unix.sleep 0.05 >>= wait_initial_refresh
+  in
+  wait_initial_refresh ()
+  >>= fun () ->
   let rec loop () =
     if is_stopped ()
     then (
       Logging.info ~section "oracle runtime stopped";
       Lwt.return ())
-    else
+    else (
+      (* Capture the wake generation BEFORE running the pass. A [request_pass] that lands
+         while the pass is running (e.g. the balance refresh completing) must wake the
+         next pass immediately; capturing it after the pass loses that wake and the loop
+         sleeps the full deadline - which is how an account whose balances arrived
+         mid-pass stayed without a decision until the next refresh/F&G change. *)
+      let generation = Atomic.get pass_requested in
       run_pass ~config ~tasks ~on_publish
       >>= fun () ->
       wait_until
         ~deadline:(Unix.gettimeofday () +. (Float.max 1.0 config.refresh_seconds /. 4.0))
-        ~generation:(Atomic.get pass_requested)
+        ~generation
         ()
-      >>= loop
+      >>= loop)
   in
   loop ()
 ;;
