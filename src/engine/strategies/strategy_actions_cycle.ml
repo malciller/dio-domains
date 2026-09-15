@@ -141,13 +141,23 @@ let run t name args =
 
 let handler : Strategy_runtime.handler = { run }
 
-(** Coarse cycle operations (hybrid: coarse now, decompose later).
+(* Coarse cycle operations (hybrid: coarse now, decompose later).
 
-    The engine provides a per-instance context whose functions call the generic cycle
-    functions ([execute_strategy] / [sync_open_orders] / [evaluate_buy_leg] /
-    [evaluate_sell_leg]), so a coarse port replicates behavior by construction. The
-    strategy file orchestrates them; the bodies are split into fine actions in a later
-    pass, verified by the harness. *)
+   The engine provides a per-instance context whose functions call the generic cycle
+   functions ([execute_strategy] / [sync_open_orders] / [evaluate_buy_leg] /
+   [evaluate_sell_leg]), so a coarse port replicates behavior by construction. The
+   strategy file orchestrates them; the bodies are split into fine actions in a later
+   pass, verified by the harness. *)
+
+(** Coarse phases the cycle engine attributes time/allocation to (dashboard STRAT
+    breakdown). *)
+type phase =
+  | Preamble
+  | Cleanup
+  | Sync
+  | Buy
+  | Sell
+
 module type ENGINE = sig
   type ctx
 
@@ -186,37 +196,30 @@ module type ENGINE = sig
   val sell_excess_sweep_phase : ctx -> unit
   val sell_finalize_end : ctx -> unit
   val on_event : ctx -> Strategy_runtime.event -> unit
+
+  (** [measure ctx phase f] runs [f] and attributes its time/allocation to [phase] when
+      per-cycle profiling is enabled. *)
+  val measure : ctx -> phase -> (unit -> unit) -> unit
 end
 
 module Make (E : ENGINE) = struct
   let handler (ctx : E.ctx) : Strategy_runtime.handler =
+    let ph phase f =
+      E.measure ctx phase f;
+      []
+    in
     { run =
         (fun t name _args ->
           match name with
-          | "cycle_prepare" ->
-            ignore (E.prepare ctx);
-            []
-          | "init_venue_state" ->
-            E.prepare_init ctx;
-            []
-          | "prepare_recovery" ->
-            E.prepare_recovery ctx;
-            []
-          | "resolve_book" ->
-            ignore (E.resolve_book ctx);
-            []
-          | "cycle_cleanup" ->
-            E.cleanup ctx;
-            []
+          | "cycle_prepare" -> ph Preamble (fun () -> ignore (E.prepare ctx))
+          | "init_venue_state" -> ph Preamble (fun () -> E.prepare_init ctx)
+          | "prepare_recovery" -> ph Preamble (fun () -> E.prepare_recovery ctx)
+          | "resolve_book" -> ph Preamble (fun () -> ignore (E.resolve_book ctx))
+          | "cycle_cleanup" -> ph Cleanup (fun () -> E.cleanup ctx)
           | "expire_amend_cooldowns" ->
-            E.expire_amend_cooldowns ctx;
-            []
-          | "evict_ghost_orders" ->
-            E.evict_ghost_orders ctx;
-            []
-          | "scan_open_orders" ->
-            E.sync ctx;
-            []
+            ph Cleanup (fun () -> E.expire_amend_cooldowns ctx)
+          | "evict_ghost_orders" -> ph Cleanup (fun () -> E.evict_ghost_orders ctx)
+          | "scan_open_orders" -> ph Sync (fun () -> E.sync ctx)
           | "refresh_maker_fee" ->
             E.refresh_fee ctx;
             []
@@ -232,83 +235,53 @@ module Make (E : ENGINE) = struct
             E.expire_tif_recovery ctx;
             []
           | "cycle_facts" ->
-            List.iter
-              (fun (k, v) -> Strategy_runtime.set_platform t k v)
-              (E.cycle_facts ctx);
-            []
+            ph Preamble (fun () ->
+              List.iter
+                (fun (k, v) -> Strategy_runtime.set_platform t k v)
+                (E.cycle_facts ctx))
           | "mark_stale_cycle" ->
             E.mark_stale ctx;
             []
-          | "cancel_excess_buys" ->
-            E.buy_cancel ctx;
-            []
-          | "buy_place" ->
-            E.buy_place ctx;
-            []
+          | "cancel_excess_buys" -> ph Buy (fun () -> E.buy_cancel ctx)
+          | "buy_place" -> ph Buy (fun () -> E.buy_place ctx)
           | "buy_place_plan" ->
-            List.iter
-              (fun (k, v) -> Strategy_runtime.set_platform t k v)
-              (E.buy_place_plan ctx);
-            []
-          | "buy_place_send" ->
-            E.buy_place_send ctx;
-            []
+            ph Buy (fun () ->
+              List.iter
+                (fun (k, v) -> Strategy_runtime.set_platform t k v)
+                (E.buy_place_plan ctx))
+          | "buy_place_send" -> ph Buy (fun () -> E.buy_place_send ctx)
           | "buy_place_send_insufficient" ->
-            E.buy_place_send_insufficient ctx;
-            []
+            ph Buy (fun () -> E.buy_place_send_insufficient ctx)
           | "buy_place_latch_capital_low" ->
-            E.buy_place_latch_capital_low ctx;
-            []
-          | "buy_place_warn_quote" ->
-            E.buy_place_warn_quote ctx;
-            []
-          | "buy_amend" ->
-            E.buy_amend ctx;
-            []
+            ph Buy (fun () -> E.buy_place_latch_capital_low ctx)
+          | "buy_place_warn_quote" -> ph Buy (fun () -> E.buy_place_warn_quote ctx)
+          | "buy_amend" -> ph Buy (fun () -> E.buy_amend ctx)
           | "buy_amend_has_sell" ->
-            Strategy_runtime.set_platform
-              t
-              "amend_has_sell"
-              (V_bool (E.buy_amend_has_sell ctx));
-            []
-          | "buy_amend_with_sell" ->
-            E.buy_amend_with_sell ctx;
-            []
-          | "buy_amend_no_sell" ->
-            E.buy_amend_no_sell ctx;
-            []
-          | "plan_sell_order" ->
-            E.sell_prepare ctx;
-            []
-          | "sell_place" ->
-            E.sell_place ctx;
-            []
+            ph Buy (fun () ->
+              Strategy_runtime.set_platform
+                t
+                "amend_has_sell"
+                (V_bool (E.buy_amend_has_sell ctx)))
+          | "buy_amend_with_sell" -> ph Buy (fun () -> E.buy_amend_with_sell ctx)
+          | "buy_amend_no_sell" -> ph Buy (fun () -> E.buy_amend_no_sell ctx)
+          | "plan_sell_order" -> ph Sell (fun () -> E.sell_prepare ctx)
+          | "sell_place" -> ph Sell (fun () -> E.sell_place ctx)
           | "sell_place_should" ->
-            Strategy_runtime.set_platform
-              t
-              "sell_place_should"
-              (V_bool (E.sell_place_should ctx));
-            []
-          | "sell_place_body" ->
-            E.sell_place_body ctx;
-            []
-          | "sell_finalize" ->
-            E.sell_finalize ctx;
-            []
+            ph Sell (fun () ->
+              Strategy_runtime.set_platform
+                t
+                "sell_place_should"
+                (V_bool (E.sell_place_should ctx)))
+          | "sell_place_body" -> ph Sell (fun () -> E.sell_place_body ctx)
+          | "sell_finalize" -> ph Sell (fun () -> E.sell_finalize ctx)
           | "sell_finalize_facts" ->
-            List.iter
-              (fun (k, v) -> Strategy_runtime.set_platform t k v)
-              (E.sell_finalize_facts ctx);
-            []
-          | "sell_finalize_latch" ->
-            E.sell_finalize_latch ctx;
-            []
-          | "sell_excess_sweep_phase" ->
-            E.sell_excess_sweep_phase ctx;
-            []
-          | "sell_finalize_end" ->
-            E.sell_finalize_end ctx;
-            []
+            ph Sell (fun () ->
+              List.iter
+                (fun (k, v) -> Strategy_runtime.set_platform t k v)
+                (E.sell_finalize_facts ctx))
+          | "sell_finalize_latch" -> ph Sell (fun () -> E.sell_finalize_latch ctx)
+          | "sell_excess_sweep_phase" -> ph Sell (fun () -> E.sell_excess_sweep_phase ctx)
+          | "sell_finalize_end" -> ph Sell (fun () -> E.sell_finalize_end ctx)
           | "apply_order_event" ->
             (match Strategy_runtime.current_event t with
              | Some ev -> E.on_event ctx ev
