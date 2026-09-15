@@ -213,10 +213,10 @@ module Make (E : ENGINE) = struct
         (fun t name args ->
           match name with
           | "set_gate" ->
-            (match List.assoc_opt "name" args, List.assoc_opt "value" args with
-             | Some (V_string k), Some v -> Strategy_runtime.set_state t k v
-             | _ -> ());
-            []
+            ph Preamble (fun () ->
+              match List.assoc_opt "name" args, List.assoc_opt "value" args with
+              | Some (V_string k), Some v -> Strategy_runtime.set_state t k v
+              | _ -> ())
           | "cycle_prepare" -> ph Preamble (fun () -> ignore (E.prepare ctx))
           | "init_venue_state" -> ph Preamble (fun () -> E.prepare_init ctx)
           | "prepare_recovery" -> ph Preamble (fun () -> E.prepare_recovery ctx)
@@ -226,9 +226,7 @@ module Make (E : ENGINE) = struct
             ph Cleanup (fun () -> E.expire_amend_cooldowns ctx)
           | "evict_ghost_orders" -> ph Cleanup (fun () -> E.evict_ghost_orders ctx)
           | "scan_open_orders" -> ph Sync (fun () -> E.sync ctx)
-          | "refresh_maker_fee" ->
-            E.refresh_fee ctx;
-            []
+          | "refresh_maker_fee" -> ph Preamble (fun () -> E.refresh_fee ctx)
           | "cycle_guard" ->
             let cont = E.guard ctx in
             Strategy_runtime.set_platform t "engine:continue" (V_bool cont);
@@ -237,9 +235,7 @@ module Make (E : ENGINE) = struct
             let active = E.buy_gate ctx in
             Strategy_runtime.set_platform t "engine:buy_active" (V_bool active);
             []
-          | "expire_tif_recovery" ->
-            E.expire_tif_recovery ctx;
-            []
+          | "expire_tif_recovery" -> ph Preamble (fun () -> E.expire_tif_recovery ctx)
           | "cycle_facts" ->
             ph Preamble (fun () ->
               List.iter
@@ -250,9 +246,7 @@ module Make (E : ENGINE) = struct
               List.iter
                 (fun (k, v) -> Strategy_runtime.set_platform t k v)
                 (E.early_facts ctx))
-          | "mark_stale_cycle" ->
-            E.mark_stale ctx;
-            []
+          | "mark_stale_cycle" -> ph Preamble (fun () -> E.mark_stale ctx)
           | "cancel_excess_buys" -> ph Buy (fun () -> E.buy_cancel ctx)
           | "buy_place" -> ph Buy (fun () -> E.buy_place ctx)
           | "buy_place_plan" ->

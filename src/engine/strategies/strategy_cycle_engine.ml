@@ -107,6 +107,7 @@ let measure c (phase : Strategy_actions_cycle.phase) f =
       let dt = Monotonic_clock.now_ns () - t0 in
       (match phase with
        | Strategy_actions_cycle.Preamble ->
+         st.alloc_preamble_words <- st.alloc_preamble_words + da;
          st.time_preamble_ns <- st.time_preamble_ns + dt
        | Strategy_actions_cycle.Cleanup ->
          st.alloc_cleanup_words <- st.alloc_cleanup_words + da;
