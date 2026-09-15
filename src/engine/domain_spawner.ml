@@ -590,7 +590,7 @@ let asset_domain_worker
        by construction. The strategy file is resolved by convention:
        strategies/<strategy>.json. *)
     let config_grid =
-      if config.config_strategy && is_grid_strategy
+      if is_grid_strategy
       then (
         (* Register the builtin action inventory so the validator recognizes actions
            (idempotent; needed because the CLI/test paths that normally register are not
@@ -1717,27 +1717,10 @@ let asset_domain_worker
                   ~now
                   ~event:(Dio_strategies.Strategy_runtime.make_event "book_update" [])))
          | None ->
-           (match !grid_strategy_asset_ref, cached_grid_state with
-            | Some asset, Some cs ->
-              Dio_strategies.Jacobs_ladder.Strategy.execute
-                ~cached_state:cs
-                ~quote_balance_stale
-                ~oracle_halted
-                ~get_open_orders_generation:(fun () ->
-                  Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol)
-                ~base_balance_age:(base_balance_age_fn ())
-                ~now
-                asset
-                !current_price
-                !tob_bid
-                !tob_ask
-                asset_bal_val
-                quote_bal_val
-                0
-                0
-                iter_orders
-                !cycle_count
-            | _ -> ()));
+           (* A bound grid asset always has [config_grid]; this arm is unreachable for
+              grid (an unbound asset is not [is_grid_strategy]). The reference grid entry
+              point is retired (M3). *)
+           ());
         match !mm_strategy_asset_ref, cached_mm_state with
         | Some asset, Some cs when not oracle_halted ->
           let mm_cp = if Float.is_nan !current_price then None else Some !current_price in
