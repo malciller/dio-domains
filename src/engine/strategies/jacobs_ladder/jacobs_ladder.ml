@@ -2,10 +2,9 @@
 
    Grid trading with a single-buy, multi-sell order model. Sub-components under
    jacobs_ladder/: types and state (Jacobs_ladder_types), exchange configuration and
-   precision (Jacobs_ladder_config), reservation and accumulation
-   (Jacobs_ladder_reservation), order construction and dispatch (Jacobs_ladder_orders),
-   execution loop (Jacobs_ladder_execution), lifecycle event handlers
-   (Jacobs_ladder_events). *)
+   precision (Jacobs_ladder_config), reservation and accumulation (Strategy_reservation),
+   order construction and dispatch (Jacobs_ladder_orders), execution loop
+   (Jacobs_ladder_execution), lifecycle event handlers (Jacobs_ladder_events). *)
 
 open Strategy_common
 
@@ -73,35 +72,27 @@ let get_min_move_threshold = Jacobs_ladder_config.get_min_move_threshold
 let calculate_grid_price = Jacobs_ladder_config.calculate_grid_price
 let grid_price = Jacobs_ladder_config.grid_price
 let get_strategy_state = Jacobs_ladder_types.get_strategy_state
-let total_reserved_by_exchange = Jacobs_ladder_reservation.total_reserved_by_exchange
-let get_exchange_reserved_atomic = Jacobs_ladder_reservation.get_exchange_reserved_atomic
-let get_total_reserved_quote = Jacobs_ladder_reservation.get_total_reserved_quote
-let set_asset_reserved_quote = Jacobs_ladder_reservation.set_asset_reserved_quote
-let atomic_check_and_reserve = Jacobs_ladder_reservation.atomic_check_and_reserve
-let can_place_buy_order = Jacobs_ladder_reservation.can_place_buy_order
-let can_place_sell_order = Jacobs_ladder_reservation.can_place_sell_order
-let amend_allowed = Jacobs_ladder_reservation.amend_allowed
-let has_active_sell = Jacobs_ladder_reservation.has_active_sell
+let total_reserved_by_exchange = Strategy_reservation.total_reserved_by_exchange
+let get_exchange_reserved_atomic = Strategy_reservation.get_exchange_reserved_atomic
+let get_total_reserved_quote = Strategy_reservation.get_total_reserved_quote
+let set_asset_reserved_quote = Strategy_reservation.set_asset_reserved_quote
+let atomic_check_and_reserve = Strategy_reservation.atomic_check_and_reserve
+let can_place_buy_order = Strategy_reservation.can_place_buy_order
+let can_place_sell_order = Strategy_reservation.can_place_sell_order
+let amend_allowed = Strategy_reservation.amend_allowed
+let has_active_sell = Strategy_reservation.has_active_sell
 
 let sell_commitment_in_flight_timeout_s =
-  Jacobs_ladder_reservation.sell_commitment_in_flight_timeout_s
+  Strategy_reservation.sell_commitment_in_flight_timeout_s
 ;;
 
-let upsert_sell_commitment = Jacobs_ladder_reservation.upsert_sell_commitment
-let arm_sell_commitment = Jacobs_ladder_reservation.arm_sell_commitment
-let rekey_sell_commitment = Jacobs_ladder_reservation.rekey_sell_commitment
-let remove_sell_commitment = Jacobs_ladder_reservation.remove_sell_commitment
-
-let remove_pending_sell_commitments =
-  Jacobs_ladder_reservation.remove_pending_sell_commitments
-;;
-
-let committed_sell_base = Jacobs_ladder_reservation.committed_sell_base
-
-let effective_committed_sell_base =
-  Jacobs_ladder_reservation.effective_committed_sell_base
-;;
-
+let upsert_sell_commitment = Strategy_reservation.upsert_sell_commitment
+let arm_sell_commitment = Strategy_reservation.arm_sell_commitment
+let rekey_sell_commitment = Strategy_reservation.rekey_sell_commitment
+let remove_sell_commitment = Strategy_reservation.remove_sell_commitment
+let remove_pending_sell_commitments = Strategy_reservation.remove_pending_sell_commitments
+let committed_sell_base = Strategy_reservation.committed_sell_base
+let effective_committed_sell_base = Strategy_reservation.effective_committed_sell_base
 let order_buffer = Jacobs_ladder_orders.order_buffer
 let get_order_buffer = Jacobs_ladder_orders.get_order_buffer
 let create_place_order = Jacobs_ladder_orders.create_place_order

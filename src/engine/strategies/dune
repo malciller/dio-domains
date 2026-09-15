@@ -20,7 +20,7 @@
   Jacobs_ladder_types
   Strategy_state
   Jacobs_ladder_config
-  Jacobs_ladder_reservation
+  Strategy_reservation
   Jacobs_ladder_orders
   Strategy_sell_orders
   Jacobs_ladder_execution

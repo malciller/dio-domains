@@ -3,7 +3,7 @@
 open Strategy_common
 open Jacobs_ladder_types
 open Jacobs_ladder_config
-open Jacobs_ladder_reservation
+open Strategy_reservation
 module Sell_orders = Strategy_sell_orders
 
 (** Shared order ringbuffer across all strategy domains. *)
