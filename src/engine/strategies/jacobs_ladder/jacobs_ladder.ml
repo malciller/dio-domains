@@ -116,8 +116,12 @@ let reconcile_persisted_sell_levels =
 ;;
 
 let evaluate_sell_leg = Jacobs_ladder_execution.evaluate_sell_leg
+let evaluate_buy_leg = Jacobs_ladder_execution.evaluate_buy_leg
+let cleanup_pending_and_cooldowns = Jacobs_ladder_execution.cleanup_pending_and_cooldowns
 let reconcile_position = Jacobs_ladder_execution.reconcile_position
 let evaluate_asset_low_recovery = Jacobs_ladder_execution.evaluate_asset_low_recovery
+let evaluate_capital_low_recovery = Jacobs_ladder_execution.evaluate_capital_low_recovery
+let unnetted_sell_hold = Jacobs_ladder_execution.unnetted_sell_hold
 let execute_strategy = Jacobs_ladder_execution.execute_strategy
 let compute_buy_ref_price = Jacobs_ladder_execution.compute_buy_ref_price
 
