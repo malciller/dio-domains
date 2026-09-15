@@ -1,7 +1,7 @@
-(* Jacobs Ladder: capital reservation and accumulation tracking. *)
+(* Capital reservation and accumulation tracking (strategy-agnostic). *)
 
 open Strategy_common
-open Jacobs_ladder_types
+open Strategy_state
 
 (* Moved to Platform_accounting (milestone 2). *)
 let total_reserved_by_exchange = Platform_accounting.total_reserved_by_exchange
