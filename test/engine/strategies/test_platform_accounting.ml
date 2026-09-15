@@ -72,6 +72,54 @@ let test_consume_fifo () =
   Alcotest.(check bool) "fifo partial" true (holds_eq holds' [ 1.0, 1.5 ])
 ;;
 
+let test_unreflected_credit () =
+  let credits = [ 100.0, 2.0; 50.0, 3.0 ] in
+  let remaining, sum =
+    Platform_accounting.unreflected_credit
+      ~credits
+      ~now:100.0
+      ~base_balance_age:(Some 0.0)
+  in
+  Alcotest.(check bool) "sum keeps fresh" true (approx sum 2.0);
+  Alcotest.(check bool) "drops stale" true (holds_eq remaining [ 100.0, 2.0 ])
+;;
+
+let test_committed_sell_base () =
+  Alcotest.(check bool)
+    "nets + venue-netted -> unnetted only"
+    true
+    (approx
+       (Platform_accounting.effective_committed_sell_base
+          ~balance_nets_open_order_holds:true
+          ~hold_netted_from_venue_state:true
+          ~ledger_total:10.0
+          ~feed_total:4.0
+          ~unnetted_hold:1.0)
+       1.0);
+  Alcotest.(check bool)
+    "nets + feed loop -> ledger excess floored by unnetted"
+    true
+    (approx
+       (Platform_accounting.effective_committed_sell_base
+          ~balance_nets_open_order_holds:true
+          ~hold_netted_from_venue_state:false
+          ~ledger_total:10.0
+          ~feed_total:4.0
+          ~unnetted_hold:1.0)
+       6.0);
+  Alcotest.(check bool)
+    "gross -> whole ledger"
+    true
+    (approx
+       (Platform_accounting.effective_committed_sell_base
+          ~balance_nets_open_order_holds:false
+          ~hold_netted_from_venue_state:false
+          ~ledger_total:10.0
+          ~feed_total:4.0
+          ~unnetted_hold:1.0)
+       10.0)
+;;
+
 let () =
   Alcotest.run
     "platform_accounting"
@@ -84,6 +132,13 @@ let () =
         ; Alcotest.test_case "released by grace" `Quick test_released_by_grace
         ; Alcotest.test_case "disabled" `Quick test_disabled
         ; Alcotest.test_case "consume FIFO" `Quick test_consume_fifo
+        ] )
+    ; ( "credit_and_ceiling"
+      , [ Alcotest.test_case "unreflected credit" `Quick test_unreflected_credit
+        ; Alcotest.test_case
+            "effective committed sell base"
+            `Quick
+            test_committed_sell_base
         ] )
     ]
 ;;

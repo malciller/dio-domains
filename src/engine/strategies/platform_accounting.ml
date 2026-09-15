@@ -117,3 +117,46 @@ let consume_sell_hold_netting ~holds ~amount =
 (** Records a placed sell's hold. Kept oldest-first; retired FIFO by
     [consume_sell_hold_netting] on a tradeable drop, or by the grace. *)
 let arm_sell_hold ~holds ~qty ~now = holds @ [ now, qty ]
+
+(** Un-reflected buy credits (fills not yet reflected in the balance feed), mirroring
+    {!unnetted_sell_hold} for the credit direction. [credits] is [(ts, qty)]; entries at
+    or after the freshness cutoff are summed and kept. Returns [(remaining, sum)]. *)
+let unreflected_credit ~credits ~now ~base_balance_age =
+  if credits = []
+  then credits, 0.0
+  else (
+    let cutoff = unreflected_cutoff ~now ~base_balance_age in
+    let rec go sum acc = function
+      | [] -> List.rev acc, sum
+      | (ts, q) :: rest when ts >= cutoff -> go (sum +. q) ((ts, q) :: acc) rest
+      | _ :: rest -> go sum acc rest
+    in
+    go 0.0 [] credits)
+;;
+
+(** Base to subtract from the venue's reported holding:
+    [spot_holding - reserved_base - committed_sell_base].
+
+    - Net-balance venues ([balance_nets_open_order_holds]):
+      - [hold_netted_from_venue_state] (Hyperliquid): the venue nets holds from its own
+        state (spotState [hold]), independent of our feed. Authoritative even when our
+        feed drops a live order, so subtracting the ledger's excess over the feed would
+        double-count. Only the short [unnetted_hold] dispatch overlay is subtracted.
+      - otherwise (Kraken): holds derive from the same open-order feed the ledger tracks,
+        so the ledger's excess over the feed compensates a dropped order and is
+        subtracted, never below [unnetted_hold].
+    - Gross-balance venues: the venue removes nothing, so the whole ledger is subtracted. *)
+let effective_committed_sell_base
+  ~balance_nets_open_order_holds
+  ~hold_netted_from_venue_state
+  ~ledger_total
+  ~feed_total
+  ~unnetted_hold
+  =
+  if balance_nets_open_order_holds
+  then
+    if hold_netted_from_venue_state
+    then unnetted_hold
+    else Float.max (Float.max 0.0 (ledger_total -. feed_total)) unnetted_hold
+  else ledger_total
+;;

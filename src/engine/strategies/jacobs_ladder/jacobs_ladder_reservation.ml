@@ -237,23 +237,12 @@ let committed_sell_base state =
   Hashtbl.fold (fun _ c acc -> acc +. c.sc_qty) state.sell_commitments 0.0
 ;;
 
-(** Base to subtract from the venue's reported holding:
-    [spot_holding - reserved_base - committed_sell_base].
-
-    - Net-balance venues ([balance_nets_open_order_holds]):
-      - [hold_netted_from_venue_state] (Hyperliquid): the venue nets holds from its own
-        state (spotState [hold]), independent of our feed. Authoritative even when our
-        feed drops a live order, so subtracting the ledger's excess over the feed would
-        double-count. Only the short [unnetted_hold] dispatch overlay is subtracted.
-      - otherwise (Kraken): holds derive from the same open-order feed the ledger tracks,
-        so the ledger's excess over the feed compensates a dropped order and is
-        subtracted, never below [unnetted_hold].
-    - Gross-balance venues: the venue removes nothing, so the whole ledger is subtracted. *)
+(* Moved to Platform_accounting (milestone 2). *)
 let effective_committed_sell_base ~ecfg ~ledger_total ~feed_total ~unnetted_hold =
-  if ecfg.balance_nets_open_order_holds
-  then
-    if ecfg.hold_netted_from_venue_state
-    then unnetted_hold
-    else Float.max (Float.max 0.0 (ledger_total -. feed_total)) unnetted_hold
-  else ledger_total
+  Platform_accounting.effective_committed_sell_base
+    ~balance_nets_open_order_holds:ecfg.balance_nets_open_order_holds
+    ~hold_netted_from_venue_state:ecfg.hold_netted_from_venue_state
+    ~ledger_total
+    ~feed_total
+    ~unnetted_hold
 ;;
