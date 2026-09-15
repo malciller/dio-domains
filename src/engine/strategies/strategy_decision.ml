@@ -1139,7 +1139,316 @@ let sell_leg_prepare
   }
 ;;
 
-(** Sell leg phase 2: the gated placement block. *)
+(** True when a fresh sell is placeable this cycle. *)
+let sell_place_should ~state ~asset_balance ~pre =
+  pre.sp_should_trigger_sell
+  && (not (Float.is_nan asset_balance))
+  && (not (has_active_sell state))
+  && (not state.asset_low)
+  && not pre.sp_is_sell_on_cooldown
+;;
+
+(** Branch: place the owed or restored sell. *)
+let sell_place_body
+  ~buy_attempted
+  ~state
+  ~now
+  ~(asset : trading_config)
+  ~bid_price
+  ~ask_price
+  ~ecfg
+  ~pre
+  =
+  let is_alpaca = pre.sp_is_alpaca in
+  let alpaca_available = pre.sp_alpaca_available in
+  let ledger_balance = pre.sp_ledger_balance in
+  let committed_sell = pre.sp_committed_sell in
+  let capital_exhausted = pre.sp_capital_exhausted in
+  let halt_inventory_check = pre.sp_halt_inventory_check in
+  let missing_after_reconcile = pre.sp_missing_after_reconcile in
+  let sell_pushed = pre.sp_sell_pushed in
+  let nothing_placeable = pre.sp_nothing_placeable in
+  let asset_bal = ledger_balance in
+  let qty =
+    match state.last_buy_fill_qty with
+    | Some q when q > 0.0 -> q
+    | _ -> venue_lot_qty state.grid_qty asset.exchange state
+  in
+  (* Sell sizing ownership. An owed sell (a buy fill's 1:1 sell, a buy placement
+     companion, inventory recovery after a balance/oracle event, the uncommitted-inventory
+     fallback) is strategy-sized on every venue: price anchored on the last buy fill +
+     grid interval, qty 1:1 with the fill, clamped to sellable inventory. The persisted
+     level file never dictates the price or sizing of a new sell. Its only role is
+     restoration: re-placing a rung the venue dropped (Alpaca fractional orders are forced
+     to day TIF, so resting rungs die at the session boundary) at its recorded price/qty.
+     Restoration is selected only when no new sell is owed, so the two obligations cannot
+     hijack each other; a restoration level below the venue's real minimum is pruned at
+     the venue-minimum gate below instead of wedging the maintenance path. *)
+  let new_sell_owed =
+    state.just_filled_buy
+    || buy_attempted
+    || state.resuming_after_balance_flag
+    || halt_inventory_check
+    || (Sell_orders.is_empty state.open_sell_orders
+        && Option.is_some state.last_buy_fill_price)
+  in
+  let target_sell_price_opt, target_sell_qty_override =
+    if ecfg.remaintain_expired_sells
+       && (not new_sell_owed)
+       && state.persisted_sell_levels <> []
+    then (
+      let missing_sorted_desc =
+        List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) !missing_after_reconcile
+      in
+      match missing_sorted_desc with
+      | (tp, tq) :: _ when tq > 0.0 ->
+        (* A missing rung is restored at its OWN recorded price/qty. Excess inventory is
+           never folded into a restore: it is swept to the top of the ladder only once
+           every rung is back (see [evaluate_excess_sweep]), so a restore can never
+           resurrect a dust level or balloon a rung into the whole balance. *)
+        Some tp, Some tq
+      | _ -> None, None)
+    else None, None
+  in
+  let sell_price =
+    match target_sell_price_opt with
+    | Some tp -> tp
+    | None ->
+      (* The owed sell price (fill/bid anchor + gi, lifted to the ask on non-Alpaca
+         venues) lives in [owed_sell_price] so the fresh-buy leg can anticipate the exact
+         same price when it clamps in this tick. Re-anchoring to the bid (rather than the
+         drifted fill) is decided there, including the capital-exhaustion exception that
+         keeps the recovery rung at fill + gi. *)
+      owed_sell_price ~state ~asset ~ecfg ~bid_price ~ask_price ~capital_exhausted
+  in
+  (* Sell quantity: every filled buy owes exactly one 1:1 sell of what it bought (the
+     persisted replacement level restores its own qty). All sizing beyond this is
+     inventory clamping below - no profit gating, no sell_mult sizing. *)
+  let sell_qty =
+    match target_sell_qty_override with
+    | Some tq -> tq
+    | None -> qty
+  in
+  (* Non-accrued, uncommitted sellable inventory. Base committed to a resting or in-flight
+     sell is subtracted on EVERY venue via [locked_in_sells] (the in-flight sell ledger),
+     so it can never be offered again - not even when the venue reports a gross figure or
+     its open-order feed momentarily drops a live order. Alpaca uses the venue's own
+     [qty_available], which is already free of resting holds. *)
+  let is_accumulation = ecfg.use_accumulation_sells in
+  let available =
+    if is_accumulation
+    then Float.max 0.0 (asset_bal -. state.reserved_base -. committed_sell)
+    else if is_alpaca
+    then alpaca_available
+    else Float.max 0.0 (asset_bal -. state.reserved_base -. committed_sell)
+  in
+  let min_order_size =
+    if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
+  in
+  let target_q = round_qty sell_qty asset.symbol asset.exchange in
+  let effective_sell_qty, balance_ok =
+    if ecfg.use_reserved_base_guard
+    then (
+      let rounded_avail = round_qty available asset.symbol asset.exchange in
+      if available >= target_q -. 1e-6 && target_q > 0.0
+      then
+        if (not is_alpaca)
+           && target_sell_qty_override = None
+           && (not ecfg.remaintain_expired_sells)
+           && rounded_avail >= target_q
+           && rounded_avail >= min_order_size -. 1e-9
+        then (
+          Logging.debug_f
+            ~section
+            "Sell order sized for %s: target_q %.8f + non-reserved surplus (available \
+             %.8f) -> sized to %.8f (min_order_size %.8f)"
+            asset.symbol
+            target_q
+            available
+            rounded_avail
+            min_order_size;
+          rounded_avail, true)
+        else if target_q >= min_order_size -. 1e-9
+        then target_q, true
+        else (
+          log_sell_block
+            ~state
+            ~now
+            ~symbol:asset.symbol
+            ~kind:"sell qty below min_order_size"
+            (Printf.sprintf
+               "sell qty %.8f below min_order_size %.8f"
+               target_q
+               min_order_size);
+          0.0, false)
+      else if available >= min_order_size -. 1e-9
+      then
+        if rounded_avail >= min_order_size -. 1e-9 && rounded_avail > 0.0
+        then (
+          Logging.debug_f
+            ~section
+            "Sell order clamped for %s: available %.8f (bal %.8f - reserved %.8f) < \
+             target_q %.8f -> clamped to %.8f (min_order_size %.8f)"
+            asset.symbol
+            available
+            asset_bal
+            state.reserved_base
+            target_q
+            rounded_avail
+            min_order_size;
+          rounded_avail, true)
+        else (
+          log_sell_block
+            ~state
+            ~now
+            ~symbol:asset.symbol
+            ~kind:"available below min_order_size (rounded)"
+            (Printf.sprintf
+               "available %.8f (bal %.8f - reserved %.8f) rounds below min_order_size \
+                %.8f"
+               available
+               asset_bal
+               state.reserved_base
+               min_order_size);
+          0.0, false)
+      else (
+        log_sell_block
+          ~state
+          ~now
+          ~symbol:asset.symbol
+          ~kind:"available below min_order_size"
+          (Printf.sprintf
+             "available %.8f (bal %.8f - reserved %.8f) is below min_order_size %.8f"
+             available
+             asset_bal
+             state.reserved_base
+             min_order_size);
+        0.0, false))
+    else if target_q >= min_order_size -. 1e-9 && target_q > 0.0
+    then target_q, true
+    else (
+      log_sell_block
+        ~state
+        ~now
+        ~symbol:asset.symbol
+        ~kind:"sell qty below min_order_size"
+        (Printf.sprintf "sell qty %.8f below min_order_size %.8f" target_q min_order_size);
+      0.0, false)
+  in
+  if balance_ok
+  then (
+    (* The NOTIONAL gate: enforce both venue minimum quantity / increment floor and venue
+       quote-notional minimum floor. *)
+    let min_notional =
+      if state.cached_venue_min_notional > 0.0
+      then state.cached_venue_min_notional
+      else if is_alpaca
+      then 1.0
+      else 0.0
+    in
+    let venue_min_ok q =
+      q > 0.0
+      && q >= min_order_size -. 1e-9
+      && (min_notional <= 0.0 || q *. sell_price >= min_notional -. 1e-9)
+    in
+    if venue_min_ok effective_sell_qty
+    then (
+      let sell_order =
+        create_order
+          state.duplicate_key_sell
+          asset.symbol
+          Sell
+          effective_sell_qty
+          (Some sell_price)
+          true
+          asset.exchange
+      in
+      if push_order ~now ~state sell_order
+      then (
+        sell_pushed := true;
+        state.asset_low <- false;
+        state.last_sell_block_reason <- "";
+        (* Arm the unnetted-hold guard for venues that opt in: until a value-changing
+           balance adoption or a tradeable drop nets it, the venue's [total - hold] figure
+           may still count this base as free, and sizing against it is the reserved_base
+           leak under bursts. *)
+        if ecfg.use_unnetted_sell_hold && effective_sell_qty > 0.0
+        then (
+          arm_sell_hold ~state ~qty:effective_sell_qty ~now;
+          Logging.debug_f
+            ~section
+            "Sell hold guard armed for %s: +%.8f (release on next balance message or \
+             %.0fs grace)"
+            asset.symbol
+            effective_sell_qty
+            sell_hold_netting_grace_s);
+        if ecfg.remaintain_expired_sells
+           && target_sell_price_opt = None
+           && effective_sell_qty > 0.0
+        then (
+          state.persisted_sell_levels
+          <- dedupe_persisted_sell_levels
+               (state.persisted_sell_levels @ [ sell_price, effective_sell_qty ]);
+          state.persistence_dirty <- true);
+        Logging.info_f
+          ~section
+          "Placed sell order for %s: %.8f @ %.4f"
+          asset.symbol
+          effective_sell_qty
+          sell_price)
+      else
+        log_sell_block
+          ~state
+          ~now
+          ~symbol:asset.symbol
+          "order dispatch rejected (duplicate in-flight placement key)")
+    else (
+      (match target_sell_qty_override, target_sell_price_opt with
+       | Some _, Some tp ->
+         (* A restoration level below the venue's real minimum can never be placed -
+            notional floors are static per level, so retrying is a permanent wedge (legacy
+            dust from clamped sizing). Prune it so the file keeps being a faithful record
+            of what CAN be on the system. *)
+         let rec remove_one acc found = function
+           | [] -> List.rev acc
+           | (sp, _sq) :: rest
+             when (not found)
+                  && (abs_float (sp -. tp) <= tp *. 0.0001 || abs_float (sp -. tp) <= 1e-4)
+             -> remove_one acc true rest
+           | item :: rest -> remove_one (item :: acc) found rest
+         in
+         let new_levels = remove_one [] false state.persisted_sell_levels in
+         if new_levels <> state.persisted_sell_levels
+         then (
+           state.persisted_sell_levels <- new_levels;
+           state.persistence_dirty <- true);
+         log_sell_block
+           ~state
+           ~now
+           ~symbol:asset.symbol
+           (Printf.sprintf
+              "persisted sell level %.4f x %.8f below venue minimum $%.2f - pruned from \
+               sell_levels_state.json (unplaceable)"
+              sell_price
+              effective_sell_qty
+              min_notional)
+       | _ ->
+         log_sell_block
+           ~state
+           ~now
+           ~symbol:asset.symbol
+           ~kind:"sellable inventory below the quote-notional minimum"
+           (Printf.sprintf
+              "sellable inventory below the quote-notional minimum (venue min $%.2f, \
+               sell_price %.4f, sell qty %.8f)"
+              min_notional
+              sell_price
+              effective_sell_qty));
+      nothing_placeable := true))
+  else nothing_placeable := true
+;;
+
+(** Sell leg phase 2: place the owed or restored sell. Reference recombination. *)
 let sell_leg_place
   ~state
   ~now
@@ -1151,305 +1460,8 @@ let sell_leg_place
   ~ecfg
   ~pre
   =
-  let is_alpaca = pre.sp_is_alpaca in
-  let alpaca_available = pre.sp_alpaca_available in
-  let ledger_balance = pre.sp_ledger_balance in
-  let committed_sell = pre.sp_committed_sell in
-  let capital_exhausted = pre.sp_capital_exhausted in
-  let halt_inventory_check = pre.sp_halt_inventory_check in
-  let should_trigger_sell = pre.sp_should_trigger_sell in
-  let is_sell_on_cooldown = pre.sp_is_sell_on_cooldown in
-  let missing_after_reconcile = pre.sp_missing_after_reconcile in
-  let sell_pushed = pre.sp_sell_pushed in
-  let nothing_placeable = pre.sp_nothing_placeable in
-  if should_trigger_sell
-     && (not (Float.is_nan asset_balance))
-     && (not (has_active_sell state))
-     && (not state.asset_low)
-     && not is_sell_on_cooldown
-  then (
-    let asset_bal = ledger_balance in
-    let qty =
-      match state.last_buy_fill_qty with
-      | Some q when q > 0.0 -> q
-      | _ -> venue_lot_qty state.grid_qty asset.exchange state
-    in
-    (* Sell sizing ownership. An owed sell (a buy fill's 1:1 sell, a buy placement
-       companion, inventory recovery after a balance/oracle event, the
-       uncommitted-inventory fallback) is strategy-sized on every venue: price anchored on
-       the last buy fill + grid interval, qty 1:1 with the fill, clamped to sellable
-       inventory. The persisted level file never dictates the price or sizing of a new
-       sell. Its only role is restoration: re-placing a rung the venue dropped (Alpaca
-       fractional orders are forced to day TIF, so resting rungs die at the session
-       boundary) at its recorded price/qty. Restoration is selected only when no new sell
-       is owed, so the two obligations cannot hijack each other; a restoration level below
-       the venue's real minimum is pruned at the venue-minimum gate below instead of
-       wedging the maintenance path. *)
-    let new_sell_owed =
-      state.just_filled_buy
-      || buy_attempted
-      || state.resuming_after_balance_flag
-      || halt_inventory_check
-      || (Sell_orders.is_empty state.open_sell_orders
-          && Option.is_some state.last_buy_fill_price)
-    in
-    let target_sell_price_opt, target_sell_qty_override =
-      if ecfg.remaintain_expired_sells
-         && (not new_sell_owed)
-         && state.persisted_sell_levels <> []
-      then (
-        let missing_sorted_desc =
-          List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) !missing_after_reconcile
-        in
-        match missing_sorted_desc with
-        | (tp, tq) :: _ when tq > 0.0 ->
-          (* A missing rung is restored at its OWN recorded price/qty. Excess inventory is
-             never folded into a restore: it is swept to the top of the ladder only once
-             every rung is back (see [evaluate_excess_sweep]), so a restore can never
-             resurrect a dust level or balloon a rung into the whole balance. *)
-          Some tp, Some tq
-        | _ -> None, None)
-      else None, None
-    in
-    let sell_price =
-      match target_sell_price_opt with
-      | Some tp -> tp
-      | None ->
-        (* The owed sell price (fill/bid anchor + gi, lifted to the ask on non-Alpaca
-           venues) lives in [owed_sell_price] so the fresh-buy leg can anticipate the
-           exact same price when it clamps in this tick. Re-anchoring to the bid (rather
-           than the drifted fill) is decided there, including the capital-exhaustion
-           exception that keeps the recovery rung at fill + gi. *)
-        owed_sell_price ~state ~asset ~ecfg ~bid_price ~ask_price ~capital_exhausted
-    in
-    (* Sell quantity: every filled buy owes exactly one 1:1 sell of what it bought (the
-       persisted replacement level restores its own qty). All sizing beyond this is
-       inventory clamping below - no profit gating, no sell_mult sizing. *)
-    let sell_qty =
-      match target_sell_qty_override with
-      | Some tq -> tq
-      | None -> qty
-    in
-    (* Non-accrued, uncommitted sellable inventory. Base committed to a resting or
-       in-flight sell is subtracted on EVERY venue via [locked_in_sells] (the in-flight
-       sell ledger), so it can never be offered again - not even when the venue reports a
-       gross figure or its open-order feed momentarily drops a live order. Alpaca uses the
-       venue's own [qty_available], which is already free of resting holds. *)
-    let is_accumulation = ecfg.use_accumulation_sells in
-    let available =
-      if is_accumulation
-      then Float.max 0.0 (asset_bal -. state.reserved_base -. committed_sell)
-      else if is_alpaca
-      then alpaca_available
-      else Float.max 0.0 (asset_bal -. state.reserved_base -. committed_sell)
-    in
-    let min_order_size =
-      if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
-    in
-    let target_q = round_qty sell_qty asset.symbol asset.exchange in
-    let effective_sell_qty, balance_ok =
-      if ecfg.use_reserved_base_guard
-      then (
-        let rounded_avail = round_qty available asset.symbol asset.exchange in
-        if available >= target_q -. 1e-6 && target_q > 0.0
-        then
-          if (not is_alpaca)
-             && target_sell_qty_override = None
-             && (not ecfg.remaintain_expired_sells)
-             && rounded_avail >= target_q
-             && rounded_avail >= min_order_size -. 1e-9
-          then (
-            Logging.debug_f
-              ~section
-              "Sell order sized for %s: target_q %.8f + non-reserved surplus (available \
-               %.8f) -> sized to %.8f (min_order_size %.8f)"
-              asset.symbol
-              target_q
-              available
-              rounded_avail
-              min_order_size;
-            rounded_avail, true)
-          else if target_q >= min_order_size -. 1e-9
-          then target_q, true
-          else (
-            log_sell_block
-              ~state
-              ~now
-              ~symbol:asset.symbol
-              ~kind:"sell qty below min_order_size"
-              (Printf.sprintf
-                 "sell qty %.8f below min_order_size %.8f"
-                 target_q
-                 min_order_size);
-            0.0, false)
-        else if available >= min_order_size -. 1e-9
-        then
-          if rounded_avail >= min_order_size -. 1e-9 && rounded_avail > 0.0
-          then (
-            Logging.debug_f
-              ~section
-              "Sell order clamped for %s: available %.8f (bal %.8f - reserved %.8f) < \
-               target_q %.8f -> clamped to %.8f (min_order_size %.8f)"
-              asset.symbol
-              available
-              asset_bal
-              state.reserved_base
-              target_q
-              rounded_avail
-              min_order_size;
-            rounded_avail, true)
-          else (
-            log_sell_block
-              ~state
-              ~now
-              ~symbol:asset.symbol
-              ~kind:"available below min_order_size (rounded)"
-              (Printf.sprintf
-                 "available %.8f (bal %.8f - reserved %.8f) rounds below min_order_size \
-                  %.8f"
-                 available
-                 asset_bal
-                 state.reserved_base
-                 min_order_size);
-            0.0, false)
-        else (
-          log_sell_block
-            ~state
-            ~now
-            ~symbol:asset.symbol
-            ~kind:"available below min_order_size"
-            (Printf.sprintf
-               "available %.8f (bal %.8f - reserved %.8f) is below min_order_size %.8f"
-               available
-               asset_bal
-               state.reserved_base
-               min_order_size);
-          0.0, false))
-      else if target_q >= min_order_size -. 1e-9 && target_q > 0.0
-      then target_q, true
-      else (
-        log_sell_block
-          ~state
-          ~now
-          ~symbol:asset.symbol
-          ~kind:"sell qty below min_order_size"
-          (Printf.sprintf
-             "sell qty %.8f below min_order_size %.8f"
-             target_q
-             min_order_size);
-        0.0, false)
-    in
-    if balance_ok
-    then (
-      (* The NOTIONAL gate: enforce both venue minimum quantity / increment floor and
-         venue quote-notional minimum floor. *)
-      let min_notional =
-        if state.cached_venue_min_notional > 0.0
-        then state.cached_venue_min_notional
-        else if is_alpaca
-        then 1.0
-        else 0.0
-      in
-      let venue_min_ok q =
-        q > 0.0
-        && q >= min_order_size -. 1e-9
-        && (min_notional <= 0.0 || q *. sell_price >= min_notional -. 1e-9)
-      in
-      if venue_min_ok effective_sell_qty
-      then (
-        let sell_order =
-          create_order
-            state.duplicate_key_sell
-            asset.symbol
-            Sell
-            effective_sell_qty
-            (Some sell_price)
-            true
-            asset.exchange
-        in
-        if push_order ~now ~state sell_order
-        then (
-          sell_pushed := true;
-          state.asset_low <- false;
-          state.last_sell_block_reason <- "";
-          (* Arm the unnetted-hold guard for venues that opt in: until a value-changing
-             balance adoption or a tradeable drop nets it, the venue's [total - hold]
-             figure may still count this base as free, and sizing against it is the
-             reserved_base leak under bursts. *)
-          if ecfg.use_unnetted_sell_hold && effective_sell_qty > 0.0
-          then (
-            arm_sell_hold ~state ~qty:effective_sell_qty ~now;
-            Logging.debug_f
-              ~section
-              "Sell hold guard armed for %s: +%.8f (release on next balance message or \
-               %.0fs grace)"
-              asset.symbol
-              effective_sell_qty
-              sell_hold_netting_grace_s);
-          if ecfg.remaintain_expired_sells
-             && target_sell_price_opt = None
-             && effective_sell_qty > 0.0
-          then (
-            state.persisted_sell_levels
-            <- dedupe_persisted_sell_levels
-                 (state.persisted_sell_levels @ [ sell_price, effective_sell_qty ]);
-            state.persistence_dirty <- true);
-          Logging.info_f
-            ~section
-            "Placed sell order for %s: %.8f @ %.4f"
-            asset.symbol
-            effective_sell_qty
-            sell_price)
-        else
-          log_sell_block
-            ~state
-            ~now
-            ~symbol:asset.symbol
-            "order dispatch rejected (duplicate in-flight placement key)")
-      else (
-        (match target_sell_qty_override, target_sell_price_opt with
-         | Some _, Some tp ->
-           (* A restoration level below the venue's real minimum can never be placed -
-              notional floors are static per level, so retrying is a permanent wedge
-              (legacy dust from clamped sizing). Prune it so the file keeps being a
-              faithful record of what CAN be on the system. *)
-           let rec remove_one acc found = function
-             | [] -> List.rev acc
-             | (sp, _sq) :: rest
-               when (not found)
-                    && (abs_float (sp -. tp) <= tp *. 0.0001
-                        || abs_float (sp -. tp) <= 1e-4) -> remove_one acc true rest
-             | item :: rest -> remove_one (item :: acc) found rest
-           in
-           let new_levels = remove_one [] false state.persisted_sell_levels in
-           if new_levels <> state.persisted_sell_levels
-           then (
-             state.persisted_sell_levels <- new_levels;
-             state.persistence_dirty <- true);
-           log_sell_block
-             ~state
-             ~now
-             ~symbol:asset.symbol
-             (Printf.sprintf
-                "persisted sell level %.4f x %.8f below venue minimum $%.2f - pruned \
-                 from sell_levels_state.json (unplaceable)"
-                sell_price
-                effective_sell_qty
-                min_notional)
-         | _ ->
-           log_sell_block
-             ~state
-             ~now
-             ~symbol:asset.symbol
-             ~kind:"sellable inventory below the quote-notional minimum"
-             (Printf.sprintf
-                "sellable inventory below the quote-notional minimum (venue min $%.2f, \
-                 sell_price %.4f, sell qty %.8f)"
-                min_notional
-                sell_price
-                effective_sell_qty));
-        nothing_placeable := true))
-    else nothing_placeable := true)
+  if sell_place_should ~state ~asset_balance ~pre
+  then sell_place_body ~state ~now ~asset ~bid_price ~ask_price ~buy_attempted ~ecfg ~pre
 ;;
 
 (** Sell finalize phase 1: retry-latch / nothing-to-sell bookkeeping. *)

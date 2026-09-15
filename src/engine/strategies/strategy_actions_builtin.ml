@@ -71,6 +71,8 @@ let declarations =
   ; act "buy_amend_no_sell" decision []
   ; act "sell_prepare" decision []
   ; act "sell_place" decision []
+  ; act "sell_place_should" read []
+  ; act "sell_place_body" decision []
   ; act "sell_finalize" decision []
   ; act "sell_finalize_facts" read []
   ; act "sell_finalize_latch" decision []

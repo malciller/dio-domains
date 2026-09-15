@@ -597,14 +597,34 @@
       ]
     },
     {
-      "id": "sell_place",
+      "id": "sell_place_should",
       "when": {
         "event": "book_update",
         "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
       },
       "then": [
         {
-          "action": "sell_place",
+          "action": "sell_place_should",
+          "args": {}
+        }
+      ]
+    },
+    {
+      "id": "sell_place",
+      "when": {
+        "all": [
+          {
+            "event": "book_update",
+            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+          },
+          {
+            "expr": "$platform.sell_place_should"
+          }
+        ]
+      },
+      "then": [
+        {
+          "action": "sell_place_body",
           "args": {}
         }
       ]
