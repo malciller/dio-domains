@@ -676,16 +676,18 @@ Exit codes: `0` valid, `1` errors, `2` usage.
 
 | Bridge | Where | Remove when | Removal |
 |---|---|---|---|
-| Hardcoded strategy-name dispatch | `domain_spawner.ml` — `is_grid_strategy` / `is_mm_strategy` (`strategy = "jacobs_ladder" \|\| "Ladder"` / `"market_maker" \|\| "MM"`) and the cleanup dispatch at `domain_spawner.ml:1702-1704` | grid: migration step M2; MM: milestone 4 | dispatch on the compiled strategy instance / strategy file, never on the user's name. A user naming their strategy anything must still run it. |
+| Hardcoded strategy-name dispatch | `domain_spawner.ml` — `is_grid_strategy` (REMOVED, M2) / `is_mm_strategy` (`strategy = "market_maker" \|\| "MM"`) | grid: done; MM: M4 | grid dispatch is now the bound strategy file; MM remains name-detected until ported. |
 | `oracle_tasks.default_trading_config` literal `strategy` | `oracle_tasks.ml` — synthetic CLI fallback config | migration step M2 | derive from the actual bound entry, or leave unset; it is not a name match, but should not assert a built-in name. |
 
 Rationale: strategy behaviour will come from the strategy file (steps/actions), so the engine selects an implementation by the file, not by a built-in name. Hardcoded name dispatch is a bridge only.
 
-**Removed so far:** the coarse `grid_cycle`/`grid_buy`/`grid_sell` actions and `Config_grid_engine.run_cycle` (no longer used by the shipped fine file).
+**Removed so far:** the coarse `grid_cycle`/`grid_buy`/`grid_sell` actions and `Config_grid_engine.run_cycle`; the grid hardcoded-name dispatch (M2); the reference grid live entry point (M3).
 
 ### 9.6 Complete migration plan (remove the old functionality)
 
 Goal: the bound strategy file is the sole decision procedure; the grid reference code is either the registered action library **or** replaced by native action implementations, and no code path selects behaviour by strategy name.
+
+**Status:** M1, M2, M3 **done and verified** (corpus: reference + candidate equivalent on all 10 traces; 19 test binaries). M4 **not started** (a full port with no corpus yet). M5 optional. M6 post-canary.
 
 **Important framing.** Today the fine actions are *wrappers* that call the reference `jacobs_ladder_execution` sub-functions (`grid_prepare`→`evaluate_asset_low_recovery`, `grid_buy_place`→`buy_place_initial`, `grid_sell_*`→the sell phases, …). So the reference grid is **not dead code yet** — it is the implementation. "Removing old functionality" therefore has two distinct meanings, and the plan must pick one per step:
 - **Adopt-as-library**: freeze the reference sub-functions as the registered action implementations and delete only the *scaffolding* (name dispatch, coarse orchestration, `execute_strategy`).
@@ -693,16 +695,22 @@ Goal: the bound strategy file is the sole decision procedure; the grid reference
 
 **Ordered steps** (each gated by the differential harness; `replay --candidate` must stay equivalent):
 
-- **M1 — Event ownership.** Move order-lifecycle handling (`handle_order_filled/cancelled/amended/acknowledged`, `Failed/Rejected/Amendment_*`) from domain-loop reference calls into strategy-file steps triggered by `fill` / `order_lifecycle` events, dispatched through the interpreter. Keeps the reference handlers as the action bodies first; the loop stops calling them directly. Gate: replays that contain fills/cancels/amends stay equivalent (extend the corpus with an amend-race and a partial-fill case).
-- **M2 — Data-driven dispatch.** Replace `is_grid_strategy` name checks with a per-asset *binding* derived from the config entry's `strategy_file` (its compiled file drives dispatch; the interpreter/adapter is chosen by the file's declared capabilities, not by the name). Remove the `"jacobs_ladder" || "Ladder"` literals and the `oracle_tasks` fallback name. Keep `is_mm_strategy` until M4. Gate: rename the strategy file and its `name` to an arbitrary string and confirm identical behaviour.
-- **M3 — Retire the reference entry points (adopt-as-library branch).** Delete `execute_strategy` and the `Jacobs_ladder.Strategy.execute`/`Strategy` orchestration seam; the interpreter is the only per-cycle entry point for bound assets. The reference sub-functions become the documented action library (`JACOBS_LADDER_ACTIONS`). Remove the `config_strategy` flag (bound assets always run the interpreter) and the reference `else` branch in `domain_spawner`. Gate: full corpus (all venues) equivalent via `--candidate`; canary run.
-- **M4 — Port Market Maker.** Decompose `market_maker` into fine actions + file exactly as the grid (milestones 3–M3 applied to MM), then delete `is_mm_strategy`. Out of scope: `Auto_hedger` (abandoned).
+- **M1 — Event ownership. [DONE]** Order-lifecycle events (`filled`/`cancelled`/`acknowledged`/`amended`/`failed`/`rejected`/`amendment_skipped`/`amendment_failed`/`cancel_cleanup`) are routed through the interpreter: the domain loop builds an interpreter event and calls `run_cycle` (file-bound assets), the strategy file has one guarded event step per kind invoking `grid_on_event`, and `grid_on_event` dispatches to the reference handlers. `strategy_replay --candidate` routes recorded events through the file's event steps. Gate met: candidate + reference equivalent on all 10 corpus traces.
+- **M2 — Data-driven dispatch. [DONE]** `load_bound_strategy`/`is_strategy_file_asset`: an entry whose `strategy` names a parsable `strategies/<name>.json` is a strategy-file asset. `is_grid_strategy`, the F&G buffer resolver, `config_grid` construction, `stop_domain` cleanup, and the final flush all key off the binding; the `"jacobs_ladder" || "Ladder"` literals and the `oracle_tasks` fallback name are gone. `is_mm_strategy` retained until M4.
+- **M3 — Retire the reference grid entry points (adopt-as-library). [DONE]** A bound grid asset always runs the interpreter (the `config_strategy` gate is dropped; the key is deprecated/ignored but still parsed for config compatibility). The live loop's reference `execute_strategy` call is removed; the reference decision sub-functions remain as the action library. `execute_strategy` itself is now used only by the offline reference replay (harness) — deleting it is M6, after canary.
+- **M4 — Port Market Maker. [NOT STARTED]** Decompose `market_maker` (1730 lines, 7 handlers) into fine actions + file exactly as the grid, then delete `is_mm_strategy`. Needs an MM corpus (recording MM traces + reference/candidate replay) before it can be verified. Out of scope: `Auto_hedger` (abandoned).
 - **M5 — Remove the reference grid (native branch, optional).** Only if native reimplementation is the goal: rewrite each registered action to own its logic and delete `jacobs_ladder_execution`'s buy/sell internals. Gate: full corpus + canary + an expanded adversarial corpus.
-- **M6 — Delete the harness scaffolding for the port** only after canary confidence: the reference replay path, `emitted_only` comparison against the reference, and the `jacobs_ladder` coarse handlers, retaining the trace/diff tooling for regression tests.
+- **M6 — Delete the harness scaffolding for the port** only after canary confidence: the reference replay path (`Strategy_replay.replay`), `execute_strategy` + the `Strategy` seam, and the reference-vs-candidate comparison, retaining the `--candidate` replay + trace/diff tooling for regression tests.
 
 **Verification gates for every step.** (1) `dio strategy replay [--candidate]` over the multi-venue corpus stays equivalent; (2) `dune test` green; (3) a live canary/shadow period comparing emitted intents on a bound asset; (4) the remaining harness gaps closed or explicitly accepted (§9.4): reclaim-cancel emits fed as inputs, trailing-event-after-last-cycle, and dual-run capture.
 
 **Deletion checklist (final state).** `is_grid_strategy`/`is_mm_strategy`; the hardcoded name literals; `execute_strategy` + the `Strategy` module seam; `config_strategy`; the `oracle_tasks` literal; the coarse `jacobs_ladder` handlers if native; `Auto_hedger` (already out of scope).
+
+**Files to delete (owner action; the agent cannot remove files).** None are deletable yet — each is still referenced until its step:
+- M4 (after the MM port is verified): `src/engine/strategies/market_maker.ml`.
+- M5 (native reimplementation only): `src/engine/strategies/jacobs_ladder/jacobs_ladder_execution.ml`, `jacobs_ladder_events.ml` (and, if fully replaced, `jacobs_ladder_types.ml`, `jacobs_ladder_reservation.ml`, `jacobs_ladder_orders.ml`, `jacobs_ladder_sell_orders.ml`, `jacobs_ladder_config.ml`).
+- M6 (post-canary): none at file level — `execute_strategy`/reference-replay are functions; remove them in place.
+- Independent (`Auto_hedger` abandoned): `src/engine/strategies/auto_hedger.ml` plus its call sites in `domain_spawner.ml` and `src/engine/supervisor/supervisor_orders.ml`, the `hedge` config field, and the dune entry.
 
 ## 10. Open items
 
