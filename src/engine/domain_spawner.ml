@@ -739,7 +739,8 @@ let asset_domain_worker
       let alloc_at_t2 =
         if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
       in
-      if did_ob && latency_this_cycle then Latency_profiler.record_ns prof_ob (t2 - t1);
+      if did_ob && latency_this_cycle && t2 > t1
+      then Latency_profiler.record_ns prof_ob (t2 - t1);
       let was_exec_ready = !exec_ready in
       let event_count = ref 0 in
       if did_exec
@@ -1726,11 +1727,15 @@ let asset_domain_worker
          unattributable. STRAT is the strategy call alone. *)
       if latency_this_cycle
       then (
-        Latency_profiler.record_ns prof_prep (!t3_strategy - t3);
-        if should_execute then Latency_profiler.record_ns prof_strategy (t4 - !t3_strategy));
+        (* Never record a zero-span sample: a phase that did no work this cycle must leave
+           the window with no sample, so the dashboard keeps the last meaningful value
+           instead of resetting the cell to 0. *)
+        if !t3_strategy > t3 then Latency_profiler.record_ns prof_prep (!t3_strategy - t3);
+        if should_execute && t4 > !t3_strategy
+        then Latency_profiler.record_ns prof_strategy (t4 - !t3_strategy));
       (* Exec histogram writes deferred from [t3] (see above): now outside both the STRAT
          and CYCLE measured spans. *)
-      if exec_per_event_ns >= 0
+      if exec_per_event_ns > 0
       then
         for _ = 1 to !event_count do
           Latency_profiler.record_ns prof_exec exec_per_event_ns
@@ -1745,7 +1750,7 @@ let asset_domain_worker
          Exchange_wakeup.wait_since sleep. Only busy cycles are recorded; idle wakeups
          would pin cycle p50/p99 at 0us. *)
       let cycle_busy = did_ob || did_exec || should_execute in
-      if latency_this_cycle && cycle_busy
+      if latency_this_cycle && cycle_busy && t4 > t1
       then
         if (* Cause string is built only for a new window maximum, avoiding a per-cycle
               closure and [alloc_start] box. *)
@@ -1792,8 +1797,9 @@ let asset_domain_worker
             | Some cs when should_execute ->
               let us ns = Latency_profiler.format_us (float ns /. 1000.0) in
               Printf.sprintf
-                " strat[pre=%s sync=%dw/%s(scan %s rec %s n %d) ledger=%d buy=%dw/%s \
+                " strat[pre=%dw/%s sync=%dw/%s(scan %s rec %s n %d) ledger=%d buy=%dw/%s \
                  sell=%dw/%s cln=%dw/%s]"
+                cs.alloc_preamble_words
                 (us cs.time_preamble_ns)
                 cs.alloc_sync_words
                 (us cs.time_sync_ns)

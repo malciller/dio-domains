@@ -249,7 +249,7 @@ let bench_strategy_cycle () =
         run_bench p n (fun () -> ignore (SR.run_cycle rt ~price:100.0 ~now:1.0 ~event)))
     in
     let words = (Gc.minor_words () -. w0) /. float n in
-    Printf.eprintf "  %s: %.1f words/cycle (interpreter core)\n%!" name words;
+    Printf.printf "  %s: %.1f words/cycle (interpreter core)\n%!" name words;
     name, n, LP.percentile p 0.50, LP.percentile p 0.90, LP.percentile p 0.99, total_ms
 ;;
 
