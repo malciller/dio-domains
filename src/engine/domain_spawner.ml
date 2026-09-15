@@ -1756,22 +1756,23 @@ let asset_domain_worker
           let phase_str =
             match cached_grid_state with
             | Some cs when should_execute ->
+              let us ns = Latency_profiler.format_us (float ns /. 1000.0) in
               Printf.sprintf
-                " strat[pre=%dus sync=%dw/%dus(scan %dus rec %dus n %d) ledger=%d \
-                 buy=%dw/%dus sell=%dw/%dus cln=%dw/%dus]"
-                (cs.time_preamble_ns / 1000)
+                " strat[pre=%s sync=%dw/%s(scan %s rec %s n %d) ledger=%d buy=%dw/%s \
+                 sell=%dw/%s cln=%dw/%s]"
+                (us cs.time_preamble_ns)
                 cs.alloc_sync_words
-                (cs.time_sync_ns / 1000)
-                (cs.time_sync_scan_ns / 1000)
-                (cs.time_sync_rec_ns / 1000)
+                (us cs.time_sync_ns)
+                (us cs.time_sync_scan_ns)
+                (us cs.time_sync_rec_ns)
                 cs.sync_orders_seen
                 (Hashtbl.length cs.sell_commitments)
                 cs.alloc_buy_words
-                (cs.time_buy_ns / 1000)
+                (us cs.time_buy_ns)
                 cs.alloc_sell_words
-                (cs.time_sell_ns / 1000)
+                (us cs.time_sell_ns)
                 cs.alloc_cleanup_words
-                (cs.time_cleanup_ns / 1000)
+                (us cs.time_cleanup_ns)
             | _ -> ""
           in
           Latency_profiler.set_cause
