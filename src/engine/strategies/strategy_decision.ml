@@ -1452,52 +1452,28 @@ let sell_leg_place
     else nothing_placeable := true)
 ;;
 
-(** Sell leg phase 3: retry-latch bookkeeping, nothing-to-sell consumption, excess sweep. *)
-let sell_leg_finalize
+(** Sell finalize phase 1: retry-latch / nothing-to-sell bookkeeping. *)
+let sell_leg_finalize_latch
   ~state
-  ~now
+  ~now:_
   ~(asset : trading_config)
   ~asset_balance
   ~buy_attempted
   ~ecfg
-  ~base_balance_age
   ~pre
   =
-  let is_alpaca = pre.sp_is_alpaca in
   let inventory_ok = pre.sp_inventory_ok in
   let inventory_basis = pre.sp_inventory_basis in
   let min_notional = pre.sp_min_notional in
   let base_ref_price = pre.sp_base_ref_price in
-  let missing_after_reconcile = pre.sp_missing_after_reconcile in
-  let available_base = pre.sp_available_base in
-  let reserve_headroom = pre.sp_reserve_headroom in
   let sell_pushed = pre.sp_sell_pushed in
   let nothing_placeable = pre.sp_nothing_placeable in
-  (* Retry semantics: the sell for a completed buy (or a buy placement) is OWED until it
-     is actually placed. Transient blockers (sell cooldown, asset_low, a NaN balance
-     snapshot, an in-flight sell placement) do NOT consume the trigger, so the leg retries
-     on the next tick - with or without a replacement buy (capital exhausted /
-     oracle-halted). Only a placed sell or a verified nothing-to-sell (known balance below
-     the venue floor) clears the latch; a later fill or placement re-arms it. This is what
-     keeps the last filled buy's inventory sellable when there is no capital to replace
-     the buy. *)
   if !sell_pushed || !nothing_placeable
   then state.just_filled_buy <- false
   else if buy_attempted && not state.just_filled_buy
   then (
     state.just_filled_buy <- true;
-    (* A freshly armed obligation must always surface its first blocker immediately, even
-       if the same blocker kind logged inside the dedup window for a previous obligation. *)
     state.last_sell_block_reason <- "");
-  (* Verified nothing-to-sell (remaintain venues - Alpaca): the trigger is armed but the
-     fresh balance figure is below the venue's order floor, so the owed sell cannot place
-     in this state. Consume the latch here - the placement block above can never reach it
-     for remaintain venues because [missing_alpaca_sell_grid] itself requires
-     [inventory_ok]. Leaving the latch armed re-fires the inventory-gate warn every tick
-     for the life of a dust balance. Recovery paths re-arm placement on their own: a
-     buy-fill event re-arms this latch, and the persistent (open_sell_orders = [] /\
-     last_buy_fill_price) grid-maintenance clause re-places the fill-anchored sell once
-     inventory clears the floor. *)
   if ecfg.remaintain_expired_sells
      && state.just_filled_buy
      && (not (Float.is_nan asset_balance))
@@ -1511,15 +1487,41 @@ let sell_leg_finalize
       asset.symbol
       (Float.max 0.0 inventory_basis)
       min_notional
-      base_ref_price);
-  (* Alpaca excess-inventory sweep: the ladder is refilled first (every rung restored from
-     the tracker); only once NO rung is missing do we route the leftover sellable base
-     onto the TOP rung as a qty-only amend, so the surplus is offered at the best price
-     instead of sitting idle. Runs after the retry block so a blocked owed sell keeps its
-     reservation and never races the amend. The sweep allowance is the min of the venue
-     free figure and the local ledger headroom ([position - reserved_base - committed]) so
-     a stale/hung balance snapshot cannot size it into reserved_base, and a stale snapshot
-     blocks the sweep outright. *)
+      base_ref_price)
+;;
+
+(** Sell finalize phase 2: Alpaca excess-inventory sweep onto the top rung. The file gates
+    when this runs; this only performs the sweep. *)
+let sell_excess_sweep_phase ~state ~now ~(asset : trading_config) ~pre ~ecfg =
+  let is_alpaca = pre.sp_is_alpaca in
+  let min_notional = pre.sp_min_notional in
+  let available_base = pre.sp_available_base in
+  let reserve_headroom = pre.sp_reserve_headroom in
+  let sweep_available =
+    let venue = Float.max 0.0 available_base in
+    if is_alpaca then Float.min venue reserve_headroom else venue
+  in
+  evaluate_excess_sweep ~state ~now ~asset ~available:sweep_available ~min_notional ~ecfg
+;;
+
+(** Sell finalize phase 3: clear the one-cycle resume marker. *)
+let sell_finalize_end ~state = state.resuming_after_balance_flag <- false
+
+(** Sell finalize: retry-latch bookkeeping, excess sweep, resume-marker clear. Reference
+    recombination. *)
+let sell_leg_finalize
+  ~state
+  ~now
+  ~(asset : trading_config)
+  ~asset_balance
+  ~buy_attempted
+  ~ecfg
+  ~base_balance_age
+  ~pre
+  =
+  sell_leg_finalize_latch ~state ~now ~asset ~asset_balance ~buy_attempted ~ecfg ~pre;
+  let missing_after_reconcile = pre.sp_missing_after_reconcile in
+  let sell_pushed = pre.sp_sell_pushed in
   if ecfg.remaintain_expired_sells
      && !missing_after_reconcile = []
      && (not state.just_filled_buy)
@@ -1532,19 +1534,8 @@ let sell_leg_finalize
      match base_balance_age with
      | Some age -> age <= sweep_max_balance_age_s
      | None -> true
-  then (
-    let sweep_available =
-      let venue = Float.max 0.0 available_base in
-      if is_alpaca then Float.min venue reserve_headroom else venue
-    in
-    evaluate_excess_sweep
-      ~state
-      ~now
-      ~asset
-      ~available:sweep_available
-      ~min_notional
-      ~ecfg);
-  state.resuming_after_balance_flag <- false
+  then sell_excess_sweep_phase ~state ~now ~asset ~pre ~ecfg;
+  sell_finalize_end ~state
 ;;
 
 let evaluate_sell_leg

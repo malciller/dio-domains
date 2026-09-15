@@ -345,6 +345,10 @@ module Stub_engine = struct
   let sell_prepare _ = ()
   let sell_place _ = ()
   let sell_finalize _ = ()
+  let sell_finalize_facts _ = []
+  let sell_finalize_latch _ = ()
+  let sell_excess_sweep_phase _ = ()
+  let sell_finalize_end _ = ()
   let on_event _ _ = ()
 end
 

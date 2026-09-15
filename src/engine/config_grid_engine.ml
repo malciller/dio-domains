@@ -623,6 +623,69 @@ let sell_place c =
   | _ -> ()
 ;;
 
+(** Fine path sell phase 3 facts: publish the excess-sweep gate. *)
+let sell_finalize_facts c =
+  match c.cg_sell_pre with
+  | Some pre ->
+    let remaintain =
+      match c.cg_ecfg with
+      | Some e -> e.remaintain_expired_sells
+      | None -> false
+    in
+    let just_filled, resuming, active_sell =
+      match c.cg_state with
+      | Some st ->
+        st.just_filled_buy, st.resuming_after_balance_flag, Jac.has_active_sell st
+      | None -> false, false, false
+    in
+    let balance_fresh =
+      match c.cg_base_age with
+      | Some age -> age <= Dio_strategies.Platform_accounting.sweep_max_balance_age_s
+      | None -> true
+    in
+    [ "remaintain_expired_sells", Dio_strategies.Strategy_expr.V_bool remaintain
+    ; ( "sell_missing_empty"
+      , Dio_strategies.Strategy_expr.V_bool (!(pre.sp_missing_after_reconcile) = []) )
+    ; "just_filled_buy", Dio_strategies.Strategy_expr.V_bool just_filled
+    ; "resuming_after_balance", Dio_strategies.Strategy_expr.V_bool resuming
+    ; "buy_attempted", Dio_strategies.Strategy_expr.V_bool c.cg_buy_attempted
+    ; "sell_pushed", Dio_strategies.Strategy_expr.V_bool !(pre.sp_sell_pushed)
+    ; "has_active_sell", Dio_strategies.Strategy_expr.V_bool active_sell
+    ; "balance_fresh", Dio_strategies.Strategy_expr.V_bool balance_fresh
+    ]
+  | None -> []
+;;
+
+(** Fine path sell phase 3a: retry-latch bookkeeping. *)
+let sell_finalize_latch c =
+  match c.cg_state, c.cg_asset, c.cg_ecfg, c.cg_sell_pre with
+  | Some state, Some asset, Some ecfg, Some pre ->
+    Jac.sell_leg_finalize_latch
+      ~state
+      ~now:c.cg_now
+      ~asset
+      ~asset_balance:c.cg_abal
+      ~buy_attempted:c.cg_buy_attempted
+      ~ecfg
+      ~pre
+  | _ -> ()
+;;
+
+(** Fine path sell phase 3b: excess sweep (the file gates when it runs). *)
+let sell_excess_sweep_phase c =
+  match c.cg_state, c.cg_asset, c.cg_ecfg, c.cg_sell_pre with
+  | Some state, Some asset, Some ecfg, Some pre ->
+    Jac.sell_excess_sweep_phase ~state ~now:c.cg_now ~asset ~pre ~ecfg
+  | _ -> ()
+;;
+
+(** Fine path sell phase 3c: clear the resume marker. *)
+let sell_finalize_end c =
+  match c.cg_state with
+  | Some state -> Jac.sell_finalize_end ~state
+  | None -> ()
+;;
+
 (** Fine path sell phase 3: retry-latch bookkeeping, consumption, excess sweep. *)
 let sell_finalize c =
   match c.cg_state, c.cg_asset, c.cg_ecfg, c.cg_sell_pre with

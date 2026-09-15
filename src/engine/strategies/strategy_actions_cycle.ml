@@ -176,6 +176,10 @@ module type ENGINE = sig
   val sell_prepare : ctx -> unit
   val sell_place : ctx -> unit
   val sell_finalize : ctx -> unit
+  val sell_finalize_facts : ctx -> (string * Strategy_expr.value) list
+  val sell_finalize_latch : ctx -> unit
+  val sell_excess_sweep_phase : ctx -> unit
+  val sell_finalize_end : ctx -> unit
   val on_event : ctx -> Strategy_runtime.event -> unit
 end
 
@@ -267,6 +271,20 @@ module Make (E : ENGINE) = struct
             []
           | "sell_finalize" ->
             E.sell_finalize ctx;
+            []
+          | "sell_finalize_facts" ->
+            List.iter
+              (fun (k, v) -> Strategy_runtime.set_platform t k v)
+              (E.sell_finalize_facts ctx);
+            []
+          | "sell_finalize_latch" ->
+            E.sell_finalize_latch ctx;
+            []
+          | "sell_excess_sweep_phase" ->
+            E.sell_excess_sweep_phase ctx;
+            []
+          | "sell_finalize_end" ->
+            E.sell_finalize_end ctx;
             []
           | "on_event" ->
             (match Strategy_runtime.current_event t with
