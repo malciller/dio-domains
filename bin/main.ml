@@ -4,30 +4,31 @@
     - Parse CLI arguments; load engine configuration from config.json.
     - Initialize logging, GC tuning, and CSPRNG backend.
     - Force the Conduit TLS context to avoid Lazy.force races across OCaml 5 domains.
-    - Start the Supervisor (establishes websocket feeds; returns fee-augmented
-      trading configs).
+    - Start the Supervisor (establishes websocket feeds; returns fee-augmented trading
+      configs).
     - Spawn one supervised domain per asset via Domain_spawner.
-    - Launch the Order Executor, Discord notifier, and Dashboard UDS server as
-      background Lwt fibers.
+    - Launch the Order Executor, Discord notifier, and Dashboard UDS server as background
+      Lwt fibers.
     - Run a memory reporter at 600s intervals in the main Lwt scheduler.
 
     Shutdown: SIGINT/SIGTERM starts graceful shutdown (liquidate Hyperliquid hedge
     positions, tear down feeds/domains) with forced exit after a 3s timeout;
-    SIGSEGV/SIGABRT/SIGBUS/SIGFPE handlers capture crash diagnostics. The process
-    blocks on a shutdown condition variable. *)
+    SIGSEGV/SIGABRT/SIGBUS/SIGFPE handlers capture crash diagnostics. The process blocks
+    on a shutdown condition variable. *)
 
 open Lwt.Infix
 
-(* OxCaml marks [Sys.set_signal] as [unsafe_multidomain]. Handlers are installed once
-   from the main domain and touch only atomics, Lwt state, and logging; they close
-   over process-wide state and are not [portable], so [Sys.Safe.set_signal] cannot
-   express them. Acknowledged rather than rewritten. *)
+(* OxCaml marks [Sys.set_signal] as [unsafe_multidomain]. Handlers are installed once from
+   the main domain and touch only atomics, Lwt state, and logging; they close over
+   process-wide state and are not [portable], so [Sys.Safe.set_signal] cannot express
+   them. Acknowledged rather than rewritten. *)
 [@@@alert "-unsafe_multidomain"]
 
 (* Capital-oracle runtime; explicit alias avoids opening the whole Dio_oracle namespace. *)
 module Oracle_runtime = Dio_oracle.Oracle_runtime
 
-(** Enable backtraces only when DIO_BACKTRACE is set; avoids allocation overhead in production. *)
+(** Enable backtraces only when DIO_BACKTRACE is set; avoids allocation overhead in
+    production. *)
 let () = Printexc.record_backtrace (Sys.getenv_opt "DIO_BACKTRACE" |> Option.is_some)
 
 module Fear_and_greed = Cmc.Fear_and_greed
@@ -35,9 +36,9 @@ module Fear_and_greed = Cmc.Fear_and_greed
 (** atexit handler: flush persistence and emit a final log entry on process termination. *)
 let () =
   at_exit (fun () ->
-    (* Flush coalesced persistence writes synchronously; prevents loss of in-memory
-       state (accumulation P&L, last_fill_oid, sell levels) within the async-save
-       coalesce window at process exit. *)
+    (* Flush coalesced persistence writes synchronously; prevents loss of in-memory state
+       (accumulation P&L, last_fill_oid, sell levels) within the async-save coalesce
+       window at process exit. *)
     Dio_persistence.Persistence_orchestrator.flush_all ();
     Logging.info ~section:"main" "Process exiting - final cleanup complete")
 ;;
@@ -81,199 +82,201 @@ let close_hedged_positions () =
     if wallet = ""
     then Lwt.return_unit
     else (
-      (* Partition hedge configs by testnet flag to deduplicate REST calls per environment. *)
+      (* Partition hedge configs by testnet flag to deduplicate REST calls per
+         environment. *)
       let testnet_map = Hashtbl.create 2 in
       List.iter
         (fun (hedge_symbol, testnet) ->
-           let existing =
-             try Hashtbl.find testnet_map testnet with
-             | _ -> []
-           in
-           Hashtbl.replace testnet_map testnet (hedge_symbol :: existing))
+          let existing =
+            try Hashtbl.find testnet_map testnet with
+            | _ -> []
+          in
+          Hashtbl.replace testnet_map testnet (hedge_symbol :: existing))
         hedge_configs;
       let testnet_envs =
         Hashtbl.fold (fun tnet syms acc -> (tnet, syms) :: acc) testnet_map []
       in
       Lwt_list.iter_s
         (fun (testnet, active_symbols) ->
-           let base_url =
-             if testnet
-             then "https://api.hyperliquid-testnet.xyz"
-             else "https://api.hyperliquid.xyz"
-           in
-           Lwt.catch
-             (fun () ->
-                let open Cohttp_lwt_unix in
-                let url = Uri.of_string (base_url ^ "/info") in
-                let body_json =
-                  Printf.sprintf {|{"type":"clearinghouseState","user":"%s"}|} wallet
-                in
-                let body = Cohttp_lwt.Body.of_string body_json in
-                let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
-                Client.post ~headers ~body url
-                >>= fun (_resp, resp_body) ->
-                Cohttp_lwt.Body.to_string resp_body
-                >>= fun body_str ->
-                (* Phase 1: Cancel outstanding hedge orders. *)
-                let open_orders_body =
-                  Printf.sprintf {|{"type":"openOrders","user":"%s"}|} wallet
-                in
-                let open_orders_req = Cohttp_lwt.Body.of_string open_orders_body in
-                Client.post ~headers ~body:open_orders_req url
-                >>= fun (_resp2, resp_body2) ->
-                Cohttp_lwt.Body.to_string resp_body2
-                >>= fun orders_str ->
-                (try
-                   let open Yojson.Safe.Util in
-                   let orders_json = Yojson.Safe.from_string orders_str in
-                   let open_orders =
-                     match orders_json with
-                     | `List l -> l
-                     | _ -> []
-                   in
-                   let hedge_orders =
-                     List.filter_map
-                       (fun o ->
-                          let coin = member "coin" o |> to_string in
-                          let oid =
-                            match member "oid" o with
-                            | `Int i -> Some (Int64.of_int i)
-                            | `Intlit s -> Some (Int64.of_string s)
-                            | _ -> None
-                          in
-                          if List.mem coin active_symbols
-                          then Option.map (fun id -> coin, id) oid
-                          else None)
-                       open_orders
-                   in
-                   if hedge_orders <> []
-                   then (
-                     Logging.warn_f
-                       ~section:"main"
-                       "Found %d open hedge orders to cancel on shutdown"
-                       (List.length hedge_orders);
-                     Lwt_list.iter_s
-                       (fun (symbol, oid) ->
-                          Logging.info_f
-                            ~section:"main"
-                            "Cancelling open hedge order %Ld for %s"
-                            oid
-                            symbol;
-                          Hyperliquid.Actions.cancel_orders
-                            ~symbol
-                            ~order_ids:[ oid ]
-                            ~testnet
-                          >>= function
-                          | Ok () ->
-                            Logging.info_f ~section:"main" "Cancelled hedge order %Ld" oid;
-                            Lwt.return_unit
-                          | Error err ->
-                            Logging.error_f
-                              ~section:"main"
-                              "Failed to cancel hedge order %Ld: %s"
-                              oid
-                              err;
-                            Lwt.return_unit)
-                       hedge_orders)
-                   else Lwt.return_unit
-                 with
-                 | _ -> Lwt.return_unit)
-                >>= fun () ->
-                (* Phase 2: Close open hedge positions via market orders. *)
-                let open Yojson.Safe.Util in
-                let json = Yojson.Safe.from_string body_str in
-                let asset_positions = member "assetPositions" json |> to_list in
-                let close_orders =
-                  List.filter_map
-                    (fun item ->
-                       try
-                         let pos = member "position" item in
-                         let coin = member "coin" pos |> to_string in
-                         let szi_str = member "szi" pos |> to_string in
-                         let szi = float_of_string szi_str in
-                         if szi <> 0.0 && List.mem coin active_symbols
-                         then (
-                           let is_buy = szi < 0.0 in
-                           (* Negative szi = short position; buy to close. Positive = long; sell to close. *)
-                           let qty_abs = Float.abs szi in
-                           Some (coin, is_buy, qty_abs))
-                         else None
-                       with
-                       | _ -> None)
-                    asset_positions
-                in
-                if close_orders = []
-                then (
-                  Logging.info
-                    ~section:"main"
-                    "No open Hedger perp positions detected for closure.";
-                  Lwt.return_unit)
-                else (
-                  Logging.warn_f
-                    ~section:"main"
-                    "Executing Market Orders to liquidate %d open Hedger perp positions!"
-                    (List.length close_orders);
-                  Lwt_list.iter_s
-                    (fun (symbol, is_buy, qty) ->
-                       let auth_token =
-                         match Supervisor.Token_store.get () with
-                         | Some token -> token
-                         | None -> "temp_token"
+          let base_url =
+            if testnet
+            then "https://api.hyperliquid-testnet.xyz"
+            else "https://api.hyperliquid.xyz"
+          in
+          Lwt.catch
+            (fun () ->
+              let open Cohttp_lwt_unix in
+              let url = Uri.of_string (base_url ^ "/info") in
+              let body_json =
+                Printf.sprintf {|{"type":"clearinghouseState","user":"%s"}|} wallet
+              in
+              let body = Cohttp_lwt.Body.of_string body_json in
+              let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
+              Client.post ~headers ~body url
+              >>= fun (_resp, resp_body) ->
+              Cohttp_lwt.Body.to_string resp_body
+              >>= fun body_str ->
+              (* Phase 1: Cancel outstanding hedge orders. *)
+              let open_orders_body =
+                Printf.sprintf {|{"type":"openOrders","user":"%s"}|} wallet
+              in
+              let open_orders_req = Cohttp_lwt.Body.of_string open_orders_body in
+              Client.post ~headers ~body:open_orders_req url
+              >>= fun (_resp2, resp_body2) ->
+              Cohttp_lwt.Body.to_string resp_body2
+              >>= fun orders_str ->
+              (try
+                 let open Yojson.Safe.Util in
+                 let orders_json = Yojson.Safe.from_string orders_str in
+                 let open_orders =
+                   match orders_json with
+                   | `List l -> l
+                   | _ -> []
+                 in
+                 let hedge_orders =
+                   List.filter_map
+                     (fun o ->
+                       let coin = member "coin" o |> to_string in
+                       let oid =
+                         match member "oid" o with
+                         | `Int i -> Some (Int64.of_int i)
+                         | `Intlit s -> Some (Int64.of_string s)
+                         | _ -> None
                        in
-                       let request =
-                         { Dio_engine.Order_executor.order_type = "market"
-                         ; side = (if is_buy then "buy" else "sell")
-                         ; quantity = qty
-                         ; symbol
-                         ; limit_price = None
-                         ; time_in_force = Some "IOC"
-                         ; post_only = Some false
-                         ; margin = None
-                         ; reduce_only = Some true
-                         ; (* Ensure order only reduces existing hedge position. *)
-                           order_userref = Some 3
-                         ; (* Maps to strategy_userref_hedge. *)
-                           cl_ord_id = None
-                         ; trigger_price = None
-                         ; trigger_price_type = None
-                         ; display_qty = None
-                         ; fee_preference = None
-                         ; duplicate_key =
-                             "hedge_close_"
-                             ^ symbol
-                             ^ "_"
-                             ^ string_of_float (Unix.gettimeofday ())
-                         ; exchange = "hyperliquid"
-                         }
-                       in
-                       Dio_engine.Order_executor.place_order
-                         ~token:auth_token
-                         ~check_duplicate:false
-                         request
+                       if List.mem coin active_symbols
+                       then Option.map (fun id -> coin, id) oid
+                       else None)
+                     open_orders
+                 in
+                 if hedge_orders <> []
+                 then (
+                   Logging.warn_f
+                     ~section:"main"
+                     "Found %d open hedge orders to cancel on shutdown"
+                     (List.length hedge_orders);
+                   Lwt_list.iter_s
+                     (fun (symbol, oid) ->
+                       Logging.info_f
+                         ~section:"main"
+                         "Cancelling open hedge order %Ld for %s"
+                         oid
+                         symbol;
+                       Hyperliquid.Actions.cancel_orders
+                         ~symbol
+                         ~order_ids:[ oid ]
+                         ~testnet
                        >>= function
-                       | Ok res ->
-                         Logging.info_f
-                           ~section:"main"
-                           "Hedge %s closed: %s %.8f (Order ID: %s)"
-                           symbol
-                           (if is_buy then "Buy" else "Sell")
-                           qty
-                           res.Dio_exchange.Exchange_intf.Types.order_id;
+                       | Ok () ->
+                         Logging.info_f ~section:"main" "Cancelled hedge order %Ld" oid;
                          Lwt.return_unit
                        | Error err ->
                          Logging.error_f
                            ~section:"main"
-                           "Hedge %s closure failed: %s"
-                           symbol
+                           "Failed to cancel hedge order %Ld: %s"
+                           oid
                            err;
                          Lwt.return_unit)
-                    close_orders))
-             (fun exn ->
-                Logging.error_f
+                     hedge_orders)
+                 else Lwt.return_unit
+               with
+               | _ -> Lwt.return_unit)
+              >>= fun () ->
+              (* Phase 2: Close open hedge positions via market orders. *)
+              let open Yojson.Safe.Util in
+              let json = Yojson.Safe.from_string body_str in
+              let asset_positions = member "assetPositions" json |> to_list in
+              let close_orders =
+                List.filter_map
+                  (fun item ->
+                    try
+                      let pos = member "position" item in
+                      let coin = member "coin" pos |> to_string in
+                      let szi_str = member "szi" pos |> to_string in
+                      let szi = float_of_string szi_str in
+                      if szi <> 0.0 && List.mem coin active_symbols
+                      then (
+                        let is_buy = szi < 0.0 in
+                        (* Negative szi = short position; buy to close. Positive = long;
+                           sell to close. *)
+                        let qty_abs = Float.abs szi in
+                        Some (coin, is_buy, qty_abs))
+                      else None
+                    with
+                    | _ -> None)
+                  asset_positions
+              in
+              if close_orders = []
+              then (
+                Logging.info
                   ~section:"main"
-                  "Failed to retrieve open perp positions for shutdown: %s"
-                  (Printexc.to_string exn);
-                Lwt.return_unit))
+                  "No open Hedger perp positions detected for closure.";
+                Lwt.return_unit)
+              else (
+                Logging.warn_f
+                  ~section:"main"
+                  "Executing Market Orders to liquidate %d open Hedger perp positions!"
+                  (List.length close_orders);
+                Lwt_list.iter_s
+                  (fun (symbol, is_buy, qty) ->
+                    let auth_token =
+                      match Supervisor.Token_store.get () with
+                      | Some token -> token
+                      | None -> "temp_token"
+                    in
+                    let request =
+                      { Dio_engine.Order_executor.order_type = "market"
+                      ; side = (if is_buy then "buy" else "sell")
+                      ; quantity = qty
+                      ; symbol
+                      ; limit_price = None
+                      ; time_in_force = Some "IOC"
+                      ; post_only = Some false
+                      ; margin = None
+                      ; reduce_only = Some true
+                      ; (* Ensure order only reduces existing hedge position. *)
+                        order_userref = Some 3
+                      ; (* Maps to strategy_userref_hedge. *)
+                        cl_ord_id = None
+                      ; trigger_price = None
+                      ; trigger_price_type = None
+                      ; display_qty = None
+                      ; fee_preference = None
+                      ; duplicate_key =
+                          "hedge_close_"
+                          ^ symbol
+                          ^ "_"
+                          ^ string_of_float (Unix.gettimeofday ())
+                      ; exchange = "hyperliquid"
+                      }
+                    in
+                    Dio_engine.Order_executor.place_order
+                      ~token:auth_token
+                      ~check_duplicate:false
+                      request
+                    >>= function
+                    | Ok res ->
+                      Logging.info_f
+                        ~section:"main"
+                        "Hedge %s closed: %s %.8f (Order ID: %s)"
+                        symbol
+                        (if is_buy then "Buy" else "Sell")
+                        qty
+                        res.Dio_exchange.Exchange_intf.Types.order_id;
+                      Lwt.return_unit
+                    | Error err ->
+                      Logging.error_f
+                        ~section:"main"
+                        "Hedge %s closure failed: %s"
+                        symbol
+                        err;
+                      Lwt.return_unit)
+                  close_orders))
+            (fun exn ->
+              Logging.error_f
+                ~section:"main"
+                "Failed to retrieve open perp positions for shutdown: %s"
+                (Printexc.to_string exn);
+              Lwt.return_unit))
         testnet_envs))
 ;;
 
@@ -323,12 +326,14 @@ let setup_signal_handlers () =
   Runtime_compat.set_signal Sys.sigterm (Sys.Signal_handle handle_graceful_shutdown)
 ;;
 
-(* Force module initialization to trigger exchange-implementation side-effect registration. *)
+(* Force module initialization to trigger exchange-implementation side-effect
+   registration. *)
 let () = ignore Kraken.Kraken_module.Kraken_impl.name
 let () = ignore Hyperliquid.Module.Hyperliquid_impl.name
 let () = ignore Alpaca.Module.Alpaca_impl.name
 
-(** Register handlers for fatal signals (SIGSEGV, SIGABRT, SIGBUS, SIGFPE) to capture diagnostics before exit. *)
+(** Register handlers for fatal signals (SIGSEGV, SIGABRT, SIGBUS, SIGFPE) to capture
+    diagnostics before exit. *)
 let setup_fatal_signal_handlers () =
   let handle_fatal_signal signum =
     let signal_name =
@@ -385,11 +390,12 @@ let setup_fatal_signal_handlers () =
   (* Register handlers for fatal signals using raw signal numbers (not defined in Sys). *)
   List.iter
     (fun signal ->
-       Runtime_compat.set_signal signal (Sys.Signal_handle handle_fatal_signal))
+      Runtime_compat.set_signal signal (Sys.Signal_handle handle_fatal_signal))
     [ 11; 6; 7; 8; 10 ]
 ;;
 
-(** Override Lwt.async_exception_hook to log unhandled async exceptions without terminating the process. *)
+(** Override Lwt.async_exception_hook to log unhandled async exceptions without
+    terminating the process. *)
 let setup_lwt_exception_handler () =
   Lwt.async_exception_hook
   := fun exn ->
@@ -410,7 +416,8 @@ let usage_msg =
   "Dio Trading Engine\n\nUsage: " ^ Sys.argv.(0) ^ "\n\nStarts the trading engine."
 ;;
 
-(** Synchronous trading engine initialization: fetches market sentiment, starts supervisor monitoring, and spawns per-asset domains. *)
+(** Synchronous trading engine initialization: fetches market sentiment, starts supervisor
+    monitoring, and spawns per-asset domains. *)
 let init_trading_engine_sync (config : Dio_engine.Config.config) =
   (* Pre-fetch Fear & Greed index before websocket connections are established. *)
   Logging.info ~section:"main" "Step 0: Fetching Fear & Greed index...";
@@ -447,24 +454,22 @@ let init_trading_engine_sync (config : Dio_engine.Config.config) =
     ~section:"main"
     "%d supervised asset domains initialized!"
     (List.length configs_with_fees);
-  (* Start the capital-oracle live runtime as a supervised module: registered in
-     the supervisor's connection registry, driven by the standard lifecycle
-     machinery, heartbeated on each pass and liveness tick, and auto-restarted by
-     the health monitor if its loop dies. One analysis pass runs immediately, then
-     background refreshes on the configured cadence. Trading domains read the
-     published qty / grid_interval / active decisions every cycle; on_publish wakes
-     them so a new decision applies immediately rather than on the next market
-     event. Failure modes (network, history, balance) fall back to last-known-good
-     and never block or crash the engine. *)
+  (* Start the capital-oracle live runtime as a supervised module: registered in the
+     supervisor's connection registry, driven by the standard lifecycle machinery,
+     heartbeated on each pass and liveness tick, and auto-restarted by the health monitor
+     if its loop dies. One analysis pass runs immediately, then background refreshes on
+     the configured cadence. Trading domains read the published qty / grid_interval /
+     active decisions every cycle; on_publish wakes them so a new decision applies
+     immediately rather than on the next market event. Failure modes (network, history,
+     balance) fall back to last-known-good and never block or crash the engine. *)
   (try
      Supervisor.start_oracle
        ~config:(Option.value config.oracle ~default:(Oracle_runtime.default_config ()))
        ~trading:configs_with_fees
        ~on_publish:(fun changed_symbols _decisions ->
-         (* Signal only the domains whose asset's decision changed this pass; each
-            domain blocks on its own per-symbol condition, so unrelated domains are
-            never woken. Decision reads are lock-free via decision_for, cached on
-            publish_generation. *)
+         (* Signal only the domains whose asset's decision changed this pass; each domain
+            blocks on its own per-symbol condition, so unrelated domains are never woken.
+            Decision reads are lock-free via decision_for, cached on publish_generation. *)
          List.iter
            (fun symbol -> Concurrency.Exchange_wakeup.signal ~symbol)
            changed_symbols)
@@ -489,6 +494,11 @@ let init_order_executor_async () =
 let init_discord_notifier () = Discord.Notifier.start ()
 
 let () =
+  (* Strategy-file tooling (e.g. `dio strategy validate <file>`) runs without booting the
+     engine. *)
+  (match Dio_strategies.Strategy_cli.maybe_run Sys.argv with
+   | Some code -> exit code
+   | None -> ());
   (* Parse CLI arguments. *)
   Arg.parse speclist (fun _ -> ()) usage_msg;
   (* Initialize the logging subsystem. *)
@@ -508,7 +518,7 @@ let () =
   Dio_persistence.Persistence_orchestrator.register_configured_strategies
     (List.map
        (fun (t : Dio_engine.Config.trading_config) ->
-          t.strategy, t.symbol, t.exchange, t.base_accumulation, t.sell_levels)
+         t.strategy, t.symbol, t.exchange, t.base_accumulation, t.sell_levels)
        config.trading);
   Dio_persistence.Persistence_orchestrator.migrate_if_legacy ();
   (* Apply GC tuning parameters from config if specified. *)
@@ -526,17 +536,16 @@ let () =
        ; Gc.major_heap_increment = gc_cfg.major_heap_increment
        }
    | None -> ());
-  (* Start the stop-the-world canary after GC configuration is applied so it
-     observes the same collector settings as the trading domains; its window
-     cadence matches the per-domain latency windows, allowing a global pause to be
-     matched to the domain cycles that spiked. Disable with DIO_CANARY=0. *)
+  (* Start the stop-the-world canary after GC configuration is applied so it observes the
+     same collector settings as the trading domains; its window cadence matches the
+     per-domain latency windows, allowing a global pause to be matched to the domain
+     cycles that spiked. Disable with DIO_CANARY=0. *)
   Canary.start ();
-  (* Periodic memory reporter on an Lwt timer (600s interval). Runs in the main
-     domain scheduler, avoiding the prior Gc.create_alarm approach: alarm callbacks
-     run in GC signal context, where Mutex.lock is unsafe on OCaml 5.x if the
-     alarmed domain already holds the lock (latent deadlock on InFlightOrders/
-     Amendments mutexes), and cycle_mod=10000 with space_overhead=20 fired without
-     reaching the threshold. *)
+  (* Periodic memory reporter on an Lwt timer (600s interval). Runs in the main domain
+     scheduler, avoiding the prior Gc.create_alarm approach: alarm callbacks run in GC
+     signal context, where Mutex.lock is unsafe on OCaml 5.x if the alarmed domain already
+     holds the lock (latent deadlock on InFlightOrders/ Amendments mutexes), and
+     cycle_mod=10000 with space_overhead=20 fired without reaching the threshold. *)
   let start_time = Unix.gettimeofday () in
   let _memory_reporter =
     Lwt.async (fun () ->
@@ -585,10 +594,10 @@ let () =
   setup_signal_handlers ();
   (* Register fatal signal handlers (SIGSEGV, SIGABRT, etc.) for crash diagnostics. *)
   setup_fatal_signal_handlers ();
-  (* Main-loop watchdog: the engine (feeds, order processing, health monitor,
-     dashboard server, per-asset wakeups) depends on the main Lwt event loop; a
-     loop wedged in an unbounded blocking op freezes the process silently. Detects
-     a lost main-loop heartbeat and force-exits for supervised restart. *)
+  (* Main-loop watchdog: the engine (feeds, order processing, health monitor, dashboard
+     server, per-asset wakeups) depends on the main Lwt event loop; a loop wedged in an
+     unbounded blocking op freezes the process silently. Detects a lost main-loop
+     heartbeat and force-exits for supervised restart. *)
   Concurrency.Main_loop_watchdog.start ();
   Lwt.async Concurrency.Main_loop_watchdog.beat_loop;
   (* Install Lwt async exception hook. *)
@@ -597,10 +606,9 @@ let () =
   try
     let start_time = Unix.gettimeofday () in
     Lwt.async (fun () -> Dio_dashboard.Dashboard_server.start ~start_time);
-    (* Publish per-venue network latency windows (ws_ping / ws_feed /
-       rest_request / signer) for the dashboard's NETWORK page. Network spike
-       logs are gated separately from the internal-op ones via
-       latency_spike_report. *)
+    (* Publish per-venue network latency windows (ws_ping / ws_feed / rest_request /
+       signer) for the dashboard's NETWORK page. Network spike logs are gated separately
+       from the internal-op ones via latency_spike_report. *)
     Network_latency.start_publisher
       ~log_spikes:(Dio_engine.Config.reports_network config.latency_spike_report)
       ~threshold_us:config.latency_network_spike_threshold_us

@@ -26,4 +26,10 @@
   Jacobs_ladder_events
   Market_maker
   Fee_cache
-  Auto_hedger))
+  Auto_hedger
+  Strategy_actions
+  Strategy_actions_builtin
+  Strategy_expr
+  Strategy_file
+  Strategy_compile
+  Strategy_cli))
