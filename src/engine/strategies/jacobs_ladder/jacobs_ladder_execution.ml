@@ -319,23 +319,21 @@ let reconcile_position ~state ~now ~base_balance_age ~asset_balance =
       <- List.filter (fun (ts, _) -> ts >= cutoff) consumed))
 ;;
 
+(* Moved to Platform_accounting (milestone 2). Thin adapter keeps the grid's state field
+   as the store; behavior is unchanged. *)
 (** Sum of buy-fill credits the balance feed has not yet netted: fills at/after the newest
     balance message (or within the grace when the feed is silent). Entries are pruned so
     the overlay cannot grow without bound, and the sum is added to [position_base] for
     sizing. *)
 let unreflected_buy_credit ~state ~base_balance_age ~now =
-  if state.buy_credits_since_balance = []
-  then 0.0
-  else (
-    let cutoff = unreflected_cutoff ~now ~base_balance_age in
-    let rec go sum acc = function
-      | [] ->
-        state.buy_credits_since_balance <- List.rev acc;
-        sum
-      | (ts, q) :: rest when ts >= cutoff -> go (sum +. q) ((ts, q) :: acc) rest
-      | _ :: rest -> go sum acc rest
-    in
-    go 0.0 [] state.buy_credits_since_balance)
+  let credits, sum =
+    Platform_accounting.unreflected_credit
+      ~credits:state.buy_credits_since_balance
+      ~now
+      ~base_balance_age
+  in
+  state.buy_credits_since_balance <- credits;
+  sum
 ;;
 
 (** Venue-authoritative immediately-sellable base for [asset], read straight from the
