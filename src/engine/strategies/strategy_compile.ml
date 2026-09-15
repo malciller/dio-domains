@@ -43,6 +43,9 @@ let known_platform_caps =
   ; "inflight_amend_buy"
   ; "open_buy_count"
   ; "has_recent_amend_buy"
+  ; "bid"
+  ; "ask"
+  ; "lot_qty"
   ]
 ;;
 

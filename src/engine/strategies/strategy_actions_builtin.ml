@@ -45,6 +45,8 @@ let declarations =
       decision
       [ se "current" e; se "grid_interval_pct" e; se "is_above" b ]
   ; act "cycle_prepare" decision []
+  ; act "prepare_init" decision []
+  ; act "prepare_recovery" decision []
   ; act "cycle_cleanup" decision []
   ; act "cycle_sync" decision []
   ; act "cycle_refresh_fee" decision []

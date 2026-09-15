@@ -321,6 +321,8 @@ module Stub_engine = struct
   type ctx = int ref
 
   let prepare _ = true
+  let prepare_init _ = ()
+  let prepare_recovery _ = true
   let cleanup _ = ()
   let sync c = incr c
   let refresh_fee _ = ()
