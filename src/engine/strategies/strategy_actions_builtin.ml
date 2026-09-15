@@ -50,6 +50,8 @@ let declarations =
   ; act "cycle_refresh_fee" decision []
   ; act "cycle_guard" decision []
   ; act "buy_gate" decision []
+  ; act "expire_tif_recovery" decision []
+  ; act "cycle_facts" read []
   ; act "buy_facts" decision []
   ; act "buy_cancel" decision []
   ; act "buy_place" decision []

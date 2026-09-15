@@ -19,7 +19,19 @@ let known_triggers =
 ;;
 
 let known_platform_caps =
-  [ "available_sell"; "balance_age"; "generation"; "is_ghost"; "open_sells"; "pending" ]
+  [ "available_sell"
+  ; "balance_age"
+  ; "generation"
+  ; "is_ghost"
+  ; "open_sells"
+  ; "pending"
+  ; "grid_interval"
+  ; "grid_qty"
+  ; "accumulation_buffer"
+  ; "oracle_halted"
+  ; "tif_recovery_pending"
+  ; "tif_recovery_since"
+  ]
 ;;
 
 let event_fields = function
