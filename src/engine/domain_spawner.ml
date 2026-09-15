@@ -1480,7 +1480,14 @@ let asset_domain_worker
            (Ex.get_open_orders ~symbol:asset_with_fees.symbol);
          Dio_strategies.Strategy_event_recorder.record_state
            r
-           [ "price", Dio_strategies.Strategy_expr.V_float !current_price ];
+           [ "price", Dio_strategies.Strategy_expr.V_float !current_price
+           ; "asset_balance", Dio_strategies.Strategy_expr.V_float (base_balance_fn ())
+           ; "quote_balance", Dio_strategies.Strategy_expr.V_float (quote_balance_fn ())
+           ; ( "balance_age"
+             , match base_balance_age_fn () with
+               | Some a -> Dio_strategies.Strategy_expr.V_float a
+               | None -> Dio_strategies.Strategy_expr.V_none )
+           ];
          Dio_strategies.Strategy_event_recorder.end_cycle r;
          incr trace_cycles;
          if !trace_cycles mod 50 = 0
