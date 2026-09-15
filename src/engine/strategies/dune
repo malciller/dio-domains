@@ -34,4 +34,7 @@
   Strategy_compile
   Strategy_guard
   Strategy_runtime
+  Strategy_trace
+  Strategy_event_recorder
+  Strategy_equivalence
   Strategy_cli))
