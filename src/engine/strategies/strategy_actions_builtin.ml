@@ -45,6 +45,13 @@ let declarations =
       decision
       [ se "current" e; se "grid_interval_pct" e; se "is_above" b ]
   ; act "grid_cycle" decision []
+  ; act "grid_prepare" decision []
+  ; act "grid_cleanup" decision []
+  ; act "grid_sync" decision []
+  ; act "grid_refresh_fee" decision []
+  ; act "grid_guard" decision []
+  ; act "grid_buy" decision []
+  ; act "grid_sell" decision []
   ; act "sync_open_orders" decision []
   ; act "evaluate_buy_leg" decision []
   ; act "evaluate_sell_leg" decision []

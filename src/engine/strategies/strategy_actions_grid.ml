@@ -151,27 +151,45 @@ module type ENGINE = sig
   type ctx
 
   val run_cycle : ctx -> unit
-  val sync_open_orders : ctx -> unit
-  val evaluate_buy_leg : ctx -> unit
-  val evaluate_sell_leg : ctx -> unit
+  val prepare : ctx -> bool
+  val cleanup : ctx -> unit
+  val sync : ctx -> unit
+  val refresh_fee : ctx -> unit
+  val guard : ctx -> bool
+  val buy : ctx -> bool
+  val sell : ctx -> unit
 end
 
 module Make (E : ENGINE) = struct
   let handler (ctx : E.ctx) : Strategy_runtime.handler =
     { run =
-        (fun _t name _args ->
+        (fun t name _args ->
           match name with
           | "grid_cycle" ->
             E.run_cycle ctx;
             []
-          | "sync_open_orders" ->
-            E.sync_open_orders ctx;
+          | "grid_prepare" ->
+            let cont = E.prepare ctx in
+            Strategy_runtime.set_platform t "engine:continue" (V_bool cont);
             []
-          | "evaluate_buy_leg" ->
-            E.evaluate_buy_leg ctx;
+          | "grid_cleanup" ->
+            E.cleanup ctx;
             []
-          | "evaluate_sell_leg" ->
-            E.evaluate_sell_leg ctx;
+          | "grid_sync" ->
+            E.sync ctx;
+            []
+          | "grid_refresh_fee" ->
+            E.refresh_fee ctx;
+            []
+          | "grid_guard" ->
+            let cont = E.guard ctx in
+            Strategy_runtime.set_platform t "engine:continue" (V_bool cont);
+            []
+          | "grid_buy" ->
+            ignore (E.buy ctx : bool);
+            []
+          | "grid_sell" ->
+            E.sell ctx;
             []
           | _ -> [])
     }

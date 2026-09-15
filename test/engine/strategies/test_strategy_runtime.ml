@@ -321,9 +321,13 @@ module Stub_engine = struct
   type ctx = int ref
 
   let run_cycle c = incr c
-  let sync_open_orders _ = ()
-  let evaluate_buy_leg _ = ()
-  let evaluate_sell_leg _ = ()
+  let prepare _ = true
+  let cleanup _ = ()
+  let sync _ = ()
+  let refresh_fee _ = ()
+  let guard _ = true
+  let buy _ = false
+  let sell _ = ()
 end
 
 module Stub_grid = Strategy_actions_grid.Make (Stub_engine)

@@ -6,9 +6,39 @@
   "state": {},
   "steps": [
     {
-      "id": "cycle",
+      "id": "prepare",
       "when": { "event": "book_update" },
-      "then": [{ "action": "grid_cycle", "args": {} }],
+      "then": [{ "action": "grid_prepare", "args": {} }]
+    },
+    {
+      "id": "skip_nan_price",
+      "when": { "engine": { "continue": false } },
+      "then": [],
+      "stop": true
+    },
+    {
+      "id": "cleanup",
+      "then": [{ "action": "grid_cleanup", "args": {} }]
+    },
+    {
+      "id": "sync",
+      "then": [{ "action": "grid_sync", "args": {} }]
+    },
+    {
+      "id": "fee",
+      "then": [{ "action": "grid_refresh_fee", "args": {} }]
+    },
+    {
+      "id": "stale_guard",
+      "then": [{ "action": "grid_guard", "args": {} }]
+    },
+    {
+      "id": "trade",
+      "when": { "engine": { "continue": true } },
+      "then": [
+        { "action": "grid_buy", "args": {} },
+        { "action": "grid_sell", "args": {} }
+      ],
       "stop": true
     }
   ]

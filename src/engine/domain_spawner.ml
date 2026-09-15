@@ -1497,9 +1497,10 @@ let asset_domain_worker
          | _ -> ());
         (match config_grid with
          | Some (ctx, rt) ->
-           (* Config-driven grid (milestone 3, coarse wrapper): feed the engine context
-              and run the strategy file's cycle. The handler calls the same reference
-              execute_strategy, so behavior is identical by construction. *)
+           (* Config-driven grid (milestone 3): feed the engine context and run the
+              strategy file's cycle. The handler calls the reference sub-functions, so
+              behavior is identical by construction. The strategy-state mutex is held for
+              the whole interpreter cycle (the fine actions do not lock). *)
            ctx.cg_asset <- !grid_strategy_asset_ref;
            ctx.cg_state <- cached_grid_state;
            ctx.cg_price <- !current_price;
@@ -1514,12 +1515,13 @@ let asset_domain_worker
            ctx.cg_base_age <- base_balance_age_fn ();
            ctx.cg_gen <- Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol;
            ctx.cg_iter <- iter_orders;
-           ignore
-             (Dio_strategies.Strategy_runtime.run_cycle
-                rt
-                ~price:!current_price
-                ~now
-                ~event:(Dio_strategies.Strategy_runtime.make_event "book_update" []))
+           Config_grid_engine.with_lock ctx (fun () ->
+             ignore
+               (Dio_strategies.Strategy_runtime.run_cycle
+                  rt
+                  ~price:!current_price
+                  ~now
+                  ~event:(Dio_strategies.Strategy_runtime.make_event "book_update" [])))
          | None ->
            (match !grid_strategy_asset_ref, cached_grid_state with
             | Some asset, Some cs ->

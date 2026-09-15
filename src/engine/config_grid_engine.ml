@@ -1,16 +1,23 @@
-(** Config-driven grid engine context (milestone 3, coarse wrapper).
+(** Config-driven grid engine context (milestone 3; fine-orchestration decomposition).
 
-    Holds the per-cycle strategy inputs and calls the reference [execute_strategy] with
-    them, so a config-driven grid replicates by construction. Enabled only when
-    [config_strategy] is set; the mutable fields are updated in place each cycle (no
-    per-cycle allocation). Shared by the domain loop and the offline candidate replay, so
-    the candidate interpreter is exercised on exactly the wiring the live loop uses. *)
+    Holds the per-cycle strategy inputs and calls the reference [execute_strategy]
+    sub-functions with them, so a config-driven grid replicates by construction. Enabled
+    only when [config_strategy] is set; the mutable fields are updated in place each cycle
+    (no per-cycle allocation). Shared by the domain loop and the offline candidate replay,
+    so the candidate interpreter is exercised on exactly the wiring the live loop uses.
 
-module Strategy = Dio_strategies.Jacobs_ladder.Strategy
+    The coarse path ([run_cycle]) is retained for the shipped coarse file; the fine path
+    ([prepare]/[cleanup]/[sync]/[refresh_fee]/[buy]/[sell]) mirrors [execute_strategy]'s
+    orchestration so the strategy file can express it as steps over reference actions. The
+    caller holds [state.mutex] for the whole interpreter cycle (see [with_lock]); the
+    sub-functions do not lock, so this must not be combined with [run_cycle]. *)
+
+module Jac = Dio_strategies.Jacobs_ladder
+module Types = Dio_strategies.Jacobs_ladder_types
 
 type ctx =
-  { mutable cg_asset : Dio_strategies.Jacobs_ladder_types.trading_config option
-  ; mutable cg_state : Dio_strategies.Jacobs_ladder_types.strategy_state option
+  { mutable cg_asset : Types.trading_config option
+  ; mutable cg_state : Types.strategy_state option
   ; mutable cg_price : float
   ; mutable cg_bid : float
   ; mutable cg_ask : float
@@ -23,6 +30,19 @@ type ctx =
   ; mutable cg_base_age : float option
   ; mutable cg_gen : int
   ; mutable cg_iter : (string -> float -> float -> string -> int option -> unit) -> unit
+  ; mutable cg_ecfg : Types.exchange_config option
+  ; mutable cg_lot_qty : float
+  ; mutable cg_bid_r : float
+  ; mutable cg_ask_r : float
+  ; mutable cg_continue : bool
+  ; mutable cg_open_buy_count : int
+  ; mutable cg_has_recent_amend_buy : bool
+  ; mutable cg_locked_in_buys : float
+  ; mutable cg_locked_in_sells : float
+  ; mutable cg_closest_sell_order : (string * float) option
+  ; mutable cg_open_persisted : (float * float) list
+  ; mutable cg_missing_persisted : (float * float) list
+  ; mutable cg_buy_attempted : bool
   }
 
 let create () =
@@ -40,13 +60,36 @@ let create () =
   ; cg_base_age = None
   ; cg_gen = -1
   ; cg_iter = (fun _ -> ())
+  ; cg_ecfg = None
+  ; cg_lot_qty = nan
+  ; cg_bid_r = nan
+  ; cg_ask_r = nan
+  ; cg_continue = false
+  ; cg_open_buy_count = 0
+  ; cg_has_recent_amend_buy = false
+  ; cg_locked_in_buys = 0.0
+  ; cg_locked_in_sells = 0.0
+  ; cg_closest_sell_order = None
+  ; cg_open_persisted = []
+  ; cg_missing_persisted = []
+  ; cg_buy_attempted = false
   }
 ;;
 
+(** Run [f] while holding the strategy-state mutex (no-op when state is absent). *)
+let with_lock ctx f =
+  match ctx.cg_state with
+  | Some state ->
+    Mutex.lock state.mutex;
+    Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) f
+  | None -> f ()
+;;
+
+(** Coarse path: run the whole reference [execute_strategy]. *)
 let run_cycle c =
   match c.cg_asset, c.cg_state with
   | Some asset, Some state ->
-    Strategy.execute
+    Jac.Strategy.execute
       ~cached_state:state
       ~quote_balance_stale:c.cg_quote_stale
       ~oracle_halted:c.cg_oracle_halted
@@ -66,6 +109,220 @@ let run_cycle c =
   | _ -> ()
 ;;
 
-let sync_open_orders (_ : ctx) = ()
-let evaluate_buy_leg (_ : ctx) = ()
-let evaluate_sell_leg (_ : ctx) = ()
+(** Fine path step 1: init, accumulation-buffer refresh, low-flag recovery, resolve
+    bid/ask. Returns whether the cycle should continue (false on NaN price). *)
+let prepare c =
+  match c.cg_asset, c.cg_state with
+  | Some asset, Some state ->
+    if String.equal state.exchange_id ""
+    then (
+      state.exchange_id <- asset.exchange;
+      state.persistence_key
+      <- Some
+           (Dio_persistence.Base_accumulation_store.key_of
+              ~strategy:asset.strategy
+              ~symbol:asset.symbol
+              ~venue:asset.exchange);
+      state.base_accumulation_enabled <- asset.base_accumulation;
+      state.sell_levels_enabled <- asset.sell_levels_persistence;
+      state.cached_ecfg <- Jac.get_exchange_config asset.exchange;
+      state.cached_round_price <- Jac.get_round_price_fn asset.symbol asset.exchange;
+      state.cached_price_increment <- Jac.get_price_increment asset.symbol asset.exchange;
+      state.cached_qty_increment <- Jac.get_qty_increment_val asset.symbol asset.exchange;
+      state.cached_venue_min_qty
+      <- (match Jac.get_exchange_module asset.exchange with
+          | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+            Option.value (Ex.get_qty_min ~symbol:asset.symbol) ~default:1.0
+          | None -> 1.0);
+      state.cached_venue_min_notional
+      <- Jac.get_min_notional_val asset.symbol asset.exchange;
+      state.exchange_reserved_atomic
+      <- Some (Jac.get_exchange_reserved_atomic asset.exchange));
+    if state.cached_venue_min_notional <= 0.0
+    then
+      state.cached_venue_min_notional
+      <- Jac.get_min_notional_val asset.symbol asset.exchange;
+    let ecfg = state.cached_ecfg in
+    c.cg_ecfg <- Some ecfg;
+    state.accumulation_buffer <- asset.accumulation_buffer;
+    let lot_qty = Jac.venue_lot_qty state.grid_qty asset.exchange state in
+    c.cg_lot_qty <- lot_qty;
+    let unnetted_hold =
+      Jac.unnetted_sell_hold ~state ~ecfg ~now:c.cg_now ~base_balance_age:c.cg_base_age
+    in
+    Jac.evaluate_asset_low_recovery
+      ~state
+      ~now:c.cg_now
+      ~base_balance_age:c.cg_base_age
+      ~ecfg
+      ~asset
+      ~asset_balance:c.cg_abal
+      ~lot_qty
+      ~unnetted_hold;
+    Jac.evaluate_capital_low_recovery
+      ~state
+      ~asset
+      ~quote_balance:c.cg_qbal
+      ~current_price:c.cg_price
+      ~lot_qty;
+    if Float.is_nan c.cg_price
+    then (
+      c.cg_continue <- false;
+      false)
+    else (
+      let bid_price, ask_price =
+        if (not (Float.is_nan c.cg_bid))
+           && c.cg_bid > 0.0
+           && (not (Float.is_nan c.cg_ask))
+           && c.cg_ask > 0.0
+        then c.cg_bid, c.cg_ask
+        else c.cg_price, c.cg_price
+      in
+      c.cg_bid_r <- bid_price;
+      c.cg_ask_r <- ask_price;
+      c.cg_continue <- true;
+      true)
+  | _ ->
+    c.cg_continue <- false;
+    false
+;;
+
+(** Fine path step 2: expire stale cooldowns/ghost markers. *)
+let cleanup c =
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    Jac.cleanup_pending_and_cooldowns ~state ~now:c.cg_now ~asset
+  | _ -> ()
+;;
+
+(** Fine path step 3: reconcile the open-order feed and publish the scan results. *)
+let sync c =
+  match c.cg_state, c.cg_asset, c.cg_ecfg with
+  | Some state, Some asset, Some ecfg ->
+    let ( open_buy_count
+        , has_recent_amend_buy
+        , locked_in_buys
+        , locked_in_sells
+        , closest
+        , open_p
+        , missing_p )
+      =
+      Jac.sync_open_orders
+        ~state
+        ~now:c.cg_now
+        ~asset
+        ~bid_price:c.cg_bid_r
+        ~lot_qty:c.cg_lot_qty
+        ~iter_open_orders:c.cg_iter
+        ~get_open_orders_generation:(fun () -> c.cg_gen)
+        ~ecfg
+    in
+    c.cg_open_buy_count <- open_buy_count;
+    c.cg_has_recent_amend_buy <- has_recent_amend_buy;
+    c.cg_locked_in_buys <- locked_in_buys;
+    c.cg_locked_in_sells <- locked_in_sells;
+    c.cg_closest_sell_order <- closest;
+    c.cg_open_persisted <- open_p;
+    c.cg_missing_persisted <- missing_p
+  | _ -> ()
+;;
+
+(** Fine path step 4: refresh the maker fee (periodic on [cycle land 0x3ff]). *)
+let refresh_fee c =
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    if state.maker_fee <= 0.0 || c.cg_cycle land 0x3ff = 0
+    then
+      state.maker_fee
+      <- (match asset.maker_fee with
+          | Some f -> f
+          | None ->
+            (match
+               Dio_strategies.Fee_cache.get_maker_fee
+                 ~exchange:asset.exchange
+                 ~symbol:asset.symbol
+             with
+             | Some cached -> cached
+             | None -> 0.0))
+  | _ -> ()
+;;
+
+(** Fine path step 5: stale-balance guard (mirrors [execute_strategy]'s [is_stale]). *)
+let guard c =
+  (match c.cg_asset, c.cg_state, c.cg_ecfg with
+   | Some _, Some state, Some ecfg ->
+     let is_stale =
+       ecfg.check_stale_balance && (Float.is_nan c.cg_abal || Float.is_nan c.cg_qbal)
+     in
+     if is_stale
+     then (
+       state.last_cycle <- c.cg_cycle;
+       c.cg_continue <- false)
+     else c.cg_continue <- true
+   | _ -> c.cg_continue <- false);
+  c.cg_continue
+;;
+
+(** Fine path step 6: TIF recovery bookkeeping + buy leg. Returns [buy_attempted]. *)
+let buy c =
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    let recovery_expired =
+      state.tif_recovery_pending && c.cg_now -. state.tif_recovery_since >= 900.0
+    in
+    if recovery_expired
+    then (
+      state.tif_recovery_pending <- false;
+      Logging.info_f
+        ~section:"config_grid_engine"
+        "TIF recovery window expired for %s - resuming normal oracle-gated buying"
+        asset.symbol);
+    let tif_recovery_active =
+      state.tif_recovery_pending && c.cg_now -. state.tif_recovery_since < 900.0
+    in
+    let buy_attempted =
+      if c.cg_oracle_halted && not tif_recovery_active
+      then false
+      else
+        Jac.evaluate_buy_leg
+          ~oracle_halted:c.cg_oracle_halted
+          ~state
+          ~now:c.cg_now
+          ~asset
+          ~bid_price:c.cg_bid_r
+          ~ask_price:c.cg_ask_r
+          ~quote_balance:c.cg_qbal
+          ~quote_balance_stale:c.cg_quote_stale
+          ~cycle:c.cg_cycle
+          ~iter_open_orders:c.cg_iter
+          ~open_buy_count_from_scan:c.cg_open_buy_count
+          ~has_recent_amend_buy:c.cg_has_recent_amend_buy
+          ~locked_in_buys:c.cg_locked_in_buys
+          ~closest_sell_order_initial:c.cg_closest_sell_order
+    in
+    c.cg_buy_attempted <- buy_attempted;
+    buy_attempted
+  | _ ->
+    c.cg_buy_attempted <- false;
+    false
+;;
+
+(** Fine path step 6: sell leg. *)
+let sell c =
+  match c.cg_state, c.cg_asset, c.cg_ecfg with
+  | Some state, Some asset, Some ecfg ->
+    Jac.evaluate_sell_leg
+      ~persisted_reconcile:(c.cg_open_persisted, c.cg_missing_persisted)
+      ~state
+      ~now:c.cg_now
+      ~asset
+      ~bid_price:c.cg_bid_r
+      ~ask_price:c.cg_ask_r
+      ~asset_balance:c.cg_abal
+      ~buy_attempted:c.cg_buy_attempted
+      ~oracle_halted:c.cg_oracle_halted
+      ~ecfg
+      ~locked_in_sells:c.cg_locked_in_sells
+      ~base_balance_age:c.cg_base_age
+  | _ -> ()
+;;
