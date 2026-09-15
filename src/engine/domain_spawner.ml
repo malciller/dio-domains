@@ -13,6 +13,59 @@ module Oracle_types = Dio_oracle.Oracle_types
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
+(** Config-driven grid engine context (milestone 3, coarse wrapper). Holds the per-cycle
+    strategy inputs and calls the reference [execute_strategy] with them, so a
+    config-driven grid replicates by construction. Enabled only when config_strategy is
+    set; the mutable fields are updated in place each cycle (no per-cycle allocation). *)
+module Config_grid_engine = struct
+  type ctx =
+    { mutable cg_asset : Dio_strategies.Jacobs_ladder_types.trading_config option
+    ; mutable cg_state : Dio_strategies.Jacobs_ladder_types.strategy_state option
+    ; mutable cg_price : float
+    ; mutable cg_bid : float
+    ; mutable cg_ask : float
+    ; mutable cg_abal : float
+    ; mutable cg_qbal : float
+    ; mutable cg_now : float
+    ; mutable cg_cycle : int
+    ; mutable cg_quote_stale : bool
+    ; mutable cg_oracle_halted : bool
+    ; mutable cg_base_age : float option
+    ; mutable cg_gen : int
+    ; mutable cg_iter : (string -> float -> float -> string -> int option -> unit) -> unit
+    }
+
+  let run_cycle c =
+    match c.cg_asset, c.cg_state with
+    | Some asset, Some state ->
+      Dio_strategies.Jacobs_ladder.Strategy.execute
+        ~cached_state:state
+        ~quote_balance_stale:c.cg_quote_stale
+        ~oracle_halted:c.cg_oracle_halted
+        ~get_open_orders_generation:(fun () -> c.cg_gen)
+        ~base_balance_age:c.cg_base_age
+        ~now:c.cg_now
+        asset
+        c.cg_price
+        c.cg_bid
+        c.cg_ask
+        c.cg_abal
+        c.cg_qbal
+        0
+        0
+        c.cg_iter
+        c.cg_cycle
+    | _ -> ()
+  ;;
+
+  let sync_open_orders (_ : ctx) = ()
+  let evaluate_buy_leg (_ : ctx) = ()
+  let evaluate_sell_leg (_ : ctx) = ()
+end
+
+module Config_grid_handlers =
+  Dio_strategies.Strategy_actions_grid.Make (Config_grid_engine)
+
 let section = "domain_spawner"
 
 (** Sampling mask for the per-cycle [Gc.quick_stat] capture, which allocates ~24 words and
@@ -553,6 +606,59 @@ let asset_domain_worker
     let cached_fng_check_threshold = config.fng_check_threshold in
     let wakeup_sync =
       Concurrency.Exchange_wakeup.get_sync_handle asset_with_fees.symbol
+    in
+    (* Config-driven grid runtime (milestone 3, coarse wrapper; default off). When
+       config_strategy is set for a grid asset, the loop dispatches to the interpreter
+       whose handler calls the same reference execute_strategy, so behavior is identical
+       by construction. The strategy file is resolved by convention:
+       strategies/<strategy>.json. *)
+    let config_grid =
+      if config.config_strategy && is_grid_strategy
+      then (
+        let path = Printf.sprintf "strategies/%s.json" asset_with_fees.strategy in
+        match Dio_strategies.Strategy_file.parse_file path with
+        | Error msg ->
+          Logging.critical_f ~section "config_strategy: cannot load %s: %s" path msg;
+          None
+        | Ok file ->
+          let diags = Dio_strategies.Strategy_compile.validate file in
+          if Dio_strategies.Strategy_compile.has_errors diags
+          then (
+            Logging.critical_f
+              ~section
+              "config_strategy: %s has errors: %s"
+              path
+              (Dio_strategies.Strategy_compile.format diags);
+            None)
+          else (
+            let ctx =
+              { Config_grid_engine.cg_asset = None
+              ; cg_state = None
+              ; cg_price = nan
+              ; cg_bid = nan
+              ; cg_ask = nan
+              ; cg_abal = nan
+              ; cg_qbal = nan
+              ; cg_now = 0.0
+              ; cg_cycle = 0
+              ; cg_quote_stale = false
+              ; cg_oracle_halted = false
+              ; cg_base_age = None
+              ; cg_gen = -1
+              ; cg_iter = (fun _ -> ())
+              }
+            in
+            Logging.info_f
+              ~section
+              "config_strategy: %s running %s"
+              asset_with_fees.symbol
+              path;
+            Some
+              ( ctx
+              , Dio_strategies.Strategy_runtime.create
+                  ~handlers:(Config_grid_handlers.handler ctx)
+                  file )))
+      else None
     in
     while Atomic.get state.is_running do
       let latency_this_cycle = !latency_active in
@@ -1413,27 +1519,53 @@ let asset_domain_worker
            call is STRAT. *)
         t3_strategy := if latency_this_cycle then Monotonic_clock.now_ns () else 0;
         alloc_at_t3s := if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0;
-        (match !grid_strategy_asset_ref, cached_grid_state with
-         | Some asset, Some cs ->
-           Dio_strategies.Jacobs_ladder.Strategy.execute
-             ~cached_state:cs
-             ~quote_balance_stale
-             ~oracle_halted
-             ~get_open_orders_generation:(fun () ->
-               Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol)
-             ~base_balance_age:(base_balance_age_fn ())
-             ~now
-             asset
-             !current_price
-             !tob_bid
-             !tob_ask
-             asset_bal_val
-             quote_bal_val
-             0
-             0
-             iter_orders
-             !cycle_count
-         | _ -> ());
+        (match config_grid with
+         | Some (ctx, rt) ->
+           (* Config-driven grid (milestone 3, coarse wrapper): feed the engine context
+              and run the strategy file's cycle. The handler calls the same reference
+              execute_strategy, so behavior is identical by construction. *)
+           ctx.cg_asset <- !grid_strategy_asset_ref;
+           ctx.cg_state <- cached_grid_state;
+           ctx.cg_price <- !current_price;
+           ctx.cg_bid <- !tob_bid;
+           ctx.cg_ask <- !tob_ask;
+           ctx.cg_abal <- asset_bal_val;
+           ctx.cg_qbal <- quote_bal_val;
+           ctx.cg_now <- now;
+           ctx.cg_cycle <- !cycle_count;
+           ctx.cg_quote_stale <- quote_balance_stale;
+           ctx.cg_oracle_halted <- oracle_halted;
+           ctx.cg_base_age <- base_balance_age_fn ();
+           ctx.cg_gen <- Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol;
+           ctx.cg_iter <- iter_orders;
+           ignore
+             (Dio_strategies.Strategy_runtime.run_cycle
+                rt
+                ~price:!current_price
+                ~now
+                ~event:(Dio_strategies.Strategy_runtime.make_event "book_update" []))
+         | None ->
+           (match !grid_strategy_asset_ref, cached_grid_state with
+            | Some asset, Some cs ->
+              Dio_strategies.Jacobs_ladder.Strategy.execute
+                ~cached_state:cs
+                ~quote_balance_stale
+                ~oracle_halted
+                ~get_open_orders_generation:(fun () ->
+                  Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol)
+                ~base_balance_age:(base_balance_age_fn ())
+                ~now
+                asset
+                !current_price
+                !tob_bid
+                !tob_ask
+                asset_bal_val
+                quote_bal_val
+                0
+                0
+                iter_orders
+                !cycle_count
+            | _ -> ()));
         match !mm_strategy_asset_ref, cached_mm_state with
         | Some asset, Some cs when not oracle_halted ->
           let mm_cp = if Float.is_nan !current_price then None else Some !current_price in

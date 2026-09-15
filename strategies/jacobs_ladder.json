@@ -1,113 +1,15 @@
 {
   "name": "jacobs_ladder",
   "version": 1,
-  "triggers": ["book_update", "fill", "order_lifecycle", "oracle_publish"],
-  "params": {
-    "qty": { "type": "decimal_str", "default": "0.00025" },
-    "grid_interval": { "type": "range", "default": [0.16, 0.16] },
-    "sell_mult": { "type": "range", "default": [0.98, 0.98] },
-    "amend_cooldown_s": { "type": "float", "default": 30.0 }
-  },
-  "state": {
-    "tracked_buy": { "type": "buy_intent?", "persist": true },
-    "reserved_base": { "type": "float", "persist": true },
-    "accumulated_profit": { "type": "float", "persist": true },
-    "last_amend_at": { "type": "float?", "persist": false }
-  },
+  "triggers": ["book_update"],
+  "params": {},
+  "state": {},
   "steps": [
     {
-      "id": "place_initial_buy",
-      "when": {
-        "event": "book_update",
-        "all": [
-          { "is_none": "$state.tracked_buy" },
-          { "not": { "pending": "buy" } },
-          { "capacity": { "quote_gte": "$price * $params.qty_f" } },
-          { "not": { "engine": { "capital_halted": true } } }
-        ]
-      },
-      "then": [
-        {
-          "action": "compute_grid_price",
-          "args": {
-            "ref": "$price",
-            "lo": "$params.grid_interval_lo",
-            "hi": "$params.grid_interval_hi",
-            "side": "below"
-          },
-          "bind": { "buy_px": "$out.price" }
-        },
-        {
-          "action": "place_buy",
-          "args": {
-            "qty": "$params.qty_dec",
-            "price": "$local.buy_px",
-            "post_only": true,
-            "dedup_key": "buy:initial"
-          },
-          "bind": { "tok": "$out.token" }
-        },
-        {
-          "action": "track_buy",
-          "args": { "token": "$local.tok", "price": "$local.buy_px" }
-        }
-      ],
+      "id": "cycle",
+      "when": { "event": "book_update" },
+      "then": [{ "action": "grid_cycle", "args": {} }],
       "stop": true
-    },
-    {
-      "id": "amend_trailing_buy",
-      "when": {
-        "event": "book_update",
-        "all": [
-          { "is_some": "$state.tracked_buy" },
-          { "expr": "$price < $state.tracked_buy.price * (1.0 - 0.001)" },
-          {
-            "cooldown_elapsed": {
-              "since": "$state.last_amend_at",
-              "seconds": "$params.amend_cooldown_s"
-            }
-          }
-        ]
-      },
-      "then": [
-        {
-          "action": "compute_amend_price",
-          "args": { "ref": "$price", "lo": "$params.grid_interval_lo" },
-          "bind": { "amend_px": "$out.price" }
-        },
-        {
-          "action": "amend_buy",
-          "args": {
-            "token": "$state.tracked_buy.token",
-            "price": "$local.amend_px",
-            "dedup_key": "buy:amend"
-          }
-        },
-        { "action": "set_time", "args": { "state": "last_amend_at" } }
-      ]
-    },
-    {
-      "id": "place_sell_on_buy_fill",
-      "when": { "event": "fill", "side": "buy" },
-      "then": [
-        {
-          "action": "compute_sell_price",
-          "args": { "base": "$event.fill_price", "mult": "$params.sell_mult_lo" },
-          "bind": { "sell_px": "$out.price" }
-        },
-        {
-          "action": "place_sell",
-          "args": {
-            "qty": "$event.fill_qty",
-            "price": "$local.sell_px",
-            "dedup_key": "sell:$event.fill_order_id"
-          }
-        },
-        {
-          "action": "accumulate",
-          "args": { "qty": "$event.fill_qty", "profit": "$event.realized" }
-        }
-      ]
     }
   ]
 }
