@@ -257,7 +257,7 @@
       ]
     },
     {
-      "id": "buy_place",
+      "id": "buy_place_plan",
       "when": {
         "all": [
           {
@@ -282,7 +282,200 @@
       },
       "then": [
         {
-          "action": "buy_place",
+          "action": "buy_place_plan",
+          "args": {}
+        }
+      ]
+    },
+    {
+      "id": "buy_place_send",
+      "when": {
+        "all": [
+          {
+            "event": "book_update"
+          },
+          {
+            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+          },
+          {
+            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+          },
+          {
+            "expr": "not $platform.has_pending_buy"
+          },
+          {
+            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+          },
+          {
+            "expr": "not ($platform.open_buy_count > 0 or $platform.has_tracked_buy)"
+          },
+          {
+            "expr": "not $platform.buy_capital_low"
+          },
+          {
+            "expr": "not $platform.buy_crossing"
+          },
+          {
+            "expr": "not $platform.buy_quote_nan"
+          },
+          {
+            "expr": "not $platform.buy_cooldown"
+          },
+          {
+            "expr": "not $platform.buy_inflight"
+          },
+          {
+            "expr": "$platform.buy_balance_ok"
+          }
+        ]
+      },
+      "then": [
+        {
+          "action": "buy_place_send",
+          "args": {}
+        }
+      ]
+    },
+    {
+      "id": "buy_place_send_insufficient",
+      "when": {
+        "all": [
+          {
+            "event": "book_update"
+          },
+          {
+            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+          },
+          {
+            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+          },
+          {
+            "expr": "not $platform.has_pending_buy"
+          },
+          {
+            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+          },
+          {
+            "expr": "not ($platform.open_buy_count > 0 or $platform.has_tracked_buy)"
+          },
+          {
+            "expr": "not $platform.buy_capital_low"
+          },
+          {
+            "expr": "not $platform.buy_crossing"
+          },
+          {
+            "expr": "not $platform.buy_quote_nan"
+          },
+          {
+            "expr": "not $platform.buy_cooldown"
+          },
+          {
+            "expr": "not $platform.buy_inflight"
+          },
+          {
+            "expr": "not $platform.buy_balance_ok"
+          },
+          {
+            "expr": "$platform.quote_balance_stale"
+          }
+        ]
+      },
+      "then": [
+        {
+          "action": "buy_place_send_insufficient",
+          "args": {}
+        }
+      ]
+    },
+    {
+      "id": "buy_place_latch",
+      "when": {
+        "all": [
+          {
+            "event": "book_update"
+          },
+          {
+            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+          },
+          {
+            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+          },
+          {
+            "expr": "not $platform.has_pending_buy"
+          },
+          {
+            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+          },
+          {
+            "expr": "not ($platform.open_buy_count > 0 or $platform.has_tracked_buy)"
+          },
+          {
+            "expr": "not $platform.buy_capital_low"
+          },
+          {
+            "expr": "not $platform.buy_crossing"
+          },
+          {
+            "expr": "not $platform.buy_quote_nan"
+          },
+          {
+            "expr": "not $platform.buy_cooldown"
+          },
+          {
+            "expr": "not $platform.buy_inflight"
+          },
+          {
+            "expr": "not $platform.buy_balance_ok"
+          },
+          {
+            "expr": "not $platform.quote_balance_stale"
+          }
+        ]
+      },
+      "then": [
+        {
+          "action": "buy_place_latch_capital_low",
+          "args": {}
+        }
+      ]
+    },
+    {
+      "id": "buy_place_warn",
+      "when": {
+        "all": [
+          {
+            "event": "book_update"
+          },
+          {
+            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+          },
+          {
+            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+          },
+          {
+            "expr": "not $platform.has_pending_buy"
+          },
+          {
+            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+          },
+          {
+            "expr": "not ($platform.open_buy_count > 0 or $platform.has_tracked_buy)"
+          },
+          {
+            "expr": "not $platform.buy_capital_low"
+          },
+          {
+            "expr": "not $platform.buy_crossing"
+          },
+          {
+            "expr": "$platform.buy_quote_nan"
+          }
+        ]
+      },
+      "then": [
+        {
+          "action": "buy_place_warn_quote",
           "args": {}
         }
       ]

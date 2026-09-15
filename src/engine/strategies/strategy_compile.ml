@@ -46,6 +46,17 @@ let known_platform_caps =
   ; "bid"
   ; "ask"
   ; "lot_qty"
+  ; "quote_balance_stale"
+  ; "buy_price"
+  ; "buy_qty"
+  ; "buy_quote_needed"
+  ; "buy_available"
+  ; "buy_balance_ok"
+  ; "buy_capital_low"
+  ; "buy_crossing"
+  ; "buy_quote_nan"
+  ; "buy_cooldown"
+  ; "buy_inflight"
   ]
 ;;
 
