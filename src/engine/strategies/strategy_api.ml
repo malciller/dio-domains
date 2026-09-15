@@ -115,6 +115,14 @@ let buy_leg_facts = Strategy_decision.buy_leg_facts
 let buy_cancel_excess = Strategy_decision.buy_cancel_excess
 let buy_place_initial = Strategy_decision.buy_place_initial
 let buy_amend = Strategy_decision.buy_amend
+
+type buy_plan = Strategy_decision.buy_plan
+
+let buy_place_plan = Strategy_decision.buy_place_plan
+let buy_place_send = Strategy_decision.buy_place_send
+let buy_place_send_insufficient = Strategy_decision.buy_place_send_insufficient
+let buy_place_latch_capital_low = Strategy_decision.buy_place_latch_capital_low
+let buy_place_warn_quote = Strategy_decision.buy_place_warn_quote
 let cleanup_pending_and_cooldowns = Strategy_lifecycle.cleanup_pending_and_cooldowns
 let reconcile_position = Strategy_lifecycle.reconcile_position
 let evaluate_asset_low_recovery = Strategy_lifecycle.evaluate_asset_low_recovery

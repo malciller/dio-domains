@@ -45,6 +45,7 @@ type ctx =
   ; mutable cg_buy_pending : bool
   ; mutable cg_buy_effective_count : int
   ; mutable cg_buy_should_cancel : bool
+  ; mutable cg_buy_plan : Jac.buy_plan option
   ; mutable cg_sell_pre : Jac.sell_pre option
   ; mutable cg_symbol : string
   }
@@ -81,6 +82,7 @@ let create () =
   ; cg_buy_pending = false
   ; cg_buy_effective_count = 0
   ; cg_buy_should_cancel = false
+  ; cg_buy_plan = None
   ; cg_sell_pre = None
   ; cg_symbol = ""
   }
@@ -413,6 +415,94 @@ let buy_cancel c =
       ~cycle:c.cg_cycle
       ~effective_buy_count
   | _ -> ()
+;;
+
+(** Fine path branch: compute the fresh-buy plan and publish its branch facts. *)
+let buy_place_plan c =
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    let p =
+      Jac.buy_place_plan
+        ~state
+        ~now:c.cg_now
+        ~asset
+        ~bid_price:c.cg_bid_r
+        ~ask_price:c.cg_ask_r
+        ~quote_balance:c.cg_qbal
+        ~oracle_halted:c.cg_oracle_halted
+        ~cycle:c.cg_cycle
+        ~locked_in_buys:c.cg_locked_in_buys
+        ~closest_sell_order_initial:c.cg_closest_sell_order
+    in
+    c.cg_buy_plan <- Some p;
+    [ "buy_price", Dio_strategies.Strategy_expr.V_float p.bp_price
+    ; "buy_qty", Dio_strategies.Strategy_expr.V_float p.bp_qty
+    ; "buy_quote_needed", Dio_strategies.Strategy_expr.V_float p.bp_quote_needed
+    ; "buy_available", Dio_strategies.Strategy_expr.V_float p.bp_available
+    ; "buy_balance_ok", Dio_strategies.Strategy_expr.V_bool p.bp_balance_ok
+    ; "buy_capital_low", Dio_strategies.Strategy_expr.V_bool p.bp_capital_low
+    ; "buy_crossing", Dio_strategies.Strategy_expr.V_bool p.bp_crossing
+    ; "buy_quote_nan", Dio_strategies.Strategy_expr.V_bool p.bp_quote_nan
+    ; "buy_cooldown", Dio_strategies.Strategy_expr.V_bool p.bp_cooldown
+    ; "buy_inflight", Dio_strategies.Strategy_expr.V_bool p.bp_inflight
+    ]
+  | _ ->
+    c.cg_buy_plan <- None;
+    []
+;;
+
+let buy_plan_exn c =
+  match c.cg_buy_plan with
+  | Some p -> p
+  | None -> failwith "config_grid_engine: buy branch action without a plan"
+;;
+
+(** Fine path branch: send the balanced fresh buy. *)
+let buy_place_send c =
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    let p = buy_plan_exn c in
+    c.cg_buy_attempted
+    <- Jac.buy_place_send ~state ~now:c.cg_now ~asset ~qty:p.bp_qty ~buy_price:p.bp_price
+  | _ -> ()
+;;
+
+(** Fine path branch: stale-balance attempt anyway. *)
+let buy_place_send_insufficient c =
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    let p = buy_plan_exn c in
+    c.cg_buy_attempted
+    <- Jac.buy_place_send_insufficient
+         ~state
+         ~now:c.cg_now
+         ~asset
+         ~qty:p.bp_qty
+         ~buy_price:p.bp_price
+         ~quote_needed:p.bp_quote_needed
+         ~available_quote_balance:p.bp_available
+  | _ -> ()
+;;
+
+(** Fine path branch: latch capital_low. *)
+let buy_place_latch_capital_low c =
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    let p = buy_plan_exn c in
+    Jac.buy_place_latch_capital_low
+      ~state
+      ~now:c.cg_now
+      ~asset
+      ~quote_needed:p.bp_quote_needed
+      ~available_quote_balance:p.bp_available
+  | _ -> ()
+;;
+
+(** Fine path branch: warn on missing quote balance. *)
+let buy_place_warn_quote c =
+  match c.cg_asset with
+  | Some asset -> Jac.buy_place_warn_quote ~asset
+  | None -> ()
 ;;
 
 (** Fine path branch: place the initial buy; sets [buy_attempted]. *)

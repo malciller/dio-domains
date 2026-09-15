@@ -164,6 +164,11 @@ module type ENGINE = sig
   val mark_stale : ctx -> unit
   val buy_cancel : ctx -> unit
   val buy_place : ctx -> unit
+  val buy_place_plan : ctx -> (string * Strategy_expr.value) list
+  val buy_place_send : ctx -> unit
+  val buy_place_send_insufficient : ctx -> unit
+  val buy_place_latch_capital_low : ctx -> unit
+  val buy_place_warn_quote : ctx -> unit
   val buy_amend : ctx -> unit
   val sell_prepare : ctx -> unit
   val sell_place : ctx -> unit
@@ -218,6 +223,23 @@ module Make (E : ENGINE) = struct
             []
           | "buy_place" ->
             E.buy_place ctx;
+            []
+          | "buy_place_plan" ->
+            List.iter
+              (fun (k, v) -> Strategy_runtime.set_platform t k v)
+              (E.buy_place_plan ctx);
+            []
+          | "buy_place_send" ->
+            E.buy_place_send ctx;
+            []
+          | "buy_place_send_insufficient" ->
+            E.buy_place_send_insufficient ctx;
+            []
+          | "buy_place_latch_capital_low" ->
+            E.buy_place_latch_capital_low ctx;
+            []
+          | "buy_place_warn_quote" ->
+            E.buy_place_warn_quote ctx;
             []
           | "buy_amend" ->
             E.buy_amend ctx;
