@@ -355,6 +355,7 @@ module Stub_engine = struct
   let sell_excess_sweep_phase _ = ()
   let sell_finalize_end _ = ()
   let on_event _ _ = ()
+  let measure _ _ f = f ()
 end
 
 module Stub_grid = Strategy_actions_cycle.Make (Stub_engine)

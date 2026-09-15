@@ -1609,6 +1609,22 @@ let asset_domain_worker
            ctx.cg_base_age <- base_balance_age_fn ();
            ctx.cg_gen <- Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol;
            ctx.cg_iter <- iter_orders;
+           (* Per-cycle phase attribution: reset the scratch fields the fine actions
+              accumulate into, and enable measurement only on sampled latency cycles. *)
+           (match cached_grid_state with
+            | Some s ->
+              s.time_preamble_ns <- 0;
+              s.time_cleanup_ns <- 0;
+              s.time_sync_ns <- 0;
+              s.time_buy_ns <- 0;
+              s.time_sell_ns <- 0;
+              s.alloc_sync_words <- 0;
+              s.alloc_buy_words <- 0;
+              s.alloc_sell_words <- 0;
+              s.alloc_cleanup_words <- 0;
+              s.sync_orders_seen <- 0
+            | None -> ());
+           ctx.cg_profile <- latency_this_cycle;
            Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
              ignore
                (Dio_strategies.Strategy_runtime.run_cycle

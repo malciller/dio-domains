@@ -46,6 +46,7 @@ type ctx =
   ; mutable cg_buy_effective_count : int
   ; mutable cg_buy_should_cancel : bool
   ; mutable cg_buy_plan : Jac.buy_plan option
+  ; mutable cg_profile : bool
   ; mutable cg_sell_pre : Jac.sell_pre option
   ; mutable cg_symbol : string
   }
@@ -83,9 +84,42 @@ let create () =
   ; cg_buy_effective_count = 0
   ; cg_buy_should_cancel = false
   ; cg_buy_plan = None
+  ; cg_profile = false
   ; cg_sell_pre = None
   ; cg_symbol = ""
   }
+;;
+
+(** Per-cycle phase attribution. Cheap on the hot path: when profiling is off it just runs
+    [f]; when on it reads the domain-local minor-word counter and monotonic clock and
+    accumulates into the strategy-state scratch fields the dashboard reads. *)
+let measure c (phase : Strategy_actions_cycle.phase) f =
+  if not c.cg_profile
+  then f ()
+  else (
+    let a0 = int_of_float (Gc.minor_words ()) in
+    let t0 = Monotonic_clock.now_ns () in
+    f ();
+    match c.cg_state with
+    | None -> ()
+    | Some st ->
+      let da = int_of_float (Gc.minor_words ()) - a0 in
+      let dt = Monotonic_clock.now_ns () - t0 in
+      (match phase with
+       | Strategy_actions_cycle.Preamble ->
+         st.time_preamble_ns <- st.time_preamble_ns + dt
+       | Strategy_actions_cycle.Cleanup ->
+         st.alloc_cleanup_words <- st.alloc_cleanup_words + da;
+         st.time_cleanup_ns <- st.time_cleanup_ns + dt
+       | Strategy_actions_cycle.Sync ->
+         st.alloc_sync_words <- st.alloc_sync_words + da;
+         st.time_sync_ns <- st.time_sync_ns + dt
+       | Strategy_actions_cycle.Buy ->
+         st.alloc_buy_words <- st.alloc_buy_words + da;
+         st.time_buy_ns <- st.time_buy_ns + dt
+       | Strategy_actions_cycle.Sell ->
+         st.alloc_sell_words <- st.alloc_sell_words + da;
+         st.time_sell_ns <- st.time_sell_ns + dt))
 ;;
 
 (** Run [f] while holding the strategy-state mutex (no-op when state is absent). *)
