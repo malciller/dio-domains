@@ -15,4 +15,9 @@
   dio.exchange
   dio.error_handling
   dio.oracle)
- (modules Config Domain_spawner Order_executor Strategy_replay))
+ (modules
+  Config
+  Config_grid_engine
+  Domain_spawner
+  Order_executor
+  Strategy_replay))
