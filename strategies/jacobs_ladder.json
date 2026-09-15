@@ -69,7 +69,11 @@
     {
       "id": "sell",
       "when": { "engine": { "continue": true } },
-      "then": [{ "action": "grid_sell", "args": {} }],
+      "then": [
+        { "action": "grid_sell_prepare", "args": {} },
+        { "action": "grid_sell_place", "args": {} },
+        { "action": "grid_sell_finalize", "args": {} }
+      ],
       "stop": true
     }
   ]

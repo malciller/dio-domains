@@ -47,6 +47,7 @@ type ctx =
   ; mutable cg_buy_pending : bool
   ; mutable cg_buy_effective_count : int
   ; mutable cg_buy_should_cancel : bool
+  ; mutable cg_sell_pre : Jac.sell_pre option
   }
 
 let create () =
@@ -81,6 +82,7 @@ let create () =
   ; cg_buy_pending = false
   ; cg_buy_effective_count = 0
   ; cg_buy_should_cancel = false
+  ; cg_sell_pre = None
   }
 ;;
 
@@ -433,5 +435,60 @@ let sell c =
       ~ecfg
       ~locked_in_sells:c.cg_locked_in_sells
       ~base_balance_age:c.cg_base_age
+  | _ -> ()
+;;
+
+(** Fine path sell phase 1: derive the sell facts and reconcile the persisted ladder. *)
+let sell_prepare c =
+  match c.cg_state, c.cg_asset, c.cg_ecfg with
+  | Some state, Some asset, Some ecfg ->
+    c.cg_sell_pre
+    <- Some
+         (Jac.sell_leg_prepare
+            ~persisted_reconcile:(c.cg_open_persisted, c.cg_missing_persisted)
+            ~state
+            ~now:c.cg_now
+            ~asset
+            ~bid_price:c.cg_bid_r
+            ~ask_price:c.cg_ask_r
+            ~asset_balance:c.cg_abal
+            ~buy_attempted:c.cg_buy_attempted
+            ~oracle_halted:c.cg_oracle_halted
+            ~ecfg
+            ~locked_in_sells:c.cg_locked_in_sells
+            ~base_balance_age:c.cg_base_age)
+  | _ -> c.cg_sell_pre <- None
+;;
+
+(** Fine path sell phase 2: the gated placement block. *)
+let sell_place c =
+  match c.cg_state, c.cg_asset, c.cg_ecfg, c.cg_sell_pre with
+  | Some state, Some asset, Some ecfg, Some pre ->
+    Jac.sell_leg_place
+      ~state
+      ~now:c.cg_now
+      ~asset
+      ~bid_price:c.cg_bid_r
+      ~ask_price:c.cg_ask_r
+      ~asset_balance:c.cg_abal
+      ~buy_attempted:c.cg_buy_attempted
+      ~ecfg
+      ~pre
+  | _ -> ()
+;;
+
+(** Fine path sell phase 3: retry-latch bookkeeping, consumption, excess sweep. *)
+let sell_finalize c =
+  match c.cg_state, c.cg_asset, c.cg_ecfg, c.cg_sell_pre with
+  | Some state, Some asset, Some ecfg, Some pre ->
+    Jac.sell_leg_finalize
+      ~state
+      ~now:c.cg_now
+      ~asset
+      ~asset_balance:c.cg_abal
+      ~buy_attempted:c.cg_buy_attempted
+      ~ecfg
+      ~base_balance_age:c.cg_base_age
+      ~pre
   | _ -> ()
 ;;

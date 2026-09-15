@@ -163,6 +163,9 @@ module type ENGINE = sig
   val buy_place : ctx -> unit
   val buy_amend : ctx -> unit
   val sell : ctx -> unit
+  val sell_prepare : ctx -> unit
+  val sell_place : ctx -> unit
+  val sell_finalize : ctx -> unit
 end
 
 module Make (E : ENGINE) = struct
@@ -231,6 +234,15 @@ module Make (E : ENGINE) = struct
             []
           | "grid_sell" ->
             E.sell ctx;
+            []
+          | "grid_sell_prepare" ->
+            E.sell_prepare ctx;
+            []
+          | "grid_sell_place" ->
+            E.sell_place ctx;
+            []
+          | "grid_sell_finalize" ->
+            E.sell_finalize ctx;
             []
           | _ -> [])
     }
