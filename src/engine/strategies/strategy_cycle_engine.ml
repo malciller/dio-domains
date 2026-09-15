@@ -3,8 +3,8 @@
     Holds the per-cycle strategy inputs and implements the reference actions the shipped
     strategy file composes ([prepare]/[cleanup]/[sync]/[refresh_fee]/[guard]/[buy_*]/
     [sell_*]), each by calling the reference [execute_strategy] sub-functions with these
-    inputs, so a config-driven grid replicates by construction. Enabled only when
-    [config_strategy] is set; the mutable fields are updated in place each cycle (no
+    inputs, so a config-driven grid replicates by construction. Enabled whenever an entry
+    is bound to a strategy file; the mutable fields are updated in place each cycle (no
     per-cycle allocation). Shared by the domain loop and the offline candidate replay, so
     the candidate interpreter is exercised on exactly the wiring the live loop uses. The
     caller holds [state.mutex] for the whole interpreter cycle (see [with_lock]); the
