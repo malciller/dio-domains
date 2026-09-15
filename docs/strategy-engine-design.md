@@ -554,7 +554,7 @@ Concrete module and integration work, with per-module status. Milestone 1's firs
 | File | Change |
 |---|---|
 | `config.ml` | instance binding to `strategy_file` + param overrides + descriptor flags; keep `trading_config`, shift `strategy` tag semantics (`config.ml:504` `read_config`) — **binding + name-match check done**; param overrides/descriptor flags pending |
-| `domain_spawner.ml` | replace `is_grid_strategy`/`is_mm_strategy` and dispatch branches (290-308, 589-798, 1425-1467, 1786-1795) with compiled-instance dispatch; add dual-run mode |
+| `domain_spawner.ml` | replace `is_grid_strategy`/`is_mm_strategy` and dispatch branches (290-308, 589-798, 1425-1467, 1786-1795) with compiled-instance dispatch; add dual-run mode — **⚠ temporary bridge**: the hardcoded name dispatch below stays until milestone 3 removes it (see §9.5) |
 | `supervisor_orders.ml` | generalise callbacks/drains (151-412, 802-808) to the protocol; expose pending/dedup + reservation to `platform_accounting` |
 | `strategy_common.ml` | finalize the `S` signature (572) to the compiled-instance contract; retain in-flight caches/ring buffer as platform-owned |
 | `order_executor.ml` | expose reservation/pending/dedup hooks used by effectful actions |
@@ -570,7 +570,7 @@ Concrete module and integration work, with per-module status. Milestone 1's firs
 | 0 | Frozen reference + harness skeleton | snapshot reference modules; recorder; trace/diff comparator | harness reproduces reference traces (ref vs ref) |
 | 1 | Registry + interpreter | §9.1 protocol modules; builtin inventory stubs; `validate` CLI | synthetic strategy files compile, validate, run deterministically; feature flag off = no live change |
 | 2 | Platform accounting + capabilities | extract grid overlay; descriptors; move flag matrix | refactor equivalence: accounting outputs match reference on corpus (§8.4.1) |
-| 3 | Grid port | mapping tables (§8.2 + persistence); remaining actions; author grid file; wire dispatch behind flag | full differential pass; STRAT-phase allocation/latency parity within the reference budget (§6.4); shadow parity; canary |
+| 3 | Grid port | mapping tables (§8.2 + persistence); remaining actions; author grid file; **remove the hardcoded name-dispatch bridge (§9.5)**; wire dispatch behind flag | full differential pass; STRAT-phase allocation/latency parity within the reference budget (§6.4); shadow parity; canary |
 | 4 | Market Maker port | same mapping → actions → file | full differential pass; allocation/latency parity; canary |
 | 5 | Tooling | paper mode, dry-run/shadow on stored history, dashboard surfacing | paper/dry-run validated against corpus |
 
@@ -604,6 +604,17 @@ Exit codes: `0` valid, `1` errors, `2` usage.
 **Local test config:** `config.json` is gitignored and set to the Alpaca testnet Ladder instances (BOTZ, LIT, REMX, SMH), so local runs do not touch the live engine.
 
 **Tooling:** the `.ocamlformat` `version` pin was removed so the OxCaml-patched `ocamlformat` on the `5.2.0+ox` switch can format the tree (`profile = janestreet`, `comment-check = false`). `dune build @fmt` is clean repo-wide.
+
+### 9.5 Temporary bridges (must be removed)
+
+> **⚠ TODO — remove in milestone 3.** These are deliberate, temporary shims that keep the current engine working while the interpreter is unwired. They violate the "names are opaque / code handles any name" rule and **must not survive into the finished engine.**
+
+| Bridge | Where | Remove when | Removal |
+|---|---|---|---|
+| Hardcoded strategy-name dispatch | `domain_spawner.ml` — `is_grid_strategy` / `is_mm_strategy` (`strategy = "jacobs_ladder" \|\| "Ladder"` / `"market_maker" \|\| "MM"`) and the cleanup dispatch at `domain_spawner.ml:1702-1704` | milestone 3 | dispatch on the compiled strategy instance / strategy file, never on the user's name. A user naming their strategy anything must still run it. |
+| `oracle_tasks.default_trading_config` literal `strategy` | `oracle_tasks.ml` — synthetic CLI fallback config | milestone 3 | derive from the actual bound entry, or leave unset; it is not a name match, but should not assert a built-in name. |
+
+Rationale: strategy behaviour will come from the strategy file (steps/actions), so the engine selects an implementation by the file, not by a built-in name. Hardcoded name dispatch is a bridge only.
 
 ## 10. Open items
 

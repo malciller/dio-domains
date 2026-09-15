@@ -270,6 +270,9 @@ let asset_domain_worker
        INACTIVE. No F&G or config fallback sizing exists: an ACTIVE startup decision sizes
        it here; an INACTIVE one is materialized by the decision handler below so the sell
        leg can run under halt. *)
+    (* TODO(milestone-3): temporary bridge. Strategy names are user-defined and opaque;
+       this hardcoded name dispatch is replaced by compiled-instance dispatch once the
+       interpreter is wired. See docs/strategy-engine-design.md §9.5. Do not extend. *)
     let grid_strategy_asset_ref =
       if asset_with_fees.strategy = "jacobs_ladder" || asset_with_fees.strategy = "Ladder"
       then (
@@ -304,6 +307,7 @@ let asset_domain_worker
     let oracle_startup_wait = 120.0 in
     let oracle_gate_open = ref (not is_grid_strategy) in
     let oracle_gate_deadline = ref (Unix.gettimeofday () +. oracle_startup_wait) in
+    (* TODO(milestone-3): temporary bridge (see above / §9.5). *)
     let is_mm_strategy =
       asset_with_fees.strategy = "market_maker" || asset_with_fees.strategy = "MM"
     in
@@ -1698,6 +1702,8 @@ let stop_domain state =
   Atomic.set state.is_running false;
   (* Release strategy state for this symbol *)
   let symbol = state.asset.symbol in
+  (* TODO(milestone-3): temporary bridge — dispatch on the compiled instance, not the
+     user's strategy name. See docs/strategy-engine-design.md §9.5. *)
   (match state.asset.strategy with
    | "Ladder" | "jacobs_ladder" ->
      Dio_strategies.Jacobs_ladder.Strategy.cleanup_strategy_state symbol
