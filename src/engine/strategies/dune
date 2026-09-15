@@ -37,4 +37,5 @@
   Strategy_trace
   Strategy_event_recorder
   Strategy_equivalence
+  Exchange_capabilities
   Strategy_cli))
