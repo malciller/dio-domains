@@ -1,5 +1,5 @@
 {
-  "name": "golden_grid",
+  "name": "jacobs_ladder",
   "version": 1,
   "triggers": ["book_update", "fill", "order_lifecycle", "oracle_publish"],
   "params": {

@@ -25,7 +25,7 @@ let default_trading_config (exchange : string) (symbol : string)
   ; sell_mult = "1.0"
   ; min_usd_balance = None
   ; max_exposure = None
-  ; strategy = "Ladder"
+  ; strategy = "jacobs_ladder"
   ; maker_fee = None
   ; taker_fee = None
   ; testnet = false

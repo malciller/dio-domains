@@ -69,8 +69,8 @@ type strategy_id =
   | Hedger
 
 let string_of_strategy_id = function
-  | Ladder -> "Ladder"
-  | MM -> "MM"
+  | Ladder -> "jacobs_ladder"
+  | MM -> "market_maker"
   | Hedger -> "Hedger"
 ;;
 
