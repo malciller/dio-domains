@@ -1633,7 +1633,7 @@ let asset_domain_worker
                ];
              Dio_strategies.Strategy_event_recorder.end_cycle r;
              incr trace_cycles;
-             if !trace_cycles mod 50 = 0
+             if !trace_cycles = 1 || !trace_cycles mod 50 = 0
              then
                Dio_strategies.Strategy_trace.save
                  trace_path
@@ -1745,7 +1745,15 @@ let asset_domain_worker
           asset_with_fees.exchange
           asset_with_fees.symbol);
       ()
-    done
+    done;
+    (* Flush the final trace on graceful shutdown. Periodic persistence is every 50 busy
+       cycles, so without this a symbol that executed fewer cycles (or a short/slow run)
+       writes no file at all. *)
+    (match trace_recorder with
+     | Some r ->
+       let cycles = Dio_strategies.Strategy_event_recorder.snapshot r in
+       if cycles <> [] then Dio_strategies.Strategy_trace.save trace_path cycles
+     | None -> ())
 ;;
 
 (** Create a new domain_state and register it in the global domain_registry. *)
