@@ -6,6 +6,7 @@ module SR = Dio_strategies.Strategy_runtime
 module SF = Dio_strategies.Strategy_file
 module SA = Dio_strategies.Strategy_actions_cycle
 module SCE = Dio_strategies.Strategy_cycle_engine
+module SS = Dio_strategies.Strategy_state
 
 (* ── helpers ──────────────────────────────────────────────────────────────── *)
 
@@ -252,6 +253,103 @@ let bench_strategy_cycle () =
     name, n, LP.percentile p 0.50, LP.percentile p 0.90, LP.percentile p 0.99, total_ms
 ;;
 
+(* Synthetic asset used by the strategy-body benchmarks. *)
+let bench_asset : SS.trading_config =
+  { exchange = "kraken"
+  ; symbol = "BENCH/USD"
+  ; qty = "1.0"
+  ; grid_interval = 1.0
+  ; sell_mult = "1.0"
+  ; strategy = "jacobs_ladder"
+  ; maker_fee = None
+  ; taker_fee = None
+  ; accumulation_buffer = 0.0
+  ; base_accumulation = false
+  ; sell_levels_persistence = false
+  }
+;;
+
+(* Feed scan + ledger reconcile with 11 resting orders (10 sells, 1 buy). *)
+let bench_sync_scan () =
+  let name = "sync_open_orders_48_orders" in
+  let state = SG.get_strategy_state "BENCH/USD" in
+  let ecfg = SG.get_exchange_config "kraken" in
+  state.persisted_sell_levels <- List.init 48 (fun i -> 100.0 +. float i, 1.0);
+  (* Seed a realistic ledger: 48 live sell commitments + resting open sells. *)
+  for i = 1 to 48 do
+    SG.upsert_sell_commitment
+      ~state
+      ~id:(Printf.sprintf "sell-%d" i)
+      ~price:(100.0 +. float i)
+      ~qty:1.0
+      ~seen:true
+      ~acked:true
+  done;
+  for i = 1 to 48 do
+    Dio_strategies.Strategy_sell_orders.push
+      state.open_sell_orders
+      (Printf.sprintf "sell-%d" i)
+      (100.0 +. float i)
+      1.0
+  done;
+  let it f =
+    for i = 1 to 48 do
+      f (Printf.sprintf "sell-%d" i) 1.0 (100.0 +. float i) "sell" None
+    done;
+    f "buy-1" 1.0 99.0 "buy" None
+  in
+  let n = 200_000 in
+  let p = LP.create ~max_latency_us:100_000 name in
+  let total_ms =
+    wall_ms (fun () ->
+      run_bench p n (fun () ->
+        ignore
+          (SG.sync_open_orders
+             ~state
+             ~now:1.0
+             ~asset:bench_asset
+             ~bid_price:99.0
+             ~lot_qty:1.0
+             ~iter_open_orders:it
+             ~get_open_orders_generation:
+               (let g = ref 0 in
+                fun () ->
+                  incr g;
+                  !g)
+             ~ecfg)))
+  in
+  name, n, LP.percentile p 0.50, LP.percentile p 0.90, LP.percentile p 0.99, total_ms
+;;
+
+(* Sell-leg fact derivation with 3 persisted levels to reconcile. *)
+let bench_sell_prepare () =
+  let name = "sell_leg_prepare" in
+  let state = SG.get_strategy_state "BENCH/USD" in
+  let ecfg = SG.get_exchange_config "kraken" in
+  let persisted_reconcile = [], [ 100.0, 1.0; 101.0, 1.0; 102.0, 1.0 ] in
+  let n = 200_000 in
+  let p = LP.create ~max_latency_us:100_000 name in
+  let total_ms =
+    wall_ms (fun () ->
+      run_bench p n (fun () ->
+        ignore
+          (SG.sell_leg_prepare
+             ~persisted_reconcile
+             ~state
+             ~now:1.0
+             ~asset:bench_asset
+             ~bid_price:99.0
+             ~ask_price:100.0
+             ~asset_balance:10.0
+             ~buy_attempted:false
+             ~oracle_halted:false
+             ~ecfg
+             ~locked_in_sells:0.0
+             ~base_balance_age:(Some 1.0))))
+  in
+  name, n, LP.percentile p 0.50, LP.percentile p 0.90, LP.percentile p 0.99, total_ms
+;;
+
 (* ── entry point ──────────────────────────────────────────────────────────── *)
 
 let () =
@@ -275,6 +373,8 @@ let () =
     ; bench_state_warmup ()
     ; bench_duplicate_key_gen ()
     ; bench_strategy_cycle ()
+    ; bench_sync_scan ()
+    ; bench_sell_prepare ()
     ]
   in
   (* Restore stderr so benchmark output is not suppressed by the test runner. *)
