@@ -534,11 +534,11 @@ Concrete module and integration work, with per-module status. Milestone 1's firs
 | `strategy_actions.ml` | registry, `t`, schema types, `register`/`find` | protocol | done |
 | `strategy_actions_builtin.ml` | declares the §4.3 inventory (schemas) | actions | done (metadata; handlers pending) |
 | `strategy_file.ml` | JSON → AST (triggers/params/state/steps) | protocol | done |
-| `strategy_expr.ml` | `$ref` scanning (`$price/$event/$state/$params/$local/$signal/$now/$platform`) | protocol | done (scanning); expression AST + compile pending |
+| `strategy_expr.ml` | expression engine: `$ref` scanning + tokenizer/parser/evaluator (arithmetic, comparison, boolean) and string templates | protocol | done |
 | `strategy_compile.ml` | static validation against the registry | protocol | done (validation); compile-to-closures pending |
 | `strategy_cli.ml` | `dio strategy validate <file>` | tooling | done |
-| `strategy_guard.ml` | guard AST + compile → `ctx -> bool` | protocol | pending |
-| `strategy_runtime.ml` | per-instance state, cycle runner, trigger buckets, binding env | protocol | pending |
+| `strategy_guard.ml` | guard evaluation over an expression `env` + facts (event/side/capacity/pending/engine/cooldown) | protocol | done (closure compile pending) |
+| `strategy_runtime.ml` | per-instance state, env, cycle runner, action dispatch, step-local bindings | protocol | done (synthetic; exchange handlers pending) |
 | `strategy_protocol.ml` | implements `Strategy_common.S` over a compiled instance | protocol | pending |
 | `platform_accounting.ml` | central accounting: grace, ghost, freshness, ceilings, pending, reservation | platform | pending |
 | `exchange_capabilities.ml` | per-venue capability descriptors | platform | pending |
@@ -574,14 +574,16 @@ Dependency order is strict: 1 before 3; 2 before 3 (the accounting module is wha
 
 ### 9.4 Status and local dev
 
-**Implemented (branch `composer`), milestone 1 first slice:**
+**Implemented (branch `composer`), milestone 1 target:**
 
 - `strategy_actions.ml` — action registry; `strategy_actions_builtin.ml` — declarations for the §4.3 inventory (metadata; handlers pending).
-- `strategy_file.ml` — JSON → AST; `strategy_expr.ml` — `$ref` scanning; `strategy_compile.ml` — static validation; `strategy_cli.ml` — `dio strategy validate`.
+- `strategy_file.ml` — JSON → AST; `strategy_compile.ml` — static validation; `strategy_cli.ml` — `dio strategy validate`.
+- `strategy_expr.ml` — expression engine (refs, arithmetic, comparison, boolean, string templates).
+- `strategy_guard.ml` — guard evaluation; `strategy_runtime.ml` — state, env, cycle runner, action dispatch, bindings; executes a compiled strategy against synthetic events and returns an ordered action trace.
 - `bin/main.ml` — CLI intercept before `Arg.parse`, so validation runs without booting the engine.
-- Tests: `test/engine/strategies/test_strategy_compose.ml` (parse + validation cases). Sample file: `strategies/golden_grid.json`.
+- Tests: `test_strategy_compose.ml` (parse + validation) and `test_strategy_runtime.ml` (expression/guard evaluation + synthetic cycle execution). Sample file: `strategies/golden_grid.json`.
 
-**Remaining for milestone 1:** expression/guard compilation to closures (`strategy_expr.ml`, `strategy_guard.ml`), the runtime (`strategy_runtime.ml`), the protocol adapter (`strategy_protocol.ml`), and the milestone-1 gate (deterministic run on synthetic files). Milestones 0 and 2–5 are not started.
+**Remaining for milestone 1:** the `Strategy_common.S` protocol adapter (`strategy_protocol.ml`) and wiring a compiled instance into the domain loop behind the default-off feature flag. Milestones 0 and 2–5 are not started.
 
 **Usage:**
 

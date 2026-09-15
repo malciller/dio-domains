@@ -1,0 +1,201 @@
+open Dio_strategies
+
+let () = Strategy_actions_builtin.register_all ()
+let vf f = Strategy_expr.V_float f
+let vs s = Strategy_expr.V_string s
+
+let strategy_json =
+  {|{
+  "name": "rt",
+  "version": 1,
+  "triggers": ["book_update", "fill"],
+  "params": {
+    "qty": { "type": "decimal_str", "default": "2" },
+    "mult": { "type": "float", "default": "1.5" }
+  },
+  "state": {
+    "tracked_buy": { "type": "buy_intent?", "persist": false },
+    "reserved": { "type": "float", "persist": false }
+  },
+  "steps": [
+    {
+      "id": "buy",
+      "when": { "event": "book_update",
+                "all": [ { "is_none": "$state.tracked_buy" },
+                         { "not": { "pending": "buy" } } ] },
+      "then": [
+        { "action": "compute_grid_price",
+          "args": { "ref": "$price", "lo": "$params.mult_f",
+                    "hi": "$params.mult_f", "side": "below" },
+          "bind": { "px": "$out.price" } },
+        { "action": "place_buy",
+          "args": { "qty": "$params.qty_dec", "price": "$local.px",
+                    "dedup_key": "buy:initial" },
+          "bind": { "tok": "$out.token" } },
+        { "action": "track_buy",
+          "args": { "token": "$local.tok", "price": "$local.px" } }
+      ],
+      "stop": true
+    },
+    {
+      "id": "sell",
+      "when": { "event": "fill", "side": "buy" },
+      "then": [
+        { "action": "compute_sell_price",
+          "args": { "base": "$event.fill_price", "mult": "$params.mult_f" },
+          "bind": { "spx": "$out.price" } },
+        { "action": "place_sell",
+          "args": { "qty": "$event.fill_qty", "price": "$local.spx",
+                    "dedup_key": "sell:$event.fill_order_id" } },
+        { "action": "accumulate", "args": { "qty": "$event.fill_qty" } }
+      ]
+    }
+  ]
+}|}
+;;
+
+let parse () =
+  match Strategy_file.parse_string strategy_json with
+  | Error e -> Alcotest.failf "parse: %s" e
+  | Ok f -> f
+;;
+
+let env_with_price p =
+  { Strategy_expr.price = (fun () -> Ok (vf p))
+  ; event = (fun _ -> Error "no event")
+  ; state = (fun _ -> Ok Strategy_expr.V_none)
+  ; param = (fun _ -> Error "no param")
+  ; local = (fun _ -> Error "no local")
+  ; signal = (fun _ -> Error "no signal")
+  ; now = (fun () -> Ok (vf 1000.0))
+  ; platform = (fun _ -> Error "no platform")
+  }
+;;
+
+let test_eval_arith () =
+  let env = env_with_price 10.0 in
+  match Strategy_expr.eval_arg env "$price * 2.0 + 1.0" with
+  | Ok (Strategy_expr.V_float f) -> Alcotest.(check (float 0.0001)) "arith" 21.0 f
+  | Ok v -> Alcotest.failf "unexpected value %s" (Strategy_expr.string_of_value v)
+  | Error e -> Alcotest.fail e
+;;
+
+let test_eval_compare () =
+  let env = env_with_price 10.0 in
+  match Strategy_expr.eval_arg env "$price < 20.0 and $price >= 10.0" with
+  | Ok (Strategy_expr.V_bool b) -> Alcotest.(check bool) "cmp" true b
+  | Ok v -> Alcotest.failf "unexpected value %s" (Strategy_expr.string_of_value v)
+  | Error e -> Alcotest.fail e
+;;
+
+let test_template () =
+  let env =
+    { (env_with_price 10.0) with
+      Strategy_expr.event =
+        (fun f ->
+          match f with
+          | "fill_order_id" -> Ok (vs "o1")
+          | _ -> Error "no")
+    }
+  in
+  match Strategy_expr.eval_arg env "sell:$event.fill_order_id" with
+  | Ok (Strategy_expr.V_string s) -> Alcotest.(check string) "template" "sell:o1" s
+  | Ok v -> Alcotest.failf "unexpected value %s" (Strategy_expr.string_of_value v)
+  | Error e -> Alcotest.fail e
+;;
+
+let make_handler log =
+  { Strategy_runtime.run =
+      (fun t name args ->
+        log := (name, args) :: !log;
+        match name with
+        | "compute_grid_price" -> [ "price", vf 99.0 ]
+        | "compute_sell_price" -> [ "price", vf 150.0 ]
+        | "place_buy" -> [ "token", vs "tok-1" ]
+        | "track_buy" ->
+          Strategy_runtime.set_state t "tracked_buy" (Strategy_expr.V_bool true);
+          []
+        | "accumulate" ->
+          Strategy_runtime.set_state t "reserved" (vf 2.0);
+          []
+        | _ -> [])
+  }
+;;
+
+let action_names calls =
+  List.map (fun (c : Strategy_runtime.action_call) -> c.ac_action) calls
+;;
+
+let test_runtime_buy_then_no_repeat () =
+  let f = parse () in
+  let log = ref [] in
+  let rt = Strategy_runtime.create ~handlers:(make_handler log) f in
+  let c1 =
+    Strategy_runtime.run_cycle
+      rt
+      ~price:100.0
+      ~now:0.0
+      ~event:(Strategy_runtime.make_event "book_update" [])
+  in
+  Alcotest.(check (list string))
+    "cycle 1 actions"
+    [ "compute_grid_price"; "place_buy"; "track_buy" ]
+    (action_names c1);
+  let c2 =
+    Strategy_runtime.run_cycle
+      rt
+      ~price:100.0
+      ~now:1.0
+      ~event:(Strategy_runtime.make_event "book_update" [])
+  in
+  Alcotest.(check (list string)) "cycle 2 actions" [] (action_names c2)
+;;
+
+let test_runtime_fill () =
+  let f = parse () in
+  let log = ref [] in
+  let rt = Strategy_runtime.create ~handlers:(make_handler log) f in
+  let fill =
+    Strategy_runtime.make_event
+      "fill"
+      [ "side", vs "buy"
+      ; "fill_price", vf 100.0
+      ; "fill_qty", vf 2.0
+      ; "fill_order_id", vs "o1"
+      ]
+  in
+  let calls = Strategy_runtime.run_cycle rt ~price:100.0 ~now:0.0 ~event:fill in
+  Alcotest.(check (list string))
+    "fill actions"
+    [ "compute_sell_price"; "place_sell"; "accumulate" ]
+    (action_names calls);
+  let place_sell =
+    List.find
+      (fun (c : Strategy_runtime.action_call) -> String.equal c.ac_action "place_sell")
+      calls
+  in
+  (match List.assoc_opt "dedup_key" place_sell.ac_args with
+   | Some (Strategy_expr.V_string s) ->
+     Alcotest.(check string) "dedup template" "sell:o1" s
+   | Some v -> Alcotest.failf "dedup wrong type %s" (Strategy_expr.string_of_value v)
+   | None -> Alcotest.fail "missing dedup_key");
+  (* qty 2 accumulated; reserved set by handler *)
+  match Strategy_runtime.get_state rt "reserved" with
+  | Some (Strategy_expr.V_float r) -> Alcotest.(check (float 0.0001)) "reserved" 2.0 r
+  | _ -> Alcotest.fail "reserved not set"
+;;
+
+let () =
+  Alcotest.run
+    "strategy_runtime"
+    [ ( "expr"
+      , [ Alcotest.test_case "arithmetic" `Quick test_eval_arith
+        ; Alcotest.test_case "comparison/bool" `Quick test_eval_compare
+        ; Alcotest.test_case "template" `Quick test_template
+        ] )
+    ; ( "runtime"
+      , [ Alcotest.test_case "buy then no repeat" `Quick test_runtime_buy_then_no_repeat
+        ; Alcotest.test_case "sell on fill" `Quick test_runtime_fill
+        ] )
+    ]
+;;
