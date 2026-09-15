@@ -10,8 +10,8 @@
     caller holds [state.mutex] for the whole interpreter cycle (see [with_lock]); the
     sub-functions do not lock. *)
 
-module Jac = Dio_strategies.Jacobs_ladder
-module Types = Dio_strategies.Jacobs_ladder_types
+module Jac = Dio_strategies.Strategy_api
+module Types = Dio_strategies.Strategy_state
 
 type ctx =
   { mutable cg_asset : Types.trading_config option

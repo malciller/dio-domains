@@ -90,7 +90,7 @@ let json_of_domains () =
    locking here unless the domain's whole-cycle critical section also shrinks; blocking
    the dashboard on a full strategy cycle trades a cosmetic race for a real stall. *)
 let json_of_grid_strategy exchange symbol =
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   let exch = Exchange.Types.exchange_of_string exchange in
   let market_is_closed =
     match exch with
@@ -123,8 +123,8 @@ let json_of_grid_strategy exchange symbol =
           else (
             Hashtbl.replace seen oid ();
             ( oid
-            , c.Dio_strategies.Jacobs_ladder.sc_price
-            , c.Dio_strategies.Jacobs_ladder.sc_qty )
+            , c.Dio_strategies.Strategy_api.sc_price
+            , c.Dio_strategies.Strategy_api.sc_qty )
             :: acc))
         state.sell_commitments
         []

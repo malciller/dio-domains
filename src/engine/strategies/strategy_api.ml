@@ -1,15 +1,16 @@
-(* Jacobs Ladder strategy.
+(* Strategy API: strategy-agnostic aggregation surface.
 
-   Grid trading with a single-buy, multi-sell order model. Sub-components under
-   jacobs_ladder/: types and state (Jacobs_ladder_types), exchange configuration and
-   precision (Strategy_venue), reservation and accumulation (Strategy_reservation), order
-   construction and dispatch (Strategy_orders), execution loop (Jacobs_ladder_execution),
-   lifecycle event handlers (Strategy_events). *)
+   Re-exports the generic state (Strategy_state), venue configuration and precision
+   (Strategy_venue), reservation/accumulation (Strategy_reservation), order construction
+   and dispatch (Strategy_orders), lifecycle/accounting actions (Strategy_lifecycle),
+   decision procedures (Strategy_decision) and lifecycle event handlers (Strategy_events),
+   plus the capital-reclamation step and the [Strategy] seam used by the offline reference
+   replay (to be retired with the harness scaffolding). *)
 
 open Strategy_common
 
 (* Re-exported Types *)
-type exchange_config = Jacobs_ladder_types.exchange_config =
+type exchange_config = Strategy_state.exchange_config =
   { time_in_force : string
   ; track_pending_sells : bool
   ; use_accumulation_sells : bool
@@ -24,7 +25,7 @@ type exchange_config = Jacobs_ladder_types.exchange_config =
   ; remaintain_expired_sells : bool
   }
 
-type trading_config = Jacobs_ladder_types.trading_config =
+type trading_config = Strategy_state.trading_config =
   { exchange : string
   ; symbol : string
   ; qty : string
@@ -38,9 +39,9 @@ type trading_config = Jacobs_ladder_types.trading_config =
   ; sell_levels_persistence : bool
   }
 
-type strategy_state = Jacobs_ladder_types.strategy_state
+type strategy_state = Strategy_state.strategy_state
 
-type sell_commitment = Jacobs_ladder_types.sell_commitment =
+type sell_commitment = Strategy_state.sell_commitment =
   { mutable sc_price : float
   ; mutable sc_qty : float
   ; mutable sc_seen : bool
@@ -50,9 +51,9 @@ type sell_commitment = Jacobs_ladder_types.sell_commitment =
   }
 
 (* Re-exported Values & Functions *)
-let section = Jacobs_ladder_types.section
-let take = Jacobs_ladder_types.take
-let contains_fragment = Jacobs_ladder_types.contains_fragment
+let section = Strategy_state.section
+let take = Strategy_state.take
+let contains_fragment = Strategy_state.contains_fragment
 let kraken_config = Strategy_venue.kraken_config
 let hyperliquid_config = Strategy_venue.hyperliquid_config
 let ibkr_config = Strategy_venue.ibkr_config
@@ -71,7 +72,7 @@ let parse_config_float = Strategy_venue.parse_config_float
 let get_min_move_threshold = Strategy_venue.get_min_move_threshold
 let calculate_grid_price = Strategy_venue.calculate_grid_price
 let grid_price = Strategy_venue.grid_price
-let get_strategy_state = Jacobs_ladder_types.get_strategy_state
+let get_strategy_state = Strategy_state.get_strategy_state
 let total_reserved_by_exchange = Strategy_reservation.total_reserved_by_exchange
 let get_exchange_reserved_atomic = Strategy_reservation.get_exchange_reserved_atomic
 let get_total_reserved_quote = Strategy_reservation.get_total_reserved_quote
@@ -100,31 +101,27 @@ let create_amend_order = Strategy_orders.create_amend_order
 let create_cancel_order = Strategy_orders.create_cancel_order
 let create_order = Strategy_orders.create_order
 let push_order = Strategy_orders.push_order
-let sync_open_orders = Jacobs_ladder_execution.sync_open_orders
+let sync_open_orders = Strategy_lifecycle.sync_open_orders
+let reconcile_persisted_sell_levels = Strategy_lifecycle.reconcile_persisted_sell_levels
+let evaluate_sell_leg = Strategy_decision.evaluate_sell_leg
 
-let reconcile_persisted_sell_levels =
-  Jacobs_ladder_execution.reconcile_persisted_sell_levels
-;;
+type sell_pre = Strategy_decision.sell_pre
 
-let evaluate_sell_leg = Jacobs_ladder_execution.evaluate_sell_leg
-
-type sell_pre = Jacobs_ladder_execution.sell_pre
-
-let sell_leg_prepare = Jacobs_ladder_execution.sell_leg_prepare
-let sell_leg_place = Jacobs_ladder_execution.sell_leg_place
-let sell_leg_finalize = Jacobs_ladder_execution.sell_leg_finalize
-let evaluate_buy_leg = Jacobs_ladder_execution.evaluate_buy_leg
-let buy_leg_facts = Jacobs_ladder_execution.buy_leg_facts
-let buy_cancel_excess = Jacobs_ladder_execution.buy_cancel_excess
-let buy_place_initial = Jacobs_ladder_execution.buy_place_initial
-let buy_amend = Jacobs_ladder_execution.buy_amend
-let cleanup_pending_and_cooldowns = Jacobs_ladder_execution.cleanup_pending_and_cooldowns
-let reconcile_position = Jacobs_ladder_execution.reconcile_position
-let evaluate_asset_low_recovery = Jacobs_ladder_execution.evaluate_asset_low_recovery
-let evaluate_capital_low_recovery = Jacobs_ladder_execution.evaluate_capital_low_recovery
-let unnetted_sell_hold = Jacobs_ladder_execution.unnetted_sell_hold
-let execute_strategy = Jacobs_ladder_execution.execute_strategy
-let compute_buy_ref_price = Jacobs_ladder_execution.compute_buy_ref_price
+let sell_leg_prepare = Strategy_decision.sell_leg_prepare
+let sell_leg_place = Strategy_decision.sell_leg_place
+let sell_leg_finalize = Strategy_decision.sell_leg_finalize
+let evaluate_buy_leg = Strategy_decision.evaluate_buy_leg
+let buy_leg_facts = Strategy_decision.buy_leg_facts
+let buy_cancel_excess = Strategy_decision.buy_cancel_excess
+let buy_place_initial = Strategy_decision.buy_place_initial
+let buy_amend = Strategy_decision.buy_amend
+let cleanup_pending_and_cooldowns = Strategy_lifecycle.cleanup_pending_and_cooldowns
+let reconcile_position = Strategy_lifecycle.reconcile_position
+let evaluate_asset_low_recovery = Strategy_lifecycle.evaluate_asset_low_recovery
+let evaluate_capital_low_recovery = Strategy_lifecycle.evaluate_capital_low_recovery
+let unnetted_sell_hold = Strategy_lifecycle.unnetted_sell_hold
+let execute_strategy = Strategy_decision.execute_strategy
+let compute_buy_ref_price = Strategy_lifecycle.compute_buy_ref_price
 
 (* ------------------------------------------------------------------ *)
 (* Priority-reclamation step (pure decision). *)
@@ -204,11 +201,11 @@ module Strategy = struct
 
   (** Cleans up strategy state for a symbol when domain stops. *)
   let rec cleanup_strategy_state symbol =
-    let map = Atomic.get Jacobs_ladder_types.strategy_states in
+    let map = Atomic.get Strategy_state.strategy_states in
     if StringMap.mem symbol map
     then (
       let new_map = StringMap.remove symbol map in
-      if not (Atomic.compare_and_set Jacobs_ladder_types.strategy_states map new_map)
+      if not (Atomic.compare_and_set Strategy_state.strategy_states map new_map)
       then cleanup_strategy_state symbol)
   ;;
 

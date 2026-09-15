@@ -11,7 +11,7 @@
 
 module Trace = Dio_strategies.Strategy_trace
 module Expr = Dio_strategies.Strategy_expr
-module Jac = Dio_strategies.Jacobs_ladder
+module Jac = Dio_strategies.Strategy_api
 module Order = Dio_strategies.Strategy_common
 module Strategy_file = Dio_strategies.Strategy_file
 module Strategy_actions_grid = Dio_strategies.Strategy_actions_grid
@@ -81,7 +81,7 @@ let emitted_of_order (o : Order.strategy_order) : Trace.emitted =
 
 (** Snapshot the decision-relevant scalar/option strategy-state fields for replay seeding,
     recorded as ["s_"-prefixed] entries. *)
-let snapshot_entries (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
+let snapshot_entries (st : Dio_strategies.Strategy_state.strategy_state)
   : (string * Expr.value) list
   =
   let optf = function
@@ -130,7 +130,7 @@ let snapshot_entries (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
 
 (** Apply a {!snapshot_entries} snapshot to [st] before replay. *)
 let seed
-  (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
+  (st : Dio_strategies.Strategy_state.strategy_state)
   (entries : (string * Expr.value) list)
   =
   let getf k d =
@@ -199,7 +199,7 @@ let seed
 ;;
 
 (** Snapshot the collection state (JSON-encoded in string entries) for replay seeding. *)
-let snapshot_collections (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
+let snapshot_collections (st : Dio_strategies.Strategy_state.strategy_state)
   : (string * Expr.value) list
   =
   let module S = Dio_strategies.Strategy_sell_orders in
@@ -212,7 +212,7 @@ let snapshot_collections (st : Dio_strategies.Jacobs_ladder_types.strategy_state
   let commitments =
     `List
       (Hashtbl.fold
-         (fun id (c : Dio_strategies.Jacobs_ladder_types.sell_commitment) acc ->
+         (fun id (c : Dio_strategies.Strategy_state.sell_commitment) acc ->
            `List
              [ `String id
              ; `Float c.sc_price
@@ -266,7 +266,7 @@ let snapshot_collections (st : Dio_strategies.Jacobs_ladder_types.strategy_state
 
 (** Restore the collection state from a {!snapshot_collections} snapshot. *)
 let seed_collections
-  (st : Dio_strategies.Jacobs_ladder_types.strategy_state)
+  (st : Dio_strategies.Strategy_state.strategy_state)
   (entries : (string * Expr.value) list)
   =
   let module S = Dio_strategies.Strategy_sell_orders in
@@ -301,7 +301,7 @@ let seed_collections
            Hashtbl.replace
              st.sell_commitments
              id
-             { Dio_strategies.Jacobs_ladder_types.sc_price = p
+             { Dio_strategies.Strategy_state.sc_price = p
              ; sc_qty = q
              ; sc_seen = seen
              ; sc_acked = acked
@@ -361,7 +361,7 @@ let seed_collections
 ;;
 
 (** Seed the strategy state from the recorded snapshot in the first cycle. *)
-let seed_from_trace (state : Dio_strategies.Jacobs_ladder_types.strategy_state) trace =
+let seed_from_trace (state : Dio_strategies.Strategy_state.strategy_state) trace =
   match trace with
   | (c : Trace.cycle) :: _ ->
     let entries =
@@ -400,7 +400,7 @@ let runtime_event_of_obs (e : Trace.event_obs) : Strategy_runtime.event =
     emitted intents per cycle. Shared by the reference and candidate replays. *)
 let drive
   ~(asset : Jac.trading_config)
-  ~(state : Dio_strategies.Jacobs_ladder_types.strategy_state)
+  ~(state : Dio_strategies.Strategy_state.strategy_state)
   ~(set_venue_available : (string -> float -> unit) option)
   ~(dispatch_events : events:Trace.event_obs list -> price:float -> now:float -> unit)
   ~(execute :

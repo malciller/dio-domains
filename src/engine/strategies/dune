@@ -16,8 +16,7 @@
   unix)
  (modules
   Strategy_common
-  Jacobs_ladder
-  Jacobs_ladder_types
+  Strategy_api
   Strategy_state
   Strategy_venue
   Strategy_reservation
@@ -25,7 +24,6 @@
   Strategy_decision
   Strategy_orders
   Strategy_sell_orders
-  Jacobs_ladder_execution
   Strategy_events
   Fee_cache
   Strategy_actions
