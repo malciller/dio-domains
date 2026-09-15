@@ -199,79 +199,35 @@ let reconcile_persisted_sell_levels ~state =
 let sell_hold_netting_grace_s = Platform_accounting.sell_hold_netting_grace_s
 let unreflected_cutoff = Platform_accounting.unreflected_cutoff
 let buy_ack_ghost_grace_s = Platform_accounting.buy_ack_ghost_grace_s
-let balance_delta_epsilon = Platform_accounting.balance_delta_epsilon
 let sweep_max_balance_age_s = Platform_accounting.sweep_max_balance_age_s
 
-(** Portion of placed-sell base the balance feed may not yet be netting. Applies to every
-    accumulation venue (Hyperliquid, Kraken, IBKR, Lighter): all report a tradeable figure
-    with open-order holds removed, and that figure trails a placement (or the adopting
-    balance message trails the order feed), so sizing against it can dip into
-    reserved_base. Gating on [track_pending_sells = false] (Hyperliquid only) left the
-    others exposed: under a burst several sells ack before the balance adopts the hold and
-    each sizes against a stale-high tradeable.
-
-    A hold is outstanding only while the newest balance message for this asset still
-    predates its placement. A message generated after the placement retires it only when
-    it did not raise the tradeable figure ([state.last_balance_delta <= 0]): a buy fill
-    raises the figure and bumps the same per-asset freshness timestamp without netting a
-    sell hold, so trusting a positive delta re-offered committed base as free and produced
-    an oversized sell the venue rejected. Positive-delta messages keep the hold until a
-    flat/down message or the grace retires it. The caller supplies per-asset freshness: a
-    fill on another coin must not advance this asset's timestamp (see
-    Hyperliquid_balances.BalanceStore.update_wallet). The grace bounds a dead feed;
-    [consume_sell_hold_netting] additionally retires holds on an observed drop. *)
+(* Moved to Platform_accounting (milestone 2). Thin adapter keeps the grid's state field
+   as the store; behavior is unchanged. *)
 let unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age =
-  if ecfg.use_unnetted_sell_hold && state.sell_holds_since_balance <> []
-  then (
-    let cutoff = unreflected_cutoff ~now ~base_balance_age in
-    let grace_cutoff = now -. sell_hold_netting_grace_s in
-    (* A message may certify netting only if its move was flat or down. An increase (buy
-       fill) cannot have applied a sell hold. The tolerance absorbs the float jitter
-       between an adopted venue figure and the same figure recomputed by the venue model,
-       which otherwise reads as a tiny positive "increase" and wedges the hold. *)
-    let message_may_certify = state.last_balance_delta <= balance_delta_epsilon in
-    let rec go unnetted acc = function
-      | [] ->
-        state.sell_holds_since_balance <- List.rev acc;
-        unnetted
-      | (placed_at, qty) :: rest ->
-        let grace_expired = placed_at < grace_cutoff in
-        let released_by_message = message_may_certify && placed_at < cutoff in
-        if grace_expired || released_by_message
-        then go unnetted acc rest
-        else go (unnetted +. qty) ((placed_at, qty) :: acc) rest
-    in
-    go 0.0 [] state.sell_holds_since_balance)
-  else 0.0
+  let holds, amount =
+    Platform_accounting.unnetted_sell_hold
+      ~use_unnetted:ecfg.use_unnetted_sell_hold
+      ~holds:state.sell_holds_since_balance
+      ~last_balance_delta:state.last_balance_delta
+      ~now
+      ~base_balance_age
+  in
+  state.sell_holds_since_balance <- holds;
+  amount
 ;;
 
-(** Retires the OLDEST outstanding sell holds against an observed tradeable drop of
-    [amount] (the venue netting applied holds). FIFO ordering matters: consuming by
-    per-hold baseline let an older hold's netting release a newer, un-netted hold and
-    over-offer a full lot. *)
+(* Moved to Platform_accounting (milestone 2). *)
 let consume_sell_hold_netting ~state ~amount =
-  if amount > 0.0 && state.sell_holds_since_balance <> []
-  then (
-    let budget = ref amount in
-    let rec go acc = function
-      | [] -> List.rev acc
-      | (placed_at, qty) :: rest when !budget <= 1e-12 ->
-        List.rev_append acc ((placed_at, qty) :: rest)
-      | (placed_at, qty) :: rest ->
-        let take = Float.min !budget qty in
-        budget := !budget -. take;
-        let left = qty -. take in
-        if left > 1e-12
-        then List.rev_append acc ((placed_at, left) :: rest)
-        else go acc rest
-    in
-    state.sell_holds_since_balance <- go [] state.sell_holds_since_balance)
+  state.sell_holds_since_balance
+  <- Platform_accounting.consume_sell_hold_netting
+       ~holds:state.sell_holds_since_balance
+       ~amount
 ;;
 
-(** Records a placed sell's hold. Kept oldest-first; retired FIFO by
-    [consume_sell_hold_netting] on a tradeable drop, or by the grace. *)
+(* Moved to Platform_accounting (milestone 2). *)
 let arm_sell_hold ~state ~qty ~now =
-  state.sell_holds_since_balance <- state.sell_holds_since_balance @ [ now, qty ]
+  state.sell_holds_since_balance
+  <- Platform_accounting.arm_sell_hold ~holds:state.sell_holds_since_balance ~qty ~now
 ;;
 
 (** Surfaces a sell-placement blocker at warn level. The same blocker re-fires every

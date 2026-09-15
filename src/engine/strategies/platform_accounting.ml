@@ -42,3 +42,78 @@ let balance_delta_epsilon = 1e-9
     top rung past [reserved_base]. A hung poll ages the snapshot past this bound and the
     sweep waits it out. *)
 let sweep_max_balance_age_s = 10.0
+
+(** Sell-hold overlays, parameterized over the hold list and the last balance delta so
+    this module stays independent of strategy state. [holds] is oldest-first:
+    [(placed_at, qty)]. Callers persist the returned list; these are pure transformations. *)
+
+(** Portion of placed-sell base the balance feed may not yet be netting. Applies to every
+    accumulation venue (Hyperliquid, Kraken, IBKR, Lighter): all report a tradeable figure
+    with open-order holds removed, and that figure trails a placement (or the adopting
+    balance message trails the order feed), so sizing against it can dip into
+    reserved_base. Gating on [track_pending_sells = false] (Hyperliquid only) left the
+    others exposed: under a burst several sells ack before the balance adopts the hold and
+    each sizes against a stale-high tradeable.
+
+    A hold is outstanding only while the newest balance message for this asset still
+    predates its placement. A message generated after the placement retires it only when
+    it did not raise the tradeable figure ([last_balance_delta <= 0]): a buy fill raises
+    the figure and bumps the same per-asset freshness timestamp without netting a sell
+    hold, so trusting a positive delta re-offered committed base as free and produced an
+    oversized sell the venue rejected. Positive-delta messages keep the hold until a
+    flat/down message or the grace retires it. The caller supplies per-asset freshness: a
+    fill on another coin must not advance this asset's timestamp (see
+    Hyperliquid_balances.BalanceStore.update_wallet). The grace bounds a dead feed;
+    [consume_sell_hold_netting] additionally retires holds on an observed drop.
+
+    Returns [(remaining_holds, unnetted_qty)]. *)
+let unnetted_sell_hold ~use_unnetted ~holds ~last_balance_delta ~now ~base_balance_age =
+  if (not use_unnetted) || holds = []
+  then holds, 0.0
+  else (
+    let cutoff = unreflected_cutoff ~now ~base_balance_age in
+    let grace_cutoff = now -. sell_hold_netting_grace_s in
+    (* A message may certify netting only if its move was flat or down. An increase (buy
+       fill) cannot have applied a sell hold. The tolerance absorbs the float jitter
+       between an adopted venue figure and the same figure recomputed by the venue model,
+       which otherwise reads as a tiny positive "increase" and wedges the hold. *)
+    let message_may_certify = last_balance_delta <= balance_delta_epsilon in
+    let rec go unnetted acc = function
+      | [] -> List.rev acc, unnetted
+      | (placed_at, qty) :: rest ->
+        let grace_expired = placed_at < grace_cutoff in
+        let released_by_message = message_may_certify && placed_at < cutoff in
+        if grace_expired || released_by_message
+        then go unnetted acc rest
+        else go (unnetted +. qty) ((placed_at, qty) :: acc) rest
+    in
+    go 0.0 [] holds)
+;;
+
+(** Retires the OLDEST outstanding sell holds against an observed tradeable drop of
+    [amount] (the venue netting applied holds). FIFO ordering matters: consuming by
+    per-hold baseline let an older hold's netting release a newer, un-netted hold and
+    over-offer a full lot. *)
+let consume_sell_hold_netting ~holds ~amount =
+  if amount > 0.0 && holds <> []
+  then (
+    let budget = ref amount in
+    let rec go acc = function
+      | [] -> List.rev acc
+      | (placed_at, qty) :: rest when !budget <= 1e-12 ->
+        List.rev_append acc ((placed_at, qty) :: rest)
+      | (placed_at, qty) :: rest ->
+        let take = Float.min !budget qty in
+        budget := !budget -. take;
+        let left = qty -. take in
+        if left > 1e-12
+        then List.rev_append acc ((placed_at, left) :: rest)
+        else go acc rest
+    in
+    go [] holds)
+  else holds
+;;
+
+(** Records a placed sell's hold. Kept oldest-first; retired FIFO by
+    [consume_sell_hold_netting] on a tradeable drop, or by the grace. *)
+let arm_sell_hold ~holds ~qty ~now = holds @ [ now, qty ]
