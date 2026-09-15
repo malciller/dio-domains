@@ -687,7 +687,24 @@ Rationale: strategy behaviour will come from the strategy file (steps/actions), 
 
 Goal: the bound strategy file is the sole decision procedure; the grid reference code is either the registered action library **or** replaced by native action implementations, and no code path selects behaviour by strategy name.
 
-**Status:** M1, M2, M3 **done and verified** (corpus: reference + candidate equivalent on all 10 traces; 19 test binaries). M4 **not started** (a full port with no corpus yet). M5 optional. M6 post-canary.
+**Target architecture (corrected direction, superseding the wrapper port).** `engine/strategies` must hold only *strategy-agnostic* machinery: the interpreter (`strategy_runtime`), the expression/guard engine, the file parser/compiler/validator, the action registry, a set of **generic trade actions**, the platform accounting/treasury module, venue capabilities, and the trace/harness. There must be **no** `jacobs_ladder/`, `market_maker.ml`, or any other strategy-policy module in OCaml. A concrete strategy is a **config file** that composes generic actions + expressions/steps and is built at runtime. The grid therefore becomes `strategies/jacobs_ladder.json` (a user file), not OCaml.
+
+The design doc's four layers and the ownership rule (§5.2) already state this: the platform owns capacity/integrity/pending/reservation invariants (`platform_accounting`); the strategy file owns policy (branch selection, price/zone math, when to place/amend/cancel). What the port did instead — `grid_*` actions and `Config_grid_engine` delegating to `jacobs_ladder_execution` — is a **transitional** device, not the destination.
+
+**Generic action inventory (target).** Grouped; all strategy-agnostic:
+- *Reads*: book/TOB, balances (base/quote, venue-available), open orders (by side/strategy), capacity/available-base, committed-sell ceiling, unreflected credit.
+- *Emission*: `place_order` (side/qty/price/post_only/reduce_only/tif), `amend_order` (id/price/qty), `cancel_order` (id), `cancel_all_buys`.
+- *Accounting verbs* (platform, invariant-preserving): reserve/release base/quote, arm/consume sell-hold, buy-credit attribution, persisted-level match/dedupe.
+- *Arithmetic/pricing*: `round_price`, tick/min-notional gates, percentage step (grid rung) — exposed to expressions so the file computes prices.
+- *Persistence*: load/save declared state via the §3.3.1 mapping.
+
+**Sequencing to the target** (each step keeps `dio strategy replay --candidate` equivalent on the frozen corpus):
+1. Implement the generic emission + read + accounting actions (they must not reference `jacobs_ladder`).
+2. Port the grid policy into `strategies/jacobs_ladder.json` incrementally, replacing one `grid_*` action/step at a time with generic actions + expressions.
+3. Once the file uses no `jacobs_ladder` code, delete `jacobs_ladder/` and drop `Config_grid_engine`/`grid_*` actions.
+4. The `MM` order tag (`strategy_common`) remains a model enum; the MM *strategy module* is removed (done) and will be re-expressed as config if/when needed.
+
+**Status:** M1, M2, M3 **done and verified** (corpus: reference + candidate equivalent on all 10 traces; 18 test binaries). **Market Maker removed** from the engine (reimplement via config later). The **generic-action refactor above is not started** — it is the remaining work. M5 optional. M6 post-canary.
 
 **Important framing.** Today the fine actions are *wrappers* that call the reference `jacobs_ladder_execution` sub-functions (`grid_prepare`→`evaluate_asset_low_recovery`, `grid_buy_place`→`buy_place_initial`, `grid_sell_*`→the sell phases, …). So the reference grid is **not dead code yet** — it is the implementation. "Removing old functionality" therefore has two distinct meanings, and the plan must pick one per step:
 - **Adopt-as-library**: freeze the reference sub-functions as the registered action implementations and delete only the *scaffolding* (name dispatch, coarse orchestration, `execute_strategy`).
@@ -698,7 +715,7 @@ Goal: the bound strategy file is the sole decision procedure; the grid reference
 - **M1 — Event ownership. [DONE]** Order-lifecycle events (`filled`/`cancelled`/`acknowledged`/`amended`/`failed`/`rejected`/`amendment_skipped`/`amendment_failed`/`cancel_cleanup`) are routed through the interpreter: the domain loop builds an interpreter event and calls `run_cycle` (file-bound assets), the strategy file has one guarded event step per kind invoking `grid_on_event`, and `grid_on_event` dispatches to the reference handlers. `strategy_replay --candidate` routes recorded events through the file's event steps. Gate met: candidate + reference equivalent on all 10 corpus traces.
 - **M2 — Data-driven dispatch. [DONE]** `load_bound_strategy`/`is_strategy_file_asset`: an entry whose `strategy` names a parsable `strategies/<name>.json` is a strategy-file asset. `is_grid_strategy`, the F&G buffer resolver, `config_grid` construction, `stop_domain` cleanup, and the final flush all key off the binding; the `"jacobs_ladder" || "Ladder"` literals and the `oracle_tasks` fallback name are gone. `is_mm_strategy` retained until M4.
 - **M3 — Retire the reference grid entry points (adopt-as-library). [DONE]** A bound grid asset always runs the interpreter (the `config_strategy` gate is dropped; the key is deprecated/ignored but still parsed for config compatibility). The live loop's reference `execute_strategy` call is removed; the reference decision sub-functions remain as the action library. `execute_strategy` itself is now used only by the offline reference replay (harness) — deleting it is M6, after canary.
-- **M4 — Port Market Maker. [NOT STARTED]** Decompose `market_maker` (1730 lines, 7 handlers) into fine actions + file exactly as the grid, then delete `is_mm_strategy`. Needs an MM corpus (recording MM traces + reference/candidate replay) before it can be verified. Out of scope: `Auto_hedger` (abandoned).
+- **M4 — Market Maker. [REMOVED]** The MM strategy module/wiring is deleted; MM will be re-expressed as a config strategy in the future if needed (no OCaml). `is_mm_strategy` is gone; MM orders route to the grid callbacks as an unreachable arm.
 - **M5 — Remove the reference grid (native branch, optional).** Only if native reimplementation is the goal: rewrite each registered action to own its logic and delete `jacobs_ladder_execution`'s buy/sell internals. Gate: full corpus + canary + an expanded adversarial corpus.
 - **M6 — Delete the harness scaffolding for the port** only after canary confidence: the reference replay path (`Strategy_replay.replay`), `execute_strategy` + the `Strategy` seam, and the reference-vs-candidate comparison, retaining the `--candidate` replay + trace/diff tooling for regression tests.
 
