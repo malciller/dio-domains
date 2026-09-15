@@ -572,10 +572,10 @@ let asset_domain_worker
     let wakeup_sync =
       Concurrency.Exchange_wakeup.get_sync_handle asset_with_fees.symbol
     in
-    (* Config-driven grid runtime (milestone 3, coarse wrapper; default off). When
-       config_strategy is set for a grid asset, the loop dispatches to the interpreter
-       whose handler calls the same reference execute_strategy, so behavior is identical
-       by construction. The strategy file is resolved by convention:
+    (* Config-driven grid runtime (milestone 3, coarse wrapper; default off). When a
+       strategy file is bound to the entry, the loop dispatches to the interpreter whose
+       handler calls the same reference execute_strategy, so behavior is identical by
+       construction. The strategy file is resolved by convention:
        strategies/<strategy>.json. *)
     let config_grid =
       if is_grid_strategy
@@ -593,18 +593,14 @@ let asset_domain_worker
           then (
             Logging.critical_f
               ~section
-              "config_strategy: %s has errors: %s"
+              "strategy file: %s has errors: %s"
               path
               (Dio_strategies.Strategy_compile.format diags);
             None)
           else (
             let ctx = Dio_strategies.Strategy_cycle_engine.create () in
             ctx.cg_symbol <- asset_with_fees.symbol;
-            Logging.info_f
-              ~section
-              "config_strategy: %s running %s"
-              asset_with_fees.symbol
-              path;
+            Logging.info_f ~section "strategy: %s running %s" asset_with_fees.symbol path;
             Some
               ( ctx
               , Dio_strategies.Strategy_runtime.create
@@ -1403,6 +1399,10 @@ let asset_domain_worker
       let alloc_at_t3s =
         ref (if latency_this_cycle then int_of_float (Gc.minor_words ()) else alloc_at_t3)
       in
+      (* Strategy-span end captured before the opt-in trace recorder runs, so enabling
+         tracing (config strategy_trace) does not distort STRAT/TOTAL. *)
+      let strat_end_ns = ref 0 in
+      let alloc_strat_end = ref 0 in
       if should_execute
       then (
         should_execute_strategy := false;
@@ -1637,6 +1637,9 @@ let asset_domain_worker
               grid (an unbound asset is not [is_grid_strategy]). The reference grid entry
               point is retired (M3). *)
            ());
+        strat_end_ns := if latency_this_cycle then Monotonic_clock.now_ns () else 0;
+        alloc_strat_end
+        := if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0;
         match trace_recorder with
         | Some r ->
           List.iter
@@ -1710,10 +1713,8 @@ let asset_domain_worker
               trace_path
               (Dio_strategies.Strategy_event_recorder.snapshot r)
         | _ -> ());
-      let t4 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
-      let alloc_at_t4 =
-        if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
-      in
+      let t4 = !strat_end_ns in
+      let alloc_at_t4 = !alloc_strat_end in
       (* PREP is recorded on every measured cycle: oracle apply / halt / reclaim / gate
          work runs on idle cycles too, and folding it into CYCLE made those cycles
          unattributable. STRAT is the strategy call alone. *)
@@ -1744,7 +1745,7 @@ let asset_domain_worker
               closure and [alloc_start] box. *)
            Latency_profiler.record_max_ns prof_cycle (t4 - t1)
         then (
-          let alloc_diff = int_of_float (Gc.minor_words ()) - alloc_start in
+          let alloc_diff = alloc_at_t4 - alloc_start in
           let gc_str =
             if gc_sampled
             then Gc_monitor.diff_to_string stats_start (Gc_monitor.get_stats ())

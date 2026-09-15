@@ -79,10 +79,6 @@ type config =
   (** When true, the domain loop records per-cycle observable traces for the
       behavioral-equivalence harness. Default false: production behavior is unchanged
       unless explicitly enabled. *)
-  ; config_strategy : bool
-  (** Deprecated / ignored: an entry bound to a strategy file always runs through the
-      config-driven interpreter (M3). The key is still accepted so existing configs parse;
-      it no longer changes behavior. *)
   }
 
 (** Logging section identifier for this module. *)
@@ -143,7 +139,6 @@ let known_top_level_keys =
   ; "fng_check_threshold"
   ; "theme"
   ; "strategy_trace"
-  ; "config_strategy"
   ]
 ;;
 
@@ -176,7 +171,6 @@ let known_trading_keys =
   ; "min_usd_balance"
   ; "max_exposure"
   ; "strategy"
-  ; "strategy_file"
   ; "maker_fee"
   ; "taker_fee"
   ; "testnet"
@@ -369,35 +363,37 @@ let parse_config json =
          symbol;
        exit 1));
   let strategy = json |> member "strategy" |> to_string in
-  (* A trading entry may bind a strategy file. Strategy names are user-defined; the file's
-     "name" must match the entry's "strategy" exactly. A mismatch, or an
-     unreadable/invalid file, is the user's to fix: log and exit 1. *)
-  (match json |> member "strategy_file" |> to_string_option with
-   | None -> ()
-   | Some path ->
-     (match Dio_strategies.Strategy_file.parse_file path with
-      | Error msg ->
-        Logging.critical_f
-          ~section
-          "Strategy file '%s' for %s/%s is invalid: %s"
-          path
-          exchange
-          symbol
-          msg;
-        exit 1
-      | Ok file ->
-        if not (String.equal file.name strategy)
-        then (
-          Logging.critical_f
-            ~section
-            "Strategy name mismatch for %s/%s: config.json declares '%s' but strategy \
-             file '%s' declares '%s'"
-            exchange
-            symbol
-            strategy
-            path
-            file.name;
-          exit 1)));
+  (* The strategy file is located by convention, [strategies/<strategy>.json]. Strategy
+     names are user-defined and the file is the strategy: its "name" must match the
+     entry's "strategy" exactly. No file (a name with no matching file) is allowed - it
+     simply binds no interpreter. A present-but-invalid file, or a name mismatch, is the
+     user's to fix: log and exit 1. *)
+  (let path = Printf.sprintf "strategies/%s.json" strategy in
+   if Sys.file_exists path
+   then (
+     match Dio_strategies.Strategy_file.parse_file path with
+     | Error msg ->
+       Logging.critical_f
+         ~section
+         "Strategy file '%s' for %s/%s is invalid: %s"
+         path
+         exchange
+         symbol
+         msg;
+       exit 1
+     | Ok file ->
+       if not (String.equal file.name strategy)
+       then (
+         Logging.critical_f
+           ~section
+           "Strategy name mismatch for %s/%s: config.json declares '%s' but strategy \
+            file '%s' declares '%s'"
+           exchange
+           symbol
+           strategy
+           path
+           file.name;
+         exit 1)));
   (* grid_interval carries the hardened search bounds (gi_min, gi_max) walked by the
      oracle's parameter search. *)
   let testnet =
@@ -593,9 +589,6 @@ let read_config () : config =
     let strategy_trace =
       json |> member "strategy_trace" |> to_bool_option |> Option.value ~default:false
     in
-    let config_strategy =
-      json |> member "config_strategy" |> to_bool_option |> Option.value ~default:false
-    in
     { cycle_mod
     ; logging
     ; gc
@@ -609,7 +602,6 @@ let read_config () : config =
     ; latency_network_spike_threshold_us
     ; theme
     ; strategy_trace
-    ; config_strategy
     }
   with
   | Yojson.Json_error msg ->
@@ -630,7 +622,6 @@ let read_config () : config =
     ; latency_network_spike_threshold_us = 20_000.0
     ; theme = None
     ; strategy_trace = false
-    ; config_strategy = false
     }
 ;;
 

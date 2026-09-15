@@ -57,7 +57,6 @@ let test_spawn_domains_basic () =
     ; fng_check_threshold = 1.5
     ; theme = None
     ; strategy_trace = false
-    ; config_strategy = false
     }
   in
   let _supervisor_thread =
@@ -90,7 +89,6 @@ let test_spawn_domains_empty () =
     ; fng_check_threshold = 1.5
     ; theme = None
     ; strategy_trace = false
-    ; config_strategy = false
     }
   in
   let _supervisor_thread =
@@ -178,7 +176,6 @@ let test_domain_error_handling () =
     ; fng_check_threshold = 1.5
     ; theme = None
     ; strategy_trace = false
-    ; config_strategy = false
     }
   in
   let _supervisor_thread =
