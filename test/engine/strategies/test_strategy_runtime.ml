@@ -327,6 +327,11 @@ module Stub_engine = struct
   let refresh_fee _ = ()
   let guard _ = true
   let buy _ = false
+  let buy_gate _ = true
+  let buy_facts _ = false, 0, false
+  let buy_cancel _ = ()
+  let buy_place _ = ()
+  let buy_amend _ = ()
   let sell _ = ()
 end
 

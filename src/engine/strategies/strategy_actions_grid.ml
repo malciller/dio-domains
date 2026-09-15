@@ -157,6 +157,11 @@ module type ENGINE = sig
   val refresh_fee : ctx -> unit
   val guard : ctx -> bool
   val buy : ctx -> bool
+  val buy_gate : ctx -> bool
+  val buy_facts : ctx -> bool * int * bool
+  val buy_cancel : ctx -> unit
+  val buy_place : ctx -> unit
+  val buy_amend : ctx -> unit
   val sell : ctx -> unit
 end
 
@@ -171,6 +176,13 @@ module Make (E : ENGINE) = struct
           | "grid_prepare" ->
             let cont = E.prepare ctx in
             Strategy_runtime.set_platform t "engine:continue" (V_bool cont);
+            (* Reset per-cycle buy facts so a cycle that skips them cannot inherit the
+               previous cycle's branch selection. *)
+            Strategy_runtime.set_platform t "engine:buy_active" (V_bool false);
+            Strategy_runtime.set_platform t "engine:buy_pending" (V_bool false);
+            Strategy_runtime.set_platform t "engine:buy_should_cancel" (V_bool false);
+            Strategy_runtime.set_platform t "engine:buy_count_zero" (V_bool false);
+            Strategy_runtime.set_platform t "engine:buy_count_positive" (V_bool false);
             []
           | "grid_cleanup" ->
             E.cleanup ctx;
@@ -187,6 +199,35 @@ module Make (E : ENGINE) = struct
             []
           | "grid_buy" ->
             ignore (E.buy ctx : bool);
+            []
+          | "grid_buy_gate" ->
+            let active = E.buy_gate ctx in
+            Strategy_runtime.set_platform t "engine:buy_active" (V_bool active);
+            []
+          | "grid_buy_facts" ->
+            let pending, effective, should_cancel = E.buy_facts ctx in
+            Strategy_runtime.set_platform t "engine:buy_pending" (V_bool pending);
+            Strategy_runtime.set_platform
+              t
+              "engine:buy_should_cancel"
+              (V_bool should_cancel);
+            Strategy_runtime.set_platform
+              t
+              "engine:buy_count_zero"
+              (V_bool (effective = 0));
+            Strategy_runtime.set_platform
+              t
+              "engine:buy_count_positive"
+              (V_bool (effective > 0));
+            []
+          | "grid_buy_cancel" ->
+            E.buy_cancel ctx;
+            []
+          | "grid_buy_place" ->
+            E.buy_place ctx;
+            []
+          | "grid_buy_amend" ->
+            E.buy_amend ctx;
             []
           | "grid_sell" ->
             E.sell ctx;
