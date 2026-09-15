@@ -28,6 +28,18 @@ let declarations =
       "owed_sell_price"
       decision
       [ se "bid" e; se "ask" e; se ~required:false "capital_exhausted" b ]
+  ; act
+      "available_base"
+      decision
+      [ se "venue_authoritative" b
+      ; se "asset_balance_nan" b
+      ; se "venue_available" e
+      ; se "ledger_balance" e
+      ; se "unreflected_credit" e
+      ; se "reserved_base" e
+      ; se "committed_sell" e
+      ; se "unnetted_hold" e
+      ]
   ; act "compute_sell_price" decision [ se "base" e; se "mult" e ]
   ; act
       "compute_amend_price"
