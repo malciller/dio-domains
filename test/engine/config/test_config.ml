@@ -25,7 +25,7 @@ let test_parse_trading_config_defaults () =
     (1.0, 1.0)
     config.grid_interval;
   Alcotest.(check string) "sell_mult default" "1.0" config.sell_mult;
-  Alcotest.(check string) "strategy" "Ladder" config.strategy;
+  Alcotest.(check string) "strategy normalized" "jacobs_ladder" config.strategy;
   Alcotest.(check (option (float 0.001))) "maker_fee none" None config.maker_fee;
   Alcotest.(check (option (float 0.001))) "taker_fee none" None config.taker_fee;
   Alcotest.(check (option string)) "min_usd_balance none" None config.min_usd_balance;
@@ -38,6 +38,10 @@ let test_parse_trading_config_optional_fields () =
   in
   let json = Yojson.Basic.from_string json_str in
   let config = Dio_engine.Config.parse_config json in
+  Alcotest.(check string)
+    "grid normalizes to jacobs_ladder"
+    "jacobs_ladder"
+    config.strategy;
   Alcotest.(check (option string)) "min_usd_balance" (Some "100") config.min_usd_balance;
   Alcotest.(check (option string)) "max_exposure" (Some "500") config.max_exposure
 ;;

@@ -300,6 +300,16 @@ let parse_accumulation_buffer json exchange symbol =
   | _ -> default
 ;;
 
+(** Canonical strategy tag. The Jacob's Ladder grid is named ["jacobs_ladder"] and the
+    market maker ["market_maker"]; legacy spellings ("Ladder", "grid", "MM") are accepted
+    and normalized here so downstream code sees one canonical name. *)
+let canonical_strategy_name s =
+  match String.lowercase_ascii (String.trim s) with
+  | "ladder" | "jacobs_ladder" | "jacobs-ladder" | "grid" -> "jacobs_ladder"
+  | "mm" | "market_maker" | "market-maker" | "marketmaker" -> "market_maker"
+  | other -> other
+;;
+
 (** Parses one entry of the JSON "trading" array into a [trading_config]. Validates keys
     and venue restrictions; [exit 1] on schema violation. *)
 let parse_config json =
@@ -362,7 +372,7 @@ let parse_config json =
          exchange
          symbol;
        exit 1));
-  let strategy = json |> member "strategy" |> to_string in
+  let strategy = json |> member "strategy" |> to_string |> canonical_strategy_name in
   (* grid_interval carries the hardened search bounds (gi_min, gi_max) walked by the
      oracle's parameter search. *)
   let testnet =

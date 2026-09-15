@@ -78,9 +78,9 @@ Responsibility split (see §5.2 for the precise ownership rule):
 > Illustrative only. The authoritative behavior specification is the reference-action mapping table in §8.2; the syntax, control flow, token bindings, and platform-owned capacity queries shown here are what matter.
 
 ```jsonc
-// strategies/golden_grid.json  — decision procedure (abridged)
+// strategies/jacobs_ladder.json  — decision procedure (abridged)
 {
-  "name": "golden_grid",
+  "name": "jacobs_ladder",
   "version": 1,
   "triggers": ["book_update", "fill", "order_lifecycle", "oracle_publish"],
   "params": {
@@ -159,7 +159,7 @@ And `config.json` shrinks to bindings:
 
 ```jsonc
 { "instances": [
-    { "strategy_file": "strategies/golden_grid.json",
+    { "strategy_file": "strategies/jacobs_ladder.json",
       "exchange": "hyperliquid", "symbol": "BTC/USDC",
       "params": { "grid_interval": [0.16, 0.16] }, "mode": "live" }
 ] }
@@ -582,7 +582,7 @@ Dependency order is strict: 1 before 3; 2 before 3 (the accounting module is wha
 - `strategy_expr.ml` — expression engine (refs, arithmetic, comparison, boolean, string templates).
 - `strategy_guard.ml` — guard evaluation; `strategy_runtime.ml` — state, env, cycle runner, action dispatch, bindings; executes a compiled strategy against synthetic events and returns an ordered action trace.
 - `bin/main.ml` — CLI intercept before `Arg.parse`, so validation runs without booting the engine.
-- Tests: `test_strategy_compose.ml` (parse + validation) and `test_strategy_runtime.ml` (expression/guard evaluation + synthetic cycle execution). Sample file: `strategies/golden_grid.json`.
+- Tests: `test_strategy_compose.ml` (parse + validation) and `test_strategy_runtime.ml` (expression/guard evaluation + synthetic cycle execution). Sample file: `strategies/jacobs_ladder.json`.
 
 **Remaining for milestone 1:** the `Strategy_common.S` protocol adapter (`strategy_protocol.ml`) and wiring a compiled instance into the domain loop behind the default-off feature flag. Milestones 0 and 2–5 are not started.
 
@@ -593,7 +593,7 @@ Dependency order is strict: 1 before 3; 2 before 3 (the accounting module is wha
 **Usage:**
 
 ```
-./_build/default/bin/main.exe strategy validate strategies/golden_grid.json
+./_build/default/bin/main.exe strategy validate strategies/jacobs_ladder.json
 ```
 
 Exit codes: `0` valid, `1` errors, `2` usage.
