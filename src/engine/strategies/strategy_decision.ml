@@ -399,9 +399,23 @@ let buy_place_initial
   !attempted
 ;;
 
-(** Branch: exactly one resting buy - trail it up, or amend down to clear a sell's 2*gi
+(** True when a resting or pending sell is tracked (the 2*gi clamp applies). *)
+let buy_amend_has_sell ~state ~closest_sell_order_initial =
+  let closest = ref closest_sell_order_initial in
+  let update oid price =
+    match !closest with
+    | None -> closest := Some (oid, price)
+    | Some (_, best_p) -> if price < best_p then closest := Some (oid, price)
+  in
+  List.iter
+    (fun (oid, side, price, _) -> if side = Sell then update oid price)
+    state.pending_orders;
+  !closest <> None
+;;
+
+(** Branch: a sell is tracked - trail the buy, or amend it down to clear the sell's 2*gi
     restricted zone. *)
-let buy_amend
+let buy_amend_with_sell
   ~state
   ~now
   ~(asset : trading_config)
@@ -425,187 +439,240 @@ let buy_amend
     (fun (oid, side, price, _) -> if side = Sell then update_closest_pending oid price)
     state.pending_orders;
   let closest_sell_order_val = !closest_sell_ref in
-  if closest_sell_order_val <> None
-  then (
-    match closest_sell_order_val, state.last_buy_order_price, state.last_buy_order_id with
-    | Some (_sell_order_id, sell_price), Some current_buy_price, Some buy_order_id ->
-      (* The 2*gi separation from the closest sell is anchored on the sell order and is
-         price-independent: while a sell is tracked by order management, the buy never
-         trails above sell - 2*gi, no matter where the perceived top of book sits. Price
-         can dislocate above a resting sell without filling it; the ladder must not let
-         the buy cross a sell that still exists. The clamp is released only when the sell
-         is removed from tracking (fill/cancel/expiry); only then does the buy trail the
-         top of book at the grid interval. [sell_price] is always a positive resting-order
-         price, so there is no zero-reference hazard. *)
-      let double_grid_interval = sell_price *. (2.0 *. grid_interval /. 100.0) in
-      let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
-      let grid_buy_from_ref = calculate_grid_price ref_price grid_interval false state in
-      let grid_buy_capped =
-        if bid_price > 0.0 then min grid_buy_from_ref bid_price else grid_buy_from_ref
-      in
-      let exact_target = state.cached_round_price (sell_price -. double_grid_interval) in
-      let proposed_buy_price = grid_buy_capped in
-      let target_buy_price = min proposed_buy_price exact_target in
-      let current_buy_price_rounded = state.cached_round_price current_buy_price in
-      let min_move_threshold = get_min_move_threshold state.cached_price_increment in
-      (* A sizing re-anchor (the capital oracle published a changed grid interval -
-         flagged by the domain worker on [force_buy_reanchor]) used to amend the resting
-         buy in both directions. A downward amendment is warranted only by a sell-spacing
-         violation (see below); a widened grid interval no longer snaps a valid resting
-         buy down to the market rung. The ladder spacing is enforced where it matters:
-         fresh placements clamp below the closest sell, and this leg corrects real
-         intrusions into a sell's restricted zone. A qty-only oracle change does not
-         re-anchor the price: the grid adopts the new size (Alpaca qty mismatch amend) or
-         on the next placement, and the resting price only trails up. *)
-      let reanchor_buy = state.force_buy_reanchor in
-      (* Downward movement of the buy is initiated to correct an actual violation of the
-         2x grid_interval restricted zone below the closest sell (above sell - 2*gi). This
-         clamp is price-independent and enforces the threshold whenever a resting buy sits
-         inside the restricted zone (e.g. after an external upward amendment, book
-         dislocation, or grid interval widening). A resting buy already outside the
-         restricted zone is never snapped down. *)
-      let trail_up = target_buy_price > current_buy_price in
-      let zone_violation = (not trail_up) && current_buy_price_rounded > exact_target in
-      let should_amend = trail_up || zone_violation in
-      (* Release reanchor latch if no action is needed. *)
-      if reanchor_buy && not should_amend then state.force_buy_reanchor <- false;
-      if should_amend
-      then (
-        let effective_amend_price =
-          if zone_violation then exact_target else target_buy_price
-        in
-        let effective_price_diff =
-          state.cached_round_price
-            (abs_float (effective_amend_price -. current_buy_price_rounded))
-        in
-        let allow =
-          amend_allowed
-            ~state
-            ~order_id:buy_order_id
-            ~target_price:effective_amend_price
-            ~current_price_rounded:current_buy_price_rounded
-            ~price_diff:effective_price_diff
-            ~min_move_threshold
-        in
-        if allow
-        then (
-          let quote_bal = quote_balance in
-          (* An amend replaces the resting buy (cancel+create on Alpaca): the capital
-             committed to that buy is released and re-committed at the new price, so the
-             affordability check must add the committed notional ([locked_in_buys], sum of
-             price*qty over open buys) back to the available balance. Without this the
-             grid falsely reports "Insufficient quote balance" when trailing a funded buy
-             up on committed capital. *)
-          let available_for_amend = quote_bal +. locked_in_buys in
-          if (not (Float.is_nan quote_balance))
-             && can_place_buy_order qty available_for_amend quote_needed
-          then (
-            let order =
-              create_amend_order
-                buy_order_id
-                asset.symbol
-                Buy
-                qty
-                (Some effective_amend_price)
-                true
-                Ladder
-                asset.exchange
-            in
-            ignore (push_order ~now ~state order);
-            state.last_buy_order_price <- Some effective_amend_price;
-            state.force_buy_reanchor <- false;
-            ())
-          else if not (Float.is_nan quote_balance)
-          then
-            Logging.warn_f
-              ~section
-              "Insufficient quote balance for %s trailing: need %.2f, have %.2f (incl. \
-               committed %.2f)"
-              asset.symbol
-              quote_needed
-              available_for_amend
-              locked_in_buys
-          else Logging.warn_f ~section "No quote balance for %s trailing" asset.symbol
-          (* The re-anchor target is already where the buy sits (within the min-move
-             threshold): nothing to amend, the sizing is applied. *))
-        else if reanchor_buy && effective_price_diff < min_move_threshold
-        then state.force_buy_reanchor <- false)
-    | _ -> ())
-  else (
-    match state.last_buy_order_price, state.last_buy_order_id with
-    | Some current_buy_price, Some buy_order_id ->
-      let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
-      let raw_target = calculate_grid_price ref_price grid_interval false state in
-      let target_buy_price =
-        if bid_price > 0.0 then min raw_target bid_price else raw_target
-      in
-      let min_move_threshold = get_min_move_threshold state.cached_price_increment in
-      let current_buy_price_rounded = state.cached_round_price current_buy_price in
-      (* No resting sell on this symbol, so a downwards amendment has no warrant at all:
-         the re-anchor contributes nothing beyond normal trail-up. A resting buy already
-         within one grid interval of the reference is left alone. *)
-      let reanchor_buy = state.force_buy_reanchor in
-      let trail_up = target_buy_price > current_buy_price in
-      (* Nothing warranted: release the latch so the sizing counts as adopted without
-         moving the book. *)
-      if reanchor_buy && not trail_up then state.force_buy_reanchor <- false;
-      if trail_up
-      then (
-        let effective_amend_price = target_buy_price in
-        let effective_price_diff =
-          state.cached_round_price
-            (abs_float (effective_amend_price -. current_buy_price_rounded))
-        in
-        let allow =
-          amend_allowed
-            ~state
-            ~order_id:buy_order_id
-            ~target_price:effective_amend_price
-            ~current_price_rounded:current_buy_price_rounded
-            ~price_diff:effective_price_diff
-            ~min_move_threshold
-        in
-        if allow
-        then (
-          let quote_bal = quote_balance in
-          (* See the with-sell branch: an amend releases the committed capital of the
-             resting buy it replaces, so that committed notional is added back to the
-             available balance before the affordability check (fixes the false
-             "insufficient quote balance" warning when trailing a funded buy up). *)
-          let available_for_amend = quote_bal +. locked_in_buys in
-          if (not (Float.is_nan quote_balance))
-             && can_place_buy_order qty available_for_amend quote_needed
-          then (
-            let order =
-              create_amend_order
-                buy_order_id
-                asset.symbol
-                Buy
-                qty
-                (Some effective_amend_price)
-                true
-                Ladder
-                asset.exchange
-            in
-            ignore (push_order ~now ~state order);
-            state.last_buy_order_price <- Some effective_amend_price;
-            state.force_buy_reanchor <- false;
-            ())
-          else if not (Float.is_nan quote_balance)
-          then
-            Logging.warn_f
-              ~section
-              "Insufficient quote balance to trail buy: need %.2f, have %.2f (incl. \
-               committed %.2f)"
-              quote_needed
-              available_for_amend
-              locked_in_buys
-          else Logging.warn_f ~section "No quote balance for buy trailing"
-          (* The re-anchor target is already where the buy sits: done. *))
-        else if reanchor_buy && effective_price_diff < min_move_threshold
-        then state.force_buy_reanchor <- false)
-    | _ -> ());
+  (match closest_sell_order_val, state.last_buy_order_price, state.last_buy_order_id with
+   | Some (_sell_order_id, sell_price), Some current_buy_price, Some buy_order_id ->
+     (* The 2*gi separation from the closest sell is anchored on the sell order and is
+        price-independent: while a sell is tracked by order management, the buy never
+        trails above sell - 2*gi, no matter where the perceived top of book sits. Price
+        can dislocate above a resting sell without filling it; the ladder must not let the
+        buy cross a sell that still exists. The clamp is released only when the sell is
+        removed from tracking (fill/cancel/expiry); only then does the buy trail the top
+        of book at the grid interval. [sell_price] is always a positive resting-order
+        price, so there is no zero-reference hazard. *)
+     let double_grid_interval = sell_price *. (2.0 *. grid_interval /. 100.0) in
+     let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
+     let grid_buy_from_ref = calculate_grid_price ref_price grid_interval false state in
+     let grid_buy_capped =
+       if bid_price > 0.0 then min grid_buy_from_ref bid_price else grid_buy_from_ref
+     in
+     let exact_target = state.cached_round_price (sell_price -. double_grid_interval) in
+     let proposed_buy_price = grid_buy_capped in
+     let target_buy_price = min proposed_buy_price exact_target in
+     let current_buy_price_rounded = state.cached_round_price current_buy_price in
+     let min_move_threshold = get_min_move_threshold state.cached_price_increment in
+     (* A sizing re-anchor (the capital oracle published a changed grid interval - flagged
+        by the domain worker on [force_buy_reanchor]) used to amend the resting buy in
+        both directions. A downward amendment is warranted only by a sell-spacing
+        violation (see below); a widened grid interval no longer snaps a valid resting buy
+        down to the market rung. The ladder spacing is enforced where it matters: fresh
+        placements clamp below the closest sell, and this leg corrects real intrusions
+        into a sell's restricted zone. A qty-only oracle change does not re-anchor the
+        price: the grid adopts the new size (Alpaca qty mismatch amend) or on the next
+        placement, and the resting price only trails up. *)
+     let reanchor_buy = state.force_buy_reanchor in
+     (* Downward movement of the buy is initiated to correct an actual violation of the 2x
+        grid_interval restricted zone below the closest sell (above sell - 2*gi). This
+        clamp is price-independent and enforces the threshold whenever a resting buy sits
+        inside the restricted zone (e.g. after an external upward amendment, book
+        dislocation, or grid interval widening). A resting buy already outside the
+        restricted zone is never snapped down. *)
+     let trail_up = target_buy_price > current_buy_price in
+     let zone_violation = (not trail_up) && current_buy_price_rounded > exact_target in
+     let should_amend = trail_up || zone_violation in
+     (* Release reanchor latch if no action is needed. *)
+     if reanchor_buy && not should_amend then state.force_buy_reanchor <- false;
+     if should_amend
+     then (
+       let effective_amend_price =
+         if zone_violation then exact_target else target_buy_price
+       in
+       let effective_price_diff =
+         state.cached_round_price
+           (abs_float (effective_amend_price -. current_buy_price_rounded))
+       in
+       let allow =
+         amend_allowed
+           ~state
+           ~order_id:buy_order_id
+           ~target_price:effective_amend_price
+           ~current_price_rounded:current_buy_price_rounded
+           ~price_diff:effective_price_diff
+           ~min_move_threshold
+       in
+       if allow
+       then (
+         let quote_bal = quote_balance in
+         (* An amend replaces the resting buy (cancel+create on Alpaca): the capital
+            committed to that buy is released and re-committed at the new price, so the
+            affordability check must add the committed notional ([locked_in_buys], sum of
+            price*qty over open buys) back to the available balance. Without this the grid
+            falsely reports "Insufficient quote balance" when trailing a funded buy up on
+            committed capital. *)
+         let available_for_amend = quote_bal +. locked_in_buys in
+         if (not (Float.is_nan quote_balance))
+            && can_place_buy_order qty available_for_amend quote_needed
+         then (
+           let order =
+             create_amend_order
+               buy_order_id
+               asset.symbol
+               Buy
+               qty
+               (Some effective_amend_price)
+               true
+               Ladder
+               asset.exchange
+           in
+           ignore (push_order ~now ~state order);
+           state.last_buy_order_price <- Some effective_amend_price;
+           state.force_buy_reanchor <- false;
+           ())
+         else if not (Float.is_nan quote_balance)
+         then
+           Logging.warn_f
+             ~section
+             "Insufficient quote balance for %s trailing: need %.2f, have %.2f (incl. \
+              committed %.2f)"
+             asset.symbol
+             quote_needed
+             available_for_amend
+             locked_in_buys
+         else Logging.warn_f ~section "No quote balance for %s trailing" asset.symbol
+         (* The re-anchor target is already where the buy sits (within the min-move
+            threshold): nothing to amend, the sizing is applied. *))
+       else if reanchor_buy && effective_price_diff < min_move_threshold
+       then state.force_buy_reanchor <- false)
+   | _ -> ());
   state.last_cycle <- cycle
+;;
+
+(** Branch: no sell tracked - trail-up only (no downward warrant). *)
+let buy_amend_no_sell
+  ~state
+  ~now
+  ~(asset : trading_config)
+  ~bid_price
+  ~ask_price
+  ~quote_balance
+  ~cycle
+  ~locked_in_buys
+  ~closest_sell_order_initial:_
+  =
+  let qty = venue_lot_qty state.grid_qty asset.exchange state in
+  let grid_interval = asset.grid_interval in
+  let quote_needed = ask_price *. qty in
+  (match state.last_buy_order_price, state.last_buy_order_id with
+   | Some current_buy_price, Some buy_order_id ->
+     let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
+     let raw_target = calculate_grid_price ref_price grid_interval false state in
+     let target_buy_price =
+       if bid_price > 0.0 then min raw_target bid_price else raw_target
+     in
+     let min_move_threshold = get_min_move_threshold state.cached_price_increment in
+     let current_buy_price_rounded = state.cached_round_price current_buy_price in
+     (* No resting sell on this symbol, so a downwards amendment has no warrant at all:
+        the re-anchor contributes nothing beyond normal trail-up. A resting buy already
+        within one grid interval of the reference is left alone. *)
+     let reanchor_buy = state.force_buy_reanchor in
+     let trail_up = target_buy_price > current_buy_price in
+     (* Nothing warranted: release the latch so the sizing counts as adopted without
+        moving the book. *)
+     if reanchor_buy && not trail_up then state.force_buy_reanchor <- false;
+     if trail_up
+     then (
+       let effective_amend_price = target_buy_price in
+       let effective_price_diff =
+         state.cached_round_price
+           (abs_float (effective_amend_price -. current_buy_price_rounded))
+       in
+       let allow =
+         amend_allowed
+           ~state
+           ~order_id:buy_order_id
+           ~target_price:effective_amend_price
+           ~current_price_rounded:current_buy_price_rounded
+           ~price_diff:effective_price_diff
+           ~min_move_threshold
+       in
+       if allow
+       then (
+         let quote_bal = quote_balance in
+         (* See the with-sell branch: an amend releases the committed capital of the
+            resting buy it replaces, so that committed notional is added back to the
+            available balance before the affordability check (fixes the false
+            "insufficient quote balance" warning when trailing a funded buy up). *)
+         let available_for_amend = quote_bal +. locked_in_buys in
+         if (not (Float.is_nan quote_balance))
+            && can_place_buy_order qty available_for_amend quote_needed
+         then (
+           let order =
+             create_amend_order
+               buy_order_id
+               asset.symbol
+               Buy
+               qty
+               (Some effective_amend_price)
+               true
+               Ladder
+               asset.exchange
+           in
+           ignore (push_order ~now ~state order);
+           state.last_buy_order_price <- Some effective_amend_price;
+           state.force_buy_reanchor <- false;
+           ())
+         else if not (Float.is_nan quote_balance)
+         then
+           Logging.warn_f
+             ~section
+             "Insufficient quote balance to trail buy: need %.2f, have %.2f (incl. \
+              committed %.2f)"
+             quote_needed
+             available_for_amend
+             locked_in_buys
+         else Logging.warn_f ~section "No quote balance for buy trailing"
+         (* The re-anchor target is already where the buy sits: done. *))
+       else if reanchor_buy && effective_price_diff < min_move_threshold
+       then state.force_buy_reanchor <- false)
+   | _ -> ());
+  state.last_cycle <- cycle
+;;
+
+(** Branch: exactly one resting buy - trail it up, or amend down to clear a sell's 2*gi
+    restricted zone. Reference recombination of the two branches. *)
+let buy_amend
+  ~state
+  ~now
+  ~(asset : trading_config)
+  ~bid_price
+  ~ask_price
+  ~quote_balance
+  ~cycle
+  ~locked_in_buys
+  ~closest_sell_order_initial
+  =
+  if buy_amend_has_sell ~state ~closest_sell_order_initial
+  then
+    buy_amend_with_sell
+      ~state
+      ~now
+      ~asset
+      ~bid_price
+      ~ask_price
+      ~quote_balance
+      ~cycle
+      ~locked_in_buys
+      ~closest_sell_order_initial
+  else
+    buy_amend_no_sell
+      ~state
+      ~now
+      ~asset
+      ~bid_price
+      ~ask_price
+      ~quote_balance
+      ~cycle
+      ~locked_in_buys
+      ~closest_sell_order_initial
 ;;
 
 let evaluate_buy_leg

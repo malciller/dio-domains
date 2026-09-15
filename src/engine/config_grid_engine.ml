@@ -525,6 +525,48 @@ let buy_place c =
   | _ -> c.cg_buy_attempted <- false
 ;;
 
+(** Fine path branch: publish whether a resting/pending sell is tracked. *)
+let buy_amend_has_sell c =
+  match c.cg_state with
+  | Some state ->
+    Jac.buy_amend_has_sell ~state ~closest_sell_order_initial:c.cg_closest_sell_order
+  | None -> false
+;;
+
+(** Fine path branch: with-sell buy amend. *)
+let buy_amend_with_sell c =
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    Jac.buy_amend_with_sell
+      ~state
+      ~now:c.cg_now
+      ~asset
+      ~bid_price:c.cg_bid_r
+      ~ask_price:c.cg_ask_r
+      ~quote_balance:c.cg_qbal
+      ~cycle:c.cg_cycle
+      ~locked_in_buys:c.cg_locked_in_buys
+      ~closest_sell_order_initial:c.cg_closest_sell_order
+  | _ -> ()
+;;
+
+(** Fine path branch: no-sell buy amend. *)
+let buy_amend_no_sell c =
+  match c.cg_state, c.cg_asset with
+  | Some state, Some asset ->
+    Jac.buy_amend_no_sell
+      ~state
+      ~now:c.cg_now
+      ~asset
+      ~bid_price:c.cg_bid_r
+      ~ask_price:c.cg_ask_r
+      ~quote_balance:c.cg_qbal
+      ~cycle:c.cg_cycle
+      ~locked_in_buys:c.cg_locked_in_buys
+      ~closest_sell_order_initial:c.cg_closest_sell_order
+  | _ -> ()
+;;
+
 (** Fine path branch: trail/amend the single resting buy. *)
 let buy_amend c =
   match c.cg_state, c.cg_asset with

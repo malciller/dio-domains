@@ -481,7 +481,7 @@
       ]
     },
     {
-      "id": "buy_amend",
+      "id": "buy_amend_has_sell",
       "when": {
         "all": [
           {
@@ -506,7 +506,75 @@
       },
       "then": [
         {
-          "action": "buy_amend",
+          "action": "buy_amend_has_sell",
+          "args": {}
+        }
+      ]
+    },
+    {
+      "id": "buy_amend_with_sell",
+      "when": {
+        "all": [
+          {
+            "event": "book_update"
+          },
+          {
+            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+          },
+          {
+            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+          },
+          {
+            "expr": "not $platform.has_pending_buy"
+          },
+          {
+            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+          },
+          {
+            "expr": "$platform.open_buy_count > 0 or $platform.has_tracked_buy"
+          },
+          {
+            "expr": "$platform.amend_has_sell"
+          }
+        ]
+      },
+      "then": [
+        {
+          "action": "buy_amend_with_sell",
+          "args": {}
+        }
+      ]
+    },
+    {
+      "id": "buy_amend_no_sell",
+      "when": {
+        "all": [
+          {
+            "event": "book_update"
+          },
+          {
+            "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))"
+          },
+          {
+            "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
+          },
+          {
+            "expr": "not $platform.has_pending_buy"
+          },
+          {
+            "expr": "not ($platform.open_buy_count > 1 and not $platform.inflight_cancel_buy and not $platform.inflight_amend_buy and not $platform.has_recent_amend_buy)"
+          },
+          {
+            "expr": "$platform.open_buy_count > 0 or $platform.has_tracked_buy"
+          },
+          {
+            "expr": "not $platform.amend_has_sell"
+          }
+        ]
+      },
+      "then": [
+        {
+          "action": "buy_amend_no_sell",
           "args": {}
         }
       ]
