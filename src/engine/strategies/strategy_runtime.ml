@@ -349,7 +349,9 @@ let run_action t (e : env) step_id (a : Strategy_file.action) : action_call =
 (** Run one cycle for a dispatch kind. The snapshot phase is
     [make_event "book_update" []]; execution events carry their fields. Returns the
     ordered action calls made this cycle. *)
-let run_cycle t ~(price : float) ~(now : float) ~(event : event) : action_call list =
+let run_cycle ?(collect = true) t ~(price : float) ~(now : float) ~(event : event)
+  : action_call list
+  =
   t.price <- price;
   t.now <- now;
   t.event <- Some event;
@@ -378,7 +380,9 @@ let run_cycle t ~(price : float) ~(now : float) ~(event : event) : action_call l
              | Error _ -> false)
         in
         let actions = if passed then step.st_then else step.st_else in
-        List.iter (fun a -> calls := run_action t e step.st_id a :: !calls) actions;
+        if collect
+        then List.iter (fun a -> calls := run_action t e step.st_id a :: !calls) actions
+        else List.iter (fun a -> ignore (run_action t e step.st_id a)) actions;
         if passed && step.st_stop then stop := true))
     t.file.steps;
   List.rev !calls
