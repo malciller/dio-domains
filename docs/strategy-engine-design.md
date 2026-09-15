@@ -540,7 +540,7 @@ Concrete module and integration work, with per-module status. Milestone 1's firs
 | `strategy_guard.ml` | guard evaluation over an expression `env` + facts (event/side/capacity/pending/engine/cooldown) | protocol | done (closure compile pending) |
 | `strategy_runtime.ml` | per-instance state, env, cycle runner, action dispatch, step-local bindings | protocol | done (synthetic; exchange handlers pending) |
 | `strategy_protocol.ml` | implements `Strategy_common.S` over a compiled instance | protocol | pending |
-| `platform_accounting.ml` | central accounting: grace, ghost, freshness, ceilings, pending, reservation | platform | pending |
+| `platform_accounting.ml` | central accounting: grace, ghost, freshness, ceilings, pending, reservation | platform | partial (pure constants + freshness cutoff extracted; state-coupled overlays pending) |
 | `exchange_capabilities.ml` | per-venue capability descriptors (extracted from the grid flag matrix) | platform | done |
 | `strategy_event_recorder.ml` | record per-cycle observations (order intents/state/persistence) into a trace | test | done |
 | `strategy_equivalence.ml` | trace diff / equivalence decision | test | done |
@@ -588,7 +588,7 @@ Dependency order is strict: 1 before 3; 2 before 3 (the accounting module is wha
 
 **Milestone 0 (in progress):** `strategy_trace.ml` (observable trace types + comparison + JSON persistence), `strategy_event_recorder.ml` (per-cycle recording), and `strategy_equivalence.ml` (trace diff) are implemented with ref-vs-ref identity, state order-insensitivity, divergence, and JSON round-trip tests (`test_strategy_harness.ml`). The domain loop records per-cycle open orders + price under the default-off `strategy_trace` config flag (`config.ml`, `domain_spawner.ml`) and persists every 50 busy cycles to `data/strategy_trace_<exchange>_<symbol>.json`; `dio strategy diff <a.json> <b.json>` compares two traces. Remaining: dual-run capture of a candidate alongside the reference, and balance snapshots in the recorded state.
 
-**Milestone 2 (in progress):** `exchange_capabilities.ml` extracts the grid's per-venue flag matrix (`jacobs_ladder_config.ml`) into capability descriptors for hyperliquid/kraken/ibkr/lighter/alpaca. The central accounting module (`platform_accounting.ml`), migration of the grid overlay, and the refactor-equivalence gate remain.
+**Milestone 2 (in progress):** `exchange_capabilities.ml` extracts the grid's per-venue flag matrix (`jacobs_ladder_config.ml`) into capability descriptors for hyperliquid/kraken/ibkr/lighter/alpaca. `platform_accounting.ml` now holds the pure overlay constants and the freshness cutoff (`sell_hold_netting_grace_s`, `buy_ack_ghost_grace_s`, `balance_delta_epsilon`, `sweep_max_balance_age_s`, `unreflected_cutoff`), aliased by the grid so behavior is unchanged (grid suite passes). Remaining: migrate the state-coupled overlays (un-netted sell hold, ghost detection, reserve-dip ceiling, reservation), then the refactor-equivalence gate.
 
 **Usage:**
 
