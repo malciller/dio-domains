@@ -31,6 +31,10 @@ let known_platform_caps =
   ; "oracle_halted"
   ; "tif_recovery_pending"
   ; "tif_recovery_since"
+  ; "price_nan"
+  ; "check_stale_balance"
+  ; "asset_balance_nan"
+  ; "quote_balance_nan"
   ]
 ;;
 

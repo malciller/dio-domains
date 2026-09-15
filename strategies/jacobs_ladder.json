@@ -62,11 +62,14 @@
     {
       "id": "prepare",
       "when": { "event": "book_update" },
-      "then": [{ "action": "cycle_prepare", "args": {} }]
+      "then": [
+        { "action": "cycle_prepare", "args": {} },
+        { "action": "cycle_facts", "args": {} }
+      ]
     },
     {
       "id": "skip_nan_price",
-      "when": { "event": "book_update", "engine": { "continue": false } },
+      "when": { "event": "book_update", "expr": "$platform.price_nan" },
       "then": [],
       "stop": true
     },
@@ -86,13 +89,18 @@
       "then": [{ "action": "cycle_refresh_fee", "args": {} }]
     },
     {
-      "id": "stale_guard",
-      "when": { "event": "book_update" },
-      "then": [{ "action": "cycle_guard", "args": {} }]
+      "id": "mark_stale",
+      "when": {
+        "all": [
+          { "event": "book_update" },
+          { "expr": "not $platform.price_nan and $platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan)" }
+        ]
+      },
+      "then": [{ "action": "mark_stale_cycle", "args": {} }]
     },
     {
       "id": "buy_gate",
-      "when": { "event": "book_update", "engine": { "continue": true } },
+      "when": { "event": "book_update", "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))" },
       "then": [
         { "action": "expire_tif_recovery", "args": {} },
         { "action": "cycle_facts", "args": {} }
@@ -103,7 +111,7 @@
       "when": {
         "all": [
           { "event": "book_update" },
-          { "engine": { "continue": true } },
+          { "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))" },
           {
             "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
           }
@@ -116,7 +124,7 @@
       "when": {
         "all": [
           { "event": "book_update" },
-          { "engine": { "continue": true } },
+          { "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))" },
           {
             "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
           },
@@ -131,7 +139,7 @@
       "when": {
         "all": [
           { "event": "book_update" },
-          { "engine": { "continue": true } },
+          { "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))" },
           {
             "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
           },
@@ -147,7 +155,7 @@
       "when": {
         "all": [
           { "event": "book_update" },
-          { "engine": { "continue": true } },
+          { "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))" },
           {
             "expr": "not ($platform.oracle_halted and not ($platform.tif_recovery_pending and $now - $platform.tif_recovery_since < 900))"
           },
@@ -160,7 +168,7 @@
     },
     {
       "id": "sell",
-      "when": { "event": "book_update", "engine": { "continue": true } },
+      "when": { "event": "book_update", "expr": "not $platform.price_nan and not ($platform.check_stale_balance and ($platform.asset_balance_nan or $platform.quote_balance_nan))" },
       "then": [
         { "action": "sell_prepare", "args": {} },
         { "action": "sell_place", "args": {} },

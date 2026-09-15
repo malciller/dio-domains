@@ -303,10 +303,27 @@ let cycle_facts c =
     | Some s -> s.tif_recovery_pending, s.tif_recovery_since
     | None -> false, 0.0
   in
+  let check_stale_balance =
+    match c.cg_ecfg with
+    | Some ecfg -> ecfg.check_stale_balance
+    | None -> false
+  in
   [ "oracle_halted", Dio_strategies.Strategy_expr.V_bool c.cg_oracle_halted
   ; "tif_recovery_pending", Dio_strategies.Strategy_expr.V_bool pending
   ; "tif_recovery_since", Dio_strategies.Strategy_expr.V_float since
+  ; "price_nan", Dio_strategies.Strategy_expr.V_bool (Float.is_nan c.cg_price)
+  ; "check_stale_balance", Dio_strategies.Strategy_expr.V_bool check_stale_balance
+  ; "asset_balance_nan", Dio_strategies.Strategy_expr.V_bool (Float.is_nan c.cg_abal)
+  ; "quote_balance_nan", Dio_strategies.Strategy_expr.V_bool (Float.is_nan c.cg_qbal)
   ]
+;;
+
+(** Fine path: the stale-balance side effect (record the cycle on the state). The file
+    decides when this applies; this only performs the latch. *)
+let mark_stale c =
+  match c.cg_state with
+  | Some state -> state.last_cycle <- c.cg_cycle
+  | None -> ()
 ;;
 
 (** Fine path step 6b: publish the buy-leg branch facts. Returns
