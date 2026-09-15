@@ -204,3 +204,104 @@ let available_base
       ~unnetted_hold
   else ledger_balance -. reserved_base -. committed_sell
 ;;
+
+(** Persisted-sell-level matching. Pure helpers shared by the grid's [sync_open_orders]
+    and [evaluate_sell_leg] reconciles. *)
+
+(** Price key: [price * 10000] rounded to int. An int key keeps within-tolerance prices in
+    the same (or an adjacent) bucket without allocating a string per lookup. *)
+let price_key p = int_of_float (Float.round (p *. 10000.0))
+
+(** Tolerance used to treat two persisted rung prices as the same level: 1 bp of price or
+    1e-4 absolute. *)
+let price_within_tolerance ~reference p =
+  Float.abs (p -. reference) <= reference *. 0.0001 || Float.abs (p -. reference) <= 1e-4
+;;
+
+(** 1-to-1 multiset match between persisted sell levels and open sell orders. Returns
+    (open_levels, missing_levels). Buckets open orders by tolerance-rounded price key and
+    verifies the original tolerance before consuming a candidate: ~O(n+m).
+
+    [open_orders] entries are [(id, price, qty)]; persisted entries are [(price, qty)]. *)
+let partition_persisted_sell_levels persisted open_orders =
+  let by_price : (int, (float * int) list) Hashtbl.t =
+    Hashtbl.create (List.length open_orders)
+  in
+  List.iter
+    (fun (_id, open_p, _open_q) ->
+      let k = price_key open_p in
+      let bucket = Option.value (Hashtbl.find_opt by_price k) ~default:[] in
+      let rec bump acc = function
+        | [] -> (open_p, 1) :: acc
+        | (p, n) :: rest when p = open_p -> ((p, n + 1) :: rest) @ acc
+        | item :: rest -> item :: bump acc rest
+      in
+      Hashtbl.replace by_price k (bump [] bucket))
+    open_orders;
+  let open_acc = ref [] in
+  let missing_acc = ref [] in
+  List.iter
+    (fun ((target_p, _target_q) as level) ->
+      let k = price_key target_p in
+      (* Probe the bucket and its neighbors: [Float.round] (half-away) can place a price
+         exactly on a 4-decimal boundary in either adjacent bucket. The per-candidate
+         tolerance check below is authoritative. *)
+      let matched =
+        let rec try_buckets = function
+          | [] -> None
+          | bk :: rest ->
+            (match Hashtbl.find_opt by_price bk with
+             | Some bucket ->
+               let rec consume acc = function
+                 | [] -> None
+                 | (p, n) :: rest when price_within_tolerance ~reference:target_p p ->
+                   if n > 1 then Some (((p, n - 1) :: rest) @ acc) else Some (rest @ acc)
+                 | item :: rest -> consume (item :: acc) rest
+               in
+               (match consume [] bucket with
+                | Some nbucket -> Some (bk, nbucket)
+                | None -> try_buckets rest)
+             | None -> try_buckets rest)
+        in
+        try_buckets [ k - 1; k; k + 1 ]
+      in
+      match matched with
+      | Some (bk, nbucket) ->
+        Hashtbl.replace by_price bk nbucket;
+        open_acc := level :: !open_acc
+      | None -> missing_acc := level :: !missing_acc)
+    persisted;
+  List.rev !open_acc, List.rev !missing_acc
+;;
+
+(** Collapse persisted levels whose prices fall within the same tolerance bucket to a
+    single rung, price-descending, keeping the FIRST occurrence. Callers pass a list with
+    the live (feed-matched) entries ahead of the stale/missing ones, so the surviving rung
+    carries the live qty. Returns the input list physically unchanged when there is
+    nothing to drop. *)
+let dedupe_persisted_sell_levels levels =
+  let rec already_deduped_desc prev = function
+    | [] -> true
+    | (p, _) :: rest ->
+      (match prev with
+       | Some pp -> Float.compare pp p > 0 && not (price_within_tolerance ~reference:pp p)
+       | None -> true)
+      && already_deduped_desc (Some p) rest
+  in
+  if already_deduped_desc None levels
+  then levels
+  else (
+    let sorted = List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) levels in
+    let changed = ref false in
+    let rec go acc = function
+      | [] -> List.rev acc
+      | (p, q) :: rest ->
+        (match acc with
+         | (ap, _) :: _ when price_within_tolerance ~reference:ap p ->
+           changed := true;
+           go acc rest
+         | _ -> go ((p, q) :: acc) rest)
+    in
+    let merged = go [] sorted in
+    if !changed then merged else levels)
+;;

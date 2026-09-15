@@ -179,6 +179,29 @@ let test_available_base () =
        43.0)
 ;;
 
+let test_persisted_levels () =
+  Alcotest.(check int) "price key rounds" 1000000 (Platform_accounting.price_key 100.0);
+  Alcotest.(check bool)
+    "within tolerance"
+    true
+    (Platform_accounting.price_within_tolerance ~reference:100.0 100.005);
+  Alcotest.(check bool)
+    "outside tolerance"
+    false
+    (Platform_accounting.price_within_tolerance ~reference:100.0 100.02);
+  let open_levels, missing =
+    Platform_accounting.partition_persisted_sell_levels
+      [ 100.0, 1.0; 110.0, 2.0 ]
+      [ "a", 100.0, 1.0 ]
+  in
+  Alcotest.(check int) "open levels" 1 (List.length open_levels);
+  Alcotest.(check int) "missing levels" 1 (List.length missing);
+  let deduped =
+    Platform_accounting.dedupe_persisted_sell_levels [ 100.0, 1.0; 100.005, 2.0 ]
+  in
+  Alcotest.(check bool) "dedupe within tolerance" true (holds_eq deduped [ 100.005, 2.0 ])
+;;
+
 let () =
   Alcotest.run
     "platform_accounting"
@@ -200,5 +223,7 @@ let () =
             test_committed_sell_base
         ; Alcotest.test_case "available base" `Quick test_available_base
         ] )
+    ; ( "persisted_levels"
+      , [ Alcotest.test_case "matching helpers" `Quick test_persisted_levels ] )
     ]
 ;;
