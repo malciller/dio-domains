@@ -59,7 +59,17 @@ let parse_capacity_key key =
      | None -> Error ("unknown capacity operator: " ^ key))
 ;;
 
-let rec eval (env : Strategy_expr.env) (facts : facts) (g : Strategy_file.guard)
+(** Guard evaluation.
+
+    [parse_expr] is threaded in so the runtime can supply a memoized parser: expression
+    guards carry their source string, and re-parsing it on every cycle is the dominant
+    per-tick cost once a file uses many [expr] guards. *)
+
+let rec eval_guard
+  ~parse_expr
+  (env : Strategy_expr.env)
+  (facts : facts)
+  (g : Strategy_file.guard)
   : (bool, string) result
   =
   let open Strategy_file in
@@ -74,10 +84,10 @@ let rec eval (env : Strategy_expr.env) (facts : facts) (g : Strategy_file.guard)
       (match facts.side () with
        | Some k -> String.equal k s
        | None -> false)
-  | G_all gs -> eval_all env facts gs
-  | G_any gs -> eval_any env facts gs
+  | G_all gs -> eval_all ~parse_expr env facts gs
+  | G_any gs -> eval_any ~parse_expr env facts gs
   | G_not g ->
-    (match eval env facts g with
+    (match eval_guard ~parse_expr env facts g with
      | Ok b -> Ok (not b)
      | Error m -> Error m)
   | G_is_none s ->
@@ -91,7 +101,7 @@ let rec eval (env : Strategy_expr.env) (facts : facts) (g : Strategy_file.guard)
      | Ok _ -> Ok true
      | Error m -> Error m)
   | G_expr s ->
-    (match Strategy_expr.parse s with
+    (match parse_expr s with
      | Error m -> Error m
      | Ok e ->
        (match Strategy_expr.eval env e with
@@ -143,22 +153,22 @@ let rec eval (env : Strategy_expr.env) (facts : facts) (g : Strategy_file.guard)
               | Ok dt, Ok (Strategy_expr.V_float nowv) -> Ok (nowv -. t0 >= dt)
               | _ -> Error "cooldown_elapsed requires numeric seconds"))))
 
-and eval_all env facts gs =
+and eval_all ~parse_expr env facts gs =
   let rec loop = function
     | [] -> Ok true
     | g :: rest ->
-      (match eval env facts g with
+      (match eval_guard ~parse_expr env facts g with
        | Ok true -> loop rest
        | Ok false -> Ok false
        | Error m -> Error m)
   in
   loop gs
 
-and eval_any env facts gs =
+and eval_any ~parse_expr env facts gs =
   let rec loop = function
     | [] -> Ok false
     | g :: rest ->
-      (match eval env facts g with
+      (match eval_guard ~parse_expr env facts g with
        | Ok true -> Ok true
        | Ok false -> loop rest
        | Error m -> Error m)
@@ -177,4 +187,8 @@ and eval_fact_map lookup kvs =
          else Ok false)
   in
   loop kvs
+;;
+
+let eval ?(parse_expr = Strategy_expr.parse) env facts g =
+  eval_guard ~parse_expr env facts g
 ;;

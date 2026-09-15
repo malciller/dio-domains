@@ -40,6 +40,7 @@ and t =
   ; signals : (string, value) Hashtbl.t
   ; platform : (string, value) Hashtbl.t
   ; locals : (string, value) Hashtbl.t
+  ; guard_cache : (string, (Strategy_expr.expr, string) result) Hashtbl.t
   ; handlers : handler
   ; mutable caps : caps
   ; mutable event : event option
@@ -162,12 +163,26 @@ let create ?(handlers = noop_handler) ?(params = []) (file : Strategy_file.t) =
   ; signals = Hashtbl.create 8
   ; platform = Hashtbl.create 8
   ; locals = Hashtbl.create 8
+  ; guard_cache = Hashtbl.create 32
   ; handlers
   ; caps = default_caps
   ; event = None
   ; price = nan
   ; now = 0.0
   }
+;;
+
+(** Memoized guard-expression parser. Expression guards carry their source string; parsing
+    it once per guard (instead of once per evaluation) removes the dominant per-tick cost
+    of a file with many [expr] guards. The cache is per-runtime, hence thread-confined to
+    the owning domain. *)
+let parse_guard t s =
+  match Hashtbl.find_opt t.guard_cache s with
+  | Some r -> r
+  | None ->
+    let r = parse s in
+    Hashtbl.replace t.guard_cache s r;
+    r
 ;;
 
 let set_state t k v = Hashtbl.replace t.state k v
@@ -307,7 +322,7 @@ let run_cycle t ~(price : float) ~(now : float) ~(event : event) : action_call l
           match step.st_when with
           | None -> true
           | Some g ->
-            (match Strategy_guard.eval e facts g with
+            (match Strategy_guard.eval ~parse_expr:(parse_guard t) e facts g with
              | Ok b -> b
              | Error _ -> false)
         in
