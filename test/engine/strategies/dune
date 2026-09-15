@@ -3,6 +3,10 @@
  (libraries dio.strategies dio.engine alcotest))
 
 (test
+ (name test_strategy_engine)
+ (libraries dio.strategies dio.engine alcotest))
+
+(test
  (name test_strategy_common)
  (libraries dio.strategies dio.engine alcotest))
 
