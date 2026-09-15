@@ -41,23 +41,23 @@ let declarations =
       ; se "unnetted_hold" e
       ]
   ; act
-      "grid_price"
+      "rung_price"
       decision
       [ se "current" e; se "grid_interval_pct" e; se "is_above" b ]
-  ; act "grid_prepare" decision []
-  ; act "grid_cleanup" decision []
-  ; act "grid_sync" decision []
-  ; act "grid_refresh_fee" decision []
-  ; act "grid_guard" decision []
-  ; act "grid_buy_gate" decision []
-  ; act "grid_buy_facts" decision []
-  ; act "grid_buy_cancel" decision []
-  ; act "grid_buy_place" decision []
-  ; act "grid_buy_amend" decision []
-  ; act "grid_sell_prepare" decision []
-  ; act "grid_sell_place" decision []
-  ; act "grid_sell_finalize" decision []
-  ; act "grid_on_event" decision []
+  ; act "cycle_prepare" decision []
+  ; act "cycle_cleanup" decision []
+  ; act "cycle_sync" decision []
+  ; act "cycle_refresh_fee" decision []
+  ; act "cycle_guard" decision []
+  ; act "buy_gate" decision []
+  ; act "buy_facts" decision []
+  ; act "buy_cancel" decision []
+  ; act "buy_place" decision []
+  ; act "buy_amend" decision []
+  ; act "sell_prepare" decision []
+  ; act "sell_place" decision []
+  ; act "sell_finalize" decision []
+  ; act "on_event" decision []
   ; act "compute_sell_price" decision [ se "base" e; se "mult" e ]
   ; act
       "compute_amend_price"

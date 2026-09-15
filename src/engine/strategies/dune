@@ -31,7 +31,7 @@
   Account_state
   Strategy_actions_trade
   Strategy_engine
-  Strategy_actions_grid
+  Strategy_actions_cycle
   Strategy_expr
   Strategy_file
   Strategy_compile

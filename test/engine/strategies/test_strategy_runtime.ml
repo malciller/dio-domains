@@ -196,7 +196,7 @@ let test_grid_buy_ref_price () =
   match Strategy_file.parse_string json with
   | Error e -> Alcotest.fail e
   | Ok f ->
-    let rt = Strategy_runtime.create ~handlers:Strategy_actions_grid.handler f in
+    let rt = Strategy_runtime.create ~handlers:Strategy_actions_cycle.handler f in
     let calls =
       Strategy_runtime.run_cycle
         rt
@@ -226,7 +226,7 @@ let test_grid_owed_sell_price () =
   match Strategy_file.parse_string json with
   | Error e -> Alcotest.fail e
   | Ok f ->
-    let rt = Strategy_runtime.create ~handlers:Strategy_actions_grid.handler f in
+    let rt = Strategy_runtime.create ~handlers:Strategy_actions_cycle.handler f in
     Strategy_runtime.set_state rt "last_buy_fill_price" (Strategy_expr.V_float 100.0);
     Strategy_runtime.set_state
       rt
@@ -268,7 +268,7 @@ let test_grid_available_base () =
   match Strategy_file.parse_string json with
   | Error e -> Alcotest.fail e
   | Ok f ->
-    let rt = Strategy_runtime.create ~handlers:Strategy_actions_grid.handler f in
+    let rt = Strategy_runtime.create ~handlers:Strategy_actions_cycle.handler f in
     let calls =
       Strategy_runtime.run_cycle
         rt
@@ -291,14 +291,14 @@ let test_grid_grid_price () =
   let json =
     {|{"name":"p","version":1,"triggers":["book_update"],"steps":[
        {"id":"s","then":[
-         {"action":"grid_price","args":{"current":"100.0","grid_interval_pct":"1.0","is_above":false},"bind":{"px":"$out.price"}},
+         {"action":"rung_price","args":{"current":"100.0","grid_interval_pct":"1.0","is_above":false},"bind":{"px":"$out.price"}},
          {"action":"echo","args":{"price":"$local.px"}}
        ]}]}|}
   in
   match Strategy_file.parse_string json with
   | Error e -> Alcotest.fail e
   | Ok f ->
-    let rt = Strategy_runtime.create ~handlers:Strategy_actions_grid.handler f in
+    let rt = Strategy_runtime.create ~handlers:Strategy_actions_cycle.handler f in
     let calls =
       Strategy_runtime.run_cycle
         rt
@@ -336,14 +336,14 @@ module Stub_engine = struct
   let on_event _ _ = ()
 end
 
-module Stub_grid = Strategy_actions_grid.Make (Stub_engine)
+module Stub_grid = Strategy_actions_cycle.Make (Stub_engine)
 
 let test_fine_dispatch () =
   let ctx = ref 0 in
   let handler = Stub_grid.handler ctx in
   let json =
     {|{"name":"p","version":1,"triggers":["book_update"],"steps":[
-       {"id":"s","then":[{"action":"grid_sync","args":{}}]}]}|}
+       {"id":"s","then":[{"action":"cycle_sync","args":{}}]}]}|}
   in
   match Strategy_file.parse_string json with
   | Error e -> Alcotest.fail e

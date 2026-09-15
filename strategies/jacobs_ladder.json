@@ -8,61 +8,61 @@
     {
       "id": "ev_filled",
       "when": { "event": "filled" },
-      "then": [{ "action": "grid_on_event", "args": {} }],
+      "then": [{ "action": "on_event", "args": {} }],
       "stop": true
     },
     {
       "id": "ev_cancelled",
       "when": { "event": "cancelled" },
-      "then": [{ "action": "grid_on_event", "args": {} }],
+      "then": [{ "action": "on_event", "args": {} }],
       "stop": true
     },
     {
       "id": "ev_acknowledged",
       "when": { "event": "acknowledged" },
-      "then": [{ "action": "grid_on_event", "args": {} }],
+      "then": [{ "action": "on_event", "args": {} }],
       "stop": true
     },
     {
       "id": "ev_amended",
       "when": { "event": "amended" },
-      "then": [{ "action": "grid_on_event", "args": {} }],
+      "then": [{ "action": "on_event", "args": {} }],
       "stop": true
     },
     {
       "id": "ev_failed",
       "when": { "event": "failed" },
-      "then": [{ "action": "grid_on_event", "args": {} }],
+      "then": [{ "action": "on_event", "args": {} }],
       "stop": true
     },
     {
       "id": "ev_rejected",
       "when": { "event": "rejected" },
-      "then": [{ "action": "grid_on_event", "args": {} }],
+      "then": [{ "action": "on_event", "args": {} }],
       "stop": true
     },
     {
       "id": "ev_amendment_skipped",
       "when": { "event": "amendment_skipped" },
-      "then": [{ "action": "grid_on_event", "args": {} }],
+      "then": [{ "action": "on_event", "args": {} }],
       "stop": true
     },
     {
       "id": "ev_amendment_failed",
       "when": { "event": "amendment_failed" },
-      "then": [{ "action": "grid_on_event", "args": {} }],
+      "then": [{ "action": "on_event", "args": {} }],
       "stop": true
     },
     {
       "id": "ev_cancel_cleanup",
       "when": { "event": "cancel_cleanup" },
-      "then": [{ "action": "grid_on_event", "args": {} }],
+      "then": [{ "action": "on_event", "args": {} }],
       "stop": true
     },
     {
       "id": "prepare",
       "when": { "event": "book_update" },
-      "then": [{ "action": "grid_prepare", "args": {} }]
+      "then": [{ "action": "cycle_prepare", "args": {} }]
     },
     {
       "id": "skip_nan_price",
@@ -73,27 +73,27 @@
     {
       "id": "cleanup",
       "when": { "event": "book_update" },
-      "then": [{ "action": "grid_cleanup", "args": {} }]
+      "then": [{ "action": "cycle_cleanup", "args": {} }]
     },
     {
       "id": "sync",
       "when": { "event": "book_update" },
-      "then": [{ "action": "grid_sync", "args": {} }]
+      "then": [{ "action": "cycle_sync", "args": {} }]
     },
     {
       "id": "fee",
       "when": { "event": "book_update" },
-      "then": [{ "action": "grid_refresh_fee", "args": {} }]
+      "then": [{ "action": "cycle_refresh_fee", "args": {} }]
     },
     {
       "id": "stale_guard",
       "when": { "event": "book_update" },
-      "then": [{ "action": "grid_guard", "args": {} }]
+      "then": [{ "action": "cycle_guard", "args": {} }]
     },
     {
       "id": "buy_gate",
       "when": { "event": "book_update", "engine": { "continue": true } },
-      "then": [{ "action": "grid_buy_gate", "args": {} }]
+      "then": [{ "action": "buy_gate", "args": {} }]
     },
     {
       "id": "buy_facts",
@@ -103,7 +103,7 @@
           { "engine": { "buy_active": true } }
         ]
       },
-      "then": [{ "action": "grid_buy_facts", "args": {} }]
+      "then": [{ "action": "buy_facts", "args": {} }]
     },
     {
       "id": "buy_cancel",
@@ -115,7 +115,7 @@
           { "engine": { "buy_should_cancel": true } }
         ]
       },
-      "then": [{ "action": "grid_buy_cancel", "args": {} }]
+      "then": [{ "action": "buy_cancel", "args": {} }]
     },
     {
       "id": "buy_place",
@@ -128,7 +128,7 @@
           { "engine": { "buy_count_zero": true } }
         ]
       },
-      "then": [{ "action": "grid_buy_place", "args": {} }]
+      "then": [{ "action": "buy_place", "args": {} }]
     },
     {
       "id": "buy_amend",
@@ -141,15 +141,15 @@
           { "engine": { "buy_count_positive": true } }
         ]
       },
-      "then": [{ "action": "grid_buy_amend", "args": {} }]
+      "then": [{ "action": "buy_amend", "args": {} }]
     },
     {
       "id": "sell",
       "when": { "event": "book_update", "engine": { "continue": true } },
       "then": [
-        { "action": "grid_sell_prepare", "args": {} },
-        { "action": "grid_sell_place", "args": {} },
-        { "action": "grid_sell_finalize", "args": {} }
+        { "action": "sell_prepare", "args": {} },
+        { "action": "sell_place", "args": {} },
+        { "action": "sell_finalize", "args": {} }
       ],
       "stop": true
     }

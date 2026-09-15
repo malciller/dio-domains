@@ -14,7 +14,7 @@ module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
 module Config_grid_handlers =
-  Dio_strategies.Strategy_actions_grid.Make (Config_grid_engine)
+  Dio_strategies.Strategy_actions_cycle.Make (Config_grid_engine)
 
 let section = "domain_spawner"
 

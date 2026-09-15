@@ -1,9 +1,9 @@
-(** Grid decision action handlers (milestone 3).
+(** Strategy-file cycle action handlers.
 
-    Maps strategy-file actions to the reference grid functions, faithful by construction:
-    the handler calls the same function the reference calls. This is the seam into which
-    the remaining grid actions are ported one by one, checked off against the
-    reference-action mapping table (design §8.2). *)
+    Maps strategy-file actions to the generic decision/accounting functions
+    (Strategy_decision / Strategy_lifecycle / Strategy_venue): each handler performs the
+    same work the reference cycle does, so the config-driven strategy replicates by
+    construction. *)
 
 open Strategy_expr
 
@@ -135,18 +135,19 @@ let run t name args =
   | "compute_buy_ref_price" -> compute_buy_ref_price args
   | "owed_sell_price" -> owed_sell_price t args
   | "available_base" -> available_base t args
-  | "grid_price" -> grid_price t args
+  | "rung_price" -> grid_price t args
   | _ -> []
 ;;
 
 let handler : Strategy_runtime.handler = { run }
 
-(** Coarse grid operations (milestone 3, hybrid: coarse now, decompose later).
+(** Coarse cycle operations (hybrid: coarse now, decompose later).
 
-    The engine provides a per-instance context whose functions call the reference grid
-    ([execute_strategy] / [sync_open_orders] / [evaluate_buy_leg] / [evaluate_sell_leg]),
-    so a coarse port replicates behavior by construction. The strategy file orchestrates
-    them; the legs are split into fine actions in a later pass, verified by the harness. *)
+    The engine provides a per-instance context whose functions call the generic cycle
+    functions ([execute_strategy] / [sync_open_orders] / [evaluate_buy_leg] /
+    [evaluate_sell_leg]), so a coarse port replicates behavior by construction. The
+    strategy file orchestrates them; the bodies are split into fine actions in a later
+    pass, verified by the harness. *)
 module type ENGINE = sig
   type ctx
 
@@ -171,7 +172,7 @@ module Make (E : ENGINE) = struct
     { run =
         (fun t name _args ->
           match name with
-          | "grid_prepare" ->
+          | "cycle_prepare" ->
             let cont = E.prepare ctx in
             Strategy_runtime.set_platform t "engine:continue" (V_bool cont);
             (* Reset per-cycle buy facts so a cycle that skips them cannot inherit the
@@ -182,24 +183,24 @@ module Make (E : ENGINE) = struct
             Strategy_runtime.set_platform t "engine:buy_count_zero" (V_bool false);
             Strategy_runtime.set_platform t "engine:buy_count_positive" (V_bool false);
             []
-          | "grid_cleanup" ->
+          | "cycle_cleanup" ->
             E.cleanup ctx;
             []
-          | "grid_sync" ->
+          | "cycle_sync" ->
             E.sync ctx;
             []
-          | "grid_refresh_fee" ->
+          | "cycle_refresh_fee" ->
             E.refresh_fee ctx;
             []
-          | "grid_guard" ->
+          | "cycle_guard" ->
             let cont = E.guard ctx in
             Strategy_runtime.set_platform t "engine:continue" (V_bool cont);
             []
-          | "grid_buy_gate" ->
+          | "buy_gate" ->
             let active = E.buy_gate ctx in
             Strategy_runtime.set_platform t "engine:buy_active" (V_bool active);
             []
-          | "grid_buy_facts" ->
+          | "buy_facts" ->
             let pending, effective, should_cancel = E.buy_facts ctx in
             Strategy_runtime.set_platform t "engine:buy_pending" (V_bool pending);
             Strategy_runtime.set_platform
@@ -215,25 +216,25 @@ module Make (E : ENGINE) = struct
               "engine:buy_count_positive"
               (V_bool (effective > 0));
             []
-          | "grid_buy_cancel" ->
+          | "buy_cancel" ->
             E.buy_cancel ctx;
             []
-          | "grid_buy_place" ->
+          | "buy_place" ->
             E.buy_place ctx;
             []
-          | "grid_buy_amend" ->
+          | "buy_amend" ->
             E.buy_amend ctx;
             []
-          | "grid_sell_prepare" ->
+          | "sell_prepare" ->
             E.sell_prepare ctx;
             []
-          | "grid_sell_place" ->
+          | "sell_place" ->
             E.sell_place ctx;
             []
-          | "grid_sell_finalize" ->
+          | "sell_finalize" ->
             E.sell_finalize ctx;
             []
-          | "grid_on_event" ->
+          | "on_event" ->
             (match Strategy_runtime.current_event t with
              | Some ev -> E.on_event ctx ev
              | None -> ());
