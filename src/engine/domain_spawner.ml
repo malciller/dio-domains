@@ -14,7 +14,7 @@ module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
 module Config_grid_handlers =
-  Dio_strategies.Strategy_actions_cycle.Make (Config_grid_engine)
+  Dio_strategies.Strategy_actions_cycle.Make (Dio_strategies.Strategy_cycle_engine)
 
 let section = "domain_spawner"
 
@@ -598,7 +598,7 @@ let asset_domain_worker
               (Dio_strategies.Strategy_compile.format diags);
             None)
           else (
-            let ctx = Config_grid_engine.create () in
+            let ctx = Dio_strategies.Strategy_cycle_engine.create () in
             ctx.cg_symbol <- asset_with_fees.symbol;
             Logging.info_f
               ~section
@@ -1609,7 +1609,7 @@ let asset_domain_worker
            ctx.cg_base_age <- base_balance_age_fn ();
            ctx.cg_gen <- Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol;
            ctx.cg_iter <- iter_orders;
-           Config_grid_engine.with_lock ctx (fun () ->
+           Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
              ignore
                (Dio_strategies.Strategy_runtime.run_cycle
                   rt

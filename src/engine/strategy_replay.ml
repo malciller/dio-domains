@@ -558,10 +558,11 @@ let replay_candidate
   =
   let state = Jac.get_strategy_state asset.symbol in
   seed_from_trace state trace;
-  let ctx = Config_grid_engine.create () in
+  let ctx = Dio_strategies.Strategy_cycle_engine.create () in
   ctx.cg_symbol <- asset.symbol;
   ctx.cg_state <- Some state;
-  let module Handlers = Strategy_actions_cycle.Make (Config_grid_engine) in
+  let module Handlers = Strategy_actions_cycle.Make (Dio_strategies.Strategy_cycle_engine)
+  in
   let rt = Strategy_runtime.create ~handlers:(Handlers.handler ctx) file in
   drive
     ~asset

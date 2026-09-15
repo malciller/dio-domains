@@ -10,8 +10,8 @@
     caller holds [state.mutex] for the whole interpreter cycle (see [with_lock]); the
     sub-functions do not lock. *)
 
-module Jac = Dio_strategies.Strategy_api
-module Types = Dio_strategies.Strategy_state
+module Jac = Strategy_api
+module Types = Strategy_state
 
 type ctx =
   { mutable cg_asset : Types.trading_config option
@@ -245,9 +245,7 @@ let refresh_fee c =
         | Some f -> f
         | None ->
           (match
-             Dio_strategies.Fee_cache.get_maker_fee
-               ~exchange:asset.exchange
-               ~symbol:asset.symbol
+             Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol
            with
            | Some cached -> cached
            | None -> 0.0))
@@ -284,7 +282,7 @@ let buy_gate c =
     then (
       state.tif_recovery_pending <- false;
       Logging.info_f
-        ~section:"config_grid_engine"
+        ~section:"strategy_cycle_engine"
         "TIF recovery window expired for %s - resuming normal oracle-gated buying"
         asset.symbol);
     let tif_recovery_active =
@@ -309,7 +307,7 @@ let expire_tif_recovery c =
     then (
       state.tif_recovery_pending <- false;
       Logging.info_f
-        ~section:"config_grid_engine"
+        ~section:"strategy_cycle_engine"
         "TIF recovery window expired for %s - resuming normal oracle-gated buying"
         asset.symbol)
   | _ -> ()
@@ -327,9 +325,7 @@ let cycle_facts c =
   let has_pending_buy =
     match state with
     | Some s ->
-      List.exists
-        (fun (_, side, _, _) -> side = Dio_strategies.Strategy_common.Buy)
-        s.pending_orders
+      List.exists (fun (_, side, _, _) -> side = Strategy_common.Buy) s.pending_orders
     | None -> false
   in
   let has_tracked_buy, inflight_cancel_buy, inflight_amend_buy, maker_fee_set =
@@ -346,24 +342,24 @@ let cycle_facts c =
     | Some ecfg -> ecfg.check_stale_balance
     | None -> false
   in
-  [ "oracle_halted", Dio_strategies.Strategy_expr.V_bool c.cg_oracle_halted
-  ; "tif_recovery_pending", Dio_strategies.Strategy_expr.V_bool pending
-  ; "tif_recovery_since", Dio_strategies.Strategy_expr.V_float since
-  ; "price_nan", Dio_strategies.Strategy_expr.V_bool (Float.is_nan c.cg_price)
-  ; "maker_fee_set", Dio_strategies.Strategy_expr.V_bool maker_fee_set
-  ; "fee_refresh_due", Dio_strategies.Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0)
-  ; "check_stale_balance", Dio_strategies.Strategy_expr.V_bool check_stale_balance
-  ; "asset_balance_nan", Dio_strategies.Strategy_expr.V_bool (Float.is_nan c.cg_abal)
-  ; "quote_balance_nan", Dio_strategies.Strategy_expr.V_bool (Float.is_nan c.cg_qbal)
-  ; "has_pending_buy", Dio_strategies.Strategy_expr.V_bool has_pending_buy
-  ; "has_tracked_buy", Dio_strategies.Strategy_expr.V_bool has_tracked_buy
-  ; "inflight_cancel_buy", Dio_strategies.Strategy_expr.V_bool inflight_cancel_buy
-  ; "inflight_amend_buy", Dio_strategies.Strategy_expr.V_bool inflight_amend_buy
-  ; "open_buy_count", Dio_strategies.Strategy_expr.V_int c.cg_open_buy_count
-  ; "bid", Dio_strategies.Strategy_expr.V_float c.cg_bid_r
-  ; "ask", Dio_strategies.Strategy_expr.V_float c.cg_ask_r
-  ; "lot_qty", Dio_strategies.Strategy_expr.V_float c.cg_lot_qty
-  ; "has_recent_amend_buy", Dio_strategies.Strategy_expr.V_bool c.cg_has_recent_amend_buy
+  [ "oracle_halted", Strategy_expr.V_bool c.cg_oracle_halted
+  ; "tif_recovery_pending", Strategy_expr.V_bool pending
+  ; "tif_recovery_since", Strategy_expr.V_float since
+  ; "price_nan", Strategy_expr.V_bool (Float.is_nan c.cg_price)
+  ; "maker_fee_set", Strategy_expr.V_bool maker_fee_set
+  ; "fee_refresh_due", Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0)
+  ; "check_stale_balance", Strategy_expr.V_bool check_stale_balance
+  ; "asset_balance_nan", Strategy_expr.V_bool (Float.is_nan c.cg_abal)
+  ; "quote_balance_nan", Strategy_expr.V_bool (Float.is_nan c.cg_qbal)
+  ; "has_pending_buy", Strategy_expr.V_bool has_pending_buy
+  ; "has_tracked_buy", Strategy_expr.V_bool has_tracked_buy
+  ; "inflight_cancel_buy", Strategy_expr.V_bool inflight_cancel_buy
+  ; "inflight_amend_buy", Strategy_expr.V_bool inflight_amend_buy
+  ; "open_buy_count", Strategy_expr.V_int c.cg_open_buy_count
+  ; "bid", Strategy_expr.V_float c.cg_bid_r
+  ; "ask", Strategy_expr.V_float c.cg_ask_r
+  ; "lot_qty", Strategy_expr.V_float c.cg_lot_qty
+  ; "has_recent_amend_buy", Strategy_expr.V_bool c.cg_has_recent_amend_buy
   ]
 ;;
 
@@ -435,16 +431,16 @@ let buy_place_plan c =
         ~closest_sell_order_initial:c.cg_closest_sell_order
     in
     c.cg_buy_plan <- Some p;
-    [ "buy_price", Dio_strategies.Strategy_expr.V_float p.bp_price
-    ; "buy_qty", Dio_strategies.Strategy_expr.V_float p.bp_qty
-    ; "buy_quote_needed", Dio_strategies.Strategy_expr.V_float p.bp_quote_needed
-    ; "buy_available", Dio_strategies.Strategy_expr.V_float p.bp_available
-    ; "buy_balance_ok", Dio_strategies.Strategy_expr.V_bool p.bp_balance_ok
-    ; "buy_capital_low", Dio_strategies.Strategy_expr.V_bool p.bp_capital_low
-    ; "buy_crossing", Dio_strategies.Strategy_expr.V_bool p.bp_crossing
-    ; "buy_quote_nan", Dio_strategies.Strategy_expr.V_bool p.bp_quote_nan
-    ; "buy_cooldown", Dio_strategies.Strategy_expr.V_bool p.bp_cooldown
-    ; "buy_inflight", Dio_strategies.Strategy_expr.V_bool p.bp_inflight
+    [ "buy_price", Strategy_expr.V_float p.bp_price
+    ; "buy_qty", Strategy_expr.V_float p.bp_qty
+    ; "buy_quote_needed", Strategy_expr.V_float p.bp_quote_needed
+    ; "buy_available", Strategy_expr.V_float p.bp_available
+    ; "buy_balance_ok", Strategy_expr.V_bool p.bp_balance_ok
+    ; "buy_capital_low", Strategy_expr.V_bool p.bp_capital_low
+    ; "buy_crossing", Strategy_expr.V_bool p.bp_crossing
+    ; "buy_quote_nan", Strategy_expr.V_bool p.bp_quote_nan
+    ; "buy_cooldown", Strategy_expr.V_bool p.bp_cooldown
+    ; "buy_inflight", Strategy_expr.V_bool p.bp_inflight
     ]
   | _ ->
     c.cg_buy_plan <- None;
@@ -454,7 +450,7 @@ let buy_place_plan c =
 let buy_plan_exn c =
   match c.cg_buy_plan with
   | Some p -> p
-  | None -> failwith "config_grid_engine: buy branch action without a plan"
+  | None -> failwith "strategy_cycle_engine: buy branch action without a plan"
 ;;
 
 (** Fine path branch: send the balanced fresh buy. *)
@@ -640,18 +636,17 @@ let sell_finalize_facts c =
     in
     let balance_fresh =
       match c.cg_base_age with
-      | Some age -> age <= Dio_strategies.Platform_accounting.sweep_max_balance_age_s
+      | Some age -> age <= Platform_accounting.sweep_max_balance_age_s
       | None -> true
     in
-    [ "remaintain_expired_sells", Dio_strategies.Strategy_expr.V_bool remaintain
-    ; ( "sell_missing_empty"
-      , Dio_strategies.Strategy_expr.V_bool (!(pre.sp_missing_after_reconcile) = []) )
-    ; "just_filled_buy", Dio_strategies.Strategy_expr.V_bool just_filled
-    ; "resuming_after_balance", Dio_strategies.Strategy_expr.V_bool resuming
-    ; "buy_attempted", Dio_strategies.Strategy_expr.V_bool c.cg_buy_attempted
-    ; "sell_pushed", Dio_strategies.Strategy_expr.V_bool !(pre.sp_sell_pushed)
-    ; "has_active_sell", Dio_strategies.Strategy_expr.V_bool active_sell
-    ; "balance_fresh", Dio_strategies.Strategy_expr.V_bool balance_fresh
+    [ "remaintain_expired_sells", Strategy_expr.V_bool remaintain
+    ; "sell_missing_empty", Strategy_expr.V_bool (!(pre.sp_missing_after_reconcile) = [])
+    ; "just_filled_buy", Strategy_expr.V_bool just_filled
+    ; "resuming_after_balance", Strategy_expr.V_bool resuming
+    ; "buy_attempted", Strategy_expr.V_bool c.cg_buy_attempted
+    ; "sell_pushed", Strategy_expr.V_bool !(pre.sp_sell_pushed)
+    ; "has_active_sell", Strategy_expr.V_bool active_sell
+    ; "balance_fresh", Strategy_expr.V_bool balance_fresh
     ]
   | None -> []
 ;;
@@ -703,20 +698,20 @@ let sell_finalize c =
 ;;
 
 let value_string = function
-  | Dio_strategies.Strategy_expr.V_string s -> s
+  | Strategy_expr.V_string s -> s
   | V_int i -> string_of_int i
   | V_float f -> string_of_float f
   | _ -> ""
 ;;
 
 let value_float = function
-  | Dio_strategies.Strategy_expr.V_float f -> f
+  | Strategy_expr.V_float f -> f
   | V_int i -> float_of_int i
   | _ -> 0.0
 ;;
 
 let value_string_opt = function
-  | Dio_strategies.Strategy_expr.V_string s -> Some s
+  | Strategy_expr.V_string s -> Some s
   | _ -> None
 ;;
 
@@ -725,12 +720,12 @@ let value_string_opt = function
     when the entry is file-bound, so the strategy file owns the event surface. The
     reference handlers remain the bodies; they lock [state.mutex] themselves, so this must
     run OUTSIDE [with_lock]. *)
-let on_event c (ev : Dio_strategies.Strategy_runtime.event) =
+let on_event c (ev : Strategy_runtime.event) =
   match c.cg_state with
   | Some _ ->
-    let f k = List.assoc_opt k ev.Dio_strategies.Strategy_runtime.ev_fields in
+    let f k = List.assoc_opt k ev.Strategy_runtime.ev_fields in
     let obs =
-      { Dio_strategies.Strategy_trace.ev_kind = ev.Dio_strategies.Strategy_runtime.ev_kind
+      { Strategy_trace.ev_kind = ev.Strategy_runtime.ev_kind
       ; ev_now =
           (match f "now" with
            | Some v -> value_float v
