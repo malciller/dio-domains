@@ -182,8 +182,8 @@ module type ENGINE = sig
   val guard : ctx -> bool
   val buy_gate : ctx -> bool
   val expire_tif_recovery : ctx -> unit
-  val cycle_facts : ctx -> (int -> Strategy_expr.value -> unit) -> unit
-  val early_facts : ctx -> (int -> Strategy_expr.value -> unit) -> unit
+  val cycle_facts : ctx -> Strategy_runtime.t -> unit
+  val early_facts : ctx -> Strategy_runtime.t -> unit
   val mark_stale : ctx -> unit
   val buy_cancel : ctx -> unit
 
@@ -195,7 +195,7 @@ module type ENGINE = sig
   (** Publish the buy-leg plan facts directly through [sink] (a slot-addressed platform
       writer) instead of returning a [(slot, value)] list, so a placement cycle does not
       allocate the intermediate list. *)
-  val buy_place_plan : ctx -> (int -> Strategy_expr.value -> unit) -> unit
+  val buy_place_plan : ctx -> Strategy_runtime.t -> unit
 
   val buy_place_send : ctx -> unit
   val buy_place_send_insufficient : ctx -> unit
@@ -210,7 +210,7 @@ module type ENGINE = sig
   val sell_place_should : ctx -> bool
   val sell_place_body : ctx -> unit
   val sell_finalize : ctx -> unit
-  val sell_finalize_facts : ctx -> (int -> Strategy_expr.value -> unit) -> unit
+  val sell_finalize_facts : ctx -> Strategy_runtime.t -> unit
   val sell_finalize_latch : ctx -> unit
   val sell_excess_sweep_phase : ctx -> unit
   val sell_finalize_end : ctx -> unit
@@ -260,16 +260,12 @@ module Make (E : ENGINE) = struct
               (V_bool active);
             []
           | "expire_tif_recovery" -> ph Preamble (fun () -> E.expire_tif_recovery ctx)
-          | "cycle_facts" ->
-            ph Facts (fun () -> E.cycle_facts ctx (Strategy_runtime.set_platform_slot t))
-          | "early_facts" ->
-            ph Facts (fun () -> E.early_facts ctx (Strategy_runtime.set_platform_slot t))
+          | "cycle_facts" -> ph Facts (fun () -> E.cycle_facts ctx t)
+          | "early_facts" -> ph Facts (fun () -> E.early_facts ctx t)
           | "mark_stale_cycle" -> ph Preamble (fun () -> E.mark_stale ctx)
           | "cancel_excess_buys" -> ph Buy (fun () -> E.buy_cancel ctx)
           | "buy_place" -> ph Buy (fun () -> E.buy_place ctx)
-          | "buy_place_plan" ->
-            ph BuyPlan (fun () ->
-              E.buy_place_plan ctx (Strategy_runtime.set_platform_slot t))
+          | "buy_place_plan" -> ph BuyPlan (fun () -> E.buy_place_plan ctx t)
           | "buy_place_send" -> ph BuyPlan (fun () -> E.buy_place_send ctx)
           | "buy_place_send_insufficient" ->
             ph BuyPlan (fun () -> E.buy_place_send_insufficient ctx)
@@ -295,9 +291,7 @@ module Make (E : ENGINE) = struct
                 (V_bool (E.sell_place_should ctx)))
           | "sell_place_body" -> ph SellPlace (fun () -> E.sell_place_body ctx)
           | "sell_finalize" -> ph SellFinalize (fun () -> E.sell_finalize ctx)
-          | "sell_finalize_facts" ->
-            ph SfinEnd (fun () ->
-              E.sell_finalize_facts ctx (Strategy_runtime.set_platform_slot t))
+          | "sell_finalize_facts" -> ph SfinEnd (fun () -> E.sell_finalize_facts ctx t)
           | "sell_finalize_latch" -> ph SfinLatch (fun () -> E.sell_finalize_latch ctx)
           | "sell_excess_sweep_phase" ->
             ph SfinSweep (fun () -> E.sell_excess_sweep_phase ctx)
