@@ -2008,15 +2008,18 @@ let start_domain config state fee_fetcher =
           Config.apply_gc_config ();
           let cpu = trading_cpu_alloc () in
           Thread_affinity.pin_self cpu;
-          (* Real-time priority so no CFS thread can preempt this trading domain. Priority
-             from DIO_TRADING_RT_PRIO (default 50; 0 disables). Best-effort: without
-             CAP_SYS_NICE it logs and keeps the default policy. *)
+          (* Opt-in real-time priority: set DIO_TRADING_RT_PRIO to a nonzero value
+             (e.g. 50) to run this trading domain SCHED_FIFO so no CFS thread can preempt
+             it. Off by default because it needs CAP_SYS_NICE; see
+             Thread_affinity.set_self_rt. *)
           (match Sys.getenv_opt "DIO_TRADING_RT_PRIO" with
-           | Some "0" -> ()
            | Some s ->
-             (try Thread_affinity.set_self_rt (int_of_string (String.trim s)) with
-              | _ -> Thread_affinity.set_self_rt 50)
-           | None -> Thread_affinity.set_self_rt 50);
+             (try
+                let prio = int_of_string (String.trim s) in
+                if prio > 0 then Thread_affinity.set_self_rt prio
+              with
+              | _ -> ())
+           | None -> ());
           Logging.info_f
             ~section
             "domain %s/%s pinned to cpu %d"
