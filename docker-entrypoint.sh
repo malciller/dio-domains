@@ -47,4 +47,15 @@ EOF
     ;;
 esac
 
+# Drop from root to the runtime uid 1000 while keeping an ambient CAP_SYS_NICE, so the
+# engine can set SCHED_FIFO on its trading domains (Thread_affinity.set_self_rt) without
+# running as root - a root process breaks the relative .env load and the credentials.
+# Ambient caps need the capability in the container's bounding set (deploy: --cap-add
+# SYS_NICE) and are only reached when the container starts as root (deploy: --user 0).
+# When the container is not started as root this is skipped and the engine runs CFS.
+if [ "$(id -u)" = "0" ]; then
+  exec setpriv --reuid=1000 --regid=1000 --init-groups \
+       --inh-caps=+sys_nice --ambient-caps=+sys_nice -- "$@"
+fi
+
 exec "$@"
