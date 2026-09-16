@@ -47,6 +47,9 @@ let sweep_max_balance_age_s = 10.0
     this module stays independent of strategy state. [holds] is oldest-first:
     [(placed_at, qty)]. Callers persist the returned list; these are pure transformations. *)
 
+(* Shared results for the empty case: returning a freshly-built [(holds, sum)] tuple on
+   every no-op call allocated 3 words per cycle; these constants are reused instead. *)
+
 (** Portion of placed-sell base the balance feed may not yet be netting. Applies to every
     accumulation venue (Hyperliquid, Kraken, IBKR, Lighter): all report a tradeable figure
     with open-order holds removed, and that figure trails a placement (or the adopting
@@ -67,9 +70,13 @@ let sweep_max_balance_age_s = 10.0
     [consume_sell_hold_netting] additionally retires holds on an observed drop.
 
     Returns [(remaining_holds, unnetted_qty)]. *)
+let no_unnetted_hold = [], 0.0
+
+let no_unreflected_credit = [], 0.0
+
 let unnetted_sell_hold ~use_unnetted ~holds ~last_balance_delta ~now ~base_balance_age =
   if (not use_unnetted) || holds = []
-  then holds, 0.0
+  then no_unnetted_hold
   else (
     let cutoff = unreflected_cutoff ~now ~base_balance_age in
     let grace_cutoff = now -. sell_hold_netting_grace_s in
@@ -123,7 +130,7 @@ let arm_sell_hold ~holds ~qty ~now = holds @ [ now, qty ]
     or after the freshness cutoff are summed and kept. Returns [(remaining, sum)]. *)
 let unreflected_credit ~credits ~now ~base_balance_age =
   if credits = []
-  then credits, 0.0
+  then no_unreflected_credit
   else (
     let cutoff = unreflected_cutoff ~now ~base_balance_age in
     let rec go sum acc = function
