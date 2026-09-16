@@ -119,7 +119,6 @@ let make_handler log =
           Strategy_runtime.set_state t "reserved" (vf 2.0);
           []
         | _ -> [])
-  ; Strategy_runtime.resolve = (fun _ -> None)
   }
 ;;
 
