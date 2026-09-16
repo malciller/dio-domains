@@ -18,6 +18,12 @@ module Config_grid_handlers =
 
 let section = "domain_spawner"
 
+(** Round-robin CPU allocator for the per-asset trading domains: pins each to a P-core
+    (see [Thread_affinity]) so a busy cycle cannot be migrated onto an E-core or preempted
+    against other runnable threads - the source of the wall >> cpu p999 stalls. Returns
+    [-1] (no pinning) when no CPU list is configured or the topology is unavailable. *)
+let trading_cpu_alloc = Thread_affinity.make_allocator ()
+
 (** Sampling mask for the per-cycle [Gc.quick_stat] capture, which allocates ~24 words and
     costs ~0.3us. Sampling every cycle was pure per-cycle overhead on the hot path; sample
     1-in-64 instead so the GC cause is still attributed when it matters. *)
@@ -2000,6 +2006,14 @@ let start_domain config state fee_fetcher =
            cached_gc_config would otherwise silently kill the domain. *)
         try
           Config.apply_gc_config ();
+          let cpu = trading_cpu_alloc () in
+          Thread_affinity.pin_self cpu;
+          Logging.info_f
+            ~section
+            "domain %s/%s pinned to cpu %d"
+            asset.exchange
+            asset.symbol
+            cpu;
           let clk_per_call, busy_wall_ns, busy_cpu_ns =
             Monotonic_clock.calibration_summary ()
           in

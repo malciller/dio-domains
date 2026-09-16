@@ -97,5 +97,10 @@ let start () =
     ignore
       (Domain.spawn (fun () ->
          Gc_config.apply ();
+         (* Keep the busy-spin off the trading P-cores: it exists to keep the package warm
+            and detect global pauses, not to compete with the strategy cycles. Idle policy
+            so it yields to anything runnable. *)
+         Thread_affinity.pin_self (Thread_affinity.make_background_allocator () ());
+         Thread_affinity.set_self_idle ();
          run ~threshold_us ~window_seconds)))
 ;;
