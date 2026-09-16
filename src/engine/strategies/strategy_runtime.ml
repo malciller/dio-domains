@@ -354,41 +354,68 @@ let create ?(handlers = noop_handler) ?(params = []) (file : Strategy_file.t) =
    only while no fact has changed since it was computed. Cheap (one int increment). *)
 let bump_gen t = t.guard_memo.memo_gen <- t.guard_memo.memo_gen + 1
 
+(** True when [slot] already holds a value equal to [v], so republishing it is a no-op.
+    Most facts (flags, balances, prices) are unchanged cycle to cycle, so this skips both
+    the [Some] box allocated by {!set_arr} and the guard-memo invalidation on the common
+    path. Structural equality on the [value] variant allocates nothing. *)
+let[@inline] slot_unchanged (a : value option array) slot (v : value) =
+  slot < Array.length a
+  &&
+  match Array.unsafe_get a slot with
+  | Some x -> x = v
+  | None -> false
+;;
+
 let set_state t k v =
-  bump_gen t;
-  t.state <- set_arr t.state (intern_key k) v
+  let slot = intern_key k in
+  if not (slot_unchanged t.state slot v)
+  then (
+    bump_gen t;
+    t.state <- set_arr t.state slot v)
 ;;
 
 let get_state t k = get_arr t.state (intern_key k)
 
 let set_platform t k v =
-  bump_gen t;
-  t.platform <- set_arr t.platform (intern_key k) v
+  let slot = intern_key k in
+  if not (slot_unchanged t.platform slot v)
+  then (
+    bump_gen t;
+    t.platform <- set_arr t.platform slot v)
 ;;
 
 let get_platform t k = get_arr t.platform (intern_key k)
 
 let set_signal t k v =
-  bump_gen t;
-  t.signals <- set_arr t.signals (intern_key k) v
+  let slot = intern_key k in
+  if not (slot_unchanged t.signals slot v)
+  then (
+    bump_gen t;
+    t.signals <- set_arr t.signals slot v)
 ;;
 
 (* Slot-addressed publication for the fixed fact/gate set. [Strategy_fact_slots] resolves
    each name to one of these indices at startup, so the per-cycle publish path is an array
    store with no string hashing. *)
 let set_state_slot t slot v =
-  bump_gen t;
-  t.state <- set_arr t.state slot v
+  if not (slot_unchanged t.state slot v)
+  then (
+    bump_gen t;
+    t.state <- set_arr t.state slot v)
 ;;
 
 let set_platform_slot t slot v =
-  bump_gen t;
-  t.platform <- set_arr t.platform slot v
+  if not (slot_unchanged t.platform slot v)
+  then (
+    bump_gen t;
+    t.platform <- set_arr t.platform slot v)
 ;;
 
 let set_signal_slot t slot v =
-  bump_gen t;
-  t.signals <- set_arr t.signals slot v
+  if not (slot_unchanged t.signals slot v)
+  then (
+    bump_gen t;
+    t.signals <- set_arr t.signals slot v)
 ;;
 
 let set_caps t c = t.caps <- c
