@@ -156,20 +156,21 @@ let () =
       (float !gmax /. 1000.0)
       (float !amax /. 1000.0)
       !missmax;
-    (* One profiled cycle: reset every per-cycle counter, then run once and dump them. *)
+    (* Steady-state per-phase allocation: reset the counters, run N cycles with profiling
+       ON and report the per-phase average. A single profiled cycle is too noisy to target
+       (the same phase varies by 5-8x run to run); this is the attribution to act on. *)
     SS.reset_phase_metrics ~profiling:true state;
     ctx.cg_profile <- true;
     rt.prof_enabled <- true;
-    run 999_999;
+    let pn = 20_000 in
+    for i = 1 to pn do
+      run (500_000 + i)
+    done;
     rt.prof_enabled <- false;
     ctx.cg_profile <- false;
-    Printf.printf
-      "  interpreter: guard=%dns args=%dns cpu=%dns\n%!"
-      rt.prof_guard_ns
-      rt.prof_args_ns
-      rt.prof_cpu_ns;
-    let p name w = Printf.printf "  %-14s %6d w\n" name w in
-    Printf.printf "profiled cycle per-phase allocation:\n";
+    let avg w = float w /. float pn in
+    Printf.printf "steady-state per-phase allocation (words/cycle):\n";
+    let p name w = Printf.printf "  %-14s %8.2f w\n" name (avg w) in
     p "preamble" state.alloc_preamble_words;
     p "facts" state.alloc_facts_words;
     p "cleanup" state.alloc_cleanup_words;
