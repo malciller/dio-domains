@@ -280,7 +280,8 @@ let () =
        [$platform.*] reference misses. Before the single-pass fix this double-evaluated
        and built a message string per miss. *)
     let saved = Array.copy rt.platform in
-    rt.platform <- Array.make (Array.length rt.platform) None;
+    rt.platform
+    <- Array.make (Array.length rt.platform) Dio_strategies.Strategy_expr.V_unset;
     rt.prof_missing <- 0;
     rt.prof_enabled <- true;
     let miss_words =

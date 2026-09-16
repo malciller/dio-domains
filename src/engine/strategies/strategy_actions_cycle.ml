@@ -25,19 +25,19 @@ let bool_arg args key =
 
 let state_float_opt t key =
   match Strategy_runtime.get_state t key with
-  | Some (V_float f) -> Some f
+  | V_float f -> Some f
   | _ -> None
 ;;
 
 let state_bool t key =
   match Strategy_runtime.get_state t key with
-  | Some (V_bool b) -> b
+  | V_bool b -> b
   | _ -> false
 ;;
 
 let platform_float t key default =
   match Strategy_runtime.get_platform t key with
-  | Some (V_float f) -> f
+  | V_float f -> f
   | _ -> default
 ;;
 

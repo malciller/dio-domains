@@ -181,7 +181,7 @@ let test_runtime_fill () =
    | None -> Alcotest.fail "missing dedup_key");
   (* qty 2 accumulated; reserved set by handler *)
   match Strategy_runtime.get_state rt "reserved" with
-  | Some (Strategy_expr.V_float r) -> Alcotest.(check (float 0.0001)) "reserved" 2.0 r
+  | Strategy_expr.V_float r -> Alcotest.(check (float 0.0001)) "reserved" 2.0 r
   | _ -> Alcotest.fail "reserved not set"
 ;;
 

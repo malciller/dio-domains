@@ -233,6 +233,7 @@ let emitted_only (t : t) : t =
 
 let value_to_json (v : Strategy_expr.value) : Yojson.Basic.t =
   match v with
+  | V_unset -> `Null
   | V_none -> `Null
   | V_float f -> `Float f
   | V_int i -> `Int i
