@@ -73,6 +73,17 @@ CAMLprim value dio_set_current_idle(value unit) {
   return Val_bool(rc == 0);
 }
 
+/* Promote the calling thread to SCHED_FIFO at [prio] so no CFS thread can preempt it.
+ * Requires CAP_SYS_NICE; returns false (and the caller logs) without it. The kernel's
+ * default sched_rt_runtime_us (95% of each period) keeps a runaway RT thread from
+ * wedging the machine. */
+CAMLprim value dio_set_current_rt(value vprio) {
+  struct sched_param p;
+  p.sched_priority = Int_val(vprio);
+  int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &p);
+  return Val_bool(rc == 0);
+}
+
 #else
 
 CAMLprim value dio_pin_current_thread(value vcpu) {
@@ -93,6 +104,11 @@ CAMLprim value dio_allowed_cpu_count(value unit) {
 
 CAMLprim value dio_set_current_idle(value unit) {
   (void)unit;
+  return Val_false;
+}
+
+CAMLprim value dio_set_current_rt(value vprio) {
+  (void)vprio;
   return Val_false;
 }
 
