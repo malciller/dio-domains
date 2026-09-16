@@ -410,6 +410,38 @@ let set_platform_slot t slot v =
     t.platform <- set_arr t.platform slot v)
 ;;
 
+(* Typed platform setters. The caller passes the raw payload, so an unchanged fact is
+   rejected by comparing the unboxed value against the slot - no [V_bool]/[V_float] block
+   is allocated. Most facts are unchanged cycle to cycle, so this removes the fact-boxing
+   allocation that [set_platform_slot t slot (V_bool ..)] paid unconditionally. *)
+let[@inline] platform_slot_get t slot =
+  if slot < Array.length t.platform then Array.unsafe_get t.platform slot else V_unset
+;;
+
+let[@inline] set_platform_bool t slot (b : bool) =
+  match platform_slot_get t slot with
+  | V_bool b0 when Bool.equal b0 b -> ()
+  | _ ->
+    bump_gen t;
+    t.platform <- set_arr t.platform slot (V_bool b)
+;;
+
+let[@inline] set_platform_float t slot (f : float) =
+  match platform_slot_get t slot with
+  | V_float f0 when Float.equal f0 f -> ()
+  | _ ->
+    bump_gen t;
+    t.platform <- set_arr t.platform slot (V_float f)
+;;
+
+let[@inline] set_platform_int t slot (i : int) =
+  match platform_slot_get t slot with
+  | V_int i0 when Int.equal i0 i -> ()
+  | _ ->
+    bump_gen t;
+    t.platform <- set_arr t.platform slot (V_int i)
+;;
+
 let set_signal_slot t slot v =
   if not (slot_unchanged t.signals slot v)
   then (

@@ -411,30 +411,12 @@ let early_facts c (t : Strategy_runtime.t) =
     | Some s -> s.maker_fee > 0.0
     | None -> false
   in
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.price_nan
-    (Strategy_expr.V_bool (Float.is_nan c.cg_price));
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.check_stale_balance
-    (Strategy_expr.V_bool check_stale_balance);
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.asset_balance_nan
-    (Strategy_expr.V_bool (Float.is_nan c.cg_abal));
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.quote_balance_nan
-    (Strategy_expr.V_bool (Float.is_nan c.cg_qbal));
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.maker_fee_set
-    (Strategy_expr.V_bool maker_fee_set);
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.fee_refresh_due
-    (Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0))
+  Strategy_runtime.set_platform_bool t Slots.price_nan (Float.is_nan c.cg_price);
+  Strategy_runtime.set_platform_bool t Slots.check_stale_balance check_stale_balance;
+  Strategy_runtime.set_platform_bool t Slots.asset_balance_nan (Float.is_nan c.cg_abal);
+  Strategy_runtime.set_platform_bool t Slots.quote_balance_nan (Float.is_nan c.cg_qbal);
+  Strategy_runtime.set_platform_bool t Slots.maker_fee_set maker_fee_set;
+  Strategy_runtime.set_platform_bool t Slots.fee_refresh_due (c.cg_cycle land 0x3ff = 0)
 ;;
 
 (** Fine path step 6a'': publish the raw gate facts the strategy file combines into the
@@ -466,66 +448,24 @@ let cycle_facts c (t : Strategy_runtime.t) =
     | Some ecfg -> ecfg.check_stale_balance
     | None -> false
   in
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.oracle_halted
-    (Strategy_expr.V_bool c.cg_oracle_halted);
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.tif_recovery_pending
-    (Strategy_expr.V_bool pending);
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.tif_recovery_since
-    (Strategy_expr.V_float since);
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.price_nan
-    (Strategy_expr.V_bool (Float.is_nan c.cg_price));
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.maker_fee_set
-    (Strategy_expr.V_bool maker_fee_set);
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.fee_refresh_due
-    (Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0));
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.check_stale_balance
-    (Strategy_expr.V_bool check_stale_balance);
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.asset_balance_nan
-    (Strategy_expr.V_bool (Float.is_nan c.cg_abal));
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.quote_balance_nan
-    (Strategy_expr.V_bool (Float.is_nan c.cg_qbal));
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.has_pending_buy
-    (Strategy_expr.V_bool has_pending_buy);
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.has_tracked_buy
-    (Strategy_expr.V_bool has_tracked_buy);
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.inflight_cancel_buy
-    (Strategy_expr.V_bool inflight_cancel_buy);
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.inflight_amend_buy
-    (Strategy_expr.V_bool inflight_amend_buy);
-  Strategy_runtime.set_platform_slot
-    t
-    Slots.open_buy_count
-    (Strategy_expr.V_int c.cg_open_buy_count);
-  Strategy_runtime.set_platform_slot
+  Strategy_runtime.set_platform_bool t Slots.oracle_halted c.cg_oracle_halted;
+  Strategy_runtime.set_platform_bool t Slots.tif_recovery_pending pending;
+  Strategy_runtime.set_platform_float t Slots.tif_recovery_since since;
+  Strategy_runtime.set_platform_bool t Slots.price_nan (Float.is_nan c.cg_price);
+  Strategy_runtime.set_platform_bool t Slots.maker_fee_set maker_fee_set;
+  Strategy_runtime.set_platform_bool t Slots.fee_refresh_due (c.cg_cycle land 0x3ff = 0);
+  Strategy_runtime.set_platform_bool t Slots.check_stale_balance check_stale_balance;
+  Strategy_runtime.set_platform_bool t Slots.asset_balance_nan (Float.is_nan c.cg_abal);
+  Strategy_runtime.set_platform_bool t Slots.quote_balance_nan (Float.is_nan c.cg_qbal);
+  Strategy_runtime.set_platform_bool t Slots.has_pending_buy has_pending_buy;
+  Strategy_runtime.set_platform_bool t Slots.has_tracked_buy has_tracked_buy;
+  Strategy_runtime.set_platform_bool t Slots.inflight_cancel_buy inflight_cancel_buy;
+  Strategy_runtime.set_platform_bool t Slots.inflight_amend_buy inflight_amend_buy;
+  Strategy_runtime.set_platform_int t Slots.open_buy_count c.cg_open_buy_count;
+  Strategy_runtime.set_platform_bool
     t
     Slots.has_recent_amend_buy
-    (Strategy_expr.V_bool c.cg_has_recent_amend_buy)
+    c.cg_has_recent_amend_buy
 ;;
 
 (** Fine path: the stale-balance side effect (record the cycle on the state). The file
@@ -596,43 +536,16 @@ let buy_place_plan c (t : Strategy_runtime.t) =
         ~closest_sell_order_initial:c.cg_closest_sell_order
     in
     c.cg_buy_plan <- Some p;
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.buy_price
-      (Strategy_expr.V_float p.bp_price);
-    Strategy_runtime.set_platform_slot t Slots.buy_qty (Strategy_expr.V_float p.bp_qty);
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.buy_quote_needed
-      (Strategy_expr.V_float p.bp_quote_needed);
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.buy_available
-      (Strategy_expr.V_float p.bp_available);
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.buy_balance_ok
-      (Strategy_expr.V_bool p.bp_balance_ok);
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.buy_capital_low
-      (Strategy_expr.V_bool p.bp_capital_low);
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.buy_crossing
-      (Strategy_expr.V_bool p.bp_crossing);
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.buy_quote_nan
-      (Strategy_expr.V_bool p.bp_quote_nan);
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.buy_cooldown
-      (Strategy_expr.V_bool p.bp_cooldown);
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.buy_inflight
-      (Strategy_expr.V_bool p.bp_inflight)
+    Strategy_runtime.set_platform_float t Slots.buy_price p.bp_price;
+    Strategy_runtime.set_platform_float t Slots.buy_qty p.bp_qty;
+    Strategy_runtime.set_platform_float t Slots.buy_quote_needed p.bp_quote_needed;
+    Strategy_runtime.set_platform_float t Slots.buy_available p.bp_available;
+    Strategy_runtime.set_platform_bool t Slots.buy_balance_ok p.bp_balance_ok;
+    Strategy_runtime.set_platform_bool t Slots.buy_capital_low p.bp_capital_low;
+    Strategy_runtime.set_platform_bool t Slots.buy_crossing p.bp_crossing;
+    Strategy_runtime.set_platform_bool t Slots.buy_quote_nan p.bp_quote_nan;
+    Strategy_runtime.set_platform_bool t Slots.buy_cooldown p.bp_cooldown;
+    Strategy_runtime.set_platform_bool t Slots.buy_inflight p.bp_inflight
   | _ -> c.cg_buy_plan <- None
 ;;
 
@@ -851,38 +764,17 @@ let sell_finalize_facts c (t : Strategy_runtime.t) =
       | Some age -> age <= Platform_accounting.sweep_max_balance_age_s
       | None -> true
     in
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.remaintain_expired_sells
-      (Strategy_expr.V_bool remaintain);
-    Strategy_runtime.set_platform_slot
+    Strategy_runtime.set_platform_bool t Slots.remaintain_expired_sells remaintain;
+    Strategy_runtime.set_platform_bool
       t
       Slots.sell_missing_empty
-      (Strategy_expr.V_bool (!(pre.sp_missing_after_reconcile) = []));
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.just_filled_buy
-      (Strategy_expr.V_bool just_filled);
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.resuming_after_balance
-      (Strategy_expr.V_bool resuming);
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.buy_attempted
-      (Strategy_expr.V_bool c.cg_buy_attempted);
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.sell_pushed
-      (Strategy_expr.V_bool !(pre.sp_sell_pushed));
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.has_active_sell
-      (Strategy_expr.V_bool active_sell);
-    Strategy_runtime.set_platform_slot
-      t
-      Slots.balance_fresh
-      (Strategy_expr.V_bool balance_fresh)
+      (!(pre.sp_missing_after_reconcile) = []);
+    Strategy_runtime.set_platform_bool t Slots.just_filled_buy just_filled;
+    Strategy_runtime.set_platform_bool t Slots.resuming_after_balance resuming;
+    Strategy_runtime.set_platform_bool t Slots.buy_attempted c.cg_buy_attempted;
+    Strategy_runtime.set_platform_bool t Slots.sell_pushed !(pre.sp_sell_pushed);
+    Strategy_runtime.set_platform_bool t Slots.has_active_sell active_sell;
+    Strategy_runtime.set_platform_bool t Slots.balance_fresh balance_fresh
   | None -> ()
 ;;
 
