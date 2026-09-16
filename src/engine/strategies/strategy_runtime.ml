@@ -44,6 +44,11 @@ type compiled_action =
   { ca_name : string
   ; ca_args : (string * compiled_arg) list
   ; ca_bind : (string * string) list
+  ; ca_gate : (int * compiled_arg) option
+  (* Precompiled ["set_gate"] fast path: [Some (slot, value)] when the gate's ["name"] is
+     a literal, so the live path can store the value into its slot without building an
+     argument assoc list or dispatching through the handler. [None] for every other action
+     (and for a dynamic gate name), which falls back to the generic path. *)
   }
 
 (** A step with its guard compiled to a closure and its actions pre-compiled. *)
@@ -266,9 +271,20 @@ let compile_arg t (j : Yojson.Basic.t) : compiled_arg =
 ;;
 
 let compile_action t (a : Strategy_file.action) : compiled_action =
+  (* A ["set_gate"] with a literal ["name"] is by far the most common arg-carrying action.
+     Resolve its state slot here, at load, so the live path is a single slot store. *)
+  let ca_gate =
+    if String.equal a.a_name "set_gate" && a.a_bind = []
+    then (
+      match List.assoc_opt "name" a.a_args, List.assoc_opt "value" a.a_args with
+      | Some (`String k), Some v -> Some (intern_key k, compile_arg t v)
+      | _ -> None)
+    else None
+  in
   { ca_name = a.a_name
   ; ca_args = List.map (fun (k, j) -> k, compile_arg t j) a.a_args
   ; ca_bind = a.a_bind
+  ; ca_gate
   }
 ;;
 
@@ -550,6 +566,19 @@ let apply_binds t (ca : compiled_action) out =
       ca.ca_bind
 ;;
 
+(** Evaluate a single serialized argument to its [value] (no [Ok]/tuple/list). *)
+let eval_arg_value e (a : compiled_arg) =
+  match a with
+  | ALit v -> Some v
+  | AExpr ex ->
+    (try Some (Strategy_expr.eval_value e ex) with
+     | Strategy_expr.Eval_error _ -> None)
+  | ATemplate s ->
+    (match interpolate e s with
+     | Ok v -> Some v
+     | Error _ -> None)
+;;
+
 let run_action t (e : env) step_id (ca : compiled_action) : action_call =
   let args = eval_args t e ca in
   let out = t.handlers.run t ca.ca_name args in
@@ -560,9 +589,17 @@ let run_action t (e : env) step_id (ca : compiled_action) : action_call =
 (** Live path: run the action without materializing an [action_call] (the caller discards
     the call list). Keeps the [collect = false] cycle allocation-free for the record. *)
 let run_action_ignore t (e : env) (ca : compiled_action) =
-  let args = eval_args t e ca in
-  let out = t.handlers.run t ca.ca_name args in
-  apply_binds t ca out
+  match ca.ca_gate with
+  | Some (slot, varg) ->
+    (* Precompiled ["set_gate"]: no argument assoc list, no handler dispatch, no thunk -
+       just evaluate the value and store it into the pre-resolved slot. *)
+    (match eval_arg_value e varg with
+     | Some v -> set_state_slot t slot v
+     | None -> ())
+  | None ->
+    let args = eval_args t e ca in
+    let out = t.handlers.run t ca.ca_name args in
+    apply_binds t ca out
 ;;
 
 (** Top-level loops so the per-step action/let iteration does not allocate a closure on
