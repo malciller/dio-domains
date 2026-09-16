@@ -75,8 +75,19 @@ module SymbolExecStore = struct
     ; open_orders : (string, open_order_internal) Hashtbl.t
     ; open_orders_cache : open_order_internal list Atomic.t
     (** Lock-free atomic snapshot of active open orders for the domain hot path. *)
+    ; open_orders_generation : int Atomic.t
+    (** Per-symbol generation bumped when this symbol's snapshot is republished, so a
+        consumer skips a rescan only when *this* symbol's orders changed. *)
     ; initial_data_received : bool Atomic.t
     ; mutex : Mutex.t
+    ; changes : (string * open_order_internal option) list Atomic.t
+    (** Orders mutated since the last drain, newest first. [Some o] is the current record
+        for an add/replace, [None] a removal. Lets the strategy apply a per-order delta
+        (O(changes)) instead of an O(open-orders) rescan. Writers prepend under [mutex];
+        the reader swaps it out lock-free with {!drain_changes}. *)
+    ; changes_overflow : bool Atomic.t
+    (** Set when the change log cannot represent the delta (a full snapshot replace),
+        forcing the consumer to do a full rescan. *)
     }
 
   let create symbol capacity =
@@ -100,15 +111,35 @@ module SymbolExecStore = struct
     ; write_pos = Atomic.make 0
     ; open_orders = Hashtbl.create 32
     ; open_orders_cache = Atomic.make []
+    ; open_orders_generation = Atomic.make 0
     ; initial_data_received = Atomic.make false
     ; mutex = Mutex.create ()
+    ; changes = Atomic.make []
+    ; changes_overflow = Atomic.make false
     }
   ;;
 
   let[@inline] publish_open_orders_cache t =
     let snapshot = Hashtbl.fold (fun _ o acc -> o :: acc) t.open_orders [] in
     Atomic.set t.open_orders_cache snapshot;
+    Atomic.incr t.open_orders_generation;
     Atomic.incr orders_generation
+  ;;
+
+  (** Record an order whose state changed, for delta consumption by the strategy. [Some o]
+      for an add/replace, [None] for a removal. Writers prepend under [t.mutex]; the
+      reader swaps the list out lock-free, so the get/set here never needs a lock. *)
+  let[@inline] note_change t id order =
+    Atomic.set t.changes ((id, order) :: Atomic.get t.changes)
+  ;;
+
+  (** [drain_changes t] swaps out the [(id, order option)] changes since the last drain
+      (and the overflow flag) lock-free, so the per-cycle drain never blocks on the store
+      mutex. *)
+  let drain_changes t =
+    let changes = Atomic.exchange t.changes [] in
+    let overflow = Atomic.exchange t.changes_overflow false in
+    changes, overflow
   ;;
 
   let push_event t (e : execution_event_internal) =
@@ -146,8 +177,11 @@ module SymbolExecStore = struct
          ; cl_ord_id = e.cl_ord_id
          }
        in
-       Hashtbl.replace t.open_orders e.order_id oo
-     | Filled | Canceled | Expired | Rejected -> Hashtbl.remove t.open_orders e.order_id);
+       Hashtbl.replace t.open_orders e.order_id oo;
+       note_change t e.order_id (Some oo)
+     | Filled | Canceled | Expired | Rejected ->
+       Hashtbl.remove t.open_orders e.order_id;
+       note_change t e.order_id None);
     publish_open_orders_cache t;
     Mutex.unlock t.mutex;
     (* Per-symbol wakeup; only this symbol's domain consumes its exec events. *)
@@ -157,6 +191,7 @@ module SymbolExecStore = struct
   let set_open_orders_snapshot t orders =
     Mutex.lock t.mutex;
     Hashtbl.clear t.open_orders;
+    Atomic.set t.changes_overflow true;
     List.iter
       (fun (o : Alpaca_types.order_record) ->
         let user_ref =
@@ -182,7 +217,8 @@ module SymbolExecStore = struct
           ; cl_ord_id = o.client_order_id
           }
         in
-        Hashtbl.replace t.open_orders o.id oo)
+        Hashtbl.replace t.open_orders o.id oo;
+        note_change t o.id (Some oo))
       orders;
     publish_open_orders_cache t;
     Mutex.unlock t.mutex;
@@ -199,6 +235,42 @@ end
 
 let stores : (string, SymbolExecStore.t) Hashtbl.t = Hashtbl.create 16
 let stores_mutex = Mutex.create ()
+
+(** Per-symbol generation for [symbol], or [-1] when the store does not exist yet so the
+    consumer's rescan gate forces a scan until the first snapshot. *)
+let get_orders_generation_for_symbol symbol =
+  match Hashtbl.find_opt stores symbol with
+  | Some s -> Atomic.get s.SymbolExecStore.open_orders_generation
+  | None -> -1
+;;
+
+(** Drain the per-order change delta for [symbol]: [(changes, overflow)] where [changes]
+    is [(id, snapshot option)] in chronological order, [snapshot] being
+    [(limit_price, remaining_qty, side, order_userref)] for an add/replace and [None] for
+    a removal. [overflow] (or a missing store) means the caller must do a full rescan. *)
+let drain_open_order_changes ~symbol =
+  match Hashtbl.find_opt stores symbol with
+  | Some store ->
+    let changes, overflow = SymbolExecStore.drain_changes store in
+    ( List.rev_map
+        (fun (id, (o : open_order_internal option)) ->
+          let snap =
+            match o with
+            | Some o ->
+              Some
+                ( o.limit_price
+                , o.remaining_qty
+                , (match o.side with
+                   | Buy -> "buy"
+                   | Sell -> "sell")
+                , o.user_ref )
+            | None -> None
+          in
+          id, snap)
+        changes
+    , overflow )
+  | None -> [], true
+;;
 
 let get_or_create_store symbol =
   Mutex.lock stores_mutex;
@@ -251,6 +323,7 @@ let remove_open_order symbol order_id =
     if existed
     then (
       Hashtbl.remove store.open_orders order_id;
+      SymbolExecStore.note_change store order_id None;
       SymbolExecStore.publish_open_orders_cache store);
     Mutex.unlock store.mutex
   | None -> ()

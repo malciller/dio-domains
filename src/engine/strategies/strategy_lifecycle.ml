@@ -124,12 +124,25 @@ let arm_sell_hold ~state ~qty ~now =
     that interpolate tick-varying figures (a live ref price, a moving balance) so the
     window holds while the logged text keeps full detail. *)
 let log_sell_block ?(kind = "") ~state ~now ~symbol reason =
-  let key = if kind = "" then reason else kind in
-  if key <> state.last_sell_block_reason || now -. state.last_sell_block_log_at >= 60.0
+  (* Dedup window: re-log only when the reason changes or 60s have passed. When [kind] is
+     supplied the key is free, so the (allocating) [reason] closure is not called at all
+     unless the line is actually emitted; otherwise it is built exactly once (the previous
+     code built it a second time on every emitted line). *)
+  let due = now -. state.last_sell_block_log_at >= 60.0 in
+  if kind <> ""
   then (
-    state.last_sell_block_reason <- key;
-    state.last_sell_block_log_at <- now;
-    Logging.warn_f ~section "Sell placement blocked for %s: %s" symbol reason)
+    if kind <> state.last_sell_block_reason || due
+    then (
+      state.last_sell_block_reason <- kind;
+      state.last_sell_block_log_at <- now;
+      Logging.warn_f ~section "Sell placement blocked for %s: %s" symbol (reason ())))
+  else (
+    let key = reason () in
+    if key <> state.last_sell_block_reason || due
+    then (
+      state.last_sell_block_reason <- key;
+      state.last_sell_block_log_at <- now;
+      Logging.warn_f ~section "Sell placement blocked for %s: %s" symbol key))
 ;;
 
 (** Reconciles the in-memory position ledger to the venue balance feed.
@@ -398,6 +411,162 @@ let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
   evict_ghost_orders ~state ~now
 ;;
 
+(** Apply a drained per-order delta (venue change log) to the persistent feed indexes, the
+    cached scan outputs ([cached_open_buy_count], [cached_locked_in_buys],
+    [cached_feed_total], [cached_closest_sell_order], [cached_best_buy_*]),
+    [cached_feed_sell_orders] and the sell-commitment ledger, in O(changes).
+
+    This is the incremental replacement for the O(open-orders) [sync_open_orders] scan:
+    the scan's per-order contribution (buy count/sum, sell list/total/closest, commitment
+    upsert) is retracted and re-applied only for the ids the venue reported as changed.
+    When the current top buy or closest sell leaves, the new extreme is recomputed from
+    the corresponding index (O(index), but only on an extreme leaving - not per changed
+    id). [changes] is [(id, snapshot option)] in chronological order ([None] = removed). *)
+let apply_open_order_delta ~state ~now_time ~ecfg ~changes =
+  let trust_feed = ecfg.hold_netted_from_venue_state in
+  let evicted_empty = Hashtbl.length state.evicted_orders = 0 in
+  let sells_dirty = ref false in
+  (* Set whenever a sell is retracted or added; resolved once after the whole delta by
+     validating the cached closest against the final index (O(1)) and recomputing (O(n))
+     only if it genuinely left. An amend that re-adds the closest at the same price - the
+     common trailing case - therefore skips the scan entirely. *)
+  let closest_dirty = ref false in
+  let recompute_closest () =
+    (* [float array] accumulator keeps this allocation-free; runs only when the closest
+       sell genuinely leaves (see [closest_dirty] handling below). *)
+    let best_id = ref "" in
+    let best_p = Array.make 1 Float.infinity in
+    Hashtbl.iter
+      (fun id (p, _) ->
+        if p < best_p.(0)
+        then (
+          best_id := id;
+          best_p.(0) <- p))
+      state.feed_sell_index;
+    state.cached_closest_sell_order
+    <- (if !best_id = "" then None else Some (!best_id, best_p.(0)))
+  in
+  let recompute_best_buy () =
+    let best_id = ref "" in
+    let best_p = Array.make 1 0.0 in
+    Hashtbl.iter
+      (fun id (p, _) ->
+        if p > best_p.(0)
+        then (
+          best_id := id;
+          best_p.(0) <- p))
+      state.feed_buy_index;
+    state.cached_best_buy_id <- !best_id;
+    state.cached_best_buy_price <- best_p.(0)
+  in
+  let recompute_recent_amend () =
+    let found = ref false in
+    Hashtbl.iter
+      (fun id _ ->
+        match Hashtbl.find_opt state.amend_cooldowns id with
+        | Some expiry when now_time < expiry -> found := true
+        | _ -> ())
+      state.feed_buy_index;
+    state.cached_has_recent_amend_buy <- !found
+  in
+  List.iter
+    (fun (oid, snap) ->
+      (match Hashtbl.find_opt state.feed_buy_index oid with
+       | Some (p, q) ->
+         state.cached_open_buy_count <- state.cached_open_buy_count - 1;
+         state.cached_locked_in_buys <- state.cached_locked_in_buys -. (p *. q);
+         Hashtbl.remove state.feed_buy_index oid;
+         if state.cached_best_buy_id = oid then recompute_best_buy ();
+         if state.cached_has_recent_amend_buy then recompute_recent_amend ()
+       | None -> ());
+      (match Hashtbl.find_opt state.feed_sell_index oid with
+       | Some (_, q) ->
+         state.cached_feed_total <- state.cached_feed_total -. q;
+         ignore (Sell_orders.remove_by_id state.cached_feed_sell_orders oid);
+         Hashtbl.remove state.feed_sell_index oid;
+         sells_dirty := true;
+         closest_dirty := true
+       | None -> ());
+      let is_our =
+        match snap with
+        | Some (_, _, _, userref) ->
+          (match userref with
+           | Some r -> r <> strategy_userref_mm
+           | None -> true)
+        | None -> true
+      in
+      let keep =
+        match snap with
+        | Some (_, qty, _, _) ->
+          qty > 0.0
+          && is_our
+          && (evicted_empty || not (Hashtbl.mem state.evicted_orders oid))
+        | None -> false
+      in
+      if keep
+      then (
+        match snap with
+        | Some (price_opt, qty, side_str, _) ->
+          let price = Option.value price_opt ~default:0.0 in
+          if side_str = "buy"
+          then (
+            Hashtbl.replace state.feed_buy_index oid (price, qty);
+            state.cached_open_buy_count <- state.cached_open_buy_count + 1;
+            state.cached_locked_in_buys <- state.cached_locked_in_buys +. (price *. qty);
+            if price > state.cached_best_buy_price && price > 0.0
+            then (
+              state.cached_best_buy_id <- oid;
+              state.cached_best_buy_price <- price);
+            match Hashtbl.find_opt state.amend_cooldowns oid with
+            | Some expiry when now_time < expiry ->
+              state.cached_has_recent_amend_buy <- true
+            | _ -> ())
+          else if side_str = "sell"
+          then (
+            add_tracked_order_id state oid;
+            Hashtbl.replace state.feed_sell_index oid (price, qty);
+            Sell_orders.push state.cached_feed_sell_orders oid price qty;
+            state.cached_feed_total <- state.cached_feed_total +. qty;
+            upsert_sell_commitment ~state ~id:oid ~price ~qty ~seen:true ~acked:true;
+            sells_dirty := true;
+            closest_dirty := true)
+        | None -> ())
+      else (
+        match Hashtbl.find_opt state.sell_commitments oid with
+        | Some c when c.sc_seen || c.sc_acked ->
+          if trust_feed
+          then (
+            Hashtbl.remove state.sell_commitments oid;
+            touch_commitments state)
+          else (
+            c.sc_listed <- false;
+            state.sell_commitments_clean <- false)
+        | _ -> ()))
+    changes;
+  (* Resolve the closest sell once, after every change is applied. The cached binding is
+     validated against the final index in O(1); the O(n) rescan runs only when the closest
+     genuinely left (an amend that re-adds it at the same price is the common case and
+     keeps the binding valid). *)
+  if !closest_dirty
+  then (
+    let valid =
+      match state.cached_closest_sell_order with
+      | Some (cid, cp) ->
+        (match Hashtbl.find_opt state.feed_sell_index cid with
+         | Some (fp, _) -> fp = cp
+         | None -> false)
+      | None -> false
+    in
+    if not valid then recompute_closest ());
+  if !sells_dirty
+  then (
+    Sell_orders.blit ~src:state.cached_feed_sell_orders ~dst:state.open_sell_orders;
+    state.sync_orders_seen <- List.length changes)
+;;
+
+(* [drain_open_order_changes] supplies the venue's per-order change log for the O(changes)
+   incremental path; callers that have none pass [(fun ~symbol:_ -> [], true)] (or
+   [Strategy_venue.no_open_order_changes]) to fall back to the full scan. *)
 let sync_open_orders
   ~state
   ~now
@@ -406,6 +575,7 @@ let sync_open_orders
   ~lot_qty
   ~iter_open_orders
   ~get_open_orders_generation
+  ~drain_open_order_changes
   ~ecfg
   =
   let now_time = now in
@@ -424,34 +594,82 @@ let sync_open_orders
     if List.length state.recently_injected_sells > 20
     then state.recently_injected_sells <- take 20 state.recently_injected_sells);
   let best_buy_price = ref 0.0 in
-  let best_buy_id = ref None in
+  let best_buy_id = ref "" in
   let open_buy_count_from_scan = ref 0 in
   let has_recent_amend_buy = ref false in
   let locked_in_buys = ref 0.0 in
   let locked_in_sells = ref 0.0 in
   let feed_total = ref 0.0 in
-  let closest_sell_order = ref None in
+  (* Deferred optionization: building [Some (id, price)] on every closer sell/list
+     allocates ~5 words per order per scan; keep the running best in plain refs and build
+     the option once at the end. Empty id = "no candidate". *)
+  let closest_sell_id = ref "" in
+  let closest_sell_price = ref nan in
   (* Rescan gate. The scan below is O(open orders) and dominated by string-keyed hashtable
      work; when the venue exposes an open-orders generation ([get_open_orders_generation])
-     that has not moved since the last scan, and the venue keeps no persisted GTC levels
-     (Alpaca), reuse the last scan's outputs and skip the scan. The ledger reconcile
-     further down still runs every cycle, so a lost placement still ages out. *)
+     that has not moved since the last scan, reuse the last scan's outputs and skip the
+     scan. This applies to every venue (including Alpaca/remaintain): an unchanged
+     generation means the feed sells are identical, so the persisted-ladder rebuild below
+     is a no-op and the ledger reconcile still runs. *)
   let generation = get_open_orders_generation () in
-  let can_skip =
-    (not ecfg.remaintain_expired_sells)
-    && state.open_orders_scan_valid
-    && generation >= 0
-    && state.open_orders_scan_generation = generation
+  (* Drain the venue's per-order change log (O(changes)). [has_changes] is true only when
+     the venue reported mutations since the last drain; an overflow (or an unsupported
+     venue, which returns [[], true]) forces the full scan. Draining on every cycle (even
+     a skip) is deliberate: the feed appends to the log before it bumps the generation, so
+     a mutation can be visible here while [generation] is unchanged - applying it now
+     avoids losing it until the next publish. *)
+  let changes, changes_overflow = drain_open_order_changes ~symbol:asset.symbol in
+  let has_changes =
+    match changes with
+    | [] -> false
+    | _ :: _ -> true
   in
+  let generation_changed =
+    (not state.open_orders_scan_valid)
+    || generation < 0
+    || state.open_orders_scan_generation <> generation
+  in
+  let can_skip = (not generation_changed) && not has_changes in
   if can_skip
   then (
     Sell_orders.blit ~src:state.cached_feed_sell_orders ~dst:state.open_sell_orders;
     open_buy_count_from_scan := state.cached_open_buy_count;
     has_recent_amend_buy := state.cached_has_recent_amend_buy;
     locked_in_buys := state.cached_locked_in_buys;
-    closest_sell_order := state.cached_closest_sell_order;
+    (match state.cached_closest_sell_order with
+     | Some (id, p) ->
+       closest_sell_id := id;
+       closest_sell_price := p
+     | None -> ());
     feed_total := state.cached_feed_total)
+  else if state.feed_index_valid && not changes_overflow
+  then (
+    (* Incremental path: the persistent indexes are a complete snapshot and the venue gave
+       us exactly the ids that moved, so apply O(changes) instead of rescanning every open
+       order + walking every commitment. *)
+    let t_scan_start = Monotonic_clock.now_ns () in
+    if has_changes then apply_open_order_delta ~state ~now_time ~ecfg ~changes;
+    state.time_sync_scan_ns <- Monotonic_clock.now_ns () - t_scan_start;
+    open_buy_count_from_scan := state.cached_open_buy_count;
+    has_recent_amend_buy := state.cached_has_recent_amend_buy;
+    locked_in_buys := state.cached_locked_in_buys;
+    best_buy_id := state.cached_best_buy_id;
+    best_buy_price := state.cached_best_buy_price;
+    feed_total := state.cached_feed_total;
+    (match state.cached_closest_sell_order with
+     | Some (id, p) ->
+       closest_sell_id := id;
+       closest_sell_price := p
+     | None -> ());
+    state.open_orders_scan_generation <- generation;
+    state.open_orders_scan_valid <- true)
   else (
+    (* Hot-path invariant (enforced): reaching the O(open-orders) scan means the
+       persistent index was not a complete snapshot, which is only ever true before the
+       first scan or after the venue's delta reported an overflow (clear/reconnect). A
+       steady-state cycle must never get here - if it does, the delta/index contract has
+       regressed and the cycle silently becomes O(n). *)
+    assert ((not state.feed_index_valid) || changes_overflow);
     (* Mark every commitment "not listed" for this scan. The scan's
        [upsert_sell_commitment ~seen:true] flips it back on, and the reconcile below tests
        the flag instead of a separate [(string, unit)] membership table. That removes a
@@ -459,6 +677,12 @@ let sync_open_orders
        lookup per ledger entry. [execute_strategy] holds [state.mutex], so this is
        single-writer. O(ledger), no allocation. *)
     Hashtbl.iter (fun _ c -> c.sc_listed <- false) state.sell_commitments;
+    (* A full scan rebuilds the commitment [sc_listed] flags and the persistent indexes
+       from scratch, so the ledger is no longer known clean and the indexes are
+       re-derived. *)
+    state.sell_commitments_clean <- false;
+    Hashtbl.reset state.feed_sell_index;
+    Hashtbl.reset state.feed_buy_index;
     Sell_orders.clear state.open_sell_orders;
     state.sync_orders_seen <- 0;
     (* Loop-invariant: [evicted_orders] does not change during the scan. *)
@@ -479,10 +703,11 @@ let sync_open_orders
         then (
           incr open_buy_count_from_scan;
           locked_in_buys := !locked_in_buys +. (price *. qty);
+          Hashtbl.replace state.feed_buy_index oid (price, qty);
           if price > !best_buy_price && price > 0.0
           then (
             best_buy_price := price;
-            best_buy_id := Some oid);
+            best_buy_id := oid);
           match Hashtbl.find_opt state.amend_cooldowns oid with
           | Some expiry when now_time < expiry -> has_recent_amend_buy := true
           | _ -> ())
@@ -490,6 +715,7 @@ let sync_open_orders
         then (
           add_tracked_order_id state oid;
           Sell_orders.push state.open_sell_orders oid price qty;
+          Hashtbl.replace state.feed_sell_index oid (price, qty);
           (* A snapshot lists each order id at most once, so accumulate directly;
              [upsert_sell_commitment] flips [sc_listed] for the reconcile below. *)
           feed_total := !feed_total +. qty;
@@ -497,77 +723,81 @@ let sync_open_orders
              adopted straight from the feed (no prior local arm) is entered here so it is
              reserved from now on. *)
           upsert_sell_commitment ~state ~id:oid ~price ~qty ~seen:true ~acked:true;
-          match !closest_sell_order with
-          | None -> closest_sell_order := Some (oid, price)
-          | Some (_, best_p) ->
-            if price < best_p then closest_sell_order := Some (oid, price)));
+          if Float.is_nan !closest_sell_price || price < !closest_sell_price
+          then (
+            closest_sell_id := oid;
+            closest_sell_price := price)));
     state.time_sync_scan_ns <- Monotonic_clock.now_ns () - t_scan_start;
-    (* Rebuild the persisted ladder from the feed deterministically: one rung per price
-       (within the same tolerance the matcher uses), its qty the live order qty at that
-       price; levels with no live order keep their recorded (missing) qty; feed prices
-       absent from the ladder are adopted. The per-price qty is the MAX across order ids
-       so an Alpaca amend (cancel+replace) window - which transiently lists the old id and
-       its replacement at the same price - or a historical duplicate cannot flap the
-       recorded qty. Replacing the old per-order 1-to-1 match/adopt is what removes the
-       SMH/REMX "Updated ... -> ..." / "Adopted ..." churn: with two ids at one price the
-       old code consumed the single level with the first id and re-adopted the second
-       every scan. *)
-    if ecfg.remaintain_expired_sells
-       && persisted_rebuild_needed
-            ~feed:state.open_sell_orders
-            state.persisted_sell_levels
-    then (
-      let feed = Sell_orders.to_list state.open_sell_orders in
-      let live_qty_at p =
-        List.fold_left
-          (fun acc (_, fp, fq) ->
-            if fq > acc && price_within_tolerance ~reference:p fp then fq else acc)
-          0.0
-          feed
-      in
-      let base =
-        List.map
-          (fun (p, recorded_q) ->
-            let live_q = live_qty_at p in
-            if live_q > 0.0 then p, live_q else p, recorded_q)
-          (dedupe_persisted_sell_levels state.persisted_sell_levels)
-      in
-      (* Adopt feed orders whose price is not already represented, deduped within
-         tolerance by the running accumulated list. *)
-      let rebuilt_rev =
-        List.fold_left
-          (fun acc (_, fp, fq) ->
-            if fq > 0.0
-               && not
-                    (List.exists
-                       (fun (p, _) -> price_within_tolerance ~reference:p fp)
-                       acc)
-            then (fp, fq) :: acc
-            else acc)
-          (List.rev base)
-          feed
-      in
-      let rebuilt = List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) rebuilt_rev in
-      if rebuilt <> state.persisted_sell_levels
-      then (
-        state.persisted_sell_levels <- rebuilt;
-        state.persistence_dirty <- true;
-        Logging.debug_f
-          ~section
-          "Persisted sell ladder for %s rebuilt from feed: %d level(s)"
-          asset.symbol
-          (List.length rebuilt)));
     state.cached_feed_total <- !feed_total;
     state.cached_open_buy_count <- !open_buy_count_from_scan;
     state.cached_has_recent_amend_buy <- !has_recent_amend_buy;
     state.cached_locked_in_buys <- !locked_in_buys;
-    state.cached_closest_sell_order <- !closest_sell_order;
-    (* Only venues that can take the generation skip read this cache; Alpaca (remaintain)
-       rescans every cycle, so skip the snapshot there. *)
-    if not ecfg.remaintain_expired_sells
-    then Sell_orders.blit ~src:state.open_sell_orders ~dst:state.cached_feed_sell_orders;
+    state.cached_closest_sell_order
+    <- (if !closest_sell_id = ""
+        then None
+        else Some (!closest_sell_id, !closest_sell_price));
+    (* Snapshot the feed sells for the generation-skip path. Kept for every venue: a
+       remaintain venue skips on an unchanged generation just like the others, and the
+       persisted rebuild reads [open_sell_orders] (blitted from here on a skip). *)
+    Sell_orders.blit ~src:state.open_sell_orders ~dst:state.cached_feed_sell_orders;
+    state.cached_best_buy_id <- !best_buy_id;
+    state.cached_best_buy_price <- !best_buy_price;
+    state.feed_index_valid <- true;
     state.open_orders_scan_generation <- generation;
     state.open_orders_scan_valid <- true);
+  (* Rebuild the persisted ladder from the feed deterministically: one rung per price
+     (within the same tolerance the matcher uses), its qty the live order qty at that
+     price; levels with no live order keep their recorded (missing) qty; feed prices
+     absent from the ladder are adopted. The per-price qty is the MAX across order ids so
+     an Alpaca amend (cancel+replace) window - which transiently lists the old id and its
+     replacement at the same price - or a historical duplicate cannot flap the recorded
+     qty. Replacing the old per-order 1-to-1 match/adopt is what removes the SMH/REMX
+     "Updated ... -> ..." / "Adopted ..." churn: with two ids at one price the old code
+     consumed the single level with the first id and re-adopted the second every scan.
+     Runs on the incremental path too (the [remaintain_expired_sells] venue's ladder must
+     track the feed's live prices between snapshots), hence outside the scan branches. *)
+  if (not can_skip)
+     && ecfg.remaintain_expired_sells
+     && persisted_rebuild_needed ~feed:state.open_sell_orders state.persisted_sell_levels
+  then (
+    let feed = Sell_orders.to_list state.open_sell_orders in
+    let live_qty_at p =
+      List.fold_left
+        (fun acc (_, fp, fq) ->
+          if fq > acc && price_within_tolerance ~reference:p fp then fq else acc)
+        0.0
+        feed
+    in
+    let base =
+      List.map
+        (fun (p, recorded_q) ->
+          let live_q = live_qty_at p in
+          if live_q > 0.0 then p, live_q else p, recorded_q)
+        (dedupe_persisted_sell_levels state.persisted_sell_levels)
+    in
+    (* Adopt feed orders whose price is not already represented, deduped within tolerance
+       by the running accumulated list. *)
+    let rebuilt_rev =
+      List.fold_left
+        (fun acc (_, fp, fq) ->
+          if fq > 0.0
+             && not
+                  (List.exists (fun (p, _) -> price_within_tolerance ~reference:p fp) acc)
+          then (fp, fq) :: acc
+          else acc)
+        (List.rev base)
+        feed
+    in
+    let rebuilt = List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) rebuilt_rev in
+    if rebuilt <> state.persisted_sell_levels
+    then (
+      state.persisted_sell_levels <- rebuilt;
+      state.persistence_dirty <- true;
+      Logging.debug_f
+        ~section
+        "Persisted sell ladder for %s rebuilt from feed: %d level(s)"
+        asset.symbol
+        (List.length rebuilt)));
   let t_rec_start = Monotonic_clock.now_ns () in
   (* Reconcile the in-flight sell ledger with this scan's feed. The feed refreshes an
      order's remaining qty while it lists it. What an absence means is venue-specific (see
@@ -584,28 +814,20 @@ let sync_open_orders
        back into [open_sell_orders] so the buy leg's wash-trade and 2*gi clamps still see
        them. [locked_in_sells] is then the ledger total. *)
   let trust_feed = ecfg.hold_netted_from_venue_state in
-  (* [upsert_sell_commitment] already refreshed every feed-listed commitment during the
-     scan, so the reconcile below only changes the ledger when a commitment absent from
-     the feed must be dropped (trust_feed venue) or has aged out of the dispatch window.
-     Rebuilding the whole list otherwise just re-allocates an identical set of 6-tuples on
-     every execution. The no-alloc guard scan decides; the rebuild path preserves the
-     original side effects, while the no-rebuild path still re-adds local-only commitments
-     to [open_sell_orders] (feed-listed ones were consed during the scan). *)
-  let commitment_needs_rebuild =
-    Hashtbl.fold
-      (fun _id c acc ->
-        acc
-        ||
-        if c.sc_listed
-        then false
-        else if c.sc_seen || c.sc_acked
-        then trust_feed
-        else now_time -. c.sc_armed > sell_commitment_in_flight_timeout_s)
-      state.sell_commitments
-      false
-  in
-  if commitment_needs_rebuild
-  then (
+  (* A cache-hit cycle whose ledger is fully feed-listed has nothing to reconcile:
+     [open_sell_orders] was just blitted from the cache (the feed's sells) and every
+     commitment is listed, so no local-only entry is missing and none is stale. Skip the
+     O(commitments) walk entirely. Otherwise one walk both pushes unlisted local-only
+     commitments back into [open_sell_orders] (so the buy leg's wash-trade / 2*gi clamps
+     still see them) and drops the commitments the feed no longer lists (trust_feed venue)
+     or that aged out of the dispatch window, then records whether any unlisted commitment
+     remains. This is the union of the previous "needs rebuild" and no-op paths: the old
+     guard scan short- circuited on the first unlisted commitment, so both paths together
+     already visited exactly these cases. *)
+  if state.sell_commitments_clean
+  then ()
+  else (
+    let any_unlisted = ref false in
     let to_remove = ref [] in
     Hashtbl.iter
       (fun id c ->
@@ -614,23 +836,20 @@ let sync_open_orders
           (* [upsert_sell_commitment] already wrote the feed's live price/qty onto this
              commitment during the scan, so the stored values are the feed values. *)
           ()
-        else if c.sc_seen || c.sc_acked
-        then
-          if trust_feed
-          then to_remove := id :: !to_remove
-          else Sell_orders.push state.open_sell_orders id c.sc_price c.sc_qty
-        else if now_time -. c.sc_armed <= sell_commitment_in_flight_timeout_s
-        then Sell_orders.push state.open_sell_orders id c.sc_price c.sc_qty
-        else to_remove := id :: !to_remove)
+        else (
+          any_unlisted := true;
+          if c.sc_seen || c.sc_acked
+          then
+            if trust_feed
+            then to_remove := id :: !to_remove
+            else Sell_orders.push state.open_sell_orders id c.sc_price c.sc_qty
+          else if now_time -. c.sc_armed <= sell_commitment_in_flight_timeout_s
+          then Sell_orders.push state.open_sell_orders id c.sc_price c.sc_qty
+          else to_remove := id :: !to_remove))
       state.sell_commitments;
-    List.iter (Hashtbl.remove state.sell_commitments) !to_remove)
-  else
-    Hashtbl.iter
-      (fun id c ->
-        if c.sc_listed
-        then ()
-        else Sell_orders.push state.open_sell_orders id c.sc_price c.sc_qty)
-      state.sell_commitments;
+    List.iter (Hashtbl.remove state.sell_commitments) !to_remove;
+    if !to_remove <> [] then state.sell_commitments_gen <- state.sell_commitments_gen + 1;
+    state.sell_commitments_clean <- not !any_unlisted);
   state.time_sync_rec_ns <- Monotonic_clock.now_ns () - t_rec_start;
   state.feed_locked_sell_base <- !feed_total;
   locked_in_sells := committed_sell_base state;
@@ -676,9 +895,10 @@ let sync_open_orders
   else if (not state.inflight_cancel_buy)
           && (not state.inflight_buy)
           && not state.inflight_amend_buy
-  then (
-    match !best_buy_id with
-    | Some best_order_id ->
+  then
+    if !best_buy_id <> ""
+    then (
+      let best_order_id = !best_buy_id in
       let best_price = !best_buy_price in
       let recent_amend =
         match Hashtbl.find_opt state.amend_cooldowns best_order_id with
@@ -691,8 +911,7 @@ let sync_open_orders
         state.last_buy_order_price <- Some best_price;
         state.last_buy_order_id <- Some best_order_id;
         state.tif_recovery_pending <- false;
-        set_asset_reserved_quote state (best_price *. lot_qty))
-    | None -> ());
+        set_asset_reserved_quote state (best_price *. lot_qty)));
   (* Split the persisted ladder into open/missing by whether a live order rests at each
      rung's price (within the matcher tolerance). The rebuild above already collapsed the
      list to one entry per price, so a membership partition is exact (no per-price count
@@ -737,7 +956,7 @@ let sync_open_orders
   , !has_recent_amend_buy
   , !locked_in_buys
   , !locked_in_sells
-  , !closest_sell_order
+  , (if !closest_sell_id = "" then None else Some (!closest_sell_id, !closest_sell_price))
   , open_persisted_levels
   , missing_persisted_levels )
 ;;

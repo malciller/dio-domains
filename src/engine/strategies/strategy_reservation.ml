@@ -130,37 +130,55 @@ let has_active_sell state =
     until its terminal event. *)
 let sell_commitment_in_flight_timeout_s = 120.0
 
+(** Bumps the commitment generation, invalidating the [committed_sell_base] fold cache.
+    Called on every [sell_commitments] mutation. *)
+let[@inline] touch_commitments state =
+  state.sell_commitments_gen <- state.sell_commitments_gen + 1
+;;
+
 (** Inserts or updates a commitment, preserving the earliest arm time. Id-keyed hashtable:
     [sync_open_orders] calls this once per open sell per execution with the feed's live
     price/qty and seen=acked=true; lookup/update is O(1) and a steady-state no-op writes
     nothing. *)
 let upsert_sell_commitment ~state ~id ~price ~qty ~seen ~acked =
-  match Hashtbl.find_opt state.sell_commitments id with
-  | Some c ->
-    let changed =
-      c.sc_price <> price
-      || c.sc_qty <> qty
-      || (seen && not c.sc_seen)
-      || (acked && not c.sc_acked)
-    in
-    if changed
-    then (
-      c.sc_price <- price;
-      c.sc_qty <- qty;
-      c.sc_seen <- c.sc_seen || seen;
-      c.sc_acked <- c.sc_acked || acked);
-    if seen then c.sc_listed <- true
-  | None ->
-    Hashtbl.replace
-      state.sell_commitments
-      id
-      { sc_price = price
-      ; sc_qty = qty
-      ; sc_seen = seen
-      ; sc_acked = acked
-      ; sc_listed = seen
-      ; sc_armed = Unix.gettimeofday ()
-      }
+  let dirty =
+    match Hashtbl.find_opt state.sell_commitments id with
+    | Some c ->
+      let changed =
+        c.sc_price <> price
+        || c.sc_qty <> qty
+        || (seen && not c.sc_seen)
+        || (acked && not c.sc_acked)
+      in
+      if changed
+      then (
+        c.sc_price <- price;
+        c.sc_qty <- qty;
+        c.sc_seen <- c.sc_seen || seen;
+        c.sc_acked <- c.sc_acked || acked);
+      if seen then c.sc_listed <- true;
+      changed
+    | None ->
+      Hashtbl.replace
+        state.sell_commitments
+        id
+        { sc_price = price
+        ; sc_qty = qty
+        ; sc_seen = seen
+        ; sc_acked = acked
+        ; sc_listed = seen
+        ; sc_armed = Unix.gettimeofday ()
+        };
+      true
+  in
+  (* A locally-armed (unseen) commitment is unlisted until a scan adopts it, so the
+     reconcile in [sync_open_orders] must run. Invalidate the skip flag; a full scan
+     re-proves it. *)
+  if not seen then state.sell_commitments_clean <- false;
+  (* Only invalidate the [committed_sell_base] cache when the sum could have changed. A
+     steady-state delta re-reports the same price/qty for a resting sell; bumping the
+     generation unconditionally forced that O(commitments) fold on every delta cycle. *)
+  if dirty then touch_commitments state
 ;;
 
 (** Records a just-dispatched sell (keyed by its temporary pending id). *)
@@ -194,11 +212,15 @@ let rekey_sell_commitment ~state ~old_id ~new_id ~price ~qty ~acked =
       c.sc_qty <- (if q > 0.0 then q else c.sc_qty);
       c.sc_acked <- c.sc_acked || acked;
       Hashtbl.replace state.sell_commitments new_id c
-    | None -> upsert_sell_commitment ~state ~id:new_id ~price ~qty:q ~seen:false ~acked)
+    | None -> upsert_sell_commitment ~state ~id:new_id ~price ~qty:q ~seen:false ~acked);
+  touch_commitments state
 ;;
 
 (** Terminal event: the sell no longer holds base. *)
-let remove_sell_commitment ~state ~id = Hashtbl.remove state.sell_commitments id
+let remove_sell_commitment ~state ~id =
+  Hashtbl.remove state.sell_commitments id;
+  touch_commitments state
+;;
 
 (** Terminal event for a placement that never got a venue id. *)
 let remove_pending_sell_commitments ~state =
@@ -209,12 +231,20 @@ let remove_pending_sell_commitments ~state =
       state.sell_commitments
       []
   in
-  List.iter (Hashtbl.remove state.sell_commitments) pending
+  List.iter (Hashtbl.remove state.sell_commitments) pending;
+  if pending <> [] then touch_commitments state
 ;;
 
-(** Total base committed to live sells (the ledger). *)
+(** Total base committed to live sells (the ledger). Cached across calls; the fold is
+    O(commitments) and this is read several times per cycle. *)
 let committed_sell_base state =
-  Hashtbl.fold (fun _ c acc -> acc +. c.sc_qty) state.sell_commitments 0.0
+  if state.committed_sell_base_gen = state.sell_commitments_gen
+  then state.committed_sell_base_cache
+  else (
+    let t = Hashtbl.fold (fun _ c acc -> acc +. c.sc_qty) state.sell_commitments 0.0 in
+    state.committed_sell_base_cache <- t;
+    state.committed_sell_base_gen <- state.sell_commitments_gen;
+    t)
 ;;
 
 (* Moved to Platform_accounting (milestone 2). *)

@@ -76,14 +76,39 @@ type t =
   ; mutable window_start : float (* Unix time the current window began. *)
   ; published : snapshot option Atomic.t (* Last completed window snapshot. *)
   ; mutex : Mutex.t (* Guards snapshot_and_reset against reset races. *)
+  ; rolling : int
+      (* Number of recent windows retained for the published aggregate; 0 disables rolling
+         and restores per-window behavior. *)
+  ; ring_buckets : int array array (* Per-window copies of the coarse tier. *)
+  ; ring_us : int array array
+  ; ring_ns : int array array
+  ; ring_samples : int array
+  ; ring_sub_us : int array
+  ; ring_overflow : int array
+  ; ring_max_ns : int array
+  ; ring_cause : string option array
+  ; mutable ring_idx : int (* Next ring slot to overwrite. *)
+  ; mutable ring_filled : int (* Number of valid ring slots (<= rolling). *)
+  ; (* Running union of the ring, updated incrementally (evict oldest, add current) so a
+       snapshot is O(buckets) and allocation-free instead of summing all N windows. *)
+    mutable sum_samples : int
+  ; mutable sum_sub_us : int
+  ; mutable sum_overflow : int
+  ; sum_buckets : int array
+  ; sum_us : int array
+  ; sum_ns : int array
   }
 
-(** [create ?bucket_us ?max_latency_us name] allocates a profiler with
+(** [create ?bucket_us ?max_latency_us ?rolling_windows name] allocates a profiler with
     [max_latency_us / bucket_us] coarse buckets, a fine tier of [bucket_us - 1] one-us
-    buckets, and a 1000-bucket nanosecond tier, all zeroed. *)
-let create ?(bucket_us = 1) ?(max_latency_us = 10_000) name =
+    buckets, and a 1000-bucket nanosecond tier, all zeroed. [rolling_windows] > 1 keeps
+    the last N completed windows and publishes percentiles over their union, so a low-rate
+    symbol's p50/p99 does not swing on a handful of samples; the default 0 publishes each
+    window on its own. *)
+let create ?(bucket_us = 1) ?(max_latency_us = 10_000) ?(rolling_windows = 0) name =
   let count = max_latency_us / bucket_us in
   let us_count = max 0 (bucket_us - 1) in
+  let rolling = max 0 rolling_windows in
   { name
   ; buckets = Array.make count 0
   ; us_buckets = Array.make us_count 0
@@ -101,6 +126,23 @@ let create ?(bucket_us = 1) ?(max_latency_us = 10_000) name =
   ; window_start = Unix.gettimeofday ()
   ; published = Atomic.make None
   ; mutex = Mutex.create ()
+  ; rolling
+  ; ring_buckets = Array.init rolling (fun _ -> Array.make count 0)
+  ; ring_us = Array.init rolling (fun _ -> Array.make us_count 0)
+  ; ring_ns = Array.init rolling (fun _ -> Array.make ns_bucket_count 0)
+  ; ring_samples = Array.make rolling 0
+  ; ring_sub_us = Array.make rolling 0
+  ; ring_overflow = Array.make rolling 0
+  ; ring_max_ns = Array.make rolling 0
+  ; ring_cause = Array.make rolling None
+  ; ring_idx = 0
+  ; ring_filled = 0
+  ; sum_samples = 0
+  ; sum_sub_us = 0
+  ; sum_overflow = 0
+  ; sum_buckets = Array.make count 0
+  ; sum_us = Array.make us_count 0
+  ; sum_ns = Array.make ns_bucket_count 0
   }
 ;;
 
@@ -264,13 +306,11 @@ let percentile t p =
         float (!k * t.bucket_us))))
 ;;
 
-(** [percentiles5 t] computes p50/p90/p95/p99/p999 in a single cumulative pass instead of
-    five scans (oracle profilers are 60k-100k buckets, where five scans cost ~0.5-5ms per
-    window). Scans the nanosecond tier, then the fine microsecond tier, then the coarse
-    buckets, capturing each target when its cumulative count is crossed. Sub-microsecond
-    percentiles are fractions of a microsecond (e.g. 0.5 = 500ns). *)
-let percentiles5 t =
-  if t.samples = 0
+(** [percentiles5_arrays ~bucket_us ~ns ~us ~coarse ~samples] computes p50/p90/p95/p99/
+    p999 in a single cumulative pass over three tier arrays. Shared by the live window and
+    the rolling union so both report identical statistics. *)
+let percentiles5_arrays ~bucket_us ~ns ~us ~coarse ~samples =
+  if samples = 0
   then 0.0, 0.0, 0.0, 0.0, 0.0
   else (
     let fracs = [| 0.50; 0.90; 0.95; 0.99; 0.999 |] in
@@ -283,7 +323,7 @@ let percentiles5 t =
       if !remaining > 0
       then
         for k = 0 to 4 do
-          if vals.(k) < 0.0 && float !cumulative >= ceil (float t.samples *. fracs.(k))
+          if vals.(k) < 0.0 && float !cumulative >= ceil (float samples *. fracs.(k))
           then (
             vals.(k) <- v;
             decr remaining)
@@ -291,26 +331,36 @@ let percentiles5 t =
     in
     (* Nanosecond tier (0..999ns → 0.0..0.999 microseconds). *)
     let i = ref 0 in
-    while !i < ns_bucket_count && !remaining > 0 do
-      cumulative := !cumulative + t.ns_buckets.(!i);
+    while !i < Array.length ns && !remaining > 0 do
+      cumulative := !cumulative + ns.(!i);
       capture (float !i /. 1000.0);
       incr i
     done;
     (* Fine microsecond tier ((j+1)us, 1us resolution). *)
     let j = ref 0 in
-    while !j < t.us_bucket_count && !remaining > 0 do
-      cumulative := !cumulative + t.us_buckets.(!j);
+    while !j < Array.length us && !remaining > 0 do
+      cumulative := !cumulative + us.(!j);
       capture (float (!j + 1));
       incr j
     done;
     (* Coarse microsecond tier. *)
     let k = ref 0 in
-    while !k < t.bucket_count && !remaining > 0 do
-      cumulative := !cumulative + t.buckets.(!k);
-      capture (float (!k * t.bucket_us));
+    while !k < Array.length coarse && !remaining > 0 do
+      cumulative := !cumulative + coarse.(!k);
+      capture (float (!k * bucket_us));
       incr k
     done;
     vals.(0), vals.(1), vals.(2), vals.(3), vals.(4))
+;;
+
+(** [percentiles5 t] computes the live window's percentiles. *)
+let percentiles5 t =
+  percentiles5_arrays
+    ~bucket_us:t.bucket_us
+    ~ns:t.ns_buckets
+    ~us:t.us_buckets
+    ~coarse:t.buckets
+    ~samples:t.samples
 ;;
 
 (** [reset t] zeroes all three histogram tiers and the sample/overflow and activity
@@ -329,12 +379,12 @@ let reset t =
   t.last_exec_time <- 0.0
 ;;
 
-(** [count_above t threshold_us] returns the number of live-histogram samples at or above
-    [threshold_us]. The nanosecond tier is exact; the fine tier is exact to its
-    microsecond bucket; a coarse bucket counts when its lower edge reaches the threshold,
-    so a spike at the ceiling is not missed to bucket rounding. Used for per-window spike
-    counts. Non-finite thresholds return 0. *)
-let count_above t threshold_us =
+(** [count_above_arrays ~bucket_us ~ns ~us ~coarse threshold_us] returns the number of
+    samples at or above [threshold_us] across three tier arrays. The nanosecond tier is
+    exact; the fine tier is exact to its microsecond bucket; a coarse bucket counts when
+    its lower edge reaches the threshold, so a spike at the ceiling is not missed to
+    bucket rounding. Non-finite thresholds return 0. *)
+let count_above_arrays ~bucket_us ~ns ~us ~coarse threshold_us =
   if not (Float.is_finite threshold_us)
   then 0
   else (
@@ -347,24 +397,34 @@ let count_above t threshold_us =
       then 0
       else max 0 (int_of_float (ceil (threshold_us *. 1000.0)))
     in
-    for i = start_ns to ns_bucket_count - 1 do
-      count := !count + t.ns_buckets.(i)
+    for i = start_ns to Array.length ns - 1 do
+      count := !count + ns.(i)
     done;
     let start_us =
       if threshold_us <= 1.0 then 0 else max 0 (int_of_float (ceil threshold_us) - 1)
     in
-    for j = start_us to t.us_bucket_count - 1 do
-      count := !count + t.us_buckets.(j)
+    for j = start_us to Array.length us - 1 do
+      count := !count + us.(j)
     done;
     let start_k =
       if threshold_us <= 0.0
       then 0
-      else max 0 (int_of_float (ceil (threshold_us /. float t.bucket_us)))
+      else max 0 (int_of_float (ceil (threshold_us /. float bucket_us)))
     in
-    for k = start_k to t.bucket_count - 1 do
-      count := !count + t.buckets.(k)
+    for k = start_k to Array.length coarse - 1 do
+      count := !count + coarse.(k)
     done;
     !count)
+;;
+
+(** [count_above t threshold_us] counts live-window samples at or above [threshold_us]. *)
+let count_above t threshold_us =
+  count_above_arrays
+    ~bucket_us:t.bucket_us
+    ~ns:t.ns_buckets
+    ~us:t.us_buckets
+    ~coarse:t.buckets
+    threshold_us
 ;;
 
 (** [snapshot_and_reset ?spike_threshold_us t] computes the current window's percentiles,
@@ -378,49 +438,109 @@ let snapshot_and_reset ?(spike_threshold_us = infinity) t =
   let now = Unix.gettimeofday () in
   Mutex.lock t.mutex;
   let window_start = t.window_start in
-  let over_threshold =
-    if Float.is_finite spike_threshold_us then count_above t spike_threshold_us else 0
-  in
-  let max_us = float t.max_latency_ns /. 1000.0 in
-  let snap =
-    if t.samples = 0
-    then
-      { name = t.name
-      ; p50 = 0.0
-      ; p90 = 0.0
-      ; p95 = 0.0
-      ; p99 = 0.0
-      ; p999 = 0.0
-      ; samples = 0
-      ; sub_us_samples = 0
-      ; overflow = 0
-      ; max_us = 0.0
-      ; over_threshold = 0
-      ; max_cause = None
-      ; executions = t.executions
-      ; last_exec_time = t.last_exec_time
-      ; window_start
-      ; window_end = now
-      }
+  (* Rolling: fold the just-finished window into the ring and report the union of the
+     retained windows, so a low-rate symbol's percentiles rest on more than a handful of
+     samples. Non-rolling: report the window alone. *)
+  let samples, sub_us_samples, overflow, max_latency_ns, max_cause, over_threshold, pcts =
+    if t.rolling > 0
+    then (
+      let idx = t.ring_idx in
+      (* Update the running union incrementally: for each bucket subtract the evicted
+         window's value, overwrite the ring slot with the current window, then add it
+         back. O(buckets) and allocation-free, versus re-summing all N windows into fresh
+         arrays every snapshot. *)
+      let rb = t.ring_buckets.(idx) in
+      for i = 0 to t.bucket_count - 1 do
+        let old = rb.(i) in
+        let cur = t.buckets.(i) in
+        rb.(i) <- cur;
+        t.sum_buckets.(i) <- t.sum_buckets.(i) - old + cur
+      done;
+      let ru = t.ring_us.(idx) in
+      for i = 0 to t.us_bucket_count - 1 do
+        let old = ru.(i) in
+        let cur = t.us_buckets.(i) in
+        ru.(i) <- cur;
+        t.sum_us.(i) <- t.sum_us.(i) - old + cur
+      done;
+      let rn = t.ring_ns.(idx) in
+      for i = 0 to ns_bucket_count - 1 do
+        let old = rn.(i) in
+        let cur = t.ns_buckets.(i) in
+        rn.(i) <- cur;
+        t.sum_ns.(i) <- t.sum_ns.(i) - old + cur
+      done;
+      t.sum_samples <- t.sum_samples - t.ring_samples.(idx) + t.samples;
+      t.sum_sub_us <- t.sum_sub_us - t.ring_sub_us.(idx) + t.sub_us_samples;
+      t.sum_overflow <- t.sum_overflow - t.ring_overflow.(idx) + t.overflow;
+      t.ring_samples.(idx) <- t.samples;
+      t.ring_sub_us.(idx) <- t.sub_us_samples;
+      t.ring_overflow.(idx) <- t.overflow;
+      t.ring_max_ns.(idx) <- t.max_latency_ns;
+      t.ring_cause.(idx) <- t.max_cause;
+      let filled = min t.rolling (t.ring_filled + 1) in
+      t.ring_filled <- filled;
+      t.ring_idx <- (idx + 1) mod t.rolling;
+      (* Max/cause cannot be maintained incrementally under eviction, so scan the (small)
+         ring for the current maximum. *)
+      let maxns = ref 0
+      and cause = ref None in
+      for k = 0 to filled - 1 do
+        if t.ring_max_ns.(k) > !maxns
+        then (
+          maxns := t.ring_max_ns.(k);
+          cause := t.ring_cause.(k))
+      done;
+      (* Spike-breaker counts and [samples] stay per-window so a single spike alarms once
+         (not for the K windows it remains in the rolling union); percentiles report the
+         union. *)
+      let over_threshold =
+        if Float.is_finite spike_threshold_us then count_above t spike_threshold_us else 0
+      in
+      ( t.samples
+      , t.sub_us_samples
+      , t.overflow
+      , !maxns
+      , !cause
+      , over_threshold
+      , percentiles5_arrays
+          ~bucket_us:t.bucket_us
+          ~ns:t.sum_ns
+          ~us:t.sum_us
+          ~coarse:t.sum_buckets
+          ~samples:t.sum_samples ))
     else (
-      let p50, p90, p95, p99, p999 = percentiles5 t in
-      { name = t.name
-      ; p50
-      ; p90
-      ; p95
-      ; p99
-      ; p999
-      ; samples = t.samples
-      ; sub_us_samples = t.sub_us_samples
-      ; overflow = t.overflow
-      ; max_us
-      ; over_threshold
-      ; max_cause = t.max_cause
-      ; executions = t.executions
-      ; last_exec_time = t.last_exec_time
-      ; window_start
-      ; window_end = now
-      })
+      let over_threshold =
+        if Float.is_finite spike_threshold_us then count_above t spike_threshold_us else 0
+      in
+      ( t.samples
+      , t.sub_us_samples
+      , t.overflow
+      , t.max_latency_ns
+      , t.max_cause
+      , over_threshold
+      , percentiles5 t ))
+  in
+  let p50, p90, p95, p99, p999 = pcts in
+  let max_us = float max_latency_ns /. 1000.0 in
+  let snap =
+    { name = t.name
+    ; p50
+    ; p90
+    ; p95
+    ; p99
+    ; p999
+    ; samples
+    ; sub_us_samples
+    ; overflow
+    ; max_us
+    ; over_threshold
+    ; max_cause
+    ; executions = t.executions
+    ; last_exec_time = t.last_exec_time
+    ; window_start
+    ; window_end = now
+    }
   in
   Atomic.set t.published (Some snap);
   reset t;

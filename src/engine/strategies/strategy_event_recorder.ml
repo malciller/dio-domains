@@ -37,6 +37,10 @@ let record_emitted_if_active e =
   | None -> ()
 ;;
 
+(** True when a recorder is registered for [symbol]. Callers on the dispatch path use this
+    to avoid building the observation record at all when tracing is off (the common case). *)
+let is_active symbol = Hashtbl.mem active_by_symbol symbol
+
 (** Record an order-lifecycle event against the recorder registered for [symbol]. *)
 let record_event_if_active symbol (e : Strategy_trace.event_obs) =
   match Hashtbl.find_opt active_by_symbol symbol with

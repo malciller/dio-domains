@@ -653,6 +653,17 @@ let apply_gc_config () =
   | None -> ()
   | Some gc ->
     let ctrl = Gc.get () in
+    Logging.info_f
+      ~section
+      "GC config requested: minor_heap_size=%d words (%d MB) space_overhead=%d \
+       max_overhead=%d window_size=%d allocation_policy=%d major_heap_increment=%d"
+      gc.minor_heap_size
+      (gc.minor_heap_size * 8 / 1_048_576)
+      gc.space_overhead
+      gc.max_overhead
+      gc.window_size
+      gc.allocation_policy
+      gc.major_heap_increment;
     Gc.set
       { ctrl with
         minor_heap_size = gc.minor_heap_size
@@ -661,5 +672,45 @@ let apply_gc_config () =
       ; window_size = gc.window_size
       ; allocation_policy = gc.allocation_policy
       ; major_heap_increment = gc.major_heap_increment
-      }
+      };
+    (* Log the values the runtime actually applied. The runtime may silently clamp any
+       field (on OxCaml [window_size] and [allocation_policy] are ignored), and a large or
+       small minor heap changes pause frequency/duration, so report every requested-vs-
+       applied difference rather than only [minor_heap_size]. *)
+    let eff = Gc.get () in
+    let clamp_note =
+      let diffs =
+        List.filter_map
+          (fun (name, requested, applied) ->
+            if requested = applied
+            then None
+            else Some (Printf.sprintf "%s requested %d applied %d" name requested applied))
+          [ "minor_heap_size", gc.minor_heap_size, eff.minor_heap_size
+          ; "space_overhead", gc.space_overhead, eff.space_overhead
+          ; "max_overhead", gc.max_overhead, eff.max_overhead
+          ; "window_size", gc.window_size, eff.window_size
+          ; "allocation_policy", gc.allocation_policy, eff.allocation_policy
+          ; "major_heap_increment", gc.major_heap_increment, eff.major_heap_increment
+          ]
+      in
+      match diffs with
+      | [] -> ""
+      | l -> " [runtime clamp: " ^ String.concat "; " l ^ "]"
+    in
+    Logging.info_f
+      ~section
+      "GC config effective: minor_heap_size=%d words (%d MB) space_overhead=%d \
+       max_overhead=%d window_size=%d allocation_policy=%d major_heap_increment=%d%s"
+      eff.minor_heap_size
+      (eff.minor_heap_size * 8 / 1_048_576)
+      eff.space_overhead
+      eff.max_overhead
+      eff.window_size
+      eff.allocation_policy
+      eff.major_heap_increment
+      clamp_note
 ;;
+
+(* config.json is the single source of truth: expose the applier to the lower-level
+   libraries that spawn domains so they apply it too (see [Gc_config_hook]). *)
+let () = Gc_config.install apply_gc_config

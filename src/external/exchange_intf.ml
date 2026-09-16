@@ -239,12 +239,94 @@ module Types = struct
   ;;
 end
 
+(** The per-cycle hot-path contract.
+
+    A trading system advertised as high-frequency must be O(1) per strategy cycle. Every
+    accessor here is a lock-free [Atomic] snapshot read (or, for
+    {!drain_open_order_changes}, an O(changes) lock-free swap). The strategy cycle may use
+    ONLY these exchange reads; any O(open-orders) or hashing/locking accessor belongs in
+    {!RECONCILE_READS} and must be reached solely from the cold reconcile path (startup,
+    reconnect, or a delta that reported overflow), never per cycle.
+
+    Keep this signature minimal: adding an O(n) or lock-taking accessor here is how the
+    hot-path guarantee silently regresses. *)
+module type HOT_READS = sig
+  (** O(1) lock-free closure for the current orderbook position. *)
+  val get_orderbook_position_fast : symbol:string -> unit -> int
+
+  (** O(1) lock-free closure for top-of-book. *)
+  val get_top_of_book_fast
+    :  symbol:string
+    -> unit
+    -> (float * float * float * float) option
+
+  (** O(1) lock-free closure for the execution ring-buffer position. *)
+  val get_execution_feed_position_fast : symbol:string -> unit -> int
+
+  (** O(1) lock-free closure: has the execution feed received initial data. *)
+  val has_execution_data_fast : symbol:string -> unit -> bool
+
+  (** O(1) lock-free tradeable balance. *)
+  val get_tradeable_balance : asset:string -> float
+
+  (** O(1) lock-free closure for tradeable balance. *)
+  val get_tradeable_balance_fast : asset:string -> unit -> float
+
+  (** O(1) lock-free closure for the venue-authoritative sellable quantity. *)
+  val get_available_balance_fast : asset:string -> unit -> float
+
+  (** O(1) lock-free closure for balance-snapshot age. *)
+  val get_balance_age_fast : asset:string -> unit -> float option
+
+  (** O(1) atomic open-orders generation ([-1] = treat as always-changed). *)
+  val get_open_orders_generation : symbol:string -> int
+
+  (** O(changes), lock-free: drain the per-order delta [(changes, overflow)]. [overflow]
+      (or an unsupported venue) is the ONLY condition that licenses a reconcile scan. *)
+  val drain_open_order_changes
+    :  symbol:string
+    -> (string * (float option * float * string * int option) option) list * bool
+end
+
+(** The cold reconcile contract: O(open-orders) reads used to rebuild strategy state at
+    startup, on reconnect, or when {!HOT_READS.drain_open_order_changes} reports overflow.
+    Never invoke these on the steady-state per-cycle path. *)
+module type RECONCILE_READS = sig
+  (** O(n): look up a single order (allocates the [Types.open_order] record). *)
+  val get_open_order : symbol:string -> order_id:string -> Types.open_order option
+
+  (** O(n): all open orders for [symbol]. *)
+  val get_open_orders : symbol:string -> Types.open_order list
+
+  (** O(n): all open orders for [asset]'s pairs. *)
+  val get_all_orders_for_asset : asset:string -> Types.open_order list
+
+  (** O(n): fold over open orders without the intermediate list. *)
+  val fold_open_orders
+    :  symbol:string
+    -> init:'a
+    -> f:('a -> Types.open_order -> 'a)
+    -> 'a
+
+  (** O(n): fast-path iteration over open orders (primitive values, no records). *)
+  val iter_open_orders_fast
+    :  symbol:string
+    -> (string -> float -> float -> string -> int option -> unit)
+    -> unit
+end
+
 (** Module signature every exchange backend satisfies.
 
     Covers order lifecycle operations (place, amend, cancel), synchronous market data
     accessors backed by ring buffers, position-based event feed consumption, balance
-    queries, instrument metadata, and fee retrieval. *)
+    queries, instrument metadata, and fee retrieval.
+
+    The hot-path reads are grouped in {!HOT_READS} and the cold scans in
+    {!RECONCILE_READS}; both are included below so the hot-path contract is explicit. *)
 module type S = sig
+  include HOT_READS
+  include RECONCILE_READS
+
   (** Human-readable exchange name used as the registry key. *)
   val name : string
 
@@ -439,6 +521,16 @@ module type S = sig
       to skip the O(open-orders) [sync_open_orders] scan when nothing has changed since
       the last scan. *)
   val get_open_orders_generation : symbol:string -> int
+
+  (** Drain the per-order change delta for [symbol]: [(changes, overflow)] where [changes]
+      is [(id, snapshot option)] in chronological order, [snapshot] being
+      [(limit_price, remaining_qty, side, order_userref)] for an add/replace and [None]
+      for a removal. [overflow] (or an unsupported venue) means the caller must do a full
+      rescan. Lets the strategy apply an O(changes) delta instead of the O(open-orders)
+      [sync_open_orders] scan. *)
+  val drain_open_order_changes
+    :  symbol:string
+    -> (string * (float option * float * string * int option) option) list * bool
 
   (** Return a fast path closure for fetching the current orderbook position without lock
       acquisition/hash lookup overhead. *)

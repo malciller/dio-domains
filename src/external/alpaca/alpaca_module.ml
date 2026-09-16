@@ -410,7 +410,14 @@ module Alpaca_impl = struct
   (* Account-wide open-orders generation. The grid strategy excludes Alpaca from the
      rescan skip via [remaintain_expired_sells], which needs the persisted GTC-level
      reconcile every cycle. *)
-  let get_open_orders_generation ~symbol:_ = Alpaca_executions.get_orders_generation ()
+  let get_open_orders_generation ~symbol =
+    Alpaca_executions.get_orders_generation_for_symbol symbol
+  ;;
+
+  let drain_open_order_changes ~symbol =
+    Alpaca_executions.drain_open_order_changes ~symbol
+  ;;
+
   let get_price_increment ~symbol:_ = Some 0.01
 
   let get_qty_increment ~symbol:_ =

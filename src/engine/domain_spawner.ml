@@ -19,9 +19,9 @@ module Config_grid_handlers =
 let section = "domain_spawner"
 
 (** Sampling mask for the per-cycle [Gc.quick_stat] capture, which allocates ~24 words and
-    costs ~0.3us. [0] samples every measured cycle so the window-max cycle always carries
-    its GC cause; at single-digit cycles/s per domain the added allocation is negligible. *)
-let gc_sample_mask = 0
+    costs ~0.3us. Sampling every cycle was pure per-cycle overhead on the hot path; sample
+    1-in-64 instead so the GC cause is still attributed when it matters. *)
+let gc_sample_mask = 0x3F
 
 (** Quote-balance age, in seconds, above which a snapshot is not authoritative. Stale
     snapshot: an under-funded buy is still attempted (the exchange's verdict rules). Fresh
@@ -78,15 +78,20 @@ let get_domain_profilers symbol =
     | Some p -> p
     | None ->
       let p =
-        { prof_ob = Latency_profiler.create (symbol ^ ":ob")
+        { prof_ob = Latency_profiler.create ~rolling_windows:8 (symbol ^ ":ob")
         ; prof_exec =
-            Latency_profiler.create ~bucket_us:10 ~max_latency_us:20_000 (symbol ^ ":exec")
-        ; prof_prep = Latency_profiler.create (symbol ^ ":prep")
-        ; prof_strategy = Latency_profiler.create (symbol ^ ":strategy")
+            Latency_profiler.create
+              ~bucket_us:10
+              ~max_latency_us:20_000
+              ~rolling_windows:8
+              (symbol ^ ":exec")
+        ; prof_prep = Latency_profiler.create ~rolling_windows:8 (symbol ^ ":prep")
+        ; prof_strategy = Latency_profiler.create ~rolling_windows:8 (symbol ^ ":strategy")
         ; prof_cycle =
             Latency_profiler.create
               ~bucket_us:10
               ~max_latency_us:20_000
+              ~rolling_windows:8
               (symbol ^ ":cycle")
         }
       in
@@ -475,6 +480,11 @@ let asset_domain_worker
        balance message newer than the placement arrives (venue hold-netting is then
        included). *)
     let base_balance_age_fn = Ex.get_balance_age_fast ~asset:base_asset in
+    (* Quote-balance snapshot age: resolved once (the accessor captures the per-asset
+       store and locks the global balance-store registry at construction), so the
+       per-cycle read is a bare closure call instead of a fresh closure + registry lock
+       every cycle. *)
+    let quote_balance_age_fn = Ex.get_balance_age_fast ~asset:quote_currency in
     (* Cached closures for latency-sensitive feed access in the hot loop *)
     let get_ob_pos_fn = Ex.get_orderbook_position_fast ~symbol:asset_with_fees.symbol in
     let get_tob_fn = Ex.get_top_of_book_fast ~symbol:asset_with_fees.symbol in
@@ -648,6 +658,17 @@ let asset_domain_worker
                   ; "reason", Dio_strategies.Strategy_expr.V_string reason
                   ]))
       | None -> ref_call ()
+    in
+    (* Fine-grained per-cycle instrumentation (phase timers + guard/arg timers +
+       sub-timers) is separate from the outer STRATEGY span recording. It costs ~100
+       [now_ns] calls/cycle plus a closure per action, which measured ~10-15us/cycle live,
+       so it is OFF by default: set [DIO_PROFILE_DETAIL=1] for a diagnostic window when
+       the per-phase breakdown is needed. The outer p50/p99/max and the whole-cycle cause
+       are always recorded. Read once per domain. *)
+    let profile_detail_enabled =
+      match Sys.getenv_opt "DIO_PROFILE_DETAIL" with
+      | Some ("1" | "true" | "on" | "yes") -> true
+      | _ -> false
     in
     while Atomic.get state.is_running do
       let latency_this_cycle = !latency_active in
@@ -1432,7 +1453,7 @@ let asset_domain_worker
            under-funded buy is skipped; a stale snapshot may be wrong, so the grid
            attempts and lets the exchange decide. Unknown age (None) is treated as stale. *)
         let quote_balance_stale =
-          match Ex.get_balance_age_fast ~asset:quote_currency () with
+          match quote_balance_age_fn () with
           | Some age -> age > stale_balance_age_seconds
           | None -> true
         in
@@ -1614,25 +1635,19 @@ let asset_domain_worker
            ctx.cg_base_age <- base_balance_age_fn ();
            ctx.cg_gen <- Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol;
            ctx.cg_iter <- iter_orders;
+           ctx.cg_drain <- Ex.drain_open_order_changes;
            (* Per-cycle phase attribution: reset the scratch fields the fine actions
-              accumulate into, and enable measurement only on sampled latency cycles. *)
+              accumulate into, and enable measurement only on sampled latency cycles (and
+              only when fine instrumentation is on). *)
+           let detail_profile = latency_this_cycle && profile_detail_enabled in
            (match cached_grid_state with
             | Some s ->
-              s.time_preamble_ns <- 0;
-              s.time_cleanup_ns <- 0;
-              s.time_sync_ns <- 0;
-              s.time_buy_ns <- 0;
-              s.time_sell_ns <- 0;
-              s.alloc_sync_words <- 0;
-              s.alloc_buy_words <- 0;
-              s.alloc_sell_words <- 0;
-              s.alloc_cleanup_words <- 0;
-              s.alloc_preamble_words <- 0;
-              s.alloc_facts_words <- 0;
-              s.time_facts_ns <- 0;
-              s.sync_orders_seen <- 0
+              Dio_strategies.Strategy_state.reset_phase_metrics
+                ~profiling:detail_profile
+                s
             | None -> ());
-           ctx.cg_profile <- latency_this_cycle;
+           ctx.cg_profile <- detail_profile;
+           rt.prof_enabled <- detail_profile;
            Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
              ignore
                (Dio_strategies.Strategy_runtime.run_cycle
@@ -1745,11 +1760,18 @@ let asset_domain_worker
           Latency_profiler.record_ns prof_exec exec_per_event_ns
         done;
       (* Flush deferred accumulation persistence outside the strategy hot path; file I/O
-         only when the dirty flag was set during execute_strategy. *)
+         only when the dirty flag was set during execute_strategy. Gate on the cached
+         state ref so a clean cycle does not pay [get_strategy_state]'s registry lock +
+         string lookup every cycle; [flush_persistence] re-checks the flag under the
+         mutex. *)
       if should_execute
       then
         if is_grid_strategy
-        then Dio_strategies.Strategy_api.Strategy.flush_persistence asset_with_fees.symbol;
+        then (
+          match cached_grid_state with
+          | Some s when s.Dio_strategies.Strategy_state.persistence_dirty ->
+            Dio_strategies.Strategy_api.Strategy.flush_persistence asset_with_fees.symbol
+          | _ -> ());
       (* Records active cycle work time before blocking, excluding
          Exchange_wakeup.wait_since sleep. Only busy cycles are recorded; idle wakeups
          would pin cycle p50/p99 at 0us. *)
@@ -1800,6 +1822,22 @@ let asset_domain_worker
             match cached_grid_state with
             | Some cs when should_execute ->
               let us ns = Latency_profiler.format_us (float ns /. 1000.0) in
+              (* Interpreter attribution from the runtime: wall time in guard and action
+                 argument evaluation, plus thread-CPU of the whole interpreter call. If
+                 [cpu] << the STRATEGY sample, the span is waiting (lock/scheduling), not
+                 doing strategy work. *)
+              let interp =
+                match config_grid with
+                | Some (_, rt) ->
+                  Printf.sprintf
+                    " interp[wall=%s guard=%s args=%s cpu=%s miss=%d]"
+                    (us (t4 - !t3_strategy))
+                    (us rt.prof_guard_ns)
+                    (us rt.prof_args_ns)
+                    (us rt.prof_cpu_ns)
+                    rt.prof_missing
+                | None -> ""
+              in
               Printf.sprintf
                 " strat[pre=%dw/%s facts=%dw/%s sync=%dw/%s(scan %s rec %s n %d) \
                  ledger=%d buy=%dw/%s bplan=%dw/%s bamend=%dw/%s sell=%dw/%s \
@@ -1841,6 +1879,7 @@ let asset_domain_worker
                 (us cs.time_splan_reconcile_ns)
                 (us cs.time_bplan_price_ns)
                 (us cs.time_bplan_sells_ns)
+              ^ interp
             | _ -> ""
           in
           Latency_profiler.set_cause
@@ -1961,6 +2000,16 @@ let start_domain config state fee_fetcher =
            cached_gc_config would otherwise silently kill the domain. *)
         try
           Config.apply_gc_config ();
+          let clk_per_call, busy_wall_ns, busy_cpu_ns =
+            Monotonic_clock.calibration_summary ()
+          in
+          Logging.info_f
+            ~section
+            "clock calibration: now_ns=%.0f ns/call; busy-loop wall=%d ns cpu=%d ns (cpu \
+             should be <= wall for a single thread)"
+            clk_per_call
+            busy_wall_ns
+            busy_cpu_ns;
           Logging.debug_f
             ~section
             "Domain for %s/%s started (restart #%d)"

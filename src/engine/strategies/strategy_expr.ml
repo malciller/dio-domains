@@ -18,7 +18,53 @@ type scope =
 type ref_ =
   { scope : scope
   ; path : string list
+  ; slot : int (* interned index of the dotted key, for slot-addressed env scopes *)
   }
+
+(** Process-wide string->slot intern table. Strategy files use a small, fixed set of fact
+    and state keys; resolving each to an integer once (at parse time) lets the hot
+    evaluator read them by array index instead of hashing the key string on every cycle
+    (the same shared predicate appears in many guards).
+
+    All domains load strategy files and mutate runtime state concurrently, so the table
+    cannot be mutated in place: an unsynchronized [Hashtbl] shared across OCaml 5 domains
+    is undefined behavior (a concurrent resize can wedge a lookup in a long probe), which
+    shows up as exactly the kind of intermittent per-thread CPU stall we were chasing.
+
+    The table is therefore append-only and published as an immutable snapshot via
+    [Atomic]. Hits (the entire runtime path) are lock-free: they read the current snapshot
+    and never touch the mutex, so concurrent domains cannot convoy on each other. Only a
+    miss (a genuinely new key, which happens while files are parsed and on first use)
+    takes [key_intern_mutex] and republishes a copy; a published table is never mutated
+    again, so a reader that captured the previous snapshot still reads it safely. *)
+let key_intern : (string, int) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 256)
+
+let key_intern_mutex = Mutex.create ()
+let key_next = Atomic.make 0
+
+let intern_key (s : string) : int =
+  let t = Atomic.get key_intern in
+  match Hashtbl.find t s with
+  | i -> i
+  | exception Not_found ->
+    Mutex.lock key_intern_mutex;
+    let t = Atomic.get key_intern in
+    let i =
+      match Hashtbl.find t s with
+      | i -> i
+      | exception Not_found ->
+        let i = Atomic.get key_next in
+        Atomic.set key_next (i + 1);
+        let t' = Hashtbl.copy t in
+        Hashtbl.replace t' s i;
+        Atomic.set key_intern t';
+        i
+    in
+    Mutex.unlock key_intern_mutex;
+    i
+;;
+
+let interned_key_count () = Atomic.get key_next
 
 type value = Strategy_actions.value =
   | V_none
@@ -71,7 +117,15 @@ let parse_ref (raw : string) : (ref_, string) result =
   | [] -> Error ("empty reference: " ^ raw)
   | head :: path ->
     (match scope_of_string head with
-     | Some scope -> Ok { scope; path }
+     | Some scope ->
+       let slot =
+         match scope, path with
+         | (State | Platform | Local | Signal), _ -> intern_key (String.concat "." path)
+         | Param, [ n ] -> intern_key n
+         | Param, _ -> intern_key (String.concat "." path)
+         | _ -> 0
+       in
+       Ok { scope; path; slot }
      | None -> Error ("unknown reference scope: $" ^ head))
 ;;
 
@@ -114,17 +168,24 @@ let to_float = function
   | _ -> Error "expected number"
 ;;
 
-(** Resolution hooks for references. Each accessor returns an error for an unresolved
-    reference (e.g. an absent event field). *)
+(** Raised when a reference cannot be resolved (unknown fact/param, absent event field,
+    malformed expression). The evaluator is direct-style so that no [Ok] wrapper is
+    allocated per reference on the hot path. *)
+exception Eval_error of string
+
+(** Resolution hooks for references. Slot-addressed scopes ([state]/[param]/[local]/
+    [signal]/[platform]) take the interned key index, so the hot evaluator never hashes a
+    key string. Each accessor returns the resolved value directly and raises [Eval_error]
+    when the reference is unresolved. *)
 type env =
-  { price : unit -> (value, string) result
-  ; event : string -> (value, string) result
-  ; state : string -> (value, string) result
-  ; param : string -> (value, string) result
-  ; local : string -> (value, string) result
-  ; signal : string -> (value, string) result
-  ; now : unit -> (value, string) result
-  ; platform : string -> (value, string) result
+  { price : unit -> value
+  ; event : string -> value
+  ; state : int -> value
+  ; param : int -> value
+  ; local : string -> value
+  ; signal : int -> value
+  ; now : unit -> value
+  ; platform : int -> value
   }
 
 type expr =
@@ -403,133 +464,144 @@ let parse (s : string) : (expr, string) result =
   | Parse_error m -> Error m
 ;;
 
-let rec eval (env : env) (e : expr) : (value, string) result =
-  match e with
-  | Lit_float f -> Ok (V_float f)
-  | Lit_int i -> Ok (V_int i)
-  | Lit_bool b -> Ok (V_bool b)
-  | Lit_string s -> Ok (V_string s)
-  | Ref r -> eval_ref env r
-  | Neg a -> lift1 env (fun x -> -.x) a
-  | Add (a, b) -> lift2 env ( +. ) a b
-  | Sub (a, b) -> lift2 env ( -. ) a b
-  | Mul (a, b) -> lift2 env ( *. ) a b
-  | Div (a, b) -> lift2 env ( /. ) a b
-  | Lt (a, b) -> cmp2 env ( < ) a b
-  | Le (a, b) -> cmp2 env ( <= ) a b
-  | Gt (a, b) -> cmp2 env ( > ) a b
-  | Ge (a, b) -> cmp2 env ( >= ) a b
-  | Eq (a, b) ->
-    (match eval env a, eval env b with
-     | Ok va, Ok vb -> Ok (V_bool (value_eq va vb))
-     | Error m, _ | _, Error m -> Error m)
-  | Ne (a, b) ->
-    (match eval env a, eval env b with
-     | Ok va, Ok vb -> Ok (V_bool (not (value_eq va vb)))
-     | Error m, _ | _, Error m -> Error m)
-  | And (a, b) -> bool2 env ( && ) a b
-  | Or (a, b) -> bool2 env ( || ) a b
-  | Not a ->
-    (match eval env a with
-     | Ok (V_bool b) -> Ok (V_bool (not b))
-     | Ok _ -> Error "not requires a bool"
-     | Error m -> Error m)
+(** Direct-style evaluator. Guards only need a bool, so the old result-returning recursion
+    boxed a [V_float]/[V_bool] and an [Ok] for every operator node and every [env]
+    accessor
+    - the dominant per-tick allocation on a file with many [expr] guards. This recursion
+      threads booleans and floats unboxed and raises [Eval_error] on failure; [eval] wraps
+      it for callers that want the explicit error channel. *)
+let value_to_float_exn = function
+  | V_float f -> f
+  | V_int i -> float_of_int i
+  | V_string s ->
+    (try float_of_string s with
+     | _ -> raise (Eval_error ("expected number, got string " ^ s)))
+  | _ -> raise (Eval_error "expected number")
+;;
 
-and eval_ref env (r : ref_) =
-  let dotted = String.concat "." r.path in
+let eval_ref (env : env) (r : ref_) : value =
   match r.scope with
   | Price -> env.price ()
   | Now -> env.now ()
   | Event ->
     (match r.path with
-     | [] -> Error "empty $event reference"
+     | [] -> raise (Eval_error "empty $event reference")
      | f :: _ -> env.event f)
   | State ->
     (match r.path with
-     | [] -> Error "empty $state reference"
-     | _ -> env.state dotted)
+     | [] -> raise (Eval_error "empty $state reference")
+     | _ -> env.state r.slot)
   | Param ->
     (match r.path with
-     | [] -> Error "empty $params reference"
-     | [ n ] -> env.param n
-     | _ -> Error "params references take no sub-path")
+     | [] -> raise (Eval_error "empty $params reference")
+     | _ -> env.param r.slot)
   | Local ->
     (match r.path with
-     | [] -> Error "empty $local reference"
-     | _ -> env.local dotted)
+     | [] -> raise (Eval_error "empty $local reference")
+     | n :: _ -> env.local n)
   | Signal ->
     (match r.path with
-     | [] -> Error "empty $signal reference"
-     | _ -> env.signal dotted)
+     | [] -> raise (Eval_error "empty $signal reference")
+     | _ -> env.signal r.slot)
   | Platform ->
     (match r.path with
-     | [] -> Error "empty $platform reference"
-     | _ -> env.platform dotted)
-
-and lift1 env f a =
-  match eval env a with
-  | Ok v ->
-    (match to_float v with
-     | Ok x -> Ok (V_float (f x))
-     | Error m -> Error m)
-  | Error m -> Error m
-
-and lift2 env f a b =
-  match eval env a, eval env b with
-  | Ok va, Ok vb ->
-    (match to_float va, to_float vb with
-     | Ok x, Ok y -> Ok (V_float (f x y))
-     | Error m, _ | _, Error m -> Error m)
-  | Error m, _ | _, Error m -> Error m
-
-and cmp2 env f a b =
-  match eval env a, eval env b with
-  | Ok va, Ok vb ->
-    (match to_float va, to_float vb with
-     | Ok x, Ok y -> Ok (V_bool (f x y))
-     | Error m, _ | _, Error m -> Error m)
-  | Error m, _ | _, Error m -> Error m
-
-and bool2 env f a b =
-  match eval env a, eval env b with
-  | Ok (V_bool x), Ok (V_bool y) -> Ok (V_bool (f x y))
-  | Ok _, Ok _ -> Error "boolean operator requires bool operands"
-  | Error m, _ | _, Error m -> Error m
+     | [] -> raise (Eval_error "empty $platform reference")
+     | _ -> env.platform r.slot)
 ;;
 
-(** Substitute [$refs] into a string template. *)
+let rec eval_bool env (e : expr) : bool =
+  match e with
+  | Lit_bool b -> b
+  | Not a -> not (eval_bool env a)
+  | And (a, b) -> eval_bool env a && eval_bool env b
+  | Or (a, b) -> eval_bool env a || eval_bool env b
+  | Lt (a, b) -> eval_float env a < eval_float env b
+  | Le (a, b) -> eval_float env a <= eval_float env b
+  | Gt (a, b) -> eval_float env a > eval_float env b
+  | Ge (a, b) -> eval_float env a >= eval_float env b
+  | Eq (a, b) -> value_eq (eval_value env a) (eval_value env b)
+  | Ne (a, b) -> not (value_eq (eval_value env a) (eval_value env b))
+  | _ ->
+    (match eval_value env e with
+     | V_bool b -> b
+     | _ -> raise (Eval_error "expected bool"))
+
+and eval_float env (e : expr) : float =
+  match e with
+  | Lit_float f -> f
+  | Lit_int i -> float_of_int i
+  | Neg a -> -.eval_float env a
+  | Add (a, b) -> eval_float env a +. eval_float env b
+  | Sub (a, b) -> eval_float env a -. eval_float env b
+  | Mul (a, b) -> eval_float env a *. eval_float env b
+  | Div (a, b) -> eval_float env a /. eval_float env b
+  | _ -> value_to_float_exn (eval_value env e)
+
+and eval_value env (e : expr) : value =
+  match e with
+  | Lit_float f -> V_float f
+  | Lit_int i -> V_int i
+  | Lit_bool b -> V_bool b
+  | Lit_string s -> V_string s
+  | Ref r -> eval_ref env r
+  | Neg a -> V_float (-.eval_float env a)
+  | Add (a, b) -> V_float (eval_float env a +. eval_float env b)
+  | Sub (a, b) -> V_float (eval_float env a -. eval_float env b)
+  | Mul (a, b) -> V_float (eval_float env a *. eval_float env b)
+  | Div (a, b) -> V_float (eval_float env a /. eval_float env b)
+  | Lt (a, b) -> V_bool (eval_float env a < eval_float env b)
+  | Le (a, b) -> V_bool (eval_float env a <= eval_float env b)
+  | Gt (a, b) -> V_bool (eval_float env a > eval_float env b)
+  | Ge (a, b) -> V_bool (eval_float env a >= eval_float env b)
+  | Eq (a, b) -> V_bool (value_eq (eval_value env a) (eval_value env b))
+  | Ne (a, b) -> V_bool (not (value_eq (eval_value env a) (eval_value env b)))
+  | And (a, b) -> V_bool (eval_bool env a && eval_bool env b)
+  | Or (a, b) -> V_bool (eval_bool env a || eval_bool env b)
+  | Not a -> V_bool (not (eval_bool env a))
+;;
+
+(** Result-returning wrapper over the direct evaluator. *)
+let eval (env : env) (e : expr) : (value, string) result =
+  try Ok (eval_value env e) with
+  | Eval_error m -> Error m
+;;
+
+(** Substitute [$refs] into a string template. A template with no [$] is returned as-is,
+    so a literal string argument (e.g. a [set_gate] [name]) costs no buffer. *)
 let interpolate (env : env) (s : string) : (value, string) result =
-  let n = String.length s in
-  let buf = Buffer.create n in
-  let i = ref 0 in
-  let err = ref None in
-  while !i < n && !err = None do
-    if s.[!i] = '$'
-    then (
-      let j = ref (!i + 1) in
-      while !j < n && is_ref_char s.[!j] do
-        incr j
-      done;
-      if !j > !i + 1
+  if not (String.contains s '$')
+  then Ok (V_string s)
+  else (
+    let n = String.length s in
+    let buf = Buffer.create n in
+    let i = ref 0 in
+    let err = ref None in
+    while !i < n && !err = None do
+      if s.[!i] = '$'
       then (
-        let raw = String.sub s (!i + 1) (!j - !i - 1) in
-        (match parse_ref raw with
-         | Error m -> err := Some m
-         | Ok r ->
-           (match eval_ref env r with
-            | Error m -> err := Some m
-            | Ok v -> Buffer.add_string buf (string_of_value v)));
-        i := !j)
+        let j = ref (!i + 1) in
+        while !j < n && is_ref_char s.[!j] do
+          incr j
+        done;
+        if !j > !i + 1
+        then (
+          let raw = String.sub s (!i + 1) (!j - !i - 1) in
+          (match parse_ref raw with
+           | Error m -> err := Some m
+           | Ok r ->
+             (try Buffer.add_string buf (string_of_value (eval_ref env r)) with
+              | Eval_error m -> err := Some m));
+          i := !j)
+        else (
+          Buffer.add_char buf '$';
+          incr i))
       else (
-        Buffer.add_char buf '$';
-        incr i))
-    else (
-      Buffer.add_char buf s.[!i];
-      incr i)
-  done;
-  match !err with
-  | Some m -> Error m
-  | None -> Ok (V_string (Buffer.contents buf))
+        Buffer.add_char buf s.[!i];
+        incr i)
+    done;
+    match !err with
+    | Some m -> Error m
+    | None -> Ok (V_string (Buffer.contents buf)))
 ;;
 
 (** Evaluate a string argument: as an expression if it parses, else as a template. *)

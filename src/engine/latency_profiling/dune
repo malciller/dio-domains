@@ -2,7 +2,7 @@
  (name dio_latency_profiling)
  (public_name dio.latency_profiling)
  (wrapped false)
- (libraries logging mtime mtime.clock.os lwt lwt.unix)
+ (libraries logging mtime mtime.clock.os lwt lwt.unix dio.gc_config)
  (foreign_stubs
   (language c)
   (names monotonic_clock_stubs))

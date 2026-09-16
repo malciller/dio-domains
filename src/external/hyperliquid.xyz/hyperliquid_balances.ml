@@ -34,6 +34,9 @@ module BalanceStore = struct
     ; trading_balance : float Atomic.t
     ; staked_balance : float Atomic.t
     ; last_updated : float Atomic.t
+    ; spendable_last_updated : float Atomic.t
+    (** Newest timestamp across non-excluded (spendable) wallets, maintained by the writer
+        under [mutex] so the per-cycle freshness read is a lock-free [Atomic.get]. *)
     }
 
   let create () =
@@ -43,6 +46,7 @@ module BalanceStore = struct
     ; trading_balance = Atomic.make 0.0
     ; staked_balance = Atomic.make 0.0
     ; last_updated = Atomic.make 0.0
+    ; spendable_last_updated = Atomic.make 0.0
     }
   ;;
 
@@ -89,10 +93,18 @@ module BalanceStore = struct
         store.wallets
         0.0
     in
+    let spendable_last_updated =
+      Hashtbl.fold
+        (fun _ w acc ->
+          if is_excluded_wallet w.wallet_type then acc else Float.max acc w.last_updated)
+        store.wallets
+        0.0
+    in
     Atomic.set store.total_balance total;
     Atomic.set store.trading_balance trading;
     Atomic.set store.staked_balance staked;
     Atomic.set store.last_updated now;
+    Atomic.set store.spendable_last_updated spendable_last_updated;
     Mutex.unlock store.mutex
   ;;
 
@@ -106,19 +118,9 @@ module BalanceStore = struct
 
   (** Wall-clock timestamp of the newest spendable (non-excluded) wallet, or 0.0 if none.
       Store-wide [last_updated] is also bumped by the staking poller (~10s), which cannot
-      change the tradeable figure, so freshness consumers must key on spendable wallets. *)
-  let get_spendable_last_updated store =
-    Mutex.lock store.mutex;
-    let t =
-      Hashtbl.fold
-        (fun _ w acc ->
-          if is_excluded_wallet w.wallet_type then acc else Float.max acc w.last_updated)
-        store.wallets
-        0.0
-    in
-    Mutex.unlock store.mutex;
-    t
-  ;;
+      change the tradeable figure, so freshness consumers must key on spendable wallets.
+      Maintained by {!update_wallet} so this is a lock-free read on the per-cycle path. *)
+  let get_spendable_last_updated store = Atomic.get store.spendable_last_updated
 end
 
 (* Global mutable state: per-asset balance stores and readiness flag. *)

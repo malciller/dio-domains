@@ -1069,6 +1069,7 @@ let test_ghost_buy_suppressed_within_ack_grace () =
          ~lot_qty:0.1
          ~iter_open_orders
          ~get_open_orders_generation:(fun () -> -1)
+         ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
          ~ecfg)
   in
   (* Acked just now: the feed has not listed the buy yet. *)
@@ -2140,6 +2141,7 @@ let test_inflight_sell_commitment_survives_feed_gap () =
         ~lot_qty:0.2
         ~iter_open_orders
         ~get_open_orders_generation:(fun () -> -1)
+        ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
         ~ecfg
     in
     locked
@@ -2923,6 +2925,7 @@ let test_virtual_gtc_sell_grid_maintenance () =
       ~lot_qty:1.0
       ~iter_open_orders:iter_orders
       ~get_open_orders_generation:(fun () -> -1)
+      ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
       ~ecfg:ecfg_alpaca
   in
   check
@@ -4987,6 +4990,7 @@ let test_reconcile_cross_boundary_tolerance () =
       ~lot_qty:1.0
       ~iter_open_orders:iter_orders
       ~get_open_orders_generation:(fun () -> -1)
+      ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
       ~ecfg
   in
   (* Persisted level should match (no second near-100.0 adoption), leaving one level
@@ -5039,6 +5043,7 @@ let test_sync_open_orders_price_keyed_index () =
       ~lot_qty:1.0
       ~iter_open_orders:iter_orders
       ~get_open_orders_generation:(fun () -> -1)
+      ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
       ~ecfg
   in
   check
@@ -5071,6 +5076,7 @@ let test_sync_open_orders_price_keyed_index () =
       ~lot_qty:1.0
       ~iter_open_orders:iter_orders2
       ~get_open_orders_generation:(fun () -> -1)
+      ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
       ~ecfg
   in
   let matches = List.filter (fun (p, _) -> p = 105.0) state2.persisted_sell_levels in
@@ -5086,6 +5092,7 @@ let test_sync_open_orders_price_keyed_index () =
       ~lot_qty:1.0
       ~iter_open_orders:iter_orders2
       ~get_open_orders_generation:(fun () -> -1)
+      ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
       ~ecfg
   in
   check
@@ -5138,6 +5145,7 @@ let test_sync_open_orders_reconcile_agreement () =
         ~lot_qty:1.0
         ~iter_open_orders:iter_orders
         ~get_open_orders_generation:(fun () -> -1)
+        ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
         ~ecfg
     in
     let ref_open, ref_missing = reconcile_persisted_sell_levels ~state in
@@ -5225,6 +5233,7 @@ let test_sync_open_orders_generation_skip () =
       ~lot_qty:1.0
       ~iter_open_orders:iter_orders
       ~get_open_orders_generation:(fun () -> !gen)
+      ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
       ~ecfg
   in
   let obc1, _hrab1, lib1, _lis1, _cs1, _op1, _mp1 = sync () in
@@ -5243,6 +5252,7 @@ let test_sync_open_orders_generation_skip () =
       ~lot_qty:1.0
       ~iter_open_orders:iter_orders_boom
       ~get_open_orders_generation:(fun () -> !gen)
+      ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
       ~ecfg
   in
   check (float 1e-9) "locked-in buys reused on skip" 99.0 lib2;
@@ -5267,6 +5277,235 @@ let test_sync_open_orders_generation_skip () =
   incr gen;
   ignore (sync ());
   check int "generation change rescans" 2 !scan_calls
+;;
+
+let test_sync_open_orders_delta_equivalence () =
+  (* A drained per-order delta must produce exactly the same derived state as a fresh full
+     scan of the final feed. Exercises add / amend / remove on the buy and sell sides, the
+     closest-sell and best-buy recompute, the sell list and total, and the commitment
+     ledger (a removed feed sell stays reserved on a venue that nets holds from the feed). *)
+  let open Dio_strategies.Strategy_api in
+  let mk_state symbol =
+    let state = get_strategy_state symbol in
+    state.exchange_id <- "kraken";
+    state.cached_ecfg <- get_exchange_config "kraken";
+    Hashtbl.clear state.sell_commitments;
+    Sell_orders.clear state.open_sell_orders;
+    Sell_orders.clear state.cached_feed_sell_orders;
+    Hashtbl.reset state.feed_sell_index;
+    Hashtbl.reset state.feed_buy_index;
+    state.feed_index_valid <- false;
+    state.open_orders_scan_valid <- false;
+    state.sell_commitments_clean <- false;
+    state
+  in
+  let asset_of symbol =
+    { exchange = "kraken"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = false
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = get_exchange_config "kraken" in
+  let delta_state = mk_state "DELTA_EQ/USD" in
+  let ref_state = mk_state "REF_EQ/USD" in
+  let delta_asset = asset_of "DELTA_EQ/USD" in
+  let ref_asset = asset_of "REF_EQ/USD" in
+  let feed =
+    ref
+      [ "buy-1", 99.0, 1.0, "buy", None
+      ; "sell-1", 101.0, 2.0, "sell", None
+      ; "sell-2", 103.0, 4.0, "sell", None
+      ]
+  in
+  let iter_of the_feed f = List.iter (fun (oid, p, q, s, u) -> f oid p q s u) !the_feed in
+  let pending_changes = ref [] in
+  let pending_overflow = ref false in
+  let drain () =
+    let c = !pending_changes in
+    pending_changes := [];
+    c, !pending_overflow
+  in
+  let sync_state state asset iter gen =
+    sync_open_orders
+      ~state
+      ~now:100.0
+      ~asset
+      ~bid_price:100.0
+      ~lot_qty:1.0
+      ~iter_open_orders:iter
+      ~get_open_orders_generation:(fun () -> gen)
+      ~drain_open_order_changes:(fun ~symbol:_ -> drain ())
+      ~ecfg
+  in
+  (* Prime both with a full scan of the initial feed. *)
+  ignore (sync_state delta_state delta_asset (iter_of feed) 1);
+  ignore (sync_state ref_state ref_asset (iter_of feed) 1);
+  check bool "delta indexes primed" true delta_state.feed_index_valid;
+  (* Mutate: drop sell-2, add sell-3 @102, amend buy-1 down to 98.5. *)
+  feed
+  := [ "buy-1", 98.5, 1.0, "buy", None
+     ; "sell-1", 101.0, 2.0, "sell", None
+     ; "sell-3", 102.0, 3.0, "sell", None
+     ];
+  pending_changes
+  := [ "sell-2", None
+     ; "sell-3", Some (Some 102.0, 3.0, "sell", None)
+     ; "buy-1", Some (Some 98.5, 1.0, "buy", None)
+     ];
+  let changes = !pending_changes in
+  (* Reference: full rescan of the final feed (overflow forces the scan path). *)
+  pending_changes := [];
+  pending_overflow := true;
+  let robc, _rh, rlib, _rlis, rcs, _rop, _rmp =
+    sync_state ref_state ref_asset (iter_of feed) 2
+  in
+  pending_overflow := false;
+  pending_changes := changes;
+  (* Delta: the scan closure must NOT run. *)
+  let boom _ = failwith "delta path must not rescan" in
+  let dobc, _dh, dlib, _dlis, dcs, _dop, _dmp =
+    sync_state delta_state delta_asset boom 2
+  in
+  check int "delta matches ref open-buy count" robc dobc;
+  check (float 1e-9) "delta matches ref locked-in buys" rlib dlib;
+  check (float 1e-9) "delta best-buy recomputed" 98.5 dlib;
+  check (option (pair string (float 1e-9))) "delta matches ref closest sell" rcs dcs;
+  let fmt_sells (state : Dio_strategies.Strategy_state.strategy_state) =
+    Sell_orders.to_list state.open_sell_orders
+    |> List.sort compare
+    |> List.map (fun (id, p, q) -> Printf.sprintf "%s@%.4f/%g" id p q)
+    |> String.concat ";"
+  in
+  let fmt_commits (state : Dio_strategies.Strategy_state.strategy_state) =
+    let acc = ref [] in
+    Hashtbl.iter
+      (fun id c ->
+        acc
+        := Printf.sprintf
+             "%s@%.4f/%g l=%b s=%b a=%b"
+             id
+             c.sc_price
+             c.sc_qty
+             c.sc_listed
+             c.sc_seen
+             c.sc_acked
+           :: !acc)
+      state.sell_commitments;
+    String.concat ";" (List.sort compare !acc)
+  in
+  check string "delta matches ref sell list" (fmt_sells ref_state) (fmt_sells delta_state);
+  check
+    string
+    "delta matches ref commitment ledger"
+    (fmt_commits ref_state)
+    (fmt_commits delta_state)
+;;
+
+let test_sync_open_orders_delta_persisted () =
+  (* On a [remaintain_expired_sells] venue (Alpaca) the persisted sell ladder must be
+     rebuilt on the incremental path too, so the ladder still tracks live feed prices
+     between full snapshots. A delta cycle must leave the ladder identical to a fresh full
+     scan of the same feed. *)
+  let open Dio_strategies.Strategy_api in
+  let mk_state symbol =
+    let state = get_strategy_state symbol in
+    state.exchange_id <- "alpaca";
+    state.cached_ecfg <- get_exchange_config "alpaca";
+    Hashtbl.clear state.sell_commitments;
+    Sell_orders.clear state.open_sell_orders;
+    Sell_orders.clear state.cached_feed_sell_orders;
+    Hashtbl.reset state.feed_sell_index;
+    Hashtbl.reset state.feed_buy_index;
+    state.feed_index_valid <- false;
+    state.open_orders_scan_valid <- false;
+    state.sell_commitments_clean <- false;
+    (* Seed a stale ladder so the rebuild has something to reconcile. *)
+    state.persisted_sell_levels <- [ 99.5, 1.0; 105.5, 9.0 ];
+    state
+  in
+  let asset_of symbol =
+    { exchange = "alpaca"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = false
+    ; sell_levels_persistence = true
+    }
+  in
+  let ecfg = get_exchange_config "alpaca" in
+  let delta_state = mk_state "DELTA_PST/USD" in
+  let ref_state = mk_state "REF_PST/USD" in
+  let delta_asset = asset_of "DELTA_PST/USD" in
+  let ref_asset = asset_of "REF_PST/USD" in
+  let feed =
+    ref [ "sell-1", 101.0, 2.0, "sell", None; "sell-2", 103.0, 4.0, "sell", None ]
+  in
+  let iter_of the_feed f = List.iter (fun (oid, p, q, s, u) -> f oid p q s u) !the_feed in
+  let pending_changes = ref [] in
+  let pending_overflow = ref false in
+  let drain () =
+    let c = !pending_changes in
+    pending_changes := [];
+    c, !pending_overflow
+  in
+  let sync_state state asset iter gen =
+    sync_open_orders
+      ~state
+      ~now:100.0
+      ~asset
+      ~bid_price:100.0
+      ~lot_qty:1.0
+      ~iter_open_orders:iter
+      ~get_open_orders_generation:(fun () -> gen)
+      ~drain_open_order_changes:(fun ~symbol:_ -> drain ())
+      ~ecfg
+  in
+  let fmt_ladder (state : Dio_strategies.Strategy_state.strategy_state) =
+    state.persisted_sell_levels
+    |> List.map (fun (p, q) -> Printf.sprintf "%.4f/%g" p q)
+    |> String.concat ";"
+  in
+  ignore (sync_state delta_state delta_asset (iter_of feed) 1);
+  ignore (sync_state ref_state ref_asset (iter_of feed) 1);
+  check bool "persisted delta indexes primed" true delta_state.feed_index_valid;
+  (* Amend sell-1's price and add sell-3. *)
+  feed := [ "sell-1", 101.5, 2.0, "sell", None; "sell-3", 104.0, 3.0, "sell", None ];
+  let changes =
+    [ "sell-2", None
+    ; "sell-3", Some (Some 104.0, 3.0, "sell", None)
+    ; "sell-1", Some (Some 101.5, 2.0, "sell", None)
+    ]
+  in
+  pending_changes := [];
+  pending_overflow := true;
+  ignore (sync_state ref_state ref_asset (iter_of feed) 2);
+  pending_overflow := false;
+  pending_changes := changes;
+  let boom _ = failwith "persisted delta path must not rescan" in
+  ignore (sync_state delta_state delta_asset boom 2);
+  check
+    string
+    "delta matches ref persisted ladder"
+    (fmt_ladder ref_state)
+    (fmt_ladder delta_state);
+  check
+    bool
+    "persisted ladder rebuilt"
+    true
+    (delta_state.persisted_sell_levels <> [ 99.5, 1.0; 105.5, 9.0 ])
 ;;
 
 (* ---- Buy-trailing: qty-only oracle re-sizes must honor the trailing rules - *)
@@ -5859,6 +6098,7 @@ let test_sell_commitment_lifecycle_all_venues () =
             ~lot_qty:0.2
             ~iter_open_orders
             ~get_open_orders_generation:(fun () -> -1)
+            ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
             ~ecfg
         in
         locked
@@ -6040,6 +6280,14 @@ let () =
             "sync_open_orders skips scan when generation unchanged"
             `Quick
             test_sync_open_orders_generation_skip
+        ; test_case
+            "sync_open_orders delta matches full scan"
+            `Quick
+            test_sync_open_orders_delta_equivalence
+        ; test_case
+            "sync_open_orders delta persists ladder"
+            `Quick
+            test_sync_open_orders_delta_persisted
         ] )
     ; "balance", [ test_case "balance checking" `Quick test_balance_checking ]
     ; ( "placement guard"

@@ -79,6 +79,7 @@ let profile ~n_levels ~n_sells ~remaintain =
          ~lot_qty:1.0
          ~iter_open_orders:iter_orders
          ~get_open_orders_generation:(fun () -> -1)
+         ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
          ~ecfg)
   in
   words_per_call ~warmup:300 ~iters:3000 call

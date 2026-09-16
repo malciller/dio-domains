@@ -81,6 +81,18 @@ type store =
   ; open_orders : (string, open_order) Hashtbl.t
   ; open_orders_cache : open_order list Atomic.t
   (** Lock-free snapshot of active open orders for the domain hot path. *)
+  ; open_orders_generation : int Atomic.t
+  (** Per-symbol generation bumped when this symbol's snapshot is republished. Consumers
+      use it to skip a full rescan of this symbol's orders; a process-global counter would
+      make one symbol's order change invalidate every other symbol's cache. *)
+  ; changes : (string * open_order option) list Atomic.t
+  (** Orders mutated since the last drain, newest first. [Some o] is the current record
+      for an add/replace, [None] a removal. Lets the strategy apply the per-order delta
+      (O(changes)) instead of an O(open-orders) rescan. Writers prepend under
+      [orders_mutex]; the reader swaps it out lock-free with {!drain_changes}. *)
+  ; changes_overflow : bool Atomic.t
+  (** Set when the change log cannot represent the delta (a full clear/replace), forcing
+      the consumer to do a full rescan. *)
   ; ready : bool Atomic.t
   ; processed_tids : (int64, float) Hashtbl.t
   (** trade_id to arrival_time mapping for deduplication. *)
@@ -179,6 +191,9 @@ let get_symbol_store symbol =
                  lifecycle events at 128 slots. *)
           ; open_orders = Hashtbl.create 32
           ; open_orders_cache = Atomic.make []
+          ; open_orders_generation = Atomic.make 0
+          ; changes = Atomic.make []
+          ; changes_overflow = Atomic.make false
           ; ready = Atomic.make (Atomic.get _startup_snapshot_done)
           ; processed_tids = Hashtbl.create 32
           ; processed_tids_queue = Queue.create ()
@@ -201,10 +216,65 @@ let[@inline] get_orders_generation () = Atomic.get orders_generation
 
 (** Publishes an immutable snapshot of open_orders to the atomic cache. Must be called by
     writers under store.orders_mutex. *)
+
+(** Record an order whose state changed, for delta consumption by the strategy. [Some o]
+    for an add/replace, [None] for a removal. Writers prepend under [store.orders_mutex];
+    the reader swaps the list out lock-free, so the get/set here never needs a lock. A
+    writer that lands between a reader's get and its exchange is simply drained next cycle
+    (the accompanying generation bump guarantees another drain). *)
+let[@inline] note_change store id order =
+  Atomic.set store.changes ((id, order) :: Atomic.get store.changes)
+;;
+
+(** [drain_changes store] swaps out the [(id, order option)] changes since the last drain
+    (and the overflow flag) lock-free, so the per-cycle drain never blocks on the feed's
+    order mutex. *)
+let drain_changes store =
+  let changes = Atomic.exchange store.changes [] in
+  let overflow = Atomic.exchange store.changes_overflow false in
+  changes, overflow
+;;
+
 let[@inline] publish_open_orders_cache store =
   let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
   Atomic.set store.open_orders_cache snapshot;
+  Atomic.incr store.open_orders_generation;
   Atomic.incr orders_generation
+;;
+
+(** Per-symbol generation for [symbol]. [-1] when the store does not exist yet, so the
+    consumer's rescan gate ([generation >= 0]) forces a scan until the first snapshot. *)
+let get_orders_generation_for_symbol symbol =
+  match Hashtbl.find_opt stores symbol with
+  | Some store -> Atomic.get store.open_orders_generation
+  | None -> -1
+;;
+
+(** Drain the per-order change delta for [symbol]:
+    [(((id, snapshot option) list), overflow)]. [snapshot] is
+    [(limit_price, remaining_qty, side, order_userref)] for an add/replace, or [None] for
+    a removal; changes are returned in chronological order. [overflow] (or a missing
+    store) means the caller must do a full rescan. O(changes). *)
+let drain_open_order_changes ~symbol =
+  match Hashtbl.find_opt stores symbol with
+  | Some store ->
+    let changes, overflow = drain_changes store in
+    ( List.rev_map
+        (fun (id, (o : open_order option)) ->
+          let snap =
+            match o with
+            | Some o ->
+              Some
+                ( o.limit_price
+                , o.remaining_qty
+                , (if o.side = Buy then "buy" else "sell")
+                , o.order_userref )
+            | None -> None
+          in
+          id, snap)
+        changes
+    , overflow )
+  | None -> [], true
 ;;
 
 let notify_ready store =
@@ -265,6 +335,7 @@ let remove_open_order ~symbol ~order_id =
   if existed
   then (
     Hashtbl.remove store.open_orders order_id;
+    note_change store order_id None;
     publish_open_orders_cache store);
   Mutex.unlock store.orders_mutex;
   (* Deferred global index and blacklist updates: outside orders_mutex to eliminate nested
@@ -326,6 +397,7 @@ let cleanup_stale_orders () =
         if removed
         then (
           Hashtbl.remove store.open_orders order_id;
+          note_change store order_id None;
           publish_open_orders_cache store);
         Mutex.unlock store.orders_mutex;
         if removed
@@ -424,6 +496,7 @@ let clear_all_open_orders () =
       let count = Hashtbl.length store.open_orders in
       total_removed := !total_removed + count;
       Hashtbl.clear store.open_orders;
+      Atomic.set store.changes_overflow true;
       publish_open_orders_cache store;
       Mutex.unlock store.orders_mutex)
     all_symbols;
@@ -557,9 +630,14 @@ let update_orders_internal_locked ?user_ref store (event : execution_event) =
        it. Avoids holding orders_mutex while contending for order_index_mutex, matching
        the Kraken architecture. *)
     let index_action = ref `None in
+    let changed = ref false in
     if is_terminal
     then (
-      Hashtbl.remove store.open_orders event.order_id;
+      if Hashtbl.mem store.open_orders event.order_id
+      then (
+        Hashtbl.remove store.open_orders event.order_id;
+        note_change store event.order_id None;
+        changed := true);
       index_action := `Remove event.order_id)
     else (
       (* UserRef recovery precedence:
@@ -630,9 +708,27 @@ let update_orders_internal_locked ?user_ref store (event : execution_event) =
         ; last_updated = now
         }
       in
-      Hashtbl.replace store.open_orders event.order_id order;
+      (* Only republish when the order actually changed. Every execution event used to
+         bump the generation, so the strategy rescanned all ~60 open orders on each
+         ack/duplicate update even when nothing moved. [last_updated] is excluded (it is
+         always [now]). *)
+      let differs =
+        match existing_order with
+        | Some o ->
+          o.remaining_qty <> order.remaining_qty
+          || o.order_status <> order.order_status
+          || o.limit_price <> order.limit_price
+          || o.order_qty <> order.order_qty
+          || o.order_userref <> order.order_userref
+        | None -> true
+      in
+      if differs
+      then (
+        Hashtbl.replace store.open_orders event.order_id order;
+        note_change store event.order_id (Some order);
+        changed := true);
       index_action := `Add (event.order_id, event.symbol));
-    publish_open_orders_cache store;
+    if !changed then publish_open_orders_cache store;
     RingBuffer.write store.events_buffer event;
     notify_ready store;
     Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;

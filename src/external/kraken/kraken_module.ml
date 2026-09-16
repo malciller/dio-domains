@@ -534,6 +534,10 @@ module Kraken_impl = struct
     Kraken_executions_feed.get_orders_generation ()
   ;;
 
+  let drain_open_order_changes ~symbol =
+    Kraken_executions_feed.drain_open_order_changes ~symbol
+  ;;
+
   (* -- Instrument metadata accessors ----------------------------------- *)
 
   (** Returns the minimum price tick size for [symbol], or [None] if unknown. *)

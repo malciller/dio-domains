@@ -22,6 +22,13 @@ type t =
   ; mutable prices : float array
   ; mutable qtys : float array
   ; mutable len : int
+  ; mutable sum_q : float
+  (** Running sum of [qtys.(0..len-1)], maintained on every mutation so [sum_qty] is an
+      O(1) read on the hot path instead of a per-cycle fold. *)
+  ; mutable min_p : float
+  (** Running minimum of [prices.(0..len-1)] ([Float.infinity] when empty), so
+      [exists_price_leq] is an O(1) comparison instead of a per-cycle scan. Recomputed
+      O(n) only when the current minimum is removed. *)
   }
 
 let create capacity =
@@ -30,10 +37,32 @@ let create capacity =
   ; prices = Array.make capacity 0.0
   ; qtys = Array.make capacity 0.0
   ; len = 0
+  ; sum_q = 0.0
+  ; min_p = Float.infinity
   }
 ;;
 
-let clear t = t.len <- 0
+(** Recompute the O(n) aggregates from scratch. Only used on the cold mutators (prefix
+    removal, first-match replace) and when the minimum leaves. Accumulates in a
+    [float array] (unboxed cells) rather than [float ref]s or a recursive float-threaded
+    loop: a boxed accumulator would allocate ~2 words per element and turn this walk into
+    a minor -GC tax every time the closest sell is amended. *)
+let recompute_aggregates t =
+  let buf = [| 0.0; Float.infinity |] in
+  for i = 0 to t.len - 1 do
+    buf.(0) <- buf.(0) +. t.qtys.(i);
+    if t.prices.(i) < buf.(1) then buf.(1) <- t.prices.(i)
+  done;
+  t.sum_q <- buf.(0);
+  t.min_p <- buf.(1)
+;;
+
+let clear t =
+  t.len <- 0;
+  t.sum_q <- 0.0;
+  t.min_p <- Float.infinity
+;;
+
 let[@inline] length t = t.len
 let[@inline] is_empty t = t.len = 0
 let[@inline] get_id t i = t.ids.(i)
@@ -63,7 +92,9 @@ let push t id price qty =
   t.ids.(t.len) <- id;
   t.prices.(t.len) <- price;
   t.qtys.(t.len) <- qty;
-  t.len <- t.len + 1
+  t.len <- t.len + 1;
+  t.sum_q <- t.sum_q +. qty;
+  if price < t.min_p then t.min_p <- price
 ;;
 
 let iter t f =
@@ -80,7 +111,9 @@ let blit ~src ~dst =
   Array.blit src.ids 0 dst.ids 0 src.len;
   Array.blit src.prices 0 dst.prices 0 src.len;
   Array.blit src.qtys 0 dst.qtys 0 src.len;
-  dst.len <- src.len
+  dst.len <- src.len;
+  dst.sum_q <- src.sum_q;
+  dst.min_p <- src.min_p
 ;;
 
 let fold t init f =
@@ -103,21 +136,10 @@ let exists_price t p =
   go 0
 ;;
 
-(** Any element whose price is at or below [x]. Closure-free counterpart to [exists_price]
-    for the threshold test (avoids boxing the float into the predicate closure on every
-    element). *)
-let exists_price_leq t x =
-  let rec go i = i < t.len && (t.prices.(i) <= x || go (i + 1)) in
-  go 0
-;;
+(** Any element whose price is at or below [x]. O(1) via the maintained [min_p]. *)
+let exists_price_leq t x = t.min_p <= x
 
-let sum_qty t =
-  let s = ref 0.0 in
-  for i = 0 to t.len - 1 do
-    s := !s +. t.qtys.(i)
-  done;
-  !s
-;;
+let sum_qty t = t.sum_q
 
 (** First element matching [pred], or [None]. Allocates the result option/tuple; only used
     on cold paths (excess sweep, amend handlers). *)
@@ -144,7 +166,8 @@ let replace_first t pred f =
         let id, price, qty = f t.ids.(i) t.prices.(i) t.qtys.(i) in
         t.ids.(i) <- id;
         t.prices.(i) <- price;
-        t.qtys.(i) <- qty)
+        t.qtys.(i) <- qty;
+        recompute_aggregates t)
       else go (i + 1)
   in
   go 0
@@ -153,6 +176,8 @@ let replace_first t pred f =
 (** Remove every element whose id equals [id] (ids are unique in practice), preserving the
     order of the survivors. Returns whether anything was removed. In place; no allocation. *)
 let remove_by_id t id =
+  let removed_qty = ref 0.0 in
+  let removed_min = ref false in
   let w = ref 0 in
   for i = 0 to t.len - 1 do
     if t.ids.(i) <> id
@@ -163,9 +188,17 @@ let remove_by_id t id =
         t.prices.(!w) <- t.prices.(i);
         t.qtys.(!w) <- t.qtys.(i));
       incr w)
+    else (
+      removed_qty := !removed_qty +. t.qtys.(i);
+      (* [min_p] is the minimum, so a removed price <= it *is* the minimum: recompute. *)
+      if t.prices.(i) <= t.min_p then removed_min := true)
   done;
   let removed = !w < t.len in
   t.len <- !w;
+  if removed
+  then (
+    t.sum_q <- t.sum_q -. !removed_qty;
+    if !removed_min then recompute_aggregates t);
   removed
 ;;
 
@@ -183,7 +216,8 @@ let remove_prefix t prefix =
         t.qtys.(!w) <- t.qtys.(i));
       incr w)
   done;
-  t.len <- !w
+  t.len <- !w;
+  recompute_aggregates t
 ;;
 
 let of_list l =

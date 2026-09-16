@@ -12,6 +12,7 @@
 
 module Jac = Strategy_api
 module Types = Strategy_state
+module Slots = Strategy_fact_slots
 
 type ctx =
   { mutable cg_asset : Types.trading_config option
@@ -28,6 +29,9 @@ type ctx =
   ; mutable cg_base_age : float option
   ; mutable cg_gen : int
   ; mutable cg_iter : (string -> float -> float -> string -> int option -> unit) -> unit
+  ; mutable cg_drain :
+      symbol:string
+      -> (string * (float option * float * string * int option) option) list * bool
   ; mutable cg_ecfg : Types.exchange_config option
   ; mutable cg_lot_qty : float
   ; mutable cg_bid_r : float
@@ -66,6 +70,7 @@ let create () =
   ; cg_base_age = None
   ; cg_gen = -1
   ; cg_iter = (fun _ -> ())
+  ; cg_drain = (fun ~symbol:_ -> [], true)
   ; cg_ecfg = None
   ; cg_lot_qty = nan
   ; cg_bid_r = nan
@@ -97,13 +102,13 @@ let measure c (phase : Strategy_actions_cycle.phase) f =
   if not c.cg_profile
   then f ()
   else (
-    let a0 = int_of_float (Gc.minor_words ()) in
+    let a0 = Monotonic_clock.minor_words () in
     let t0 = Monotonic_clock.now_ns () in
     f ();
     match c.cg_state with
     | None -> ()
     | Some st ->
-      let da = int_of_float (Gc.minor_words ()) - a0 in
+      let da = Monotonic_clock.minor_words () - a0 in
       let dt = Monotonic_clock.now_ns () - t0 in
       (match phase with
        | Strategy_actions_cycle.Preamble ->
@@ -301,6 +306,7 @@ let sync c =
         ~lot_qty:c.cg_lot_qty
         ~iter_open_orders:c.cg_iter
         ~get_open_orders_generation:(fun () -> c.cg_gen)
+        ~drain_open_order_changes:c.cg_drain
         ~ecfg
     in
     c.cg_open_buy_count <- open_buy_count;
@@ -405,12 +411,12 @@ let early_facts c sink =
     | Some s -> s.maker_fee > 0.0
     | None -> false
   in
-  sink "price_nan" (Strategy_expr.V_bool (Float.is_nan c.cg_price));
-  sink "check_stale_balance" (Strategy_expr.V_bool check_stale_balance);
-  sink "asset_balance_nan" (Strategy_expr.V_bool (Float.is_nan c.cg_abal));
-  sink "quote_balance_nan" (Strategy_expr.V_bool (Float.is_nan c.cg_qbal));
-  sink "maker_fee_set" (Strategy_expr.V_bool maker_fee_set);
-  sink "fee_refresh_due" (Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0))
+  sink Slots.price_nan (Strategy_expr.V_bool (Float.is_nan c.cg_price));
+  sink Slots.check_stale_balance (Strategy_expr.V_bool check_stale_balance);
+  sink Slots.asset_balance_nan (Strategy_expr.V_bool (Float.is_nan c.cg_abal));
+  sink Slots.quote_balance_nan (Strategy_expr.V_bool (Float.is_nan c.cg_qbal));
+  sink Slots.maker_fee_set (Strategy_expr.V_bool maker_fee_set);
+  sink Slots.fee_refresh_due (Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0))
 ;;
 
 (** Fine path step 6a'': publish the raw gate facts the strategy file combines into the
@@ -442,21 +448,21 @@ let cycle_facts c sink =
     | Some ecfg -> ecfg.check_stale_balance
     | None -> false
   in
-  sink "oracle_halted" (Strategy_expr.V_bool c.cg_oracle_halted);
-  sink "tif_recovery_pending" (Strategy_expr.V_bool pending);
-  sink "tif_recovery_since" (Strategy_expr.V_float since);
-  sink "price_nan" (Strategy_expr.V_bool (Float.is_nan c.cg_price));
-  sink "maker_fee_set" (Strategy_expr.V_bool maker_fee_set);
-  sink "fee_refresh_due" (Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0));
-  sink "check_stale_balance" (Strategy_expr.V_bool check_stale_balance);
-  sink "asset_balance_nan" (Strategy_expr.V_bool (Float.is_nan c.cg_abal));
-  sink "quote_balance_nan" (Strategy_expr.V_bool (Float.is_nan c.cg_qbal));
-  sink "has_pending_buy" (Strategy_expr.V_bool has_pending_buy);
-  sink "has_tracked_buy" (Strategy_expr.V_bool has_tracked_buy);
-  sink "inflight_cancel_buy" (Strategy_expr.V_bool inflight_cancel_buy);
-  sink "inflight_amend_buy" (Strategy_expr.V_bool inflight_amend_buy);
-  sink "open_buy_count" (Strategy_expr.V_int c.cg_open_buy_count);
-  sink "has_recent_amend_buy" (Strategy_expr.V_bool c.cg_has_recent_amend_buy)
+  sink Slots.oracle_halted (Strategy_expr.V_bool c.cg_oracle_halted);
+  sink Slots.tif_recovery_pending (Strategy_expr.V_bool pending);
+  sink Slots.tif_recovery_since (Strategy_expr.V_float since);
+  sink Slots.price_nan (Strategy_expr.V_bool (Float.is_nan c.cg_price));
+  sink Slots.maker_fee_set (Strategy_expr.V_bool maker_fee_set);
+  sink Slots.fee_refresh_due (Strategy_expr.V_bool (c.cg_cycle land 0x3ff = 0));
+  sink Slots.check_stale_balance (Strategy_expr.V_bool check_stale_balance);
+  sink Slots.asset_balance_nan (Strategy_expr.V_bool (Float.is_nan c.cg_abal));
+  sink Slots.quote_balance_nan (Strategy_expr.V_bool (Float.is_nan c.cg_qbal));
+  sink Slots.has_pending_buy (Strategy_expr.V_bool has_pending_buy);
+  sink Slots.has_tracked_buy (Strategy_expr.V_bool has_tracked_buy);
+  sink Slots.inflight_cancel_buy (Strategy_expr.V_bool inflight_cancel_buy);
+  sink Slots.inflight_amend_buy (Strategy_expr.V_bool inflight_amend_buy);
+  sink Slots.open_buy_count (Strategy_expr.V_int c.cg_open_buy_count);
+  sink Slots.has_recent_amend_buy (Strategy_expr.V_bool c.cg_has_recent_amend_buy)
 ;;
 
 (** Fine path: the stale-balance side effect (record the cycle on the state). The file
@@ -510,7 +516,7 @@ let buy_cancel c =
 ;;
 
 (** Fine path branch: compute the fresh-buy plan and publish its branch facts. *)
-let buy_place_plan c =
+let buy_place_plan c sink =
   match c.cg_state, c.cg_asset with
   | Some state, Some asset ->
     let p =
@@ -527,20 +533,17 @@ let buy_place_plan c =
         ~closest_sell_order_initial:c.cg_closest_sell_order
     in
     c.cg_buy_plan <- Some p;
-    [ "buy_price", Strategy_expr.V_float p.bp_price
-    ; "buy_qty", Strategy_expr.V_float p.bp_qty
-    ; "buy_quote_needed", Strategy_expr.V_float p.bp_quote_needed
-    ; "buy_available", Strategy_expr.V_float p.bp_available
-    ; "buy_balance_ok", Strategy_expr.V_bool p.bp_balance_ok
-    ; "buy_capital_low", Strategy_expr.V_bool p.bp_capital_low
-    ; "buy_crossing", Strategy_expr.V_bool p.bp_crossing
-    ; "buy_quote_nan", Strategy_expr.V_bool p.bp_quote_nan
-    ; "buy_cooldown", Strategy_expr.V_bool p.bp_cooldown
-    ; "buy_inflight", Strategy_expr.V_bool p.bp_inflight
-    ]
-  | _ ->
-    c.cg_buy_plan <- None;
-    []
+    sink Slots.buy_price (Strategy_expr.V_float p.bp_price);
+    sink Slots.buy_qty (Strategy_expr.V_float p.bp_qty);
+    sink Slots.buy_quote_needed (Strategy_expr.V_float p.bp_quote_needed);
+    sink Slots.buy_available (Strategy_expr.V_float p.bp_available);
+    sink Slots.buy_balance_ok (Strategy_expr.V_bool p.bp_balance_ok);
+    sink Slots.buy_capital_low (Strategy_expr.V_bool p.bp_capital_low);
+    sink Slots.buy_crossing (Strategy_expr.V_bool p.bp_crossing);
+    sink Slots.buy_quote_nan (Strategy_expr.V_bool p.bp_quote_nan);
+    sink Slots.buy_cooldown (Strategy_expr.V_bool p.bp_cooldown);
+    sink Slots.buy_inflight (Strategy_expr.V_bool p.bp_inflight)
+  | _ -> c.cg_buy_plan <- None
 ;;
 
 let buy_plan_exn c =
@@ -739,7 +742,7 @@ let sell_place c =
 ;;
 
 (** Fine path sell phase 3 facts: publish the excess-sweep gate. *)
-let sell_finalize_facts c =
+let sell_finalize_facts c sink =
   match c.cg_sell_pre with
   | Some pre ->
     let remaintain =
@@ -758,16 +761,17 @@ let sell_finalize_facts c =
       | Some age -> age <= Platform_accounting.sweep_max_balance_age_s
       | None -> true
     in
-    [ "remaintain_expired_sells", Strategy_expr.V_bool remaintain
-    ; "sell_missing_empty", Strategy_expr.V_bool (!(pre.sp_missing_after_reconcile) = [])
-    ; "just_filled_buy", Strategy_expr.V_bool just_filled
-    ; "resuming_after_balance", Strategy_expr.V_bool resuming
-    ; "buy_attempted", Strategy_expr.V_bool c.cg_buy_attempted
-    ; "sell_pushed", Strategy_expr.V_bool !(pre.sp_sell_pushed)
-    ; "has_active_sell", Strategy_expr.V_bool active_sell
-    ; "balance_fresh", Strategy_expr.V_bool balance_fresh
-    ]
-  | None -> []
+    sink Slots.remaintain_expired_sells (Strategy_expr.V_bool remaintain);
+    sink
+      Slots.sell_missing_empty
+      (Strategy_expr.V_bool (!(pre.sp_missing_after_reconcile) = []));
+    sink Slots.just_filled_buy (Strategy_expr.V_bool just_filled);
+    sink Slots.resuming_after_balance (Strategy_expr.V_bool resuming);
+    sink Slots.buy_attempted (Strategy_expr.V_bool c.cg_buy_attempted);
+    sink Slots.sell_pushed (Strategy_expr.V_bool !(pre.sp_sell_pushed));
+    sink Slots.has_active_sell (Strategy_expr.V_bool active_sell);
+    sink Slots.balance_fresh (Strategy_expr.V_bool balance_fresh)
+  | None -> ()
 ;;
 
 (** Fine path sell phase 3a: retry-latch bookkeeping. *)

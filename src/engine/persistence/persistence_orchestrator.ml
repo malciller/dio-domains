@@ -387,7 +387,10 @@ let create ~filename ~parse ~serialize =
       pending
   in
   drainers := drain :: !drainers;
-  ignore (Domain.spawn (background_worker t));
+  ignore
+    (Domain.spawn (fun () ->
+       Gc_config.apply ();
+       background_worker t ()));
   t
 ;;
 
