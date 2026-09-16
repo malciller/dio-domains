@@ -218,12 +218,12 @@ module type ENGINE = sig
 
   (** [measure ctx phase f] runs [f] and attributes its time/allocation to [phase] when
       per-cycle profiling is enabled. *)
-  val measure : ctx -> phase -> (unit -> unit) -> unit
+  val measure : ctx -> phase -> local_ (unit -> unit) -> unit
 end
 
 module Make (E : ENGINE) = struct
   let handler (ctx : E.ctx) : Strategy_runtime.handler =
-    let[@inline] ph phase f =
+    let[@inline] ph phase (local_ (f : unit -> unit)) =
       E.measure ctx phase f;
       []
     in
