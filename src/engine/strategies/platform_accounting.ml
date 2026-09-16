@@ -75,26 +75,31 @@ let no_unnetted_hold = [], 0.0
 let no_unreflected_credit = [], 0.0
 
 let unnetted_sell_hold ~use_unnetted ~holds ~last_balance_delta ~now ~base_balance_age =
-  if (not use_unnetted) || holds = []
-  then no_unnetted_hold
-  else (
-    let cutoff = unreflected_cutoff ~now ~base_balance_age in
-    let grace_cutoff = now -. sell_hold_netting_grace_s in
-    (* A message may certify netting only if its move was flat or down. An increase (buy
-       fill) cannot have applied a sell hold. The tolerance absorbs the float jitter
-       between an adopted venue figure and the same figure recomputed by the venue model,
-       which otherwise reads as a tiny positive "increase" and wedges the hold. *)
-    let message_may_certify = last_balance_delta <= balance_delta_epsilon in
-    let rec go unnetted acc = function
-      | [] -> List.rev acc, unnetted
-      | (placed_at, qty) :: rest ->
-        let grace_expired = placed_at < grace_cutoff in
-        let released_by_message = message_may_certify && placed_at < cutoff in
-        if grace_expired || released_by_message
-        then go unnetted acc rest
-        else go (unnetted +. qty) ((placed_at, qty) :: acc) rest
-    in
-    go 0.0 [] holds)
+  match holds with
+  | [] -> no_unnetted_hold
+  | _ :: _ ->
+    (* Holds are retained verbatim when the overlay is disabled; only the empty case can
+       share the constant, since a non-empty list must be passed back unchanged. *)
+    if not use_unnetted
+    then holds, 0.0
+    else (
+      let cutoff = unreflected_cutoff ~now ~base_balance_age in
+      let grace_cutoff = now -. sell_hold_netting_grace_s in
+      (* A message may certify netting only if its move was flat or down. An increase (buy
+         fill) cannot have applied a sell hold. The tolerance absorbs the float jitter
+         between an adopted venue figure and the same figure recomputed by the venue
+         model, which otherwise reads as a tiny positive "increase" and wedges the hold. *)
+      let message_may_certify = last_balance_delta <= balance_delta_epsilon in
+      let rec go unnetted acc = function
+        | [] -> List.rev acc, unnetted
+        | (placed_at, qty) :: rest ->
+          let grace_expired = placed_at < grace_cutoff in
+          let released_by_message = message_may_certify && placed_at < cutoff in
+          if grace_expired || released_by_message
+          then go unnetted acc rest
+          else go (unnetted +. qty) ((placed_at, qty) :: acc) rest
+      in
+      go 0.0 [] holds)
 ;;
 
 (** Retires the OLDEST outstanding sell holds against an observed tradeable drop of
