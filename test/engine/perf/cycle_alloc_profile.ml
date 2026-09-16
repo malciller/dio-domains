@@ -90,6 +90,10 @@ let () =
             Printf.sprintf "sell-%d" i, 100.0 +. float i, 1.0, "sell", None)
         in
         fun f -> List.iter (fun (id, p, q, s, u) -> f id p q s u) orders);
+    (* Representative delta: one same-price sell amend per cycle, no overflow, so the
+       measured cycle is the production incremental path rather than a full rescan. *)
+    ctx.cg_drain
+    <- (fun ~symbol:_ -> [ "sell-0", Some (Some 100.0, 1.0, "sell", None) ], false);
     let module H = SA.Make (SCE) in
     let rt = SR.create ~handlers:(H.handler ctx) file in
     let event = SR.make_event "book_update" [] in
