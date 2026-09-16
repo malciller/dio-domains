@@ -445,9 +445,6 @@ let init_trading_engine_sync (config : Dio_engine.Config.config) =
   (* Live survivor profiler (DIO_MEMPROF_LIVE=1) started before any domain is spawned so
      every domain joins the profile. *)
   Leak_probe.start ();
-  (* Keep the main domain (Lwt scheduler: supervisor, oracle, dashboard callbacks) off the
-     trading P-cores so it cannot preempt a trading cycle. *)
-  Thread_affinity.pin_self_background ();
   let configs_with_fees = Supervisor.start_monitoring () in
   (* Spawn one supervised domain per asset to consume market data and execute strategies. *)
   Logging.info ~section:"main" "Initializing supervised asset domains...";
