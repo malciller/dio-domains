@@ -18,17 +18,26 @@
       "symbol": "BTC/USDC",
       "exchange": "hyperliquid",
       "qty": "0.0001",
-      "grid_interval": [0.1, 0.5],
+      "grid_interval": [
+        0.1,
+        0.5
+      ],
       "strategy": "Ladder",
       "testnet": true,
       "sell_mult": "0.99",
-      "accumulation_buffer": [0.1, 0.5]
+      "accumulation_buffer": [
+        0.1,
+        0.5
+      ]
     },
     {
       "symbol": "SPY",
       "exchange": "alpaca",
       "qty": "0.01",
-      "grid_interval": [0.1, 0.5],
+      "grid_interval": [
+        0.1,
+        0.5
+      ],
       "strategy": "Ladder",
       "testnet": true,
       "data_feed": "iex",
