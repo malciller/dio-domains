@@ -67,6 +67,7 @@ let intern_key (s : string) : int =
 let interned_key_count () = Atomic.get key_next
 
 type value = Strategy_actions.value =
+  | V_unset
   | V_none
   | V_float of float
   | V_int of int
@@ -132,6 +133,7 @@ let parse_ref (raw : string) : (ref_, string) result =
 let refs_in (s : string) : (ref_, string) result list = List.map parse_ref (raw_refs s)
 
 let string_of_value = function
+  | V_unset -> ""
   | V_none -> ""
   | V_float f -> string_of_float f
   | V_int i -> string_of_int i

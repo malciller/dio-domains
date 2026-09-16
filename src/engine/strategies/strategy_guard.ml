@@ -8,9 +8,9 @@ type facts =
   { event_kind : unit -> string (* "" when no event is in context *)
   ; side : unit -> string (* "" when the event has no side *)
   ; pending : string -> bool
-  ; engine_flag : string -> Strategy_expr.value option
-  ; capacity : string -> Strategy_expr.value option
-  ; signal : string -> Strategy_expr.value option
+  ; engine_flag : string -> Strategy_expr.value
+  ; capacity : string -> Strategy_expr.value
+  ; signal : string -> Strategy_expr.value
   ; order_posture : string -> string -> bool
   }
 
@@ -90,8 +90,8 @@ let rec eval_guard_exn
          | Error m -> raise (Strategy_expr.Eval_error m)
          | Ok (asset, op) ->
            (match facts.capacity asset with
-            | None -> false
-            | Some fact ->
+            | Strategy_expr.V_unset -> false
+            | fact ->
               (match Strategy_expr.eval_arg env expr_s with
                | Error m -> raise (Strategy_expr.Eval_error m)
                | Ok ev ->
@@ -152,8 +152,8 @@ and eval_fact_map_exn lookup kvs =
     | [] -> true
     | (k, v) :: rest ->
       (match lookup k with
-       | None -> false
-       | Some fact ->
+       | Strategy_expr.V_unset -> false
+       | fact ->
          if Strategy_expr.value_eq fact (Strategy_expr.value_of_literal v)
          then loop rest
          else false)
@@ -208,8 +208,8 @@ and capacity_all compiled env facts =
      | Error m -> raise (Strategy_expr.Eval_error m)
      | Ok (asset, op) ->
        (match facts.capacity asset with
-        | None -> false
-        | Some fact ->
+        | Strategy_expr.V_unset -> false
+        | fact ->
           (match expr_r with
            | Error m -> raise (Strategy_expr.Eval_error m)
            | Ok e ->

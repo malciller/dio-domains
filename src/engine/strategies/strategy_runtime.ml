@@ -67,10 +67,10 @@ type handler = { run : t -> string -> (string * value) list -> (int * value) lis
 
 and t =
   { file : Strategy_file.t
-  ; mutable state : value option array
-  ; params : value option array
-  ; mutable signals : value option array
-  ; mutable platform : value option array
+  ; mutable state : value array
+  ; mutable params : value array
+  ; mutable signals : value array
+  ; mutable platform : value array
   ; locals : (string, value) Hashtbl.t
   ; guard_cache : (string, (Strategy_expr.expr, string) result) Hashtbl.t
   ; mutable compiled : compiled_step list
@@ -127,28 +127,27 @@ let default_float = function
   | _ -> 0.0
 ;;
 
-(** Growable slot-addressed value table. [None] means "not set"; [Some V_none] is a real
-    value, so a missing fact is distinguishable from a fact explicitly set to none. *)
-let set_arr (a : value option array) slot (v : value) : value option array =
+(** Growable slot-addressed value table. [V_unset] means "not published"; [V_none] is a
+    real value, so a missing fact stays distinguishable from a fact set to none - without
+    the [Some] box that a [value option array] allocated on every publish. *)
+let set_arr (a : value array) slot (v : value) : value array =
   if slot < Array.length a
   then (
-    a.(slot) <- Some v;
+    a.(slot) <- v;
     a)
   else (
     let n = Array.length a in
     let n' = max (slot + 1) (max 8 (n * 2)) in
-    let na = Array.make n' None in
+    let na = Array.make n' V_unset in
     Array.blit a 0 na 0 n;
-    na.(slot) <- Some v;
+    na.(slot) <- v;
     na)
 ;;
 
-let get_arr (a : value option array) slot =
-  if slot < Array.length a then a.(slot) else None
-;;
+let get_arr (a : value array) slot = if slot < Array.length a then a.(slot) else V_unset
 
 let expand_params (file : Strategy_file.t) (overrides : (string * value) list) =
-  let arr = ref (Array.make (max 8 (interned_key_count ())) None) in
+  let arr = ref (Array.make (max 8 (interned_key_count ())) V_unset) in
   let set k v = arr := set_arr !arr (intern_key k) v in
   List.iter
     (fun (p : Strategy_file.param) ->
@@ -306,7 +305,7 @@ let create ?(handlers = noop_handler) ?(params = []) (file : Strategy_file.t) =
     List.fold_left
       (fun a (s : Strategy_file.state_decl) ->
         set_arr a (intern_key s.s_name) (default_of_kind s.s_kind))
-      (Array.make (max 8 (interned_key_count ())) None)
+      (Array.make (max 8 (interned_key_count ())) V_unset)
       file.state
   in
   let guard_memo : Strategy_guard.memo =
@@ -321,8 +320,8 @@ let create ?(handlers = noop_handler) ?(params = []) (file : Strategy_file.t) =
     { file
     ; state
     ; params = expand_params file params
-    ; signals = Array.make (max 8 (interned_key_count ())) None
-    ; platform = Array.make (max 8 (interned_key_count ())) None
+    ; signals = Array.make (max 8 (interned_key_count ())) V_unset
+    ; platform = Array.make (max 8 (interned_key_count ())) V_unset
     ; locals = Hashtbl.create 8
     ; guard_cache = Hashtbl.create 32
     ; compiled = []
@@ -355,15 +354,15 @@ let create ?(handlers = noop_handler) ?(params = []) (file : Strategy_file.t) =
 let bump_gen t = t.guard_memo.memo_gen <- t.guard_memo.memo_gen + 1
 
 (** True when [slot] already holds a value equal to [v], so republishing it is a no-op.
-    Most facts (flags, balances, prices) are unchanged cycle to cycle, so this skips both
-    the [Some] box allocated by {!set_arr} and the guard-memo invalidation on the common
-    path. Structural equality on the [value] variant allocates nothing. *)
-let[@inline] slot_unchanged (a : value option array) slot (v : value) =
+    Most facts (flags, balances, prices) are unchanged cycle to cycle, so this skips the
+    store and the guard-memo invalidation on the common path. Structural equality on the
+    [value] variant allocates nothing. *)
+let[@inline] slot_unchanged (a : value array) slot (v : value) =
   slot < Array.length a
   &&
   match Array.unsafe_get a slot with
-  | Some x -> x = v
-  | None -> false
+  | V_unset -> false
+  | x -> x = v
 ;;
 
 let set_state t k v =
@@ -446,13 +445,13 @@ let env_of t : env =
   ; state =
       (fun slot ->
         match get_arr t.state slot with
-        | Some v -> v
-        | None -> V_none)
+        | V_unset -> V_none
+        | v -> v)
   ; param =
       (fun slot ->
         match get_arr t.params slot with
-        | Some v -> v
-        | None -> miss t)
+        | V_unset -> miss t
+        | v -> v)
   ; local =
       (fun n ->
         match Hashtbl.find t.locals n with
@@ -461,14 +460,14 @@ let env_of t : env =
   ; signal =
       (fun slot ->
         match get_arr t.signals slot with
-        | Some v -> v
-        | None -> miss t)
+        | V_unset -> miss t
+        | v -> v)
   ; now = (fun () -> V_float t.now)
   ; platform =
       (fun slot ->
         match get_arr t.platform slot with
-        | Some v -> v
-        | None -> miss t)
+        | V_unset -> miss t
+        | v -> v)
   }
 ;;
 
@@ -489,7 +488,7 @@ let facts_of t : Strategy_guard.facts =
   ; pending =
       (fun p ->
         match get_arr t.platform (intern_key ("pending:" ^ p)) with
-        | Some (V_bool b) -> b
+        | V_bool b -> b
         | _ -> false)
   ; engine_flag = (fun k -> get_arr t.platform (intern_key ("engine:" ^ k)))
   ; capacity = (fun a -> get_arr t.platform (intern_key ("capacity:" ^ a)))
@@ -593,17 +592,19 @@ let apply_binds t (ca : compiled_action) out =
       ca.ca_bind
 ;;
 
-(** Evaluate a single serialized argument to its [value] (no [Ok]/tuple/list). *)
+(** Evaluate a single serialized argument to its [value] (no [Ok]/tuple/list). [V_unset]
+    signals an evaluation error - it is the slot sentinel and never a real value, so this
+    avoids the [Some]/[None] box the option return used to allocate. *)
 let eval_arg_value e (a : compiled_arg) =
   match a with
-  | ALit v -> Some v
+  | ALit v -> v
   | AExpr ex ->
-    (try Some (Strategy_expr.eval_value e ex) with
-     | Strategy_expr.Eval_error _ -> None)
+    (try Strategy_expr.eval_value e ex with
+     | Strategy_expr.Eval_error _ -> V_unset)
   | ATemplate s ->
     (match interpolate e s with
-     | Ok v -> Some v
-     | Error _ -> None)
+     | Ok v -> v
+     | Error _ -> V_unset)
 ;;
 
 let run_action t (e : env) step_id (ca : compiled_action) : action_call =
@@ -621,8 +622,8 @@ let run_action_ignore t (e : env) (ca : compiled_action) =
     (* Precompiled ["set_gate"]: no argument assoc list, no handler dispatch, no thunk -
        just evaluate the value and store it into the pre-resolved slot. *)
     (match eval_arg_value e varg with
-     | Some v -> set_state_slot t slot v
-     | None -> ())
+     | V_unset -> ()
+     | v -> set_state_slot t slot v)
   | None ->
     let args = eval_args t e ca in
     let out = t.handlers.run t ca.ca_name args in
@@ -654,6 +655,39 @@ let rec apply_lets e t = function
     apply_lets e t rest
 ;;
 
+(** Top-level step loop: the previous [List.iter (fun cs -> ...)] and the [run_steps]
+    dispatch closure both allocated on every cycle. Hoisting the loop removes both; the
+    action iterator is chosen by the [collect] flag instead of a closure. *)
+let rec iter_steps t e facts ~prof ~collect calls stop = function
+  | [] -> ()
+  | (cs : compiled_step) :: rest ->
+    if not !stop
+    then (
+      if t.has_lets
+      then (
+        if Hashtbl.length t.locals > 0 then Hashtbl.reset t.locals;
+        apply_lets e t cs.cs_let);
+      let passed =
+        match cs.cs_guard with
+        | None -> true
+        | Some g ->
+          (* Precompiled closure: no per-cycle parse/cache lookup; an unresolved guard is
+             treated as false. Timed only when there is a guard. *)
+          let g0 = if prof then Monotonic_clock.now_ns () else 0 in
+          let r =
+            try g e facts with
+            | Eval_error _ -> false
+          in
+          if g0 > 0
+          then t.prof_guard_ns <- t.prof_guard_ns + (Monotonic_clock.now_ns () - g0);
+          r
+      in
+      let actions = if passed then cs.cs_then else cs.cs_else in
+      if collect then iter_collect t e cs.cs_id calls actions else iter_ignore t e actions;
+      if passed && cs.cs_stop then stop := true);
+    iter_steps t e facts ~prof ~collect calls stop rest
+;;
+
 (** Run one cycle for a dispatch kind. The snapshot phase is
     [make_event "book_update" []]; execution events carry their fields. Returns the
     ordered action calls made this cycle. *)
@@ -678,39 +712,7 @@ let run_cycle ?(collect = true) t ~(price : float) ~(now : float) ~(event : even
   let facts = facts_cached t in
   let calls = ref [] in
   let stop = ref false in
-  let run_steps =
-    if collect
-    then fun step_id calls actions -> iter_collect t e step_id calls actions
-    else fun _step_id _calls actions -> iter_ignore t e actions
-  in
-  List.iter
-    (fun (cs : compiled_step) ->
-      if not !stop
-      then (
-        if t.has_lets
-        then (
-          if Hashtbl.length t.locals > 0 then Hashtbl.reset t.locals;
-          apply_lets e t cs.cs_let);
-        let passed =
-          match cs.cs_guard with
-          | None -> true
-          | Some g ->
-            (* Precompiled closure: no per-cycle parse/cache lookup; an unresolved guard
-               is treated as false, matching the previous result-matching behavior. Timed
-               only when there is a guard, so guardless steps pay no clock read. *)
-            let g0 = if prof then Monotonic_clock.now_ns () else 0 in
-            let r =
-              try g e facts with
-              | Eval_error _ -> false
-            in
-            if g0 > 0
-            then t.prof_guard_ns <- t.prof_guard_ns + (Monotonic_clock.now_ns () - g0);
-            r
-        in
-        let actions = if passed then cs.cs_then else cs.cs_else in
-        run_steps cs.cs_id calls actions;
-        if passed && cs.cs_stop then stop := true))
-    t.compiled;
+  iter_steps t e facts ~prof ~collect calls stop t.compiled;
   if prof then t.prof_cpu_ns <- Monotonic_clock.thread_cpu_ns () - cpu0;
   List.rev !calls
 ;;

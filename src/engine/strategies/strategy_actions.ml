@@ -25,6 +25,11 @@ type class_ =
   | Read
 
 type value =
+  | V_unset
+    (* Slot-array sentinel: "this fact has never been published". Never a user value and
+       never produced by evaluation; lets a slot hold a [value] directly instead of a
+       [value option], so publishing a fact stores it without allocating a [Some] box on
+       the hot path. *)
   | V_none
   | V_float of float
   | V_int of int
