@@ -223,7 +223,7 @@ end
 
 module Make (E : ENGINE) = struct
   let handler (ctx : E.ctx) : Strategy_runtime.handler =
-    let ph phase f =
+    let[@inline] ph phase f =
       E.measure ctx phase f;
       []
     in

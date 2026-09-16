@@ -98,7 +98,7 @@ let create () =
 (** Per-cycle phase attribution. Cheap on the hot path: when profiling is off it just runs
     [f]; when on it reads the domain-local minor-word counter and monotonic clock and
     accumulates into the strategy-state scratch fields the dashboard reads. *)
-let measure c (phase : Strategy_actions_cycle.phase) f =
+let[@inline] measure c (phase : Strategy_actions_cycle.phase) f =
   if not c.cg_profile
   then f ()
   else (
