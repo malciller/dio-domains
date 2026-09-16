@@ -390,7 +390,6 @@ let create ~filename ~parse ~serialize =
   ignore
     (Domain.spawn (fun () ->
        Gc_config.apply ();
-       Thread_affinity.pin_self_background ();
        background_worker t ()));
   t
 ;;
