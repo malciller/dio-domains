@@ -18,6 +18,7 @@ external pin_current_thread : int -> bool = "dio_pin_current_thread"
 external pin_current_thread_range : int -> int -> bool = "dio_pin_current_thread_range"
 external allowed_cpu_count : unit -> int = "dio_allowed_cpu_count"
 external set_current_idle : unit -> bool = "dio_set_current_idle"
+external set_current_rt : int -> bool = "dio_set_current_rt"
 
 let ( let* ) = Option.bind
 
@@ -211,6 +212,21 @@ let set_self_idle () =
     Logging.debug_f
       ~section:"affinity"
       "could not set SCHED_IDLE on current thread (continuing with default policy)"
+;;
+
+(** Promote the calling trading domain to SCHED_FIFO at [prio] (best-effort). A real-time
+    thread cannot be preempted by any CFS thread, which is the only way to remove the
+    scheduling component of the p999 tail. Needs CAP_SYS_NICE (see deploy: --cap-add
+    SYS_NICE and running as root); without it the call fails and we log once and keep the
+    default policy. *)
+let set_self_rt prio =
+  if not (set_current_rt prio)
+  then
+    Logging.warn_f
+      ~section:"affinity"
+      "could not set SCHED_FIFO priority %d on a trading domain (need CAP_SYS_NICE); \
+       continuing with the default scheduling policy"
+      prio
 ;;
 
 let describe () =
