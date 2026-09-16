@@ -155,7 +155,8 @@ let ensure_worker () =
     ignore
       (Domain.spawn (fun () ->
          Gc_config.apply ();
-         Thread_affinity.pin_self_background ();
+         (* NOT pinned to a background E-core: parsing is on the feed critical path, and
+            an E-core stalls it enough to back the feed up and spike the trading cycles. *)
          worker_loop ()))
 ;;
 
