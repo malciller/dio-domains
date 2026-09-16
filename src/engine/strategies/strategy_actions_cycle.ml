@@ -139,7 +139,7 @@ let run t name args =
   | _ -> []
 ;;
 
-let handler : Strategy_runtime.handler = { run; resolve = (fun _ -> None) }
+let handler : Strategy_runtime.handler = { run }
 
 (* Coarse cycle operations (hybrid: coarse now, decompose later).
 
@@ -227,194 +227,81 @@ module Make (E : ENGINE) = struct
       E.measure ctx phase f;
       []
     in
-    let table
-      : ( string
-          , Strategy_runtime.t
-            -> (string * Strategy_expr.value) list
-            -> (int * Strategy_expr.value) list )
-          Hashtbl.t
-      =
-      Hashtbl.create 64
-    in
-    let add name f = Hashtbl.replace table name f in
-    add "set_gate" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Facts (fun () ->
-        match List.assoc_opt "name" args, List.assoc_opt "value" args with
-        | Some (V_string k), Some v -> Strategy_runtime.set_state t k v
-        | _ -> ()));
-    add "cycle_prepare" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Preamble (fun () -> ignore (E.prepare ctx)));
-    add "init_venue_state" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Preamble (fun () -> E.prepare_init ctx));
-    add "prepare_recovery" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Preamble (fun () -> E.prepare_recovery ctx));
-    add "resolve_book" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Preamble (fun () -> ignore (E.resolve_book ctx)));
-    add "cycle_cleanup" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Cleanup (fun () -> E.cleanup ctx));
-    add "expire_amend_cooldowns" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Cleanup (fun () -> E.expire_amend_cooldowns ctx));
-    add "evict_ghost_orders" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Cleanup (fun () -> E.evict_ghost_orders ctx));
-    add "scan_open_orders" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Sync (fun () -> E.sync ctx));
-    add "refresh_maker_fee" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Preamble (fun () -> E.refresh_fee ctx));
-    add "cycle_guard" (fun t args ->
-      ignore t;
-      ignore args;
-      let cont = E.guard ctx in
-      Strategy_runtime.set_platform_slot
-        t
-        Strategy_fact_slots.engine_continue
-        (V_bool cont);
-      []);
-    add "buy_gate" (fun t args ->
-      ignore t;
-      ignore args;
-      let active = E.buy_gate ctx in
-      Strategy_runtime.set_platform_slot
-        t
-        Strategy_fact_slots.engine_buy_active
-        (V_bool active);
-      []);
-    add "expire_tif_recovery" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Preamble (fun () -> E.expire_tif_recovery ctx));
-    add "cycle_facts" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Facts (fun () -> E.cycle_facts ctx t));
-    add "early_facts" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Facts (fun () -> E.early_facts ctx t));
-    add "mark_stale_cycle" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Preamble (fun () -> E.mark_stale ctx));
-    add "cancel_excess_buys" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Buy (fun () -> E.buy_cancel ctx));
-    add "buy_place" (fun t args ->
-      ignore t;
-      ignore args;
-      ph Buy (fun () -> E.buy_place ctx));
-    add "buy_place_plan" (fun t args ->
-      ignore t;
-      ignore args;
-      ph BuyPlan (fun () -> E.buy_place_plan ctx t));
-    add "buy_place_send" (fun t args ->
-      ignore t;
-      ignore args;
-      ph BuyPlan (fun () -> E.buy_place_send ctx));
-    add "buy_place_send_insufficient" (fun t args ->
-      ignore t;
-      ignore args;
-      ph BuyPlan (fun () -> E.buy_place_send_insufficient ctx));
-    add "buy_place_latch_capital_low" (fun t args ->
-      ignore t;
-      ignore args;
-      ph BuyPlan (fun () -> E.buy_place_latch_capital_low ctx));
-    add "buy_place_warn_quote" (fun t args ->
-      ignore t;
-      ignore args;
-      ph BuyPlan (fun () -> E.buy_place_warn_quote ctx));
-    add "buy_amend" (fun t args ->
-      ignore t;
-      ignore args;
-      ph BuyAmend (fun () -> E.buy_amend ctx));
-    add "buy_amend_has_sell" (fun t args ->
-      ignore t;
-      ignore args;
-      ph BuyAmend (fun () ->
-        Strategy_runtime.set_platform_slot
-          t
-          Strategy_fact_slots.amend_has_sell
-          (V_bool (E.buy_amend_has_sell ctx))));
-    add "buy_amend_with_sell" (fun t args ->
-      ignore t;
-      ignore args;
-      ph BuyAmend (fun () -> E.buy_amend_with_sell ctx));
-    add "buy_amend_no_sell" (fun t args ->
-      ignore t;
-      ignore args;
-      ph BuyAmend (fun () -> E.buy_amend_no_sell ctx));
-    add "plan_sell_order" (fun t args ->
-      ignore t;
-      ignore args;
-      ph SellPlan (fun () -> E.sell_prepare ctx));
-    add "sell_place" (fun t args ->
-      ignore t;
-      ignore args;
-      ph SellPlace (fun () -> E.sell_place ctx));
-    add "sell_place_should" (fun t args ->
-      ignore t;
-      ignore args;
-      ph SellPlace (fun () ->
-        Strategy_runtime.set_platform_slot
-          t
-          Strategy_fact_slots.sell_place_should
-          (V_bool (E.sell_place_should ctx))));
-    add "sell_place_body" (fun t args ->
-      ignore t;
-      ignore args;
-      ph SellPlace (fun () -> E.sell_place_body ctx));
-    add "sell_finalize" (fun t args ->
-      ignore t;
-      ignore args;
-      ph SellFinalize (fun () -> E.sell_finalize ctx));
-    add "sell_finalize_facts" (fun t args ->
-      ignore t;
-      ignore args;
-      ph SfinEnd (fun () -> E.sell_finalize_facts ctx t));
-    add "sell_finalize_latch" (fun t args ->
-      ignore t;
-      ignore args;
-      ph SfinLatch (fun () -> E.sell_finalize_latch ctx));
-    add "sell_excess_sweep_phase" (fun t args ->
-      ignore t;
-      ignore args;
-      ph SfinSweep (fun () -> E.sell_excess_sweep_phase ctx));
-    add "sell_finalize_end" (fun t args ->
-      ignore t;
-      ignore args;
-      ph SfinEnd (fun () -> E.sell_finalize_end ctx));
-    add "apply_order_event" (fun t args ->
-      ignore t;
-      ignore args;
-      (match Strategy_runtime.current_event t with
-       | Some ev -> E.on_event ctx ev
-       | None -> ());
-      []);
     { run =
         (fun t name args ->
-          match Hashtbl.find_opt table name with
-          | Some f -> f t args
-          | None -> [])
-    ; resolve = (fun name -> Hashtbl.find_opt table name)
+          match name with
+          | "set_gate" ->
+            ph Facts (fun () ->
+              match List.assoc_opt "name" args, List.assoc_opt "value" args with
+              | Some (V_string k), Some v -> Strategy_runtime.set_state t k v
+              | _ -> ())
+          | "cycle_prepare" -> ph Preamble (fun () -> ignore (E.prepare ctx))
+          | "init_venue_state" -> ph Preamble (fun () -> E.prepare_init ctx)
+          | "prepare_recovery" -> ph Preamble (fun () -> E.prepare_recovery ctx)
+          | "resolve_book" -> ph Preamble (fun () -> ignore (E.resolve_book ctx))
+          | "cycle_cleanup" -> ph Cleanup (fun () -> E.cleanup ctx)
+          | "expire_amend_cooldowns" ->
+            ph Cleanup (fun () -> E.expire_amend_cooldowns ctx)
+          | "evict_ghost_orders" -> ph Cleanup (fun () -> E.evict_ghost_orders ctx)
+          | "scan_open_orders" -> ph Sync (fun () -> E.sync ctx)
+          | "refresh_maker_fee" -> ph Preamble (fun () -> E.refresh_fee ctx)
+          | "cycle_guard" ->
+            let cont = E.guard ctx in
+            Strategy_runtime.set_platform_slot
+              t
+              Strategy_fact_slots.engine_continue
+              (V_bool cont);
+            []
+          | "buy_gate" ->
+            let active = E.buy_gate ctx in
+            Strategy_runtime.set_platform_slot
+              t
+              Strategy_fact_slots.engine_buy_active
+              (V_bool active);
+            []
+          | "expire_tif_recovery" -> ph Preamble (fun () -> E.expire_tif_recovery ctx)
+          | "cycle_facts" -> ph Facts (fun () -> E.cycle_facts ctx t)
+          | "early_facts" -> ph Facts (fun () -> E.early_facts ctx t)
+          | "mark_stale_cycle" -> ph Preamble (fun () -> E.mark_stale ctx)
+          | "cancel_excess_buys" -> ph Buy (fun () -> E.buy_cancel ctx)
+          | "buy_place" -> ph Buy (fun () -> E.buy_place ctx)
+          | "buy_place_plan" -> ph BuyPlan (fun () -> E.buy_place_plan ctx t)
+          | "buy_place_send" -> ph BuyPlan (fun () -> E.buy_place_send ctx)
+          | "buy_place_send_insufficient" ->
+            ph BuyPlan (fun () -> E.buy_place_send_insufficient ctx)
+          | "buy_place_latch_capital_low" ->
+            ph BuyPlan (fun () -> E.buy_place_latch_capital_low ctx)
+          | "buy_place_warn_quote" -> ph BuyPlan (fun () -> E.buy_place_warn_quote ctx)
+          | "buy_amend" -> ph BuyAmend (fun () -> E.buy_amend ctx)
+          | "buy_amend_has_sell" ->
+            ph BuyAmend (fun () ->
+              Strategy_runtime.set_platform_slot
+                t
+                Strategy_fact_slots.amend_has_sell
+                (V_bool (E.buy_amend_has_sell ctx)))
+          | "buy_amend_with_sell" -> ph BuyAmend (fun () -> E.buy_amend_with_sell ctx)
+          | "buy_amend_no_sell" -> ph BuyAmend (fun () -> E.buy_amend_no_sell ctx)
+          | "plan_sell_order" -> ph SellPlan (fun () -> E.sell_prepare ctx)
+          | "sell_place" -> ph SellPlace (fun () -> E.sell_place ctx)
+          | "sell_place_should" ->
+            ph SellPlace (fun () ->
+              Strategy_runtime.set_platform_slot
+                t
+                Strategy_fact_slots.sell_place_should
+                (V_bool (E.sell_place_should ctx)))
+          | "sell_place_body" -> ph SellPlace (fun () -> E.sell_place_body ctx)
+          | "sell_finalize" -> ph SellFinalize (fun () -> E.sell_finalize ctx)
+          | "sell_finalize_facts" -> ph SfinEnd (fun () -> E.sell_finalize_facts ctx t)
+          | "sell_finalize_latch" -> ph SfinLatch (fun () -> E.sell_finalize_latch ctx)
+          | "sell_excess_sweep_phase" ->
+            ph SfinSweep (fun () -> E.sell_excess_sweep_phase ctx)
+          | "sell_finalize_end" -> ph SfinEnd (fun () -> E.sell_finalize_end ctx)
+          | "apply_order_event" ->
+            (match Strategy_runtime.current_event t with
+             | Some ev -> E.on_event ctx ev
+             | None -> ());
+            []
+          | _ -> [])
     }
   ;;
 end

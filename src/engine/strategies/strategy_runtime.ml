@@ -45,17 +45,14 @@ type compiled_action =
   ; ca_args : (string * compiled_arg) list
   ; ca_bind : (string * string) list
   ; ca_gate : (int * compiled_arg) option
-      (* Precompiled ["set_gate"] fast path: [Some (slot, value)] when the gate's ["name"]
-         is a literal, so the live path can store the value into its slot without building
-         an argument assoc list or dispatching through the handler. [None] for every other
-         action (and for a dynamic gate name), which falls back to the generic path. *)
-  ; ca_fn : (t -> (string * value) list -> (int * value) list) option
-  (* Handler resolved once at load (via [handler.resolve]) so the cycle calls it directly
-     instead of matching the action name every cycle. [None] falls back to [run]. *)
+  (* Precompiled ["set_gate"] fast path: [Some (slot, value)] when the gate's ["name"] is
+     a literal, so the live path can store the value into its slot without building an
+     argument assoc list or dispatching through the handler. [None] for every other action
+     (and for a dynamic gate name), which falls back to the generic path. *)
   }
 
 (** A step with its guard compiled to a closure and its actions pre-compiled. *)
-and compiled_step =
+type compiled_step =
   { cs_id : string
   ; cs_let : (string * string) list
   ; cs_guard : (Strategy_expr.env -> Strategy_guard.facts -> bool) option
@@ -66,12 +63,7 @@ and compiled_step =
 
 (** Action handler. Inputs are argument-name-keyed (the handler matches by name); outputs
     are slot-keyed ([Strategy_fact_slots] indices) so publishing is an array store. *)
-and handler =
-  { run : t -> string -> (string * value) list -> (int * value) list
-  ; resolve : string -> (t -> (string * value) list -> (int * value) list) option
-  (** Look up an action's handler at load time so the cycle can call it directly instead
-      of matching the action name every cycle. *)
-  }
+type handler = { run : t -> string -> (string * value) list -> (int * value) list }
 
 and t =
   { file : Strategy_file.t
@@ -106,7 +98,7 @@ and t =
   ; mutable prof_missing : int
   }
 
-let noop_handler = { run = (fun _ _ _ -> []); resolve = (fun _ -> None) }
+let noop_handler = { run = (fun _ _ _ -> []) }
 
 let default_of_kind = function
   | Strategy_file.S_float -> V_float 0.0
@@ -292,7 +284,6 @@ let compile_action t (a : Strategy_file.action) : compiled_action =
   ; ca_args = List.map (fun (k, j) -> k, compile_arg t j) a.a_args
   ; ca_bind = a.a_bind
   ; ca_gate
-  ; ca_fn = t.handlers.resolve a.a_name
   }
 ;;
 
@@ -650,11 +641,7 @@ let eval_arg_value e (a : compiled_arg) =
 
 let run_action t (e : env) step_id (ca : compiled_action) : action_call =
   let args = eval_args t e ca in
-  let out =
-    match ca.ca_fn with
-    | Some f -> f t args
-    | None -> t.handlers.run t ca.ca_name args
-  in
+  let out = t.handlers.run t ca.ca_name args in
   apply_binds t ca out;
   { ac_step = step_id; ac_action = ca.ca_name; ac_args = args }
 ;;
@@ -671,11 +658,7 @@ let run_action_ignore t (e : env) (ca : compiled_action) =
      | v -> set_state_slot t slot v)
   | None ->
     let args = eval_args t e ca in
-    let out =
-      match ca.ca_fn with
-      | Some f -> f t args
-      | None -> t.handlers.run t ca.ca_name args
-    in
+    let out = t.handlers.run t ca.ca_name args in
     apply_binds t ca out
 ;;
 
