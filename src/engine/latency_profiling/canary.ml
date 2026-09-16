@@ -22,7 +22,9 @@
 let section = "canary"
 
 (** [enabled ()] honors the [DIO_CANARY] kill switch. The canary busy-spins a full core,
-    so it must be easy to disable outside a diagnostic window. *)
+    which keeps that core (and, via the shared clock domain, the package) out of deep
+    idle, so event-driven wakeups don't pay C-state/frequency exit latency. It must still
+    be easy to disable outside a diagnostic window. *)
 let enabled () =
   match Sys.getenv_opt "DIO_CANARY" with
   | Some ("0" | "false" | "off" | "no") -> false
@@ -92,5 +94,8 @@ let start () =
       "Stop-the-world canary started (threshold %s, window %.0fs)"
       (Latency_profiler.format_us threshold_us)
       window_seconds;
-    ignore (Domain.spawn (fun () -> run ~threshold_us ~window_seconds)))
+    ignore
+      (Domain.spawn (fun () ->
+         Gc_config.apply ();
+         run ~threshold_us ~window_seconds)))
 ;;

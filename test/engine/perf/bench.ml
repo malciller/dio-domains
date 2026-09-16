@@ -251,7 +251,8 @@ let bench_strategy_cycle () =
     let w0 = Gc.minor_words () in
     let total_ms =
       wall_ms (fun () ->
-        run_bench p n (fun () -> ignore (SR.run_cycle rt ~price:100.0 ~now:1.0 ~event)))
+        run_bench p n (fun () ->
+          ignore (SR.run_cycle ~collect:false rt ~price:100.0 ~now:1.0 ~event)))
     in
     let words = (Gc.minor_words () -. w0) /. float n in
     Printf.printf "  %s: %.1f words/cycle (interpreter core)\n%!" name words;
@@ -321,6 +322,7 @@ let bench_sync_scan () =
                 fun () ->
                   incr g;
                   !g)
+             ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
              ~ecfg)))
   in
   name, n, LP.percentile p 0.50, LP.percentile p 0.90, LP.percentile p 0.99, total_ms

@@ -1123,7 +1123,7 @@ let sell_leg_prepare
     else None
   in
   (match skip_reason with
-   | Some reason -> log_sell_block ~state ~now ~symbol:asset.symbol reason
+   | Some reason -> log_sell_block ~state ~now ~symbol:asset.symbol (fun () -> reason)
    | None -> ());
   let sell_pushed = ref false in
   let nothing_placeable = ref false in
@@ -1284,10 +1284,11 @@ let sell_place_body
             ~now
             ~symbol:asset.symbol
             ~kind:"sell qty below min_order_size"
-            (Printf.sprintf
-               "sell qty %.8f below min_order_size %.8f"
-               target_q
-               min_order_size);
+            (fun () ->
+               Printf.sprintf
+                 "sell qty %.8f below min_order_size %.8f"
+                 target_q
+                 min_order_size);
           0.0, false)
       else if available >= min_order_size -. 1e-9
       then
@@ -1311,13 +1312,14 @@ let sell_place_body
             ~now
             ~symbol:asset.symbol
             ~kind:"available below min_order_size (rounded)"
-            (Printf.sprintf
-               "available %.8f (bal %.8f - reserved %.8f) rounds below min_order_size \
-                %.8f"
-               available
-               asset_bal
-               state.reserved_base
-               min_order_size);
+            (fun () ->
+               Printf.sprintf
+                 "available %.8f (bal %.8f - reserved %.8f) rounds below min_order_size \
+                  %.8f"
+                 available
+                 asset_bal
+                 state.reserved_base
+                 min_order_size);
           0.0, false)
       else (
         log_sell_block
@@ -1325,12 +1327,13 @@ let sell_place_body
           ~now
           ~symbol:asset.symbol
           ~kind:"available below min_order_size"
-          (Printf.sprintf
-             "available %.8f (bal %.8f - reserved %.8f) is below min_order_size %.8f"
-             available
-             asset_bal
-             state.reserved_base
-             min_order_size);
+          (fun () ->
+             Printf.sprintf
+               "available %.8f (bal %.8f - reserved %.8f) is below min_order_size %.8f"
+               available
+               asset_bal
+               state.reserved_base
+               min_order_size);
         0.0, false))
     else if target_q >= min_order_size -. 1e-9 && target_q > 0.0
     then target_q, true
@@ -1340,7 +1343,11 @@ let sell_place_body
         ~now
         ~symbol:asset.symbol
         ~kind:"sell qty below min_order_size"
-        (Printf.sprintf "sell qty %.8f below min_order_size %.8f" target_q min_order_size);
+        (fun () ->
+           Printf.sprintf
+             "sell qty %.8f below min_order_size %.8f"
+             target_q
+             min_order_size);
       0.0, false)
   in
   if balance_ok
@@ -1405,11 +1412,8 @@ let sell_place_body
           effective_sell_qty
           sell_price)
       else
-        log_sell_block
-          ~state
-          ~now
-          ~symbol:asset.symbol
-          "order dispatch rejected (duplicate in-flight placement key)")
+        log_sell_block ~state ~now ~symbol:asset.symbol (fun () ->
+          "order dispatch rejected (duplicate in-flight placement key)"))
     else (
       (match target_sell_qty_override, target_sell_price_opt with
        | Some _, Some tp ->
@@ -1430,28 +1434,26 @@ let sell_place_body
          then (
            state.persisted_sell_levels <- new_levels;
            state.persistence_dirty <- true);
-         log_sell_block
-           ~state
-           ~now
-           ~symbol:asset.symbol
-           (Printf.sprintf
-              "persisted sell level %.4f x %.8f below venue minimum $%.2f - pruned from \
-               sell_levels_state.json (unplaceable)"
-              sell_price
-              effective_sell_qty
-              min_notional)
+         log_sell_block ~state ~now ~symbol:asset.symbol (fun () ->
+           Printf.sprintf
+             "persisted sell level %.4f x %.8f below venue minimum $%.2f - pruned from \
+              sell_levels_state.json (unplaceable)"
+             sell_price
+             effective_sell_qty
+             min_notional)
        | _ ->
          log_sell_block
            ~state
            ~now
            ~symbol:asset.symbol
            ~kind:"sellable inventory below the quote-notional minimum"
-           (Printf.sprintf
-              "sellable inventory below the quote-notional minimum (venue min $%.2f, \
-               sell_price %.4f, sell qty %.8f)"
-              min_notional
-              sell_price
-              effective_sell_qty));
+           (fun () ->
+              Printf.sprintf
+                "sellable inventory below the quote-notional minimum (venue min $%.2f, \
+                 sell_price %.4f, sell qty %.8f)"
+                min_notional
+                sell_price
+                effective_sell_qty));
       nothing_placeable := true))
   else nothing_placeable := true
 ;;
@@ -1634,6 +1636,7 @@ let execute_strategy
   ?(quote_balance_stale = false)
   ?(oracle_halted = false)
   ?(get_open_orders_generation = fun () -> -1)
+  ?(drain_open_order_changes = fun ~symbol:_ -> [], true)
   ~base_balance_age
   ~now
   (asset : trading_config)
@@ -1757,6 +1760,7 @@ let execute_strategy
             ~lot_qty
             ~iter_open_orders
             ~get_open_orders_generation
+            ~drain_open_order_changes
             ~ecfg
         in
         state.alloc_sync_words <- int_of_float (Gc.minor_words () -. a_sync_start);

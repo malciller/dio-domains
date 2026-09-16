@@ -178,6 +178,14 @@ type symbol_store =
   ; ready : bool Atomic.t
   ; last_event_time : float Atomic.t
   ; orders_mutex : Mutex.t
+  ; changes : (string * open_order option) list Atomic.t
+  (** Orders mutated since the last drain, newest first. [Some o] is the current record
+      for an add/replace, [None] a removal. Lets the strategy apply a per-order delta
+      (O(changes)) instead of an O(open-orders) rescan. Writers prepend under
+      [orders_mutex]; the reader swaps it out lock-free with {!drain_changes}. *)
+  ; changes_overflow : bool Atomic.t
+  (** Set when the change log cannot represent the delta (a full clear), forcing the
+      consumer to do a full rescan. *)
   }
 
 (** Global symbol-to-store mapping. *)
@@ -263,6 +271,8 @@ let get_symbol_store symbol =
           ; ready = Atomic.make false
           ; last_event_time = Atomic.make 0.0
           ; orders_mutex = Mutex.create ()
+          ; changes = Atomic.make []
+          ; changes_overflow = Atomic.make false
           }
         in
         Hashtbl.add symbol_stores symbol s;
@@ -279,6 +289,50 @@ let[@inline] publish_open_orders_cache store =
   let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
   Atomic.set store.open_orders_cache snapshot;
   Atomic.incr orders_generation
+;;
+
+(** Record an order whose state changed, for delta consumption by the strategy. [Some o]
+    for an add/replace, [None] for a removal. Writers prepend under [store.orders_mutex];
+    the reader swaps the list out lock-free, so the get/set here never needs a lock. *)
+let[@inline] note_change store id order =
+  Atomic.set store.changes ((id, order) :: Atomic.get store.changes)
+;;
+
+(** [drain_changes store] swaps out the [(id, order option)] changes since the last drain
+    (and the overflow flag) lock-free, so the per-cycle drain never blocks on the feed's
+    order mutex. *)
+let drain_changes store =
+  let changes = Atomic.exchange store.changes [] in
+  let overflow = Atomic.exchange store.changes_overflow false in
+  changes, overflow
+;;
+
+(** Drain the per-order change delta for [symbol]: [(changes, overflow)] where [changes]
+    is [(id, snapshot option)] in chronological order, [snapshot] being
+    [(limit_price, remaining_qty, side, order_userref)] for an add/replace and [None] for
+    a removal. [overflow] (or a missing store) means the caller must do a full rescan. *)
+let drain_open_order_changes ~symbol =
+  match Hashtbl.find_opt symbol_stores symbol with
+  | Some store ->
+    let changes, overflow = drain_changes store in
+    ( List.rev_map
+        (fun (id, (o : open_order option)) ->
+          let snap =
+            match o with
+            | Some o ->
+              Some
+                ( o.limit_price
+                , o.remaining_qty
+                , (match o.side with
+                   | Buy -> "buy"
+                   | Sell -> "sell")
+                , o.order_userref )
+            | None -> None
+          in
+          id, snap)
+        changes
+    , overflow )
+  | None -> [], true
 ;;
 
 (** Marks the store ready. Atomic flag only; safe from the Parse_worker domain, and the
@@ -370,6 +424,7 @@ let update_open_order_price ~symbol ~order_id ~new_price =
        { order with limit_price = Some new_price; last_updated = Unix.gettimeofday () }
      in
      Hashtbl.replace store.open_orders order_id updated;
+     note_change store order_id (Some updated);
      publish_open_orders_cache store;
      Logging.debug_f
        ~section
@@ -550,7 +605,9 @@ let update_open_orders store (event : execution_event) =
   then (
     if (* Terminal: remove from open orders if present. *)
        was_tracked
-    then Hashtbl.remove store.open_orders event.order_id)
+    then (
+      Hashtbl.remove store.open_orders event.order_id;
+      note_change store event.order_id None))
   else (
     (* Non-terminal: upsert. Kraken's execution snapshot replays all open orders as
        exec_type=new/status=new with minimal data: limit_price is often absent and
@@ -606,6 +663,7 @@ let update_open_orders store (event : execution_event) =
       }
     in
     Hashtbl.replace store.open_orders event.order_id order;
+    note_change store event.order_id (Some order);
     needs_cleanup := (not was_tracked) && Hashtbl.length store.open_orders > 1000);
   publish_open_orders_cache store;
   Mutex.unlock store.orders_mutex;
@@ -1082,6 +1140,7 @@ let handle_snapshot json on_heartbeat =
             if exists
             then (
               Hashtbl.remove store.open_orders order_id;
+              note_change store order_id None;
               publish_open_orders_cache store);
             Mutex.unlock store.orders_mutex;
             exists

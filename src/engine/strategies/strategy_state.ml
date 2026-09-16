@@ -281,6 +281,19 @@ type strategy_state =
          vice versa). Plain ints, no allocation; scratch only. *)
   ; mutable open_orders_scan_generation : int
   ; mutable open_orders_scan_valid : bool
+  ; mutable sell_commitments_clean : bool
+      (* True when every [sell_commitments] entry is feed-listed (no reconcile work
+         pending). Set false whenever an unlisted commitment is armed/rekeyed; recomputed
+         at the end of each full scan. Lets [sync_open_orders] skip the O(commitments)
+         reconcile walk on a cache-hit cycle. Conservative: stays false until a full scan
+         proves otherwise. *)
+  ; mutable sell_commitments_gen : int
+      (* Bumped on every [sell_commitments] mutation; invalidates the
+         [committed_sell_base] fold cache below. *)
+  ; mutable committed_sell_base_cache : float
+  ; mutable committed_sell_base_gen : int
+      (* Cached [committed_sell_base] and the [sell_commitments_gen] it was computed at.
+         The fold is O(commitments) and was run several times per cycle (HL carries ~60). *)
   ; mutable cached_feed_total : float
   ; mutable cached_open_buy_count : int
   ; mutable cached_has_recent_amend_buy : bool
@@ -293,6 +306,22 @@ type strategy_state =
          strategy cycle O(1). The cache is split from the ledger reconcile, which still
          runs every cycle to age out lost placements and re-add locally-armed commitments.
          The feed-listed sell list is reused by pointer (never mutated in place). *)
+  ; mutable feed_sell_index : (string, float * float) Hashtbl.t
+      (* Persistent feed-sell index (id -> (price, remaining qty)) backing the O(changes)
+         delta path in [sync_open_orders]: the venue's open-order change log updates only
+         the ids that moved instead of the strategy rescanning all of them. *)
+  ; mutable feed_buy_index : (string, float * float) Hashtbl.t
+      (* Persistent feed-buy index (id -> (price, remaining qty)); same role on the buy
+         side, and the source for the [best_buy] / [locked_in_buys] recompute when a buy
+         is removed or amended. *)
+  ; mutable feed_index_valid : bool
+      (* false until the first full scan populates the two indexes; a delta is only
+         applied when the indexes are a complete snapshot. Reset on overflow/reconnect so
+         the next cycle falls back to a full scan. *)
+  ; mutable cached_best_buy_id : string
+  ; mutable cached_best_buy_price : float
+      (* Best (highest-priced) resting buy in the feed; maintained incrementally and
+         recomputed from [feed_buy_index] when the top buy leaves. *)
   ; mutable last_fill_oid : string option
       (* OID of last profit-credited fill; replay resumption point *)
   ; mutable highest_startup_oid : string option
@@ -607,12 +636,21 @@ let rec get_strategy_state asset_symbol =
       ; sync_orders_seen = 0
       ; open_orders_scan_generation = -2
       ; open_orders_scan_valid = false
+      ; sell_commitments_clean = false
+      ; sell_commitments_gen = 0
+      ; committed_sell_base_cache = 0.0
+      ; committed_sell_base_gen = -1
       ; cached_feed_total = 0.0
       ; cached_open_buy_count = 0
       ; cached_has_recent_amend_buy = false
       ; cached_locked_in_buys = 0.0
       ; cached_closest_sell_order = None
       ; cached_feed_sell_orders = Strategy_sell_orders.create 16
+      ; feed_sell_index = Hashtbl.create 64
+      ; feed_buy_index = Hashtbl.create 8
+      ; feed_index_valid = false
+      ; cached_best_buy_id = ""
+      ; cached_best_buy_price = 0.0
       ; time_buy_ns = 0
       ; time_sell_ns = 0
       ; last_fill_oid = persisted_last_fill_oid
@@ -695,4 +733,49 @@ let sub_stop (s : strategy_state) (which : sub_timer) t0 =
     | Splan_reconcile -> s.time_splan_reconcile_ns <- s.time_splan_reconcile_ns + dt
     | Bplan_price -> s.time_bplan_price_ns <- s.time_bplan_price_ns + dt
     | Bplan_sells -> s.time_bplan_sells_ns <- s.time_bplan_sells_ns + dt)
+;;
+
+(** Zero every per-cycle phase-attribution scratch field. Called at the top of each
+    strategy execution (before any [measure] span runs); without it the split-phase
+    counters ([bplan]/[bamend]/[splan]/[splace]/[sfin*] and the sub-timers) accumulate
+    across cycles and the dashboard STRAT breakdown reports lifetime totals instead of the
+    cycle that produced the spike. [profiling] is set alongside so the sub-timers only pay
+    a clock read on sampled cycles. *)
+let reset_phase_metrics ?(profiling = false) (s : strategy_state) =
+  s.profiling <- profiling;
+  s.alloc_preamble_words <- 0;
+  s.time_preamble_ns <- 0;
+  s.alloc_facts_words <- 0;
+  s.time_facts_ns <- 0;
+  s.alloc_cleanup_words <- 0;
+  s.time_cleanup_ns <- 0;
+  s.alloc_sync_words <- 0;
+  s.time_sync_ns <- 0;
+  s.time_sync_scan_ns <- 0;
+  s.time_sync_rec_ns <- 0;
+  s.sync_orders_seen <- 0;
+  s.alloc_buy_words <- 0;
+  s.time_buy_ns <- 0;
+  s.alloc_buy_plan_words <- 0;
+  s.time_buy_plan_ns <- 0;
+  s.alloc_buy_amend_words <- 0;
+  s.time_buy_amend_ns <- 0;
+  s.alloc_sell_words <- 0;
+  s.time_sell_ns <- 0;
+  s.alloc_sell_plan_words <- 0;
+  s.time_sell_plan_ns <- 0;
+  s.alloc_sell_place_words <- 0;
+  s.time_sell_place_ns <- 0;
+  s.alloc_sell_finalize_words <- 0;
+  s.time_sell_finalize_ns <- 0;
+  s.alloc_sfin_latch_words <- 0;
+  s.time_sfin_latch_ns <- 0;
+  s.alloc_sfin_sweep_words <- 0;
+  s.time_sfin_sweep_ns <- 0;
+  s.alloc_sfin_end_words <- 0;
+  s.time_sfin_end_ns <- 0;
+  s.time_splan_overlays_ns <- 0;
+  s.time_splan_reconcile_ns <- 0;
+  s.time_bplan_price_ns <- 0;
+  s.time_bplan_sells_ns <- 0
 ;;

@@ -1,5 +1,13 @@
 {
   "logging_level": "info",
+  "gc": {
+    "minor_heap_size": 524288,
+    "space_overhead": 200,
+    "max_overhead": 1000000,
+    "window_size": 10,
+    "allocation_policy": 2,
+    "major_heap_increment": 1048576
+  },
   "oracle": {
     "target_survival": 0.95,
     "min_active_dsurv": 0.0,

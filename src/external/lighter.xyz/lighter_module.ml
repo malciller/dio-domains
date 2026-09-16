@@ -316,6 +316,10 @@ module Lighter_impl = struct
     Lighter_executions_feed.get_orders_generation ()
   ;;
 
+  let drain_open_order_changes ~symbol =
+    Lighter_executions_feed.drain_open_order_changes ~symbol
+  ;;
+
   let get_execution_feed_position ~symbol =
     Lighter_executions_feed.get_current_position symbol
   ;;

@@ -44,6 +44,14 @@ type symbol_store =
   (** Lock-free atomic snapshot cache of active open orders for the domain hotpath. *)
   ; ready : bool Atomic.t
   ; orders_mutex : Mutex.t
+  ; changes : (string * open_order option) list Atomic.t
+  (** Orders mutated since the last drain, newest first. [Some o] is the current record
+      for an add/replace, [None] a removal. Lets the strategy apply a per-order delta
+      (O(changes)) instead of an O(open-orders) rescan. Writers prepend under
+      [orders_mutex]; the reader swaps it out lock-free with {!drain_changes}. *)
+  ; changes_overflow : bool Atomic.t
+  (** Set when the change log cannot represent the delta (a full clear), forcing the
+      consumer to do a full rescan. *)
   }
 
 let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 32
@@ -71,6 +79,8 @@ let get_symbol_store symbol =
           ; open_orders_cache = Atomic.make []
           ; ready = Atomic.make false
           ; orders_mutex = Mutex.create ()
+          ; changes = Atomic.make []
+          ; changes_overflow = Atomic.make false
           }
         in
         Hashtbl.replace symbol_stores symbol s;
@@ -93,6 +103,49 @@ let[@inline] publish_open_orders_cache store =
   let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
   Atomic.set store.open_orders_cache snapshot;
   Atomic.incr orders_generation
+;;
+
+(** Record an order whose state changed, for delta consumption by the strategy. [Some o]
+    for an add/replace, [None] for a removal. Writers prepend under [store.orders_mutex];
+    the reader swaps the list out lock-free, so the get/set here never needs a lock. *)
+let[@inline] note_change store id order =
+  Atomic.set store.changes ((id, order) :: Atomic.get store.changes)
+;;
+
+(** [drain_changes store] swaps out the [(id, order option)] changes since the last drain
+    (and the overflow flag) lock-free, so the per-cycle drain never blocks on the feed's
+    order mutex. *)
+let drain_changes store =
+  let changes = Atomic.exchange store.changes [] in
+  let overflow = Atomic.exchange store.changes_overflow false in
+  changes, overflow
+;;
+
+(** Drain the per-order change delta for [symbol]: [(changes, overflow)] where [changes]
+    is [(id, snapshot option)] in chronological order, [snapshot] being
+    [(limit_price, remaining_qty, side, order_userref)] for an add/replace and [None] for
+    a removal. IBKR carries no userref, so it is always [None]. [overflow] (or a missing
+    store) means the caller must do a full rescan. *)
+let drain_open_order_changes ~symbol =
+  match Hashtbl.find_opt symbol_stores symbol with
+  | Some store ->
+    let changes, overflow = drain_changes store in
+    ( List.rev_map
+        (fun (id, (o : open_order option)) ->
+          let snap =
+            match o with
+            | Some o ->
+              Some
+                ( o.oo_limit_price
+                , o.oo_remaining_qty
+                , String.lowercase_ascii o.oo_side
+                , None )
+            | None -> None
+          in
+          id, snap)
+        changes
+    , overflow )
+  | None -> [], true
 ;;
 
 let notify_ready store =
@@ -139,6 +192,7 @@ let update_open_orders symbol (event : execution_event) =
   if is_terminal || event.remaining_qty <= 0.0
   then (
     Hashtbl.remove store.open_orders event.order_id;
+    note_change store event.order_id None;
     (* Drop the id from the global id->symbol index so long-running processes do not
        accumulate stale entries. *)
     try unregister_order ~order_id:(int_of_string event.order_id) with
@@ -161,7 +215,11 @@ let update_open_orders symbol (event : execution_event) =
       ; oo_limit_price = limit_price
       ; oo_status = event.status
       ; oo_last_updated = event.timestamp
-      });
+      };
+    note_change
+      store
+      event.order_id
+      (Some (Hashtbl.find store.open_orders event.order_id)));
   publish_open_orders_cache store;
   Mutex.unlock store.orders_mutex;
   RingBuffer.write store.events_buffer event;
@@ -323,6 +381,7 @@ let handle_open_order fields =
       }
   in
   Hashtbl.replace store.open_orders (string_of_int order_id) oo;
+  note_change store (string_of_int order_id) (Some oo);
   publish_open_orders_cache store;
   Mutex.unlock store.orders_mutex;
   Logging.debug_f

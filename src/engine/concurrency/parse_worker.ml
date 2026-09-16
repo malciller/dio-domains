@@ -151,7 +151,11 @@ let worker_loop () =
     determine GC-config exposure for domains spawned after [Config.apply_gc_config]. *)
 let ensure_worker () =
   if Atomic.compare_and_set worker_started false true
-  then ignore (Domain.spawn worker_loop)
+  then
+    ignore
+      (Domain.spawn (fun () ->
+         Gc_config.apply ();
+         worker_loop ()))
 ;;
 
 (** Submit a raw frame for asynchronous parsing.

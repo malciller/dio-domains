@@ -14,5 +14,6 @@
   dio.latency_profiling
   dio.exchange
   dio.error_handling
-  dio.oracle)
+  dio.oracle
+  dio.gc_config)
  (modules Config Domain_spawner Order_executor Strategy_replay))

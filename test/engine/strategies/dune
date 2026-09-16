@@ -25,3 +25,7 @@
 (test
  (name test_platform_accounting)
  (libraries dio.strategies alcotest))
+
+(test
+ (name test_hot_path_invariants)
+ (libraries dio.strategies dio.engine alcotest))

@@ -149,11 +149,10 @@ ENV MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:2"
 #    effect, so both are omitted. a (allocation_policy) is likewise a no-op in
 #    OCaml 5. Sweep s and o with test/engine/perf/sweep_gc_params.sh; do not
 #    sweep a.
-#    NB: the gc block in config.json is applied per-domain via Gc.set at startup
-#    (engine/config.ml apply_gc_config) and OVERRIDES s/o/O here, so those are
-#    the effective values at runtime. This ENV only covers the window before
-#    apply_gc_config runs.
-ENV OCAMLRUNPARAM="s=33554432,o=120,O=1000000"
+#    NB: the gc block in config.json is the single source of truth. It is applied
+#    in every spawned domain via Gc.set (engine/config.ml apply_gc_config). Do NOT
+#    set OCAMLRUNPARAM here: any domain that spawns before/without that call would
+#    silently inherit it, and a 256MB minor heap produced multi-ms pauses.
 
 # 9a. Lighter signer library path. The .so is absent from the default image
 #     (build with INCLUDE_LIGHTER_SIGNER=1 to include it); the loader warns and

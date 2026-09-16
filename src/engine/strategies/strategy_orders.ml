@@ -12,24 +12,27 @@ let order_buffer = LockFreeQueue.create ()
 (** Accessor for the shared order ringbuffer. *)
 let get_order_buffer () = order_buffer
 
-(** Records an emitted order into the active trace recorder (no-op when tracing is off). *)
-let record_emitted order =
-  Strategy_event_recorder.record_emitted_if_active
-    { Strategy_trace.em_op =
-        (match order.operation with
-         | Place -> "place"
-         | Amend -> "amend"
-         | Cancel -> "cancel")
-    ; em_symbol = order.symbol
-    ; em_side =
-        (match order.side with
-         | Buy -> "buy"
-         | Sell -> "sell")
-    ; em_qty = order.qty
-    ; em_price = Option.value order.price ~default:nan
-    ; em_post_only = order.post_only
-    ; em_order_id = order.order_id
-    }
+(** Records an emitted order into the active trace recorder (no-op when tracing is off).
+    The observation record is built only when a recorder is registered for the symbol. *)
+let record_emitted (order : strategy_order) =
+  if Strategy_event_recorder.is_active order.symbol
+  then
+    Strategy_event_recorder.record_emitted_if_active
+      { Strategy_trace.em_op =
+          (match order.operation with
+           | Place -> "place"
+           | Amend -> "amend"
+           | Cancel -> "cancel")
+      ; em_symbol = order.symbol
+      ; em_side =
+          (match order.side with
+           | Buy -> "buy"
+           | Sell -> "sell")
+      ; em_qty = order.qty
+      ; em_price = Option.value order.price ~default:nan
+      ; em_post_only = order.post_only
+      ; em_order_id = order.order_id
+      }
 ;;
 
 let create_place_order dup_key asset_symbol side qty price post_only strategy exchange =

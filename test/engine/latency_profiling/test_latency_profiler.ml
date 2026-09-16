@@ -441,6 +441,46 @@ let test_spike_message_without_cause () =
      | None -> false)
 ;;
 
+let test_rolling_aggregates_windows () =
+  let t = LP.create ~rolling_windows:3 "rolling" in
+  (* Window 1: 10 samples at 10us. *)
+  for _ = 1 to 10 do
+    LP.record t (Mtime.Span.of_uint64_ns 10000L)
+  done;
+  let s1 = LP.snapshot_and_reset t in
+  Alcotest.(check int) "window 1 samples" 10 s1.samples;
+  Alcotest.(check (float 0.1)) "window 1 p50" 10.0 s1.p50;
+  (* Window 2: 10 samples at 20us; percentiles cover the rolling union but [samples] stays
+     per-window (so a spike alarms once, not for every window it remains in). *)
+  for _ = 1 to 10 do
+    LP.record t (Mtime.Span.of_uint64_ns 20000L)
+  done;
+  let s2 = LP.snapshot_and_reset t in
+  Alcotest.(check int) "samples stay per-window" 10 s2.samples;
+  Alcotest.(check (float 0.1)) "window 2 p50 is the union's lower half" 10.0 s2.p50;
+  (* Window 3: 10 samples at 30us; union median is now 20us. *)
+  for _ = 1 to 10 do
+    LP.record t (Mtime.Span.of_uint64_ns 30000L)
+  done;
+  let s3 = LP.snapshot_and_reset t in
+  Alcotest.(check (float 0.1)) "window 3 p50 is the union's median" 20.0 s3.p50;
+  (* Window 4 is empty: the oldest (10us) evicts, leaving 20us + 30us. *)
+  let s4 = LP.snapshot_and_reset t in
+  Alcotest.(check int) "empty window reports zero current samples" 0 s4.samples;
+  Alcotest.(check (float 0.1)) "window 4 p50 evicts the oldest" 20.0 s4.p50
+;;
+
+let test_rolling_off_is_per_window () =
+  let t = LP.create "plain" in
+  for _ = 1 to 10 do
+    LP.record t (Mtime.Span.of_uint64_ns 10000L)
+  done;
+  let s1 = LP.snapshot_and_reset t in
+  Alcotest.(check int) "non-rolling window keeps its samples" 10 s1.samples;
+  let s2 = LP.snapshot_and_reset t in
+  Alcotest.(check int) "non-rolling empty window resets" 0 s2.samples
+;;
+
 let () =
   run
     "Latency Profiler"
@@ -491,6 +531,13 @@ let () =
       , [ test_case "silent when healthy" `Quick test_spike_message_silent_when_healthy
         ; test_case "reports breaching stages" `Quick test_spike_message_reports_breaches
         ; test_case "omits cause line when absent" `Quick test_spike_message_without_cause
+        ] )
+    ; ( "rolling window"
+      , [ test_case "aggregates and evicts windows" `Quick test_rolling_aggregates_windows
+        ; test_case
+            "disabled keeps per-window semantics"
+            `Quick
+            test_rolling_off_is_per_window
         ] )
     ]
 ;;

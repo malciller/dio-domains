@@ -61,14 +61,14 @@ let parse () =
 ;;
 
 let env_with_price p =
-  { Strategy_expr.price = (fun () -> Ok (vf p))
-  ; event = (fun _ -> Error "no event")
-  ; state = (fun _ -> Ok Strategy_expr.V_none)
-  ; param = (fun _ -> Error "no param")
-  ; local = (fun _ -> Error "no local")
-  ; signal = (fun _ -> Error "no signal")
-  ; now = (fun () -> Ok (vf 1000.0))
-  ; platform = (fun _ -> Error "no platform")
+  { Strategy_expr.price = (fun () -> vf p)
+  ; event = (fun _ -> raise (Strategy_expr.Eval_error "no event"))
+  ; state = (fun _ -> Strategy_expr.V_none)
+  ; param = (fun _ -> raise (Strategy_expr.Eval_error "no param"))
+  ; local = (fun _ -> raise (Strategy_expr.Eval_error "no local"))
+  ; signal = (fun _ -> raise (Strategy_expr.Eval_error "no signal"))
+  ; now = (fun () -> vf 1000.0)
+  ; platform = (fun _ -> raise (Strategy_expr.Eval_error "no platform"))
   }
 ;;
 
@@ -94,8 +94,8 @@ let test_template () =
       Strategy_expr.event =
         (fun f ->
           match f with
-          | "fill_order_id" -> Ok (vs "o1")
-          | _ -> Error "no")
+          | "fill_order_id" -> vs "o1"
+          | _ -> raise (Strategy_expr.Eval_error "no"))
     }
   in
   match Strategy_expr.eval_arg env "sell:$event.fill_order_id" with
@@ -109,9 +109,9 @@ let make_handler log =
       (fun t name args ->
         log := (name, args) :: !log;
         match name with
-        | "compute_grid_price" -> [ "price", vf 99.0 ]
-        | "compute_sell_price" -> [ "price", vf 150.0 ]
-        | "place_buy" -> [ "token", vs "tok-1" ]
+        | "compute_grid_price" -> [ Strategy_expr.intern_key "price", vf 99.0 ]
+        | "compute_sell_price" -> [ Strategy_expr.intern_key "price", vf 150.0 ]
+        | "place_buy" -> [ Strategy_expr.intern_key "token", vs "tok-1" ]
         | "track_buy" ->
           Strategy_runtime.set_state t "tracked_buy" (Strategy_expr.V_bool true);
           []
@@ -337,7 +337,7 @@ module Stub_engine = struct
   let mark_stale _ = ()
   let buy_cancel _ = ()
   let buy_place _ = ()
-  let buy_place_plan _ = []
+  let buy_place_plan _ _ = ()
   let buy_place_send _ = ()
   let buy_place_send_insufficient _ = ()
   let buy_place_latch_capital_low _ = ()
@@ -351,7 +351,7 @@ module Stub_engine = struct
   let sell_place_should _ = false
   let sell_place_body _ = ()
   let sell_finalize _ = ()
-  let sell_finalize_facts _ = []
+  let sell_finalize_facts _ _ = ()
   let sell_finalize_latch _ = ()
   let sell_excess_sweep_phase _ = ()
   let sell_finalize_end _ = ()

@@ -559,7 +559,9 @@ let () =
   (* Start the stop-the-world canary after GC configuration is applied so it observes the
      same collector settings as the trading domains; its window cadence matches the
      per-domain latency windows, allowing a global pause to be matched to the domain
-     cycles that spiked. Disable with DIO_CANARY=0. *)
+     cycles that spiked. Its busy-spin also keeps the package out of deep idle so
+     event-driven wakeups don't pay C-state/frequency exit latency. Disable with
+     DIO_CANARY=0. *)
   Canary.start ();
   (* Periodic memory reporter on an Lwt timer (600s interval). Runs in the main domain
      scheduler, avoiding the prior Gc.create_alarm approach: alarm callbacks run in GC
