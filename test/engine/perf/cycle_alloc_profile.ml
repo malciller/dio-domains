@@ -41,6 +41,16 @@ let path () =
 
 let () =
   SG.Strategy.init ();
+  (match Sys.getenv_opt "DIO_MINOR_HEAP" with
+   | Some s ->
+     (try
+        let w = int_of_string (String.trim s) in
+        let c = Gc.get () in
+        Gc.set { c with minor_heap_size = w };
+        Printf.printf "minor_heap_size set to %d words\n%!" w
+      with
+      | _ -> ())
+   | None -> ());
   match SF.parse_file (path ()) with
   | Error e -> Printf.eprintf "cycle_alloc_profile: %s\n%!" e
   | Ok file ->
@@ -109,12 +119,16 @@ let () =
     let times = Array.make n 0.0 in
     let before = Gc.minor_words () in
     for i = 1 to n do
-      let t0 = Mtime_clock.now_ns () in
+      let t0 = Monotonic_clock.now_ns () in
       run (3000 + i);
-      times.(i - 1) <- Int64.to_float (Int64.sub (Mtime_clock.now_ns ()) t0) /. 1000.0
+      times.(i - 1) <- float (Monotonic_clock.now_ns () - t0) /. 1000.0
     done;
     let after = Gc.minor_words () in
+    (* index of the worst cycle and the next-worst, to see if spikes are periodic *)
+    let argmax = ref 0 in
+    Array.iteri (fun i v -> if v > times.(!argmax) then argmax := i) times;
     Array.sort compare times;
+    Printf.printf "worst cycle index=%d (period?)\n%!" !argmax;
     Printf.printf
       "steady-state live cycle: %.1f minor words/cycle (%.1f bytes)  p50=%.1fus \
        p99=%.1fus max=%.1fus\n\
@@ -135,9 +149,9 @@ let () =
     and amax = ref 0
     and missmax = ref 0 in
     for i = 1 to n do
-      let t0 = Mtime_clock.now_ns () in
+      let t0 = Monotonic_clock.now_ns () in
       run (3000 + i);
-      ptimes.(i - 1) <- Int64.to_float (Int64.sub (Mtime_clock.now_ns ()) t0) /. 1000.0;
+      ptimes.(i - 1) <- float (Monotonic_clock.now_ns () - t0) /. 1000.0;
       if rt.prof_guard_ns > !gmax then gmax := rt.prof_guard_ns;
       if rt.prof_args_ns > !amax then amax := rt.prof_args_ns;
       if rt.prof_missing > !missmax then missmax := rt.prof_missing
@@ -205,11 +219,11 @@ let () =
     in
     let interp_us =
       let n = 50_000 in
-      let t0 = Mtime_clock.now_ns () in
+      let t0 = Monotonic_clock.now_ns () in
       for i = 1 to n do
         ignore (SR.run_cycle ~collect:false rt2 ~price:100.0 ~now:(float i) ~event)
       done;
-      Int64.to_float (Int64.sub (Mtime_clock.now_ns ()) t0) /. float n /. 1000.0
+      float (Monotonic_clock.now_ns () - t0) /. float n /. 1000.0
     in
     Printf.printf
       "  interpreter-only cycle: %.1f w/cycle, %.2fus/cycle\n%!"
@@ -281,11 +295,11 @@ let () =
     rt.prof_enabled <- false;
     let miss_us =
       let n = 50_000 in
-      let t0 = Mtime_clock.now_ns () in
+      let t0 = Monotonic_clock.now_ns () in
       for _ = 1 to n do
         List.iter (fun j -> ignore (SR.value_of_json rt e j)) string_args
       done;
-      Int64.to_float (Int64.sub (Mtime_clock.now_ns ()) t0) /. float n /. 1000.0
+      float (Monotonic_clock.now_ns () - t0) /. float n /. 1000.0
     in
     rt.platform <- saved;
     Printf.printf

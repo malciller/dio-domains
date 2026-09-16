@@ -439,8 +439,12 @@ let init_trading_engine_sync (config : Dio_engine.Config.config) =
         "Failed to fetch Fear & Greed at startup: %s"
         (Printexc.to_string exn)
   in
-  (* Start supervisor monitoring; returns trading configs augmented with fee schedules. *)
+  (* Start the supervisor monitoring; returns trading configs augmented with fee
+     schedules. *)
   Logging.info ~section:"main" "Starting supervisor and initializing feeds...";
+  (* Live survivor profiler (DIO_MEMPROF_LIVE=1) started before any domain is spawned so
+     every domain joins the profile. *)
+  Leak_probe.start ();
   let configs_with_fees = Supervisor.start_monitoring () in
   (* Spawn one supervised domain per asset to consume market data and execute strategies. *)
   Logging.info ~section:"main" "Initializing supervised asset domains...";
@@ -573,7 +577,7 @@ let () =
   let _memory_reporter =
     Lwt.async (fun () ->
       let rec loop () =
-        Lwt_unix.sleep 600.0
+        Lwt_unix.sleep (if Leak_probe.enabled () then 60.0 else 600.0)
         >>= fun () ->
         if Atomic.get shutdown_requested
         then Lwt.return_unit
@@ -593,6 +597,7 @@ let () =
             runtime
             s.major_collections
             s.heap_chunks;
+          Leak_probe.report ();
           (* Spawn next cycle independently to break the Lwt.bind chain. *)
           Lwt.async loop;
           Lwt.return_unit)

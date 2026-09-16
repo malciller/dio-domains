@@ -12,11 +12,17 @@
  * below degrade to no-ops returning false and the OCaml layer leaves affinity
  * alone (dev builds/tests run on macOS; production runs linux/amd64). */
 
+/* Must precede every system header: <caml/mlvalues.h> (included below) pulls in
+ * stdlib/system headers, after which defining _GNU_SOURCE has no effect and
+ * CPU_ZERO/CPU_SET/pthread_setaffinity_np/SCHED_IDLE stay undeclared. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <caml/mlvalues.h>
 
 #ifdef __linux__
 
-#define _GNU_SOURCE
 #include <pthread.h>
 #include <sched.h>
 

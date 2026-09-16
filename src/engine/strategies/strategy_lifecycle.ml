@@ -528,6 +528,15 @@ let apply_open_order_delta ~state ~now_time ~ecfg ~changes =
             Sell_orders.push state.cached_feed_sell_orders oid price qty;
             state.cached_feed_total <- state.cached_feed_total +. qty;
             upsert_sell_commitment ~state ~id:oid ~price ~qty ~seen:true ~acked:true;
+            (* A newly-added sell at a price below the cached closest must become the
+               cached closest immediately. The post-loop [valid] check only detects the
+               cached closest LEAVING (or changing price); it does not see a new lower
+               sell, so without this the buy leg keeps clamping against the stale higher
+               sell and trails into the true closest sell's 2*gi zone. Mirrors the
+               best-buy update on the buy-add branch above. *)
+            (match state.cached_closest_sell_order with
+             | Some (_, best) when price > 0.0 && price >= best -> ()
+             | _ -> state.cached_closest_sell_order <- Some (oid, price));
             sells_dirty := true;
             closest_dirty := true)
         | None -> ())

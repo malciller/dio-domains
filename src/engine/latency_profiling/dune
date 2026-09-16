@@ -12,4 +12,5 @@
   Monotonic_clock
   Network_latency
   Canary
-  Thread_affinity))
+  Thread_affinity
+  Leak_probe))

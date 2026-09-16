@@ -5409,6 +5409,125 @@ let test_sync_open_orders_delta_equivalence () =
     (fmt_commits delta_state)
 ;;
 
+let test_sync_open_orders_delta_new_lower_sell_binds_buy_clamp () =
+  (* REGRESSION (grouped sells / over-accumulation): the incremental delta path only
+     invalidated [cached_closest_sell_order] when the cached order LEFT or changed price.
+     A newly-added sell BELOW the cached closest - the normal case as price falls - was
+     never promoted, so the buy leg kept clamping against the stale higher sell and
+     trailed into the true closest sell's 2*gi zone. On the next fill the companion sell
+     landed within one rung of the existing sell, grouping sells and over-committing
+     capital. *)
+  let open Dio_strategies.Strategy_api in
+  let symbol = "DELTA_LOWER/USD" in
+  let state = get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.cached_ecfg <- get_exchange_config "kraken";
+  state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+  Hashtbl.clear state.sell_commitments;
+  Sell_orders.clear state.open_sell_orders;
+  Sell_orders.clear state.cached_feed_sell_orders;
+  Hashtbl.reset state.feed_sell_index;
+  Hashtbl.reset state.feed_buy_index;
+  state.feed_index_valid <- false;
+  state.open_orders_scan_valid <- false;
+  state.sell_commitments_clean <- false;
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "kraken"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "jacobs_ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = Some 0.0
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = false
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = get_exchange_config "kraken" in
+  let feed =
+    ref [ "buy-1", 99.0, 1.0, "buy", None; "sell-1", 101.0, 2.0, "sell", None ]
+  in
+  let iter_of the_feed f = List.iter (fun (oid, p, q, s, u) -> f oid p q s u) !the_feed in
+  let pending_changes = ref [] in
+  let drain () =
+    let c = !pending_changes in
+    pending_changes := [];
+    c, false
+  in
+  let sync iter gen =
+    sync_open_orders
+      ~state
+      ~now:100.0
+      ~asset
+      ~bid_price:100.0
+      ~lot_qty:1.0
+      ~iter_open_orders:iter
+      ~get_open_orders_generation:(fun () -> gen)
+      ~drain_open_order_changes:(fun ~symbol:_ -> drain ())
+      ~ecfg
+  in
+  (* Prime the persistent indexes with a full scan: closest sell is sell-1 @ 101. *)
+  let _obc, _h, _lib, _lis, cs0, _op, _mp = sync (iter_of feed) 1 in
+  check
+    (option (pair string (float 1e-9)))
+    "initial closest sell"
+    (Some ("sell-1", 101.0))
+    cs0;
+  (* Add a LOWER sell while sell-1 stays listed: only the delta path runs. A full scan
+     would find sell-2; the delta path must too. *)
+  feed
+  := [ "buy-1", 99.0, 1.0, "buy", None
+     ; "sell-1", 101.0, 2.0, "sell", None
+     ; "sell-2", 99.5, 1.0, "sell", None
+     ];
+  pending_changes := [ "sell-2", Some (Some 99.5, 1.0, "sell", None) ];
+  let boom _ = failwith "delta path must not rescan" in
+  let _obc, _h, _lib, _lis, cs1, _op, _mp = sync boom 2 in
+  check
+    (option (pair string (float 1e-9)))
+    "new lower sell becomes the reported closest"
+    (Some ("sell-2", 99.5))
+    cs1;
+  check
+    (option (pair string (float 1e-9)))
+    "new lower sell promoted in the cached closest"
+    (Some ("sell-2", 99.5))
+    state.cached_closest_sell_order;
+  (* End-to-end: the buy amend must clamp against sell-2 (99.5 - 2*gi = 97.51), not the
+     stale sell-1 (101 - 2*gi = 98.98). *)
+  ignore (get_pending_orders 100);
+  state.last_buy_order_id <- Some "buy-1";
+  state.last_buy_order_price <- Some 96.0;
+  state.inflight_amend_buy <- false;
+  state.pending_orders <- [];
+  ignore
+    (Dio_strategies.Strategy_decision.evaluate_buy_leg
+       ~oracle_halted:false
+       ~state
+       ~now:100.0
+       ~asset
+       ~bid_price:100.5
+       ~ask_price:101.0
+       ~quote_balance:1000.0
+       ~quote_balance_stale:false
+       ~cycle:3
+       ~iter_open_orders:(fun _ -> ())
+       ~open_buy_count_from_scan:1
+       ~has_recent_amend_buy:false
+       ~locked_in_buys:0.0
+       ~closest_sell_order_initial:cs1);
+  match get_pending_orders 10 with
+  | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
+    check
+      (option (float 0.))
+      "buy amended to the true closest sell's 2*gi floor"
+      (Some 97.51)
+      o.price
+  | _ -> failwith "expected exactly one buy amend"
+;;
+
 let test_sync_open_orders_delta_persisted () =
   (* On a [remaintain_expired_sells] venue (Alpaca) the persisted sell ladder must be
      rebuilt on the incremental path too, so the ladder still tracks live feed prices
@@ -6284,6 +6403,10 @@ let () =
             "sync_open_orders delta matches full scan"
             `Quick
             test_sync_open_orders_delta_equivalence
+        ; test_case
+            "sync_open_orders delta promotes a new lower sell"
+            `Quick
+            test_sync_open_orders_delta_new_lower_sell_binds_buy_clamp
         ; test_case
             "sync_open_orders delta persists ladder"
             `Quick
