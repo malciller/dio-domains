@@ -1,5 +1,5 @@
 (library
  (name dio_persistence)
  (public_name dio.persistence)
- (libraries yojson logging threads dio.gc_config)
+ (libraries yojson logging threads dio.gc_config dio.latency_profiling)
  (modules Persistence_orchestrator Base_accumulation_store Sell_levels_store))

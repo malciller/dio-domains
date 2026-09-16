@@ -179,6 +179,15 @@ let make_background_allocator () =
       c)
 ;;
 
+(** Shared background allocator so distinct background domains/threads land on distinct
+    (E-)cores instead of all piling onto the first one. *)
+let background_alloc = lazy (make_background_allocator ())
+
+(** Pin the calling thread to a background CPU (best-effort): keeps feed parsing,
+    persistence and the supervisor off the trading P-cores so they cannot preempt a
+    trading cycle. *)
+let pin_self_background () = pin_self (Lazy.force background_alloc ())
+
 (** Pin the calling domain to a fixed background range [lo, hi] (best-effort). Used to
     keep the busy-spin canary and other polling work off the trading cores. *)
 let pin_self_to_range lo hi =
