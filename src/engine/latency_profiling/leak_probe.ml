@@ -45,15 +45,21 @@ let frame_of (a : Gc.Memprof.allocation) =
   go 0
 ;;
 
+(* [try_lock]: the memprof callback can fire on a thread that already holds [mutex] - the
+   report path allocates while holding it and sampling is active in that thread, so the
+   alloc callback re-enters here. A blocking lock then raises
+   [Sys_error "Mutex.lock: Resource deadlock avoided"]. Dropping the sample on contention
+   is correct for a profiler. *)
 let bump site d =
-  Mutex.lock mutex;
-  Hashtbl.replace
-    live
-    site
-    ((try Hashtbl.find live site with
-      | Not_found -> 0)
-     + d);
-  Mutex.unlock mutex
+  if Mutex.try_lock mutex
+  then (
+    Hashtbl.replace
+      live
+      site
+      ((try Hashtbl.find live site with
+        | Not_found -> 0)
+       + d);
+    Mutex.unlock mutex)
 ;;
 
 let enabled () = Sys.getenv_opt "DIO_MEMPROF_LIVE" <> None
@@ -91,21 +97,27 @@ let start () =
 (** Log the sites with the most live samples and their growth since the last call. The
     leaked site shows both a large absolute count and steady positive growth. *)
 let report () =
-  if Atomic.get started
+  if Atomic.get started && Mutex.try_lock mutex
   then (
-    Mutex.lock mutex;
-    let rows = Hashtbl.fold (fun k v acc -> (k, v) :: acc) live [] in
-    let prevc k =
-      try Hashtbl.find prev k with
-      | Not_found -> 0
-    in
-    Hashtbl.reset prev;
-    Hashtbl.iter (fun k v -> Hashtbl.replace prev k v) live;
-    Mutex.unlock mutex;
-    let rows = List.sort (fun (_, a) (_, b) -> compare b a) rows in
-    Logging.info_f ~section "live survivor sites (samples; growth since last report):";
-    List.iteri
-      (fun i (k, v) ->
-        if i < 12 then Logging.info_f ~section "  %6d  (+%d)  %s" v (v - prevc k) k)
-      rows)
+    (* Never let a diagnostic crash the trading loop. *)
+    try
+      let rows = Hashtbl.fold (fun k v acc -> (k, v) :: acc) live [] in
+      let prevc k =
+        try Hashtbl.find prev k with
+        | Not_found -> 0
+      in
+      Hashtbl.reset prev;
+      Hashtbl.iter (fun k v -> Hashtbl.replace prev k v) live;
+      Mutex.unlock mutex;
+      let rows = List.sort (fun (_, a) (_, b) -> compare b a) rows in
+      Logging.info_f ~section "live survivor sites (samples; growth since last report):";
+      List.iteri
+        (fun i (k, v) ->
+          if i < 12 then Logging.info_f ~section "  %6d  (+%d)  %s" v (v - prevc k) k)
+        rows
+    with
+    | e ->
+      (try Mutex.unlock mutex with
+       | _ -> ());
+      Logging.warn_f ~section "leak probe report failed: %s" (Printexc.to_string e))
 ;;
