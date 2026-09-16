@@ -292,5 +292,75 @@ let () =
       "  arg eval (all facts missing): %.1f w/cycle, %.2fus/cycle, misses=%d/iter\n%!"
       miss_words
       miss_us
-      (miss_missing / 200_000)
+      (miss_missing / 200_000);
+    (* Optional: authoritative allocation-site attribution via Gc.Memprof. Sampling is per
+       allocated word, so a site's [n_samples * size] estimates the words it allocates.
+       Run with DIO_MEMPROF=1 to dump the steady-state cycle's top allocation sites with
+       source locations, instead of guessing from a phase counter. *)
+    (match Sys.getenv_opt "DIO_MEMPROF" with
+     | None -> ()
+     | Some _ ->
+       let sites : (string, int) Hashtbl.t = Hashtbl.create 512 in
+       let frame_of (a : Gc.Memprof.allocation) =
+         let entries = Printexc.raw_backtrace_entries a.callstack in
+         let rec go i =
+           if i >= Array.length entries
+           then "<no-debug-info>"
+           else (
+             match Printexc.backtrace_slots_of_raw_entry entries.(i) with
+             | Some slots when Array.length slots > 0 ->
+               let s = slots.(0) in
+               let name =
+                 match Printexc.Slot.name s with
+                 | Some n -> n
+                 | None -> "?"
+               in
+               let loc =
+                 match Printexc.Slot.location s with
+                 | Some l ->
+                   Printf.sprintf "%s:%d" (Filename.basename l.filename) l.line_number
+                 | None -> "?"
+               in
+               name ^ " @ " ^ loc
+             | _ -> go (i + 1))
+         in
+         go 0
+       in
+       let on_alloc (a : Gc.Memprof.allocation) =
+         let k = frame_of a in
+         let w = a.Gc.Memprof.n_samples in
+         Hashtbl.replace
+           sites
+           k
+           (w
+            +
+            try Hashtbl.find sites k with
+            | Not_found -> 0)
+       in
+       let tracker : (unit, unit) Gc.Memprof.tracker =
+         { alloc_minor =
+             (fun a ->
+               on_alloc a;
+               None)
+         ; alloc_major = (fun _ -> None)
+         ; promote = (fun _ -> None)
+         ; dealloc_minor = (fun _ -> ())
+         ; dealloc_major = (fun _ -> ())
+         }
+       in
+       let mn = 20_000 in
+       let rate = 1.0 in
+       let prof = Gc.Memprof.start ~sampling_rate:rate ~callstack_size:12 tracker in
+       for i = 1 to mn do
+         run (900_000 + i)
+       done;
+       Gc.Memprof.stop ();
+       Gc.Memprof.discard prof;
+       let rows = Hashtbl.fold (fun k v acc -> (k, v) :: acc) sites [] in
+       let rows = List.sort (fun (_, a) (_, b) -> compare b a) rows in
+       Printf.printf "memprof top allocation sites (words/cycle):\n";
+       List.iteri
+         (fun i (k, v) ->
+           if i < 25 then Printf.printf "  %7.1f  %s\n" (float v /. float mn) k)
+         rows)
 ;;
