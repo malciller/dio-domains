@@ -83,12 +83,16 @@ let detect_p_core_cpus () =
   | [] -> []
   | _ ->
     let top = List.fold_left (fun a (_, f) -> max a f) 0 freqs in
-    (* Group the top-frequency CPUs by physical core, keep the lowest sibling of each. *)
+    (* P-cores sit within ~15% of the top turbo bin; E-cores fall well below (3.5 vs 4.7
+       GHz on the i7-12650H, which itself reports two P-core bins). An exact match on
+       [top] would keep only one bin and drop half the P-cores. *)
+    let is_p f = f * 100 >= top * 85 in
+    (* Group the P-core CPUs by physical core, keep the lowest sibling of each. *)
     let seen = Hashtbl.create 16 in
     let cores =
       List.filter_map
         (fun (c, f) ->
-          if f <> top
+          if not (is_p f)
           then None
           else (
             match package_id c, core_id c with
