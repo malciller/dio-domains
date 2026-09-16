@@ -563,6 +563,7 @@ let () =
      event-driven wakeups don't pay C-state/frequency exit latency. Disable with
      DIO_CANARY=0. *)
   Canary.start ();
+  Logging.info_f ~section:"main" "%s" (Thread_affinity.describe ());
   (* Periodic memory reporter on an Lwt timer (600s interval). Runs in the main domain
      scheduler, avoiding the prior Gc.create_alarm approach: alarm callbacks run in GC
      signal context, where Mutex.lock is unsafe on OCaml 5.x if the alarmed domain already
