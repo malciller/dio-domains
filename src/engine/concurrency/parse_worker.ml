@@ -155,6 +155,7 @@ let ensure_worker () =
     ignore
       (Domain.spawn (fun () ->
          Gc_config.apply ();
+         Thread_affinity.pin_self_background ();
          worker_loop ()))
 ;;
 
