@@ -25,6 +25,7 @@
       "strategy": "Ladder",
       "testnet": true,
       "sell_mult": "0.99",
+      "cpu_priority": 10,
       "accumulation_buffer": [
         0.1,
         0.5
@@ -41,7 +42,8 @@
       "strategy": "Ladder",
       "testnet": true,
       "data_feed": "iex",
-      "sell_levels": true
+      "sell_levels": true,
+      "cpu_priority": 0
     }
   ]
 }

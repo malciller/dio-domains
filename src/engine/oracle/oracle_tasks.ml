@@ -34,6 +34,7 @@ let default_trading_config (exchange : string) (symbol : string)
   ; data_feed = None
   ; base_accumulation = true
   ; sell_levels = true
+  ; cpu_priority = 0
   }
 ;;
 

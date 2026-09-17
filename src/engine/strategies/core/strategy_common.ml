@@ -30,6 +30,10 @@ type trading_config =
   ; sell_levels : bool
   (** Per-strategy opt-in to pending-sell-level persistence (default true when absent from
       config.json). *)
+  ; cpu_priority : int
+  (** Core-assignment priority: trading domains are pinned to trading CPUs in descending
+      [cpu_priority] order, so a higher value claims a P-core before a lower one. Ties
+      keep config order. Default 0. *)
   }
 
 (** Integer userref tags for per-strategy order grouping on the exchange. *)

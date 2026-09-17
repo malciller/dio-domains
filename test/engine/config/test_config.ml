@@ -233,6 +233,20 @@ let test_to_float_opt_accepts_int () =
   Alcotest.(check (option (float 1e-9))) "string absent" None (to_float_opt (`String "x"))
 ;;
 
+let test_parse_trading_config_cpu_priority () =
+  let default =
+    Dio_engine.Config.parse_config
+      (Yojson.Basic.from_string {|{"symbol": "X/USD", "qty": "1", "strategy": "Ladder"}|})
+  in
+  Alcotest.(check int) "cpu_priority defaults to 0" 0 default.cpu_priority;
+  let explicit =
+    Dio_engine.Config.parse_config
+      (Yojson.Basic.from_string
+         {|{"symbol": "Y/USD", "qty": "1", "strategy": "Ladder", "cpu_priority": 7}|})
+  in
+  Alcotest.(check int) "explicit cpu_priority parsed" 7 explicit.cpu_priority
+;;
+
 let () =
   Alcotest.run
     "Config"
@@ -243,6 +257,7 @@ let () =
             "optional fields"
             `Quick
             test_parse_trading_config_optional_fields
+        ; Alcotest.test_case "cpu priority" `Quick test_parse_trading_config_cpu_priority
         ] )
     ; ( "logging_config"
       , [ Alcotest.test_case "valid logging" `Quick test_parse_logging_config_valid

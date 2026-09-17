@@ -141,19 +141,36 @@ let pin_self cpu =
       cpu
 ;;
 
-(** Round-robin allocator over the trading CPU list. [next ()] returns the next CPU, or
-    [-1] when no list is configured. *)
+(** Number of trading CPUs available for pinning (0 when no list/topology is available). *)
+let trading_cpu_count () = List.length (trading_cpus ())
+
+(** The configured real-time priority, if any. [DIO_TRADING_RT_PRIO] must parse to a
+    positive integer; unset, 0, or garbage disables RT. Read per domain. *)
+let configured_rt_prio () =
+  match Sys.getenv_opt "DIO_TRADING_RT_PRIO" with
+  | None -> None
+  | Some s ->
+    (try
+       let p = int_of_string (String.trim s) in
+       if p > 0 then Some p else None
+     with
+     | _ -> None)
+;;
+
+(** Allocator over the trading CPU list that hands out each CPU at most once and returns
+    [-1] (unpinned) once the list is exhausted. The cursor is an [Atomic], not a [ref]:
+    every trading domain allocates concurrently from its own domain. Unlike the previous
+    wrapping round-robin this never reuses a CPU - once the domains outnumbered the CPUs
+    that pinned two domains to one core, and under SCHED_FIFO those two starve each other
+    (and every CFS thread on that core), enough to wedge startup. Callers pin on a real
+    CPU and treat [-1] as "share the remaining cores" (unpinned, CFS). *)
 let make_allocator () =
   let cpus = Array.of_list (trading_cpus ()) in
   let n = Array.length cpus in
-  let i = ref 0 in
+  let cursor = Atomic.make 0 in
   fun () ->
-    if n = 0
-    then -1
-    else (
-      let c = cpus.(!i mod n) in
-      incr i;
-      c)
+    let i = Atomic.fetch_and_add cursor 1 in
+    if i < n then cpus.(i) else -1
 ;;
 
 (** The background CPU list: [DIO_BACKGROUND_CPUS] if set, else every online CPU that is
