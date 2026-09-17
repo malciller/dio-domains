@@ -5,8 +5,8 @@ open Lwt.Infix
 
 let section = "hyperliquid_orderbook"
 
-(* Raw l2Book frames are large; 64 slots absorb bursts that would otherwise
-   lap the dashboard reader in one tick. *)
+(* Raw l2Book frames are large; 64 slots absorb bursts that would otherwise lap the
+   dashboard reader in one tick. *)
 let ring_buffer_size = 64
 
 type level =
@@ -24,11 +24,10 @@ type orderbook =
 (** Lock-free SPSC ring buffer for orderbook snapshots. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Top-of-book cache. Single WS-thread writer publishes an immutable snapshot
-    record with one [Atomic.set]; domain workers read it with one [Atomic.get].
-    Avoids the ring-buffer read + bounds-check + field-extraction pipeline on
-    the latency-critical path and prevents torn reads under the OCaml 5 memory
-    model. *)
+(** Top-of-book cache. Single WS-thread writer publishes an immutable snapshot record with
+    one [Atomic.set]; domain workers read it with one [Atomic.get]. Avoids the ring-buffer
+    read + bounds-check + field-extraction pipeline on the latency-critical path and
+    prevents torn reads under the OCaml 5 memory model. *)
 type tob_cache =
   { bid_px : float
   ; bid_sz : float
@@ -47,13 +46,13 @@ let stores : (string, store) Hashtbl.t = Hashtbl.create 32
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Coin-to-symbol resolution cache, populated at [initialize] to avoid
-    [resolve_symbol] + [Hashtbl.mem] per tick. Only the WS thread writes (at
-    init); domain workers never access it. *)
+(** Coin-to-symbol resolution cache, populated at [initialize] to avoid [resolve_symbol] +
+    [Hashtbl.mem] per tick. Only the WS thread writes (at init); domain workers never
+    access it. *)
 let coin_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 32
 
-(** Returns the store for [symbol], creating one if absent. Uses double-checked
-    locking via [initialization_mutex] for thread safety. *)
+(** Returns the store for [symbol], creating one if absent. Uses double-checked locking
+    via [initialization_mutex] for thread safety. *)
 let ensure_store symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store -> store
@@ -92,8 +91,8 @@ let notify_ready store =
 ;;
 
 let find_registered_symbol coin =
-  (* Fast path: check the cached coin_to_symbol table first.
-     This avoids resolve_symbol + Hashtbl.mem on every tick. *)
+  (* Fast path: check the cached coin_to_symbol table first. This avoids resolve_symbol +
+     Hashtbl.mem on every tick. *)
   match Hashtbl.find_opt coin_to_symbol coin with
   | Some _ as r -> r
   | None ->
@@ -241,10 +240,10 @@ let get_bids_asks msg =
   search 0
 ;;
 
-(** Zero-allocation depth-1 top-of-book parser: extracts the first bid and ask
-    {px, sz} from the raw JSON without intermediate collections. Returns
-    [(bid_px, bid_sz, ask_px, ask_sz, true)] on success, [(0, 0, 0, 0, false)]
-    on failure. Layout: "levels":[[bids],[asks]]. *)
+(** Zero-allocation depth-1 top-of-book parser: extracts the first bid and ask [{px, sz}]
+    from the raw JSON without intermediate collections. Returns
+    [(bid_px, bid_sz, ask_px, ask_sz, true)] on success, [(0, 0, 0, 0, false)] on failure.
+    Layout: "levels":[[bids],[asks]]. *)
 let parse_tob_fast msg =
   let px_key = "\"px\":\"" in
   let sz_key = "\"sz\":\"" in
@@ -315,10 +314,10 @@ let parse_tob_fast msg =
   search 0
 ;;
 
-(** Hot-path orderbook processor. Uses zero-allocation depth-1 TOB parse
-    to update the mutable cache directly. Still writes to the ring buffer
-    for any consumers that need full snapshots, but the domain-critical
-    get_best_bid_ask_fast path reads from the mutable cache. *)
+(** Hot-path orderbook processor. Uses zero-allocation depth-1 TOB parse to update the
+    mutable cache directly. Still writes to the ring buffer for any consumers that need
+    full snapshots, but the domain-critical get_best_bid_ask_fast path reads from the
+    mutable cache. *)
 let process_raw_market_data msg =
   if String.starts_with ~prefix:"{\"channel\":\"l2Book\"," msg
   then (
@@ -329,15 +328,14 @@ let process_raw_market_data msg =
       | Some symbol ->
         (try
            let store = ensure_store symbol in
-           (* Zero-alloc depth-1 fast path: parse TOB, publish an immutable
-               snapshot record with one Atomic.set (L4, no torn reads). *)
+           (* Zero-alloc depth-1 fast path: parse TOB, publish an immutable snapshot
+              record with one Atomic.set (L4, no torn reads). *)
            let bid_px, bid_sz, ask_px, ask_sz, ok = parse_tob_fast msg in
            if ok
            then Atomic.set store.tob { bid_px; bid_sz; ask_px; ask_sz; tob_valid = true };
            (* Store the RAW message in the ring buffer. The full-book parse
-                (get_bids_asks) is deferred to read time : the dashboard
-                parses on its 0.5s cadence; the domain TOB path never parses
-                the full book. *)
+              (get_bids_asks) is deferred to read time : the dashboard parses on its 0.5s
+              cadence; the domain TOB path never parses the full book. *)
            RingBuffer.write store.buffer msg;
            notify_ready store;
            Concurrency.Exchange_wakeup.signal ~symbol
@@ -351,8 +349,8 @@ let process_raw_market_data msg =
       | None -> ()))
 ;;
 
-(** Parse a raw l2Book message into an [orderbook] on demand (the full
-    book is parsed lazily, only when a consumer reads the ring buffer). *)
+(** Parse a raw l2Book message into an [orderbook] on demand (the full book is parsed
+    lazily, only when a consumer reads the ring buffer). *)
 let[@inline always] parse_orderbook symbol msg =
   let bids, asks = get_bids_asks msg in
   { symbol; bids; asks; timestamp = Unix.gettimeofday () }
@@ -367,8 +365,8 @@ let[@inline always] get_latest_orderbook symbol =
   | None -> None
 ;;
 
-(** Read top-of-book from the atomic snapshot cache (zero allocation,
-    lock-free, and free of torn reads per L4). *)
+(** Read top-of-book from the atomic snapshot cache (zero allocation, lock-free, and free
+    of torn reads per L4). *)
 let[@inline always] get_best_bid_ask symbol =
   match Hashtbl.find_opt stores symbol with
   | Some store ->
@@ -377,11 +375,10 @@ let[@inline always] get_best_bid_ask symbol =
   | None -> None
 ;;
 
-(** Returns a cached closure that reads top-of-book from the atomic TOB cache.
-    The closure itself allocates nothing; it reads one Atomic record and
-    wraps it in a Some tuple. The store pointer is captured at
-    closure-creation time so the domain hot loop never touches the stores
-    Hashtbl. *)
+(** Returns a cached closure that reads top-of-book from the atomic TOB cache. The closure
+    itself allocates nothing; it reads one Atomic record and wraps it in a Some tuple. The
+    store pointer is captured at closure-creation time so the domain hot loop never
+    touches the stores Hashtbl. *)
 let[@inline always] get_best_bid_ask_fast symbol =
   let store = ensure_store symbol in
   fun () ->
@@ -389,8 +386,8 @@ let[@inline always] get_best_bid_ask_fast symbol =
     if t.tob_valid then Some (t.bid_px, t.bid_sz, t.ask_px, t.ask_sz) else None
 ;;
 
-(** Returns all orderbook snapshots written since [last_pos], parsing the
-    raw messages lazily on read. *)
+(** Returns all orderbook snapshots written since [last_pos], parsing the raw messages
+    lazily on read. *)
 let[@inline always] read_orderbook_events symbol last_pos =
   match Hashtbl.find_opt stores symbol with
   | Some store ->
@@ -398,9 +395,9 @@ let[@inline always] read_orderbook_events symbol last_pos =
   | None -> []
 ;;
 
-(** Iterates [f] over orderbook snapshots since [last_pos], parsing each raw
-    message lazily on read  and without intermediate list allocation.
-    Returns the new cursor position. *)
+(** Iterates [f] over orderbook snapshots since [last_pos], parsing each raw message
+    lazily on read and without intermediate list allocation. Returns the new cursor
+    position. *)
 let[@inline always] iter_orderbook_events symbol last_pos f =
   match Hashtbl.find_opt stores symbol with
   | Some store ->
@@ -456,25 +453,25 @@ let _processor_task =
     let sub = Hyperliquid_ws.subscribe_raw_market_data () in
     Lwt.catch
       (fun () ->
-         Logging.debug_f ~section "Starting Hyperliquid orderbook processor task";
-         let%lwt () =
-           Concurrency.Lwt_util.consume_stream process_raw_market_data sub.stream
-         in
-         (* Stream ended (disconnect pushed None). Re-subscribe immediately;
-         consume_stream blocks event-driven on the new stream until the
-         WS reconnects and data flows. Sever Forward chain via Lwt.async. *)
-         sub.close ();
-         Logging.info ~section "Orderbook stream ended (disconnect), re-subscribing...";
-         Lwt.async run;
-         Lwt.return_unit)
+        Logging.debug_f ~section "Starting Hyperliquid orderbook processor task";
+        let%lwt () =
+          Concurrency.Lwt_util.consume_stream process_raw_market_data sub.stream
+        in
+        (* Stream ended (disconnect pushed None). Re-subscribe immediately; consume_stream
+           blocks event-driven on the new stream until the WS reconnects and data flows.
+           Sever Forward chain via Lwt.async. *)
+        sub.close ();
+        Logging.info ~section "Orderbook stream ended (disconnect), re-subscribing...";
+        Lwt.async run;
+        Lwt.return_unit)
       (fun exn ->
-         sub.close ();
-         Logging.error_f
-           ~section
-           "Hyperliquid orderbook processor task crashed: %s. Re-subscribing..."
-           (Printexc.to_string exn);
-         Lwt.async run;
-         Lwt.return_unit)
+        sub.close ();
+        Logging.error_f
+          ~section
+          "Hyperliquid orderbook processor task crashed: %s. Re-subscribing..."
+          (Printexc.to_string exn);
+        Lwt.async run;
+        Lwt.return_unit)
   in
   Lwt.async run
 ;;
@@ -486,15 +483,15 @@ let initialize symbols =
     (List.length symbols);
   List.iter
     (fun symbol ->
-       let _ = ensure_store symbol in
-       (* Pre-populate coin_to_symbol cache for known symbols.
-       Resolves coin identifiers at startup so the hot path hits the cache. *)
-       let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
-       if coin <> "" then Hashtbl.replace coin_to_symbol coin symbol;
-       Logging.debug_f
-         ~section
-         "Created Hyperliquid orderbook buffer for %s (coin=%s)"
-         symbol
-         coin)
+      let _ = ensure_store symbol in
+      (* Pre-populate coin_to_symbol cache for known symbols. Resolves coin identifiers at
+         startup so the hot path hits the cache. *)
+      let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
+      if coin <> "" then Hashtbl.replace coin_to_symbol coin symbol;
+      Logging.debug_f
+        ~section
+        "Created Hyperliquid orderbook buffer for %s (coin=%s)"
+        symbol
+        coin)
     symbols
 ;;

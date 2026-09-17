@@ -1,16 +1,14 @@
 open Notty
 open Theme
 
-(** INACTIVE oracle decision (oracle-paused; the grid places no new orders);
-    [false] when no decision exists. Alias of [Snapshot.oracle_inactive] for
-    existing callers/tests. *)
+(** INACTIVE oracle decision (oracle-paused; the grid places no new orders); [false] when
+    no decision exists. Alias of [Snapshot.oracle_inactive] for existing callers/tests. *)
 let oracle_inactive = Snapshot.oracle_inactive
 
 let strategy_paused = Snapshot.strategy_paused
 
-(** Accumulated quantity: inventory not committed to a resting sell.
-    [staked] is part of [base] but non-tradeable, so it is never reduced by
-    [pending].
+(** Accumulated quantity: inventory not committed to a resting sell. [staked] is part of
+    [base] but non-tradeable, so it is never reduced by [pending].
     @return [staked] + max 0.0 ([base] - [staked] - [pending]) *)
 let accum_qty_of ~staked ~pending base =
   staked +. Float.max 0.0 (base -. staked -. pending)
@@ -88,10 +86,9 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let base_bal = s.market.base_balance in
     let staked_bal = s.market.staked_balance in
     let hold_value = base_bal *. mid in
-    (* Resting buy price: the strategy's tracked price (follows amendments),
-       else the lowest open exchange buy order. Keeps a committed buy visible
-       when the domain is halted by an oracle INACTIVE decision and its state
-       goes stale. *)
+    (* Resting buy price: the strategy's tracked price (follows amendments), else the
+       lowest open exchange buy order. Keeps a committed buy visible when the domain is
+       halted by an oracle INACTIVE decision and its state goes stale. *)
     let buy_price =
       if s.buy_price > 0.0
       then s.buy_price
@@ -108,9 +105,9 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let unrealized_profit, pending_sell_qty =
       List.fold_left
         (fun (up, qty_acc) (o : Snapshot.order) ->
-           if o.price > 0.0 && o.qty > 0.0
-           then up +. (o.price *. o.qty), qty_acc +. o.qty
-           else up, qty_acc)
+          if o.price > 0.0 && o.qty > 0.0
+          then up +. (o.price *. o.qty), qty_acc +. o.qty
+          else up, qty_acc)
         (0.0, 0.0)
         sell_orders
     in
@@ -127,9 +124,9 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       let sell_prices =
         List.filter_map
           (fun (o : Snapshot.order) ->
-             if o.price > 0.0 && mid > 0.0
-             then Some ((o.price -. mid) /. mid *. 100.0)
-             else None)
+            if o.price > 0.0 && mid > 0.0
+            then Some ((o.price -. mid) /. mid *. 100.0)
+            else None)
           sell_orders
       in
       match sell_prices with
@@ -187,9 +184,8 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         in
         is_near_buy, false
     in
-    (* Blink the near-fill tint while price is close to execution; a solid
-       tint (the previous [Anim.flash] behavior) reads as static and loses the
-       "about to fill" cue. *)
+    (* Blink the near-fill tint while price is close to execution; a solid tint (the
+       previous [Anim.flash] behavior) reads as static and loses the "about to fill" cue. *)
     if near_buy || near_sell then Anim.motion_pending := true;
     let blink_on = Anim.blink () in
     let flash_buy = near_buy && blink_on in
@@ -421,9 +417,9 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let unrealized_profit, pending_sell_qty =
       List.fold_left
         (fun (up, qty_acc) (o : Snapshot.order) ->
-           if o.price > 0.0 && o.qty > 0.0
-           then up +. (o.price *. o.qty), qty_acc +. o.qty
-           else up, qty_acc)
+          if o.price > 0.0 && o.qty > 0.0
+          then up +. (o.price *. o.qty), qty_acc +. o.qty
+          else up, qty_acc)
         (0.0, 0.0)
         sell_orders
     in
@@ -439,9 +435,9 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       let sell_prices =
         List.filter_map
           (fun (o : Snapshot.order) ->
-             if o.price > 0.0 && mid > 0.0
-             then Some ((o.price -. mid) /. mid *. 100.0)
-             else None)
+            if o.price > 0.0 && mid > 0.0
+            then Some ((o.price -. mid) /. mid *. 100.0)
+            else None)
           sell_orders
       in
       match sell_prices with
@@ -665,21 +661,21 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
   let strat_keys =
     List.map
       (fun (sym, (s : Snapshot.strategy)) ->
-         let base = if s.market.base_asset = "" then sym else s.market.base_asset in
-         (s.exchange, sym), (s.exchange, base))
+        let base = if s.market.base_asset = "" then sym else s.market.base_asset in
+        (s.exchange, sym), (s.exchange, base))
       strats
   in
   let valid_balances =
     List.filter
       (fun (b : Snapshot.balance) ->
-         let is_strat_asset =
-           List.exists
-             (fun ((ex1, s1), (ex2, b2)) ->
-                (ex1 = b.exchange && (s1 = b.symbol || s1 = b.asset))
-                || (ex2 = b.exchange && b2 = b.asset))
-             strat_keys
-         in
-         b.balance > 0.0 && not is_strat_asset)
+        let is_strat_asset =
+          List.exists
+            (fun ((ex1, s1), (ex2, b2)) ->
+              (ex1 = b.exchange && (s1 = b.symbol || s1 = b.asset))
+              || (ex2 = b.exchange && b2 = b.asset))
+            strat_keys
+        in
+        b.balance > 0.0 && not is_strat_asset)
       all_balances
   in
   let inactive_rows_data =
@@ -696,98 +692,93 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
   let active_images =
     List.map
       (fun row_data ->
-         let idx = !curr_row_idx in
-         incr curr_row_idx;
-         build_strategy_row
-           ~is_selected:(selected_index = Some idx)
-           (idx mod 2 = 1)
-           row_data)
+        let idx = !curr_row_idx in
+        incr curr_row_idx;
+        build_strategy_row
+          ~is_selected:(selected_index = Some idx)
+          (idx mod 2 = 1)
+          row_data)
       active_rows_data
   in
   let paused_images =
     List.map
       (fun row_data ->
-         let idx = !curr_row_idx in
-         incr curr_row_idx;
-         build_strategy_row
-           ~is_selected:(selected_index = Some idx)
-           (idx mod 2 = 1)
-           row_data)
+        let idx = !curr_row_idx in
+        incr curr_row_idx;
+        build_strategy_row
+          ~is_selected:(selected_index = Some idx)
+          (idx mod 2 = 1)
+          row_data)
       paused_rows_data
   in
   let inactive_rows =
     List.map
       (fun (b : Snapshot.balance) ->
-         let idx = !curr_row_idx in
-         incr curr_row_idx;
-         build_balance_row
-           ~is_selected:(selected_index = Some idx)
-           (idx mod 2 = 1)
-           b
-           false)
+        let idx = !curr_row_idx in
+        incr curr_row_idx;
+        build_balance_row ~is_selected:(selected_index = Some idx) (idx mod 2 = 1) b false)
       inactive_rows_data
   in
   let quote_rows =
     List.mapi
       (fun idx (b : Snapshot.balance) ->
-         build_balance_row ~is_selected:false (idx mod 2 = 1) b true)
+        build_balance_row ~is_selected:false (idx mod 2 = 1) b true)
       quote_rows_data
   in
   let total_up_strats, total_hold_strats, total_accum_val_strats =
     List.fold_left
       (fun (up_acc, hold_acc, accum_val_acc) (_symbol, (s : Snapshot.strategy)) ->
-         let mid = s.market.mid in
-         let base_bal = s.market.base_balance in
-         let staked_bal = s.market.staked_balance in
-         let sell_orders =
-           if s.sell_orders <> [] then s.sell_orders else s.market.sell_orders
-         in
-         let strat_up, pending_sell_qty =
-           List.fold_left
-             (fun (a, q_acc) (o : Snapshot.order) ->
-                if o.price > 0.0 && o.qty > 0.0
-                then a +. (o.price *. o.qty), q_acc +. o.qty
-                else a, q_acc)
-             (0.0, 0.0)
-             sell_orders
-         in
-         let accum_holding =
-           accum_qty_of ~staked:staked_bal ~pending:pending_sell_qty base_bal
-         in
-         let accum_hold_value = accum_holding *. mid in
-         ( up_acc +. strat_up
-         , hold_acc +. (base_bal *. mid)
-         , accum_val_acc +. accum_hold_value ))
+        let mid = s.market.mid in
+        let base_bal = s.market.base_balance in
+        let staked_bal = s.market.staked_balance in
+        let sell_orders =
+          if s.sell_orders <> [] then s.sell_orders else s.market.sell_orders
+        in
+        let strat_up, pending_sell_qty =
+          List.fold_left
+            (fun (a, q_acc) (o : Snapshot.order) ->
+              if o.price > 0.0 && o.qty > 0.0
+              then a +. (o.price *. o.qty), q_acc +. o.qty
+              else a, q_acc)
+            (0.0, 0.0)
+            sell_orders
+        in
+        let accum_holding =
+          accum_qty_of ~staked:staked_bal ~pending:pending_sell_qty base_bal
+        in
+        let accum_hold_value = accum_holding *. mid in
+        ( up_acc +. strat_up
+        , hold_acc +. (base_bal *. mid)
+        , accum_val_acc +. accum_hold_value ))
       (0.0, 0.0, 0.0)
       strats
   in
   let total_up_bals, total_hold_bals, total_accum_val_bals =
     List.fold_left
       (fun (up_acc, hold_acc, accum_val_acc) (b : Snapshot.balance) ->
-         if b.balance <= 0.0
-         then up_acc, hold_acc, accum_val_acc
-         else (
-           let mid = b.mid in
-           let is_quote = Snapshot.is_quote_asset b.asset in
-           let bal_up, pending_sell_qty =
-             List.fold_left
-               (fun (a, q_acc) (o : Snapshot.order) ->
-                  if o.price > 0.0 && o.qty > 0.0
-                  then a +. (o.price *. o.qty), q_acc +. o.qty
-                  else a, q_acc)
-               (0.0, 0.0)
-               b.sell_orders
-           in
-           let accum_holding =
-             if is_quote
-             then 0.0
-             else
-               accum_qty_of ~staked:b.staked_balance ~pending:pending_sell_qty b.balance
-           in
-           let accum_hold_value = accum_holding *. mid in
-           ( up_acc +. bal_up
-           , hold_acc +. (b.balance *. mid)
-           , accum_val_acc +. accum_hold_value )))
+        if b.balance <= 0.0
+        then up_acc, hold_acc, accum_val_acc
+        else (
+          let mid = b.mid in
+          let is_quote = Snapshot.is_quote_asset b.asset in
+          let bal_up, pending_sell_qty =
+            List.fold_left
+              (fun (a, q_acc) (o : Snapshot.order) ->
+                if o.price > 0.0 && o.qty > 0.0
+                then a +. (o.price *. o.qty), q_acc +. o.qty
+                else a, q_acc)
+              (0.0, 0.0)
+              b.sell_orders
+          in
+          let accum_holding =
+            if is_quote
+            then 0.0
+            else accum_qty_of ~staked:b.staked_balance ~pending:pending_sell_qty b.balance
+          in
+          let accum_hold_value = accum_holding *. mid in
+          ( up_acc +. bal_up
+          , hold_acc +. (b.balance *. mid)
+          , accum_val_acc +. accum_hold_value )))
       (0.0, 0.0, 0.0)
       all_balances
   in
@@ -797,9 +788,9 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
   let total_quote_val =
     List.fold_left
       (fun acc (b : Snapshot.balance) ->
-         if Snapshot.is_quote_asset b.asset && b.balance > 0.0
-         then acc +. b.balance
-         else acc)
+        if Snapshot.is_quote_asset b.asset && b.balance > 0.0
+        then acc +. b.balance
+        else acc)
       0.0
       all_balances
   in

@@ -1,6 +1,6 @@
-(** [Exchange_intf] implementation for Lighter L2: wires the WebSocket feeds,
-    FFI signer, action endpoints, and instrument metadata behind the
-    venue-agnostic interface consumed by strategies. *)
+(** [Exchange_intf] implementation for Lighter L2: wires the WebSocket feeds, FFI signer,
+    action endpoints, and instrument metadata behind the venue-agnostic interface consumed
+    by strategies. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
@@ -30,24 +30,24 @@ module Lighter_impl = struct
     | Lighter_executions_feed.Sell -> Types.Sell
   ;;
 
-  (** Places an order; rounds price/qty to the instrument's tick and lot sizes
-      before submission. *)
+  (** Places an order; rounds price/qty to the instrument's tick and lot sizes before
+      submission. *)
   let place_order
-        ~token:_
-        ~order_type
-        ~side
-        ~qty
-        ~symbol
-        ?limit_price
-        ?time_in_force
-        ?post_only
-        ?reduce_only
-        ?order_userref:_
-        ?cl_ord_id:_
-        ?trigger_price:_
-        ?display_qty:_
-        ?retry_config:_
-        ()
+    ~token:_
+    ~order_type
+    ~side
+    ~qty
+    ~symbol
+    ?limit_price
+    ?time_in_force
+    ?post_only
+    ?reduce_only
+    ?order_userref:_
+    ?cl_ord_id:_
+    ?trigger_price:_
+    ?display_qty:_
+    ?retry_config:_
+    ()
     =
     let is_buy =
       match side with
@@ -60,8 +60,8 @@ module Lighter_impl = struct
       | None ->
         (match order_type with
          | Types.Market ->
-           (* No true market orders: cross the spread with a 5% slippage
-               tolerance to maximize fill odds. *)
+           (* No true market orders: cross the spread with a 5% slippage tolerance to
+              maximize fill odds. *)
            (match Lighter_orderbook_feed.get_best_bid_ask symbol with
             | Some (bid, _, ask, _) -> if is_buy then ask *. 1.05 else bid *. 0.95
             | None ->
@@ -93,20 +93,19 @@ module Lighter_impl = struct
     | Error msg -> Error msg
   ;;
 
-  (** Amends qty/price of an existing order in place, without a
-      cancel-and-replace cycle. *)
+  (** Amends qty/price of an existing order in place, without a cancel-and-replace cycle. *)
   let amend_order
-        ~token:_
-        ~order_id
-        ?cl_ord_id:_
-        ?qty
-        ?limit_price
-        ?post_only:_
-        ?trigger_price:_
-        ?display_qty:_
-        ?symbol
-        ?retry_config:_
-        ()
+    ~token:_
+    ~order_id
+    ?cl_ord_id:_
+    ?qty
+    ?limit_price
+    ?post_only:_
+    ?trigger_price:_
+    ?display_qty:_
+    ?symbol
+    ?retry_config:_
+    ()
     =
     let existing = Lighter_executions_feed.find_order_everywhere order_id in
     let sym =
@@ -121,10 +120,9 @@ module Lighter_impl = struct
     then Lwt.return (Error "Cannot amend: symbol unknown and order not found")
     else if Option.is_none existing
     then
-      (* Reject amends for orders missing from the live cache (e.g. after a
-         WS reconnect): retrying against an untracked phantom order would
-         spam L2 modify txs; surfacing the error engages the upstream amend
-         failure cooldown instead. *)
+      (* Reject amends for orders missing from the live cache (e.g. after a WS reconnect):
+         retrying against an untracked phantom order would spam L2 modify txs; surfacing
+         the error engages the upstream amend failure cooldown instead. *)
       Lwt.return (Error (Printf.sprintf "Order not found for amendment: %s" order_id))
     else (
       let new_qty =
@@ -152,16 +150,16 @@ module Lighter_impl = struct
       | Error msg -> Error msg)
   ;;
 
-  (** Cancels a list of orders, resolving each symbol from the executions feed
-      when not supplied. *)
+  (** Cancels a list of orders, resolving each symbol from the executions feed when not
+      supplied. *)
   let cancel_orders
-        ~token:_
-        ?order_ids
-        ?cl_ord_ids:_
-        ?order_userrefs:_
-        ?symbol
-        ?retry_config:_
-        ()
+    ~token:_
+    ?order_ids
+    ?cl_ord_ids:_
+    ?order_userrefs:_
+    ?symbol
+    ?retry_config:_
+    ()
     =
     let ids =
       match order_ids with
@@ -174,20 +172,20 @@ module Lighter_impl = struct
       let results =
         Lwt_list.map_s
           (fun order_id ->
-             (* Symbol from the argument, else from the executions feed. *)
-             let sym =
-               match symbol with
-               | Some s -> s
-               | None ->
-                 (match Lighter_executions_feed.find_order_everywhere order_id with
-                  | Some o -> o.symbol
-                  | None -> "")
-             in
-             if sym = ""
-             then
-               Lwt.return
-                 (Error (Printf.sprintf "Cannot cancel %s: symbol unknown" order_id))
-             else Lighter_actions.cancel_order ~symbol:sym ~order_id)
+            (* Symbol from the argument, else from the executions feed. *)
+            let sym =
+              match symbol with
+              | Some s -> s
+              | None ->
+                (match Lighter_executions_feed.find_order_everywhere order_id with
+                 | Some o -> o.symbol
+                 | None -> "")
+            in
+            if sym = ""
+            then
+              Lwt.return
+                (Error (Printf.sprintf "Cannot cancel %s: symbol unknown" order_id))
+            else Lighter_actions.cancel_order ~symbol:sym ~order_id)
           ids
       in
       results
@@ -225,9 +223,9 @@ module Lighter_impl = struct
   (* Lighter's tradeable figure is already hold-netted. *)
   let get_available_balance_fast = get_tradeable_balance_fast
 
-  (* No freshness tracking: unknown age (treated as stale by strategies, which
-     preserves the previous attempt-anyway behavior). *)
-  let get_balance_age_fast ~asset:_ = fun () -> None
+  (* No freshness tracking: unknown age (treated as stale by strategies, which preserves
+     the previous attempt-anyway behavior). *)
+  let get_balance_age_fast ~asset:_ () = None
   let get_total_balance ~asset = Lighter_balances.get_balance asset
   let get_staked_balance ~asset:_ = 0.0
   let get_all_balances () = Lighter_balances.get_all_balances ()
@@ -254,17 +252,17 @@ module Lighter_impl = struct
     let orders = Lighter_executions_feed.get_open_orders symbol in
     List.map
       (fun (o : Lighter_executions_feed.open_order) ->
-         { Types.order_id = o.order_id
-         ; symbol = o.symbol
-         ; side = side_of_lighter_side o.side
-         ; qty = o.order_qty
-         ; cum_qty = o.cum_qty
-         ; remaining_qty = o.remaining_qty
-         ; limit_price = o.limit_price
-         ; status = status_of_lighter_status o.order_status
-         ; user_ref = o.order_userref
-         ; cl_ord_id = o.cl_ord_id
-         })
+        { Types.order_id = o.order_id
+        ; symbol = o.symbol
+        ; side = side_of_lighter_side o.side
+        ; qty = o.order_qty
+        ; cum_qty = o.cum_qty
+        ; remaining_qty = o.remaining_qty
+        ; limit_price = o.limit_price
+        ; status = status_of_lighter_status o.order_status
+        ; user_ref = o.order_userref
+        ; cl_ord_id = o.cl_ord_id
+        })
       orders
   ;;
 
@@ -318,6 +316,10 @@ module Lighter_impl = struct
     Lighter_executions_feed.get_orders_generation ()
   ;;
 
+  let drain_open_order_changes ~symbol =
+    Lighter_executions_feed.drain_open_order_changes ~symbol
+  ;;
+
   let get_execution_feed_position ~symbol =
     Lighter_executions_feed.get_current_position symbol
   ;;
@@ -336,17 +338,17 @@ module Lighter_impl = struct
     let events = Lighter_executions_feed.read_execution_events symbol start_pos in
     List.map
       (fun (e : Lighter_executions_feed.execution_event) ->
-         { Types.order_id = e.order_id
-         ; order_status = status_of_lighter_status e.order_status
-         ; limit_price = e.limit_price
-         ; side = side_of_lighter_side e.side
-         ; remaining_qty = max 0.0 (e.order_qty -. e.cum_qty)
-         ; filled_qty = e.cum_qty
-         ; avg_price = e.avg_price
-         ; timestamp = e.timestamp
-         ; is_amended = e.is_amended
-         ; cl_ord_id = e.cl_ord_id
-         })
+        { Types.order_id = e.order_id
+        ; order_status = status_of_lighter_status e.order_status
+        ; limit_price = e.limit_price
+        ; side = side_of_lighter_side e.side
+        ; remaining_qty = max 0.0 (e.order_qty -. e.cum_qty)
+        ; filled_qty = e.cum_qty
+        ; avg_price = e.avg_price
+        ; timestamp = e.timestamp
+        ; is_amended = e.is_amended
+        ; cl_ord_id = e.cl_ord_id
+        })
       events
   ;;
 
@@ -379,13 +381,13 @@ module Lighter_impl = struct
     let events = Lighter_orderbook_feed.read_orderbook_events symbol start_pos in
     List.map
       (fun (ob : Lighter_orderbook_feed.orderbook) ->
-         let map_levels levels =
-           Array.map (fun (l : Lighter_orderbook_feed.level) -> l.price, l.size) levels
-         in
-         { Types.bids = map_levels ob.bids
-         ; asks = map_levels ob.asks
-         ; timestamp = ob.timestamp
-         })
+        let map_levels levels =
+          Array.map (fun (l : Lighter_orderbook_feed.level) -> l.price, l.size) levels
+        in
+        { Types.bids = map_levels ob.bids
+        ; asks = map_levels ob.asks
+        ; timestamp = ob.timestamp
+        })
       events
   ;;
 
@@ -438,9 +440,9 @@ module Lighter_impl = struct
        | None -> None, None)
   ;;
 
-  (* Uniform decode entry: routes one inbound text frame through the same pure
-     decoder used by the WS layer ([Lighter_ws.decode_text_frame]), which has no
-     Lwt or connection-state dependencies. *)
+  (* Uniform decode entry: routes one inbound text frame through the same pure decoder
+     used by the WS layer ([Lighter_ws.decode_text_frame]), which has no Lwt or
+     connection-state dependencies. *)
   let decode_frame content =
     try ignore (Lighter_ws.decode_text_frame content) with
     | exn ->
@@ -491,15 +493,14 @@ let initialize_signer () =
     Lwt.return_unit
 ;;
 
-(** Fetches instrument metadata over REST for [symbols] into the instruments
-    feed. *)
+(** Fetches instrument metadata over REST for [symbols] into the instruments feed. *)
 let initialize_instruments ~symbols =
   let base_url = Lighter_proxy.api_base_url () in
   Lighter_instruments_feed.fetch_and_initialize ~base_url ~required_symbols:symbols
 ;;
 
-(** Pulls open orders for the account over REST and feeds them into the
-    executions feed to reconcile state after a reconnect. *)
+(** Pulls open orders for the account over REST and feeds them into the executions feed to
+    reconcile state after a reconnect. *)
 let fetch_open_orders () =
   let section = "lighter_startup" in
   let account_index =
@@ -521,45 +522,44 @@ let fetch_open_orders () =
   in
   Lwt.catch
     (fun () ->
-       let uri = Uri.of_string url in
-       let%lwt resp, body = Cohttp_lwt_unix.Client.get uri in
-       let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-       let%lwt body_str = Cohttp_lwt.Body.to_string body in
-       if status < 200 || status >= 300
-       then (
-         Logging.error_f
-           ~section
-           "openOrders request failed: HTTP %d (body=%s)"
-           status
-           (if String.length body_str > 200
-            then String.sub body_str 0 200 ^ "..."
-            else body_str);
-         if status >= 500 then Lighter_proxy.rotate_proxy ();
-         Lighter_executions_feed.set_startup_snapshot_done ();
-         Lwt.return_unit)
-       else (
-         let trimmed = String.trim body_str in
-         if trimmed = "" || trimmed = "{}" || trimmed = "[]"
-         then (
-           Logging.info_f ~section "No open orders on Lighter (empty response)";
-           Lighter_executions_feed.set_startup_snapshot_done ();
-           Lwt.return_unit)
-         else (
-           let json = Yojson.Safe.from_string trimmed in
-           Lighter_executions_feed.handle_snapshot json;
-           Lighter_executions_feed.set_startup_snapshot_done ();
-           Logging.debug_f ~section "Fetched and injected open orders";
-           Lwt.return_unit)))
+      let uri = Uri.of_string url in
+      let%lwt resp, body = Cohttp_lwt_unix.Client.get uri in
+      let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+      let%lwt body_str = Cohttp_lwt.Body.to_string body in
+      if status < 200 || status >= 300
+      then (
+        Logging.error_f
+          ~section
+          "openOrders request failed: HTTP %d (body=%s)"
+          status
+          (if String.length body_str > 200
+           then String.sub body_str 0 200 ^ "..."
+           else body_str);
+        if status >= 500 then Lighter_proxy.rotate_proxy ();
+        Lighter_executions_feed.set_startup_snapshot_done ();
+        Lwt.return_unit)
+      else (
+        let trimmed = String.trim body_str in
+        if trimmed = "" || trimmed = "{}" || trimmed = "[]"
+        then (
+          Logging.info_f ~section "No open orders on Lighter (empty response)";
+          Lighter_executions_feed.set_startup_snapshot_done ();
+          Lwt.return_unit)
+        else (
+          let json = Yojson.Safe.from_string trimmed in
+          Lighter_executions_feed.handle_snapshot json;
+          Lighter_executions_feed.set_startup_snapshot_done ();
+          Logging.debug_f ~section "Fetched and injected open orders";
+          Lwt.return_unit)))
     (fun exn ->
-       Logging.error_f ~section "Failed to fetch open orders: %s" (Printexc.to_string exn);
-       Lighter_executions_feed.set_startup_snapshot_done ();
-       Lwt.return_unit)
+      Logging.error_f ~section "Failed to fetch open orders: %s" (Printexc.to_string exn);
+      Lighter_executions_feed.set_startup_snapshot_done ();
+      Lwt.return_unit)
 ;;
 
-(** Fetches all asset balances via the REST API at startup, ensuring balances
-    (including USDC) are populated before domains start. Handles both unified
-    accounts (USDC is account-level collateral) and split accounts (USDC is
-    in the assets array). *)
+(** Fetches all asset balances via the REST API at startup, ensuring balances (including
+    USDC) are populated before domains start. Handles both unified accounts (USDC is
+    account-level collateral) and split accounts (USDC is in the assets array). *)
 let fetch_balances () =
   let section = "lighter_startup" in
   let account_index =
@@ -573,131 +573,131 @@ let fetch_balances () =
   let url = Printf.sprintf "%s/api/v1/account?by=index&value=%d" base_url account_index in
   Lwt.catch
     (fun () ->
-       let uri = Uri.of_string url in
-       let%lwt resp, body = Cohttp_lwt_unix.Client.get uri in
-       let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-       let%lwt body_str = Cohttp_lwt.Body.to_string body in
-       if status < 200 || status >= 300
-       then (
-         Logging.error_f
-           ~section
-           "Lighter account request failed: HTTP %d (body=%s)"
-           status
-           (if String.length body_str > 300
-            then String.sub body_str 0 300 ^ "..."
-            else body_str);
-         if status >= 500 then Lighter_proxy.rotate_proxy ();
-         Lwt.return_unit)
-       else (
-         let trimmed = String.trim body_str in
-         Logging.info_f
-           ~section
-           "Lighter account response: %s"
-           (if String.length trimmed > 500
-            then String.sub trimmed 0 500 ^ "..."
-            else trimmed);
-         let json = Yojson.Safe.from_string trimmed in
-         let open Yojson.Safe.Util in
-         let accounts =
-           try member "accounts" json |> to_list with
-           | _ -> []
-         in
-         match accounts with
-         | [] ->
-           Logging.error_f ~section "Lighter account response has no accounts";
-           Lwt.return_unit
-         | account :: _ ->
-           let assets =
-             try member "assets" account |> to_list with
-             | _ -> []
-           in
-           let assets_assoc =
-             List.map
-               (fun asset_json ->
-                  let asset_id =
-                    try member "asset_id" asset_json |> to_int |> string_of_int with
-                    | _ -> "?"
-                  in
-                  asset_id, asset_json)
-               assets
-           in
-           (* For unified accounts, USDC lives at the account level as
-             collateral/available_balance, not in the assets array.
-             Check if assets already has a positive USDC entry; if not,
-             inject the account-level collateral as a synthetic USDC asset. *)
-           let has_usdc_in_assets =
-             List.exists
-               (fun (_id, aj) ->
-                  let sym =
-                    try member "symbol" aj |> to_string with
-                    | _ -> ""
-                  in
-                  let bal =
-                    try Lighter_types.parse_json_float (member "balance" aj) with
-                    | _ -> 0.0
-                  in
-                  sym = "USDC" && bal > 0.0)
-               assets_assoc
-           in
-           let final_assets =
-             if has_usdc_in_assets
-             then assets_assoc
-             else (
-               (* Read account-level collateral (unified account USDC balance) *)
-               let collateral =
-                 try Lighter_types.parse_json_float (member "collateral" account) with
-                 | _ -> 0.0
-               in
-               let available =
-                 try
-                   Lighter_types.parse_json_float (member "available_balance" account)
-                 with
-                 | _ -> 0.0
-               in
-               let usdc_balance = max collateral available in
-               Logging.info_f
-                 ~section
-                 "Unified account detected: injecting USDC from account-level \
-                  collateral=%.6f available=%.6f -> %.6f"
-                 collateral
-                 available
-                 usdc_balance;
-               if usdc_balance > 0.0
-               then
-                 assets_assoc
-                 @ [ ( "3"
-                     , `Assoc
-                         [ "symbol", `String "USDC"
-                         ; "asset_id", `Int 3
-                         ; "balance", `String (Printf.sprintf "%.6f" usdc_balance)
-                         ; "locked_balance", `String "0.000000"
-                         ] )
-                   ]
-               else assets_assoc)
-           in
-           let synthetic_json =
-             `Assoc
-               [ "type", `String "snapshot/account_all_assets"
-               ; "channel", `String (Printf.sprintf "account_all_assets/%d" account_index)
-               ; "account_all", `Assoc [ "assets", `Assoc final_assets ]
-               ]
-           in
-           Lighter_balances.process_market_data synthetic_json;
-           let usdc_bal = Lighter_balances.get_balance "USDC" in
-           Logging.info_f
-             ~section
-             "Lighter balances fetched via REST: USDC=%.6f (%d assets from array, %d \
-              total injected)"
-             usdc_bal
-             (List.length assets)
-             (List.length final_assets);
-           Lwt.return_unit))
+      let uri = Uri.of_string url in
+      let%lwt resp, body = Cohttp_lwt_unix.Client.get uri in
+      let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+      let%lwt body_str = Cohttp_lwt.Body.to_string body in
+      if status < 200 || status >= 300
+      then (
+        Logging.error_f
+          ~section
+          "Lighter account request failed: HTTP %d (body=%s)"
+          status
+          (if String.length body_str > 300
+           then String.sub body_str 0 300 ^ "..."
+           else body_str);
+        if status >= 500 then Lighter_proxy.rotate_proxy ();
+        Lwt.return_unit)
+      else (
+        let trimmed = String.trim body_str in
+        Logging.info_f
+          ~section
+          "Lighter account response: %s"
+          (if String.length trimmed > 500
+           then String.sub trimmed 0 500 ^ "..."
+           else trimmed);
+        let json = Yojson.Safe.from_string trimmed in
+        let open Yojson.Safe.Util in
+        let accounts =
+          try member "accounts" json |> to_list with
+          | _ -> []
+        in
+        match accounts with
+        | [] ->
+          Logging.error_f ~section "Lighter account response has no accounts";
+          Lwt.return_unit
+        | account :: _ ->
+          let assets =
+            try member "assets" account |> to_list with
+            | _ -> []
+          in
+          let assets_assoc =
+            List.map
+              (fun asset_json ->
+                let asset_id =
+                  try member "asset_id" asset_json |> to_int |> string_of_int with
+                  | _ -> "?"
+                in
+                asset_id, asset_json)
+              assets
+          in
+          (* For unified accounts, USDC lives at the account level as
+             collateral/available_balance, not in the assets array. Check if assets
+             already has a positive USDC entry; if not, inject the account-level
+             collateral as a synthetic USDC asset. *)
+          let has_usdc_in_assets =
+            List.exists
+              (fun (_id, aj) ->
+                let sym =
+                  try member "symbol" aj |> to_string with
+                  | _ -> ""
+                in
+                let bal =
+                  try Lighter_types.parse_json_float (member "balance" aj) with
+                  | _ -> 0.0
+                in
+                sym = "USDC" && bal > 0.0)
+              assets_assoc
+          in
+          let final_assets =
+            if has_usdc_in_assets
+            then assets_assoc
+            else (
+              (* Read account-level collateral (unified account USDC balance) *)
+              let collateral =
+                try Lighter_types.parse_json_float (member "collateral" account) with
+                | _ -> 0.0
+              in
+              let available =
+                try
+                  Lighter_types.parse_json_float (member "available_balance" account)
+                with
+                | _ -> 0.0
+              in
+              let usdc_balance = max collateral available in
+              Logging.info_f
+                ~section
+                "Unified account detected: injecting USDC from account-level \
+                 collateral=%.6f available=%.6f -> %.6f"
+                collateral
+                available
+                usdc_balance;
+              if usdc_balance > 0.0
+              then
+                assets_assoc
+                @ [ ( "3"
+                    , `Assoc
+                        [ "symbol", `String "USDC"
+                        ; "asset_id", `Int 3
+                        ; "balance", `String (Printf.sprintf "%.6f" usdc_balance)
+                        ; "locked_balance", `String "0.000000"
+                        ] )
+                  ]
+              else assets_assoc)
+          in
+          let synthetic_json =
+            `Assoc
+              [ "type", `String "snapshot/account_all_assets"
+              ; "channel", `String (Printf.sprintf "account_all_assets/%d" account_index)
+              ; "account_all", `Assoc [ "assets", `Assoc final_assets ]
+              ]
+          in
+          Lighter_balances.process_market_data synthetic_json;
+          let usdc_bal = Lighter_balances.get_balance "USDC" in
+          Logging.info_f
+            ~section
+            "Lighter balances fetched via REST: USDC=%.6f (%d assets from array, %d \
+             total injected)"
+            usdc_bal
+            (List.length assets)
+            (List.length final_assets);
+          Lwt.return_unit))
     (fun exn ->
-       Logging.error_f
-         ~section
-         "Failed to fetch Lighter balances: %s"
-         (Printexc.to_string exn);
-       Lwt.return_unit)
+      Logging.error_f
+        ~section
+        "Failed to fetch Lighter balances: %s"
+        (Printexc.to_string exn);
+      Lwt.return_unit)
 ;;
 
 (* Register the implementation with the exchange registry at module load. *)
@@ -705,5 +705,7 @@ let () = Exchange.Registry.register (module Lighter_impl)
 
 (* Register the uniform venue decoder for the parse-domain offload route. *)
 let () =
-  Concurrency.Parse_worker.register_venue_decoder ~venue:"lighter" Lighter_impl.decode_frame
+  Concurrency.Parse_worker.register_venue_decoder
+    ~venue:"lighter"
+    Lighter_impl.decode_frame
 ;;

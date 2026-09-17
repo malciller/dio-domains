@@ -1,5 +1,5 @@
-(* Alpaca oracle adapter tests: bar and calendar parsing. Pure functions
-   only (no network). *)
+(* Alpaca oracle adapter tests: bar and calendar parsing. Pure functions only (no
+   network). *)
 
 let near a b = Alcotest.(check (float 1e-9)) "approx" a b
 

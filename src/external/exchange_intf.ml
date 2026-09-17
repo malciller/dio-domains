@@ -1,11 +1,11 @@
 (** Exchange interface definition.
 
-    Defines the canonical module signature [S] all exchange backends implement,
-    a shared [Types] module for order lifecycle and market data records, and a
-    [Registry] for dynamic exchange lookup at runtime. *)
+    Defines the canonical module signature [S] all exchange backends implement, a shared
+    [Types] module for order lifecycle and market data records, and a [Registry] for
+    dynamic exchange lookup at runtime. *)
 
-(** Shared types for order management, market data events, and retry
-    configuration. Used uniformly across all exchange implementations. *)
+(** Shared types for order management, market data events, and retry configuration. Used
+    uniformly across all exchange implementations. *)
 module Types = struct
   (** Supported exchanges for type-safe dispatch. *)
   type exchange_id =
@@ -34,8 +34,8 @@ module Types = struct
     | Custom s -> s
   ;;
 
-  (** Supported order types. [Other s] captures exchange-specific types
-      not covered by the standard variants. *)
+  (** Supported order types. [Other s] captures exchange-specific types not covered by the
+      standard variants. *)
   type order_type =
     | Limit
     | Market
@@ -67,8 +67,8 @@ module Types = struct
     ; order_userref : int option (** User reference integer, if provided. *)
     }
 
-  (** Lifecycle states of an order on the exchange. [Unknown s] captures
-      any status string not mapped to a known variant. *)
+  (** Lifecycle states of an order on the exchange. [Unknown s] captures any status string
+      not mapped to a known variant. *)
   type order_status =
     | Pending
     | New
@@ -79,8 +79,8 @@ module Types = struct
     | Rejected
     | Unknown of string
 
-  (** Snapshot of a single open order, including fill progress and
-      optional client identifiers. *)
+  (** Snapshot of a single open order, including fill progress and optional client
+      identifiers. *)
   type open_order =
     { order_id : string (** Exchange-assigned order identifier. *)
     ; symbol : string (** Trading pair symbol. *)
@@ -126,34 +126,30 @@ module Types = struct
     ; avg_price : float (** Volume-weighted average fill price. *)
     ; timestamp : float (** Unix timestamp of the execution report. *)
     ; is_amended : bool
-      (** True when this event is an in-place amendment confirmation
-                                       (Kraken exec_type=amended), not a genuine new-order
-                                       acknowledgment. Domain workers must skip
-                                       handle_order_acknowledged for these. *)
+    (** True when this event is an in-place amendment confirmation (Kraken
+        exec_type=amended), not a genuine new-order acknowledgment. Domain workers must
+        skip handle_order_acknowledged for these. *)
     ; cl_ord_id : string option
-      (** Client order id when the venue provides one
-                                       (Hyperliquid cloid, Lighter client_order_id). *)
+    (** Client order id when the venue provides one (Hyperliquid cloid, Lighter
+        client_order_id). *)
     }
 
-  (** Parameters controlling exponential backoff retry behavior.
-      Canonical definition lives in [Error_handling]; re-exported here so
-      exchange module signatures can reference [Types.retry_config] without
-      depending on [Error_handling] directly. *)
+  (** Parameters controlling exponential backoff retry behavior. Canonical definition
+      lives in [Error_handling]; re-exported here so exchange module signatures can
+      reference [Types.retry_config] without depending on [Error_handling] directly. *)
   type retry_config = Error_handling.retry_config =
     { max_attempts : int (** Maximum number of attempts (including the initial). *)
     ; base_delay_ms : float (** Initial delay between retries, in milliseconds. *)
     ; max_delay_ms : float (** Upper bound on delay between retries, in milliseconds. *)
     ; backoff_factor : float
-      (** Multiplicative factor applied to the delay after each attempt. *)
+    (** Multiplicative factor applied to the delay after each attempt. *)
     }
 
-  (* ---- Oracle data-layer types ----
-     Shared with the capital oracle via [Oracle]; defined here so venue
-     libraries can implement [Oracle.S] without depending on the oracle
-     library. [Oracle_types] aliases these. *)
+  (* ---- Oracle data-layer types ---- Shared with the capital oracle via [Oracle];
+     defined here so venue libraries can implement [Oracle.S] without depending on the
+     oracle library. [Oracle_types] aliases these. *)
 
-  (** Historical daily OHLC bar (the oracle's data layer). One bar per
-      session/date. *)
+  (** Historical daily OHLC bar (the oracle's data layer). One bar per session/date. *)
   type bar =
     { date : string (** ISO date (YYYY-MM-DD). *)
     ; open_ : float
@@ -170,9 +166,8 @@ module Types = struct
     | Crypto
     | Equity
 
-  (* ---- Bar/date helpers ----
-     Shared with the oracle and external data clients (e.g. Yahoo) that must
-     not depend on the oracle library. The oracle's [Oracle_calendar]
+  (* ---- Bar/date helpers ---- Shared with the oracle and external data clients (e.g.
+     Yahoo) that must not depend on the oracle library. The oracle's [Oracle_calendar]
      re-exports these. *)
 
   (** Parse an ISO date (YYYY-MM-DD) into (year, month, day). *)
@@ -184,9 +179,9 @@ module Types = struct
     y, m, d
   ;;
 
-  (** Days since 1970-01-01 of a civil (y, m, d) date. Exact integer
-      arithmetic; independent of timezone, DST and Unix.mktime. Valid for the
-      proleptic Gregorian calendar (all dates here are >= 1970). *)
+  (** Days since 1970-01-01 of a civil (y, m, d) date. Exact integer arithmetic;
+      independent of timezone, DST and Unix.mktime. Valid for the proleptic Gregorian
+      calendar (all dates here are >= 1970). *)
   let days_from_civil y m d =
     let y = if m <= 2 then y - 1 else y in
     let era = (if y >= 0 then y else y - 399) / 400 in
@@ -224,8 +219,8 @@ module Types = struct
     arr
   ;;
 
-  (** De-duplicate an ascending bar array by date (first occurrence wins).
-      The input must already be sorted ascending; the array is copied. *)
+  (** De-duplicate an ascending bar array by date (first occurrence wins). The input must
+      already be sorted ascending; the array is copied. *)
   let dedup (bars : bar array) =
     let n = Array.length bars in
     if n = 0
@@ -235,30 +230,112 @@ module Types = struct
       let prev = ref bars.(0).date in
       Array.iteri
         (fun i b ->
-           if i > 0 && b.date <> !prev
-           then (
-             out := b :: !out;
-             prev := b.date))
+          if i > 0 && b.date <> !prev
+          then (
+            out := b :: !out;
+            prev := b.date))
         bars;
       Array.of_list (List.rev !out))
   ;;
 end
 
+(** The per-cycle hot-path contract.
+
+    A trading system advertised as high-frequency must be O(1) per strategy cycle. Every
+    accessor here is a lock-free [Atomic] snapshot read (or, for
+    {!drain_open_order_changes}, an O(changes) lock-free swap). The strategy cycle may use
+    ONLY these exchange reads; any O(open-orders) or hashing/locking accessor belongs in
+    {!RECONCILE_READS} and must be reached solely from the cold reconcile path (startup,
+    reconnect, or a delta that reported overflow), never per cycle.
+
+    Keep this signature minimal: adding an O(n) or lock-taking accessor here is how the
+    hot-path guarantee silently regresses. *)
+module type HOT_READS = sig
+  (** O(1) lock-free closure for the current orderbook position. *)
+  val get_orderbook_position_fast : symbol:string -> unit -> int
+
+  (** O(1) lock-free closure for top-of-book. *)
+  val get_top_of_book_fast
+    :  symbol:string
+    -> unit
+    -> (float * float * float * float) option
+
+  (** O(1) lock-free closure for the execution ring-buffer position. *)
+  val get_execution_feed_position_fast : symbol:string -> unit -> int
+
+  (** O(1) lock-free closure: has the execution feed received initial data. *)
+  val has_execution_data_fast : symbol:string -> unit -> bool
+
+  (** O(1) lock-free tradeable balance. *)
+  val get_tradeable_balance : asset:string -> float
+
+  (** O(1) lock-free closure for tradeable balance. *)
+  val get_tradeable_balance_fast : asset:string -> unit -> float
+
+  (** O(1) lock-free closure for the venue-authoritative sellable quantity. *)
+  val get_available_balance_fast : asset:string -> unit -> float
+
+  (** O(1) lock-free closure for balance-snapshot age. *)
+  val get_balance_age_fast : asset:string -> unit -> float option
+
+  (** O(1) atomic open-orders generation ([-1] = treat as always-changed). *)
+  val get_open_orders_generation : symbol:string -> int
+
+  (** O(changes), lock-free: drain the per-order delta [(changes, overflow)]. [overflow]
+      (or an unsupported venue) is the ONLY condition that licenses a reconcile scan. *)
+  val drain_open_order_changes
+    :  symbol:string
+    -> (string * (float option * float * string * int option) option) list * bool
+end
+
+(** The cold reconcile contract: O(open-orders) reads used to rebuild strategy state at
+    startup, on reconnect, or when {!HOT_READS.drain_open_order_changes} reports overflow.
+    Never invoke these on the steady-state per-cycle path. *)
+module type RECONCILE_READS = sig
+  (** O(n): look up a single order (allocates the [Types.open_order] record). *)
+  val get_open_order : symbol:string -> order_id:string -> Types.open_order option
+
+  (** O(n): all open orders for [symbol]. *)
+  val get_open_orders : symbol:string -> Types.open_order list
+
+  (** O(n): all open orders for [asset]'s pairs. *)
+  val get_all_orders_for_asset : asset:string -> Types.open_order list
+
+  (** O(n): fold over open orders without the intermediate list. *)
+  val fold_open_orders
+    :  symbol:string
+    -> init:'a
+    -> f:('a -> Types.open_order -> 'a)
+    -> 'a
+
+  (** O(n): fast-path iteration over open orders (primitive values, no records). *)
+  val iter_open_orders_fast
+    :  symbol:string
+    -> (string -> float -> float -> string -> int option -> unit)
+    -> unit
+end
+
 (** Module signature every exchange backend satisfies.
 
-    Covers order lifecycle operations (place, amend, cancel), synchronous
-    market data accessors backed by ring buffers, position-based event feed
-    consumption, balance queries, instrument metadata, and fee retrieval. *)
+    Covers order lifecycle operations (place, amend, cancel), synchronous market data
+    accessors backed by ring buffers, position-based event feed consumption, balance
+    queries, instrument metadata, and fee retrieval.
+
+    The hot-path reads are grouped in {!HOT_READS} and the cold scans in
+    {!RECONCILE_READS}; both are included below so the hot-path contract is explicit. *)
 module type S = sig
+  include HOT_READS
+  include RECONCILE_READS
+
   (** Human-readable exchange name used as the registry key. *)
   val name : string
 
   (** Submit a new order to the exchange.
 
-      Required parameters: [token] (auth), [order_type], [side], [qty],
-      [symbol]. Optional parameters control limit pricing, time-in-force,
-      post-only and reduce-only flags, user reference, client order id,
-      trigger price, iceberg display quantity, and retry behavior.
+      Required parameters: [token] (auth), [order_type], [side], [qty], [symbol]. Optional
+      parameters control limit pricing, time-in-force, post-only and reduce-only flags,
+      user reference, client order id, trigger price, iceberg display quantity, and retry
+      behavior.
 
       Returns [Ok add_order_result] on acceptance or [Error msg] on failure. *)
   val place_order
@@ -281,8 +358,8 @@ module type S = sig
 
   (** Amend an existing order (price, quantity, trigger, display qty).
 
-      Requires [token] and [order_id]. All mutable order fields are optional.
-      Returns [Ok amend_order_result] on acceptance or [Error msg] on failure. *)
+      Requires [token] and [order_id]. All mutable order fields are optional. Returns
+      [Ok amend_order_result] on acceptance or [Error msg] on failure. *)
   val amend_order
     :  token:string
     -> order_id:string
@@ -297,8 +374,8 @@ module type S = sig
     -> unit
     -> (Types.amend_order_result, string) result Lwt.t
 
-  (** Cancel one or more orders identified by order id, client order id,
-      or user reference. At least one identifier list should be non-empty.
+  (** Cancel one or more orders identified by order id, client order id, or user
+      reference. At least one identifier list should be non-empty.
 
       Returns [Ok cancel_order_result list] or [Error msg]. *)
   val cancel_orders
@@ -313,253 +390,255 @@ module type S = sig
 
   (* ---- Market data accessors ---- *)
 
-  (** Return top-of-book as [(bid_price, bid_size, ask_price, ask_size)],
-      or [None] if orderbook data is unavailable. *)
+  (** Return top-of-book as [(bid_price, bid_size, ask_price, ask_size)], or [None] if
+      orderbook data is unavailable. *)
   val get_top_of_book : symbol:string -> (float * float * float * float) option
 
-  (** Return [true] if a usable orderbook has been cached for [symbol] since
-      the last connection reset. Unlike [get_top_of_book], this ignores
-      freshness: a thin market that has not ticked recently still reports
-      [true]. Callers use it to decide whether a subscription needs
-      re-establishing, not whether a quote is currently tradeable. *)
+  (** Return [true] if a usable orderbook has been cached for [symbol] since the last
+      connection reset. Unlike [get_top_of_book], this ignores freshness: a thin market
+      that has not ticked recently still reports [true]. Callers use it to decide whether
+      a subscription needs re-establishing, not whether a quote is currently tradeable. *)
   val has_orderbook_data : symbol:string -> bool
 
   (** Return the current tradeable balance for [asset]. Returns [0.0] if unknown. *)
   val get_tradeable_balance : asset:string -> float
 
-  (** Return a fast path closure for fetching live tradeable balance of
-      [asset] without lock acquisition/hash lookup overhead. *)
+  (** Return a fast path closure for fetching live tradeable balance of [asset] without
+      lock acquisition/hash lookup overhead. *)
   val get_tradeable_balance_fast : asset:string -> unit -> float
 
-  (** Return a fast path closure for fetching the venue-authoritative
-      immediately-sellable quantity of [asset] (total minus base held by
-      resting open orders). On venues that already report a hold-netted
-      tradeable figure this equals [get_tradeable_balance_fast]; on Alpaca,
-      whose stored balance is GROSS, it returns the venue's [qty_available].
-      Returns [0.0] (or [nan] where the venue distinguishes "unknown") when the
-      figure is unavailable; callers must treat that as not-sellable and fall
-      back to their local basis. *)
+  (** Return a fast path closure for fetching the venue-authoritative immediately-sellable
+      quantity of [asset] (total minus base held by resting open orders). On venues that
+      already report a hold-netted tradeable figure this equals
+      [get_tradeable_balance_fast]; on Alpaca, whose stored balance is GROSS, it returns
+      the venue's [qty_available]. Returns [0.0] (or [nan] where the venue distinguishes
+      "unknown") when the figure is unavailable; callers must treat that as not-sellable
+      and fall back to their local basis. *)
   val get_available_balance_fast : asset:string -> unit -> float
 
-  (** Return a fast path closure yielding the age (seconds) of the cached
-      [asset] balance snapshot, or [None] when the exchange does not track
-      freshness. A fresh snapshot is authoritative: strategies that cannot
-      fund a buy against it skip placement. A stale (or unknown-age) snapshot
-      may be wrong, so strategies may still attempt and let the exchange
-      decide. *)
+  (** Return a fast path closure yielding the age (seconds) of the cached [asset] balance
+      snapshot, or [None] when the exchange does not track freshness. A fresh snapshot is
+      authoritative: strategies that cannot fund a buy against it skip placement. A stale
+      (or unknown-age) snapshot may be wrong, so strategies may still attempt and let the
+      exchange decide. *)
   val get_balance_age_fast : asset:string -> unit -> float option
 
-  (** Return the total balance for [asset] including staked/earn/vault balances. Returns [0.0] if unknown. *)
+  (** Return the total balance for [asset] including staked/earn/vault balances. Returns
+      [0.0] if unknown. *)
   val get_total_balance : asset:string -> float
 
-  (** Return the staked/locked balance for [asset] that is part of the total
-      but NOT tradeable (e.g. delegated HYPE). Returns [0.0] if unknown. *)
+  (** Return the staked/locked balance for [asset] that is part of the total but NOT
+      tradeable (e.g. delegated HYPE). Returns [0.0] if unknown. *)
   val get_staked_balance : asset:string -> float
 
   (** Return all cached asset balances as [(asset_name, balance)] pairs. *)
   val get_all_balances : unit -> (string * float) list
 
-  (** Look up a specific open order by [symbol] and [order_id].
-      Returns [None] if not found. *)
+  (** Look up a specific open order by [symbol] and [order_id]. Returns [None] if not
+      found. *)
   val get_open_order : symbol:string -> order_id:string -> Types.open_order option
 
   (** Return all open orders for [symbol]. *)
   val get_open_orders : symbol:string -> Types.open_order list
 
-  (** Return all open orders across all symbol stores whose symbol
-      starts with [asset ^ "/"]. Used by the dashboard to surface orders
-      for non-strategy balance assets stored under a different symbol key
-      than the dashboard constructs. *)
+  (** Return all open orders across all symbol stores whose symbol starts with
+      [asset ^ "/"]. Used by the dashboard to surface orders for non-strategy balance
+      assets stored under a different symbol key than the dashboard constructs. *)
   val get_all_orders_for_asset : asset:string -> Types.open_order list
 
   (* ---- Dynamic Subscription ---- *)
 
-  (** Dynamically subscribe additional symbols to the real-time orderbook
-      feed. Pipes top-of-book data into the central feed for non-active
-      balance assets. *)
+  (** Dynamically subscribe additional symbols to the real-time orderbook feed. Pipes
+      top-of-book data into the central feed for non-active balance assets. *)
   val subscribe_orderbook : symbols:string list -> unit Lwt.t
 
   (* ---- Ring buffer event feed consumption ---- *)
 
-  (** Return the current write position of the orderbook ring buffer for
-      [symbol]. Used as the starting cursor for [read_orderbook_events]. *)
+  (** Return the current write position of the orderbook ring buffer for [symbol]. Used as
+      the starting cursor for [read_orderbook_events]. *)
   val get_orderbook_position : symbol:string -> int
 
-  (** Read orderbook events from [start_pos] up to the current write
-      position. Returns a newly allocated list of events. *)
+  (** Read orderbook events from [start_pos] up to the current write position. Returns a
+      newly allocated list of events. *)
   val read_orderbook_events : symbol:string -> start_pos:int -> Types.orderbook_event list
 
-  (** Iterate over orderbook events from [start_pos] without allocating
-      an intermediate list. Returns the new read position. *)
+  (** Iterate over orderbook events from [start_pos] without allocating an intermediate
+      list. Returns the new read position. *)
   val iter_orderbook_events
     :  symbol:string
     -> start_pos:int
     -> (Types.orderbook_event -> unit)
     -> int
 
-  (** Iterate over orderbook events from [start_pos], extracting only
-      top-of-book (best bid, best ask) without allocating converted arrays.
-      Callback receives [(bid_price, bid_size, ask_price, ask_size)].
-      Returns the new read position. *)
+  (** Iterate over orderbook events from [start_pos], extracting only top-of-book (best
+      bid, best ask) without allocating converted arrays. Callback receives
+      [(bid_price, bid_size, ask_price, ask_size)]. Returns the new read position. *)
   val iter_top_of_book_events
     :  symbol:string
     -> start_pos:int
     -> (float -> float -> float -> float -> unit)
     -> int
 
-  (** Return the current write position of the execution feed ring buffer
-      for [symbol]. Used as the starting cursor for [read_execution_events]. *)
+  (** Return the current write position of the execution feed ring buffer for [symbol].
+      Used as the starting cursor for [read_execution_events]. *)
   val get_execution_feed_position : symbol:string -> int
 
-  (** Return [true] if the execution feed has received its initial data
-      snapshot for [symbol]. Used by domain workers to gate strategy
-      execution until open order state is populated. *)
+  (** Return [true] if the execution feed has received its initial data snapshot for
+      [symbol]. Used by domain workers to gate strategy execution until open order state
+      is populated. *)
   val has_execution_data : symbol:string -> bool
 
-  (** Read execution events from [start_pos] up to the current write
-      position. Returns a newly allocated list of events. *)
+  (** Read execution events from [start_pos] up to the current write position. Returns a
+      newly allocated list of events. *)
   val read_execution_events : symbol:string -> start_pos:int -> Types.execution_event list
 
-  (** Iterate over execution events from [start_pos] without allocating
-      an intermediate list. Returns the new read position. *)
+  (** Iterate over execution events from [start_pos] without allocating an intermediate
+      list. Returns the new read position. *)
   val iter_execution_events
     :  symbol:string
     -> start_pos:int
     -> (Types.execution_event -> unit)
     -> int
 
-  (** Fold over open orders for [symbol] without allocating an intermediate
-      list. Applies [f] to each open order, threading the accumulator. *)
+  (** Fold over open orders for [symbol] without allocating an intermediate list. Applies
+      [f] to each open order, threading the accumulator. *)
   val fold_open_orders
     :  symbol:string
     -> init:'a
     -> f:('a -> Types.open_order -> 'a)
     -> 'a
 
-  (** Fast path iterator that avoids creating Types.open_order intermediate
-      records. Yields primitive order values directly to the callback. *)
+  (** Fast path iterator that avoids creating Types.open_order intermediate records.
+      Yields primitive order values directly to the callback. *)
   val iter_open_orders_fast
     :  symbol:string
     -> (string -> float -> float -> string -> int option -> unit)
     -> unit
 
-  (** A counter that increments whenever this account's open-orders snapshot
-      changes (any new/fill/cancel/amend). [-1] for venues that expose no such
-      signal, in which case callers MUST treat the snapshot as changed on every
-      call. The grid strategy uses it to skip the O(open-orders)
-      [sync_open_orders] scan when nothing has changed since the last scan. *)
+  (** A counter that increments whenever this account's open-orders snapshot changes (any
+      new/fill/cancel/amend). [-1] for venues that expose no such signal, in which case
+      callers MUST treat the snapshot as changed on every call. The grid strategy uses it
+      to skip the O(open-orders) [sync_open_orders] scan when nothing has changed since
+      the last scan. *)
   val get_open_orders_generation : symbol:string -> int
 
-  (** Return a fast path closure for fetching the current orderbook position
-      without lock acquisition/hash lookup overhead. *)
+  (** Drain the per-order change delta for [symbol]: [(changes, overflow)] where [changes]
+      is [(id, snapshot option)] in chronological order, [snapshot] being
+      [(limit_price, remaining_qty, side, order_userref)] for an add/replace and [None]
+      for a removal. [overflow] (or an unsupported venue) means the caller must do a full
+      rescan. Lets the strategy apply an O(changes) delta instead of the O(open-orders)
+      [sync_open_orders] scan. *)
+  val drain_open_order_changes
+    :  symbol:string
+    -> (string * (float option * float * string * int option) option) list * bool
+
+  (** Return a fast path closure for fetching the current orderbook position without lock
+      acquisition/hash lookup overhead. *)
   val get_orderbook_position_fast : symbol:string -> unit -> int
 
-  (** Return a fast path closure for fetching top-of-book data without hash
-      lookup overhead. *)
+  (** Return a fast path closure for fetching top-of-book data without hash lookup
+      overhead. *)
   val get_top_of_book_fast
     :  symbol:string
     -> unit
     -> (float * float * float * float) option
 
-  (** Return a fast path closure for fetching the current execution feed
-      position without hash lookup overhead. *)
+  (** Return a fast path closure for fetching the current execution feed position without
+      hash lookup overhead. *)
   val get_execution_feed_position_fast : symbol:string -> unit -> int
 
-  (** Return a fast path closure for checking if the execution feed has initial
-      data without hash lookup overhead. *)
+  (** Return a fast path closure for checking if the execution feed has initial data
+      without hash lookup overhead. *)
   val has_execution_data_fast : symbol:string -> unit -> bool
 
   (* ---- Instrument metadata ---- *)
 
-  (** Return the minimum price increment (tick size) for [symbol],
-      or [None] if instrument metadata is unavailable. *)
+  (** Return the minimum price increment (tick size) for [symbol], or [None] if instrument
+      metadata is unavailable. *)
   val get_price_increment : symbol:string -> float option
 
-  (** Return the minimum quantity increment (lot step) for [symbol],
-      or [None] if instrument metadata is unavailable. *)
+  (** Return the minimum quantity increment (lot step) for [symbol], or [None] if
+      instrument metadata is unavailable. *)
   val get_qty_increment : symbol:string -> float option
 
-  (** Return the minimum order quantity for [symbol], or [None] if
-      instrument metadata is unavailable. *)
+  (** Return the minimum order quantity for [symbol], or [None] if instrument metadata is
+      unavailable. *)
   val get_qty_min : symbol:string -> float option
 
-  (** Round [price] to the exchange's valid precision for [symbol].
-      Hyperliquid: 5 significant figures, capped at
-      (MAX_DECIMALS - szDecimals) decimal places.
-      Kraken: nearest price_increment tick. *)
+  (** Round [price] to the exchange's valid precision for [symbol]. Hyperliquid: 5
+      significant figures, capped at (MAX_DECIMALS - szDecimals) decimal places. Kraken:
+      nearest price_increment tick. *)
   val round_price : symbol:string -> price:float -> float
 
-  (** Return cached (maker_fee, taker_fee) for [symbol]. Each component
-      is [None] if the fee has not been fetched. *)
+  (** Return cached (maker_fee, taker_fee) for [symbol]. Each component is [None] if the
+      fee has not been fetched. *)
   val get_fees : symbol:string -> float option * float option
 
   (* ---- Raw frame decoding (uniform ingress) ---- *)
 
-  (** Decode one raw inbound market-data/execution frame. The single,
-      venue-uniform entry point the engine uses to hand a raw payload to a
-      venue; implementations route it to the right feed internally.
+  (** Decode one raw inbound market-data/execution frame. The single, venue-uniform entry
+      point the engine uses to hand a raw payload to a venue; implementations route it to
+      the right feed internally.
 
-      Runs on the parse domain: implementations MUST NOT touch Lwt primitives,
-      promises, streams or other single-domain state. Mutexes, atomics and
-      [Logging] are allowed. Connection management, authentication and Lwt
-      subscriber fan-out stay in the venue's WebSocket layer. *)
+      Runs on the parse domain: implementations MUST NOT touch Lwt primitives, promises,
+      streams or other single-domain state. Mutexes, atomics and [Logging] are allowed.
+      Connection management, authentication and Lwt subscriber fan-out stay in the venue's
+      WebSocket layer. *)
   val decode_frame : string -> unit
 end
 
-(** Dynamic registry mapping exchange names to their [(module S)]
-    implementations. Backed by a [Hashtbl] for O(1) lookup. *)
+(** Dynamic registry mapping exchange names to their [(module S)] implementations. Backed
+    by a [Hashtbl] for O(1) lookup. *)
 module Registry = struct
   (** Internal hash table storing registered exchange modules, keyed by name. *)
   let _exchanges : (string, (module S)) Hashtbl.t = Hashtbl.create 4
 
-  (** Register an exchange module. Replaces any existing entry with the
-      same [Exchange.name]. *)
+  (** Register an exchange module. Replaces any existing entry with the same
+      [Exchange.name]. *)
   let register (module Exchange : S) =
     Hashtbl.replace _exchanges Exchange.name (module Exchange)
   ;;
 
-  (** Look up a registered exchange module by name. Returns [None] if
-      no module has been registered under that name. *)
+  (** Look up a registered exchange module by name. Returns [None] if no module has been
+      registered under that name. *)
   let get name = Hashtbl.find_opt _exchanges name
 
-  (** Return all registered exchange names. Used by the dashboard to enumerate
-      balances across all exchanges, not just those with configured trading
-      strategies. *)
+  (** Return all registered exchange names. Used by the dashboard to enumerate balances
+      across all exchanges, not just those with configured trading strategies. *)
   let get_all_names () =
     Hashtbl.fold (fun name _ acc -> name :: acc) _exchanges []
     |> List.sort_uniq String.compare
   ;;
 end
 
-(** Oracle data-venue interface: the contract the capital oracle needs from an
-    exchange beyond live trading - historical daily bars, session calendars,
-    fees, account balances and instrument metadata.
+(** Oracle data-venue interface: the contract the capital oracle needs from an exchange
+    beyond live trading - historical daily bars, session calendars, fees, account balances
+    and instrument metadata.
 
-    Independent of the live-trading signature [S] above (which has no
-    historical-bars or calendar concept); a venue implements BOTH, or only [S]
-    if it does not participate in oracle modeling. The runtime registry lives
-    in [Oracle.Registry], mirroring [Registry] above.
+    Independent of the live-trading signature [S] above (which has no historical-bars or
+    calendar concept); a venue implements BOTH, or only [S] if it does not participate in
+    oracle modeling. The runtime registry lives in [Oracle.Registry], mirroring [Registry]
+    above.
 
-    Raw-bar contract: implementations return RAW source rows (any order); the
-    oracle sorts, de-duplicates and normalizes centrally
-    ([Oracle_calendar.normalize_bars] on every read, cache and direct fetch
-    alike), so a corrected normalization rule self-heals without a refetch.
-    Implementations may still pre-clean (normalize is idempotent) when they
-    need source-level logging. *)
+    Raw-bar contract: implementations return RAW source rows (any order); the oracle
+    sorts, de-duplicates and normalizes centrally ([Oracle_calendar.normalize_bars] on
+    every read, cache and direct fetch alike), so a corrected normalization rule
+    self-heals without a refetch. Implementations may still pre-clean (normalize is
+    idempotent) when they need source-level logging. *)
 module Oracle = struct
   module type S = sig
     (** Human-readable venue name used as the registry key (e.g. "kraken"). *)
     val name : string
 
-    (** Session calendar semantics: [Crypto] (session = day) or [Equity]
-        (market sessions). Drives gap detection and horizon labels. *)
+    (** Session calendar semantics: [Crypto] (session = day) or [Equity] (market
+        sessions). Drives gap detection and horizon labels. *)
     val calendar_kind : Types.calendar_kind
 
-    (** Fetch historical daily bars for [symbol] starting at [from] (ISO date
-        of the first day to include; [None] = full history from the venue's
-        earliest available data). [feed] and [end_date] are Alpaca-only knobs
-        (IEX/SIP feed, request window end); other venues ignore them. Returns
-        raw source bars; the oracle normalizes centrally. *)
+    (** Fetch historical daily bars for [symbol] starting at [from] (ISO date of the first
+        day to include; [None] = full history from the venue's earliest available data).
+        [feed] and [end_date] are Alpaca-only knobs (IEX/SIP feed, request window end);
+        other venues ignore them. Returns raw source bars; the oracle normalizes
+        centrally. *)
     val fetch_bars
       :  ?feed:string
       -> ?end_date:string
@@ -568,71 +647,67 @@ module Oracle = struct
       -> unit
       -> Types.bar list Lwt.t
 
-    (** Fetch expected session dates over [start_date]..[end_date]. Equity
-        venues build their session model from this; crypto venues return []. *)
+    (** Fetch expected session dates over [start_date]..[end_date]. Equity venues build
+        their session model from this; crypto venues return []. *)
     val fetch_calendar : start_date:string -> end_date:string -> string list Lwt.t
 
-    (** Fetch authoritative (maker, taker) fees for [symbol] from the venue.
-        The oracle falls back to [default_fees] on failure. *)
+    (** Fetch authoritative (maker, taker) fees for [symbol] from the venue. The oracle
+        falls back to [default_fees] on failure. *)
     val fetch_fees : testnet:bool -> symbol:string -> (float * float) Lwt.t
 
-    (** Venue default (maker, taker) fees, used offline and as the failed-fetch
-        fallback. [symbol]-parameterized (Hyperliquid spot vs perp differ). *)
+    (** Venue default (maker, taker) fees, used offline and as the failed-fetch fallback.
+        [symbol]-parameterized (Hyperliquid spot vs perp differ). *)
     val default_fees : symbol:string -> float * float
 
-    (** One-shot account balance fetch returning already-normalized
-        (asset, available, total) triples (e.g. XXBT -> BTC, UBTC -> BTC).
-        The oracle wraps them into its own balance snapshot record. *)
+    (** One-shot account balance fetch returning already-normalized (asset, available,
+        total) triples (e.g. XXBT -> BTC, UBTC -> BTC). The oracle wraps them into its own
+        balance snapshot record. *)
     val fetch_balances
       :  testnet:bool
       -> ((string * float * float) list, string) result Lwt.t
 
-    (** Populate instrument metadata (price tick / lot size) for [symbols] so
-        the live registry's [get_price_increment] / [get_qty_increment]
-        answer. No-op for venues with static ticks. *)
+    (** Populate instrument metadata (price tick / lot size) for [symbols] so the live
+        registry's [get_price_increment] / [get_qty_increment] answer. No-op for venues
+        with static ticks. *)
     val init_instruments : testnet:bool -> symbols:string list -> unit Lwt.t
 
-    (** One-shot snapshot from the venue's LIVE websocket-fed balance store as
-        (asset, available, total) triples, or [None] when the venue has no live
-        store or its store semantics do not match the oracle's REST balance
-        view. The oracle runtime prefers this (in-process websocket data, no
-        standalone HTTP round-trip) and falls back to [fetch_balances] on
-        [None].
+    (** One-shot snapshot from the venue's LIVE websocket-fed balance store as (asset,
+        available, total) triples, or [None] when the venue has no live store or its store
+        semantics do not match the oracle's REST balance view. The oracle runtime prefers
+        this (in-process websocket data, no standalone HTTP round-trip) and falls back to
+        [fetch_balances] on [None].
 
-        Hyperliquid deliberately returns [None]: its live "USDC" store
-        aggregates perp clearinghouse USDC with the spot wallet, while the
-        oracle pool counts spot capital only (perp margin is not grid capital).
-        REST spotClearinghouseState stays authoritative there. *)
+        Hyperliquid deliberately returns [None]: its live "USDC" store aggregates perp
+        clearinghouse USDC with the spot wallet, while the oracle pool counts spot capital
+        only (perp margin is not grid capital). REST spotClearinghouseState stays
+        authoritative there. *)
     val live_balances : unit -> (string * float * float) list option
 
-    (** Default quote asset for symbols written without an explicit quote
-        (e.g. "BTC" -> USDC on Hyperliquid, USD on Kraken/Alpaca). Used by
-        the portfolio topology resolution. *)
+    (** Default quote asset for symbols written without an explicit quote (e.g. "BTC" ->
+        USDC on Hyperliquid, USD on Kraken/Alpaca). Used by the portfolio topology
+        resolution. *)
     val default_quote : string
 
-    (** Default minimum order notional in quote terms for [symbol]
-        (0.0 = not constrained). Hyperliquid spot enforces a 10 USDC
-        MinTradeSpotNtl floor; perp/equity venues are not
-        notional-constrained in this model. *)
+    (** Default minimum order notional in quote terms for [symbol] (0.0 = not
+        constrained). Hyperliquid spot enforces a 10 USDC MinTradeSpotNtl floor;
+        perp/equity venues are not notional-constrained in this model. *)
     val min_notional : symbol:string -> float
   end
 
-  (** Dynamic registry mapping venue names to their [(module S)]
-      implementations, mirroring [Registry] above. A venue registers here
-      (typically from its own library at module load) to participate in oracle
-      modeling. [Hashtbl.replace] semantics: a later registration overrides an
-      earlier one under the same name. *)
+  (** Dynamic registry mapping venue names to their [(module S)] implementations,
+      mirroring [Registry] above. A venue registers here (typically from its own library
+      at module load) to participate in oracle modeling. [Hashtbl.replace] semantics: a
+      later registration overrides an earlier one under the same name. *)
   module Registry = struct
     (** Internal hash table storing registered oracle-venue modules, keyed by
         [Oracle.S.name]. *)
     let _venues : (string, (module S)) Hashtbl.t = Hashtbl.create 4
 
-    (** Register an oracle-venue module. Replaces any existing entry with the
-        same [name]. *)
+    (** Register an oracle-venue module. Replaces any existing entry with the same [name]. *)
     let register (module V : S) = Hashtbl.replace _venues V.name (module V)
 
-    (** Look up a registered oracle-venue module by name. Returns [None] when
-        no module has been registered under that name. *)
+    (** Look up a registered oracle-venue module by name. Returns [None] when no module
+        has been registered under that name. *)
     let get name = Hashtbl.find_opt _venues name
 
     (** Return all registered venue names, sorted. *)

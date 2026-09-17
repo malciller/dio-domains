@@ -118,11 +118,8 @@ let test_parse_tws_order_status () =
   in
   List.iter
     (fun (str, expected) ->
-       let result = Ibkr.Types.parse_tws_order_status str in
-       Alcotest.(check bool)
-         (Printf.sprintf "parse status %s" str)
-         true
-         (result = expected))
+      let result = Ibkr.Types.parse_tws_order_status str in
+      Alcotest.(check bool) (Printf.sprintf "parse status %s" str) true (result = expected))
     test_cases
 ;;
 
@@ -147,8 +144,8 @@ let test_to_exchange_order_status () =
   in
   List.iter
     (fun (tws_status, expected) ->
-       let result = Ibkr.Types.to_exchange_order_status tws_status in
-       Alcotest.(check bool) "status mapping" true (result = expected))
+      let result = Ibkr.Types.to_exchange_order_status tws_status in
+      Alcotest.(check bool) "status mapping" true (result = expected))
     test_cases
 ;;
 

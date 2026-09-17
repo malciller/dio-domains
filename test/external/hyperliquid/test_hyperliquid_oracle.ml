@@ -1,13 +1,12 @@
-(* Hyperliquid oracle adapter tests: spot/perpetual resolution, candle
-   parsing and window ordering. These exercise the pure functions of
-   [Hyperliquid.Hyperliquid_oracle] only (no network). Source normalization
-   lives centrally in Oracle_calendar.normalize_bars and is tested with the
-   oracle calendar suite (test_oracle_calendar.ml). *)
+(* Hyperliquid oracle adapter tests: spot/perpetual resolution, candle parsing and window
+   ordering. These exercise the pure functions of [Hyperliquid.Hyperliquid_oracle] only
+   (no network). Source normalization lives centrally in Oracle_calendar.normalize_bars
+   and is tested with the oracle calendar suite (test_oracle_calendar.ml). *)
 
 let meta_fixture () =
-  (* A spotMeta slice: token index table plus one canonical pair (PURR/USDC)
-     and two wrapped pairs exposed as "@N" aliases (BTC spot = UBTC/USDC,
-     "@142"; HFUN/USDC, "@1"). *)
+  (* A spotMeta slice: token index table plus one canonical pair (PURR/USDC) and two
+     wrapped pairs exposed as "@N" aliases (BTC spot = UBTC/USDC, "@142"; HFUN/USDC,
+     "@1"). *)
   {|{
      "tokens": [
        {"name":"USDC","index":0,"szDecimals":8},
@@ -55,8 +54,8 @@ let test_coin_of_symbol_spot () =
     "USD quote normalized"
     (Some "PURR/USDC")
     (coin "PURR/USD");
-  (* Wrapped majors resolve through the feed-style key to the "@N" alias, so
-     spot history is used instead of leaving the asset inactive. *)
+  (* Wrapped majors resolve through the feed-style key to the "@N" alias, so spot history
+     is used instead of leaving the asset inactive. *)
   Alcotest.(check (option string)) "wrapped major -> @N" (Some "@142") (coin "BTC/USDC");
   Alcotest.(check (option string))
     "wrapped major USD quote"
@@ -67,15 +66,15 @@ let test_coin_of_symbol_spot () =
 let test_coin_of_symbol_no_spot_pair () =
   let pairs = pairs_fixture () in
   let coin = Hyperliquid.Hyperliquid_oracle.coin_of_symbol ~pairs in
-  (* Symbols that are not a Hyperliquid spot pair have no spot history: they
-     resolve to None, never to a perpetual proxy. *)
+  (* Symbols that are not a Hyperliquid spot pair have no spot history: they resolve to
+     None, never to a perpetual proxy. *)
   let cases = [ "XRP/USDC"; "LINK/USD"; "UBTC/USDC"; "BTC/USDT" ] in
   List.iter
     (fun symbol ->
-       Alcotest.(check (option string))
-         (Printf.sprintf "%s is not a spot pair" symbol)
-         None
-         (coin symbol))
+      Alcotest.(check (option string))
+        (Printf.sprintf "%s is not a spot pair" symbol)
+        None
+        (coin symbol))
     cases
 ;;
 
@@ -101,16 +100,16 @@ let test_parse_candles_sorts_and_dedups () =
         , {"t":1700000000000,"o":"100.0","h":"101.0","l":"99.0","c":"100.5","v":"10.0","n":2} ]|}
   in
   let bars = Hyperliquid.Hyperliquid_oracle.parse_candles ~symbol:"BTC/USDC" json in
-  (* Raw-bar contract: parse_candles preserves every row; ordering + dedup
-     happen centrally (windows_to_series / the oracle pipeline). *)
+  (* Raw-bar contract: parse_candles preserves every row; ordering + dedup happen
+     centrally (windows_to_series / the oracle pipeline). *)
   Alcotest.(check int) "raw rows preserved" 3 (List.length bars);
   let dates = List.map (fun (b : Dio_exchange.Exchange_intf.Types.bar) -> b.date) bars in
   Alcotest.(check (list string))
     "response order preserved"
     [ "2024-01-11"; "2023-11-14"; "2023-11-14" ]
     dates;
-  (* The window helper restores ascending order and de-duplicates, so the
-     served series has one bar per date, oldest first. *)
+  (* The window helper restores ascending order and de-duplicates, so the served series
+     has one bar per date, oldest first. *)
   let out = Hyperliquid.Hyperliquid_oracle.windows_to_series [ bars ] in
   Alcotest.(check int) "two bars after dedup" 2 (List.length out);
   let dates = List.map (fun (b : Dio_exchange.Exchange_intf.Types.bar) -> b.date) out in
@@ -138,10 +137,9 @@ let test_parse_candles_bad_shape () =
 ;;
 
 let test_windows_to_series_ascending () =
-  (* Regression: the window accumulation must restore ascending time order.
-     The LAST bar is the CURRENT close - the grid start price and all ladder
-     capital math read it, so a missing final sort prices every ladder from
-     the oldest fetched close. *)
+  (* Regression: the window accumulation must restore ascending time order. The LAST bar
+     is the CURRENT close - the grid start price and all ladder capital math read it, so a
+     missing final sort prices every ladder from the oldest fetched close. *)
   let mk date close =
     Dio_exchange.Exchange_intf.Types.
       { date; open_ = close; high = close; low = close; close; volume = 100.0 }
@@ -160,16 +158,16 @@ let test_windows_to_series_ascending () =
 
 let test_venue_contract () =
   let open Hyperliquid.Hyperliquid_oracle in
-  (* Hyperliquid spot enforces MinTradeSpotNtl = 10 USDC; perp/venus coins
-     (slash-less symbols) are not notional-constrained. *)
+  (* Hyperliquid spot enforces MinTradeSpotNtl = 10 USDC; perp/venus coins (slash-less
+     symbols) are not notional-constrained. *)
   Alcotest.(check (float 1e-9))
     "spot min_notional = 10 USDC"
     10.0
     (min_notional ~symbol:"BTC/USDC");
   Alcotest.(check (float 1e-9)) "perp min_notional = 0" 0.0 (min_notional ~symbol:"BTC");
   Alcotest.(check string) "default quote USDC" "USDC" default_quote;
-  (* The live WS "USDC" store mixes perp margin with spot; the oracle pool
-     counts spot only, so the adapter deliberately has no live snapshot. *)
+  (* The live WS "USDC" store mixes perp margin with spot; the oracle pool counts spot
+     only, so the adapter deliberately has no live snapshot. *)
   Alcotest.(check bool)
     "no live balance snapshot (REST spot authoritative)"
     true

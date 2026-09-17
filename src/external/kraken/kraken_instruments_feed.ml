@@ -1,14 +1,12 @@
-(**
-   Kraken instrument metadata feed.
+(** Kraken instrument metadata feed.
 
-   Maintains a local cache of per-pair trading parameters (tick sizes, quantity
-   constraints, cost minimums, trading status) sourced from the Kraken REST
-   API ([/0/public/AssetPairs]).  A WebSocket-based feed path is stubbed but
-   not yet implemented; [initialize_symbols] populates the cache via REST.
+    Maintains a local cache of per-pair trading parameters (tick sizes, quantity
+    constraints, cost minimums, trading status) sourced from the Kraken REST API
+    ([/0/public/AssetPairs]). A WebSocket-based feed path is stubbed but not yet
+    implemented; [initialize_symbols] populates the cache via REST.
 
-   Consumers (e.g. [Kraken_module]) query the cache synchronously through
-   [get_price_increment], [get_qty_increment], [get_qty_min], etc.
-*)
+    Consumers (e.g. [Kraken_module]) query the cache synchronously through
+    [get_price_increment], [get_qty_increment], [get_qty_min], etc. *)
 
 open Lwt.Infix
 
@@ -81,8 +79,8 @@ let pair_cache : (string, pair_info) Hashtbl.t = Hashtbl.create 32
 
 let cache_mutex = Lwt_mutex.create ()
 
-(** Parses a single pair JSON object (WebSocket schema) into a [pair_info].
-    Returns [None] if any required field is missing or malformed. *)
+(** Parses a single pair JSON object (WebSocket schema) into a [pair_info]. Returns [None]
+    if any required field is missing or malformed. *)
 let parse_pair_info json : pair_info option =
   try
     let open Yojson.Safe.Util in
@@ -106,8 +104,8 @@ let parse_pair_info json : pair_info option =
   | _ -> None
 ;;
 
-(** Insert or replace [info] in [pair_cache] under [cache_mutex].
-    Logs a warning on status transitions and a debug line on first insertion. *)
+(** Insert or replace [info] in [pair_cache] under [cache_mutex]. Logs a warning on status
+    transitions and a debug line on first insertion. *)
 let update_pair_info info =
   Lwt_mutex.with_lock cache_mutex (fun () ->
     let prev_status =
@@ -148,9 +146,9 @@ let is_pair_tradeable symbol : bool Lwt.t =
   | Some info -> is_tradeable info.status
 ;;
 
-(** Processes a full instrument data snapshot (WebSocket schema).
-    Extracts the ["pairs"] array from the ["data"] envelope and updates
-    the cache for each successfully parsed pair. *)
+(** Processes a full instrument data snapshot (WebSocket schema). Extracts the ["pairs"]
+    array from the ["data"] envelope and updates the cache for each successfully parsed
+    pair. *)
 let process_instrument_data json =
   try
     let open Yojson.Safe.Util in
@@ -158,9 +156,9 @@ let process_instrument_data json =
     let pairs = member "pairs" data |> to_list in
     Lwt_list.iter_s
       (fun pair_json ->
-         match parse_pair_info pair_json with
-         | Some info -> update_pair_info info
-         | None -> Lwt.return_unit)
+        match parse_pair_info pair_json with
+        | Some info -> update_pair_info info
+        | None -> Lwt.return_unit)
       pairs
   with
   | exn ->
@@ -171,8 +169,8 @@ let process_instrument_data json =
     Lwt.return_unit
 ;;
 
-(** Placeholder for a future WebSocket-based instrument feed subscription.
-    Currently a no-op; the cache is populated via [fetch_from_rest] instead. *)
+(** Placeholder for a future WebSocket-based instrument feed subscription. Currently a
+    no-op; the cache is populated via [fetch_from_rest] instead. *)
 let connect_and_subscribe () : unit Lwt.t =
   Logging.info
     ~section
@@ -180,167 +178,165 @@ let connect_and_subscribe () : unit Lwt.t =
   Lwt.return_unit
 ;;
 
-(** Fetches pair metadata from [GET /0/public/AssetPairs] and populates the
-    cache for each symbol in [symbols].
+(** Fetches pair metadata from [GET /0/public/AssetPairs] and populates the cache for each
+    symbol in [symbols].
 
-    Symbol matching accounts for Kraken naming conventions: the function
-    normalises the requested symbol to uppercase, strips slashes, and
-    compares against both the [wsname] and [altname] fields in the API
-    response, including legacy aliases (e.g. XBT/USD for BTC/USD). *)
+    Symbol matching accounts for Kraken naming conventions: the function normalises the
+    requested symbol to uppercase, strips slashes, and compares against both the [wsname]
+    and [altname] fields in the API response, including legacy aliases (e.g. XBT/USD for
+    BTC/USD). *)
 let fetch_from_rest symbols =
   Lwt.catch
     (fun () ->
-       let open Cohttp_lwt_unix in
-       let url = Uri.of_string "https://api.kraken.com/0/public/AssetPairs" in
-       Client.get url
-       >>= fun (_resp, body) ->
-       Cohttp_lwt.Body.to_string body
-       >>= fun body_str ->
-       Logging.debug_f
-         ~section
-         "Fetched AssetPairs data (%d bytes)"
-         (String.length body_str);
-       let open Yojson.Safe.Util in
-       let json = Yojson.Safe.from_string body_str in
-       let result = member "result" json in
-       let canonicalize_kraken_name s =
-         let uppercase = String.uppercase_ascii s in
-         let no_xbt =
-           if String.length uppercase >= 4 && String.sub uppercase 0 4 = "XXBT"
-           then "BTC" ^ String.sub uppercase 4 (String.length uppercase - 4)
-           else if String.length uppercase >= 3 && String.sub uppercase 0 3 = "XBT"
-           then "BTC" ^ String.sub uppercase 3 (String.length uppercase - 3)
-           else if String.length uppercase >= 5 && String.sub uppercase 0 5 = "XXETH"
-           then "ETH" ^ String.sub uppercase 5 (String.length uppercase - 5)
-           else if String.length uppercase >= 4 && String.sub uppercase 0 4 = "XETH"
-           then "ETH" ^ String.sub uppercase 4 (String.length uppercase - 4)
-           else uppercase
-         in
-         if
-           String.length no_xbt >= 4
+      let open Cohttp_lwt_unix in
+      let url = Uri.of_string "https://api.kraken.com/0/public/AssetPairs" in
+      Client.get url
+      >>= fun (_resp, body) ->
+      Cohttp_lwt.Body.to_string body
+      >>= fun body_str ->
+      Logging.debug_f
+        ~section
+        "Fetched AssetPairs data (%d bytes)"
+        (String.length body_str);
+      let open Yojson.Safe.Util in
+      let json = Yojson.Safe.from_string body_str in
+      let result = member "result" json in
+      let canonicalize_kraken_name s =
+        let uppercase = String.uppercase_ascii s in
+        let no_xbt =
+          if String.length uppercase >= 4 && String.sub uppercase 0 4 = "XXBT"
+          then "BTC" ^ String.sub uppercase 4 (String.length uppercase - 4)
+          else if String.length uppercase >= 3 && String.sub uppercase 0 3 = "XBT"
+          then "BTC" ^ String.sub uppercase 3 (String.length uppercase - 3)
+          else if String.length uppercase >= 5 && String.sub uppercase 0 5 = "XXETH"
+          then "ETH" ^ String.sub uppercase 5 (String.length uppercase - 5)
+          else if String.length uppercase >= 4 && String.sub uppercase 0 4 = "XETH"
+          then "ETH" ^ String.sub uppercase 4 (String.length uppercase - 4)
+          else uppercase
+        in
+        if String.length no_xbt >= 4
            && String.sub no_xbt (String.length no_xbt - 4) 4 = "ZUSD"
-         then String.sub no_xbt 0 (String.length no_xbt - 4) ^ "USD"
-         else if
-           String.length no_xbt >= 4
-           && String.sub no_xbt (String.length no_xbt - 4) 4 = "ZEUR"
-         then String.sub no_xbt 0 (String.length no_xbt - 4) ^ "EUR"
-         else no_xbt
-       in
-       Lwt_list.iter_s
-         (fun symbol ->
-            let norm = String.uppercase_ascii symbol in
-            let no_slash =
-              String.map (fun c -> if c = '/' then '\000' else c) norm
-              |> String.split_on_char '\000'
-              |> String.concat ""
+        then String.sub no_xbt 0 (String.length no_xbt - 4) ^ "USD"
+        else if String.length no_xbt >= 4
+                && String.sub no_xbt (String.length no_xbt - 4) 4 = "ZEUR"
+        then String.sub no_xbt 0 (String.length no_xbt - 4) ^ "EUR"
+        else no_xbt
+      in
+      Lwt_list.iter_s
+        (fun symbol ->
+          let norm = String.uppercase_ascii symbol in
+          let no_slash =
+            String.map (fun c -> if c = '/' then '\000' else c) norm
+            |> String.split_on_char '\000'
+            |> String.concat ""
+          in
+          let pairs_assoc = to_assoc result in
+          let matches_pair (_, pair_json) =
+            try
+              let altname = member "altname" pair_json |> to_string_option in
+              let wsname = member "wsname" pair_json |> to_string_option in
+              let ws_match = function
+                | Some n -> canonicalize_kraken_name n = norm || n = norm
+                | None -> false
+              in
+              let alt_match = function
+                | Some n -> canonicalize_kraken_name n = no_slash || n = no_slash
+                | None -> false
+              in
+              ws_match wsname || alt_match altname
+            with
+            | _ -> false
+          in
+          let found = List.find_opt matches_pair pairs_assoc in
+          match found with
+          | None ->
+            Logging.info_f
+              ~section
+              "No REST data found for %s, will use default instrument data"
+              symbol;
+            Lwt.return_unit
+          | Some (pair_name, pair_json) ->
+            Logging.debug_f
+              ~section
+              "Found pair data for %s: pair_name=%s"
+              symbol
+              pair_name;
+            let safe_get fn def field =
+              try fn (member field pair_json) with
+              | _ -> def
             in
-            let pairs_assoc = to_assoc result in
-            let matches_pair (_, pair_json) =
-              try
-                let altname = member "altname" pair_json |> to_string_option in
-                let wsname = member "wsname" pair_json |> to_string_option in
-                let ws_match = function
-                  | Some n -> canonicalize_kraken_name n = norm || n = norm
-                  | None -> false
-                in
-                let alt_match = function
-                  | Some n -> canonicalize_kraken_name n = no_slash || n = no_slash
-                  | None -> false
-                in
-                ws_match wsname || alt_match altname
-              with
-              | _ -> false
+            let qty_prec = safe_get to_int 8 "lot_decimals" in
+            let qty_inc = 10.0 ** -.float_of_int qty_prec in
+            let qty_min =
+              safe_get (fun m -> to_string m |> float_of_string) 0.0001 "ordermin"
             in
-            let found = List.find_opt matches_pair pairs_assoc in
-            match found with
-            | None ->
-              Logging.info_f
-                ~section
-                "No REST data found for %s, will use default instrument data"
-                symbol;
-              Lwt.return_unit
-            | Some (pair_name, pair_json) ->
-              Logging.debug_f
-                ~section
-                "Found pair data for %s: pair_name=%s"
-                symbol
-                pair_name;
-              let safe_get fn def field =
-                try fn (member field pair_json) with
-                | _ -> def
-              in
-              let qty_prec = safe_get to_int 8 "lot_decimals" in
-              let qty_inc = 10.0 ** -.float_of_int qty_prec in
-              let qty_min =
-                safe_get (fun m -> to_string m |> float_of_string) 0.0001 "ordermin"
-              in
-              let price_inc =
-                safe_get (fun m -> to_string m |> float_of_string) 0.01 "tick_size"
-              in
-              let cost_min =
-                safe_get (fun m -> to_string m |> float_of_string) 0.5 "costmin"
-              in
-              (* Derive price precision: prefer explicit JSON fields, fall back
-             to counting decimal digits in tick_size. *)
-              let price_prec =
-                try member "pair_decimals" pair_json |> to_int with
-                | _ ->
-                  (try member "decimals" pair_json |> to_int with
-                   | _ ->
-                     (* Infer precision from tick_size by counting decimal places. *)
-                     let rec count_decimals v count =
-                       if count > 12
-                       then count (* Cap at 12 to avoid float rounding drift. *)
-                       else (
-                         let scaled = v *. (10.0 ** float_of_int count) in
-                         if Float.abs (scaled -. Float.round scaled) < 1e-9
-                         then count
-                         else count_decimals v (count + 1))
-                     in
-                     count_decimals price_inc 0)
-              in
-              let pair_info =
-                { symbol
-                ; base = safe_get to_string "" "base"
-                ; quote = safe_get to_string "" "quote"
-                ; status =
-                    (try status_of_string (member "status" pair_json |> to_string) with
-                     | _ -> Online)
-                ; qty_precision = qty_prec
-                ; qty_increment = qty_inc
-                ; qty_min
-                ; price_precision = price_prec
-                ; price_increment = price_inc
-                ; cost_precision = safe_get to_int 5 "cost_decimals"
-                ; cost_min
-                ; marginable = safe_get (fun m -> to_int m > 0) false "margin_call"
-                ; has_index = true
-                ; last_updated = Unix.time ()
-                }
-              in
-              Logging.debug_f
-                ~section
-                "Instrument data for %s: status=%s, qty_precision=%d, \
-                 qty_increment=%.8f, qty_min=%.8f, price_precision=%d, \
-                 price_increment=%.8f, cost_precision=%d, cost_min=%.2f, marginable=%b"
-                symbol
-                (status_to_string pair_info.status)
-                pair_info.qty_precision
-                pair_info.qty_increment
-                pair_info.qty_min
-                pair_info.price_precision
-                pair_info.price_increment
-                pair_info.cost_precision
-                pair_info.cost_min
-                pair_info.marginable;
-              update_pair_info pair_info)
-         symbols)
+            let price_inc =
+              safe_get (fun m -> to_string m |> float_of_string) 0.01 "tick_size"
+            in
+            let cost_min =
+              safe_get (fun m -> to_string m |> float_of_string) 0.5 "costmin"
+            in
+            (* Derive price precision: prefer explicit JSON fields, fall back to counting
+               decimal digits in tick_size. *)
+            let price_prec =
+              try member "pair_decimals" pair_json |> to_int with
+              | _ ->
+                (try member "decimals" pair_json |> to_int with
+                 | _ ->
+                   (* Infer precision from tick_size by counting decimal places. *)
+                   let rec count_decimals v count =
+                     if count > 12
+                     then count (* Cap at 12 to avoid float rounding drift. *)
+                     else (
+                       let scaled = v *. (10.0 ** float_of_int count) in
+                       if Float.abs (scaled -. Float.round scaled) < 1e-9
+                       then count
+                       else count_decimals v (count + 1))
+                   in
+                   count_decimals price_inc 0)
+            in
+            let pair_info =
+              { symbol
+              ; base = safe_get to_string "" "base"
+              ; quote = safe_get to_string "" "quote"
+              ; status =
+                  (try status_of_string (member "status" pair_json |> to_string) with
+                   | _ -> Online)
+              ; qty_precision = qty_prec
+              ; qty_increment = qty_inc
+              ; qty_min
+              ; price_precision = price_prec
+              ; price_increment = price_inc
+              ; cost_precision = safe_get to_int 5 "cost_decimals"
+              ; cost_min
+              ; marginable = safe_get (fun m -> to_int m > 0) false "margin_call"
+              ; has_index = true
+              ; last_updated = Unix.time ()
+              }
+            in
+            Logging.debug_f
+              ~section
+              "Instrument data for %s: status=%s, qty_precision=%d, qty_increment=%.8f, \
+               qty_min=%.8f, price_precision=%d, price_increment=%.8f, \
+               cost_precision=%d, cost_min=%.2f, marginable=%b"
+              symbol
+              (status_to_string pair_info.status)
+              pair_info.qty_precision
+              pair_info.qty_increment
+              pair_info.qty_min
+              pair_info.price_precision
+              pair_info.price_increment
+              pair_info.cost_precision
+              pair_info.cost_min
+              pair_info.marginable;
+            update_pair_info pair_info)
+        symbols)
     (fun exn ->
-       Logging.error_f
-         ~section
-         "Failed to fetch instrument data from REST: %s"
-         (Printexc.to_string exn);
-       Lwt.return_unit)
+      Logging.error_f
+        ~section
+        "Failed to fetch instrument data from REST: %s"
+        (Printexc.to_string exn);
+      Lwt.return_unit)
 ;;
 
 (** Rounds [value] to the nearest multiple of [increment]. *)
@@ -352,10 +348,9 @@ let round_quantity info qty = round_to_increment qty info.qty_increment
 (** Rounds [price] to the nearest valid tick for [info]. *)
 let round_price info price = round_to_increment price info.price_increment
 
-(** Validates [qty] and [price] against the constraints in [info].
-    Rounds both values to their respective increments, then checks
-    minimum quantity, minimum cost (qty * price), and tradeable status.
-    Returns [Ok (rounded_qty, rounded_price, cost)] or [Error msg]. *)
+(** Validates [qty] and [price] against the constraints in [info]. Rounds both values to
+    their respective increments, then checks minimum quantity, minimum cost (qty * price),
+    and tradeable status. Returns [Ok (rounded_qty, rounded_price, cost)] or [Error msg]. *)
 let validate_order info ~qty ~price =
   let rqty = round_quantity info qty in
   let rprice = round_price info price in
@@ -374,8 +369,8 @@ let validate_order info ~qty ~price =
   else Ok (rqty, rprice, cost)
 ;;
 
-(** Populates the instrument cache for [symbols] via the REST API.
-    Intended to be called once at application startup before trading begins. *)
+(** Populates the instrument cache for [symbols] via the REST API. Intended to be called
+    once at application startup before trading begins. *)
 let initialize_symbols symbols : unit Lwt.t =
   Logging.debug_f
     ~section
@@ -384,8 +379,8 @@ let initialize_symbols symbols : unit Lwt.t =
   fetch_from_rest symbols
 ;;
 
-(** Returns [(price_precision, qty_precision)] for [symbol], or [None].
-    Synchronous; reads [pair_cache] without acquiring [cache_mutex]. *)
+(** Returns [(price_precision, qty_precision)] for [symbol], or [None]. Synchronous; reads
+    [pair_cache] without acquiring [cache_mutex]. *)
 let get_precision_info symbol : (int * int) option =
   try
     Hashtbl.find_opt pair_cache symbol
@@ -394,8 +389,8 @@ let get_precision_info symbol : (int * int) option =
   | _ -> None
 ;;
 
-(** Returns the minimum price tick size for [symbol], or [None].
-    Synchronous; reads [pair_cache] without acquiring [cache_mutex]. *)
+(** Returns the minimum price tick size for [symbol], or [None]. Synchronous; reads
+    [pair_cache] without acquiring [cache_mutex]. *)
 let get_price_increment symbol : float option =
   try
     Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.price_increment)
@@ -410,15 +405,15 @@ let get_price_precision_exn symbol : int =
   | None -> failwith (Printf.sprintf "No price precision found for symbol %s" symbol)
 ;;
 
-(** Returns the minimum order quantity for [symbol], or [None].
-    Synchronous; reads [pair_cache] without acquiring [cache_mutex]. *)
+(** Returns the minimum order quantity for [symbol], or [None]. Synchronous; reads
+    [pair_cache] without acquiring [cache_mutex]. *)
 let get_qty_min symbol : float option =
   try Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.qty_min) with
   | _ -> None
 ;;
 
-(** Returns the minimum quantity step size for [symbol], or [None].
-    Synchronous; reads [pair_cache] without acquiring [cache_mutex]. *)
+(** Returns the minimum quantity step size for [symbol], or [None]. Synchronous; reads
+    [pair_cache] without acquiring [cache_mutex]. *)
 let get_qty_increment symbol : float option =
   try
     Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.qty_increment)

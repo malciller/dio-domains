@@ -26,7 +26,9 @@ let fint s key =
 ;;
 
 let test_string_fields () =
-  let s = {|{"S":"AAPL","bp":123.45,"bs":10,"ap":124.5,"as":5,"t":"2026-01-01T00:00:00Z"}|} in
+  let s =
+    {|{"S":"AAPL","bp":123.45,"bs":10,"ap":124.5,"as":5,"t":"2026-01-01T00:00:00Z"}|}
+  in
   Alcotest.(check string) "S" "AAPL" (fstr s "S");
   Alcotest.(check string) "t" "2026-01-01T00:00:00Z" (fstr s "t");
   Alcotest.(check (float 1e-9)) "bp" 123.45 (ffloat s "bp");
@@ -47,7 +49,10 @@ let test_nested_not_descended () =
   (* The inner "b" must not shadow the top-level "b". *)
   let s = {|{"a":{"b":1},"b":2}|} in
   Alcotest.(check int) "top-level b" 2 (fint s "b");
-  Alcotest.(check int) "top-level a is an object" 0 (J.int_of_span s (fst (get s "a")) (snd (get s "a")))
+  Alcotest.(check int)
+    "top-level a is an object"
+    0
+    (J.int_of_span s (fst (get s "a")) (snd (get s "a")))
 ;;
 
 let test_deep_nesting () =
@@ -91,7 +96,10 @@ let test_array_of_objects () =
       | None -> "?"
     in
     seen := (t, sym) :: !seen);
-  Alcotest.(check (list (pair string string))) "elements" [ "q", "A"; "t", "B" ] (List.rev !seen)
+  Alcotest.(check (list (pair string string)))
+    "elements"
+    [ "q", "A"; "t", "B" ]
+    (List.rev !seen)
 ;;
 
 let test_array_fold_scalars () =

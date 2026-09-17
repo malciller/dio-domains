@@ -1,9 +1,8 @@
-(** Order status and execution tracking from orderStatus, openOrder, and
-    execDetails. TWS streams these automatically for orders placed by this
-    client; no explicit subscription is required.
+(** Order status and execution tracking from orderStatus, openOrder, and execDetails. TWS
+    streams these automatically for orders placed by this client; no explicit subscription
+    is required.
 
-    Startup: requests an open-order snapshot via reqOpenOrders to prime
-    state. *)
+    Startup: requests an open-order snapshot via reqOpenOrders to prime state. *)
 
 let section = "ibkr_executions"
 
@@ -36,15 +35,23 @@ type open_order =
   ; oo_last_updated : float
   }
 
-(** Per-symbol storage: event ring buffer, open-order table, atomic
-    snapshot cache, readiness flag, and mutex. *)
+(** Per-symbol storage: event ring buffer, open-order table, atomic snapshot cache,
+    readiness flag, and mutex. *)
 type symbol_store =
   { events_buffer : execution_event RingBuffer.t
   ; open_orders : (string, open_order) Hashtbl.t
   ; open_orders_cache : open_order list Atomic.t
-    (** Lock-free atomic snapshot cache of active open orders for the domain hotpath. *)
+  (** Lock-free atomic snapshot cache of active open orders for the domain hotpath. *)
   ; ready : bool Atomic.t
   ; orders_mutex : Mutex.t
+  ; changes : (string * open_order option) list Atomic.t
+  (** Orders mutated since the last drain, newest first. [Some o] is the current record
+      for an add/replace, [None] a removal. Lets the strategy apply a per-order delta
+      (O(changes)) instead of an O(open-orders) rescan. Writers prepend under
+      [orders_mutex]; the reader swaps it out lock-free with {!drain_changes}. *)
+  ; changes_overflow : bool Atomic.t
+  (** Set when the change log cannot represent the delta (a full clear), forcing the
+      consumer to do a full rescan. *)
   }
 
 let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 32
@@ -72,6 +79,8 @@ let get_symbol_store symbol =
           ; open_orders_cache = Atomic.make []
           ; ready = Atomic.make false
           ; orders_mutex = Mutex.create ()
+          ; changes = Atomic.make []
+          ; changes_overflow = Atomic.make false
           }
         in
         Hashtbl.replace symbol_stores symbol s;
@@ -81,19 +90,62 @@ let get_symbol_store symbol =
     store
 ;;
 
-(** Account-wide generation, bumped whenever any symbol's open-orders snapshot
-    is republished. Lets the grid strategy's [sync_open_orders] skip its
-    O(open-orders) rescan when nothing changed. *)
+(** Account-wide generation, bumped whenever any symbol's open-orders snapshot is
+    republished. Lets the grid strategy's [sync_open_orders] skip its O(open-orders)
+    rescan when nothing changed. *)
 let orders_generation = Atomic.make 0
 
 let[@inline] get_orders_generation () = Atomic.get orders_generation
 
-(** Publishes an immutable snapshot of open_orders to the atomic cache.
-    Must be called by writers under store.orders_mutex. *)
+(** Publishes an immutable snapshot of open_orders to the atomic cache. Must be called by
+    writers under store.orders_mutex. *)
 let[@inline] publish_open_orders_cache store =
   let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
   Atomic.set store.open_orders_cache snapshot;
   Atomic.incr orders_generation
+;;
+
+(** Record an order whose state changed, for delta consumption by the strategy. [Some o]
+    for an add/replace, [None] for a removal. Writers prepend under [store.orders_mutex];
+    the reader swaps the list out lock-free, so the get/set here never needs a lock. *)
+let[@inline] note_change store id order =
+  Atomic.set store.changes ((id, order) :: Atomic.get store.changes)
+;;
+
+(** [drain_changes store] swaps out the [(id, order option)] changes since the last drain
+    (and the overflow flag) lock-free, so the per-cycle drain never blocks on the feed's
+    order mutex. *)
+let drain_changes store =
+  let changes = Atomic.exchange store.changes [] in
+  let overflow = Atomic.exchange store.changes_overflow false in
+  changes, overflow
+;;
+
+(** Drain the per-order change delta for [symbol]: [(changes, overflow)] where [changes]
+    is [(id, snapshot option)] in chronological order, [snapshot] being
+    [(limit_price, remaining_qty, side, order_userref)] for an add/replace and [None] for
+    a removal. IBKR carries no userref, so it is always [None]. [overflow] (or a missing
+    store) means the caller must do a full rescan. *)
+let drain_open_order_changes ~symbol =
+  match Hashtbl.find_opt symbol_stores symbol with
+  | Some store ->
+    let changes, overflow = drain_changes store in
+    ( List.rev_map
+        (fun (id, (o : open_order option)) ->
+          let snap =
+            match o with
+            | Some o ->
+              Some
+                ( o.oo_limit_price
+                , o.oo_remaining_qty
+                , String.lowercase_ascii o.oo_side
+                , None )
+            | None -> None
+          in
+          id, snap)
+        changes
+    , overflow )
+  | None -> [], true
 ;;
 
 let notify_ready store =
@@ -119,16 +171,16 @@ let resolve_symbol order_id =
   r
 ;;
 
-(** Removes [order_id] from the map; call when the order reaches a
-    terminal state so long-running processes do not leak entries. *)
+(** Removes [order_id] from the map; call when the order reaches a terminal state so
+    long-running processes do not leak entries. *)
 let unregister_order ~order_id =
   Mutex.lock global_mutex;
   Hashtbl.remove order_to_symbol order_id;
   Mutex.unlock global_mutex
 ;;
 
-(** Applies an execution event to the tracked open-order state: removes
-    terminal or fully filled orders, otherwise updates fill quantities. *)
+(** Applies an execution event to the tracked open-order state: removes terminal or fully
+    filled orders, otherwise updates fill quantities. *)
 let update_open_orders symbol (event : execution_event) =
   let store = get_symbol_store symbol in
   let is_terminal =
@@ -140,8 +192,9 @@ let update_open_orders symbol (event : execution_event) =
   if is_terminal || event.remaining_qty <= 0.0
   then (
     Hashtbl.remove store.open_orders event.order_id;
-    (* Drop the id from the global id->symbol index so long-running
-       processes do not accumulate stale entries. *)
+    note_change store event.order_id None;
+    (* Drop the id from the global id->symbol index so long-running processes do not
+       accumulate stale entries. *)
     try unregister_order ~order_id:(int_of_string event.order_id) with
     | _ -> ())
   else (
@@ -162,7 +215,11 @@ let update_open_orders symbol (event : execution_event) =
       ; oo_limit_price = limit_price
       ; oo_status = event.status
       ; oo_last_updated = event.timestamp
-      });
+      };
+    note_change
+      store
+      event.order_id
+      (Some (Hashtbl.find store.open_orders event.order_id)));
   publish_open_orders_cache store;
   Mutex.unlock store.orders_mutex;
   RingBuffer.write store.events_buffer event;
@@ -170,8 +227,8 @@ let update_open_orders symbol (event : execution_event) =
   Concurrency.Exchange_wakeup.signal ~symbol
 ;;
 
-(** orderStatus handler. Fields: orderId, status, filled, remaining,
-    avgFillPrice, permId, parentId, lastFillPrice, clientId, whyHeld. *)
+(** orderStatus handler. Fields: orderId, status, filled, remaining, avgFillPrice, permId,
+    parentId, lastFillPrice, clientId, whyHeld. *)
 let handle_order_status fields =
   let order_id, fields = Ibkr_codec.read_int fields in
   let status_str, fields = Ibkr_codec.read_string fields in
@@ -190,9 +247,7 @@ let handle_order_status fields =
       { order_id = string_of_int order_id
       ; symbol
       ; side =
-          ""
-          (* orderStatus carries no side; filled from the cached open
-           order below. *)
+          "" (* orderStatus carries no side; filled from the cached open order below. *)
       ; status
       ; filled_qty = filled
       ; remaining_qty = remaining
@@ -255,8 +310,8 @@ let handle_order_status fields =
       status_str
 ;;
 
-(** openOrder handler. Supplies fields orderStatus lacks (side, limit
-    price, quantity); most trailing fields are ignored. *)
+(** openOrder handler. Supplies fields orderStatus lacks (side, limit price, quantity);
+    most trailing fields are ignored. *)
 let handle_open_order fields =
   let order_id, fields = Ibkr_codec.read_int fields in
   (* Contract fields *)
@@ -326,6 +381,7 @@ let handle_open_order fields =
       }
   in
   Hashtbl.replace store.open_orders (string_of_int order_id) oo;
+  note_change store (string_of_int order_id) (Some oo);
   publish_open_orders_cache store;
   Mutex.unlock store.orders_mutex;
   Logging.debug_f
@@ -341,9 +397,9 @@ let handle_open_order fields =
     order_type
 ;;
 
-(** execDetails handler: records a discrete fill. Fields follow the
-    contract block, then execId, time, account, exchange, side, shares,
-    price, permId, clientId, liquidation, cumQty, avgPrice. *)
+(** execDetails handler: records a discrete fill. Fields follow the contract block, then
+    execId, time, account, exchange, side, shares, price, permId, clientId, liquidation,
+    cumQty, avgPrice. *)
 let handle_exec_details fields =
   let _req_id, fields = Ibkr_codec.read_int fields in
   let _order_id, fields = Ibkr_codec.read_int fields in
@@ -413,8 +469,7 @@ let handle_exec_details fields =
   ()
 ;;
 
-(** Registers the orderStatus/openOrder/execDetails handlers with the
-    dispatcher. *)
+(** Registers the orderStatus/openOrder/execDetails handlers with the dispatcher. *)
 let register_handlers () =
   Ibkr_dispatcher.register_handler
     ~msg_id:Ibkr_types.msg_in_order_status
@@ -427,9 +482,8 @@ let register_handlers () =
     ~handler:handle_exec_details
 ;;
 
-(** Requests an execution history snapshot. Unused by the startup
-    sequence (open orders are requested instead); retained for manual fill
-    replay. *)
+(** Requests an execution history snapshot. Unused by the startup sequence (open orders
+    are requested instead); retained for manual fill replay. *)
 let request_executions conn =
   Logging.info ~section "Requesting execution history snapshot";
   Ibkr_connection.send
@@ -447,8 +501,8 @@ let request_executions conn =
     ]
 ;;
 
-(** Sends reqOpenOrders; TWS replies with a snapshot of active orders
-    followed by openOrderEnd. *)
+(** Sends reqOpenOrders; TWS replies with a snapshot of active orders followed by
+    openOrderEnd. *)
 let request_open_orders conn =
   Logging.info ~section "Requesting open orders snapshot";
   Ibkr_connection.send
@@ -516,19 +570,18 @@ let[@inline always] has_execution_data_fast symbol =
   fun () -> Atomic.get store.ready
 ;;
 
-(** Marks every initialized symbol store ready. Called on openOrderEnd
-    after the startup snapshot, so waiters do not block on symbols with
-    no executions yet. *)
+(** Marks every initialized symbol store ready. Called on openOrderEnd after the startup
+    snapshot, so waiters do not block on symbols with no executions yet. *)
 let mark_ready_all () =
   Hashtbl.iter
     (fun symbol store ->
-       if not (Atomic.get store.ready)
-       then (
-         Logging.debug_f
-           ~section
-           "Marking executions feed ready for %s (snapshot complete)"
-           symbol;
-         notify_ready store))
+      if not (Atomic.get store.ready)
+      then (
+        Logging.debug_f
+          ~section
+          "Marking executions feed ready for %s (snapshot complete)"
+          symbol;
+        notify_ready store))
     symbol_stores
 ;;
 
@@ -540,8 +593,8 @@ let initialize symbols =
     (List.length symbols);
   List.iter
     (fun symbol ->
-       let _ = get_symbol_store symbol in
-       ())
+      let _ = get_symbol_store symbol in
+      ())
     symbols;
   register_handlers ();
   Logging.info ~section "Executions feed initialized"

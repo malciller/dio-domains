@@ -1,18 +1,17 @@
 (** Real-time balance tracking for Lighter.
 
-    Base assets (ETH, etc.) come from the [account_all_assets/{ACCOUNT_ID}] WS
-    channel. USDC depends on account mode: split accounts report USDC in the
-    assets array; unified accounts hold USDC as account-level collateral, read
-    from the [user_stats] channel and seeded at startup via REST
-    /api/v1/account.
+    Base assets (ETH, etc.) come from the [account_all_assets/{ACCOUNT_ID}] WS channel.
+    USDC depends on account mode: split accounts report USDC in the assets array; unified
+    accounts hold USDC as account-level collateral, read from the [user_stats] channel and
+    seeded at startup via REST /api/v1/account.
 
-    Messages are processed synchronously from the WS frame handler in
-    [lighter_ws.ml], so nothing is lost to bounded-stream backpressure. *)
+    Messages are processed synchronously from the WS frame handler in [lighter_ws.ml], so
+    nothing is lost to bounded-stream backpressure. *)
 
 let section = "lighter_balances"
 
-(** Per-asset balance snapshot; the last-update timestamp supports staleness
-    checks by callers. *)
+(** Per-asset balance snapshot; the last-update timestamp supports staleness checks by
+    callers. *)
 type balance_data =
   { asset : string
   ; balance : float
@@ -21,8 +20,8 @@ type balance_data =
   ; last_updated : float
   }
 
-(** Thread-safe per-asset store: a wallets hashtable guarded by a mutex, with
-    the aggregate total exposed via atomics for lock-free reads. *)
+(** Thread-safe per-asset store: a wallets hashtable guarded by a mutex, with the
+    aggregate total exposed via atomics for lock-free reads. *)
 module BalanceStore = struct
   type wallet_balance =
     { balance : float
@@ -54,12 +53,12 @@ module BalanceStore = struct
     Fun.protect
       ~finally:(fun () -> Mutex.unlock store.mutex)
       (fun () ->
-         Hashtbl.replace store.wallets wallet_key wallet_data;
-         let total =
-           Hashtbl.fold (fun _ wallet acc -> acc +. wallet.balance) store.wallets 0.0
-         in
-         Atomic.set store.total_balance total;
-         Atomic.set store.last_updated now)
+        Hashtbl.replace store.wallets wallet_key wallet_data;
+        let total =
+          Hashtbl.fold (fun _ wallet acc -> acc +. wallet.balance) store.wallets 0.0
+        in
+        Atomic.set store.total_balance total;
+        Atomic.set store.last_updated now)
   ;;
 
   let get_balance store = Atomic.get store.total_balance
@@ -89,12 +88,12 @@ let get_balance_store asset =
   Fun.protect
     ~finally:(fun () -> Mutex.unlock balance_stores_mutex)
     (fun () ->
-       match Hashtbl.find_opt balance_stores asset with
-       | Some store -> store
-       | None ->
-         let store = BalanceStore.create () in
-         Hashtbl.add balance_stores asset store;
-         store)
+      match Hashtbl.find_opt balance_stores asset with
+      | Some store -> store
+      | None ->
+        let store = BalanceStore.create () in
+        Hashtbl.add balance_stores asset store;
+        store)
 ;;
 
 let get_balance asset =
@@ -107,10 +106,10 @@ let get_all_balances () =
   Fun.protect
     ~finally:(fun () -> Mutex.unlock balance_stores_mutex)
     (fun () ->
-       Hashtbl.fold
-         (fun asset store acc -> (asset, BalanceStore.get_balance store) :: acc)
-         balance_stores
-         [])
+      Hashtbl.fold
+        (fun asset store acc -> (asset, BalanceStore.get_balance store) :: acc)
+        balance_stores
+        [])
 ;;
 
 let get_balance_data asset =
@@ -133,9 +132,9 @@ let get_all_assets () =
   Fun.protect
     ~finally:(fun () -> Mutex.unlock balance_stores_mutex)
     (fun () ->
-       let assets = ref [] in
-       Hashtbl.iter (fun asset _store -> assets := asset :: !assets) balance_stores;
-       !assets)
+      let assets = ref [] in
+      Hashtbl.iter (fun asset _store -> assets := asset :: !assets) balance_stores;
+      !assets)
 ;;
 
 let notify_ready () =
@@ -183,8 +182,8 @@ let publish_balance_update storage_key balance =
     }
 ;;
 
-(** Handles [account_all]/[account_all_assets] payloads: extracts account-level
-    USDC collateral (unified accounts) plus the per-asset balances map. *)
+(** Handles [account_all]/[account_all_assets] payloads: extracts account-level USDC
+    collateral (unified accounts) plus the per-asset balances map. *)
 let process_asset_balances json =
   let open Yojson.Safe.Util in
   let account_data =
@@ -195,8 +194,8 @@ let process_asset_balances json =
       let v2 = member "data" json in
       if v2 <> `Null then v2 else json)
   in
-  (* In unified accounts, USDC is collateral, reported at the account level.
-     Extract it directly if present. *)
+  (* In unified accounts, USDC is collateral, reported at the account level. Extract it
+     directly if present. *)
   let extract_float_opt key =
     let v = member key account_data in
     if v <> `Null
@@ -234,85 +233,85 @@ let process_asset_balances json =
   else (
     List.iter
       (fun (asset_id, balance_json) ->
-         try
-           let storage_key =
-             match balance_json with
-             | `Assoc _ ->
-               let sym = member "symbol" balance_json in
-               if sym <> `Null
-               then (
-                 try to_string sym with
-                 | _ -> asset_id)
-               else asset_id
-             | _ -> asset_id
-           in
-           let normalized_key =
-             if String.uppercase_ascii storage_key = "USDC" then "USDC" else storage_key
-           in
-           let balance =
-             match balance_json with
-             | `Assoc _ ->
-               let try_field key =
-                 let v = member key balance_json in
-                 if v <> `Null then Some (Lighter_types.parse_json_float v) else None
-               in
-               (match try_field "balance" with
-                | Some b -> b
-                | None ->
-                  (match try_field "collateral" with
-                   | Some b -> b
-                   | None ->
-                     (match try_field "margin_balance" with
-                      | Some b -> b
-                      | None ->
-                        (match try_field "available" with
-                         | Some b -> b
-                         | None ->
-                           (match try_field "free" with
-                            | Some b -> b
-                            | None ->
-                              Logging.warn_f
-                                ~section
-                                "Balance object for %s has unknown structure: %s"
-                                normalized_key
-                                (Yojson.Safe.to_string balance_json);
-                              0.0)))))
-             | _ -> Lighter_types.parse_json_float balance_json
-           in
-           (* Guard: for unified accounts, USDC is account-level collateral
-           reported via user_stats, not the assets array. The WS
-           account_all_assets snapshot may report USDC balance=0, which would
-           clobber the correct value seeded by REST or user_stats.
-           Never overwrite a positive USDC balance with zero from this path. *)
-           if normalized_key = "USDC" && balance <= 0.0
-           then (
-             let existing = get_balance "USDC" in
-             if existing > 0.0
-             then
-               Logging.debug_f
-                 ~section
-                 "Skipping USDC zero from account_all_assets (existing=%.6f)"
-                 existing
-             else (
-               publish_balance_update normalized_key balance;
-               Logging.debug_f ~section "Balance update: %s = %.8f" normalized_key balance))
-           else (
-             publish_balance_update normalized_key balance;
-             Logging.debug_f ~section "Balance update: %s = %.8f" normalized_key balance)
-         with
-         | exn ->
-           Logging.warn_f
-             ~section
-             "Failed to parse balance for %s: %s"
-             asset_id
-             (Printexc.to_string exn))
+        try
+          let storage_key =
+            match balance_json with
+            | `Assoc _ ->
+              let sym = member "symbol" balance_json in
+              if sym <> `Null
+              then (
+                try to_string sym with
+                | _ -> asset_id)
+              else asset_id
+            | _ -> asset_id
+          in
+          let normalized_key =
+            if String.uppercase_ascii storage_key = "USDC" then "USDC" else storage_key
+          in
+          let balance =
+            match balance_json with
+            | `Assoc _ ->
+              let try_field key =
+                let v = member key balance_json in
+                if v <> `Null then Some (Lighter_types.parse_json_float v) else None
+              in
+              (match try_field "balance" with
+               | Some b -> b
+               | None ->
+                 (match try_field "collateral" with
+                  | Some b -> b
+                  | None ->
+                    (match try_field "margin_balance" with
+                     | Some b -> b
+                     | None ->
+                       (match try_field "available" with
+                        | Some b -> b
+                        | None ->
+                          (match try_field "free" with
+                           | Some b -> b
+                           | None ->
+                             Logging.warn_f
+                               ~section
+                               "Balance object for %s has unknown structure: %s"
+                               normalized_key
+                               (Yojson.Safe.to_string balance_json);
+                             0.0)))))
+            | _ -> Lighter_types.parse_json_float balance_json
+          in
+          (* Guard: for unified accounts, USDC is account-level collateral reported via
+             user_stats, not the assets array. The WS account_all_assets snapshot may
+             report USDC balance=0, which would clobber the correct value seeded by REST
+             or user_stats. Never overwrite a positive USDC balance with zero from this
+             path. *)
+          if normalized_key = "USDC" && balance <= 0.0
+          then (
+            let existing = get_balance "USDC" in
+            if existing > 0.0
+            then
+              Logging.debug_f
+                ~section
+                "Skipping USDC zero from account_all_assets (existing=%.6f)"
+                existing
+            else (
+              publish_balance_update normalized_key balance;
+              Logging.debug_f ~section "Balance update: %s = %.8f" normalized_key balance))
+          else (
+            publish_balance_update normalized_key balance;
+            Logging.debug_f ~section "Balance update: %s = %.8f" normalized_key balance)
+        with
+        | exn ->
+          Logging.warn_f
+            ~section
+            "Failed to parse balance for %s: %s"
+            asset_id
+            (Printexc.to_string exn))
       assets;
     notify_ready ())
 ;;
 
-(** Processes user_stats to maintain USDC balance for unified accounts.
-    In unified/cross-margin mode, USDC collateral lives at the account level
-    (reported via user_stats), not in the assets array (account_all_assets). *)
+(** Processes user_stats to maintain USDC balance for unified accounts. In
+    unified/cross-margin mode, USDC collateral lives at the account level (reported via
+    user_stats), not in the assets array (account_all_assets). *)
 let process_user_stats json =
   let open Yojson.Safe.Util in
   let stats =
@@ -430,10 +429,9 @@ let process_market_data json =
 (** Timestamp of the last balance refresh request (debounce gate). *)
 let last_refresh_request = Atomic.make 0.0
 
-(** Triggers an asynchronous REST balance fetch to recover stale USDC values.
-    Debounced to at most once per 2 seconds to avoid API rate limits.
-    Called when sell fills are detected but the WS balance feed has not
-    updated. *)
+(** Triggers an asynchronous REST balance fetch to recover stale USDC values. Debounced to
+    at most once per 2 seconds to avoid API rate limits. Called when sell fills are
+    detected but the WS balance feed has not updated. *)
 let request_balance_refresh () =
   let now = Unix.gettimeofday () in
   let last = Atomic.get last_refresh_request in
@@ -444,120 +442,120 @@ let request_balance_refresh () =
     Lwt.async (fun () ->
       Lwt.catch
         (fun () ->
-           (* Delay briefly to allow exchange settlement before fetching *)
-           let open Lwt.Infix in
-           Lwt_unix.sleep 0.3
-           >>= fun () ->
-           let account_index =
-             match Sys.getenv_opt "LIGHTER_ACCOUNT_INDEX" |> Option.map String.trim with
-             | Some s ->
-               (try int_of_string s with
-                | _ -> 0)
-             | None -> 0
-           in
-           let base_url = Lighter_proxy.api_base_url () in
-           let url =
-             Printf.sprintf "%s/api/v1/account?by=index&value=%d" base_url account_index
-           in
-           let uri = Uri.of_string url in
-           let%lwt resp, body = Cohttp_lwt_unix.Client.get uri in
-           let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-           let%lwt body_str = Cohttp_lwt.Body.to_string body in
-           if status >= 200 && status < 300
-           then (
-             let trimmed = String.trim body_str in
-             if trimmed <> "" && trimmed <> "{}"
-             then (
-               let json = Yojson.Safe.from_string trimmed in
-               let open Yojson.Safe.Util in
-               let accounts =
-                 try member "accounts" json |> to_list with
-                 | _ -> []
-               in
-               match accounts with
-               | account :: _ ->
-                 let assets =
-                   try member "assets" account |> to_list with
-                   | _ -> []
-                 in
-                 let assets_assoc =
-                   List.map
-                     (fun asset_json ->
-                        let asset_id =
-                          try member "asset_id" asset_json |> to_int |> string_of_int with
-                          | _ -> "?"
-                        in
-                        asset_id, asset_json)
-                     assets
-                 in
-                 (* Check for unified account USDC collateral *)
-                 let has_usdc_in_assets =
-                   List.exists
-                     (fun (_id, aj) ->
-                        let sym =
-                          try member "symbol" aj |> to_string with
-                          | _ -> ""
-                        in
-                        let bal =
-                          try Lighter_types.parse_json_float (member "balance" aj) with
-                          | _ -> 0.0
-                        in
-                        sym = "USDC" && bal > 0.0)
-                     assets_assoc
-                 in
-                 let final_assets =
-                   if has_usdc_in_assets
-                   then assets_assoc
-                   else (
-                     let collateral =
-                       try
-                         Lighter_types.parse_json_float (member "collateral" account)
-                       with
-                       | _ -> 0.0
-                     in
-                     let available =
-                       try
-                         Lighter_types.parse_json_float
-                           (member "available_balance" account)
-                       with
-                       | _ -> 0.0
-                     in
-                     let usdc_balance = max collateral available in
-                     if usdc_balance > 0.0
-                     then
-                       assets_assoc
-                       @ [ ( "3"
-                           , `Assoc
-                               [ "symbol", `String "USDC"
-                               ; "asset_id", `Int 3
-                               ; "balance", `String (Printf.sprintf "%.6f" usdc_balance)
-                               ; "locked_balance", `String "0.000000"
-                               ] )
-                         ]
-                     else assets_assoc)
-                 in
-                 let synthetic_json =
-                   `Assoc
-                     [ "type", `String "snapshot/account_all_assets"
-                     ; ( "channel"
-                       , `String (Printf.sprintf "account_all_assets/%d" account_index) )
-                     ; "account_all", `Assoc [ "assets", `Assoc final_assets ]
-                     ]
-                 in
-                 process_market_data synthetic_json;
-                 let usdc_bal = get_balance "USDC" in
-                 Logging.info_f ~section "Balance refresh complete: USDC=%.6f" usdc_bal
-               | [] -> Logging.warn_f ~section "Balance refresh: empty accounts array");
-             Lwt.return_unit)
-           else (
-             Logging.warn_f ~section "Balance refresh failed: HTTP %d" status;
-             Lwt.return_unit))
+          (* Delay briefly to allow exchange settlement before fetching *)
+          let open Lwt.Infix in
+          Lwt_unix.sleep 0.3
+          >>= fun () ->
+          let account_index =
+            match Sys.getenv_opt "LIGHTER_ACCOUNT_INDEX" |> Option.map String.trim with
+            | Some s ->
+              (try int_of_string s with
+               | _ -> 0)
+            | None -> 0
+          in
+          let base_url = Lighter_proxy.api_base_url () in
+          let url =
+            Printf.sprintf "%s/api/v1/account?by=index&value=%d" base_url account_index
+          in
+          let uri = Uri.of_string url in
+          let%lwt resp, body = Cohttp_lwt_unix.Client.get uri in
+          let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+          let%lwt body_str = Cohttp_lwt.Body.to_string body in
+          if status >= 200 && status < 300
+          then (
+            let trimmed = String.trim body_str in
+            if trimmed <> "" && trimmed <> "{}"
+            then (
+              let json = Yojson.Safe.from_string trimmed in
+              let open Yojson.Safe.Util in
+              let accounts =
+                try member "accounts" json |> to_list with
+                | _ -> []
+              in
+              match accounts with
+              | account :: _ ->
+                let assets =
+                  try member "assets" account |> to_list with
+                  | _ -> []
+                in
+                let assets_assoc =
+                  List.map
+                    (fun asset_json ->
+                      let asset_id =
+                        try member "asset_id" asset_json |> to_int |> string_of_int with
+                        | _ -> "?"
+                      in
+                      asset_id, asset_json)
+                    assets
+                in
+                (* Check for unified account USDC collateral *)
+                let has_usdc_in_assets =
+                  List.exists
+                    (fun (_id, aj) ->
+                      let sym =
+                        try member "symbol" aj |> to_string with
+                        | _ -> ""
+                      in
+                      let bal =
+                        try Lighter_types.parse_json_float (member "balance" aj) with
+                        | _ -> 0.0
+                      in
+                      sym = "USDC" && bal > 0.0)
+                    assets_assoc
+                in
+                let final_assets =
+                  if has_usdc_in_assets
+                  then assets_assoc
+                  else (
+                    let collateral =
+                      try
+                        Lighter_types.parse_json_float (member "collateral" account)
+                      with
+                      | _ -> 0.0
+                    in
+                    let available =
+                      try
+                        Lighter_types.parse_json_float
+                          (member "available_balance" account)
+                      with
+                      | _ -> 0.0
+                    in
+                    let usdc_balance = max collateral available in
+                    if usdc_balance > 0.0
+                    then
+                      assets_assoc
+                      @ [ ( "3"
+                          , `Assoc
+                              [ "symbol", `String "USDC"
+                              ; "asset_id", `Int 3
+                              ; "balance", `String (Printf.sprintf "%.6f" usdc_balance)
+                              ; "locked_balance", `String "0.000000"
+                              ] )
+                        ]
+                    else assets_assoc)
+                in
+                let synthetic_json =
+                  `Assoc
+                    [ "type", `String "snapshot/account_all_assets"
+                    ; ( "channel"
+                      , `String (Printf.sprintf "account_all_assets/%d" account_index) )
+                    ; "account_all", `Assoc [ "assets", `Assoc final_assets ]
+                    ]
+                in
+                process_market_data synthetic_json;
+                let usdc_bal = get_balance "USDC" in
+                Logging.info_f ~section "Balance refresh complete: USDC=%.6f" usdc_bal
+              | [] -> Logging.warn_f ~section "Balance refresh: empty accounts array");
+            Lwt.return_unit)
+          else (
+            Logging.warn_f ~section "Balance refresh failed: HTTP %d" status;
+            Lwt.return_unit))
         (fun exn ->
-           Logging.error_f
-             ~section
-             "Balance refresh exception: %s"
-             (Printexc.to_string exn);
-           Lwt.return_unit)))
+          Logging.error_f
+            ~section
+            "Balance refresh exception: %s"
+            (Printexc.to_string exn);
+          Lwt.return_unit)))
 ;;
 
 let initialize assets =

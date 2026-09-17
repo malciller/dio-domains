@@ -153,10 +153,9 @@ let test_json_parsing_helpers () =
   | _ -> Alcotest.fail "json parsing helpers crashed"
 ;;
 
-(* Kraken's official book-checksum example (docs.kraken.com, "Book checksum
-   (WebSocket v2)"). Concatenated normalization of the documented BTC/USD
-   snapshot must CRC32 to exactly 3310070434. Guards the CRC32 table and the
-   dot/leading-zero normalization. *)
+(* Kraken's official book-checksum example (docs.kraken.com, "Book checksum (WebSocket
+   v2)"). Concatenated normalization of the documented BTC/USD snapshot must CRC32 to
+   exactly 3310070434. Guards the CRC32 table and the dot/leading-zero normalization. *)
 let official_asks =
   [ "45285.2", "0.00100000"
   ; "45286.4", "1.54571953"
@@ -189,10 +188,7 @@ let test_crc32_official_documented_example () =
   let doc_input =
     "45285210000045286415457195345286615457110945289615456091145290215890660452918154553491452947445474945296135380000452975994554245299518772827452835100000004528341545820154528211000000045281010000000452803154592586452790799000045277633101034527753000000045277315460273745276615445238"
   in
-  let expected =
-    Int32.of_int (3310070434 - 4294967296)
-    (* unsigned -> signed *)
-  in
+  let expected = Int32.of_int (3310070434 - 4294967296) (* unsigned -> signed *) in
   Alcotest.(check int32)
     "crc32_zlib matches Kraken's documented example"
     expected
@@ -200,9 +196,9 @@ let test_crc32_official_documented_example () =
 ;;
 
 let test_checksum_normalization_matches_kraken_spec () =
-  (* Feed the official snapshot through per-level normalization (asks ascending
-     first, then bids descending), the path used by calculate_checksum; require
-     the documented result. *)
+  (* Feed the official snapshot through per-level normalization (asks ascending first,
+     then bids descending), the path used by calculate_checksum; require the documented
+     result. *)
   let crc =
     ref (Kraken.Kraken_orderbook_feed.crc32_zlib "")
     (* placeholder; replaced below *)
@@ -211,13 +207,13 @@ let test_checksum_normalization_matches_kraken_spec () =
   let crc = ref 0xFFFFFFFFl in
   List.iter
     (fun (p, q) ->
-       crc := Kraken.Kraken_orderbook_feed.add_normalized_to_crc !crc p;
-       crc := Kraken.Kraken_orderbook_feed.add_normalized_to_crc !crc q)
+      crc := Kraken.Kraken_orderbook_feed.add_normalized_to_crc !crc p;
+      crc := Kraken.Kraken_orderbook_feed.add_normalized_to_crc !crc q)
     official_asks;
   List.iter
     (fun (p, q) ->
-       crc := Kraken.Kraken_orderbook_feed.add_normalized_to_crc !crc p;
-       crc := Kraken.Kraken_orderbook_feed.add_normalized_to_crc !crc q)
+      crc := Kraken.Kraken_orderbook_feed.add_normalized_to_crc !crc p;
+      crc := Kraken.Kraken_orderbook_feed.add_normalized_to_crc !crc q)
     official_bids;
   let result = Int32.logxor !crc 0xFFFFFFFFl in
   let expected = Int32.of_int (3310070434 - 4294967296) in
@@ -228,8 +224,8 @@ let test_checksum_normalization_matches_kraken_spec () =
 ;;
 
 let test_parse_level_preserves_wire_price () =
-  (* Wire representation must survive parsing: it is the checksum input.
-     Re-formatting (padding to fixed decimals) invalidates every check. *)
+  (* Wire representation must survive parsing: it is the checksum input. Re-formatting
+     (padding to fixed decimals) invalidates every check. *)
   match
     Kraken.Kraken_orderbook_feed.parse_level
       "WIRE_TEST/USD"

@@ -1,5 +1,5 @@
-(* Test-only [Unix.putenv] to simulate missing credentials in a single-threaded
-   process; acknowledges the OxCaml [unsafe_multidomain] alert. *)
+(* Test-only [Unix.putenv] to simulate missing credentials in a single-threaded process;
+   acknowledges the OxCaml [unsafe_multidomain] alert. *)
 [@@@alert "-unsafe_multidomain"]
 
 let test_missing_env_variables () =
@@ -77,8 +77,8 @@ let test_env_file_loading () =
     (Lwt_main.run
        (Lwt.catch
           (fun () ->
-             (Logging.load_dotenv ~path:".env") ();
-             Lwt.return true)
+            (Logging.load_dotenv ~path:".env") ();
+            Lwt.return true)
           (fun _ -> Lwt.return false)));
   Alcotest.(check bool) "env file loading doesn't crash" true true
 ;;

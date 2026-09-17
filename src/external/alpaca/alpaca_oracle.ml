@@ -1,13 +1,13 @@
 (** Alpaca oracle data-venue adapter; implements [Exchange_intf.Oracle.S].
 
-    Endpoints: daily bars (/v2/stocks/{symbol}/bars, paginated on
-    next_page_token), market calendar (/v2/calendar), account balances
-    (account + positions via [Alpaca_rest]; commission-free fees), instrument
-    metadata (static 0.01 tick / fractional lots, nothing to fetch).
+    Endpoints: daily bars (/v2/stocks/[{symbol}]/bars, paginated on next_page_token),
+    market calendar (/v2/calendar), account balances (account + positions via
+    [Alpaca_rest]; commission-free fees), instrument metadata (static 0.01 tick /
+    fractional lots, nothing to fetch).
 
-    [parse_*] functions are fixture-testable without network. [fetch_bars]
-    returns RAW bars; the oracle sorts, de-duplicates, normalizes centrally.
-    HTTP calls are timeout-bounded. *)
+    [parse_*] functions are fixture-testable without network. [fetch_bars] returns RAW
+    bars; the oracle sorts, de-duplicates, normalizes centrally. HTTP calls are
+    timeout-bounded. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
@@ -18,8 +18,8 @@ let trading_base_url = "https://paper-api.alpaca.markets"
 let max_pages = 30
 let default_timeout = 10.0
 
-(** Bounded GET: a hung upstream raises after [default_timeout]; does not
-    freeze the oracle pass. *)
+(** Bounded GET: a hung upstream raises after [default_timeout]; does not freeze the
+    oracle pass. *)
 let get ?(headers = Cohttp.Header.init ()) (uri : Uri.t)
   : (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
   =
@@ -65,8 +65,8 @@ let number_of_json = function
   | _ -> None
 ;;
 
-(** Parse a /v2/bars response body. Bar values can be JSON floats or whole
-    integers, so numbers are read tolerantly. *)
+(** Parse a /v2/bars response body. Bar values can be JSON floats or whole integers, so
+    numbers are read tolerantly. *)
 let parse_bars (json : Yojson.Safe.t) : Exchange.Types.bar list =
   let open Yojson.Safe.Util in
   match member "bars" json with
@@ -122,9 +122,9 @@ let fetch_calendar ~start_date ~end_date : string list Lwt.t =
   else Lwt.return (parse_calendar (Yojson.Safe.from_string body_str))
 ;;
 
-(** Daily bars for [symbol] from [from] (ISO date; [None] = "2010-01-01"),
-    paginating on next_page_token. [feed] is "iex" or "sip"; [end_date] bounds
-    the request window (default today). *)
+(** Daily bars for [symbol] from [from] (ISO date; [None] = "2010-01-01"), paginating on
+    next_page_token. [feed] is "iex" or "sip"; [end_date] bounds the request window
+    (default today). *)
 let fetch_bars ?(feed = "iex") ?end_date ~from ~symbol () : Exchange.Types.bar list Lwt.t =
   load_dotenv ();
   let start_date = Option.value from ~default:"2010-01-01" in
@@ -175,13 +175,13 @@ let fetch_bars ?(feed = "iex") ?end_date ~from ~symbol () : Exchange.Types.bar l
       Lwt.catch
         (fun () -> fetch)
         (fun exn ->
-           Logging.warn_f
-             ~section
-             "Alpaca bars fetch failed for %s (%s), returning %d bars so far"
-             symbol
-             (Printexc.to_string exn)
-             (List.length acc);
-           Lwt.return (List.rev acc)))
+          Logging.warn_f
+            ~section
+            "Alpaca bars fetch failed for %s (%s), returning %d bars so far"
+            symbol
+            (Printexc.to_string exn)
+            (List.length acc);
+          Lwt.return (List.rev acc)))
   in
   go None [] max_pages
 ;;
@@ -200,35 +200,34 @@ let fetch_balances ~testnet : ((string * float * float) list, string) result Lwt
   Alpaca_types.Config.set_testnet testnet;
   Lwt.catch
     (fun () ->
-       Alpaca_rest.get_account ()
-       >>= function
-       | Error error -> Lwt.return (Error error)
-       | Ok account ->
-         Alpaca_rest.get_positions ()
-         >|= (function
-          | Error error -> Error error
-          | Ok positions ->
-            let account_balance =
-              ( String.uppercase_ascii account.currency
-              , nonnegative account.cash
-              , nonnegative account.equity )
-            in
-            let position_balances =
-              List.map
-                (fun (position : Alpaca_types.position_record) ->
-                   ( String.uppercase_ascii position.symbol
-                   , nonnegative position.qty
-                   , nonnegative position.qty ))
-                positions
-            in
-            Ok (account_balance :: position_balances)))
+      Alpaca_rest.get_account ()
+      >>= function
+      | Error error -> Lwt.return (Error error)
+      | Ok account ->
+        Alpaca_rest.get_positions ()
+        >|= (function
+         | Error error -> Error error
+         | Ok positions ->
+           let account_balance =
+             ( String.uppercase_ascii account.currency
+             , nonnegative account.cash
+             , nonnegative account.equity )
+           in
+           let position_balances =
+             List.map
+               (fun (position : Alpaca_types.position_record) ->
+                 ( String.uppercase_ascii position.symbol
+                 , nonnegative position.qty
+                 , nonnegative position.qty ))
+               positions
+           in
+           Ok (account_balance :: position_balances)))
     (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
 ;;
 
-(** Live websocket-fed balance snapshot: cash (available), equity (total), and
-    per-symbol positions, mirroring [fetch_balances]. Returns [Some] triples
-    when the store holds data, [None] otherwise (the oracle runtime falls back
-    to the REST one-shot). *)
+(** Live websocket-fed balance snapshot: cash (available), equity (total), and per-symbol
+    positions, mirroring [fetch_balances]. Returns [Some] triples when the store holds
+    data, [None] otherwise (the oracle runtime falls back to the REST one-shot). *)
 let live_balances () : (string * float * float) list option =
   match Exchange.Registry.get "alpaca" with
   | None -> None
@@ -240,24 +239,24 @@ let live_balances () : (string * float * float) list option =
       Some
         (List.map
            (fun (asset, total) ->
-              let available =
-                try Ex.get_tradeable_balance ~asset with
-                | _ -> 0.0
-              in
-              asset, available, total)
+             let available =
+               try Ex.get_tradeable_balance ~asset with
+               | _ -> 0.0
+             in
+             asset, available, total)
            balances)
 ;;
 
 let default_quote = "USD"
 
-(** Venue floor is DOLLAR notional, not base quantity: Alpaca requires at least
-    $1 order value (minimum fractional-share order). The sell-leg inventory
-    gate attempts a sell only when non-accrued inventory is worth >= this. *)
+(** Venue floor is DOLLAR notional, not base quantity: Alpaca requires at least $1 order
+    value (minimum fractional-share order). The sell-leg inventory gate attempts a sell
+    only when non-accrued inventory is worth >= this. *)
 let min_notional ~symbol:_ = 1.0
 
 (* ---- Instrument metadata (static 0.01 tick, fractional lots) ---- *)
 
 let init_instruments ~testnet:_ ~symbols:_ : unit Lwt.t = Lwt.return_unit
 let name = "alpaca"
-(* Registered in [Alpaca_module]; a module cannot register itself (the wrapped
-   self-path dangles). *)
+(* Registered in [Alpaca_module]; a module cannot register itself (the wrapped self-path
+   dangles). *)

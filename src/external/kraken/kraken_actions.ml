@@ -1,7 +1,5 @@
-(**
-   Kraken trading action utilities.
-   Provides helper functions for order parameter formatting, precision truncation, and payload construction.
-*)
+(** Kraken trading action utilities. Provides helper functions for order parameter
+    formatting, precision truncation, and payload construction. *)
 open Lwt.Infix
 
 open Yojson.Safe
@@ -49,8 +47,8 @@ let truncate_price_to_precision price symbol =
     price
 ;;
 
-(** Returns true if the string contains the given substring.
-    Delegates to the centralized [Error_handling.string_contains]. *)
+(** Returns true if the string contains the given substring. Delegates to the centralized
+    [Error_handling.string_contains]. *)
 let string_contains = Error_handling.string_contains
 
 (** Serializes JSON to a string, applying instrument-specific float precision bounds. *)
@@ -101,7 +99,7 @@ let rec json_to_string_precise ?field_name symbol (json : Yojson.Safe.t) : strin
         ","
         (List.map
            (fun (k, v) ->
-              "\"" ^ k ^ "\":" ^ json_to_string_precise ~field_name:k symbol v)
+             "\"" ^ k ^ "\":" ^ json_to_string_precise ~field_name:k symbol v)
            pairs)
     ^ "}"
   | `Intlit s -> s
@@ -138,50 +136,48 @@ type retry_config = Error_handling.retry_config =
 
 let default_retry_config = Error_handling.default_retry_config
 
-(** Returns true for errors that indicate transient network conditions.
-    Delegates to the centralized [Error_handling.is_retriable_error]. *)
+(** Returns true for errors that indicate transient network conditions. Delegates to the
+    centralized [Error_handling.is_retriable_error]. *)
 let is_retriable_error = Error_handling.is_retriable_error
 
 (** Places an order, retrying via [retry_config]. *)
 let place_order
-      ~token
-      ~order_type
-      ~side
-      ~order_qty
-      ~symbol
-      ?limit_price
-      ?time_in_force
-      ?post_only
-      ?margin
-      ?reduce_only
-      ?order_userref
-      ?cl_ord_id
-      ?trigger_price
-      ?trigger_price_type
-      ?display_qty
-      ?fee_preference
-      ?validate
-      ?retry_config
-      ()
+  ~token
+  ~order_type
+  ~side
+  ~order_qty
+  ~symbol
+  ?limit_price
+  ?time_in_force
+  ?post_only
+  ?margin
+  ?reduce_only
+  ?order_userref
+  ?cl_ord_id
+  ?trigger_price
+  ?trigger_price_type
+  ?display_qty
+  ?fee_preference
+  ?validate
+  ?retry_config
+  ()
   : (Kraken_common_types.add_order_result, string) result Lwt.t
   =
   let config =
-    (* Placements must NOT retry on transport errors (Timeout/Connection):
-       the request may have reached the matching engine before the 10s WS
-       response timeout, so a retry can silently double-place (Kraken v2 has
-       no idempotency token for userref-tagged grid orders). We force a
-       single attempt: an ambiguous failure surfaces to the strategy via the
-       Failed event, its in-flight/dedup guards clear, and the ladder
-       re-places on its next cycle - the engine's own reconciliation is the
-       recovery path. Amend/cancel keep their converge-safe retries. *)
+    (* Placements must NOT retry on transport errors (Timeout/Connection): the request may
+       have reached the matching engine before the 10s WS response timeout, so a retry can
+       silently double-place (Kraken v2 has no idempotency token for userref-tagged grid
+       orders). We force a single attempt: an ambiguous failure surfaces to the strategy
+       via the Failed event, its in-flight/dedup guards clear, and the ladder re-places on
+       its next cycle - the engine's own reconciliation is the recovery path. Amend/cancel
+       keep their converge-safe retries. *)
     match retry_config with
     | Some c -> { c with max_attempts = 1 }
     | None -> { default_retry_config with max_attempts = 1 }
   in
-  (* Ensure cl_ord_id is stable across retries for idempotency.
-     If the caller didn't provide one and order_userref is not set,
-     generate a unique ID before entering the retry loop.
-     Note: Kraken API errors if both cl_ord_id and order_userref are sent. *)
+  (* Ensure cl_ord_id is stable across retries for idempotency. If the caller didn't
+     provide one and order_userref is not set, generate a unique ID before entering the
+     retry loop. Note: Kraken API errors if both cl_ord_id and order_userref are sent. *)
   let cl_ord_id =
     match cl_ord_id, order_userref with
     | Some _, _ -> cl_ord_id
@@ -324,21 +320,21 @@ let place_order
 
 (** Amends an order, retrying via [retry_config]. *)
 let amend_order
-      ~token
-      ~order_id
-      ?cl_ord_id
-      ?order_qty
-      ?limit_price
-      ?limit_price_type
-      ?post_only
-      ?trigger_price
-      ?trigger_price_type
-      ?display_qty
-      ?deadline
-      ?validate
-      ?symbol
-      ?retry_config
-      ()
+  ~token
+  ~order_id
+  ?cl_ord_id
+  ?order_qty
+  ?limit_price
+  ?limit_price_type
+  ?post_only
+  ?trigger_price
+  ?trigger_price_type
+  ?display_qty
+  ?deadline
+  ?validate
+  ?symbol
+  ?retry_config
+  ()
   : (Kraken_common_types.amend_order_result, string) result Lwt.t
   =
   let config =
@@ -351,7 +347,6 @@ let amend_order
     let symbol_str = Option.value symbol ~default:"" in
     if symbol_str = "" then failwith "Symbol required for price precision in amend_order";
     (* Fail if no symbol was supplied; price precision truncation requires it. *)
-
     let params = `Assoc [ "order_id", `String order_id; "token", `String token ] in
     let params =
       match order_qty with
@@ -474,11 +469,10 @@ let amend_order
   Error_handling.retry_with_backoff ~section ~config ~f:amend_order_once ()
 ;;
 
-(** Cancels orders, one request per order, retried via [retry_config].
-    Requests are sent in parallel, each carrying its own req_id so responses
-    correlate per order. A single shared req_id would desync multi-frame
-    responses, since [resolve_response] removes the waiter on the first frame,
-    and Kraken does not offer a true batch cancel. *)
+(** Cancels orders, one request per order, retried via [retry_config]. Requests are sent
+    in parallel, each carrying its own req_id so responses correlate per order. A single
+    shared req_id would desync multi-frame responses, since [resolve_response] removes the
+    waiter on the first frame, and Kraken does not offer a true batch cancel. *)
 let cancel_orders ~token ?order_ids ?cl_ord_ids ?order_userrefs ?retry_config ()
   : (Kraken_common_types.cancel_order_result list, string) result Lwt.t
   =
@@ -505,12 +499,12 @@ let cancel_orders ~token ?order_ids ?cl_ord_ids ?order_userrefs ?retry_config ()
     in
     from_order_ids @ from_cl_ord_ids @ from_userrefs
   in
-  (* Execute all cancels in parallel: each cancel carries its own req_id,
-     so response correlation is per-order; the shared-req_id desync concern
-     only applies to a true batch cancel, which Kraken does not offer. The old
-     sequential pipeline turned N cancels into N times the RTT on the domain's
-     critical path, while parallel requests collapse it to roughly one RTT.
-     Each failure is logged and the remaining cancels still complete. *)
+  (* Execute all cancels in parallel: each cancel carries its own req_id, so response
+     correlation is per-order; the shared-req_id desync concern only applies to a true
+     batch cancel, which Kraken does not offer. The old sequential pipeline turned N
+     cancels into N times the RTT on the domain's critical path, while parallel requests
+     collapse it to roughly one RTT. Each failure is logged and the remaining cancels
+     still complete. *)
   let cancel_single (key, value) =
     let cancel_once () =
       let req_id = next_req_id () in

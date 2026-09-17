@@ -19,12 +19,17 @@
 ; the version pinned in Dockerfile.base) while classic OCaml reports a plain
 ; version (e.g. "5.2.0"). If the pinned OxCaml compiler version is bumped,
 ; update the string here to match.
-(rule
- (targets ctx.ml)
- (enabled_if (= %{ocaml_version} "5.2.0+ox"))
- (action (copy ctx_direct.ml ctx.ml)))
 
 (rule
  (targets ctx.ml)
- (enabled_if (<> %{ocaml_version} "5.2.0+ox"))
- (action (copy ctx_lazy.ml ctx.ml)))
+ (enabled_if
+  (= %{ocaml_version} "5.2.0+ox"))
+ (action
+  (copy ctx_direct.ml ctx.ml)))
+
+(rule
+ (targets ctx.ml)
+ (enabled_if
+  (<> %{ocaml_version} "5.2.0+ox"))
+ (action
+  (copy ctx_lazy.ml ctx.ml)))

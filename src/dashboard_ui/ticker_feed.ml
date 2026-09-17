@@ -1,12 +1,11 @@
 open Notty
 open Theme
 
-(** Ticker feed: horizontally scrolling assets, primarily paused strategies
-    and zero-balance tracked tickers. Excludes active strategies, cash (quote
-    currencies), and active balances. *)
+(** Ticker feed: horizontally scrolling assets, primarily paused strategies and
+    zero-balance tracked tickers. Excludes active strategies, cash (quote currencies), and
+    active balances. *)
 
-(** Grouping table keyed by base asset; cleared each render to avoid per-frame
-    allocation. *)
+(** Grouping table keyed by base asset; cleared each render to avoid per-frame allocation. *)
 let group_tbl : (string, (Notty.attr * string * float * float * float) list) Hashtbl.t =
   Hashtbl.create 16
 ;;
@@ -18,20 +17,20 @@ let render_ticker w (snapshot : Snapshot.t) =
   let all_strategies =
     List.filter_map
       (fun (symbol, (st : Snapshot.strategy)) ->
-         let bid = st.market.bid in
-         let ask = st.market.ask in
-         let mid = st.market.mid in
-         if mid <= 0.0 then None else Some (st.exchange, symbol, mid, bid, ask))
+        let bid = st.market.bid in
+        let ask = st.market.ask in
+        let mid = st.market.mid in
+        if mid <= 0.0 then None else Some (st.exchange, symbol, mid, bid, ask))
       strats
   in
   let non_quote_bals =
     List.filter_map
       (fun (b : Snapshot.balance) ->
-         if Snapshot.is_quote_asset b.asset
-         then None
-         else if b.mid <= 0.0
-         then None
-         else Some (b.exchange, b.symbol, b.mid, b.bid, b.ask))
+        if Snapshot.is_quote_asset b.asset
+        then None
+        else if b.mid <= 0.0
+        then None
+        else Some (b.exchange, b.symbol, b.mid, b.bid, b.ask))
       all_balances
   in
   let combined = all_strategies @ non_quote_bals in
@@ -44,15 +43,15 @@ let render_ticker w (snapshot : Snapshot.t) =
     Hashtbl.clear group_tbl;
     List.iter
       (fun (ex, sym, mid, bid, ask) ->
-         let asset = base_asset_of sym in
-         let exch_tag = exch_tag_of ex in
-         let sym_attr = exch_sym_attr ex in
-         let entry = sym_attr, exch_tag, mid, bid, ask in
-         let existing =
-           try Hashtbl.find group_tbl asset with
-           | Not_found -> []
-         in
-         Hashtbl.replace group_tbl asset (entry :: existing))
+        let asset = base_asset_of sym in
+        let exch_tag = exch_tag_of ex in
+        let sym_attr = exch_sym_attr ex in
+        let entry = sym_attr, exch_tag, mid, bid, ask in
+        let existing =
+          try Hashtbl.find group_tbl asset with
+          | Not_found -> []
+        in
+        Hashtbl.replace group_tbl asset (entry :: existing))
       combined;
     Hashtbl.fold (fun asset entries acc -> (asset, List.rev entries) :: acc) group_tbl []
     |> List.sort (fun (a1, _) (a2, _) -> String.compare a1 a2)
@@ -76,59 +75,59 @@ let render_ticker w (snapshot : Snapshot.t) =
         (fun g1 g2 -> String.compare (fst (List.hd g1)) (fst (List.hd g2)))
         combined_groups
     in
-    (* One chunk per asset group; single-entry groups are paired two per row
-       to save space. *)
+    (* One chunk per asset group; single-entry groups are paired two per row to save
+       space. *)
     let chunks_list =
       List.map
         (fun group ->
-           let group_imgs =
-             List.map
-               (fun (asset, entries) ->
-                  let asset_header =
-                    I.string A.(fg t.c_text ++ st bold) (Printf.sprintf " %s " asset)
-                  in
-                  let price_images =
-                    List.map
-                      (fun (sym_attr, _exch_tag, mid, bid, ask) ->
-                         let price_str = if mid > 0.0 then format_price mid else "--" in
-                         let spread_str = format_spread_bps bid ask in
-                         let spread_attr =
-                           if bid <= 0.0 || ask <= 0.0
-                           then t.a_dim
-                           else (
-                             let bps = (ask -. bid) /. ((bid +. ask) /. 2.0) *. 10000.0 in
-                             if bps < 5.0
-                             then t.a_bps_tight
-                             else if bps < 20.0
-                             then t.a_bps_norm
-                             else if bps < 50.0
-                             then t.a_bps_wide
-                             else t.a_bps_xtrm)
-                         in
-                         I.hcat
-                           [ I.string sym_attr price_str
-                           ; I.string t.a_dim " "
-                           ; I.string spread_attr spread_str
-                           ])
-                      entries
-                  in
-                  let spacing = I.string t.a_dim "  " in
-                  let entries_combined =
-                    List.fold_left
-                      (fun acc ch ->
-                         if I.width acc = 0 then ch else I.hcat [ acc; spacing; ch ])
-                      I.empty
-                      price_images
-                  in
-                  I.hcat [ asset_header; entries_combined; I.string t.a_text " " ])
-               group
-           in
-           let sub_separator = I.string A.(fg t.c_dim) " │ " in
-           List.fold_left
-             (fun acc img ->
-                if I.width acc = 0 then img else I.hcat [ acc; sub_separator; img ])
-             I.empty
-             group_imgs)
+          let group_imgs =
+            List.map
+              (fun (asset, entries) ->
+                let asset_header =
+                  I.string A.(fg t.c_text ++ st bold) (Printf.sprintf " %s " asset)
+                in
+                let price_images =
+                  List.map
+                    (fun (sym_attr, _exch_tag, mid, bid, ask) ->
+                      let price_str = if mid > 0.0 then format_price mid else "--" in
+                      let spread_str = format_spread_bps bid ask in
+                      let spread_attr =
+                        if bid <= 0.0 || ask <= 0.0
+                        then t.a_dim
+                        else (
+                          let bps = (ask -. bid) /. ((bid +. ask) /. 2.0) *. 10000.0 in
+                          if bps < 5.0
+                          then t.a_bps_tight
+                          else if bps < 20.0
+                          then t.a_bps_norm
+                          else if bps < 50.0
+                          then t.a_bps_wide
+                          else t.a_bps_xtrm)
+                      in
+                      I.hcat
+                        [ I.string sym_attr price_str
+                        ; I.string t.a_dim " "
+                        ; I.string spread_attr spread_str
+                        ])
+                    entries
+                in
+                let spacing = I.string t.a_dim "  " in
+                let entries_combined =
+                  List.fold_left
+                    (fun acc ch ->
+                      if I.width acc = 0 then ch else I.hcat [ acc; spacing; ch ])
+                    I.empty
+                    price_images
+                in
+                I.hcat [ asset_header; entries_combined; I.string t.a_text " " ])
+              group
+          in
+          let sub_separator = I.string A.(fg t.c_dim) " │ " in
+          List.fold_left
+            (fun acc img ->
+              if I.width acc = 0 then img else I.hcat [ acc; sub_separator; img ])
+            I.empty
+            group_imgs)
         sorted_groups
     in
     let chunks = Array.of_list chunks_list in
@@ -170,8 +169,7 @@ let render_ticker w (snapshot : Snapshot.t) =
     let rec find_cols c = if c <= 1 then 1 else if fits c then c else find_cols (c - 1) in
     let cols = if n = 0 then 1 else find_cols n in
     let col_widths = get_col_widths cols in
-    (* Rotate visible items on the wall clock (5s cycle), independent of the
-       render loop. *)
+    (* Rotate visible items on the wall clock (5s cycle), independent of the render loop. *)
     let cycle_time = 5.0 in
     let page = int_of_float (Unix.gettimeofday () /. cycle_time) in
     let slot_images =
@@ -183,17 +181,16 @@ let render_ticker w (snapshot : Snapshot.t) =
         else (
           let len = List.length items in
           let item = List.nth items (page mod len) in
-          (* Pad to exact column width so adjacent elements do not bounce
-             horizontally. *)
+          (* Pad to exact column width so adjacent elements do not bounce horizontally. *)
           I.hsnap ~align:`Left col_widths.(c) item))
     in
     let valid_slots = List.filter (fun img -> I.width img > 0) slot_images in
     let final_img =
       List.fold_left
         (fun acc slot ->
-           if I.width acc = feed_w
-           then I.hcat [ acc; slot ]
-           else I.hcat [ acc; separator; slot ])
+          if I.width acc = feed_w
+          then I.hcat [ acc; slot ]
+          else I.hcat [ acc; separator; slot ])
         feed_start
         valid_slots
     in

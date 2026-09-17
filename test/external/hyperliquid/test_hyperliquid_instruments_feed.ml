@@ -16,9 +16,9 @@ let test_round_price_to_tick () =
   let stored_price = 70.4999900000 in
   let requested_price = 70.5000000000 in
   let tick = 0.0000100000 in
-  (* The diff equals the tick size here; 5-sig-fig rounding would not catch
-     the problem if precision rules differ. HYPE/USDC mock rules use
-     szDecimals = 5, so the price decimal cap is 5. *)
+  (* The diff equals the tick size here; 5-sig-fig rounding would not catch the problem if
+     precision rules differ. HYPE/USDC mock rules use szDecimals = 5, so the price decimal
+     cap is 5. *)
   let rounded_stored = Hyperliquid.Instruments_feed.round_price_to_tick stored_price in
   let rounded_requested =
     Hyperliquid.Instruments_feed.round_price_to_tick requested_price
@@ -84,8 +84,8 @@ let test_get_qty_increment () =
 ;;
 
 let test_get_price_increment () =
-  (* Hyperliquid quotes prices to 2 decimal places; the venue increment is
-     0.01 regardless of symbol. *)
+  (* Hyperliquid quotes prices to 2 decimal places; the venue increment is 0.01 regardless
+     of symbol. *)
   let incr = Hyperliquid.Instruments_feed.get_price_increment "any" in
   Alcotest.(check bool) "always Some" true (Option.is_some incr);
   Alcotest.(check (option (float 0.0000001))) "value" (Some 0.01) incr

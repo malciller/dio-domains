@@ -1,5 +1,17 @@
 (include_subdirs unqualified)
 
+; Module layers (see README.md for the ownership rule). Physical subdirs only:
+; `include_subdirs unqualified` keeps module identity equal to the basename, so
+; nothing outside this library references these paths.
+;
+;   core/      legacy strategy-agnostic decision engine (reference; retire with the
+;              equivalence harness)
+;   platform/  central accounting + per-venue capability descriptors
+;   actions/   action registry (the code-side extension surface) + the functor
+;              bridge onto the reference grid (Make Strategy_cycle_engine)
+;   protocol/  strategy-file interpreter: parse, validate, compile, run steps
+;   harness/   equivalence tooling: traces, recorder, diff, `dio strategy` CLI
+
 (library
  (name dio_strategies)
  (public_name dio.strategies)
@@ -15,15 +27,37 @@
   lwt.unix
   unix)
  (modules
+  ; core/ — legacy reference decision engine
   Strategy_common
-  Jacobs_ladder
-  Jacobs_ladder_types
-  Jacobs_ladder_config
-  Jacobs_ladder_reservation
-  Jacobs_ladder_orders
-  Jacobs_ladder_sell_orders
-  Jacobs_ladder_execution
-  Jacobs_ladder_events
-  Market_maker
+  Strategy_state
+  Strategy_venue
+  Strategy_reservation
+  Strategy_orders
+  Strategy_sell_orders
+  Strategy_lifecycle
+  Strategy_decision
+  Strategy_events
+  Strategy_api
+  ; platform/ — central accounting
+  Platform_accounting
+  Exchange_capabilities
   Fee_cache
-  Auto_hedger))
+  ; actions/ — registry + grid bridge
+  Strategy_actions
+  Strategy_actions_builtin
+  Strategy_actions_cycle
+  Strategy_cycle_engine
+  ; protocol/ — strategy-file interpreter
+  Strategy_file
+  Strategy_script
+  Strategy_loader
+  Strategy_compile
+  Strategy_expr
+  Strategy_guard
+  Strategy_runtime
+  Strategy_fact_slots
+  ; harness/ — equivalence tooling
+  Strategy_trace
+  Strategy_event_recorder
+  Strategy_equivalence
+  Strategy_cli))

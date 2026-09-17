@@ -28,8 +28,8 @@ let test_normalize_base64_secret () =
   in
   List.iter
     (fun (input, expected) ->
-       let result = Kraken.Kraken_common_types.normalize_base64_secret input in
-       Alcotest.(check string) ("normalize " ^ input) expected result)
+      let result = Kraken.Kraken_common_types.normalize_base64_secret input in
+      Alcotest.(check string) ("normalize " ^ input) expected result)
     test_cases
 ;;
 

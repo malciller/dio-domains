@@ -1,9 +1,9 @@
-(** Dashboard state serialization. Aggregates engine state from multiple modules
-    and serializes it as JSON for the TUI dashboard over a Unix domain socket. *)
+(** Dashboard state serialization. Aggregates engine state from multiple modules and
+    serializes it as JSON for the TUI dashboard over a Unix domain socket. *)
 
 module Exchange = Dio_exchange.Exchange_intf
 module Fear_and_greed = Cmc.Fear_and_greed
-module Sell_orders = Dio_strategies.Jacobs_ladder_sell_orders
+module Sell_orders = Dio_strategies.Strategy_sell_orders
 
 (** Cached engine start time. Set once by the server at startup. *)
 let engine_start_time = ref 0.0
@@ -69,30 +69,28 @@ let json_of_domains () =
   `List
     (List.map
        (fun (key, (running, restart_count, last_restart)) ->
-          `Assoc
-            [ "key", `String key
-            ; "running", `Bool running
-            ; "restart_count", `Int restart_count
-            ; "last_restart", `Float last_restart
-            ])
+         `Assoc
+           [ "key", `String key
+           ; "running", `Bool running
+           ; "restart_count", `Int restart_count
+           ; "last_restart", `Float last_restart
+           ])
        statuses)
 ;;
 
 (* Strategy state: Grid *)
 
-(* Concurrency: this encoder reads grid strategy state without state.mutex,
-   from the dashboard server (main domain), while the symbol's asset domain
-   mutates it. Benign under OCaml 5: every field read is a word-sized slot
-   swapped atomically (boxed immutable floats, pointer options/strings) or an
-   immutable list replaced wholesale, so a reader sees the old or new value,
-   never a torn mix; no update can be lost (readers do no read-modify-write).
-   Only the symbol's domain thread mutates this state (writers from other
-   threads were removed by the lifecycle event queues, grid H3 / MM R2). Do not
-   add locking here unless the domain's whole-cycle critical section also
-   shrinks; blocking the dashboard on a full strategy cycle trades a cosmetic
-   race for a real stall. *)
+(* Concurrency: this encoder reads grid strategy state without state.mutex, from the
+   dashboard server (main domain), while the symbol's asset domain mutates it. Benign
+   under OCaml 5: every field read is a word-sized slot swapped atomically (boxed
+   immutable floats, pointer options/strings) or an immutable list replaced wholesale, so
+   a reader sees the old or new value, never a torn mix; no update can be lost (readers do
+   no read-modify-write). Only the symbol's domain thread mutates this state (writers from
+   other threads were removed by the lifecycle event queues, grid H3 / MM R2). Do not add
+   locking here unless the domain's whole-cycle critical section also shrinks; blocking
+   the dashboard on a full strategy cycle trades a cosmetic race for a real stall. *)
 let json_of_grid_strategy exchange symbol =
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   let exch = Exchange.Types.exchange_of_string exchange in
   let market_is_closed =
     match exch with
@@ -100,34 +98,34 @@ let json_of_grid_strategy exchange symbol =
     | Alpaca -> not (Alpaca.Market_hours.is_market_open ())
     | _ -> false
   in
-  (* Sell set for the SELLS count. The venue feed alone is insufficient:
-     Kraken's open-order cache can drop a resting sell (reported 0 pending while
-     the order rested). The in-flight ledger is armed at dispatch and kept across
-     feed gaps, so union it with the feed, deduped by order id (the feed wins,
-     its remaining qty is fresher). Same count, no new column. *)
+  (* Sell set for the SELLS count. The venue feed alone is insufficient: Kraken's
+     open-order cache can drop a resting sell (reported 0 pending while the order rested).
+     The in-flight ledger is armed at dispatch and kept across feed gaps, so union it with
+     the feed, deduped by order id (the feed wins, its remaining qty is fresher). Same
+     count, no new column. *)
   let sell_orders =
     let seen = Hashtbl.create 16 in
     let from_feed =
       List.filter
         (fun (oid, _, _) ->
-           if Hashtbl.mem seen oid
-           then false
-           else (
-             Hashtbl.replace seen oid ();
-             true))
+          if Hashtbl.mem seen oid
+          then false
+          else (
+            Hashtbl.replace seen oid ();
+            true))
         (Sell_orders.to_list state.open_sell_orders)
     in
     let from_ledger =
       Hashtbl.fold
         (fun oid c acc ->
-           if Hashtbl.mem seen oid
-           then acc
-           else (
-             Hashtbl.replace seen oid ();
-             ( oid
-             , c.Dio_strategies.Jacobs_ladder.sc_price
-             , c.Dio_strategies.Jacobs_ladder.sc_qty )
-             :: acc))
+          if Hashtbl.mem seen oid
+          then acc
+          else (
+            Hashtbl.replace seen oid ();
+            ( oid
+            , c.Dio_strategies.Strategy_api.sc_price
+            , c.Dio_strategies.Strategy_api.sc_qty )
+            :: acc))
         state.sell_commitments
         []
     in
@@ -142,7 +140,7 @@ let json_of_grid_strategy exchange symbol =
       , `List
           (List.map
              (fun (oid, price, qty) ->
-                `Assoc [ "id", `String oid; "price", `Float price; "qty", `Float qty ])
+               `Assoc [ "id", `String oid; "price", `Float price; "qty", `Float qty ])
              sell_orders) )
     ; "sell_count", `Int (List.length sell_orders)
     ; "accumulated_profit", `Float state.accumulated_profit
@@ -161,42 +159,10 @@ let json_of_grid_strategy exchange symbol =
     ]
 ;;
 
-(* Strategy state: Market Maker *)
-
-let json_of_mm_strategy exchange symbol =
-  let state = Dio_strategies.Market_maker.get_strategy_state symbol in
-  let exch = Exchange.Types.exchange_of_string exchange in
-  let market_is_closed =
-    match exch with
-    | Ibkr -> not (Ibkr.Market_hours.is_regular_market_open ())
-    | Alpaca -> not (Alpaca.Market_hours.is_market_open ())
-    | _ -> false
-  in
-  `Assoc
-    [ "type", `String "MM"
-    ; "buy_price", json_of_float_opt state.last_buy_order_price
-    ; "buy_qty", `Float 0.0
-    ; "buy_id", json_of_string_opt state.last_buy_order_id
-    ; ( "sell_orders"
-      , `List
-          (List.map
-             (fun (oid, price, qty) ->
-                `Assoc [ "id", `String oid; "price", `Float price; "qty", `Float qty ])
-             state.open_sell_orders) )
-    ; "sell_count", `Int (List.length state.open_sell_orders)
-    ; "capital_low", `Bool state.capital_low
-    ; "market_is_closed", `Bool market_is_closed
-    ; "asset_low", `Bool state.asset_low
-    ; "inflight_buy", `Bool state.inflight_buy
-    ; "inflight_sell", `Bool state.inflight_sell
-    ; "pending_count", `Int (List.length state.pending_orders)
-    ]
-;;
-
 (* Per-symbol market data *)
 
-(** Split a trading symbol on '/' into (base_asset, quote_currency); quote
-    defaults to "USD" when no delimiter is present. *)
+(** Split a trading symbol on '/' into (base_asset, quote_currency); quote defaults to
+    "USD" when no delimiter is present. *)
 let split_symbol symbol =
   if String.contains symbol '/'
   then (
@@ -277,12 +243,12 @@ let json_of_market_data exchange symbol base_asset quote_currency =
         `List
           (List.map
              (fun (t : Alpaca.Orderbook.trade) ->
-                `Assoc
-                  [ "price", `Float t.price
-                  ; "qty", `Float t.size
-                  ; "timestamp", `Float t.timestamp
-                  ; "side", `String t.side
-                  ])
+               `Assoc
+                 [ "price", `Float t.price
+                 ; "qty", `Float t.size
+                 ; "timestamp", `Float t.timestamp
+                 ; "side", `String t.side
+                 ])
              recent_trades))
       else `List []
     in
@@ -292,45 +258,45 @@ let json_of_market_data exchange symbol base_asset quote_currency =
     let unique_orders =
       List.filter
         (fun (o : Exchange.Types.open_order) ->
-           if Hashtbl.mem seen o.order_id
-           then false
-           else (
-             Hashtbl.replace seen o.order_id ();
-             true))
+          if Hashtbl.mem seen o.order_id
+          then false
+          else (
+            Hashtbl.replace seen o.order_id ();
+            true))
         (open_orders @ asset_orders)
     in
     let exch_buy_orders =
       List.filter
         (fun (o : Exchange.Types.open_order) ->
-           o.side = Exchange.Types.Buy && o.remaining_qty > 0.0)
+          o.side = Exchange.Types.Buy && o.remaining_qty > 0.0)
         unique_orders
     in
     let exch_sell_orders =
       List.filter
         (fun (o : Exchange.Types.open_order) ->
-           o.side = Exchange.Types.Sell && o.remaining_qty > 0.0)
+          o.side = Exchange.Types.Sell && o.remaining_qty > 0.0)
         unique_orders
     in
     let buy_orders_json =
       `List
         (List.map
            (fun (o : Exchange.Types.open_order) ->
-              `Assoc
-                [ "id", `String o.order_id
-                ; "price", `Float (Option.value o.limit_price ~default:0.0)
-                ; "qty", `Float o.remaining_qty
-                ])
+             `Assoc
+               [ "id", `String o.order_id
+               ; "price", `Float (Option.value o.limit_price ~default:0.0)
+               ; "qty", `Float o.remaining_qty
+               ])
            exch_buy_orders)
     in
     let sell_orders_json =
       `List
         (List.map
            (fun (o : Exchange.Types.open_order) ->
-              `Assoc
-                [ "id", `String o.order_id
-                ; "price", `Float (Option.value o.limit_price ~default:0.0)
-                ; "qty", `Float o.remaining_qty
-                ])
+             `Assoc
+               [ "id", `String o.order_id
+               ; "price", `Float (Option.value o.limit_price ~default:0.0)
+               ; "qty", `Float o.remaining_qty
+               ])
            exch_sell_orders)
     in
     `Assoc
@@ -400,62 +366,61 @@ let json_of_latency_snapshot (snap : Latency_profiler.snapshot) =
     ]
 ;;
 
-(** Merge the capital-oracle per-asset latency windows into the per-domain
-    latency map under the "oracle" label, so ENGINE LATENCY rows show this
-    pass's per-asset oracle pipeline time. Keys match the trading-config symbols
-    the domains are keyed by, case-insensitively; the original spelling is
-    preserved. *)
+(** Merge the capital-oracle per-asset latency windows into the per-domain latency map
+    under the "oracle" label, so ENGINE LATENCY rows show this pass's per-asset oracle
+    pipeline time. Keys match the trading-config symbols the domains are keyed by,
+    case-insensitively; the original spelling is preserved. *)
 let merge_oracle_asset_latencies latencies =
   let by_symbol = Hashtbl.create 16 in
   List.iter
     (fun (symbol, json) ->
-       Hashtbl.replace by_symbol (String.lowercase_ascii symbol) (symbol, json))
+      Hashtbl.replace by_symbol (String.lowercase_ascii symbol) (symbol, json))
     latencies;
   List.iter
     (fun (symbol, snap_opt) ->
-       let key = String.lowercase_ascii symbol in
-       match Hashtbl.find_opt by_symbol key, snap_opt with
-       | Some (orig, `Assoc l), Some snap ->
-         Hashtbl.replace
-           by_symbol
-           key
-           (orig, `Assoc (("oracle", json_of_latency_snapshot snap) :: l))
-       | _ -> ())
+      let key = String.lowercase_ascii symbol in
+      match Hashtbl.find_opt by_symbol key, snap_opt with
+      | Some (orig, `Assoc l), Some snap ->
+        Hashtbl.replace
+          by_symbol
+          key
+          (orig, `Assoc (("oracle", json_of_latency_snapshot snap) :: l))
+      | _ -> ())
     (Dio_oracle.Oracle_runtime.asset_profiler_snapshots ());
   Hashtbl.fold (fun _ (orig, json) acc -> (orig, json) :: acc) by_symbol []
 ;;
 
-(** Merge the per-venue network latency windows into the per-domain latency map
-    under the NETWORK-page labels (ws_ping / ws_feed / rest_request / signer), so
-    ENGINE LATENCY rows show each domain venue's network characteristics. Keys
-    match the trading-config symbols the domains are keyed by, case-insensitively.
-    Venues with no network measurement are absent; the NETWORK page renders "--". *)
+(** Merge the per-venue network latency windows into the per-domain latency map under the
+    NETWORK-page labels (ws_ping / ws_feed / rest_request / signer), so ENGINE LATENCY
+    rows show each domain venue's network characteristics. Keys match the trading-config
+    symbols the domains are keyed by, case-insensitively. Venues with no network
+    measurement are absent; the NETWORK page renders "--". *)
 let merge_network_latencies latencies =
   let by_symbol = Hashtbl.create 16 in
   List.iter
     (fun (symbol, json) ->
-       Hashtbl.replace by_symbol (String.lowercase_ascii symbol) (symbol, json))
+      Hashtbl.replace by_symbol (String.lowercase_ascii symbol) (symbol, json))
     latencies;
   let config = get_config () in
   List.iter
     (fun (tc : Dio_engine.Config.trading_config) ->
-       let key = String.lowercase_ascii tc.symbol in
-       let venue_snaps = Network_latency.snapshots tc.exchange in
-       if venue_snaps <> []
-       then (
-         match Hashtbl.find_opt by_symbol key with
-         | Some (orig, `Assoc l) ->
-           let network_entries =
-             List.filter_map
-               (fun (label, snap_opt) ->
-                  match snap_opt with
-                  | Some snap -> Some (label, json_of_latency_snapshot snap)
-                  | None -> None)
-               venue_snaps
-           in
-           if network_entries <> []
-           then Hashtbl.replace by_symbol key (orig, `Assoc (network_entries @ l))
-         | _ -> ()))
+      let key = String.lowercase_ascii tc.symbol in
+      let venue_snaps = Network_latency.snapshots tc.exchange in
+      if venue_snaps <> []
+      then (
+        match Hashtbl.find_opt by_symbol key with
+        | Some (orig, `Assoc l) ->
+          let network_entries =
+            List.filter_map
+              (fun (label, snap_opt) ->
+                match snap_opt with
+                | Some snap -> Some (label, json_of_latency_snapshot snap)
+                | None -> None)
+              venue_snaps
+          in
+          if network_entries <> []
+          then Hashtbl.replace by_symbol key (orig, `Assoc (network_entries @ l))
+        | _ -> ()))
     config.trading;
   Hashtbl.fold (fun _ (orig, json) acc -> (orig, json) :: acc) by_symbol []
 ;;
@@ -465,29 +430,29 @@ let json_of_domain_latencies () =
   let latencies =
     List.map
       (fun (symbol, snaps) ->
-         ( symbol
-         , `Assoc
-             (List.filter_map
-                (fun (label, snap_opt) ->
-                   match snap_opt with
-                   | Some snap -> Some (label, json_of_latency_snapshot snap)
-                   | None -> None)
-                snaps) ))
+        ( symbol
+        , `Assoc
+            (List.filter_map
+               (fun (label, snap_opt) ->
+                 match snap_opt with
+                 | Some snap -> Some (label, json_of_latency_snapshot snap)
+                 | None -> None)
+               snaps) ))
       profilers
   in
   `Assoc (merge_network_latencies (merge_oracle_asset_latencies latencies))
 ;;
 
-(** Engine-global capital-oracle latency windows (per-pass stages), serialized
-    for the latency cards. Empty until the runtime completes its first pass. *)
+(** Engine-global capital-oracle latency windows (per-pass stages), serialized for the
+    latency cards. Empty until the runtime completes its first pass. *)
 let json_of_oracle_latency () =
   let snaps = Dio_oracle.Oracle_runtime.profiler_snapshots () in
   `Assoc
     (List.filter_map
        (fun (label, snap_opt) ->
-          match snap_opt with
-          | Some snap -> Some (label, json_of_latency_snapshot snap)
-          | None -> None)
+         match snap_opt with
+         | Some snap -> Some (label, json_of_latency_snapshot snap)
+         | None -> None)
        snaps)
 ;;
 
@@ -519,8 +484,8 @@ let json_of_memory () =
     ]
 ;;
 
-(** One capital-oracle decision, serialized for the dashboard: the ACTIVE/INACTIVE
-    verdict (pause state), the sizing it published, and the capital consumed. *)
+(** One capital-oracle decision, serialized for the dashboard: the ACTIVE/INACTIVE verdict
+    (pause state), the sizing it published, and the capital consumed. *)
 let json_of_decision (d : Dio_oracle.Oracle_runtime.decision) =
   `Assoc
     [ "exchange", `String d.exchange
@@ -571,22 +536,21 @@ let json_of_recent_fills () =
   `List
     (List.map
        (fun (f : B.fill_event) ->
-          `Assoc
-            [ "venue", `String f.venue
-            ; "symbol", `String f.symbol
-            ; "side", `String f.side
-            ; "amount", `Float f.amount
-            ; "fill_price", `Float f.fill_price
-            ; "value", `Float f.value
-            ; "timestamp", `Float f.timestamp
-            ])
+         `Assoc
+           [ "venue", `String f.venue
+           ; "symbol", `String f.symbol
+           ; "side", `String f.side
+           ; "amount", `Float f.amount
+           ; "fill_price", `Float f.fill_price
+           ; "value", `Float f.value
+           ; "timestamp", `Float f.timestamp
+           ])
        recent)
 ;;
 
-(** Parse-domain offload health: submitted/processed/fallen-back frame counts,
-    peak queue depth, and per-handler cumulative parse time. A rising
-    [fallbacks] count means the parse domain is saturated and hot threads are
-    parsing frames inline instead. *)
+(** Parse-domain offload health: submitted/processed/fallen-back frame counts, peak queue
+    depth, and per-handler cumulative parse time. A rising [fallbacks] count means the
+    parse domain is saturated and hot threads are parsing frames inline instead. *)
 let json_of_parse_worker () =
   let handlers =
     Concurrency.Parse_worker.handler_stats_snapshot ()
@@ -616,9 +580,9 @@ let build_snapshot () =
     | Some v -> `Float v
     | None -> `Null
   in
-  (* Per-symbol strategy state, market data, and capital-oracle decision. The
-     oracle verdict drives the dashboard's paused status; before the first oracle
-     pass there is no decision and the oracle field is null. *)
+  (* Per-symbol strategy state, market data, and capital-oracle decision. The oracle
+     verdict drives the dashboard's paused status; before the first oracle pass there is
+     no decision and the oracle field is null. *)
   let oracle_by_symbol =
     match json_of_oracle_decisions () with
     | `Assoc l -> l
@@ -632,33 +596,32 @@ let build_snapshot () =
   let strategies =
     List.map
       (fun (tc : Dio_engine.Config.trading_config) ->
-         let strategy_json =
-           match tc.strategy with
-           | "Ladder" | "jacobs_ladder" -> json_of_grid_strategy tc.exchange tc.symbol
-           | "MM" -> json_of_mm_strategy tc.exchange tc.symbol
-           | other -> `Assoc [ "type", `String other ]
-         in
-         let base_asset, quote_currency = split_symbol tc.symbol in
-         let market_json =
-           json_of_market_data tc.exchange tc.symbol base_asset quote_currency
-         in
-         ( tc.symbol
-         , `Assoc
-             [ "exchange", `String tc.exchange
-             ; "strategy", strategy_json
-             ; "market", market_json
-             ; "oracle", oracle_of tc.symbol
-             ; "qty", `String tc.qty
-             ; "grid_interval_lo", `Float (fst tc.grid_interval)
-             ; "grid_interval_hi", `Float (snd tc.grid_interval)
-             ; "accumulation_buffer_lo", `Float (fst tc.accumulation_buffer)
-             ; "accumulation_buffer_hi", `Float (snd tc.accumulation_buffer)
-             ; "sell_mult", `String tc.sell_mult
-             ] ))
+        let strategy_json =
+          match tc.strategy with
+          | "Ladder" | "jacobs_ladder" -> json_of_grid_strategy tc.exchange tc.symbol
+          | other -> `Assoc [ "type", `String other ]
+        in
+        let base_asset, quote_currency = split_symbol tc.symbol in
+        let market_json =
+          json_of_market_data tc.exchange tc.symbol base_asset quote_currency
+        in
+        ( tc.symbol
+        , `Assoc
+            [ "exchange", `String tc.exchange
+            ; "strategy", strategy_json
+            ; "market", market_json
+            ; "oracle", oracle_of tc.symbol
+            ; "qty", `String tc.qty
+            ; "grid_interval_lo", `Float (fst tc.grid_interval)
+            ; "grid_interval_hi", `Float (snd tc.grid_interval)
+            ; "accumulation_buffer_lo", `Float (fst tc.accumulation_buffer)
+            ; "accumulation_buffer_hi", `Float (snd tc.accumulation_buffer)
+            ; "sell_mult", `String tc.sell_mult
+            ] ))
       config.trading
   in
-  (* Aggregate balances from all registered exchanges, enriched with ticker data
-     and open sell orders. *)
+  (* Aggregate balances from all registered exchanges, enriched with ticker data and open
+     sell orders. *)
   let configured_symbols =
     List.map
       (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange, tc.symbol)
@@ -668,183 +631,180 @@ let build_snapshot () =
   let all_balances =
     List.concat_map
       (fun exch_name ->
-         match Exchange.Registry.get exch_name with
-         | None -> []
-         | Some (module Ex) ->
-           List.filter_map
-             (fun (asset, bal) ->
-                let quote =
-                  match Exchange.Types.exchange_of_string exch_name with
-                  | Hyperliquid | Lighter -> "USDC"
-                  | Kraken | Ibkr | Alpaca | Custom _ -> "USD"
+        match Exchange.Registry.get exch_name with
+        | None -> []
+        | Some (module Ex) ->
+          List.filter_map
+            (fun (asset, bal) ->
+              let quote =
+                match Exchange.Types.exchange_of_string exch_name with
+                | Hyperliquid | Lighter -> "USDC"
+                | Kraken | Ibkr | Alpaca | Custom _ -> "USD"
+              in
+              let is_equity_exch =
+                match Exchange.Types.exchange_of_string exch_name with
+                | Alpaca | Ibkr -> true
+                | _ -> false
+              in
+              let symbol =
+                if is_equity_exch && not (String.contains asset '/')
+                then asset
+                else asset ^ "/" ^ quote
+              in
+              (* Skip assets already covered by a configured strategy *)
+              let is_configured =
+                List.exists
+                  (fun (ex, sym) ->
+                    ex = exch_name
+                    && (sym = symbol || sym = asset || fst (split_symbol sym) = asset))
+                  configured_symbols
+              in
+              if is_configured
+              then None
+              else (
+                let is_quote =
+                  asset = "USD"
+                  || asset = "USDC"
+                  || asset = "ZUSD"
+                  || asset = "USDT"
+                  || asset = quote
+                  || asset = "USDe"
                 in
-                let is_equity_exch =
-                  match Exchange.Types.exchange_of_string exch_name with
-                  | Alpaca | Ibkr -> true
-                  | _ -> false
-                in
-                let symbol =
-                  if is_equity_exch && not (String.contains asset '/')
-                  then asset
-                  else asset ^ "/" ^ quote
-                in
-                (* Skip assets already covered by a configured strategy *)
-                let is_configured =
-                  List.exists
-                    (fun (ex, sym) ->
-                       ex = exch_name
-                       && (sym = symbol || sym = asset || fst (split_symbol sym) = asset))
-                    configured_symbols
-                in
-                if is_configured
-                then None
-                else (
-                  let is_quote =
-                    asset = "USD"
-                    || asset = "USDC"
-                    || asset = "ZUSD"
-                    || asset = "USDT"
-                    || asset = quote
-                    || asset = "USDe"
-                  in
-                  let tob =
-                    match Ex.get_top_of_book ~symbol with
-                    | Some (b, bs, a, as_) when b > 0.0 || a > 0.0 -> Some (b, bs, a, as_)
-                    | _ ->
-                      if is_quote
-                      then None
-                      else
-                        List.find_map
-                          (fun other_exch ->
-                             if other_exch = exch_name
-                             then None
-                             else (
-                               match Exchange.Registry.get other_exch with
-                               | None -> None
-                               | Some (module OtherEx) ->
-                                 let other_quote =
-                                   match Exchange.Types.exchange_of_string other_exch with
-                                   | Hyperliquid | Lighter -> "USDC"
-                                   | Kraken | Ibkr | Alpaca | Custom _ -> "USD"
-                                 in
-                                 let other_sym = asset ^ "/" ^ other_quote in
-                                 (match OtherEx.get_top_of_book ~symbol:other_sym with
+                let tob =
+                  match Ex.get_top_of_book ~symbol with
+                  | Some (b, bs, a, as_) when b > 0.0 || a > 0.0 -> Some (b, bs, a, as_)
+                  | _ ->
+                    if is_quote
+                    then None
+                    else
+                      List.find_map
+                        (fun other_exch ->
+                          if other_exch = exch_name
+                          then None
+                          else (
+                            match Exchange.Registry.get other_exch with
+                            | None -> None
+                            | Some (module OtherEx) ->
+                              let other_quote =
+                                match Exchange.Types.exchange_of_string other_exch with
+                                | Hyperliquid | Lighter -> "USDC"
+                                | Kraken | Ibkr | Alpaca | Custom _ -> "USD"
+                              in
+                              let other_sym = asset ^ "/" ^ other_quote in
+                              (match OtherEx.get_top_of_book ~symbol:other_sym with
+                               | Some (b, bs, a, as_) when b > 0.0 || a > 0.0 ->
+                                 Some (b, bs, a, as_)
+                               | _ ->
+                                 (match OtherEx.get_top_of_book ~symbol:asset with
                                   | Some (b, bs, a, as_) when b > 0.0 || a > 0.0 ->
                                     Some (b, bs, a, as_)
-                                  | _ ->
-                                    (match OtherEx.get_top_of_book ~symbol:asset with
-                                     | Some (b, bs, a, as_) when b > 0.0 || a > 0.0 ->
-                                       Some (b, bs, a, as_)
-                                     | _ -> None))))
-                          exchange_names
-                  in
-                  let bid_json, ask_json =
-                    match tob with
-                    | Some (b, _, a, _) -> `Float b, `Float a
-                    | None -> if is_quote then `Float 1.0, `Float 1.0 else `Null, `Null
-                  in
-                  let staked_balance =
-                    try Ex.get_staked_balance ~asset with
-                    | _ -> 0.0
-                  in
-                  let tradeable_balance =
-                    try Ex.get_tradeable_balance ~asset with
-                    | _ -> bal
-                  in
-                  (* Open sell orders for this symbol; also query all symbol
-                     stores for this asset to catch orders under alternative
-                     symbol keys. *)
-                  let open_orders = Ex.get_open_orders ~symbol in
-                  let asset_orders = Ex.get_all_orders_for_asset ~asset in
-                  let seen = Hashtbl.create 8 in
-                  let unique_orders =
-                    List.filter
-                      (fun (o : Exchange.Types.open_order) ->
-                         if Hashtbl.mem seen o.order_id
-                         then false
-                         else (
-                           Hashtbl.replace seen o.order_id ();
-                           true))
-                      (open_orders @ asset_orders)
-                  in
-                  let sell_orders =
-                    List.filter
-                      (fun (o : Exchange.Types.open_order) ->
-                         o.side = Exchange.Types.Sell && o.remaining_qty > 0.0)
-                      unique_orders
-                  in
-                  let sell_orders_json =
+                                  | _ -> None))))
+                        exchange_names
+                in
+                let bid_json, ask_json =
+                  match tob with
+                  | Some (b, _, a, _) -> `Float b, `Float a
+                  | None -> if is_quote then `Float 1.0, `Float 1.0 else `Null, `Null
+                in
+                let staked_balance =
+                  try Ex.get_staked_balance ~asset with
+                  | _ -> 0.0
+                in
+                let tradeable_balance =
+                  try Ex.get_tradeable_balance ~asset with
+                  | _ -> bal
+                in
+                (* Open sell orders for this symbol; also query all symbol stores for this
+                   asset to catch orders under alternative symbol keys. *)
+                let open_orders = Ex.get_open_orders ~symbol in
+                let asset_orders = Ex.get_all_orders_for_asset ~asset in
+                let seen = Hashtbl.create 8 in
+                let unique_orders =
+                  List.filter
+                    (fun (o : Exchange.Types.open_order) ->
+                      if Hashtbl.mem seen o.order_id
+                      then false
+                      else (
+                        Hashtbl.replace seen o.order_id ();
+                        true))
+                    (open_orders @ asset_orders)
+                in
+                let sell_orders =
+                  List.filter
+                    (fun (o : Exchange.Types.open_order) ->
+                      o.side = Exchange.Types.Sell && o.remaining_qty > 0.0)
+                    unique_orders
+                in
+                let sell_orders_json =
+                  `List
+                    (List.map
+                       (fun (o : Exchange.Types.open_order) ->
+                         `Assoc
+                           [ "id", `String o.order_id
+                           ; "price", `Float (Option.value o.limit_price ~default:0.0)
+                           ; "qty", `Float o.remaining_qty
+                           ])
+                       sell_orders)
+                in
+                let pos =
+                  try Ex.get_orderbook_position ~symbol with
+                  | _ -> 0
+                in
+                let ob_event =
+                  if pos > 0
+                  then (
+                    match
+                      try Ex.read_orderbook_events ~symbol ~start_pos:(pos - 1) with
+                      | _ -> []
+                    with
+                    | ev :: _ -> Some ev
+                    | [] -> None)
+                  else None
+                in
+                let bids_json =
+                  match ob_event with
+                  | Some ev ->
                     `List
-                      (List.map
-                         (fun (o : Exchange.Types.open_order) ->
-                            `Assoc
-                              [ "id", `String o.order_id
-                              ; "price", `Float (Option.value o.limit_price ~default:0.0)
-                              ; "qty", `Float o.remaining_qty
-                              ])
-                         sell_orders)
-                  in
-                  let pos =
-                    try Ex.get_orderbook_position ~symbol with
-                    | _ -> 0
-                  in
-                  let ob_event =
-                    if pos > 0
-                    then (
-                      match
-                        try Ex.read_orderbook_events ~symbol ~start_pos:(pos - 1) with
-                        | _ -> []
-                      with
-                      | ev :: _ -> Some ev
-                      | [] -> None)
-                    else None
-                  in
-                  let bids_json =
-                    match ob_event with
-                    | Some ev ->
-                      `List
-                        (Array.to_list
-                           (Array.map
-                              (fun (p, q) ->
-                                 `Assoc [ "price", `Float p; "qty", `Float q ])
-                              ev.bids))
-                    | None ->
-                      (match tob with
-                       | Some (b, bs, _, _) ->
-                         `List [ `Assoc [ "price", `Float b; "qty", `Float bs ] ]
-                       | None -> `List [])
-                  in
-                  let asks_json =
-                    match ob_event with
-                    | Some ev ->
-                      `List
-                        (Array.to_list
-                           (Array.map
-                              (fun (p, q) ->
-                                 `Assoc [ "price", `Float p; "qty", `Float q ])
-                              ev.asks))
-                    | None ->
-                      (match tob with
-                       | Some (_, _, a, as_) ->
-                         `List [ `Assoc [ "price", `Float a; "qty", `Float as_ ] ]
-                       | None -> `List [])
-                  in
-                  Some
-                    (`Assoc
-                        [ "exchange", `String exch_name
-                        ; "asset", `String asset
-                        ; "symbol", `String symbol
-                        ; "balance", `Float bal
-                        ; "staked_balance", `Float staked_balance
-                        ; "tradeable_balance", `Float tradeable_balance
-                        ; "bid", bid_json
-                        ; "ask", ask_json
-                        ; "bids", bids_json
-                        ; "asks", asks_json
-                        ; "sell_orders", sell_orders_json
-                        ; "sell_count", `Int (List.length sell_orders)
-                        ])))
-             (Ex.get_all_balances ()))
+                      (Array.to_list
+                         (Array.map
+                            (fun (p, q) -> `Assoc [ "price", `Float p; "qty", `Float q ])
+                            ev.bids))
+                  | None ->
+                    (match tob with
+                     | Some (b, bs, _, _) ->
+                       `List [ `Assoc [ "price", `Float b; "qty", `Float bs ] ]
+                     | None -> `List [])
+                in
+                let asks_json =
+                  match ob_event with
+                  | Some ev ->
+                    `List
+                      (Array.to_list
+                         (Array.map
+                            (fun (p, q) -> `Assoc [ "price", `Float p; "qty", `Float q ])
+                            ev.asks))
+                  | None ->
+                    (match tob with
+                     | Some (_, _, a, as_) ->
+                       `List [ `Assoc [ "price", `Float a; "qty", `Float as_ ] ]
+                     | None -> `List [])
+                in
+                Some
+                  (`Assoc
+                    [ "exchange", `String exch_name
+                    ; "asset", `String asset
+                    ; "symbol", `String symbol
+                    ; "balance", `Float bal
+                    ; "staked_balance", `Float staked_balance
+                    ; "tradeable_balance", `Float tradeable_balance
+                    ; "bid", bid_json
+                    ; "ask", ask_json
+                    ; "bids", bids_json
+                    ; "asks", asks_json
+                    ; "sell_orders", sell_orders_json
+                    ; "sell_count", `Int (List.length sell_orders)
+                    ])))
+            (Ex.get_all_balances ()))
       exchange_names
   in
   `Assoc

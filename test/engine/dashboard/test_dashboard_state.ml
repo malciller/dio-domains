@@ -1,8 +1,8 @@
-(* Dashboard state tests: the capital-oracle decision serialization - the
-   snapshot carries the oracle's ACTIVE/INACTIVE verdict, sizing and capital
-   accounting per tracked asset (the dashboard's pause state source). *)
+(* Dashboard state tests: the capital-oracle decision serialization - the snapshot carries
+   the oracle's ACTIVE/INACTIVE verdict, sizing and capital accounting per tracked asset
+   (the dashboard's pause state source). *)
 
-module Sell_orders = Dio_strategies.Jacobs_ladder_sell_orders
+module Sell_orders = Dio_strategies.Strategy_sell_orders
 
 let make_decision () =
   { Dio_oracle.Oracle_runtime.exchange = "hyperliquid"
@@ -72,15 +72,15 @@ let test_decision_fields () =
 ;;
 
 let test_keyed_by_symbol () =
-  (* The decisions map is keyed by symbol so the snapshot can join them onto
-     the strategy entries. *)
+  (* The decisions map is keyed by symbol so the snapshot can join them onto the strategy
+     entries. *)
   let all =
     match Dio_dashboard.Dashboard_state.json_of_oracle_decisions () with
     | `Assoc l -> l
     | _ -> []
   in
-  (* The runtime's live decisions are an empty snapshot in this test
-     process; the map is a plain assoc either way. *)
+  (* The runtime's live decisions are an empty snapshot in this test process; the map is a
+     plain assoc either way. *)
   Alcotest.(check bool)
     "decisions map is an assoc"
     (List.for_all (fun (k, _) -> k <> "") all)
@@ -88,19 +88,18 @@ let test_keyed_by_symbol () =
 ;;
 
 let test_ladder_sell_count_uses_ledger () =
-  (* The SELLS count must report the live sell set, not only what the venue
-     feed lists. Kraken's open-order feed can drop a resting sell, which
-     showed as 0 pending sells while the order still rested; the in-flight
-     ledger is armed at dispatch and is the authority. Feed empty + two ledger
-     commitments => count 2. *)
+  (* The SELLS count must report the live sell set, not only what the venue feed lists.
+     Kraken's open-order feed can drop a resting sell, which showed as 0 pending sells
+     while the order still rested; the in-flight ledger is armed at dispatch and is the
+     authority. Feed empty + two ledger commitments => count 2. *)
   let symbol = "DASH_SELLCOUNT/XMR/USD" in
-  let state = Dio_strategies.Jacobs_ladder.get_strategy_state symbol in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   Sell_orders.clear state.open_sell_orders;
   Hashtbl.clear state.sell_commitments;
   Hashtbl.replace
     state.sell_commitments
     "oid-a"
-    { Dio_strategies.Jacobs_ladder.sc_price = 539.67
+    { Dio_strategies.Strategy_api.sc_price = 539.67
     ; sc_qty = 0.3
     ; sc_seen = false
     ; sc_acked = false
@@ -110,7 +109,7 @@ let test_ladder_sell_count_uses_ledger () =
   Hashtbl.replace
     state.sell_commitments
     "oid-b"
-    { Dio_strategies.Jacobs_ladder.sc_price = 540.10
+    { Dio_strategies.Strategy_api.sc_price = 540.10
     ; sc_qty = 0.2
     ; sc_seen = true
     ; sc_acked = true

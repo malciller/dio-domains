@@ -1,29 +1,30 @@
 (** Canary / stop-the-world detector.
 
-    A trading domain paused by another domain's major collection observes no GC
-    delta in its own [Gc.quick_stat] counters, so the per-cycle [Gc_monitor]
-    cause string stays blank while cycle latency balloons. A dedicated busy-spin
-    domain reads a non-allocating monotonic clock and records the gap between
-    consecutive reads. A gap far above the spin loop's natural iteration time is
-    a process-wide runtime pause (major-GC stop-the-world) or a scheduler
-    descheduling. Windows are reported on the same cadence as the per-domain
-    latency profiles for timestamp correlation.
+    A trading domain paused by another domain's major collection observes no GC delta in
+    its own [Gc.quick_stat] counters, so the per-cycle [Gc_monitor] cause string stays
+    blank while cycle latency balloons. A dedicated busy-spin domain reads a
+    non-allocating monotonic clock and records the gap between consecutive reads. A gap
+    far above the spin loop's natural iteration time is a process-wide runtime pause
+    (major-GC stop-the-world) or a scheduler descheduling. Windows are reported on the
+    same cadence as the per-domain latency profiles for timestamp correlation.
 
-    The clock is {!Monotonic_clock.now_ns}, an immediate-[int] C stub. Every
-    stdlib clock ([Mtime_clock.now_ns], [Unix.gettimeofday], [Gc.quick_stat])
-    allocates, and an allocating canary would trigger its own minor collections
-    and measure itself rather than the runtime. *)
+    The clock is {!Monotonic_clock.now_ns}, an immediate-[int] C stub. Every stdlib clock
+    ([Mtime_clock.now_ns], [Unix.gettimeofday], [Gc.quick_stat]) allocates, and an
+    allocating canary would trigger its own minor collections and measure itself rather
+    than the runtime. *)
 
-(* OxCaml marks [Domain.spawn] as [do_not_spawn_domains]. The canary runs at most
-   one dedicated diagnostic domain, gated by the [DIO_CANARY] kill switch, to
-   observe process-wide runtime pauses. *)
+(* OxCaml marks [Domain.spawn] as [do_not_spawn_domains]. The canary runs at most one
+   dedicated diagnostic domain, gated by the [DIO_CANARY] kill switch, to observe
+   process-wide runtime pauses. *)
 [@@@alert "-unsafe_multidomain"]
 [@@@alert "-do_not_spawn_domains"]
 
 let section = "canary"
 
-(** [enabled ()] honors the [DIO_CANARY] kill switch. The canary busy-spins a
-    full core, so it must be easy to disable outside a diagnostic window. *)
+(** [enabled ()] honors the [DIO_CANARY] kill switch. The canary busy-spins a full core,
+    which keeps that core (and, via the shared clock domain, the package) out of deep
+    idle, so event-driven wakeups don't pay C-state/frequency exit latency. It must still
+    be easy to disable outside a diagnostic window. *)
 let enabled () =
   match Sys.getenv_opt "DIO_CANARY" with
   | Some ("0" | "false" | "off" | "no") -> false
@@ -39,10 +40,17 @@ let env_float name default =
      | None -> default)
 ;;
 
-(** [run ~threshold_us ~window_seconds] never returns. Records the gap between
-    consecutive clock reads into a latency histogram and logs a summary every
-    [window_seconds], on the same cadence as the per-domain windows so a global
-    pause can be matched to the domain cycles that spiked. *)
+(** Most recent window's maximum observed gap, in nanoseconds. Written by the canary
+    domain at each window roll, read by the per-domain spike reporter to distinguish a
+    global stop-the-world pause from a single thread being descheduled. *)
+let last_max_cell = Atomic.make 0
+
+let last_window_max_ns () = Atomic.get last_max_cell
+
+(** [run ~threshold_us ~window_seconds] never returns. Records the gap between consecutive
+    clock reads into a latency histogram and logs a summary every [window_seconds], on the
+    same cadence as the per-domain windows so a global pause can be matched to the domain
+    cycles that spiked. *)
 let run ~threshold_us ~window_seconds =
   let prof = Latency_profiler.create ~bucket_us:1 ~max_latency_us:10_000 "canary" in
   let window_ns = int_of_float (window_seconds *. 1_000_000_000.) in
@@ -59,6 +67,7 @@ let run ~threshold_us ~window_seconds =
       let snap =
         Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us prof
       in
+      Atomic.set last_max_cell (int_of_float (snap.max_us *. 1000.0));
       Logging.info_f
         ~section
         "STW canary p50=%s p99=%s max=%s spikes=%d/%d (threshold %s)"
@@ -85,5 +94,13 @@ let start () =
       "Stop-the-world canary started (threshold %s, window %.0fs)"
       (Latency_profiler.format_us threshold_us)
       window_seconds;
-    ignore (Domain.spawn (fun () -> run ~threshold_us ~window_seconds)))
+    ignore
+      (Domain.spawn (fun () ->
+         Gc_config.apply ();
+         (* Keep the busy-spin off the trading P-cores: it exists to keep the package warm
+            and detect global pauses, not to compete with the strategy cycles. Idle policy
+            so it yields to anything runnable. *)
+         Thread_affinity.pin_self_background ();
+         Thread_affinity.set_self_idle ();
+         run ~threshold_us ~window_seconds)))
 ;;

@@ -1,28 +1,28 @@
 (** Background renewal of resting Lighter orders.
 
-    Lighter mandates Good-Till-Time (GTT) orders with a 28-day maximum TTL,
-    and [SignModifyOrder] cannot change TIF or expiry. GTC is emulated by
-    cancel-and-replace of orders nearing expiry; this is the only way to
-    extend validity while preserving the resting order. *)
+    Lighter mandates Good-Till-Time (GTT) orders with a 28-day maximum TTL, and
+    [SignModifyOrder] cannot change TIF or expiry. GTC is emulated by cancel-and-replace
+    of orders nearing expiry; this is the only way to extend validity while preserving the
+    resting order. *)
 
 open Lwt.Infix
 
 let section = "lighter_tif_renewal"
 
-(** Renewal threshold in seconds: orders expiring within this window are
-    renewed. 1 day keeps a full day of margin around the 28-day TTL. *)
+(** Renewal threshold in seconds: orders expiring within this window are renewed. 1 day
+    keeps a full day of margin around the 28-day TTL. *)
 let renewal_threshold_seconds = 1.0 *. 86400.0
 
-(** Period of the expiration check loop, in seconds. Each pass is a cheap
-    iteration over the in-memory open-orders table. *)
+(** Period of the expiration check loop, in seconds. Each pass is a cheap iteration over
+    the in-memory open-orders table. *)
 let check_interval_seconds = 3600.0
 
 let shutdown_requested = ref false
 let signal_shutdown () = shutdown_requested := true
 
-(** Cancels a resting order and replaces it at the same price with the
-    remaining quantity, restarting the TTL clock. Returns [Ok ()] once the
-    replacement is accepted, [Error msg] on network or protocol failures. *)
+(** Cancels a resting order and replaces it at the same price with the remaining quantity,
+    restarting the TTL clock. Returns [Ok ()] once the replacement is accepted,
+    [Error msg] on network or protocol failures. *)
 let renew_order (order : Lighter_executions_feed.open_order) : (unit, string) result Lwt.t
   =
   let symbol = order.symbol in
@@ -68,8 +68,8 @@ let renew_order (order : Lighter_executions_feed.open_order) : (unit, string) re
       (* Brief pause so the cancel propagates back over the WS feed first. *)
       Lwt_unix.sleep 0.5
       >>= fun () ->
-      (* Re-place at the same price with the remaining qty; the default
-         expiry yields a fresh 28-day TTL. *)
+      (* Re-place at the same price with the remaining qty; the default expiry yields a
+         fresh 28-day TTL. *)
       Lighter_actions.place_order ~symbol ~is_buy ~qty:remaining_qty ~price ()
       >>= fun place_result ->
       (match place_result with
@@ -84,8 +84,8 @@ let renew_order (order : Lighter_executions_feed.open_order) : (unit, string) re
            remaining_qty;
          Lwt.return (Ok ())
        | Error msg ->
-         (* Cancel succeeded but re-place failed: the liquidity is now off
-             the book and needs manual intervention. *)
+         (* Cancel succeeded but re-place failed: the liquidity is now off the book and
+            needs manual intervention. *)
          Logging.error_f
            ~section
            "TIF RENEWAL CRITICAL: order %s [%s] was cancelled but re-place failed: %s. \
@@ -96,20 +96,19 @@ let renew_order (order : Lighter_executions_feed.open_order) : (unit, string) re
          Lwt.return (Error (Printf.sprintf "re-place failed after cancel: %s" msg))))
 ;;
 
-(** One renewal pass: scans cached open orders and renews those expiring
-    within [renewal_threshold_seconds]. *)
+(** One renewal pass: scans cached open orders and renews those expiring within
+    [renewal_threshold_seconds]. *)
 let run_renewal_cycle () =
   let now = Unix.gettimeofday () in
   let all_orders = Lighter_executions_feed.get_all_open_orders_with_expiry () in
   let expiring =
     List.filter
       (fun (order : Lighter_executions_feed.open_order) ->
-         match order.order_expiry with
-         | Some expiry ->
-           let remaining = expiry -. now in
-           remaining < renewal_threshold_seconds && remaining > 0.0
-         | None ->
-           false)
+        match order.order_expiry with
+        | Some expiry ->
+          let remaining = expiry -. now in
+          remaining < renewal_threshold_seconds && remaining > 0.0
+        | None -> false)
       all_orders
   in
   let total_open = List.length all_orders in
@@ -141,50 +140,50 @@ let run_renewal_cycle () =
   (* Per-order expiry diagnostics. *)
   List.iter
     (fun (order : Lighter_executions_feed.open_order) ->
-       let now_t = Unix.gettimeofday () in
-       match order.order_expiry with
-       | Some exp ->
-         let remaining_days = (exp -. now_t) /. 86400.0 in
-         Logging.debug_f
-           ~section
-           "  Order %s [%s]: expiry=%.0f, remaining=%.1f days, needs_renewal=%b"
-           order.order_id
-           order.symbol
-           exp
-           remaining_days
-           (remaining_days *. 86400.0 < renewal_threshold_seconds)
-       | None ->
-         Logging.debug_f
-           ~section
-           "  Order %s [%s]: NO EXPIRY DATA"
-           order.order_id
-           order.symbol)
+      let now_t = Unix.gettimeofday () in
+      match order.order_expiry with
+      | Some exp ->
+        let remaining_days = (exp -. now_t) /. 86400.0 in
+        Logging.debug_f
+          ~section
+          "  Order %s [%s]: expiry=%.0f, remaining=%.1f days, needs_renewal=%b"
+          order.order_id
+          order.symbol
+          exp
+          remaining_days
+          (remaining_days *. 86400.0 < renewal_threshold_seconds)
+      | None ->
+        Logging.debug_f
+          ~section
+          "  Order %s [%s]: NO EXPIRY DATA"
+          order.order_id
+          order.symbol)
     all_orders;
-  (* Renew sequentially with a pause between operations so signer nonces are
-     consumed in order; [consume_stream_s] also bounds pending work instead of
-     accumulating unbounded [Forward] promises in the runtime. *)
+  (* Renew sequentially with a pause between operations so signer nonces are consumed in
+     order; [consume_stream_s] also bounds pending work instead of accumulating unbounded
+     [Forward] promises in the runtime. *)
   let expiring_stream = Lwt_stream.of_list expiring in
   Concurrency.Lwt_util.consume_stream_s
     (fun (order : Lighter_executions_feed.open_order) ->
-       if !shutdown_requested
-       then Lwt.return_unit
-       else (
-         let expiry = Option.get order.order_expiry in
-         let remaining_days = (expiry -. now) /. 86400.0 in
-         Logging.info_f
-           ~section
-           "Renewing order %s [%s]: %.1f days remaining (expiry=%.0f)"
-           order.order_id
-           order.symbol
-           remaining_days
-           expiry;
-         renew_order order
-         >>= fun result ->
-         (match result with
-          | Ok () -> ()
-          | Error _ -> ());
-         (* 200ms spacing keeps signer nonces monotonic between renewals. *)
-         Lwt_unix.sleep 0.2))
+      if !shutdown_requested
+      then Lwt.return_unit
+      else (
+        let expiry = Option.get order.order_expiry in
+        let remaining_days = (expiry -. now) /. 86400.0 in
+        Logging.info_f
+          ~section
+          "Renewing order %s [%s]: %.1f days remaining (expiry=%.0f)"
+          order.order_id
+          order.symbol
+          remaining_days
+          expiry;
+        renew_order order
+        >>= fun result ->
+        (match result with
+         | Ok () -> ()
+         | Error _ -> ());
+        (* 200ms spacing keeps signer nonces monotonic between renewals. *)
+        Lwt_unix.sleep 0.2))
     expiring_stream
 ;;
 
@@ -200,12 +199,9 @@ let start ~symbols:_ =
     ~interval:check_interval_seconds
     ~stop:(fun () -> !shutdown_requested)
     (fun () ->
-       Lwt.catch
-         (fun () -> run_renewal_cycle ())
-         (fun exn ->
-            Logging.error_f
-              ~section
-              "TIF renewal cycle failed: %s"
-              (Printexc.to_string exn);
-            Lwt.return_unit))
+      Lwt.catch
+        (fun () -> run_renewal_cycle ())
+        (fun exn ->
+          Logging.error_f ~section "TIF renewal cycle failed: %s" (Printexc.to_string exn);
+          Lwt.return_unit))
 ;;

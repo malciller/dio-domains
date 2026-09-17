@@ -1,16 +1,15 @@
 (** TCP transport for the IB Gateway connection.
 
-    Owns the Unix socket, the TWS handshake, length-prefixed frame
-    reading/writing, and reconnection with exponential backoff.
-    Single writer, single reader under Lwt; the reader loop runs in the
-    background and feeds decoded field lists to a callback. *)
+    Owns the Unix socket, the TWS handshake, length-prefixed frame reading/writing, and
+    reconnection with exponential backoff. Single writer, single reader under Lwt; the
+    reader loop runs in the background and feeds decoded field lists to a callback. *)
 
 open Lwt.Infix
 
 let section = "ibkr_connection"
 
-(** Connection state: socket, IO channels, negotiated server version,
-    order id counter, and the write mutex. *)
+(** Connection state: socket, IO channels, negotiated server version, order id counter,
+    and the write mutex. *)
 type t =
   { mutable socket : Lwt_unix.file_descr option
   ; mutable ic : Lwt_io.input_channel option
@@ -25,8 +24,8 @@ type t =
   ; write_mutex : Lwt_mutex.t
   }
 
-(** Builds a connection record for [host]:[port] with the given client
-    id; no socket is opened. *)
+(** Builds a connection record for [host]:[port] with the given client id; no socket is
+    opened. *)
 let create ~host ~port ~client_id =
   { socket = None
   ; ic = None
@@ -42,13 +41,13 @@ let create ~host ~port ~client_id =
   }
 ;;
 
-(** Connection status: true once the TCP socket is bound and the TWS
-    handshake is complete. *)
+(** Connection status: true once the TCP socket is bound and the TWS handshake is
+    complete. *)
 let is_connected t = t.connected
 
-(** Returns the next order id, incrementing the local counter.
-    The starting value is supplied by TWS during the handshake. Single
-    threaded use only: no synchronization here. *)
+(** Returns the next order id, incrementing the local counter. The starting value is
+    supplied by TWS during the handshake. Single threaded use only: no synchronization
+    here. *)
 let get_next_order_id t =
   let id = t.next_order_id in
   t.next_order_id <- id + 1;
@@ -63,12 +62,12 @@ let get_server_version t = t.server_version
 
 (* ---- Low-level IO ---- *)
 
-(** Shared 4-byte buffer for length prefixes. Safe because reads are
-    strictly sequential on the Lwt stream. *)
+(** Shared 4-byte buffer for length prefixes. Safe because reads are strictly sequential
+    on the Lwt stream. *)
 let length_buf = Bytes.create 4
 
-(** Growable payload buffer, reallocated when a frame exceeds capacity.
-    Safe because [decode_fields] copies eagerly. *)
+(** Growable payload buffer, reallocated when a frame exceeds capacity. Safe because
+    [decode_fields] copies eagerly. *)
 let msg_buf = ref (Bytes.create 4096)
 
 (** Reads exactly [n] bytes into [buf]. *)
@@ -97,8 +96,8 @@ let read_message ic =
     >|= fun () -> Ibkr_codec.decode_fields (Bytes.sub_string !msg_buf 0 len))
 ;;
 
-(** Writes raw bytes under the write mutex so frames are not
-    interleaved. No-op with an error log when disconnected. *)
+(** Writes raw bytes under the write mutex so frames are not interleaved. No-op with an
+    error log when disconnected. *)
 let write_raw t bytes =
   match t.oc with
   | Some oc ->
@@ -155,9 +154,9 @@ let handshake t =
 
 (* ---- Connection lifecycle ---- *)
 
-(** Connects the socket and runs the handshake. Does not start the
-    reader loop; call [start_reader] separately. On failure the socket is
-    closed and the exception re-raised. *)
+(** Connects the socket and runs the handshake. Does not start the reader loop; call
+    [start_reader] separately. On failure the socket is closed and the exception
+    re-raised. *)
 let connect t =
   Logging.info_f
     ~section
@@ -169,31 +168,31 @@ let connect t =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Lwt.catch
     (fun () ->
-       Lwt_unix.connect fd addr
-       >>= fun () ->
-       let ic = Lwt_io.of_fd ~mode:Lwt_io.input fd in
-       let oc = Lwt_io.of_fd ~mode:Lwt_io.output fd in
-       t.socket <- Some fd;
-       t.ic <- Some ic;
-       t.oc <- Some oc;
-       t.connected <- true;
-       handshake t
-       >>= fun () ->
-       Logging.info ~section "Handshake complete, awaiting nextValidId";
-       Lwt.return_unit)
+      Lwt_unix.connect fd addr
+      >>= fun () ->
+      let ic = Lwt_io.of_fd ~mode:Lwt_io.input fd in
+      let oc = Lwt_io.of_fd ~mode:Lwt_io.output fd in
+      t.socket <- Some fd;
+      t.ic <- Some ic;
+      t.oc <- Some oc;
+      t.connected <- true;
+      handshake t
+      >>= fun () ->
+      Logging.info ~section "Handshake complete, awaiting nextValidId";
+      Lwt.return_unit)
     (fun exn ->
-       Logging.error_f ~section "Connection failed: %s" (Printexc.to_string exn);
-       Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit)
-       >>= fun () ->
-       t.socket <- None;
-       t.ic <- None;
-       t.oc <- None;
-       t.connected <- false;
-       Lwt.fail exn)
+      Logging.error_f ~section "Connection failed: %s" (Printexc.to_string exn);
+      Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit)
+      >>= fun () ->
+      t.socket <- None;
+      t.ic <- None;
+      t.oc <- None;
+      t.connected <- false;
+      Lwt.fail exn)
 ;;
 
-(** Closes the IO channels and socket and marks the connection down.
-    Channel/socket cleanup errors are swallowed. *)
+(** Closes the IO channels and socket and marks the connection down. Channel/socket
+    cleanup errors are swallowed. *)
 let disconnect t =
   t.connected <- false;
   let close_ic =
@@ -220,17 +219,16 @@ let disconnect t =
   Lwt.join [ close_ic; close_oc; close_fd ]
 ;;
 
-(** Background reader loop. Decodes each frame and invokes [on_message]
-    with the message id and remaining fields; handler exceptions are
-    logged, not propagated.
+(** Background reader loop. Decodes each frame and invokes [on_message] with the message
+    id and remaining fields; handler exceptions are logged, not propagated.
 
-    Termination: EOF, [EBADF], or a closed channel ends the loop quietly;
-    any other error logs and ends. Both paths clear [t.connected] and
-    invoke [on_disconnect]; [disconnect] is never called.
+    Termination: EOF, [EBADF], or a closed channel ends the loop quietly; any other error
+    logs and ends. Both paths clear [t.connected] and invoke [on_disconnect]; [disconnect]
+    is never called.
 
-    Handlers run under [Lwt.async] so they are not chained onto the
-    stream-consumption promise. Chaining would block the reader on every
-    handler and retain one pending promise per message. *)
+    Handlers run under [Lwt.async] so they are not chained onto the stream-consumption
+    promise. Chaining would block the reader on every handler and retain one pending
+    promise per message. *)
 let start_reader t ~on_message ~on_disconnect =
   match t.ic with
   | None -> Logging.error ~section "Cannot start reader: not connected"
@@ -259,34 +257,34 @@ let start_reader t ~on_message ~on_disconnect =
         Lwt.async (fun () ->
           Lwt.catch
             (fun () ->
-               on_message ~msg_id ~fields:rest;
-               Lwt.return_unit)
+              on_message ~msg_id ~fields:rest;
+              Lwt.return_unit)
             (fun exn ->
-               Logging.error_f
-                 ~section
-                 "Handler error for msg_id=%d: %s"
-                 msg_id
-                 (Printexc.to_string exn);
-               Lwt.return_unit))
+              Logging.error_f
+                ~section
+                "Handler error for msg_id=%d: %s"
+                msg_id
+                (Printexc.to_string exn);
+              Lwt.return_unit))
     in
     Lwt.async (fun () ->
       Lwt.catch
         (fun () ->
-           Concurrency.Lwt_util.consume_stream process_fields stream
-           >>= fun () ->
-           Logging.warn ~section "Connection closed by gateway (EOF)";
-           t.connected <- false;
-           on_disconnect "Connection closed by gateway (EOF)";
-           Lwt.return_unit)
+          Concurrency.Lwt_util.consume_stream process_fields stream
+          >>= fun () ->
+          Logging.warn ~section "Connection closed by gateway (EOF)";
+          t.connected <- false;
+          on_disconnect "Connection closed by gateway (EOF)";
+          Lwt.return_unit)
         (fun exn ->
-           Logging.error_f ~section "Reader error: %s" (Printexc.to_string exn);
-           t.connected <- false;
-           on_disconnect (Printf.sprintf "Reader error: %s" (Printexc.to_string exn));
-           Lwt.return_unit))
+          Logging.error_f ~section "Reader error: %s" (Printexc.to_string exn);
+          t.connected <- false;
+          on_disconnect (Printf.sprintf "Reader error: %s" (Printexc.to_string exn));
+          Lwt.return_unit))
 ;;
 
-(** Retries [connect] with exponential backoff until it succeeds or
-    [max_attempts] is exhausted, then fails. *)
+(** Retries [connect] with exponential backoff until it succeeds or [max_attempts] is
+    exhausted, then fails. *)
 let connect_with_retry t ~max_attempts =
   let base_delay = Ibkr_types.default_reconnect_base_delay_ms /. 1000.0 in
   let max_delay = Ibkr_types.default_reconnect_max_delay_ms /. 1000.0 in
@@ -301,10 +299,10 @@ let connect_with_retry t ~max_attempts =
       Lwt.catch
         (fun () -> connect t)
         (fun exn ->
-           Logging.warn_f ~section "Attempt %d failed: %s" n (Printexc.to_string exn);
-           let next_delay = Float.min (delay *. backoff) max_delay in
-           Logging.info_f ~section "Retrying in %.1fs" delay;
-           Lwt_unix.sleep delay >>= fun () -> attempt (n + 1) next_delay))
+          Logging.warn_f ~section "Attempt %d failed: %s" n (Printexc.to_string exn);
+          let next_delay = Float.min (delay *. backoff) max_delay in
+          Logging.info_f ~section "Retrying in %.1fs" delay;
+          Lwt_unix.sleep delay >>= fun () -> attempt (n + 1) next_delay))
   in
   attempt 1 base_delay
 ;;

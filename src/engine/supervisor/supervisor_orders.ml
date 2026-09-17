@@ -1,9 +1,9 @@
-(** Central order processing loop. Drains pending orders from all strategy
-    ring buffers (grid, market maker, hedger) and dispatches them to
-    [Order_executor] via [Lwt.async]. Blocks on [OrderSignal] when idle.
+(** Central order processing loop. Drains pending orders from all strategy ring buffers
+    (grid, market maker, hedger) and dispatches them to [Order_executor] via [Lwt.async].
+    Blocks on [OrderSignal] when idle.
 
-    Uses a unified dispatch pipeline with strategy-specific callbacks to
-    avoid duplicated order handling. *)
+    Uses a unified dispatch pipeline with strategy-specific callbacks to avoid duplicated
+    order handling. *)
 
 open Lwt.Infix
 
@@ -14,12 +14,12 @@ open Supervisor_connection
 
 let section = "order_processor"
 
-(* --------------------------------------------------------------------------
-   Strategy callback interface
+(* -------------------------------------------------------------------------- Strategy
+   callback interface
    -------------------------------------------------------------------------- *)
 
-(** Per-strategy callbacks invoked during order lifecycle events. Each
-    strategy supplies its own implementation to preserve unique behavior. *)
+(** Per-strategy callbacks invoked during order lifecycle events. Each strategy supplies
+    its own implementation to preserve unique behavior. *)
 type strategy_callbacks =
   { on_place_ok : strategy_order -> string (* order_id *) -> unit
   ; on_place_fail : strategy_order -> string (* error *) -> unit
@@ -55,11 +55,10 @@ let contains_fragment s fragment =
   loop 0
 ;;
 
-(** True when a placement error means the strategy's inventory view diverged
-    from the venue: a shorting/capacity rejection proves the venue held the
-    funds (a resting order the local view missed), or the position was already
-    consumed (an unobserved fill). Retrying against a stale view re-sells
-    inventory the account no longer has. *)
+(** True when a placement error means the strategy's inventory view diverged from the
+    venue: a shorting/capacity rejection proves the venue held the funds (a resting order
+    the local view missed), or the position was already consumed (an unobserved fill).
+    Retrying against a stale view re-sells inventory the account no longer has. *)
 let is_inventory_rejection err =
   let lower = String.lowercase_ascii err in
   contains_fragment lower "not allowed to short"
@@ -75,27 +74,26 @@ let is_inventory_rejection err =
 
 let reconciliation_in_flight = Atomic.make false
 
-(** Set when a rejection arrives during an in-flight reconcile; the running
-    reconcile then re-runs once after finishing. Dropping it silently is
-    unsafe because its desync may predate the running reconcile's balance
-    snapshot. *)
+(** Set when a rejection arrives during an in-flight reconcile; the running reconcile then
+    re-runs once after finishing. Dropping it silently is unsafe because its desync may
+    predate the running reconcile's balance snapshot. *)
 let reconciliation_pending = Atomic.make false
 
-(** Event-driven reconciliation after an inventory-class placement rejection:
-    re-bootstrap the venue's open orders and balances; their completion
-    wakeups re-run the symbol's strategy against fresh state.
+(** Event-driven reconciliation after an inventory-class placement rejection: re-bootstrap
+    the venue's open orders and balances; their completion wakeups re-run the symbol's
+    strategy against fresh state.
 
-    Alpaca only: its balances are gross (open-order holds are not netted), so
-    a missed fill leaves the ladder believing it still holds sellable
-    inventory. Other venues report tradeable (hold-netted) balances. *)
+    Alpaca only: its balances are gross (open-order holds are not netted), so a missed
+    fill leaves the ladder believing it still holds sellable inventory. Other venues
+    report tradeable (hold-netted) balances. *)
 let refresh_inventory_state_on_rejection (order : strategy_order) err =
   if String.equal order.exchange "alpaca" && is_inventory_rejection err
   then (
     let rec run ~with_open_orders =
       match Atomic.compare_and_set reconciliation_in_flight false true with
       | false ->
-        (* A reconcile is running: queue exactly one re-run; the current
-           reconcile's snapshot may predate this rejection's desync. *)
+        (* A reconcile is running: queue exactly one re-run; the current reconcile's
+           snapshot may predate this rejection's desync. *)
         Atomic.set reconciliation_pending true;
         Logging.warn_f
           ~section
@@ -107,32 +105,31 @@ let refresh_inventory_state_on_rejection (order : strategy_order) err =
         Lwt.async (fun () ->
           Lwt.catch
             (fun () ->
-               Logging.warn_f
-                 ~section
-                 "Reconciling venue state after inventory-class rejection: %s %s (%s)"
-                 (side_str order)
-                 order.symbol
-                 err;
-               let jobs =
-                 [ Alpaca.Balances.update_balances () ]
-                 @
-                 if with_open_orders
-                 then [ Alpaca.Executions.bootstrap_open_orders () ]
-                 else []
-               in
-               Lwt.join jobs)
+              Logging.warn_f
+                ~section
+                "Reconciling venue state after inventory-class rejection: %s %s (%s)"
+                (side_str order)
+                order.symbol
+                err;
+              let jobs =
+                [ Alpaca.Balances.update_balances () ]
+                @
+                if with_open_orders
+                then [ Alpaca.Executions.bootstrap_open_orders () ]
+                else []
+              in
+              Lwt.join jobs)
             (fun exn ->
-               Logging.warn_f
-                 ~section
-                 "Post-rejection reconciliation failed for %s: %s"
-                 order.symbol
-                 (Printexc.to_string exn);
-               Lwt.return_unit)
+              Logging.warn_f
+                ~section
+                "Post-rejection reconciliation failed for %s: %s"
+                order.symbol
+                (Printexc.to_string exn);
+              Lwt.return_unit)
           >>= fun () ->
           Atomic.set reconciliation_in_flight false;
-          (* The queued re-run always includes the open-orders bootstrap:
-             the suppressed rejection's side is unknown, and the bootstrap is
-             a cheap idempotent fetch. *)
+          (* The queued re-run always includes the open-orders bootstrap: the suppressed
+             rejection's side is unknown, and the bootstrap is a cheap idempotent fetch. *)
           if Atomic.get reconciliation_pending
           then (
             Atomic.set reconciliation_pending false;
@@ -144,8 +141,8 @@ let refresh_inventory_state_on_rejection (order : strategy_order) err =
   else ()
 ;;
 
-(* --------------------------------------------------------------------------
-   Strategy callback implementations
+(* -------------------------------------------------------------------------- Strategy
+   callback implementations
    -------------------------------------------------------------------------- *)
 
 let grid_callbacks : strategy_callbacks =
@@ -161,9 +158,9 @@ let grid_callbacks : strategy_callbacks =
           order_id;
         match order.price with
         | Some price ->
-          (* Enqueue onto the per-symbol lifecycle queue; the domain thread
-             drains it, so the strategy mutex is never taken cross-thread. *)
-          Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
+          (* Enqueue onto the per-symbol lifecycle queue; the domain thread drains it, so
+             the strategy mutex is never taken cross-thread. *)
+          Dio_strategies.Strategy_api.Strategy.enqueue_event
             order.symbol
             (Ack { now = Unix.gettimeofday (); order_id; side = order.side; price })
         | None -> ())
@@ -178,12 +175,12 @@ let grid_callbacks : strategy_callbacks =
           (price_str order)
           err;
         refresh_inventory_state_on_rejection order err;
-        Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
+        Dio_strategies.Strategy_api.Strategy.enqueue_event
           order.symbol
           (Failed { now = Unix.gettimeofday (); side = order.side; reason = err });
         match order.price with
         | Some price ->
-          Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
+          Dio_strategies.Strategy_api.Strategy.enqueue_event
             order.symbol
             (Rejected { now = Unix.gettimeofday (); side = order.side; price })
         | None -> ())
@@ -199,7 +196,7 @@ let grid_callbacks : strategy_callbacks =
           new_order_id;
         match order.price with
         | Some price ->
-          Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
+          Dio_strategies.Strategy_api.Strategy.enqueue_event
             order.symbol
             (Amended
                { now = Unix.gettimeofday ()
@@ -217,7 +214,7 @@ let grid_callbacks : strategy_callbacks =
       (fun order target_order_id ->
         match order.price with
         | Some price ->
-          Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
+          Dio_strategies.Strategy_api.Strategy.enqueue_event
             order.symbol
             (Amendment_skipped
                { now = Unix.gettimeofday ()
@@ -239,7 +236,7 @@ let grid_callbacks : strategy_callbacks =
           order.qty
           (price_str order)
           err;
-        Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
+        Dio_strategies.Strategy_api.Strategy.enqueue_event
           order.symbol
           (Amendment_failed
              { now = Unix.gettimeofday ()
@@ -250,123 +247,14 @@ let grid_callbacks : strategy_callbacks =
   ; on_cancel_ok =
       (fun order target_order_id ->
         Logging.info_f ~section "✓ Cancelled order: %s" target_order_id;
-        (* Enqueue, never mutate directly: these callbacks run on the
-           supervisor's Lwt fiber, and strategy state must be touched only on
-           the symbol's domain thread. *)
-        Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
+        (* Enqueue, never mutate directly: these callbacks run on the supervisor's Lwt
+           fiber, and strategy state must be touched only on the symbol's domain thread. *)
+        Dio_strategies.Strategy_api.Strategy.enqueue_event
           order.symbol
           (Cancel_cleanup { order_id = target_order_id }))
   ; on_cancel_fail =
       (fun order target_order_id ->
-        Dio_strategies.Jacobs_ladder.Strategy.enqueue_event
-          order.symbol
-          (Cancel_cleanup { order_id = target_order_id }))
-  }
-;;
-
-let mm_callbacks : strategy_callbacks =
-  { on_place_ok =
-      (fun order order_id ->
-        Logging.info_f
-          ~section
-          " Order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
-          (side_str order)
-          order.symbol
-          order.qty
-          (price_str order)
-          order_id)
-  ; on_place_fail =
-      (fun order err ->
-        Logging.error_f
-          ~section
-          " Order placement failed: %s %s %.8f @ %s - %s"
-          (side_str order)
-          order.symbol
-          order.qty
-          (price_str order)
-          err;
-        refresh_inventory_state_on_rejection order err;
-        (* Enqueue instead of calling handlers directly on this Lwt fiber:
-           the symbol's domain thread drains and executes them, so MM state is
-           never mutated cross-thread against execute_strategy. *)
-        Dio_strategies.Market_maker.Strategy.enqueue_event
-          order.symbol
-          (Failed { now = Unix.gettimeofday (); side = order.side; reason = err });
-        match order.price with
-        | Some price ->
-          Dio_strategies.Market_maker.Strategy.enqueue_event
-            order.symbol
-            (Rejected { now = Unix.gettimeofday (); side = order.side; price })
-        | None -> ())
-  ; on_amend_ok =
-      (fun order target_order_id new_order_id ->
-        Logging.info_f
-          ~section
-          "✓ Order amended successfully: %s %s %.8f @ %s New Order: %s"
-          (side_str order)
-          order.symbol
-          order.qty
-          (price_str order)
-          new_order_id;
-        match order.price with
-        | Some price ->
-          Dio_strategies.Market_maker.Strategy.enqueue_event
-            order.symbol
-            (Amended
-               { now = Unix.gettimeofday ()
-               ; old_id = target_order_id
-               ; new_id = new_order_id
-               ; side = order.side
-               ; price
-               })
-        | None ->
-          Logging.warn_f
-            ~section
-            "Amendment acknowledged but no price available for strategy update: %s"
-            new_order_id)
-  ; on_amend_skipped =
-      (fun order target_order_id ->
-        match order.price with
-        | Some price ->
-          Dio_strategies.Market_maker.Strategy.enqueue_event
-            order.symbol
-            (Amendment_skipped
-               { now = Unix.gettimeofday ()
-               ; order_id = target_order_id
-               ; side = order.side
-               ; price
-               })
-        | None ->
-          Logging.warn_f
-            ~section
-            "Amendment skipped but no price available for strategy update")
-  ; on_amend_fail =
-      (fun order target_order_id err ->
-        Logging.error_f
-          ~section
-          "✗ Order amendment failed: %s %s %.8f @ %s - %s"
-          (side_str order)
-          order.symbol
-          order.qty
-          (price_str order)
-          err;
-        Dio_strategies.Market_maker.Strategy.enqueue_event
-          order.symbol
-          (Amendment_failed
-             { now = Unix.gettimeofday ()
-             ; order_id = target_order_id
-             ; side = order.side
-             ; reason = err
-             }))
-  ; on_cancel_ok =
-      (fun order target_order_id ->
-        Logging.info_f ~section "✓ Cancelled order: %s" target_order_id;
-        Dio_strategies.Market_maker.Strategy.enqueue_event
-          order.symbol
-          (Cancel_cleanup { order_id = target_order_id }))
-  ; on_cancel_fail =
-      (fun order target_order_id ->
-        Dio_strategies.Market_maker.Strategy.enqueue_event
+        Dio_strategies.Strategy_api.Strategy.enqueue_event
           order.symbol
           (Cancel_cleanup { order_id = target_order_id }))
   }
@@ -402,33 +290,31 @@ let hedger_callbacks : strategy_callbacks =
   }
 ;;
 
-(** Resolves the callbacks for [order]. The MM batch handles both Grid and MM
-    amend/cancel orders, so the strategy field determines routing. *)
+(** Resolves the callbacks for [order]. *)
 let callbacks_for_strategy (order : strategy_order) =
   match order.strategy with
   | Ladder -> grid_callbacks
-  | MM -> mm_callbacks
+  | MM -> grid_callbacks (* MM strategy removed; unreachable *)
   | Hedger -> hedger_callbacks
 ;;
 
-(* --------------------------------------------------------------------------
-   Unified order dispatch
+(* -------------------------------------------------------------------------- Unified
+   order dispatch
    -------------------------------------------------------------------------- *)
 
-(** Deadline after which a dispatched Place/Amend that has produced no
-    terminal callback is declared failed. Must exceed the worst-case
-    legitimate REST duration including the venue retry budget (3 attempts with
-    up to 30s backoff); 120s keeps the zombie-completion window small while
-    guaranteeing in-flight guards cannot wedge forever - e.g. the Alpaca
-    placement REST has no HTTP timeout, so a black-holed connection produces
-    no terminal event on its own. A REST completion after the deadline fires
-    is a zombie and is suppressed, so exactly one terminal event reaches the
-    strategy; a request that landed venue-side before the deadline is adopted
-    by the next open-orders scan. *)
+(** Deadline after which a dispatched Place/Amend that has produced no terminal callback
+    is declared failed. Must exceed the worst-case legitimate REST duration including the
+    venue retry budget (3 attempts with up to 30s backoff); 120s keeps the
+    zombie-completion window small while guaranteeing in-flight guards cannot wedge
+    forever - e.g. the Alpaca placement REST has no HTTP timeout, so a black-holed
+    connection produces no terminal event on its own. A REST completion after the deadline
+    fires is a zombie and is suppressed, so exactly one terminal event reaches the
+    strategy; a request that landed venue-side before the deadline is adopted by the next
+    open-orders scan. *)
 let dispatch_deadline_s = 120.0
 
-(** Atomic first-wins latch: runs [f] only if no terminal event has been
-    delivered yet ([resolved] unset), setting [resolved] on the way. *)
+(** Atomic first-wins latch: runs [f] only if no terminal event has been delivered yet
+    ([resolved] unset), setting [resolved] on the way. *)
 let once_only resolved f () =
   if Atomic.compare_and_set resolved false true then f () else Lwt.return_unit
 ;;
@@ -460,57 +346,57 @@ let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
     let resolved = Atomic.make false in
     Lwt.catch
       (fun () ->
-         Lwt.choose
-           [ (Dio_engine.Order_executor.place_order
-                ~token:auth_token
-                ~check_duplicate:false
-                order_request
-              >>= function
-              | Ok result ->
-                once_only
-                  resolved
-                  (fun () ->
-                     Atomic.incr orders_placed;
-                     cb.on_place_ok order result.order_id;
-                     Lwt.return_unit)
-                  ()
-              | Error err ->
-                once_only
-                  resolved
-                  (fun () ->
-                     cb.on_place_fail order err;
-                     Lwt.return_unit)
-                  ())
-           ; (Lwt_unix.sleep dispatch_deadline_s
-              >>= fun () ->
-              once_only
-                resolved
-                (fun () ->
-                   Logging.error_f
-                     ~section
-                     "⏱ Place dispatch deadline (%.0fs) exceeded for %s %s - \
-                      synthesizing terminal failure"
-                     dispatch_deadline_s
-                     (side_str order)
-                     order.symbol;
-                   cb.on_place_fail order "dispatch deadline exceeded";
+        Lwt.choose
+          [ (Dio_engine.Order_executor.place_order
+               ~token:auth_token
+               ~check_duplicate:false
+               order_request
+             >>= function
+             | Ok result ->
+               once_only
+                 resolved
+                 (fun () ->
+                   Atomic.incr orders_placed;
+                   cb.on_place_ok order result.order_id;
                    Lwt.return_unit)
-                ())
-           ])
+                 ()
+             | Error err ->
+               once_only
+                 resolved
+                 (fun () ->
+                   cb.on_place_fail order err;
+                   Lwt.return_unit)
+                 ())
+          ; (Lwt_unix.sleep dispatch_deadline_s
+             >>= fun () ->
+             once_only
+               resolved
+               (fun () ->
+                 Logging.error_f
+                   ~section
+                   "⏱ Place dispatch deadline (%.0fs) exceeded for %s %s - synthesizing \
+                    terminal failure"
+                   dispatch_deadline_s
+                   (side_str order)
+                   order.symbol;
+                 cb.on_place_fail order "dispatch deadline exceeded";
+                 Lwt.return_unit)
+               ())
+          ])
       (fun exn ->
-         let err = Printexc.to_string exn in
-         Logging.error_f
-           ~section
-           "✗ Exception placing order %s %s: %s"
-           (side_str order)
-           order.symbol
-           err;
-         once_only
-           resolved
-           (fun () ->
-              cb.on_place_fail order err;
-              Lwt.return_unit)
-           ()))
+        let err = Printexc.to_string exn in
+        Logging.error_f
+          ~section
+          "✗ Exception placing order %s %s: %s"
+          (side_str order)
+          order.symbol
+          err;
+        once_only
+          resolved
+          (fun () ->
+            cb.on_place_fail order err;
+            Lwt.return_unit)
+          ()))
 ;;
 
 (** Dispatches an Amend order asynchronously via Order_executor. *)
@@ -536,141 +422,140 @@ let dispatch_amend ~auth_token ~orders_placed ~cb (order : strategy_order) targe
     let resolved = Atomic.make false in
     Lwt.catch
       (fun () ->
-         Lwt.choose
-           [ (Dio_engine.Order_executor.amend_order ~token:auth_token amend_request
-              >>= function
-              | Ok result ->
-                if
-                  result.Dio_exchange.Exchange_intf.Types.amend_id
+        Lwt.choose
+          [ (Dio_engine.Order_executor.amend_order ~token:auth_token amend_request
+             >>= function
+             | Ok result ->
+               if result.Dio_exchange.Exchange_intf.Types.amend_id
                   = Some "skipped_no_change"
-                then
-                  once_only
-                    resolved
-                    (fun () ->
-                       cb.on_amend_skipped order target_order_id;
-                       Lwt.return_unit)
-                    ()
-                else
-                  once_only
-                    resolved
-                    (fun () ->
-                       Atomic.incr orders_placed;
-                       let amend_id_str =
-                         match result.Dio_exchange.Exchange_intf.Types.amend_id with
-                         | Some id -> id
-                         | None -> "none"
-                       in
-                       Logging.debug_f
-                         ~section
-                         "✓ Order amended (Amend ID: %s)"
-                         amend_id_str;
-                       cb.on_amend_ok
-                         order
-                         target_order_id
-                         result.Dio_exchange.Exchange_intf.Types.new_order_id;
-                       Lwt.return_unit)
-                    ()
-              | Error err ->
-                once_only
-                  resolved
-                  (fun () ->
-                     cb.on_amend_fail order target_order_id err;
+               then
+                 once_only
+                   resolved
+                   (fun () ->
+                     cb.on_amend_skipped order target_order_id;
                      Lwt.return_unit)
-                  ())
-           ; (Lwt_unix.sleep dispatch_deadline_s
-              >>= fun () ->
-              once_only
-                resolved
-                (fun () ->
-                   Logging.error_f
-                     ~section
-                     "⏱ Amend dispatch deadline (%.0fs) exceeded for %s %s (%s) - \
-                      synthesizing terminal failure"
-                     dispatch_deadline_s
-                     (side_str order)
-                     order.symbol
-                     target_order_id;
-                   cb.on_amend_fail order target_order_id "dispatch deadline exceeded";
+                   ()
+               else
+                 once_only
+                   resolved
+                   (fun () ->
+                     Atomic.incr orders_placed;
+                     let amend_id_str =
+                       match result.Dio_exchange.Exchange_intf.Types.amend_id with
+                       | Some id -> id
+                       | None -> "none"
+                     in
+                     Logging.debug_f
+                       ~section
+                       "✓ Order amended (Amend ID: %s)"
+                       amend_id_str;
+                     cb.on_amend_ok
+                       order
+                       target_order_id
+                       result.Dio_exchange.Exchange_intf.Types.new_order_id;
+                     Lwt.return_unit)
+                   ()
+             | Error err ->
+               once_only
+                 resolved
+                 (fun () ->
+                   cb.on_amend_fail order target_order_id err;
                    Lwt.return_unit)
-                ())
-           ])
+                 ())
+          ; (Lwt_unix.sleep dispatch_deadline_s
+             >>= fun () ->
+             once_only
+               resolved
+               (fun () ->
+                 Logging.error_f
+                   ~section
+                   "⏱ Amend dispatch deadline (%.0fs) exceeded for %s %s (%s) - \
+                    synthesizing terminal failure"
+                   dispatch_deadline_s
+                   (side_str order)
+                   order.symbol
+                   target_order_id;
+                 cb.on_amend_fail order target_order_id "dispatch deadline exceeded";
+                 Lwt.return_unit)
+               ())
+          ])
       (fun exn ->
-         let err = Printexc.to_string exn in
-         Logging.error_f
-           ~section
-           "✗ Exception amending order %s %s: %s"
-           (side_str order)
-           order.symbol
-           err;
-         once_only
-           resolved
-           (fun () ->
-              cb.on_amend_fail order target_order_id err;
-              Lwt.return_unit)
-           ()))
+        let err = Printexc.to_string exn in
+        Logging.error_f
+          ~section
+          "✗ Exception amending order %s %s: %s"
+          (side_str order)
+          order.symbol
+          err;
+        once_only
+          resolved
+          (fun () ->
+            cb.on_amend_fail order target_order_id err;
+            Lwt.return_unit)
+          ()))
 ;;
 
 (** Dispatches a Cancel order asynchronously via Order_executor. *)
 let dispatch_cancel
-      ~auth_token
-      ~orders_placed
-      ~cb
-      (order : strategy_order)
-      target_order_id
+  ~auth_token
+  ~orders_placed
+  ~cb
+  (order : strategy_order)
+  target_order_id
   =
   Lwt.async (fun () ->
     let%lwt () = Lwt.pause () in
     Lwt.catch
       (fun () ->
-         let request : Dio_engine.Order_executor.cancel_request =
-           { exchange = order.exchange
-           ; order_ids = Some [ target_order_id ]
-           ; cl_ord_ids = None
-           ; order_userrefs = None
-           ; symbol = Some order.symbol
-           }
-         in
-         Dio_engine.Order_executor.cancel_orders ~token:auth_token request
-         >>= function
-         | Ok results ->
-           let count = List.length results in
-           Atomic.set orders_placed (Atomic.get orders_placed + count);
-           Logging.info_f
-             ~section
-             "✓ Cancelled %d order(s) successfully: %s"
-             count
-             target_order_id;
-           cb.on_cancel_ok order target_order_id;
-           Lwt.return_unit
-         | Error err ->
-           Logging.error_f
-             ~section
-             "✗ Order cancellation failed: %s - %s"
-             target_order_id
-             err;
-           cb.on_cancel_fail order target_order_id;
-           Lwt.return_unit)
+        let request : Dio_engine.Order_executor.cancel_request =
+          { exchange = order.exchange
+          ; order_ids = Some [ target_order_id ]
+          ; cl_ord_ids = None
+          ; order_userrefs = None
+          ; symbol = Some order.symbol
+          }
+        in
+        Dio_engine.Order_executor.cancel_orders ~token:auth_token request
+        >>= function
+        | Ok results ->
+          let count = List.length results in
+          Atomic.set orders_placed (Atomic.get orders_placed + count);
+          Logging.info_f
+            ~section
+            "✓ Cancelled %d order(s) successfully: %s"
+            count
+            target_order_id;
+          cb.on_cancel_ok order target_order_id;
+          Lwt.return_unit
+        | Error err ->
+          Logging.error_f
+            ~section
+            "✗ Order cancellation failed: %s - %s"
+            target_order_id
+            err;
+          cb.on_cancel_fail order target_order_id;
+          Lwt.return_unit)
       (fun exn ->
-         Logging.error_f
-           ~section
-           "✗ Exception cancelling order %s: %s"
-           target_order_id
-           (Printexc.to_string exn);
-         cb.on_cancel_fail order target_order_id;
-         Lwt.return_unit))
+        Logging.error_f
+          ~section
+          "✗ Exception cancelling order %s: %s"
+          target_order_id
+          (Printexc.to_string exn);
+        cb.on_cancel_fail order target_order_id;
+        Lwt.return_unit))
 ;;
 
-(* --------------------------------------------------------------------------
-   Unified order processor
+(* -------------------------------------------------------------------------- Unified
+   order processor
    -------------------------------------------------------------------------- *)
 
-(** Processes a single order: checks connectivity, resolves auth token,
-    and dispatches via the appropriate operation handler. *)
+(** Processes a single order: checks connectivity, resolves auth token, and dispatches via
+    the appropriate operation handler. *)
 let process_single_order
-      ~orders_placed
-      ~order_mutex
-      ~is_connected
-      (order : strategy_order)
+  ~orders_placed
+  ~order_mutex
+  ~is_connected
+  (order : strategy_order)
   =
   if Atomic.get shutdown_requested then () else Mutex.lock order_mutex;
   try
@@ -690,10 +575,9 @@ let process_single_order
          | Some target_order_id ->
            dispatch_amend ~auth_token ~orders_placed ~cb order target_order_id
          | None ->
-           (* A terminal callback is mandatory: with no callback and no
-              deadline, the amend's pending_amend_ token and
-              InFlightAmendments entry (never reaped while Pending) wedge the
-              side forever. *)
+           (* A terminal callback is mandatory: with no callback and no deadline, the
+              amend's pending_amend_ token and InFlightAmendments entry (never reaped
+              while Pending) wedge the side forever. *)
            Logging.error_f
              ~section
              "Amendment request missing target order ID for %s %s - failing fast"
@@ -718,10 +602,10 @@ let process_single_order
          | Some target_order_id -> cb.on_amend_fail order target_order_id err
          | None -> ())
       | Cancel ->
-        (* A cancel rejected because the venue is disconnected must still
-           reach the strategy's [on_cancel_fail] -> cleanup_pending_cancellation.
-           Swallowing it leaves inflight_cancel_buy set forever, suppressing
-           ghost-buy cleanup and the excess-buy cancellation leg. *)
+        (* A cancel rejected because the venue is disconnected must still reach the
+           strategy's [on_cancel_fail] -> cleanup_pending_cancellation. Swallowing it
+           leaves inflight_cancel_buy set forever, suppressing ghost-buy cleanup and the
+           excess-buy cancellation leg. *)
         (match order.order_id with
          | Some target_order_id -> cb.on_cancel_fail order target_order_id
          | None -> ())
@@ -800,16 +684,12 @@ let order_processing_loop () =
       in
       (* Drain ring buffers regardless of connection status to prevent backpressure *)
       let pending_grid_orders =
-        Dio_strategies.Jacobs_ladder.Strategy.get_pending_orders 100
+        Dio_strategies.Strategy_api.Strategy.get_pending_orders 100
       in
-      let pending_mm_orders =
-        Dio_strategies.Market_maker.Strategy.get_pending_orders 100
-      in
-      let pending_hedge_orders = Dio_strategies.Auto_hedger.get_pending_orders 100 in
-      if pending_grid_orders = [] && pending_mm_orders = [] && pending_hedge_orders = []
+      if pending_grid_orders = []
       then (
-        (* No pending orders: block until signalled. Sever the promise chain
-           via [Lwt.async] to prevent [Forward] node accumulation. *)
+        (* No pending orders: block until signalled. Sever the promise chain via
+           [Lwt.async] to prevent [Forward] node accumulation. *)
         OrderSignal.wait ()
         >>= fun () ->
         Lwt.async loop;
@@ -820,23 +700,6 @@ let order_processing_loop () =
           List.iter
             (process_single_order ~orders_placed ~order_mutex ~is_connected)
             pending_grid_orders;
-          if not (Atomic.get shutdown_requested)
-          then
-            List.iter
-              (process_single_order ~orders_placed ~order_mutex ~is_connected)
-              pending_mm_orders;
-          if not (Atomic.get shutdown_requested)
-          then
-            List.iter
-              (fun order ->
-                 if order.operation <> Place
-                 then
-                   Logging.warn_f
-                     ~section
-                     "Auto hedger only supports Place operations, got other for %s"
-                     order.symbol
-                 else process_single_order ~orders_placed ~order_mutex ~is_connected order)
-              pending_hedge_orders;
           (* Sever promise chain before next drain cycle. *)
           Lwt.async loop;
           Lwt.return_unit

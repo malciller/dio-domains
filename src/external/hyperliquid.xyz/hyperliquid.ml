@@ -1,5 +1,5 @@
-(** Top-level namespace for the Hyperliquid exchange integration.
-    Re-exports signer, WebSocket client, actions, feeds, fees, and types. *)
+(** Top-level namespace for the Hyperliquid exchange integration. Re-exports signer,
+    WebSocket client, actions, feeds, fees, and types. *)
 
 (** EIP-712 typed-data signing for Hyperliquid L1 actions. *)
 module Signer = Hyperliquid_signer
@@ -31,6 +31,6 @@ module Module = Hyperliquid_module
 (** Shared type definitions for Hyperliquid domain objects. *)
 module Types = Hyperliquid_types
 
-(** Oracle data-venue adapter (candles, fees, spot balances, instruments);
-    implements [Exchange_intf.Oracle.S]. *)
+(** Oracle data-venue adapter (candles, fees, spot balances, instruments); implements
+    [Exchange_intf.Oracle.S]. *)
 module Hyperliquid_oracle = Hyperliquid_oracle

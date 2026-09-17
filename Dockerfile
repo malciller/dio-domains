@@ -108,6 +108,12 @@ COPY --from=lighter_signer /app/signer-out/ /opt/lighter-signer/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
+# 5b'. Strategy files. The engine resolves each config entry's `strategy` to
+#      strategies/<name>.strategy (preferred) or strategies/<name>.json at runtime;
+#      without these the domains start but no strategy is loaded and nothing
+#      trades. Baked into the image at /app/strategies (the engine's cwd).
+COPY --from=builder /app/strategies /app/strategies
+
 # 5c. Third-party license notices. Required by the licenses of the bundled
 #     libraries; the opam manifest is generated from the exact build switch.
 COPY THIRD_PARTY_LICENSES third_party/ /usr/share/licenses/dio/
@@ -144,11 +150,10 @@ ENV MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:2"
 #    effect, so both are omitted. a (allocation_policy) is likewise a no-op in
 #    OCaml 5. Sweep s and o with test/engine/perf/sweep_gc_params.sh; do not
 #    sweep a.
-#    NB: the gc block in config.json is applied per-domain via Gc.set at startup
-#    (engine/config.ml apply_gc_config) and OVERRIDES s/o/O here, so those are
-#    the effective values at runtime. This ENV only covers the window before
-#    apply_gc_config runs.
-ENV OCAMLRUNPARAM="s=33554432,o=120,O=1000000"
+#    NB: the gc block in config.json is the single source of truth. It is applied
+#    in every spawned domain via Gc.set (engine/config.ml apply_gc_config). Do NOT
+#    set OCAMLRUNPARAM here: any domain that spawns before/without that call would
+#    silently inherit it, and a 256MB minor heap produced multi-ms pauses.
 
 # 9a. Lighter signer library path. The .so is absent from the default image
 #     (build with INCLUDE_LIGHTER_SIGNER=1 to include it); the loader warns and

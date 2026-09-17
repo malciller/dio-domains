@@ -1,11 +1,11 @@
 (** Shared types, constants, and utility functions for the Kraken API integration.
-    Provides cryptographic signing, nonce generation, base64 secret handling,
-    JSON field parsers, and default feed configuration values used across all
-    Kraken subsystems. *)
+    Provides cryptographic signing, nonce generation, base64 secret handling, JSON field
+    parsers, and default feed configuration values used across all Kraken subsystems. *)
 
 let section = "kraken_common"
 
-(** Multiplier to convert Unix epoch seconds (float) to millisecond precision for nonce generation. *)
+(** Multiplier to convert Unix epoch seconds (float) to millisecond precision for nonce
+    generation. *)
 let nonce_ms_multiplier = 1000.0
 
 (* Feed configuration defaults *)
@@ -13,49 +13,48 @@ let nonce_ms_multiplier = 1000.0
 (** Number of price levels maintained per side (bid/ask) in the orderbook. *)
 let default_orderbook_depth = 10
 
-(** Ring buffer capacity (slots) for the orderbook feed channel. 16 risks a
-    burst lapping a dashboard reader; 64 absorbs typical bursts. *)
+(** Ring buffer capacity (slots) for the orderbook feed channel. 16 risks a burst lapping
+    a dashboard reader; 64 absorbs typical bursts. *)
 let default_ring_buffer_size_orderbook = 64
 
-(** Ring buffer capacity (slots) for the executions feed channel. Exec bursts
-    (mass cancels on reconnect, volatile fills) can lap the domain consumer
-    and drop lifecycle events. 512 x small records is ~100KB per symbol. *)
+(** Ring buffer capacity (slots) for the executions feed channel. Exec bursts (mass
+    cancels on reconnect, volatile fills) can lap the domain consumer and drop lifecycle
+    events. 512 x small records is ~100KB per symbol. *)
 let default_ring_buffer_size_executions = 512
 
-(** Upper bound on the number of dynamically discovered assets tracked by the balances feed. *)
+(** Upper bound on the number of dynamically discovered assets tracked by the balances
+    feed. *)
 let default_dynamic_assets_cap = 50
 
 (** Maximum age (seconds) before a cached balance entry is considered stale. *)
 let default_balance_staleness_threshold_s = 300.0
 
-(** Maximum age (seconds) of a cached orderbook frame before [get_best_bid_ask*]
-    rejects it as stale. Prevents trading and display on a frozen feed after a
-    desync or connection drop. *)
+(** Maximum age (seconds) of a cached orderbook frame before [get_best_bid_ask*] rejects
+    it as stale. Prevents trading and display on a frozen feed after a desync or
+    connection drop. *)
 let default_max_book_age_s = 10.0
 
-(** Base delay (seconds) for per-symbol orderbook resubscribe retries. Doubles
-    per consecutive failure with jitter, capped at
-    [default_resubscribe_backoff_cap_s]. *)
+(** Base delay (seconds) for per-symbol orderbook resubscribe retries. Doubles per
+    consecutive failure with jitter, capped at [default_resubscribe_backoff_cap_s]. *)
 let default_resubscribe_backoff_base_s = 0.5
 
 (** Upper bound (seconds) on a single resubscribe retry delay. *)
 let default_resubscribe_backoff_cap_s = 30.0
 
-(** Consecutive resubscribe failures tolerated before giving up on a symbol
-    until the next sequence event or full reconnect (which resubscribes all
-    symbols and clears stores). *)
+(** Consecutive resubscribe failures tolerated before giving up on a symbol until the next
+    sequence event or full reconnect (which resubscribes all symbols and clears stores). *)
 let default_max_resubscribe_attempts = 8
 
-(** Minimum seconds between checksum-triggered resubscribe requests for the
-    same symbol. Guards against an unsub/resub hot-loop when validation
-    persistently fails. *)
+(** Minimum seconds between checksum-triggered resubscribe requests for the same symbol.
+    Guards against an unsub/resub hot-loop when validation persistently fails. *)
 let default_resubscribe_cooldown_s = 5.0
 
-(** Quote currencies permanently tracked by the balances feed regardless of configured trading pairs. *)
+(** Quote currencies permanently tracked by the balances feed regardless of configured
+    trading pairs. *)
 let default_configured_currencies = [ "USD"; "EUR"; "USDT"; "USDC" ]
 
-(** Forces evaluation of the lazy Conduit TLS context.
-    Raises [Failure] if the context has not been initialized prior to domain spawning. *)
+(** Forces evaluation of the lazy Conduit TLS context. Raises [Failure] if the context has
+    not been initialized prior to domain spawning. *)
 let get_conduit_ctx () =
   try Ws_lwt.resolve_ctx () with
   | CamlinternalLazy.Undefined ->
@@ -71,15 +70,27 @@ let get_conduit_ctx () =
     raise exn
 ;;
 
-(** Generates a monotonically increasing nonce string from the current Unix time in milliseconds.
-    Used as a replay-prevention token in authenticated Kraken API requests. *)
+(** Generates a strictly increasing nonce string from the current Unix time in
+    milliseconds. Kraken rejects any nonce not greater than the last one seen for the API
+    key, so concurrent REST calls (open orders, balances, fees, oracle, token) must never
+    observe the same or a lower value: a plain [gettimeofday] does, within a millisecond
+    and across threads, which surfaced as EAPI:Invalid nonce retries. An atomic
+    compare-and-set keeps the sequence strictly monotonic across threads and clock skew. *)
+let last_nonce = Atomic.make 0L
+
 let nonce () : string =
-  Unix.gettimeofday () *. nonce_ms_multiplier |> Int64.of_float |> Int64.to_string
+  let now = Int64.of_float (Unix.gettimeofday () *. nonce_ms_multiplier) in
+  let rec bump () =
+    let prev = Atomic.get last_nonce in
+    let next = if Int64.compare now prev > 0 then now else Int64.add prev 1L in
+    if Atomic.compare_and_set last_nonce prev next then next else bump ()
+  in
+  Int64.to_string (bump ())
 ;;
 
-(** Normalizes a base64 or base64url encoded secret string.
-    Strips whitespace, converts base64url characters (- and _) to standard base64 (+ and /),
-    and appends padding as required. Raises [Failure] if the input is empty. *)
+(** Normalizes a base64 or base64url encoded secret string. Strips whitespace, converts
+    base64url characters (- and _) to standard base64 (+ and /), and appends padding as
+    required. Raises [Failure] if the input is empty. *)
 let normalize_base64_secret (secret : string) : string =
   let trimmed = String.trim secret in
   if trimmed = "" then failwith "Kraken API secret is empty";
@@ -100,9 +111,9 @@ let normalize_base64_secret (secret : string) : string =
   if padding = 0 then sanitized else sanitized ^ String.make padding '='
 ;;
 
-(** Decodes a base64-encoded Kraken API secret into raw bytes.
-    Applies normalization before decoding. Raises [Failure] on malformed input,
-    enforcing a startup-time invariant that the configured secret is valid. *)
+(** Decodes a base64-encoded Kraken API secret into raw bytes. Applies normalization
+    before decoding. Raises [Failure] on malformed input, enforcing a startup-time
+    invariant that the configured secret is valid. *)
 let decode_secret_base64 (secret : string) : string =
   match Base64.decode (normalize_base64_secret secret) with
   | Ok decoded -> decoded
@@ -111,9 +122,9 @@ let decode_secret_base64 (secret : string) : string =
 ;;
 
 (** Computes the HMAC-SHA512 signature for an authenticated Kraken REST request.
-    Procedure: SHA256(nonce || body), then HMAC-SHA512(decoded_secret, path || sha256_digest).
-    Returns the base64-encoded signature. Raises [Failure] if base64 encoding of the
-    result fails, indicating a runtime invariant violation. *)
+    Procedure: SHA256(nonce || body), then HMAC-SHA512(decoded_secret, path ||
+    sha256_digest). Returns the base64-encoded signature. Raises [Failure] if base64
+    encoding of the result fails, indicating a runtime invariant violation. *)
 let sign ~secret ~path ~body ~nonce =
   let sha256 = Digestif.SHA256.(digest_string (nonce ^ body) |> to_raw_string) in
   let hmac =
@@ -126,11 +137,12 @@ let sign ~secret ~path ~body ~nonce =
 ;;
 
 (* Shared JSON field parsers *)
-(** Polymorphic JSON field extractors. Each function accepts a [Yojson.Safe.t] object
-    and a field name, returning [Some value] on successful coercion or [None] on
-    type mismatch or missing field. Suppresses all exceptions. *)
+(** Polymorphic JSON field extractors. Each function accepts a [Yojson.Safe.t] object and
+    a field name, returning [Some value] on successful coercion or [None] on type mismatch
+    or missing field. Suppresses all exceptions. *)
 
-(** Extracts a float from field [field]. Coerces from [`Float], [`Int], [`String], or [`Intlit]. *)
+(** Extracts a float from field [field]. Coerces from [`Float], [`Int], [`String], or
+    [`Intlit]. *)
 let parse_float_opt json field =
   try
     let open Yojson.Safe.Util in
@@ -184,9 +196,9 @@ let parse_int_opt json field =
 
 (* WebSocket response types *)
 
-(** Envelope type for Kraken WebSocket v2 API responses.
-    Carries method name, success flag, optional request correlation ID,
-    server-side timestamps, and optional result/error/warning payloads. *)
+(** Envelope type for Kraken WebSocket v2 API responses. Carries method name, success
+    flag, optional request correlation ID, server-side timestamps, and optional
+    result/error/warning payloads. *)
 type ws_response =
   { method_ : string
   ; success : bool
@@ -198,8 +210,8 @@ type ws_response =
   ; warnings : string list option
   }
 
-(** Result payload returned by the add_order WebSocket method.
-    Contains the exchange-assigned order ID and optional client-supplied identifiers. *)
+(** Result payload returned by the add_order WebSocket method. Contains the
+    exchange-assigned order ID and optional client-supplied identifiers. *)
 type add_order_result =
   { order_id : string
   ; cl_ord_id : string option
@@ -209,8 +221,8 @@ type add_order_result =
 (** Type alias for the add_order response envelope. *)
 type add_order_response = ws_response
 
-(** Result payload returned by the amend_order WebSocket method.
-    Contains the amendment ID, target order ID, and optional client order ID. *)
+(** Result payload returned by the amend_order WebSocket method. Contains the amendment
+    ID, target order ID, and optional client order ID. *)
 type amend_order_result =
   { amend_id : string
   ; order_id : string
@@ -220,8 +232,8 @@ type amend_order_result =
 (** Type alias for the amend_order response envelope. *)
 type amend_order_response = ws_response
 
-(** Result payload returned by the cancel_order WebSocket method.
-    Contains the cancelled order ID and optional client order ID. *)
+(** Result payload returned by the cancel_order WebSocket method. Contains the cancelled
+    order ID and optional client order ID. *)
 type cancel_order_result =
   { order_id : string
   ; cl_ord_id : string option

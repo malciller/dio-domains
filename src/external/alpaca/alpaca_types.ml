@@ -39,16 +39,16 @@ module Config = struct
     if !is_paper then "https://paper-api.alpaca.markets" else "https://api.alpaca.markets"
   ;;
 
-  (** Trade events (fills, partial fills, cancels, replaces, rejects) via the
-      Events API over Server-Sent Events. The legacy v1 [wss://.../stream]
-      trade_updates WebSocket is deprecated and answers with HTTP 500; do not
-      reintroduce it. Auth: [APCA-API-KEY-ID] / [APCA-API-SECRET-KEY], as REST. *)
+  (** Trade events (fills, partial fills, cancels, replaces, rejects) via the Events API
+      over Server-Sent Events. The legacy v1 [wss://.../stream] trade_updates WebSocket is
+      deprecated and answers with HTTP 500; do not reintroduce it. Auth: [APCA-API-KEY-ID]
+      / [APCA-API-SECRET-KEY], as REST. *)
   let trading_events_url () = rest_base_url () ^ "/v2/events/trades"
 
   let data_ws_url () = Printf.sprintf "wss://stream.data.alpaca.markets/v2/%s" !data_feed
 
-  (** Overnight feed (8:00 PM - 4:00 AM ET). The regular v2 stream delivers
-      nothing overnight; the data connection switches here while
+  (** Overnight feed (8:00 PM - 4:00 AM ET). The regular v2 stream delivers nothing
+      overnight; the data connection switches here while
       [Alpaca_market_hours.is_overnight_hours ()] is true. *)
   let overnight_ws_url () = "wss://stream.data.alpaca.markets/v1beta1/overnight"
 
@@ -177,9 +177,9 @@ type position_record =
   ; exchange : string
   ; qty : float
   ; qty_available : float
-    (** Venue-authoritative immediately-sellable quantity: [qty] minus the base
-        held by resting open orders. Sole ground truth for free inventory;
-        otherwise reconstructed from the eventually-consistent open-order cache. *)
+  (** Venue-authoritative immediately-sellable quantity: [qty] minus the base held by
+      resting open orders. Sole ground truth for free inventory; otherwise reconstructed
+      from the eventually-consistent open-order cache. *)
   ; market_value : float
   ; avg_entry_price : float
   ; current_price : float

@@ -1,26 +1,25 @@
 (* Oracle_cache - disk-persisted daily OHLC history.
 
-   Full-history refetch per pass was too slow (Kraken walks to pair
-   inception, up to 60 pages; Hyperliquid re-downloads the candleSnapshot
-   range; Yahoo re-downloads deep history). Bars are immutable except the
-   latest, so each pass fetches only the delta since the last cached bar,
-   merges (dedup keeps the newest occurrence of a date), re-normalizes
-   through [Oracle_calendar.normalize_bars] and persists. A current cache
-   skips the network; a failed delta fetch falls back to the cached history
-   (stale but real). Persistence never fails the caller; corrupt files are
-   treated as a fresh start; writes are atomic.
+   Full-history refetch per pass was too slow (Kraken walks to pair inception, up to 60
+   pages; Hyperliquid re-downloads the candleSnapshot range; Yahoo re-downloads deep
+   history). Bars are immutable except the latest, so each pass fetches only the delta
+   since the last cached bar, merges (dedup keeps the newest occurrence of a date),
+   re-normalizes through [Oracle_calendar.normalize_bars] and persists. A current cache
+   skips the network; a failed delta fetch falls back to the cached history (stale but
+   real). Persistence never fails the caller; corrupt files are treated as a fresh start;
+   writes are atomic.
 
-   File layout: <dir>/<exchange>/<symbol>.json - ascending JSON array of raw
-   bars [{date,o,h,l,c,v}]. Normalization is applied on read, so a corrected
-   rule self-heals without a refetch. v2 stores raw bars (v1 stored
-   normalized series and could not self-heal). *)
+   File layout: <dir>/<exchange>/<symbol>.json - ascending JSON array of raw bars
+   [{date,o,h,l,c,v}]. Normalization is applied on read, so a corrected rule self-heals
+   without a refetch. v2 stores raw bars (v1 stored normalized series and could not
+   self-heal). *)
 
 open Lwt.Infix
 
 let section = "oracle_cache"
 
-(** Base history directory: /app/data in Docker, ./data locally. v2 stores
-    raw bars with read-time normalization. *)
+(** Base history directory: /app/data in Docker, ./data locally. v2 stores raw bars with
+    read-time normalization. *)
 let cache_dir =
   if Sys.file_exists "/app"
   then "/app/data/oracle_history/v2"
@@ -30,8 +29,8 @@ let cache_dir =
 (* Mutex guarding all file I/O (shared with other modules' threads). *)
 let file_mutex = Mutex.create ()
 
-(** mkdir -p: create [dir] and any missing parents; an existing component
-    is fine (idempotent, tolerates a racing writer). *)
+(** mkdir -p: create [dir] and any missing parents; an existing component is fine
+    (idempotent, tolerates a racing writer). *)
 let mkdir_p (dir : string) =
   let rec create path =
     if not (Sys.file_exists path)
@@ -58,7 +57,7 @@ let ensure_dir ~(dir : string) =
 let sanitize (s : string) =
   String.map
     (fun c ->
-       if c = '/' || c = '\\' || c = ':' || c = ' ' || c = '*' || c = '?' then '_' else c)
+      if c = '/' || c = '\\' || c = ':' || c = ' ' || c = '*' || c = '?' then '_' else c)
     s
 ;;
 
@@ -106,24 +105,24 @@ let load_bars ~(dir : string) ~(exchange : string) ~(symbol : string)
     Fun.protect
       ~finally:(fun () -> Mutex.unlock file_mutex)
       (fun () ->
-         try
-           match Yojson.Safe.from_file path with
-           | `List rows -> List.filter_map bar_of_json rows
-           | _ -> []
-         with
-         | Yojson.Json_error msg ->
-           Logging.warn_f ~section "Corrupt history cache %s: %s (refetching)" path msg;
-           []
-         | Sys_error msg ->
-           Logging.warn_f ~section "Cannot read history cache %s: %s" path msg;
-           []))
+        try
+          match Yojson.Safe.from_file path with
+          | `List rows -> List.filter_map bar_of_json rows
+          | _ -> []
+        with
+        | Yojson.Json_error msg ->
+          Logging.warn_f ~section "Corrupt history cache %s: %s (refetching)" path msg;
+          []
+        | Sys_error msg ->
+          Logging.warn_f ~section "Cannot read history cache %s: %s" path msg;
+          []))
 ;;
 
 let save_bars
-      ~(dir : string)
-      ~(exchange : string)
-      ~(symbol : string)
-      (bars : Oracle_types.bar list)
+  ~(dir : string)
+  ~(exchange : string)
+  ~(symbol : string)
+  (bars : Oracle_types.bar list)
   =
   if bars <> []
   then (
@@ -135,12 +134,12 @@ let save_bars
     Fun.protect
       ~finally:(fun () -> Mutex.unlock file_mutex)
       (fun () ->
-         try
-           Yojson.Safe.to_file tmp (`List (List.map bar_to_json bars));
-           Sys.rename tmp path
-         with
-         | Sys_error msg ->
-           Logging.warn_f ~section "Could not write history cache %s: %s" path msg))
+        try
+          Yojson.Safe.to_file tmp (`List (List.map bar_to_json bars));
+          Sys.rename tmp path
+        with
+        | Sys_error msg ->
+          Logging.warn_f ~section "Could not write history cache %s: %s" path msg))
 ;;
 
 (* ---- date helpers (exact civil-date math, no timezone dependence) ---- *)
@@ -154,20 +153,20 @@ let unix_of_iso (date : string) : int64 = Int64.div (ms_of_iso date) 1000L
 
 (* ---- freshness / merge / delta policy ---- *)
 
-(** A cached history is current when its last bar covers today or yesterday
-    (the in-progress daily bar may lag a day; the grid start price prefers
-    the live websocket bid anyway). *)
+(** A cached history is current when its last bar covers today or yesterday (the
+    in-progress daily bar may lag a day; the grid start price prefers the live websocket
+    bid anyway). *)
 let is_fresh ~(today : string) (bars : Oracle_types.bar list) =
   match List.rev bars with
   | b :: _ -> String.compare b.date (Oracle_calendar.add_days today (-1)) >= 0
   | [] -> false
 ;;
 
-(** A bounded history (e.g. the Yahoo deep extension, covering up to the day
-    before the venue series starts) is complete when its last bar reaches
-    [date] - afterwards it never needs another fetch. [tolerance_days]
-    absorbs non-trading days so a weekend/holiday boundary is not
-    re-requested forever; 7 days covers any weekend plus holiday span. *)
+(** A bounded history (e.g. the Yahoo deep extension, covering up to the day before the
+    venue series starts) is complete when its last bar reaches [date] - afterwards it
+    never needs another fetch. [tolerance_days] absorbs non-trading days so a
+    weekend/holiday boundary is not re-requested forever; 7 days covers any weekend plus
+    holiday span. *)
 let covers_through ?(tolerance_days = 0) ~(date : string) (bars : Oracle_types.bar list) =
   let floor = Oracle_calendar.add_days date (-tolerance_days) in
   match List.rev bars with
@@ -175,9 +174,9 @@ let covers_through ?(tolerance_days = 0) ~(date : string) (bars : Oracle_types.b
   | [] -> false
 ;;
 
-(** Merge cached and fresh bars raw (the cache is source truth; normalization
-    is on read). [dedup] keeps the last occurrence of a date, so a revised
-    current-day bar replaces the cached one. *)
+(** Merge cached and fresh bars raw (the cache is source truth; normalization is on read).
+    [dedup] keeps the last occurrence of a date, so a revised current-day bar replaces the
+    cached one. *)
 let merge_bars (cached : Oracle_types.bar list) (fresh : Oracle_types.bar list) =
   cached @ fresh
   |> Array.of_list
@@ -186,35 +185,35 @@ let merge_bars (cached : Oracle_types.bar list) (fresh : Oracle_types.bar list) 
   |> Array.to_list
 ;;
 
-(** Clean-series view of raw cached history: normalization applies at read
-    time, so the served series reflects current rules without a refetch. *)
+(** Clean-series view of raw cached history: normalization applies at read time, so the
+    served series reflects current rules without a refetch. *)
 let clean_bars (bars : Oracle_types.bar list) : Oracle_types.bar list =
   let clean, _, _ = Oracle_calendar.normalize_bars bars in
   Array.to_list clean
 ;;
 
-(** Read-only cache access for offline/cache-only runs: cleaned on-disk bars
-    for this asset, no network fallback. A cache miss returns []. *)
+(** Read-only cache access for offline/cache-only runs: cleaned on-disk bars for this
+    asset, no network fallback. A cache miss returns []. *)
 let read_cached ?(dir = cache_dir) ~(exchange : string) ~(symbol : string) ()
   : Oracle_types.bar list
   =
   load_bars ~dir ~exchange ~symbol |> clean_bars
 ;;
 
-(** Delta-fetch policy for one asset. If the cache is current (last bar >=
-    today-1, or a bounded history reaching [complete_through]), return the
-    clean view with no network. Otherwise call [fetch] with [Some start_date]
-    = day after the last cached bar (None = full history), merge raw, persist
-    raw, return the clean view. A failed delta fetch logs and returns the
-    cached history (stale but real); an empty failing cache returns []. *)
+(** Delta-fetch policy for one asset. If the cache is current (last bar >= today-1, or a
+    bounded history reaching [complete_through]), return the clean view with no network.
+    Otherwise call [fetch] with [Some start_date] = day after the last cached bar (None =
+    full history), merge raw, persist raw, return the clean view. A failed delta fetch
+    logs and returns the cached history (stale but real); an empty failing cache returns
+    []. *)
 let with_delta
-      ?(dir = cache_dir)
-      ?(complete_through : string option)
-      ~(exchange : string)
-      ~(symbol : string)
-      ~(today : string)
-      ~(fetch : string option -> Oracle_types.bar list Lwt.t)
-      ()
+  ?(dir = cache_dir)
+  ?(complete_through : string option)
+  ~(exchange : string)
+  ~(symbol : string)
+  ~(today : string)
+  ~(fetch : string option -> Oracle_types.bar list Lwt.t)
+  ()
   : Oracle_types.bar list Lwt.t
   =
   let cached = load_bars ~dir ~exchange ~symbol in
@@ -235,22 +234,22 @@ let with_delta
     in
     Lwt.catch
       (fun () ->
-         fetch boundary
-         >|= fun fresh_bars ->
-         let merged = merge_bars cached fresh_bars in
-         save_bars ~dir ~exchange ~symbol merged;
-         clean_bars merged)
+        fetch boundary
+        >|= fun fresh_bars ->
+        let merged = merge_bars cached fresh_bars in
+        save_bars ~dir ~exchange ~symbol merged;
+        clean_bars merged)
       (fun exn ->
-         Logging.warn_f
-           ~section
-           "%s/%s history delta fetch failed (%s); using cached history (%d bar(s) \
-            through %s)"
-           exchange
-           symbol
-           (Printexc.to_string exn)
-           (List.length cached)
-           (match List.rev cached with
-            | b :: _ -> b.date
-            | [] -> "-");
-         Lwt.return cached))
+        Logging.warn_f
+          ~section
+          "%s/%s history delta fetch failed (%s); using cached history (%d bar(s) \
+           through %s)"
+          exchange
+          symbol
+          (Printexc.to_string exn)
+          (List.length cached)
+          (match List.rev cached with
+           | b :: _ -> b.date
+           | [] -> "-");
+        Lwt.return cached))
 ;;

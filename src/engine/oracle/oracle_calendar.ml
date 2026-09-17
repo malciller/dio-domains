@@ -1,18 +1,17 @@
 (* Oracle_calendar - session-consistent views over raw bars.
 
-   Sorts bars by ISO date and de-duplicates. Detects missing sessions: for
-   Crypto a session is any calendar day; for Equity an expected-session
-   predicate (US weekdays minus holidays, from Oracle_sessions) drives
-   detection. Missing bars are never forward-filled; gaps are metadata and
-   the caller fails the analysis when max_gap exceeds tolerance. *)
+   Sorts bars by ISO date and de-duplicates. Detects missing sessions: for Crypto a
+   session is any calendar day; for Equity an expected-session predicate (US weekdays
+   minus holidays, from Oracle_sessions) drives detection. Missing bars are never
+   forward-filled; gaps are metadata and the caller fails the analysis when max_gap
+   exceeds tolerance. *)
 
 open Oracle_types
 
-(* ---- ISO date helpers (YYYY-MM-DD) ----
-   Pure civil-date math (days from the 1970-01-01 epoch, via Howard
-   Hinnant's algorithms); no local-timezone dependence. The shared
-   definitions live in [Exchange_intf.Types] so external data clients (Yahoo
-   deep history) can use them without depending on this library. *)
+(* ---- ISO date helpers (YYYY-MM-DD) ---- Pure civil-date math (days from the 1970-01-01
+   epoch, via Howard Hinnant's algorithms); no local-timezone dependence. The shared
+   definitions live in [Exchange_intf.Types] so external data clients (Yahoo deep history)
+   can use them without depending on this library. *)
 
 let iso_ymd = Dio_exchange.Exchange_intf.Types.iso_ymd
 let days_from_civil = Dio_exchange.Exchange_intf.Types.days_from_civil
@@ -41,26 +40,23 @@ let dates_between ~(from_date : string) ~(to_date : string) =
   if n < 0 then [] else List.init (n + 1) (fun i -> add_days from_date i)
 ;;
 
-(* ---- Series normalization ----
-   Venue feeds can return non-market rows that corrupt peak-to-valley
-   drawdown and ATH/floor references: fabricated placeholder candles
-   (constant dummy OHLC, zero/dust volume) and rows whose extreme prints
-   never traded. [normalize_bars] drops the former and folds the latter into
-   the row's close. Applied at every fetch source and every history-cache
-   read, so runtime, CLI and replay share one clean series. Outlier judgment
-   is local (each row against its nearest real-trading neighbor, volume >=
-   0.01), never a global median, so genuinely cheap historical rows survive
-   while ~100x-off placeholder levels are dropped. *)
+(* ---- Series normalization ---- Venue feeds can return non-market rows that corrupt
+   peak-to-valley drawdown and ATH/floor references: fabricated placeholder candles
+   (constant dummy OHLC, zero/dust volume) and rows whose extreme prints never traded.
+   [normalize_bars] drops the former and folds the latter into the row's close. Applied at
+   every fetch source and every history-cache read, so runtime, CLI and replay share one
+   clean series. Outlier judgment is local (each row against its nearest real-trading
+   neighbor, volume >= 0.01), never a global median, so genuinely cheap historical rows
+   survive while ~100x-off placeholder levels are dropped. *)
 
-(** Normalize a candle list into the canonical clean series: ascending,
-    de-duplicated, fabricated rows dropped, absurd intra-row extremes folded
-    into the close. Returns (clean bars, dropped count, clamped count).
-    Pass 1 drops rows with non-finite/non-positive fields or >10x
-    intra-candle range. Pass 2 folds rows whose extreme prints sit >2x from
-    the row's close into a flat close (the close is kept). Pass 3 drops rows
-    whose close deviates >8x from the nearest real-trading neighbor (left
-    first, else right; real = volume >= 0.01); rows with no real neighbor
-    are kept. A series with no row at volume >= 0.01 normalizes to empty. *)
+(** Normalize a candle list into the canonical clean series: ascending, de-duplicated,
+    fabricated rows dropped, absurd intra-row extremes folded into the close. Returns
+    (clean bars, dropped count, clamped count). Pass 1 drops rows with
+    non-finite/non-positive fields or >10x intra-candle range. Pass 2 folds rows whose
+    extreme prints sit >2x from the row's close into a flat close (the close is kept).
+    Pass 3 drops rows whose close deviates >8x from the nearest real-trading neighbor
+    (left first, else right; real = volume >= 0.01); rows with no real neighbor are kept.
+    A series with no row at volume >= 0.01 normalizes to empty. *)
 let normalize_bars (bars : bar list) : bar array * int * int =
   let arr = bars |> Array.of_list |> sort_bars |> dedup in
   let n = Array.length arr in
@@ -96,9 +92,9 @@ let normalize_bars (bars : bar list) : bar array * int * int =
         arr.(i) <- { b with open_ = b.close; high = b.close; low = b.close };
         incr clamped))
   done;
-  (* Pass 3: local, volume-aware outlier guard (see module doc). Drops
-     fabricated placeholder levels ~100x off the surrounding real market;
-     genuine cheap-era rows survive. *)
+  (* Pass 3: local, volume-aware outlier guard (see module doc). Drops fabricated
+     placeholder levels ~100x off the surrounding real market; genuine cheap-era rows
+     survive. *)
   let is_real (b : bar) = b.volume >= 0.01 in
   for i = 0 to n - 1 do
     if good.(i)
@@ -131,9 +127,8 @@ let normalize_bars (bars : bar list) : bar array * int * int =
           incr dropped)
       | _ -> ())
   done;
-  (* No surviving row at volume >= 0.01 means the series is entirely
-     fabricated: empty it rather than feed placeholders into drawdown/floor
-     math. *)
+  (* No surviving row at volume >= 0.01 means the series is entirely fabricated: empty it
+     rather than feed placeholders into drawdown/floor math. *)
   let any_real = ref false in
   for i = 0 to n - 1 do
     if good.(i) && arr.(i).volume >= 0.01 then any_real := true
@@ -153,8 +148,8 @@ let normalize_bars (bars : bar list) : bar array * int * int =
   Array.of_list !out, !dropped, !clamped
 ;;
 
-(** Expected sessions between the first and last bar date for a session
-    predicate (e.g. US weekdays minus holidays). Ascending. *)
+(** Expected sessions between the first and last bar date for a session predicate (e.g. US
+    weekdays minus holidays). Ascending. *)
 let expected_sessions ~(is_session : string -> bool) (bars : bar array) =
   let n = Array.length bars in
   if n = 0
@@ -172,9 +167,9 @@ let missing_sessions ~(is_session : string -> bool) (bars : bar array) =
   expected_sessions ~is_session bars |> List.filter (fun d -> not (Hashtbl.mem present d))
 ;;
 
-(** Group skipped sessions into gap runs: consecutive calendar-day runs become
-    one gap whose [after]/[before] are the bounding present sessions and
-    [missing_days] is the run length. *)
+(** Group skipped sessions into gap runs: consecutive calendar-day runs become one gap
+    whose [after]/[before] are the bounding present sessions and [missing_days] is the run
+    length. *)
 let gaps_of_missing ~(bars : bar array) (missing : string list) =
   let present = Hashtbl.create 64 in
   Array.iter (fun b -> Hashtbl.replace present b.date ()) bars;
@@ -188,35 +183,34 @@ let gaps_of_missing ~(bars : bar array) (missing : string list) =
   let runs = runs [] [] missing |> List.filter (fun r -> r <> []) in
   List.map
     (fun run ->
-       let after =
-         let rec back d =
-           let prev = add_days d (-1) in
-           if Hashtbl.mem present prev then Some prev else back prev
-         in
-         back (List.hd run)
-       in
-       let before =
-         let rec fwd d =
-           let next = add_days d 1 in
-           if Hashtbl.mem present next then Some next else fwd next
-         in
-         fwd (List.rev run |> List.hd)
-       in
-       { after = Option.value ~default:"-" after
-       ; before = Option.value ~default:"-" before
-       ; missing_days = List.length run
-       })
+      let after =
+        let rec back d =
+          let prev = add_days d (-1) in
+          if Hashtbl.mem present prev then Some prev else back prev
+        in
+        back (List.hd run)
+      in
+      let before =
+        let rec fwd d =
+          let next = add_days d 1 in
+          if Hashtbl.mem present next then Some next else fwd next
+        in
+        fwd (List.rev run |> List.hd)
+      in
+      { after = Option.value ~default:"-" after
+      ; before = Option.value ~default:"-" before
+      ; missing_days = List.length run
+      })
     runs
 ;;
 
-(** Detects missing-session runs. For Crypto: gaps are days with no bar. For
-    Equity: gaps are expected sessions (per the [is_session] predicate, e.g.
-    US weekdays minus holidays) with no bar; without a predicate no gaps are
-    reported. *)
+(** Detects missing-session runs. For Crypto: gaps are days with no bar. For Equity: gaps
+    are expected sessions (per the [is_session] predicate, e.g. US weekdays minus
+    holidays) with no bar; without a predicate no gaps are reported. *)
 let detect_gaps
-      ~(calendar_kind : calendar_kind)
-      ?(is_session : (string -> bool) option)
-      (bars : bar array)
+  ~(calendar_kind : calendar_kind)
+  ?(is_session : (string -> bool) option)
+  (bars : bar array)
   =
   match calendar_kind with
   | Equity ->

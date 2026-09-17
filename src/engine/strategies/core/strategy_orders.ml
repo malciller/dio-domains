@@ -1,17 +1,39 @@
-(* Jacobs Ladder: order construction and buffer management. *)
+(* Order construction and lock-free dispatch (strategy-agnostic). *)
 
 open Strategy_common
-open Jacobs_ladder_types
-open Jacobs_ladder_config
-open Jacobs_ladder_reservation
-
-module Sell_orders = Jacobs_ladder_sell_orders
+open Strategy_state
+open Strategy_venue
+open Strategy_reservation
+module Sell_orders = Strategy_sell_orders
 
 (** Shared order ringbuffer across all strategy domains. *)
 let order_buffer = LockFreeQueue.create ()
 
 (** Accessor for the shared order ringbuffer. *)
 let get_order_buffer () = order_buffer
+
+(** Records an emitted order into the active trace recorder (no-op when tracing is off).
+    The observation record is built only when a recorder is registered for the symbol. *)
+let record_emitted (order : strategy_order) =
+  if Strategy_event_recorder.is_active order.symbol
+  then
+    Strategy_event_recorder.record_emitted_if_active
+      { Strategy_trace.em_op =
+          (match order.operation with
+           | Place -> "place"
+           | Amend -> "amend"
+           | Cancel -> "cancel")
+      ; em_symbol = order.symbol
+      ; em_side =
+          (match order.side with
+           | Buy -> "buy"
+           | Sell -> "sell")
+      ; em_qty = order.qty
+      ; em_price = Option.value order.price ~default:nan
+      ; em_post_only = order.post_only
+      ; em_order_id = order.order_id
+      }
+;;
 
 let create_place_order dup_key asset_symbol side qty price post_only strategy exchange =
   let ecfg = get_exchange_config exchange in
@@ -73,8 +95,8 @@ let create_order dup_key asset_symbol side qty price post_only exchange =
   create_place_order dup_key asset_symbol side qty price post_only Ladder exchange
 ;;
 
-(** Pushes [order] to the ringbuffer. Returns true on success, false on
-    duplicate key or full buffer. *)
+(** Pushes [order] to the ringbuffer. Returns true on success, false on duplicate key or
+    full buffer. *)
 let push_order ~now ?state order =
   let operation_str =
     match order.operation with
@@ -98,6 +120,7 @@ let push_order ~now ?state order =
           Order_actions.incr order.symbol;
           state.last_order_time <- now;
           if order.side = Buy then state.inflight_cancel_buy <- true;
+          record_emitted order;
           true
         | None ->
           Logging.warn_f
@@ -128,6 +151,7 @@ let push_order ~now ?state order =
       | Some () ->
         OrderSignal.broadcast ();
         Order_actions.incr order.symbol;
+        record_emitted order;
         let state =
           match state with
           | Some s -> s
@@ -148,10 +172,10 @@ let push_order ~now ?state order =
                (string_of_order_side order.side)
                order_price
            in
-           (* Arm the in-flight sell ledger at dispatch for every venue
-              (including track_pending_sells=false): base leaves the sellable
-              pool when the order is pushed, before any ack or feed visibility,
-              and is released only on a terminal event. *)
+           (* Arm the in-flight sell ledger at dispatch for every venue (including
+              track_pending_sells=false): base leaves the sellable pool when the order is
+              pushed, before any ack or feed visibility, and is released only on a
+              terminal event. *)
            (match order.side with
             | Sell ->
               arm_sell_commitment
