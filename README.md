@@ -1,10 +1,10 @@
 # dio-domains
 
-dio is an OCaml 5 trading engine. Strategies live in files. The engine loads a
-strategy, validates it, and runs it over a library of registered actions. The
-bundled strategy is Jacobs Ladder, a grid that buys dips and sells into
-reversals. It runs against Kraken, Hyperliquid, Lighter, Interactive Brokers,
-and Alpaca.
+dio is an OCaml 5 trading engine built for high-frequency trading. Strategies
+live in files. The engine loads a strategy, validates it, and runs it over a
+library of registered actions. The bundled strategy is Jacobs Ladder, a grid
+that buys dips and sells into reversals. It runs against Kraken, Hyperliquid,
+Lighter, Interactive Brokers, and Alpaca.
 
 Each traded asset runs in its own OCaml domain. Order intents go through a
 lock-free executor, and market data arrives on lock-free ring buffers. A
@@ -61,6 +61,23 @@ and [deployment](https://diophantsolutions.com/dio/DEPLOYMENT/).
 | `dio` | The engine. Trades the instruments in `config.json`. |
 | `dio-dashboard` | Terminal UI. Connects to a running engine over the Unix domain socket. |
 | `dio-oracle` | Runs the sizing pipeline offline and prints the decision surface. |
+
+## Performance
+
+dio targets high-frequency trading. Trading domains pin to performance cores,
+background work stays on efficiency cores, and real-time `SCHED_FIFO` priority is
+available through `DIO_TRADING_RT_PRIO` on a dedicated host. The strategy
+interpreter resolves action handlers at load, prewarms guards, and hoists
+per-cycle closures out of the steady state. The OxCaml flambda2 build uses
+`local_` allocation mode, and CI fails on any compiler alert.
+
+Latency and allocation are observable through every phase of the cycle:
+
+- A histogram profiler reports p50, p90, p95, p99, and p999, with a nanosecond
+  tier for sub-microsecond samples.
+- A busy-spin canary detects process-wide stop-the-world pauses and scheduler
+  descheduling that per-domain GC counters miss.
+- Per-cycle GC counters attribute a spike to collector activity or to CPU work.
 
 ## Strategy files
 
