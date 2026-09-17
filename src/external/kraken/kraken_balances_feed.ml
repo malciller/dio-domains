@@ -533,6 +533,59 @@ let parse_update json on_heartbeat =
     None
 ;;
 
+(** Connection id whose status frame was last surfaced at INFO. Kraken emits periodic
+    [status] frames on the live authenticated connection, so a change in connection id is
+    the only signal of a genuinely new socket; periodic repeats drop to DEBUG to avoid
+    presenting them as reconnections. *)
+let last_status_connection_id : string option Atomic.t = Atomic.make None
+
+(** Extracts the [connection_id] from a status payload. It can exceed the native int
+    range, in which case Yojson yields an [Intlit] rather than an [Int]. *)
+let status_connection_id data =
+  match Yojson.Safe.Util.member "connection_id" data with
+  | `Int i -> Some (string_of_int i)
+  | `Intlit s -> Some s
+  | `Float f -> Some (Printf.sprintf "%.0f" f)
+  | `String s -> Some s
+  | _ -> None
+;;
+
+(** Logs an exchange [status] frame. A new connection id (a new socket) is logged at INFO;
+    routine periodic repeats drop to DEBUG. *)
+let log_status_frame json =
+  let open Yojson.Safe.Util in
+  let data =
+    match member "data" json with
+    | `List (first :: _) -> first
+    | _ -> `Null
+  in
+  let system =
+    member "system" data |> to_string_option |> Option.value ~default:"unknown"
+  in
+  let connection_id = status_connection_id data in
+  let is_new_connection =
+    match connection_id with
+    | Some id -> Atomic.get last_status_connection_id <> Some id
+    | None -> false
+  in
+  if is_new_connection
+  then (
+    (match connection_id with
+     | Some id -> Atomic.set last_status_connection_id (Some id)
+     | None -> ());
+    Logging.info_f
+      ~section
+      "Connected to Kraken authenticated WebSocket (connection_id=%s, system=%s)"
+      (Option.value connection_id ~default:"unknown")
+      system)
+  else
+    Logging.debug_f
+      ~section
+      "Kraken status update: system=%s, connection_id=%s"
+      system
+      (Option.value connection_id ~default:"unknown")
+;;
+
 (** Routes a parsed JSON WebSocket message to the appropriate handler by channel and type. *)
 let handle_message_json json on_heartbeat =
   try
@@ -565,8 +618,7 @@ let handle_message_json json on_heartbeat =
            "Subscription failed: %s"
            (Option.value error ~default:"Unknown error")
        | None -> ())
-    | Some "status", _, _ ->
-      Logging.info ~section "Connected to Kraken authenticated WebSocket"
+    | Some "status", _, _ -> log_status_frame json
     | _ -> ()
   with
   | exn -> Logging.error_f ~section "Error handling message: %s" (Printexc.to_string exn)
