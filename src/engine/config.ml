@@ -20,6 +20,8 @@ type trading_config = Dio_strategies.Strategy_common.trading_config =
   ; data_feed : string option
   ; base_accumulation : bool (** Per-strategy opt-in to base-accumulation persistence. *)
   ; sell_levels : bool (** Per-strategy opt-in to pending-sell-level persistence. *)
+  ; cpu_priority : int
+  (** Core-assignment priority (descending); ties keep config order. Default 0. *)
   }
 
 type logging_config =
@@ -179,6 +181,7 @@ let known_trading_keys =
   ; "data_feed"
   ; "base_accumulation"
   ; "sell_levels"
+  ; "cpu_priority"
   ]
 ;;
 
@@ -391,6 +394,8 @@ let parse_config json =
       json |> member "base_accumulation" |> to_bool_option |> Option.value ~default:true
   ; sell_levels =
       json |> member "sell_levels" |> to_bool_option |> Option.value ~default:false
+  ; cpu_priority =
+      json |> member "cpu_priority" |> to_int_option |> Option.value ~default:0
   }
 ;;
 

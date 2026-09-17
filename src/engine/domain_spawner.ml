@@ -54,6 +54,10 @@ type domain_state =
   ; restart_count : int Atomic.t
   ; is_running : bool Atomic.t
   ; mutex : Mutex.t
+  ; pinned_cpu : int
+  (** Trading CPU assigned once at registration and reused on every restart, so a
+      restarted domain returns to its own core. [-1] means no core was available (more
+      domains than trading CPUs): the domain stays unpinned and shares. *)
   }
 
 (** Global registry mapping domain keys to their supervisor state. *)
@@ -1952,6 +1956,7 @@ let register_domain asset =
     ; restart_count = Atomic.make 0
     ; is_running = Atomic.make false
     ; mutex = Mutex.create ()
+    ; pinned_cpu = trading_cpu_alloc ()
     }
   in
   Mutex.lock registry_mutex;
@@ -2006,20 +2011,20 @@ let start_domain config state fee_fetcher =
            cached_gc_config would otherwise silently kill the domain. *)
         try
           Config.apply_gc_config ();
-          let cpu = trading_cpu_alloc () in
+          (* Pin this domain to its assigned trading core (stable across restarts). The
+             allocator hands out each CPU once and returns -1 when the domain count
+             exceeds the core count; those overflow domains stay unpinned and share the
+             remaining cores. *)
+          let cpu = state.pinned_cpu in
           Thread_affinity.pin_self cpu;
-          (* Opt-in real-time priority: set DIO_TRADING_RT_PRIO to a nonzero value
-             (e.g. 50) to run this trading domain SCHED_FIFO so no CFS thread can preempt
-             it. Off by default because it needs CAP_SYS_NICE; see
-             Thread_affinity.set_self_rt. *)
-          (match Sys.getenv_opt "DIO_TRADING_RT_PRIO" with
-           | Some s ->
-             (try
-                let prio = int_of_string (String.trim s) in
-                if prio > 0 then Thread_affinity.set_self_rt prio
-              with
-              | _ -> ())
-           | None -> ());
+          (* Opt-in real-time priority: DIO_TRADING_RT_PRIO (e.g. 50) runs the domain
+             SCHED_FIFO so no CFS thread can preempt it. Needs CAP_SYS_NICE (see
+             Thread_affinity.set_self_rt). Only rung on for a domain that owns a core: an
+             RT thread co-resident on a shared or unpinned core can starve its neighbours,
+             so overflow domains stay CFS. *)
+          (match Thread_affinity.configured_rt_prio () with
+           | Some prio when cpu >= 0 -> Thread_affinity.set_self_rt prio
+           | Some _ | None -> ());
           Logging.info_f
             ~section
             "domain %s/%s pinned to cpu %d"
@@ -2174,6 +2179,15 @@ let supervisor_loop config fee_fetcher =
   done
 ;;
 
+(** Order trading assets for core assignment: descending [cpu_priority], with ties keeping
+    config order ([List.stable_sort]). Registration claims a trading CPU, so this decides
+    who gets a P-core first when domains outnumber cores. *)
+let order_by_cpu_priority (assets : trading_config list) =
+  List.stable_sort
+    (fun (a : trading_config) b -> compare b.cpu_priority a.cpu_priority)
+    assets
+;;
+
 (** Initialize strategies, register all assets, start their domains, and launch the
     supervisor thread. Returns the supervisor Thread.t handle. *)
 let spawn_supervised_domains_for_assets
@@ -2184,8 +2198,28 @@ let spawn_supervised_domains_for_assets
   =
   (* Initialize strategy module state *)
   Dio_strategies.Strategy_api.Strategy.init ();
-  (* Register each asset in the domain registry *)
-  List.iter (fun asset -> ignore (register_domain asset)) assets;
+  (* Register assets in core-assignment order: registration is where a trading CPU is
+     claimed, so the highest [cpu_priority] claims a P-core first and ties keep config
+     order. Priorities beyond the core count simply fall through to unpinned. *)
+  List.iter (fun asset -> ignore (register_domain asset)) (order_by_cpu_priority assets);
+  (* Surface an oversubscribed pinning plan: each trading CPU is handed to exactly one
+     domain (P-cores first), and any domain beyond the core count runs unpinned and shares
+     the remaining cores rather than doubling up on a P-core. Doubling up would, under
+     SCHED_FIFO, put two real-time domains on one core and starve both. *)
+  let domain_count = List.length assets in
+  let cpu_count = Thread_affinity.trading_cpu_count () in
+  if cpu_count > 0 && domain_count > cpu_count
+  then
+    Logging.warn_f
+      ~section
+      "affinity: %d trading domains but only %d trading CPUs (%s); the %d highest \
+       cpu_priority get a dedicated core and the remaining %d run unpinned (shared \
+       cores)"
+      domain_count
+      cpu_count
+      (String.concat "," (List.map string_of_int (Thread_affinity.trading_cpus ())))
+      cpu_count
+      (domain_count - cpu_count);
   (* Pre-force the shared cached_gc_config Lazy before spawning domains: OCaml 5 domains
      concurrently forcing the same value race, and if the computing domain fails the
      others get CamlinternalLazy.Undefined. Forcing in the main domain eliminates the

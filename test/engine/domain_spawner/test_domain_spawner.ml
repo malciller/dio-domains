@@ -23,6 +23,7 @@ let test_spawn_domains_basic () =
       ; data_feed = None
       ; base_accumulation = true
       ; sell_levels = true
+      ; cpu_priority = 0
       }
     ; { Dio_engine.Config.exchange = "kraken"
       ; symbol = "ETH/USD"
@@ -40,6 +41,7 @@ let test_spawn_domains_basic () =
       ; data_feed = None
       ; base_accumulation = true
       ; sell_levels = true
+      ; cpu_priority = 0
       }
     ]
   in
@@ -119,6 +121,7 @@ let test_fee_fetcher_integration () =
     ; data_feed = None
     ; base_accumulation = true
     ; sell_levels = true
+    ; cpu_priority = 0
     }
   in
   let asset_with_fees = mock_fee_fetcher asset in
@@ -159,6 +162,7 @@ let test_domain_error_handling () =
     ; data_feed = None
     ; base_accumulation = true
     ; sell_levels = true
+    ; cpu_priority = 0
     }
   in
   (* Domains handle errors internally; the runner must not crash. *)
@@ -190,6 +194,45 @@ let test_domain_error_handling () =
   Alcotest.(check int) "domain created for failing asset" 1 (List.length status)
 ;;
 
+let mk_asset symbol cpu_priority : Dio_engine.Config.trading_config =
+  { Dio_engine.Config.exchange = "kraken"
+  ; symbol
+  ; qty = "1.0"
+  ; grid_interval = 1.0, 1.0
+  ; sell_mult = "1.0"
+  ; min_usd_balance = None
+  ; max_exposure = None
+  ; strategy = "jacobs_ladder"
+  ; maker_fee = None
+  ; taker_fee = None
+  ; testnet = false
+  ; hedge = false
+  ; accumulation_buffer = 0.01, 0.01
+  ; data_feed = None
+  ; base_accumulation = true
+  ; sell_levels = true
+  ; cpu_priority
+  }
+;;
+
+let test_order_by_cpu_priority () =
+  let symbols assets =
+    List.map (fun (a : Dio_engine.Config.trading_config) -> a.symbol) assets
+  in
+  Alcotest.(check (list string))
+    "descending priority, ties keep config order"
+    [ "D"; "B"; "A"; "C" ]
+    (symbols
+       (Dio_engine.Domain_spawner.order_by_cpu_priority
+          [ mk_asset "A" 0; mk_asset "B" 5; mk_asset "C" 0; mk_asset "D" 10 ]));
+  Alcotest.(check (list string))
+    "equal priorities preserve config order"
+    [ "A"; "C" ]
+    (symbols
+       (Dio_engine.Domain_spawner.order_by_cpu_priority
+          [ mk_asset "A" 0; mk_asset "C" 0 ]))
+;;
+
 let () =
   Alcotest.run
     "Domain Spawner"
@@ -198,6 +241,8 @@ let () =
         ; Alcotest.test_case "empty list" `Quick test_spawn_domains_empty
         ; Alcotest.test_case "error handling" `Quick test_domain_error_handling
         ] )
+    ; ( "affinity"
+      , [ Alcotest.test_case "cpu priority ordering" `Quick test_order_by_cpu_priority ] )
     ; ( "integration"
       , [ Alcotest.test_case "fee fetcher" `Quick test_fee_fetcher_integration
         ; Alcotest.test_case "strategy init" `Quick test_strategy_initialization

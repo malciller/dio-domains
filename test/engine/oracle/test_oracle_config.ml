@@ -1,7 +1,7 @@
 (* Tests for Dio_oracle.Oracle_tasks (symbol/exchange resolution, calendar kind) and the
    Hyperliquid candle parser. *)
 
-let trading_config ?(exchange = "kraken") ?(symbol = "X") ()
+let trading_config ?(exchange = "kraken") ?(symbol = "X") ?(cpu_priority = 0) ()
   : Dio_strategies.Strategy_common.trading_config
   =
   { exchange
@@ -20,6 +20,7 @@ let trading_config ?(exchange = "kraken") ?(symbol = "X") ()
   ; data_feed = None
   ; base_accumulation = true
   ; sell_levels = true
+  ; cpu_priority
   }
 ;;
 
