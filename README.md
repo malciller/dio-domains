@@ -1,16 +1,16 @@
 # dio-domains
 
-dio is an OCaml 5 trading engine. Trading behaviour is defined by **strategy
-files**, not compiled code: the engine loads a strategy, validates it, and runs
-it over a registered library of actions. The strategy it ships — the
-**Jacobs Ladder** grid, which buys dips and sells into reversals — runs against
-Kraken, Hyperliquid, Lighter, Interactive Brokers, and Alpaca.
+dio is an OCaml 5 trading engine. Strategies live in files. The engine loads a
+strategy, validates it, and runs it over a library of registered actions. The
+bundled strategy is Jacobs Ladder, a grid that buys dips and sells into
+reversals. It runs against Kraken, Hyperliquid, Lighter, Interactive Brokers,
+and Alpaca.
 
-Each traded asset runs in its own OCaml domain. Order intents funnel through a
-lock-free executor, market data lands in lock-free ring buffers, and a
-**capital-survival oracle** sizes each position from the asset's all-time
-drawdown history. A terminal dashboard attaches to the running engine over a
-Unix domain socket.
+Each traded asset runs in its own OCaml domain. Order intents go through a
+lock-free executor, and market data arrives on lock-free ring buffers. A
+capital-survival oracle sizes each position from the asset's all-time drawdown
+history. A terminal dashboard connects to the running engine over a Unix domain
+socket.
 
 [![ci](https://github.com/malciller/dio-domains/actions/workflows/ci.yml/badge.svg)](https://github.com/malciller/dio-domains/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/malciller/dio-domains)](https://github.com/malciller/dio-domains/releases)
@@ -19,26 +19,18 @@ Unix domain socket.
 [![OCaml](https://img.shields.io/github/languages/top/malciller/dio-domains)](https://ocaml.org)
 [![license](https://img.shields.io/github/license/malciller/dio-domains)](LICENSE)
 
-> **This trades real money.** It comes with no warranty. Test on a testnet
-> before risking capital.
+> dio trades real money and ships without warranty. Test on a testnet before
+> risking capital.
 
 ![dio terminal dashboard](assets/dio-dashboard.gif)
 
-> Like it? [Star the repo](https://github.com/malciller/dio-domains/stargazers)
-> so more people find it. [Watch releases](https://github.com/malciller/dio-domains/releases)
-> to see what's next. Bugs and ideas go in the issue tracker.
-
 ## Quick start
 
-New to this? The [deployment guide](https://diophantsolutions.com/dio/DEPLOYMENT/)
-is a step-by-step walkthrough: make a folder, pull the image, extract the starter
-files, and fill in `config.json` and `.env`. The short version:
+The [deployment guide](https://diophantsolutions.com/dio/DEPLOYMENT/) has the
+full walkthrough. Create a working directory, pull the image, extract the
+starter files, then fill in `config.json` and `.env`.
 
-The image ships the example config, env template, and compose file. Pull them
-out first (no repository clone needed). It is published to both GitHub Container
-Registry (`ghcr.io/malciller/dio-domains`) and Docker Hub
-(`malciller/dio-domains`); the commands below use GHCR — substitute the Docker
-Hub name if you prefer:
+The image contains the example config, env template, and compose file:
 
 ```sh
 IMAGE=ghcr.io/malciller/dio-domains:latest
@@ -46,15 +38,18 @@ docker pull $IMAGE
 docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE /usr/share/doc/dio/config.example.json /out/config.json
 docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE /usr/share/doc/dio/.env.example /out/.env
 docker run --rm -v "$PWD:/out" --entrypoint cp $IMAGE /usr/share/doc/dio/compose.yaml /out/compose.yaml
-# edit config.json and .env for your venues and instruments
 
 docker compose up -d                 # start the engine
 docker compose run --rm dashboard    # attach the dashboard (Ctrl-p Ctrl-q to detach)
 ```
 
-The published image is `linux/amd64`. On Apple Silicon it runs under emulation.
-The engine reads `config.json` and `.env` from the working directory and writes
-state to the `dio-data` volume.
+The image is published to GitHub Container Registry
+(`ghcr.io/malciller/dio-domains`) and Docker Hub (`malciller/dio-domains`). The
+commands use GHCR. Substitute the Docker Hub name to use that registry.
+
+The published image targets `linux/amd64` and runs under emulation on Apple
+Silicon. The engine reads `config.json` and `.env` from the working directory and
+writes state to the `dio-data` volume.
 
 Full reference: [configuration](https://diophantsolutions.com/dio/CONFIGURATION/)
 and [deployment](https://diophantsolutions.com/dio/DEPLOYMENT/).
@@ -69,11 +64,11 @@ and [deployment](https://diophantsolutions.com/dio/DEPLOYMENT/).
 
 ## Strategy files
 
-A strategy is a file, not compiled code. Each entry in `config.json` names one
-(`"strategy": "jacobs_ladder"`); the engine loads `strategies/<name>.strategy`,
-validates it, and compiles it to the internal step/action representation at
-startup. The script is a small, dotted language (also accepts `.json`, the
-compiled form) with no braces or significant whitespace in names:
+Each entry in `config.json` names a strategy, for example
+`"strategy": "jacobs_ladder"`. The engine loads `strategies/<name>.strategy`,
+validates it, and compiles it to its internal step/action representation at
+startup. The script is a small dotted language. The compiled `.json` form is
+also accepted.
 
 ```
 when book.updates:
@@ -82,10 +77,10 @@ when book.updates:
       stop
 ```
 
-`dio strategy validate <file>` checks a strategy statically and
-`dio strategy compile <file.strategy>` emits its JSON form. See the
-[strategy script guide](https://diophantsolutions.com/dio/STRATEGY/) for the
-language and the action vocabulary.
+`dio strategy validate <file>` checks a strategy statically.
+`dio strategy compile <file.strategy>` emits its JSON form. The
+[strategy script guide](https://diophantsolutions.com/dio/STRATEGY/) documents
+the language and the action vocabulary.
 
 ## Documentation
 
@@ -100,8 +95,8 @@ All documentation lives at **<https://diophantsolutions.com/dio/>**:
 ## Support
 
 Bug reports and feature requests go through GitHub issues:
-<https://github.com/malciller/dio-domains/issues>. There is no email or chat
-support. Never paste API keys or other secrets into an issue.
+<https://github.com/malciller/dio-domains/issues>. Do not paste API keys or other
+secrets into an issue.
 
 ## License
 
