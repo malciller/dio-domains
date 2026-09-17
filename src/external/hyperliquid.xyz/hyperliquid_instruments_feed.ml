@@ -315,13 +315,17 @@ let round_price_to_tick price =
 ;;
 
 (** Rounds quantity down to the instrument's sz_decimals (lot size). Uses floor to prevent
-    over-allocation. Returns qty unmodified if the instrument is not found in the cache. *)
+    over-allocation. Returns qty unmodified if the instrument is not found in the cache.
+    Adds a relative epsilon before the floor so binary representation error cannot drop an
+    on-lot quantity a full step: [0.0003 *. 1e5 = 29.999999999999996] floors to [0.00029]
+    without it, but to [0.0003] with it. *)
 let round_qty_to_lot symbol qty =
   match lookup_info symbol with
   | Some info ->
     let multiplier = 10. ** float_of_int info.sz_decimals in
     (* Floor to avoid exceeding available balance. *)
-    floor (qty *. multiplier) /. multiplier
+    let scaled = qty *. multiplier in
+    floor (scaled +. (1e-9 *. Float.max 1.0 (Float.abs scaled))) /. multiplier
   | None ->
     (* Unknown instrument: return qty unmodified. *)
     qty

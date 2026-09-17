@@ -230,6 +230,17 @@ let test_round_qty () =
     "floor 2 dec"
     1.23
     (Lighter.Types.round_qty ~size_decimals:2 1.2369);
+  (* Regression: an on-lot quantity must not be knocked down a full step by binary
+     representation error (0.0003 *. 1e5 = 29.999999999999996 floors to 0.00029). *)
+  Alcotest.(check (float 0.000000001))
+    "on-lot 0.0003 stays 0.0003"
+    0.0003
+    (Lighter.Types.round_qty ~size_decimals:5 0.0003);
+  (* Genuinely sub-lot fractions still floor down. *)
+  Alcotest.(check (float 0.000000001))
+    "0.000349 floors to 0.00034"
+    0.00034
+    (Lighter.Types.round_qty ~size_decimals:5 0.000349);
   (* idempotency *)
   let q1 = Lighter.Types.round_qty ~size_decimals:4 1.23456789 in
   let q2 = Lighter.Types.round_qty ~size_decimals:4 q1 in

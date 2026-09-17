@@ -41,7 +41,28 @@ let test_round_qty_to_lot () =
   Alcotest.(check (float 0.000001))
     "no round for unknown"
     1.23456
-    (Hyperliquid.Instruments_feed.round_qty_to_lot "UNKNOWN" 1.23456)
+    (Hyperliquid.Instruments_feed.round_qty_to_lot "UNKNOWN" 1.23456);
+  (* Regression: an on-lot quantity must not be knocked down a full step by binary
+     representation error (0.0003 *. 1e5 = 29.999999999999996 floors to 0.00029). BTC has
+     szDecimals = 5. *)
+  Hyperliquid.Instruments_feed.register_test_instrument
+    ~symbol:"RND_BTC/USDC"
+    ~sz_decimals:5;
+  Alcotest.(check (float 0.000000001))
+    "on-lot 0.0003 stays 0.0003"
+    0.0003
+    (Hyperliquid.Instruments_feed.round_qty_to_lot "RND_BTC/USDC" 0.0003);
+  (* Genuinely sub-lot fractions still floor down. *)
+  Alcotest.(check (float 0.000000001))
+    "0.000349 floors to 0.00034"
+    0.00034
+    (Hyperliquid.Instruments_feed.round_qty_to_lot "RND_BTC/USDC" 0.000349);
+  (* Idempotency: re-rounding an already rounded quantity is a no-op. *)
+  let r1 = Hyperliquid.Instruments_feed.round_qty_to_lot "RND_BTC/USDC" 0.0003 in
+  Alcotest.(check (float 0.000000001))
+    "idempotent"
+    r1
+    (Hyperliquid.Instruments_feed.round_qty_to_lot "RND_BTC/USDC" r1)
 ;;
 
 let test_get_subscription_coin () =

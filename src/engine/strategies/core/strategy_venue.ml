@@ -180,10 +180,20 @@ let get_qty_increment_val symbol exchange =
     0.01
 ;;
 
+(** Floor [value] down to the lot whose reciprocal step is [inv] (i.e. a step of
+    [1/.inv]). A relative epsilon is added before the floor so binary representation error
+    cannot drop an on-lot quantity a full step: [0.0003 *. 1e5 = 29.999999999999996]
+    floors to [0.00029] without it, but to [0.0003] with it. *)
+let floor_to_inv value inv =
+  if inv <= 0.0 || not (Float.is_finite inv)
+  then value
+  else (
+    let scaled = value *. inv in
+    floor (scaled +. (1e-9 *. Float.max 1.0 (Float.abs scaled))) /. inv)
+;;
+
 let round_qty qty symbol exchange =
-  let increment = get_qty_increment_val symbol exchange in
-  let inv = 1.0 /. increment in
-  floor ((qty *. inv) +. 1e-9) /. inv
+  floor_to_inv qty (1.0 /. get_qty_increment_val symbol exchange)
 ;;
 
 (** Minimum accepted order QUANTITY for [symbol] in base-asset units, from the live venue
@@ -212,19 +222,13 @@ let venue_lot_qty grid_qty exchange state =
     if grid_qty <= 0.0
     then 0.0
     else (
-      let q =
-        let inv = 1.0 /. state.cached_qty_increment in
-        floor (grid_qty *. inv) /. inv
-      in
+      let q = floor_to_inv grid_qty (1.0 /. state.cached_qty_increment) in
       if q > 0.0 then q else state.cached_venue_min_qty)
   | "lighter" ->
     if grid_qty <= 0.0
     then 0.0
     else (
-      let q =
-        let inv = 1.0 /. state.cached_qty_increment in
-        floor (grid_qty *. inv) /. inv
-      in
+      let q = floor_to_inv grid_qty (1.0 /. state.cached_qty_increment) in
       if q > 0.0 then q else state.cached_venue_min_qty)
   | _ -> grid_qty
 ;;
