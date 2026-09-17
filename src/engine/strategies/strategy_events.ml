@@ -596,6 +596,20 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
             true
           | _ -> false
         in
+        (* A fill is terminal for the placement as well. The placement Ack normally
+           removes the [pending_buy_] token first, but if that Ack is lost or delayed past
+           a fast fill the token would make [buy_leg_facts] report an in-flight buy
+           forever, blocking every later buy placement and amendment. Drop it here, only
+           for our tracked buy (an external/untracked fill must not clear a concurrent
+           placement's token). The token is keyed by price, so this side-scoped clear is
+           the reliable match. *)
+        if side = Buy && _was_tracked_buy
+        then
+          state.pending_orders
+          <- filter_keep_if_needed
+               (fun (pending_id, s, _, _) ->
+                 not (s = Buy && String.starts_with ~prefix:"pending_buy_" pending_id))
+               state.pending_orders;
         (* A fill for the OLD id of a just-replaced order (Hyperliquid/Alpaca
            cancel+create can fill the old order at the moment of replacement): the fill is
            real and its accounting below stands, but the RESTING buy is the replacement -

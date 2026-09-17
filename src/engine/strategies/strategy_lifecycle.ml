@@ -645,6 +645,13 @@ let sync_open_orders
     open_buy_count_from_scan := state.cached_open_buy_count;
     has_recent_amend_buy := state.cached_has_recent_amend_buy;
     locked_in_buys := state.cached_locked_in_buys;
+    (* Publish the cached best buy too: the adoption block below re-tracks a resting buy
+       when tracking was cleared (cancel/amend clearance). Leaving these empty on a skip
+       cycle meant a quiet symbol whose buy was untracked never got adopted - the buy leg
+       then saw [open_buy_count > 0] with no [last_buy_order_id] and could neither amend
+       nor replace it until the next order delta. *)
+    best_buy_id := state.cached_best_buy_id;
+    best_buy_price := state.cached_best_buy_price;
     (match state.cached_closest_sell_order with
      | Some (id, p) ->
        closest_sell_id := id;

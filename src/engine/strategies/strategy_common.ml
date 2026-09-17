@@ -322,6 +322,38 @@ module InFlightAmendments = struct
     | _ -> false
   ;;
 
+  (** True when [order_id] is the replacement (new) id produced by an amendment whose old
+      id is still in the recognition window. A cancel+replace venue (Hyperliquid/Alpaca)
+      returns a new order id and the feed transiently lists the old and new id together;
+      order management that acts on "more than one buy" must treat this new id as part of
+      the amendment, not as a duplicate to cancel. The replacement id has no registry
+      entry of its own (the old id holds the [Replaced] entry), so
+      [is_amend_lifecycle_active] alone does not cover it. *)
+  let is_replacement_target order_id =
+    let rec scan s =
+      if s >= num_shards
+      then false
+      else (
+        let registry = registries.(s) in
+        let mutex = shard_mutexes.(s) in
+        Mutex.lock mutex;
+        let found =
+          Hashtbl.fold
+            (fun _ (entry : entry) acc ->
+              acc
+              ||
+              match entry.phase with
+              | Replaced new_id -> String.equal new_id order_id
+              | _ -> false)
+            registry
+            false
+        in
+        Mutex.unlock mutex;
+        found || scan (s + 1))
+    in
+    scan 0
+  ;;
+
   (** Remove [order_id] from the registry (terminal phases, cleanup). Returns true if it
       was present. *)
   let remove_in_flight_amendment order_id =
