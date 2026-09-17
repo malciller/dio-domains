@@ -1,10 +1,11 @@
 # dio-domains
 
 dio is an OCaml 5 trading engine built for high-frequency trading. Strategies
-live in files. The engine loads a strategy, validates it, and runs it over a
-library of registered actions. The bundled strategy is Jacobs Ladder, a grid
-that buys dips and sells into reversals. It runs against Kraken, Hyperliquid,
-Lighter, Interactive Brokers, and Alpaca.
+are authored and extended through a scripting configuration. The engine loads a
+strategy, validates it, and runs it over a library of registered actions. The
+bundled strategy is Jacobs Ladder, a grid that buys dips and sells into
+reversals. It runs against Kraken, Hyperliquid, Lighter, Interactive Brokers,
+and Alpaca.
 
 Each traded asset runs in its own OCaml domain. Order intents go through a
 lock-free executor, and market data arrives on lock-free ring buffers. A
