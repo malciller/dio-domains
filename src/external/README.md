@@ -228,7 +228,7 @@ let () = ignore Alpaca.Module.Alpaca_impl.name
 
 - US equities, paper or live. `data_feed` selects `iex` (default, free) or `sip` (paid, full-market).
 - Balances and positions are REST-polled every 2 seconds (`/v2/account`, `/v2/positions`) and published to an atomic store that `get_tradeable_balance_fast` reads. `get_available_balance_fast` returns the venue's available quantity, because the stored balance is gross. Order and fill events arrive over SSE (`/v2/events/trades`), not WebSocket.
-- Sessions: regular `09:30`–`16:00` ET; pre-market `04:00`–`09:30`; after-hours `16:00`–`20:00`; overnight `20:00`–`04:00`; the full tradable window runs from Sunday `20:00` to Friday `20:00` ET. The extended-hours flag is attached to non-crypto limit orders placed in an extended session. `day` TIF is forced only for fractional equity orders; otherwise the requested TIF (default `gtc`) is used.
+- Sessions: regular `09:30` to `16:00` ET; pre-market `04:00` to `09:30`; after-hours `16:00` to `20:00`; overnight `20:00` to `04:00`; the full tradable window runs from Sunday `20:00` to Friday `20:00` ET. The extended-hours flag is attached to non-crypto limit orders placed in an extended session. `day` TIF is forced only for fractional equity orders; otherwise the requested TIF (default `gtc`) is used.
 - `default_fees`: `0.0` / `0.0`. `default_quote`: `USD`. `min_notional`: `1.0`.
 - Oracle adapter: `data.alpaca.markets` `/v2/stocks/{symbol}/bars` (timeframe `1Day`, default feed `iex`, paginated on `next_page_token`, maximum 30 pages) plus `/v2/calendar` on the paper trading host for session dates.
 
