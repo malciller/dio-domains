@@ -159,26 +159,33 @@ let load ~key =
 ;;
 
 (** Resolve the store key whose symbol segment is [symbol]
-    ("{strategy}:{symbol}:{venue}"). Used during hydration before the strategy
-    name is known; logs a warning and picks the first when ambiguous. *)
+    ("{strategy}:{symbol}:{venue}"). When exactly one configured strategy matches the
+    symbol, return its canonical key directly (same key [state_key_of_symbol] uses), so
+    stale keys left by a strategy rename never shadow the live entry. Otherwise fall back
+    to a symbol-segment scan; logs a warning and picks the first when that is ambiguous. *)
 let resolve_key_for_symbol ~symbol =
-  let matches_symbol k =
-    match String.split_on_char ':' k with
-    | [ _strategy; sym; _venue ] -> sym = symbol
-    | _ -> false
-  in
-  let matches = List.filter matches_symbol (Persistence_orchestrator.keys orchestrator) in
-  match matches with
-  | [] -> None
-  | [ k ] -> Some k
-  | k :: _ ->
-    Logging.warn_f
-      ~section
-      "Ambiguous persistence key for symbol %s (%d matches); using %s"
-      symbol
-      (List.length matches)
-      k;
-    Some k
+  match Persistence_orchestrator.unique_configured_strategy_for_symbol symbol with
+  | Some (strategy, venue) -> Some (key_of ~strategy ~symbol ~venue)
+  | None ->
+    let matches_symbol k =
+      match String.split_on_char ':' k with
+      | [ _strategy; sym; _venue ] -> sym = symbol
+      | _ -> false
+    in
+    let matches =
+      List.filter matches_symbol (Persistence_orchestrator.keys orchestrator)
+    in
+    (match matches with
+     | [] -> None
+     | [ k ] -> Some k
+     | k :: _ ->
+       Logging.warn_f
+         ~section
+         "Ambiguous persistence key for symbol %s (%d matches); using %s"
+         symbol
+         (List.length matches)
+         k;
+       Some k)
 ;;
 
 let save ~key t = Persistence_orchestrator.put orchestrator ~key t
