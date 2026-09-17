@@ -2,20 +2,32 @@ name: ci
 on:
   push:
     branches: ["**"]
-    # Tags are release gates: build-test on the exact commit that the
+    # Tags are release gates: build-test-oxcaml on the exact commit that the
     # release workflow waits for before publishing a GitHub Release.
     tags: ["v*"]
   pull_request:
 
 jobs:
-  build-test:
-    # Classic-flambda OCaml 5.2 build + tests. This is the production toolchain
-    # for `main`. `ubuntu-latest` is understood by GitHub-hosted runners and by
-    # the standard act_runner label set used by Gitea; if the self-hosted Gitea
-    # runner uses a custom label, change this to that label.
+  build-test-oxcaml:
+    # OxCaml (flambda2) build + tests, using the split image process:
+    # Dockerfile.base builds the OxCaml compiler + all opam deps (slow, changes
+    # rarely), and Dockerfile builds the engine on top of it (fast). The base
+    # image is cached between CI runs so day-to-day builds never recompile the
+    # compiler.
+    #
+    # This is the only toolchain: the engine uses OxCaml features (`local_`
+    # signature mode) and runtime symbols (`caml_minor_words_allocated`) that
+    # stock OCaml does not provide, so there is no classic-flambda job.
+    #
+    # Requires a runner with Docker and >= 16 GB RAM for the first (uncached)
+    # base build: the OxCaml compiler bootstrap OOMs at 8 GB. On the
+    # self-hosted Gitea runner, `runs-on` must name a label whose runner has
+    # both; change it if needed.
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      DIO_BASE_IMAGE: dio-oxcaml-base:5.2.0minus40
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -45,100 +57,6 @@ jobs:
             exit 1
           fi
           echo "cohttp client-only guard passed"
-
-      - name: Install system build dependencies
-        run: |
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-               bubblewrap g++-multilib gcc-multilib m4 make mercurial \
-               musl-tools rsync autoconf automake libtool \
-               libffi-dev libgmp-dev libpcre3-dev libssl-dev pkg-config
-
-      - name: Build libsecp256k1 with schnorrsig support
-        # Pinned to the v0.7.1 commit: without this the step builds whatever
-        # upstream HEAD is at run time and installs it as root.
-        env:
-          SECP256K1_COMMIT: 1a53f4961f337b4d166c25fce72ef0dc88806618
-        run: |
-          rm -rf /tmp/secp256k1
-          git clone https://github.com/bitcoin-core/secp256k1.git /tmp/secp256k1
-          git -C /tmp/secp256k1 checkout --detach "$SECP256K1_COMMIT"
-          cd /tmp/secp256k1
-          ./autogen.sh
-          ./configure --enable-module-schnorrsig --enable-module-recovery
-          make
-          sudo make install
-          sudo ldconfig
-
-      - name: Set up opam and OCaml 5.2.0
-        # Must be idempotent: the self-hosted Gitea runner persists its opam
-        # root and `default` switch between jobs, unlike GitHub-hosted runners.
-        # `opam init` on an already-initialised root exits non-zero, so reinit
-        # instead. A `default` switch that is not on 5.2.0 is removed and
-        # recreated, so a stale switch cannot leak into the build.
-        run: |
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y opam
-          if [ -d "$HOME/.opam" ]; then
-            opam init --bare --disable-sandboxing --reinit -y --no-setup
-          else
-            opam init --bare --disable-sandboxing -y --no-setup
-          fi
-          if opam switch list --short 2>/dev/null | grep -qx "default"; then
-            if ! opam exec --switch default -- ocamlc -version 2>/dev/null | grep -qx "5.2.0"; then
-              opam switch remove default -y
-            fi
-          fi
-          if ! opam switch list --short 2>/dev/null | grep -qx "default"; then
-            opam switch create default ocaml-base-compiler.5.2.0 -y
-          fi
-          eval "$(opam env --switch default)"
-          opam exec --switch default -- ocamlc -version
-
-      # actions/cache is only available on github.com; the Gitea act_runner
-      # does not implement it. The guard keeps the step to GitHub while the rest
-      # of the workflow runs unchanged on both.
-      - name: Restore Dune cache
-        if: github.server_url == 'https://github.com'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/dune
-          key: ${{ runner.os }}-dune-cache-${{ hashFiles('**/*.opam', 'dune-project', 'dune') }}
-          restore-keys: |
-            ${{ runner.os }}-dune-cache-
-
-      - name: Install opam deps
-        run: opam install . --deps-only --with-test --assume-depexts -y --switch default
-
-      - name: Build
-        # Clean first: the self-hosted Gitea runner reuses a workspace, and a
-        # `_build` left over from a previous job can contain absolute paths to a
-        # switch that no longer exists (e.g. after the switch is recreated).
-        run: |
-          opam exec --switch default -- dune clean
-          opam exec --switch default -- dune build @all
-
-      - name: Run tests
-        run: opam exec --switch default -- dune runtest
-
-  build-test-oxcaml:
-    # OxCaml (flambda2) build + tests, using the split image process:
-    # Dockerfile.base builds the OxCaml compiler + all opam deps (slow, changes
-    # rarely), and Dockerfile builds the engine on top of it (fast). The base
-    # image is cached between CI runs so day-to-day builds never recompile the
-    # compiler.
-    #
-    # Requires a runner with Docker and >= 16 GB RAM for the first (uncached)
-    # base build: the OxCaml compiler bootstrap OOMs at 8 GB. On the
-    # self-hosted Gitea runner, `runs-on` must name a label whose runner has
-    # both; change it if needed.
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      DIO_BASE_IMAGE: dio-oxcaml-base:5.2.0minus40
-
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Buildx (GitHub-hosted runners)
         if: github.server_url == 'https://github.com'
