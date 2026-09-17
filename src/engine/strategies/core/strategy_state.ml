@@ -345,6 +345,14 @@ type strategy_state =
          figure (tradeable for accumulation venues, gross for Alpaca). *)
   ; mutable position_initialized : bool
       (* true once [position_base] has been seeded from a venue balance *)
+  ; mutable position_gross : float
+      (* Adopted GROSS base ([total] minus staked/delegated) for hold-netted venues that
+         expose it; [nan] until seeded. The gross/hold split is what lets the overlays
+         tell a buy fill apart from a sell hold: a buy raises gross, a sell hold does not. *)
+  ; mutable balance_uses_gross : bool
+      (* true once [position_gross] has been seeded; switches the feed-lag overlays to
+         gross/hold reconciliation (see [reconcile_position]) so a buy fill offset by a
+         same-window sell hold is still attributed and cannot inflate sellable inventory. *)
   ; mutable buy_credits_since_balance : (float * float) list
       (* (fill wall-clock time, credited qty) for buy fills not yet reflected in the
          balance feed, oldest first. Mirrors [sell_holds_since_balance]: entries at/after
@@ -659,6 +667,8 @@ let rec get_strategy_state asset_symbol =
       ; skipped_fills_total = 0
       ; position_base = 0.0
       ; position_initialized = false
+      ; position_gross = Float.nan
+      ; balance_uses_gross = false
       ; buy_credits_since_balance = []
       ; attributed_balance_increase = 0.0
       ; position_venue_ts = 0.0

@@ -12,6 +12,7 @@ let test_arm_then_outstanding () =
   let holds = Platform_accounting.arm_sell_hold ~holds:[] ~qty:2.0 ~now:100.0 in
   let holds', unnetted =
     Platform_accounting.unnetted_sell_hold
+      ~allow_message_certify:true
       ~use_unnetted:true
       ~holds
       ~last_balance_delta:1.0
@@ -27,6 +28,7 @@ let test_released_by_flat_message () =
   let holds = [ 100.0, 2.0 ] in
   let holds', unnetted =
     Platform_accounting.unnetted_sell_hold
+      ~allow_message_certify:true
       ~use_unnetted:true
       ~holds
       ~last_balance_delta:0.0
@@ -37,11 +39,30 @@ let test_released_by_flat_message () =
   Alcotest.(check bool) "no holds" true (holds' = [])
 ;;
 
+let test_no_certify_on_flat () =
+  (* With message-certification disabled (the gross/hold reconciliation path), a flat
+     tradeable message must NOT retire a hold - a flat figure can be a buy fill offset by
+     a same-window sell hold. Retirement then comes from an observed hold change or grace. *)
+  let holds = [ 100.0, 2.0 ] in
+  let holds', unnetted =
+    Platform_accounting.unnetted_sell_hold
+      ~allow_message_certify:false
+      ~use_unnetted:true
+      ~holds
+      ~last_balance_delta:0.0
+      ~now:101.0
+      ~base_balance_age:(Some 0.0)
+  in
+  Alcotest.(check bool) "flat message does not certify" true (approx unnetted 2.0);
+  Alcotest.(check bool) "hold kept" true (holds_eq holds' [ 100.0, 2.0 ])
+;;
+
 let test_released_by_grace () =
   (* dead feed (age None): the grace retires an old hold *)
   let holds = [ 100.0, 2.0 ] in
   let _, unnetted =
     Platform_accounting.unnetted_sell_hold
+      ~allow_message_certify:true
       ~use_unnetted:true
       ~holds
       ~last_balance_delta:1.0
@@ -55,6 +76,7 @@ let test_disabled () =
   let holds = [ 100.0, 2.0 ] in
   let holds', unnetted =
     Platform_accounting.unnetted_sell_hold
+      ~allow_message_certify:true
       ~use_unnetted:false
       ~holds
       ~last_balance_delta:1.0
@@ -261,6 +283,10 @@ let () =
             "released by flat message"
             `Quick
             test_released_by_flat_message
+        ; Alcotest.test_case
+            "flat does not certify when disabled"
+            `Quick
+            test_no_certify_on_flat
         ; Alcotest.test_case "released by grace" `Quick test_released_by_grace
         ; Alcotest.test_case "disabled" `Quick test_disabled
         ; Alcotest.test_case "consume FIFO" `Quick test_consume_fifo

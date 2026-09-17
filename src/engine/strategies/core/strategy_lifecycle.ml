@@ -94,6 +94,7 @@ let unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age =
   let holds, amount =
     Platform_accounting.unnetted_sell_hold
       ~use_unnetted:ecfg.use_unnetted_sell_hold
+      ~allow_message_certify:(not state.balance_uses_gross)
       ~holds:state.sell_holds_since_balance
       ~last_balance_delta:state.last_balance_delta
       ~now
@@ -153,7 +154,7 @@ let log_sell_block ?(kind = "") ~state ~now ~symbol reason =
     figure and could size a sell past [reserved_base]). Any buy credit the message's
     generation time already covers is dropped from the overlay; newer credits stay, so a
     just-filled buy remains sellable until the feed nets it. *)
-let reconcile_position ~state ~now ~base_balance_age ~asset_balance =
+let reconcile_position ~state ~now ~base_balance_age ~asset_balance ~asset_gross =
   if not (Float.is_nan asset_balance)
   then (
     let venue_ts =
@@ -171,6 +172,9 @@ let reconcile_position ~state ~now ~base_balance_age ~asset_balance =
     in
     if (not state.position_initialized) || is_new_message
     then (
+      (* The venue gross read (module lookup + two balance atomics) is paid only when a
+         message is actually adopted, not every cycle. *)
+      let asset_gross = asset_gross () in
       (* Track how far the adopted figure moved since the last adoption. A positive move
          can already contain buy fills whose execution events have not arrived yet
          (executions and balances are independent feeds), so buy fills draw this down
@@ -180,14 +184,38 @@ let reconcile_position ~state ~now ~base_balance_age ~asset_balance =
          (nonexistent) fill merely under-credit, which is the safe direction. *)
       let delta = asset_balance -. state.position_base in
       let was_initialized = state.position_initialized in
+      (* Gross change of this message, when the venue exposes a gross total. [None] on the
+         first gross-bearing message (nothing to diff against) and when no gross is
+         available. *)
+      let gross_delta =
+        match asset_gross with
+        | Some g when was_initialized && not (Float.is_nan state.position_gross) ->
+          Some (g -. state.position_gross)
+        | _ -> None
+      in
       if was_initialized
       then (
-        state.attributed_balance_increase
-        <- Float.max 0.0 (state.attributed_balance_increase +. delta);
-        (* A tradeable DROP is the venue netting holds (or base leaving): retire the
-           oldest outstanding sell holds by that amount. Buys only raise tradeable, so
-           they never consume a hold. *)
-        if delta < 0.0 then consume_sell_hold_netting ~state ~amount:(-.delta))
+        match gross_delta with
+        | Some d_gross ->
+          (* Gross basis: a buy fill raises gross, so attribute against gross - a
+             same-window sell hold cannot mask it. *)
+          state.attributed_balance_increase
+          <- Float.max 0.0 (state.attributed_balance_increase +. Float.max 0.0 d_gross);
+          (* A genuine hold move is the gross/tradeable gap changing: an application (hold
+             up) or a fill (hold down) both mean the venue has accounted for the committed
+             base. Retire armed holds by that magnitude. A flat tradeable with a matching
+             gross rise (buy fill + sell hold) therefore neither leaves the buy credit
+             unabsorbed nor the sell hold netted. *)
+          let d_hold = d_gross -. delta in
+          if abs_float d_hold > 1e-12
+          then consume_sell_hold_netting ~state ~amount:(abs_float d_hold)
+        | None ->
+          state.attributed_balance_increase
+          <- Float.max 0.0 (state.attributed_balance_increase +. delta);
+          (* A tradeable DROP is the venue netting holds (or base leaving): retire the
+             oldest outstanding sell holds by that amount. Buys only raise tradeable, so
+             they never consume a hold. *)
+          if delta < 0.0 then consume_sell_hold_netting ~state ~amount:(-.delta))
       else state.attributed_balance_increase <- 0.0;
       (* Direction of this message, consumed by [unnetted_sell_hold]: only a flat/down
          move can have applied an outstanding sell hold. A buy-fill increase bumps the
@@ -196,6 +224,11 @@ let reconcile_position ~state ~now ~base_balance_age ~asset_balance =
       state.last_balance_delta <- (if was_initialized then delta else 0.0);
       state.position_base <- asset_balance;
       state.position_initialized <- true;
+      (match asset_gross with
+       | Some g ->
+         state.position_gross <- g;
+         state.balance_uses_gross <- true
+       | None -> ());
       state.position_venue_ts <- venue_ts;
       (* Retire overlay credits the adopted increase already covers, oldest first, then
          drop anything older than the message generation (belt and suspenders for a dead
@@ -252,6 +285,35 @@ let venue_available_base ~(asset : trading_config) =
     | None -> Float.nan)
 ;;
 
+(** Gross per-asset base ([total] minus staked/delegated) for hold-netted venues that
+    expose it, or [None] when unavailable. This is the basis the feed-lag overlays need to
+    tell a buy fill (raises gross) apart from a sell hold (raises hold, not gross): the
+    tradeable figure alone cannot, because a buy fill and a same-window sell hold cancel
+    in it. Returns [None] on venues that do not net holds from their own state, and when
+    the gross figure is missing/zero or inconsistent (below the reported tradeable), so
+    callers fall back to the legacy net-delta reconciliation. *)
+let venue_gross_base ~(hold_netted : bool) ~(asset : trading_config) ~spendable =
+  if not hold_netted
+  then None
+  else (
+    match get_exchange_module asset.exchange with
+    | Some (module Ex : Exchange.S) ->
+      let total =
+        try Ex.get_total_balance ~asset:asset.symbol with
+        | _ -> Float.nan
+      in
+      let staked =
+        try Ex.get_staked_balance ~asset:asset.symbol with
+        | _ -> Float.nan
+      in
+      if Float.is_nan total || Float.is_nan staked
+      then None
+      else (
+        let gross = Float.max 0.0 (total -. staked) in
+        if gross +. 1e-9 < spendable then None else Some gross)
+    | None -> None)
+;;
+
 (** Evaluates asset balance recovery and clears asset_low when available balance is
     restored. *)
 let evaluate_asset_low_recovery
@@ -266,7 +328,13 @@ let evaluate_asset_low_recovery
   =
   if not (Float.is_nan asset_balance)
   then (
-    reconcile_position ~state ~now ~base_balance_age ~asset_balance;
+    let asset_gross () =
+      venue_gross_base
+        ~hold_netted:ecfg.hold_netted_from_venue_state
+        ~asset
+        ~spendable:asset_balance
+    in
+    reconcile_position ~state ~now ~base_balance_age ~asset_balance ~asset_gross;
     let unreflected = unreflected_buy_credit ~state ~base_balance_age ~now in
     let asset_bal = state.position_base +. unreflected in
     let qty_f = lot_qty in

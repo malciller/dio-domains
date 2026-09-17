@@ -504,6 +504,7 @@ let test_unnetted_sell_hold_gates_second_sizing () =
     (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
        state.duplicate_key_sell);
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:103.0
     ~base_balance_age:(Some 0.2)
@@ -833,6 +834,7 @@ let test_unnetted_sell_hold_burst_downmove () =
        tradeable net unchanged (no drop), message newer than the armed hold. *)
     let msg_now = fill_now +. 0.5 in
     Dio_strategies.Strategy_api.reconcile_position
+      ~asset_gross:(fun () -> None)
       ~state
       ~now:msg_now
       ~base_balance_age:(Some 0.0)
@@ -952,6 +954,7 @@ let test_unnetted_sell_hold_ignores_buy_increase () =
   (* Message t=110 (age 1.0): tradeable 0.05 -> 0.20, a +0.15 buy-fill increase not yet
      carrying the sell's hold. *)
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:110.0
     ~base_balance_age:(Some 1.0)
@@ -994,6 +997,7 @@ let test_unnetted_sell_hold_ignores_buy_increase () =
     (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
        state.duplicate_key_sell);
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:111.0
     ~base_balance_age:(Some 1.0)
@@ -1207,6 +1211,7 @@ let test_position_reconcile_freshness_gate () =
   (* Message generated at 999 (now 1000.5, age 1.5): adopt the figure and prune the credit
      it covers. *)
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:1000.5
     ~base_balance_age:(Some 1.5)
@@ -1225,6 +1230,7 @@ let test_position_reconcile_freshness_gate () =
      adopted value nor the fresh credit changes. *)
   state.buy_credits_since_balance <- [ 999.7, 0.15 ];
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:1000.1
     ~base_balance_age:(Some 1.4)
@@ -1241,6 +1247,7 @@ let test_position_reconcile_freshness_gate () =
     (List.length state.buy_credits_since_balance = 1);
   (* Feed catches up (generated 1001.5): adopt the value and prune. *)
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:1002.0
     ~base_balance_age:(Some 0.5)
@@ -1271,6 +1278,7 @@ let test_position_reconcile_lower_balance_cannot_dip_reserve () =
   state.position_venue_ts <- 500.0;
   state.buy_credits_since_balance <- [];
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:501.0
     ~base_balance_age:(Some 0.5)
@@ -1305,6 +1313,7 @@ let test_position_seed_prunes_covered_credit () =
   state.buy_credits_since_balance <- [ 998.5, 0.2 ];
   (* First message generated at 999 (after the fill at 998.5). *)
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:1000.5
     ~base_balance_age:(Some 1.5)
@@ -1339,6 +1348,7 @@ let test_position_seed_keeps_newer_credit () =
   state.position_venue_ts <- 0.0;
   state.buy_credits_since_balance <- [ 999.5, 0.2 ];
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:1000.5
     ~base_balance_age:(Some 1.5)
@@ -1367,6 +1377,7 @@ let test_position_stale_message_does_not_regress_ledger () =
   state.position_venue_ts <- 1000.0;
   state.buy_credits_since_balance <- [];
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:1000.1
     ~base_balance_age:(Some 10.0)
@@ -1391,6 +1402,7 @@ let test_position_partial_credit_prune () =
   state.buy_credits_since_balance <- [ 998.5, 0.1; 999.5, 0.2 ];
   (* Message generated at 999.5; fill at 998.5 covered, fill at 999.5 not. *)
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:1000.0
     ~base_balance_age:(Some 0.5)
@@ -1433,6 +1445,7 @@ let test_position_balance_before_fill_no_double_credit () =
   state.last_fill_oid <- None;
   (* Balance message already includes the 0.2 fill. *)
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:1001.0
     ~base_balance_age:(Some 0.0)
@@ -1532,6 +1545,7 @@ let test_position_upward_reconcile_adopts_venue () =
   state.position_venue_ts <- 1000.0;
   state.buy_credits_since_balance <- [];
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:1001.0
     ~base_balance_age:(Some 0.5)
@@ -1555,6 +1569,7 @@ let test_position_nan_balance_does_not_seed () =
   state.position_venue_ts <- 0.0;
   state.buy_credits_since_balance <- [ 999.5, 0.2 ];
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:1000.0
     ~base_balance_age:(Some 0.5)
@@ -1644,6 +1659,74 @@ let test_position_buy_credit_and_sell_hold_cancel () =
     true
     (sell_qty < 1e-9);
   drain ()
+;;
+
+let test_position_gross_reconcile_flat_message_clears_overlays () =
+  (* REGRESSION (dip-cascade oversell): on a hold-netted venue a buy fill and a
+     same-window sell hold cancel in the tradeable figure, so the balance message nets to
+     flat. The net-delta reconciliation absorbed neither the buy credit nor retired the
+     hold on a genuine hold change: the buy credit then rode on top of base already
+     committed to the resting sell, inflating one 0.15 rung into a rejected 0.30 sell.
+     Reconciling against the gross total and the hold separately absorbs the credit (gross
+     rose) and retires the hold (hold rose), so the two cancel to zero. *)
+  let symbol = "GROSS1/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.15;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 0.98;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.0922;
+  state.accumulated_profit <- 0.0;
+  Sell_orders.clear state.open_sell_orders;
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- true;
+  state.position_base <- 0.0933;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 100.0;
+  state.position_gross <- 0.2433;
+  state.balance_uses_gross <- true;
+  state.last_seen_asset_balance <- 0.0933;
+  state.buy_credits_since_balance <- [ 101.0, 0.15 ];
+  state.attributed_balance_increase <- 0.0;
+  state.sell_holds_since_balance <- [ 100.0, 0.15 ];
+  state.last_balance_delta <- 0.0;
+  (* Message at t=101: tradeable flat (the buy raised gross, the hold raised, they
+     cancel). *)
+  Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> Some 0.3933)
+    ~state
+    ~now:101.0
+    ~base_balance_age:(Some 0.0)
+    ~asset_balance:0.0933;
+  check
+    bool
+    "gross rise absorbs the pending buy credit"
+    true
+    (state.buy_credits_since_balance = []);
+  check
+    bool
+    "hold rise retires the armed sell hold"
+    true
+    (state.sell_holds_since_balance = []);
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let unnetted =
+    Dio_strategies.Strategy_api.unnetted_sell_hold
+      ~state
+      ~ecfg
+      ~now:101.0
+      ~base_balance_age:(Some 0.0)
+  in
+  check bool "no residual unnetted sell hold" true (unnetted < 1e-9);
+  let available = state.position_base -. state.reserved_base -. unnetted in
+  check
+    bool
+    "available does not include the phantom rung"
+    true
+    (available <= 0.0933 -. 0.0922 +. 1e-9)
 ;;
 
 let test_position_dead_feed_credit_expires () =
@@ -1968,6 +2051,7 @@ let test_position_sell_hold_releases_fifo_on_netting () =
   (* A 0.15 tradeable drop (the older hold netting) must retire only the oldest hold,
      leaving the newer one outstanding. *)
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:1002.0
     ~base_balance_age:(Some 0.5)
@@ -1987,6 +2071,7 @@ let test_position_sell_hold_releases_fifo_on_netting () =
   state.position_base <- 0.35;
   state.position_venue_ts <- 1002.0;
   Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
     ~state
     ~now:1004.0
     ~base_balance_age:(Some 0.5)
@@ -6768,6 +6853,10 @@ let () =
             "buy credit and unnetted sell hold cancel in the lag window"
             `Quick
             test_position_buy_credit_and_sell_hold_cancel
+        ; test_case
+            "gross reconcile clears buy credit and sell hold on a flat message"
+            `Quick
+            test_position_gross_reconcile_flat_message_clears_overlays
         ; test_case
             "credit decays when the feed goes silent past the grace"
             `Quick

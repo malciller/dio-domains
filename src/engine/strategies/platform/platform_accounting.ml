@@ -74,7 +74,14 @@ let no_unnetted_hold = [], 0.0
 
 let no_unreflected_credit = [], 0.0
 
-let unnetted_sell_hold ~use_unnetted ~holds ~last_balance_delta ~now ~base_balance_age =
+let unnetted_sell_hold
+  ~use_unnetted
+  ~allow_message_certify
+  ~holds
+  ~last_balance_delta
+  ~now
+  ~base_balance_age
+  =
   match holds with
   | [] -> no_unnetted_hold
   | _ :: _ ->
@@ -86,10 +93,17 @@ let unnetted_sell_hold ~use_unnetted ~holds ~last_balance_delta ~now ~base_balan
       let cutoff = unreflected_cutoff ~now ~base_balance_age in
       let grace_cutoff = now -. sell_hold_netting_grace_s in
       (* A message may certify netting only if its move was flat or down. An increase (buy
-         fill) cannot have applied a sell hold. The tolerance absorbs the float jitter
+         fill) cannot have applied a sell hold. On a hold-netted venue that exposes a
+         gross total, message-certification is disabled ([allow_message_certify = false]):
+         a flat tradeable figure there can be a buy fill offset by a same-window sell
+         hold, which must NOT read as the hold having been netted. Retirement then comes
+         only from an observed hold change (see [reconcile_position] /
+         [consume_sell_hold_netting]) or the grace. The tolerance absorbs the float jitter
          between an adopted venue figure and the same figure recomputed by the venue
          model, which otherwise reads as a tiny positive "increase" and wedges the hold. *)
-      let message_may_certify = last_balance_delta <= balance_delta_epsilon in
+      let message_may_certify =
+        allow_message_certify && last_balance_delta <= balance_delta_epsilon
+      in
       let rec go unnetted acc = function
         | [] -> List.rev acc, unnetted
         | (placed_at, qty) :: rest ->
