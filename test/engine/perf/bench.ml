@@ -4,6 +4,7 @@ module SG = Dio_strategies.Strategy_api
 module FC = Dio_strategies.Fee_cache
 module SR = Dio_strategies.Strategy_runtime
 module SF = Dio_strategies.Strategy_file
+module SL = Dio_strategies.Strategy_loader
 module SA = Dio_strategies.Strategy_actions_cycle
 module SCE = Dio_strategies.Strategy_cycle_engine
 module SS = Dio_strategies.Strategy_state
@@ -233,10 +234,10 @@ let bench_strategy_cycle () =
   let name = "strategy_run_cycle_real_file" in
   let path =
     match Sys.getenv_opt "DUNE_SOURCEROOT" with
-    | Some root -> Filename.concat root "strategies/jacobs_ladder.json"
-    | None -> "strategies/jacobs_ladder.json"
+    | Some root -> Filename.concat root "strategies/jacobs_ladder.strategy"
+    | None -> "strategies/jacobs_ladder.strategy"
   in
-  match SF.parse_file path with
+  match SL.parse_file ~path with
   | Error e ->
     Printf.eprintf "bench: %s\n%!" e;
     name, 0, 0.0, 0.0, 0.0, 0.0

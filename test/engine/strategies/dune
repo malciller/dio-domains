@@ -1,31 +1,48 @@
 (test
  (name test_strategy_common)
+ (modules test_strategy_common)
  (libraries dio.strategies dio.engine alcotest))
 
 (test
  (name test_jacobs_ladder)
+ (modules test_jacobs_ladder)
  (libraries dio.strategies dio.engine dio.hyperliquid dio.alpaca alcotest))
 
 (test
  (name test_jacobs_ladder_sell_orders)
+ (modules test_jacobs_ladder_sell_orders)
  (libraries dio.strategies alcotest))
 
 (test
  (name test_strategy_compose)
+ (modules test_strategy_compose)
  (libraries dio.strategies alcotest))
+
+(rule
+ (copy ../../../strategies/jacobs_ladder.strategy jacobs_ladder.strategy))
+
+(test
+ (name test_strategy_script)
+ (modules test_strategy_script)
+ (libraries dio.strategies alcotest)
+ (deps jacobs_ladder.strategy))
 
 (test
  (name test_strategy_runtime)
+ (modules test_strategy_runtime)
  (libraries dio.strategies alcotest))
 
 (test
  (name test_strategy_harness)
+ (modules test_strategy_harness)
  (libraries dio.strategies alcotest))
 
 (test
  (name test_platform_accounting)
+ (modules test_platform_accounting)
  (libraries dio.strategies alcotest))
 
 (test
  (name test_hot_path_invariants)
+ (modules test_hot_path_invariants)
  (libraries dio.strategies dio.engine alcotest))

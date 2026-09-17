@@ -5,7 +5,10 @@
     normally. *)
 
 let usage =
-  "Usage:\n  dio strategy validate <strategy.json>\n  dio strategy diff <a.json> <b.json>"
+  "Usage:\n\
+  \  dio strategy validate <file>\n\
+  \  dio strategy compile <file.strategy> [-o out.json]\n\
+  \  dio strategy diff <a> <b>"
 ;;
 
 let print_diagnostic (d : Strategy_compile.diagnostic) =
@@ -14,7 +17,7 @@ let print_diagnostic (d : Strategy_compile.diagnostic) =
 
 let validate_file (path : string) : int =
   Strategy_actions_builtin.register_all ();
-  match Strategy_file.parse_file path with
+  match Strategy_loader.parse_file ~path with
   | Error msg ->
     Printf.eprintf "strategy: %s: parse failed: %s\n" path msg;
     1
@@ -33,6 +36,36 @@ let validate_file (path : string) : int =
         (List.length warnings);
       List.iter print_diagnostic diags);
     if Strategy_compile.has_errors diags then 1 else 0
+;;
+
+let compile_file (path : string) (output : string option) : int =
+  Strategy_actions_builtin.register_all ();
+  match Strategy_loader.parse_file ~path with
+  | Error msg ->
+    Printf.eprintf "strategy: %s: parse failed: %s\n" path msg;
+    2
+  | Ok f ->
+    let diags = Strategy_compile.validate f in
+    if Strategy_compile.has_errors diags
+    then (
+      Printf.printf
+        "strategy %S (%s): %d error(s)\n"
+        f.name
+        path
+        (List.length (Strategy_compile.errors diags));
+      List.iter print_diagnostic diags;
+      2)
+    else (
+      let json = Strategy_file.to_json f in
+      let rendered = Yojson.Basic.pretty_to_string json in
+      (match output with
+       | None -> Printf.printf "strategy %S (%s): ok\n%s\n" f.name path rendered
+       | Some out ->
+         let ch = open_out out in
+         output_string ch rendered;
+         close_out ch;
+         Printf.printf "strategy %S: compiled to %s\n" f.name out);
+      0)
 ;;
 
 let diff_files (a : string) (b : string) : int =
@@ -55,6 +88,13 @@ let diff_files (a : string) (b : string) : int =
 let maybe_run (argv : string array) : int option =
   match Array.to_list argv with
   | _ :: "strategy" :: "validate" :: file :: _ -> Some (validate_file file)
+  | _ :: "strategy" :: "compile" :: file :: rest ->
+    let output =
+      match rest with
+      | "-o" :: out :: _ -> Some out
+      | _ -> None
+    in
+    Some (compile_file file output)
   | _ :: "strategy" :: "diff" :: a :: b :: _ -> Some (diff_files a b)
   | _ :: "strategy" :: _ ->
     Printf.eprintf "%s\n" usage;

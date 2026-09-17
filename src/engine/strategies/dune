@@ -49,6 +49,8 @@
   Strategy_cycle_engine
   ; protocol/ — strategy-file interpreter
   Strategy_file
+  Strategy_script
+  Strategy_loader
   Strategy_compile
   Strategy_expr
   Strategy_guard

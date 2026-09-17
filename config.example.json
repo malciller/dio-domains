@@ -22,7 +22,7 @@
         0.1,
         0.5
       ],
-      "strategy": "Ladder",
+      "strategy": "jacobs_ladder",
       "testnet": true,
       "sell_mult": "0.99",
       "cpu_priority": 10,
@@ -39,7 +39,7 @@
         0.1,
         0.5
       ],
-      "strategy": "Ladder",
+      "strategy": "jacobs_ladder",
       "testnet": true,
       "data_feed": "iex",
       "sell_levels": true,

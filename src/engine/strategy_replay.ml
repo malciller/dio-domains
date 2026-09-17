@@ -707,8 +707,12 @@ let run
             then replay ~asset ~set_venue_available ~trace
             else (
               Strategy_actions_builtin.register_all ();
-              let path_file = Printf.sprintf "strategies/%s.json" asset.strategy in
-              match Strategy_file.parse_file path_file with
+              let path_file =
+                match Dio_strategies.Strategy_loader.locate ~name:asset.strategy with
+                | Some p -> p
+                | None -> Printf.sprintf "strategies/%s.json" asset.strategy
+              in
+              match Dio_strategies.Strategy_loader.parse_file ~path:path_file with
               | Error msg ->
                 Printf.eprintf "replay: cannot load %s: %s\n" path_file msg;
                 exit 1

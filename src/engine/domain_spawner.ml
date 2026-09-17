@@ -129,17 +129,22 @@ let log_latency_window ~key ~window_seconds ~threshold_us ~ob ~exec ~prep ~strat
 ;;
 
 (** Path of the strategy file bound to an entry by name convention
-    ([strategies/<strategy>.json]). *)
+    ([strategies/<name>.strategy] preferred, then [strategies/<name>.json]). *)
 let strategy_file_path (asset : trading_config) =
-  Printf.sprintf "strategies/%s.json" asset.strategy
+  match Dio_strategies.Strategy_loader.locate ~name:asset.strategy with
+  | Some path -> Some path
+  | None -> None
 ;;
 
 (** The compiled strategy file bound to an entry, if any. Data-driven dispatch: an asset's
     behaviour is selected by its bound file, never by the strategy name. *)
 let load_bound_strategy (asset : trading_config) : Dio_strategies.Strategy_file.t option =
-  match Dio_strategies.Strategy_file.parse_file (strategy_file_path asset) with
-  | Ok f -> Some f
-  | Error _ -> None
+  match strategy_file_path asset with
+  | None -> None
+  | Some path ->
+    (match Dio_strategies.Strategy_loader.parse_file ~path with
+     | Ok f -> Some f
+     | Error _ -> None)
 ;;
 
 (** Whether an entry is backed by a strategy file (i.e. runs the config-driven engine). *)
@@ -604,7 +609,11 @@ let asset_domain_worker
            (idempotent; needed because the CLI/test paths that normally register are not
            on the engine startup path). *)
         Dio_strategies.Strategy_actions_builtin.register_all ();
-        let path = Printf.sprintf "strategies/%s.json" asset_with_fees.strategy in
+        let path =
+          match strategy_file_path asset_with_fees with
+          | Some p -> p
+          | None -> Printf.sprintf "strategies/%s.json" asset_with_fees.strategy
+        in
         match bound_strategy_file with
         | None -> None
         | Some file ->

@@ -13,6 +13,7 @@
 module SG = Dio_strategies.Strategy_api
 module SR = Dio_strategies.Strategy_runtime
 module SF = Dio_strategies.Strategy_file
+module SL = Dio_strategies.Strategy_loader
 module SA = Dio_strategies.Strategy_actions_cycle
 module SCE = Dio_strategies.Strategy_cycle_engine
 module SS = Dio_strategies.Strategy_state
@@ -35,8 +36,8 @@ let asset : SS.trading_config =
 
 let path () =
   match Sys.getenv_opt "DUNE_SOURCEROOT" with
-  | Some root -> Filename.concat root "strategies/jacobs_ladder.json"
-  | None -> "strategies/jacobs_ladder.json"
+  | Some root -> Filename.concat root "strategies/jacobs_ladder.strategy"
+  | None -> "strategies/jacobs_ladder.strategy"
 ;;
 
 let () =
@@ -51,7 +52,7 @@ let () =
       with
       | _ -> ())
    | None -> ());
-  match SF.parse_file (path ()) with
+  match SL.parse_file ~path:(path ()) with
   | Error e -> Printf.eprintf "cycle_alloc_profile: %s\n%!" e
   | Ok file ->
     let state = SG.get_strategy_state "BENCH/USD" in
