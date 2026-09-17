@@ -1,8 +1,10 @@
 # dio-domains
 
-dio is an OCaml 5 trading engine. It runs a **ladder** strategy (buying dips and
-selling into reversals) and a top-of-book **market maker** against Kraken,
-Hyperliquid, Lighter, Interactive Brokers, and Alpaca.
+dio is an OCaml 5 trading engine. Trading behaviour is defined by **strategy
+files**, not compiled code: the engine loads a strategy, validates it, and runs
+it over a registered library of actions. The strategy it ships — the
+**Jacobs Ladder** grid, which buys dips and sells into reversals — runs against
+Kraken, Hyperliquid, Lighter, Interactive Brokers, and Alpaca.
 
 Each traded asset runs in its own OCaml domain. Order intents funnel through a
 lock-free executor, market data lands in lock-free ring buffers, and a
@@ -17,8 +19,8 @@ Unix domain socket.
 [![OCaml](https://img.shields.io/github/languages/top/malciller/dio-domains)](https://ocaml.org)
 [![license](https://img.shields.io/github/license/malciller/dio-domains)](LICENSE)
 
-> **This trades real money.** It comes with no warranty. The auto-hedge strategy
-> is experimental — test on a testnet before risking capital.
+> **This trades real money.** It comes with no warranty. Test on a testnet
+> before risking capital.
 
 ![dio terminal dashboard](assets/dio-dashboard.gif)
 
@@ -65,11 +67,32 @@ and [deployment](https://diophantsolutions.com/dio/DEPLOYMENT/).
 | `dio-dashboard` | Terminal UI. Connects to a running engine over the Unix domain socket. |
 | `dio-oracle` | Runs the sizing pipeline offline and prints the decision surface. |
 
+## Strategy files
+
+A strategy is a file, not compiled code. Each entry in `config.json` names one
+(`"strategy": "jacobs_ladder"`); the engine loads `strategies/<name>.strategy`,
+validates it, and compiles it to the internal step/action representation at
+startup. The script is a small, dotted language (also accepts `.json`, the
+compiled form) with no braces or significant whitespace in names:
+
+```
+when book.updates:
+  skip.nan.price:
+    if $platform.price.nan:
+      stop
+```
+
+`dio strategy validate <file>` checks a strategy statically and
+`dio strategy compile <file.strategy>` emits its JSON form. See the
+[strategy script guide](https://diophantsolutions.com/dio/STRATEGY/) for the
+language and the action vocabulary.
+
 ## Documentation
 
 All documentation lives at **<https://diophantsolutions.com/dio/>**:
 [deployment](https://diophantsolutions.com/dio/DEPLOYMENT/),
 [configuration](https://diophantsolutions.com/dio/CONFIGURATION/),
+[strategy scripts](https://diophantsolutions.com/dio/STRATEGY/),
 [capital oracle](https://diophantsolutions.com/dio/ORACLE/),
 [risk and terms](https://diophantsolutions.com/dio/RISK/), and the
 [specification](https://diophantsolutions.com/dio/SPEC/).

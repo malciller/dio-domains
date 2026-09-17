@@ -536,42 +536,41 @@ let read_config () : config =
        free for tests and tooling. *)
     List.iter
       (fun (t : trading_config) ->
-        let path = Printf.sprintf "strategies/%s.json" t.strategy in
-        if not (Sys.file_exists path)
-        then (
+        match Dio_strategies.Strategy_loader.locate ~name:t.strategy with
+        | None ->
           Logging.critical_f
             ~section
-            "Strategy file '%s' for %s/%s does not exist. Strategy files must be \
-             deployed alongside config.json (e.g. /app/strategies); refusing to start \
-             with no strategy bound."
-            path
+            "Strategy file for %s/%s does not exist (tried strategies/<name>.strategy and \
+             strategies/<name>.json). Strategy files must be deployed alongside \
+             config.json (e.g. /app/strategies); refusing to start with no strategy \
+             bound."
             t.exchange
             t.symbol;
-          exit 1)
-        else (
-          match Dio_strategies.Strategy_file.parse_file path with
-          | Error msg ->
-            Logging.critical_f
-              ~section
-              "Strategy file '%s' for %s/%s is invalid: %s"
-              path
-              t.exchange
-              t.symbol
-              msg;
-            exit 1
-          | Ok file ->
-            if not (String.equal file.name t.strategy)
-            then (
-              Logging.critical_f
-                ~section
-                "Strategy name mismatch for %s/%s: config.json declares '%s' but \
-                 strategy file '%s' declares '%s'"
-                t.exchange
-                t.symbol
-                t.strategy
-                path
-                file.name;
-              exit 1)))
+          exit 1
+        | Some path ->
+          (match Dio_strategies.Strategy_loader.parse_file ~path with
+           | Error msg ->
+             Logging.critical_f
+               ~section
+               "Strategy file '%s' for %s/%s is invalid: %s"
+               path
+               t.exchange
+               t.symbol
+               msg;
+             exit 1
+           | Ok file ->
+             if not (String.equal file.name t.strategy)
+             then (
+               Logging.critical_f
+                 ~section
+                 "Strategy name mismatch for %s/%s: config.json declares '%s' but \
+                  strategy file '%s' declares '%s'"
+                 t.exchange
+                 t.symbol
+                 t.strategy
+                 path
+                 file.name;
+               exit 1)))
       trading;
     let fng_check_threshold =
       json |> member "fng_check_threshold" |> to_float_opt |> Option.value ~default:1.5

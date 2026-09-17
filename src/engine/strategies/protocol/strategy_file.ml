@@ -295,3 +295,124 @@ let parse_file (path : string) : (t, string) result =
   | Sys_error m -> Error m
   | exn -> Error (Printexc.to_string exn)
 ;;
+
+(* ── Serialization (to_json): the JSON writer mirror of [parse]. Used by the `dio
+   strategy compile` command and by tests that round-trip parsed scripts. *)
+
+let kind_to_string (k : param_kind) =
+  match k with
+  | P_float -> "float"
+  | P_int -> "int"
+  | P_bool -> "bool"
+  | P_string -> "string"
+  | P_decimal_str -> "decimal_str"
+  | P_range -> "range"
+  | P_enum _ -> "enum"
+;;
+
+let param_to_json (p : param) =
+  let base = [ "type", `String (kind_to_string p.p_kind) ] in
+  let with_default =
+    match p.p_default with
+    | Some v -> base @ [ "default", v ]
+    | None -> base
+  in
+  match p.p_kind, with_default with
+  | P_enum values, kvs ->
+    `Assoc (kvs @ [ "values", `List (List.map (fun v -> `String v) values) ])
+  | _, kvs -> `Assoc kvs
+;;
+
+let state_kind_to_string (k : state_kind) =
+  match k with
+  | S_float -> "float"
+  | S_float_opt -> "float?"
+  | S_int -> "int"
+  | S_bool -> "bool"
+  | S_string -> "string"
+  | S_buy_intent_opt -> "buy_intent?"
+  | S_sell_intent_opt -> "sell_intent?"
+  | S_reserve_policy -> "reserve_policy"
+;;
+
+let state_decl_to_json (s : state_decl) =
+  `Assoc [ "type", `String (state_kind_to_string s.s_kind); "persist", `Bool s.s_persist ]
+;;
+
+let rec guard_to_json (g : guard) : Yojson.Basic.t =
+  match g with
+  | G_event e -> `Assoc [ "event", `String e ]
+  | G_side s -> `Assoc [ "side", `String s ]
+  | G_all gs -> `Assoc [ "all", `List (List.map guard_to_json gs) ]
+  | G_any gs -> `Assoc [ "any", `List (List.map guard_to_json gs) ]
+  | G_not g -> `Assoc [ "not", guard_to_json g ]
+  | G_is_none r -> `Assoc [ "is_none", `String r ]
+  | G_is_some r -> `Assoc [ "is_some", `String r ]
+  | G_expr s -> `Assoc [ "expr", `String s ]
+  | G_capacity kvs -> `Assoc [ "capacity", str_map_to_json kvs ]
+  | G_pending k -> `Assoc [ "pending", `String k ]
+  | G_order kvs -> `Assoc [ "order", str_map_to_json kvs ]
+  | G_signal kvs -> `Assoc [ "signal", str_map_to_json kvs ]
+  | G_engine kvs -> `Assoc [ "engine", str_map_to_json kvs ]
+  | G_cooldown { since; seconds } ->
+    `Assoc
+      [ "cooldown_elapsed", `Assoc [ "since", `String since; "seconds", `String seconds ]
+      ]
+
+and str_map_to_json kvs = `Assoc (List.map (fun (k, v) -> k, `String v) kvs)
+
+let action_to_json (a : action) =
+  let base = [ "action", `String a.a_name ] in
+  let with_args =
+    match a.a_args with
+    | [] -> base
+    | kvs -> base @ [ "args", `Assoc kvs ]
+  in
+  let with_bind =
+    match a.a_bind with
+    | [] -> with_args
+    | kvs -> with_args @ [ "bind", `Assoc (List.map (fun (k, v) -> k, `String v) kvs) ]
+  in
+  match a.a_on_error with
+  | O_stop -> `Assoc with_bind
+  | O_continue -> `Assoc (with_bind @ [ "on_error", `String "continue" ])
+;;
+
+let step_to_json (s : step) =
+  let base_kvs = [ "id", `String s.st_id ] in
+  let with_let =
+    match s.st_let with
+    | [] -> base_kvs
+    | kvs -> base_kvs @ [ "let", `Assoc (List.map (fun (k, v) -> k, `String v) kvs) ]
+  in
+  let with_when =
+    match s.st_when with
+    | None -> with_let
+    | Some g -> with_let @ [ "when", guard_to_json g ]
+  in
+  let with_then =
+    match s.st_then with
+    | [] -> with_when
+    | acts -> with_when @ [ "then", `List (List.map action_to_json acts) ]
+  in
+  let with_else =
+    match s.st_else with
+    | [] -> with_then
+    | acts -> with_then @ [ "else", `List (List.map action_to_json acts) ]
+  in
+  let with_stop = if s.st_stop then with_else @ [ "stop", `Bool true ] else with_else in
+  `Assoc with_stop
+;;
+
+let to_json (t : t) : Yojson.Basic.t =
+  `Assoc
+    [ "name", `String t.name
+    ; "version", `Int t.version
+    ; "triggers", `List (List.map (fun x -> `String x) t.triggers)
+    ; "params", `Assoc (List.map (fun p -> p.p_name, param_to_json p) t.params)
+    ; ( "state"
+      , `Assoc (List.map (fun (s : state_decl) -> s.s_name, state_decl_to_json s) t.state)
+      )
+    ; "steps", `List (List.map step_to_json t.steps)
+    ]
+;;
