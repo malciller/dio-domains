@@ -1,15 +1,14 @@
-(** Lighter L2 order book feed: subscribes to order_book channels by market
-    index, applies an initial snapshot followed by incremental deltas, and
-    publishes per-symbol depth snapshots to lock-free ring buffers for
-    low-latency readers. *)
+(** Lighter L2 order book feed: subscribes to order_book channels by market index, applies
+    an initial snapshot followed by incremental deltas, and publishes per-symbol depth
+    snapshots to lock-free ring buffers for low-latency readers. *)
 
 let section = "lighter_orderbook"
 
 (* Sized to absorb bursts without lapping readers. *)
 let ring_buffer_size = 64
 
-(** Max price levels retained per side; consumers only need top of book, and
-    the cap bounds memory. *)
+(** Max price levels retained per side; consumers only need top of book, and the cap
+    bounds memory. *)
 let max_depth = 10
 
 type level =
@@ -27,16 +26,16 @@ type orderbook =
 (** Lock-free SPSC ring buffer holding published book snapshots. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
 
-(** Per-symbol state: ring buffer, ready flag, and a mutex-guarded local book
-    used to apply deltas. *)
+(** Per-symbol state: ring buffer, ready flag, and a mutex-guarded local book used to
+    apply deltas. *)
 type store =
   { buffer : orderbook RingBuffer.t
   ; ready : bool Atomic.t
   ; (* Local book state, used only to evaluate sequential delta updates. *)
     mutable local_bids : (float * float) list
-    (** Maintains strictly sorted descending sequence by price coordinate *)
+  (** Maintains strictly sorted descending sequence by price coordinate *)
   ; mutable local_asks : (float * float) list
-    (** Maintains strictly sorted ascending sequence by price coordinate *)
+  (** Maintains strictly sorted ascending sequence by price coordinate *)
   ; ob_mutex : Mutex.t
   }
 
@@ -53,27 +52,22 @@ let notify_ready store =
     | _ -> ())
 ;;
 
-(** Merges one price level update into a sorted list. Size zero removes the
-    level; otherwise upserts or inserts in sort order (single pass, tail
-    shared on update, no resort needed). *)
+(** Merges one price level update into a sorted list. Size zero removes the level;
+    otherwise upserts or inserts in sort order (single pass, tail shared on update, no
+    resort needed). *)
 let apply_delta levels price size ~is_bid =
   if size = 0.0
   then List.filter (fun (p, _) -> p <> price) levels
   else (
-    (* Single-pass upsert-or-insert over sorted list. [cmp] orders bids
-       descending, asks ascending. *)
-    let cmp =
-      if is_bid then fun a b -> compare b a else fun a b -> compare a b
-    in
+    (* Single-pass upsert-or-insert over sorted list. [cmp] orders bids descending, asks
+       ascending. *)
+    let cmp = if is_bid then fun a b -> compare b a else fun a b -> compare a b in
     let rec go acc = function
-      | [] ->
-        List.rev_append acc [ price, size ]
-      | (p, _) :: tl when p = price ->
-        List.rev_append acc ((p, size) :: tl)
+      | [] -> List.rev_append acc [ price, size ]
+      | (p, _) :: tl when p = price -> List.rev_append acc ((p, size) :: tl)
       | ((p, _) as hd) :: tl ->
         if cmp price p < 0
-        then
-          List.rev_append acc ((price, size) :: hd :: tl)
+        then List.rev_append acc ((price, size) :: hd :: tl)
         else go (hd :: acc) tl
     in
     go [] levels)
@@ -89,8 +83,7 @@ let truncate_to_depth levels =
   if List.length levels <= max_depth then levels else take max_depth [] levels
 ;;
 
-(** Converts the local lists to arrays and writes the snapshot to the ring
-    buffer. *)
+(** Converts the local lists to arrays and writes the snapshot to the ring buffer. *)
 let flush_to_ring store symbol =
   let nb = min (List.length store.local_bids) max_depth in
   let na = min (List.length store.local_asks) max_depth in
@@ -140,9 +133,8 @@ let process_orderbook_snapshot ~market_index json =
     let ob_data = member "order_book" json in
     if ob_data = `Null
     then (
-      if
-        (* Log null-payload diagnostics once for schema debugging. *)
-        not (Atomic.exchange first_snapshot_logged true)
+      if (* Log null-payload diagnostics once for schema debugging. *)
+         not (Atomic.exchange first_snapshot_logged true)
       then (
         let keys =
           try List.map fst (to_assoc json) with
@@ -166,8 +158,7 @@ let process_orderbook_snapshot ~market_index json =
           "Orderbook snapshot keys for %s: [%s]"
           symbol
           (String.concat ", " keys));
-      (* Accept both abbreviated ([b]/[a]) and full ([bids]/[asks]) field
-         names. *)
+      (* Accept both abbreviated ([b]/[a]) and full ([bids]/[asks]) field names. *)
       let bids_json = get_list_field ob_data "b" "bids" in
       let asks_json = get_list_field ob_data "a" "asks" in
       let parse_level_opt level =
@@ -215,8 +206,8 @@ let process_orderbook_snapshot ~market_index json =
       (Printexc.to_string exn)
 ;;
 
-(** Parses an incremental delta and applies it to the local book, then
-    republishes to the ring buffer. *)
+(** Parses an incremental delta and applies it to the local book, then republishes to the
+    ring buffer. *)
 let process_orderbook_update ~market_index json =
   let open Yojson.Safe.Util in
   let symbol =
@@ -255,29 +246,29 @@ let process_orderbook_update ~market_index json =
         let b_len = ref (List.length store.local_bids) in
         List.iter
           (fun level ->
-             match parse_level_opt level with
-             | Some (price, size) ->
-               store.local_bids <- apply_delta store.local_bids price size ~is_bid:true;
-               incr b_len;
-               if !b_len >= max_depth * 2
-               then (
-                 store.local_bids <- truncate_to_depth store.local_bids;
-                 b_len := max_depth)
-             | None -> ())
+            match parse_level_opt level with
+            | Some (price, size) ->
+              store.local_bids <- apply_delta store.local_bids price size ~is_bid:true;
+              incr b_len;
+              if !b_len >= max_depth * 2
+              then (
+                store.local_bids <- truncate_to_depth store.local_bids;
+                b_len := max_depth)
+            | None -> ())
           bids_json;
         store.local_bids <- truncate_to_depth store.local_bids;
         let a_len = ref (List.length store.local_asks) in
         List.iter
           (fun level ->
-             match parse_level_opt level with
-             | Some (price, size) ->
-               store.local_asks <- apply_delta store.local_asks price size ~is_bid:false;
-               incr a_len;
-               if !a_len >= max_depth * 2
-               then (
-                 store.local_asks <- truncate_to_depth store.local_asks;
-                 a_len := max_depth)
-             | None -> ())
+            match parse_level_opt level with
+            | Some (price, size) ->
+              store.local_asks <- apply_delta store.local_asks price size ~is_bid:false;
+              incr a_len;
+              if !a_len >= max_depth * 2
+              then (
+                store.local_asks <- truncate_to_depth store.local_asks;
+                a_len := max_depth)
+            | None -> ())
           asks_json;
         store.local_asks <- truncate_to_depth store.local_asks;
         flush_to_ring store symbol;
@@ -332,8 +323,8 @@ let[@inline always] read_orderbook_events symbol last_pos =
   | None -> []
 ;;
 
-(** Applies [f] to each snapshot after [last_pos] without intermediate
-    allocations; returns the new cursor. *)
+(** Applies [f] to each snapshot after [last_pos] without intermediate allocations;
+    returns the new cursor. *)
 let[@inline always] iter_orderbook_events symbol last_pos f =
   match Hashtbl.find_opt stores symbol with
   | Some store -> RingBuffer.iter_since store.buffer last_pos f
@@ -373,19 +364,19 @@ let initialize symbols =
     (List.length symbols);
   List.iter
     (fun symbol ->
-       Mutex.lock initialization_mutex;
-       if not (Hashtbl.mem stores symbol)
-       then (
-         let store =
-           { buffer = RingBuffer.create ring_buffer_size
-           ; ready = Atomic.make false
-           ; local_bids = []
-           ; local_asks = []
-           ; ob_mutex = Mutex.create ()
-           }
-         in
-         Hashtbl.add stores symbol store);
-       Mutex.unlock initialization_mutex;
-       Logging.debug_f ~section "Created Lighter orderbook buffer for %s" symbol)
+      Mutex.lock initialization_mutex;
+      if not (Hashtbl.mem stores symbol)
+      then (
+        let store =
+          { buffer = RingBuffer.create ring_buffer_size
+          ; ready = Atomic.make false
+          ; local_bids = []
+          ; local_asks = []
+          ; ob_mutex = Mutex.create ()
+          }
+        in
+        Hashtbl.add stores symbol store);
+      Mutex.unlock initialization_mutex;
+      Logging.debug_f ~section "Created Lighter orderbook buffer for %s" symbol)
     symbols
 ;;

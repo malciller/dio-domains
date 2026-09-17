@@ -1,42 +1,39 @@
 (** Allocation-light, single-pass JSON field extraction.
 
-    The feed parsers build a full [Yojson.Safe.t] DOM per frame and then walk it
-    with [member]/[to_*], which allocates a variant node per token and promotes
-    through the minor heap. These helpers instead locate a named field's value
-    *span* inside the raw string, so a caller extracts only the few fields it
-    needs and pays no AST.
+    The feed parsers build a full [Yojson.Safe.t] DOM per frame and then walk it with
+    [member]/[to_*], which allocates a variant node per token and promotes through the
+    minor heap. These helpers instead locate a named field's value *span* inside the raw
+    string, so a caller extracts only the few fields it needs and pays no AST.
 
-    Spans are [(start, stop)] offsets into the source string, [stop] exclusive.
-    The leaf parsers and skippers are [@zero_alloc] (compiler-checked): nothing
-    here allocates except [string_of_span] (the extracted string is the result),
-    the [Some] returned by [find_field], and the [int * int] interior helpers.
-    The int-based parsers and scanners are checked outright; the float parser
-    ([float_of_span]) is ref-free and carries [@zero_alloc assume] because its
-    intermediate arithmetic is unboxed only under the flambda release build
-    (-O3) and the checked form would be a false positive on vanilla
-    compilers.
-    Nested objects/arrays and string escapes are handled by
+    Spans are [(start, stop)] offsets into the source string, [stop] exclusive. The leaf
+    parsers and skippers are [@zero_alloc] (compiler-checked): nothing here allocates
+    except [string_of_span] (the extracted string is the result), the [Some] returned by
+    [find_field], and the [int * int] interior helpers. The int-based parsers and scanners
+    are checked outright; the float parser ([float_of_span]) is ref-free and carries
+    [@zero_alloc assume] because its intermediate arithmetic is unboxed only under the
+    flambda release build (-O3) and the checked form would be a false positive on vanilla
+    compilers. Nested objects/arrays and string escapes are handled by
     [skip_value]/[skip_string]; keys are compared without allocation.
 
-    The bounds are authoritative: callers pass the *interior* of an object or
-    array (between its braces/brackets, via [object_interior]/[array_interior]),
-    and scanning never crosses [hi]. *)
+    The bounds are authoritative: callers pass the *interior* of an object or array
+    (between its braces/brackets, via [object_interior]/[array_interior]), and scanning
+    never crosses [hi]. *)
 
 let is_ws c =
   match c with
   | ' ' | '\t' | '\n' | '\r' -> true
   | _ -> false
 [@@zero_alloc]
+;;
 
-let rec skip_ws s i hi =
-  if i < hi && is_ws s.[i] then skip_ws s (i + 1) hi else i
+let rec skip_ws s i hi = if i < hi && is_ws s.[i] then skip_ws s (i + 1) hi else i
 [@@zero_alloc]
 ;;
 
-(** [skip_string_from s j hi]: scan from [j] (just past an opening quote) to just
-    past the closing quote, honouring backslash escapes. [skip_string] is the
-    wrapper that consumes the opening quote: [i] is the opening quote and
-    returns the index after the closing quote. *)
+(** [skip_string_from s j hi]: scan from [j] (just past an opening quote) to just past the
+    closing quote, honouring backslash escapes. [skip_string] is the wrapper that consumes
+    the opening quote: [i] is the opening quote and returns the index after the closing
+    quote. *)
 let rec skip_string_from s j hi =
   if j >= hi
   then j
@@ -46,9 +43,9 @@ let rec skip_string_from s j hi =
     | '"' -> j + 1
     | _ -> skip_string_from s (j + 1) hi)
 [@@zero_alloc]
+;;
 
-let skip_string s i hi =
-  if i >= hi then i else skip_string_from s (i + 1) hi
+let skip_string s i hi = if i >= hi then i else skip_string_from s (i + 1) hi
 [@@zero_alloc]
 ;;
 
@@ -68,8 +65,8 @@ let rec skip_container s i hi =
 [@@zero_alloc]
 ;;
 
-(** [skip_scalar s i hi]: index of the delimiter (whitespace, comma, close
-    brace/bracket) ending an unscanned scalar starting at [i]. *)
+(** [skip_scalar s i hi]: index of the delimiter (whitespace, comma, close brace/bracket)
+    ending an unscanned scalar starting at [i]. *)
 let rec skip_scalar s i hi =
   if i >= hi
   then i
@@ -78,9 +75,10 @@ let rec skip_scalar s i hi =
     | ',' | '}' | ']' | ' ' | '\t' | '\n' | '\r' -> i
     | _ -> skip_scalar s (i + 1) hi)
 [@@zero_alloc]
+;;
 
-(** [skip_value s i hi]: returns the index just past the JSON value at [i],
-    skipping strings, nested containers, and unscanned scalars. *)
+(** [skip_value s i hi]: returns the index just past the JSON value at [i], skipping
+    strings, nested containers, and unscanned scalars. *)
 let skip_value s i hi =
   let i = skip_ws s i hi in
   if i >= hi
@@ -117,10 +115,12 @@ let find_field s lo hi key =
     else (
       let key_end = skip_string s i hi in
       let matches =
-        let kstart = i + 1 and kend = key_end - 1 in
+        let kstart = i + 1
+        and kend = key_end - 1 in
         kend - kstart = klen
-        && (let rec eq k = k >= klen || (s.[kstart + k] = key.[k] && eq (k + 1)) in
-            eq 0)
+        &&
+        let rec eq k = k >= klen || (s.[kstart + k] = key.[k] && eq (k + 1)) in
+        eq 0
       in
       let after = skip_ws s key_end hi in
       if after >= hi || s.[after] <> ':'
@@ -156,19 +156,20 @@ let array_fold s lo hi init f =
 let array_iter s lo hi f = array_fold s lo hi () (fun () i e -> f i e)
 let value_is_string s i = i < String.length s && s.[i] = '"' [@@zero_alloc]
 
-(** Accumulate the integer value of the digit run starting at [i] into [acc].
-    Shared by the exponent parser and [int_of_span]. *)
+(** Accumulate the integer value of the digit run starting at [i] into [acc]. Shared by
+    the exponent parser and [int_of_span]. *)
 let rec int_digits s i hi acc =
   if i < hi && s.[i] >= '0' && s.[i] <= '9'
   then int_digits s (i + 1) hi ((acc * 10) + (Char.code s.[i] - 48))
   else acc
 [@@zero_alloc]
+;;
 
-(** [10.0] raised to [n] by repeated multiplication; exact for [n <= 15],
-    within a few ulps of libm outside that. Allocation-free. *)
-let rec pow10 acc n =
-  if n <= 0 then acc else pow10 (acc *. 10.0) (n - 1)
+(** [10.0] raised to [n] by repeated multiplication; exact for [n <= 15], within a few
+    ulps of libm outside that. Allocation-free. *)
+let rec pow10 acc n = if n <= 0 then acc else pow10 (acc *. 10.0) (n - 1)
 [@@zero_alloc assume]
+;;
 
 (** Parse a JSON number from [i, j) without allocating. Tolerant of [j] landing
     on a trailing delimiter (stops at the first non-number char). Ref-free (a
@@ -194,6 +195,7 @@ let rec parse_float s i hi acc scale =
     if neg then acc /. p else acc *. p)
   else acc
 [@@zero_alloc assume]
+;;
 
 let float_of_span s i j =
   let i = skip_ws s i j in
@@ -236,7 +238,9 @@ let string_of_span s i j =
            | c -> Buffer.add_char buf c);
           go (k + 2)
         | '"' -> ()
-        | c -> Buffer.add_char buf c; go (k + 1))
+        | c ->
+          Buffer.add_char buf c;
+          go (k + 1))
     in
     go (i + 1);
     Buffer.contents buf)

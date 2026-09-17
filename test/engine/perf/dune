@@ -16,6 +16,14 @@
  (name sync_alloc_profile)
  (libraries dio.strategies unix))
 
+(executable
+ (name cycle_alloc_profile)
+ (libraries dio.strategies dio.engine mtime mtime.clock.os unix))
+
+(executable
+ (name intern_contention)
+ (libraries dio.strategies dio.latency_profiling))
+
 (rule
  (alias runtest)
  (deps

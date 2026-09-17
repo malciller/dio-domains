@@ -8,6 +8,6 @@ module Balances = Alpaca_balances
 module Module = Alpaca_module
 module Market_hours = Alpaca_market_hours
 
-(** Oracle data-venue adapter: historical bars, market calendar, balances,
-    fees; implements [Exchange_intf.Oracle.S]. *)
+(** Oracle data-venue adapter: historical bars, market calendar, balances, fees;
+    implements [Exchange_intf.Oracle.S]. *)
 module Alpaca_oracle = Alpaca_oracle

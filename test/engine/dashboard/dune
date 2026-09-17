@@ -12,4 +12,9 @@
 
 (executable
  (name bench_dashboard)
- (libraries dio.dashboard_ui notty-community notty-community.unix yojson unix))
+ (libraries
+  dio.dashboard_ui
+  notty-community
+  notty-community.unix
+  yojson
+  unix))

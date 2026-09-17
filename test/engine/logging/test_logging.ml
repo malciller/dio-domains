@@ -1,5 +1,5 @@
-(* Test-only use of [Unix.putenv] to exercise COLUMNS handling; single-threaded
-   test process. OxCaml [unsafe_multidomain] alert acknowledged. *)
+(* Test-only use of [Unix.putenv] to exercise COLUMNS handling; single-threaded test
+   process. OxCaml [unsafe_multidomain] alert acknowledged. *)
 [@@@alert "-unsafe_multidomain"]
 
 let test_log_levels () =
@@ -76,7 +76,6 @@ let test_level_conversions () =
 let test_global_level_filtering () =
   (* ERROR global level admits only ERROR and CRITICAL. *)
   Logging.set_level Logging.ERROR;
-
   Logging.debug ~section:"test_logging" "Filtered debug";
   Logging.info ~section:"test_logging" "Filtered info";
   Logging.warn ~section:"test_logging" "Filtered warn";
@@ -91,7 +90,6 @@ let test_section_level_filtering () =
   (* Global DEBUG; section override to ERROR. *)
   Logging.set_level Logging.DEBUG;
   Logging.set_section_level "strict_section" Logging.ERROR;
-
   Logging.debug ~section:"test_logging" "Global debug";
   Logging.info ~section:"test_logging" "Global info";
   Logging.warn ~section:"test_logging" "Global warn";
@@ -140,10 +138,9 @@ let test_section_management () =
   Alcotest.(check bool) "section levels are consistent" true (section1 = section2)
 ;;
 
-(* ---- format_line behavior ----
-   [Logging.format_line] is pure (no I/O, no queue), so its rendered output is
-   assertable. The section column is fixed at 20 chars; the message column is
-   always 40 (12 timestamp + 1 + 5 level + 1 + 20 section + 1). That column
+(* ---- format_line behavior ---- [Logging.format_line] is pure (no I/O, no queue), so its
+   rendered output is assertable. The section column is fixed at 20 chars; the message
+   column is always 40 (12 timestamp + 1 + 5 level + 1 + 20 section + 1). That column
    stability is the layout invariant. *)
 
 let msg_col = 40
@@ -158,8 +155,8 @@ let contains_substring haystack needle =
   n = 0 || go 0
 ;;
 
-(* Display width: count each UTF-8 sequence as one column (ASCII = 1 byte).
-   Used for wrap assertions since the ┆ gutter is 3 bytes / 1 column. *)
+(* Display width: count each UTF-8 sequence as one column (ASCII = 1 byte). Used for wrap
+   assertions since the ┆ gutter is 3 bytes / 1 column. *)
 let visual_len s =
   let n = String.length s in
   let rec go i acc =
@@ -208,8 +205,8 @@ let test_format_line_alignment () =
   Alcotest.(check char) "section padded" ' ' (String.get l1 38)
 ;;
 
-(* Regression: the message column must be the same before AND after a long
-   section name appears: it must never shift mid-stream. *)
+(* Regression: the message column must be the same before AND after a long section name
+   appears: it must never shift mid-stream. *)
 let test_format_line_stable_column () =
   Logging.set_colors false;
   let a = Logging.format_line Logging.INFO "main" "alpha" in
@@ -231,9 +228,9 @@ let test_format_line_multiline () =
   | [ head; cont ] ->
     let head_msg_col = String.index head 'h' in
     Alcotest.(check int) "header starts at message column" msg_col head_msg_col;
-    (* Continuation is rendered under a gutter at the message column; the
-       caller's 6-space indent is replaced by the gutter + one space. Byte
-       offset is msg_col + 4 because the ┆ gutter is 3 bytes + 1 space. *)
+    (* Continuation is rendered under a gutter at the message column; the caller's 6-space
+       indent is replaced by the gutter + one space. Byte offset is msg_col + 4 because
+       the ┆ gutter is 3 bytes + 1 space. *)
     Alcotest.(check bool) "gutter glyph" true (contains_substring cont gutter_bytes);
     Alcotest.(check int)
       "detail text starts after the gutter"
@@ -242,8 +239,8 @@ let test_format_line_multiline () =
   | _ -> Alcotest.fail "expected two lines"
 ;;
 
-(* Regression: blank continuation lines are dropped (no stray gutter-only
-   lines) and leading whitespace is normalized away by the gutter. *)
+(* Regression: blank continuation lines are dropped (no stray gutter-only lines) and
+   leading whitespace is normalized away by the gutter. *)
 let test_format_line_multiline_blank_and_indent () =
   Logging.set_colors false;
   let line =
@@ -261,8 +258,8 @@ let test_format_line_multiline_blank_and_indent () =
   | _ -> Alcotest.fail "expected two lines"
 ;;
 
-(* Long lines wrap at word boundaries to the configured width; the prefix
-   stays on the first line and every wrapped chunk fits inside the width. *)
+(* Long lines wrap at word boundaries to the configured width; the prefix stays on the
+   first line and every wrapped chunk fits inside the width. *)
 let test_format_line_wrap () =
   Logging.set_colors false;
   Logging.set_width (Some 60);
@@ -285,8 +282,8 @@ let test_format_line_wrap () =
   Logging.set_width None
 ;;
 
-(* Non-terminal output (docker logs, pipes) still wraps - the width comes
-   from the COLUMNS env var when set (a TTY has no width to report). *)
+(* Non-terminal output (docker logs, pipes) still wraps - the width comes from the COLUMNS
+   env var when set (a TTY has no width to report). *)
 let test_format_line_non_tty_wrap () =
   Logging.set_colors false;
   Logging.set_width None;
@@ -304,7 +301,7 @@ let test_format_line_non_tty_wrap () =
   Alcotest.(check bool) "non-tty long message wraps" true (List.length lines > 1);
   List.iter
     (fun l ->
-       Alcotest.(check bool) "wrapped within COLUMNS width" true (visual_len l <= 90))
+      Alcotest.(check bool) "wrapped within COLUMNS width" true (visual_len l <= 90))
     lines;
   close_out oc;
   Logging.set_output stderr;
@@ -314,8 +311,8 @@ let test_format_line_non_tty_wrap () =
   | None -> Unix.putenv "COLUMNS" ""
 ;;
 
-(* In color mode the gutter is rendered dim (gray) and the block's header
-   still carries the full colored prefix. *)
+(* In color mode the gutter is rendered dim (gray) and the block's header still carries
+   the full colored prefix. *)
 let test_format_line_gutter_color () =
   Logging.set_colors true;
   let line = Logging.format_line Logging.INFO "oracle_runtime" "head\n      sub detail" in

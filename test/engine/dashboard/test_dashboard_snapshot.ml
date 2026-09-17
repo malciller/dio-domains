@@ -1,6 +1,6 @@
-(* Snapshot parser tests: the typed model must decode the engine's JSON
-   faithfully (defaults, derived mids, asset classification) so renderers can
-   trust record fields instead of re-reading raw Yojson. *)
+(* Snapshot parser tests: the typed model must decode the engine's JSON faithfully
+   (defaults, derived mids, asset classification) so renderers can trust record fields
+   instead of re-reading raw Yojson. *)
 
 open Dashboard_ui
 
@@ -9,17 +9,17 @@ let mk_order ?(id = "o") ?(price = 1.0) ?(qty = 1.0) () =
 ;;
 
 let strategy_json
-      ?(exchange = "hyperliquid")
-      ?(type_ = "Ladder")
-      ?(capital_low = false)
-      ?(market_closed = false)
-      ?(oracle = `Null)
-      ?(buy_price = 0.0)
-      ?(sell_orders = [])
-      ?(bid = 100.0)
-      ?(ask = 101.0)
-      ?(base_asset = "BTC")
-      ()
+  ?(exchange = "hyperliquid")
+  ?(type_ = "Ladder")
+  ?(capital_low = false)
+  ?(market_closed = false)
+  ?(oracle = `Null)
+  ?(buy_price = 0.0)
+  ?(sell_orders = [])
+  ?(bid = 100.0)
+  ?(ask = 101.0)
+  ?(base_asset = "BTC")
+  ()
   =
   `Assoc
     [ "exchange", `String exchange

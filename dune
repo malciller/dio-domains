@@ -4,6 +4,8 @@
 ; allocation on the execution-event hot path. It is a no-op on non-flambda
 ; compilers, so local `dune build` (the dev profile) is unaffected; the
 ; release profile must be built on a flambda switch (see Dockerfile).
+
 (env
  (release
-  (ocamlopt_flags (:standard -O3))))
+  (ocamlopt_flags
+   (:standard -O3))))

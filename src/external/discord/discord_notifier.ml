@@ -1,8 +1,8 @@
 (** Discord order fill notifier.
 
-    Consumes fill events from the centralized [Fill_event_bus] ring buffer and
-    delivers formatted notifications to a Discord webhook. A token bucket
-    enforces compliance with Discord's webhook rate limit (5 requests / 2 s).
+    Consumes fill events from the centralized [Fill_event_bus] ring buffer and delivers
+    formatted notifications to a Discord webhook. A token bucket enforces compliance with
+    Discord's webhook rate limit (5 requests / 2 s).
 
     Architecture:
     - One Lwt consumer fiber drains the ring buffer per wakeup.
@@ -16,16 +16,15 @@ open Lwt.Infix
 
 let section = "discord_notifier"
 
-(** Maximum fill events per embed. Discord supports up to 25 fields; 10 keeps
-    messages readable (each fill uses ~5-6 fields). *)
+(** Maximum fill events per embed. Discord supports up to 25 fields; 10 keeps messages
+    readable (each fill uses ~5-6 fields). *)
 let max_fills_per_message = 10
 
 (* Token bucket rate limiter. *)
 
-(** Token bucket state for rate limiting webhook POSTs.
-    Discord enforces 5 requests / 2 seconds per webhook URL. 5 tokens with a
-    400ms refill interval = 2.5 req/s steady state, below the limit with margin
-    for clock drift. *)
+(** Token bucket state for rate limiting webhook POSTs. Discord enforces 5 requests / 2
+    seconds per webhook URL. 5 tokens with a 400ms refill interval = 2.5 req/s steady
+    state, below the limit with margin for clock drift. *)
 type token_bucket =
   { mutable tokens : float
   ; mutable last_refill : float
@@ -188,9 +187,8 @@ let build_webhook_payload (fills : Concurrency.Fill_event_bus.fill_event list) =
 
 (* Webhook HTTP client. *)
 
-(** POST a JSON payload to the Discord webhook URL.
-    Returns [Ok ()] on success, [Error msg] on failure.
-    On 429, sleeps for the Retry-After duration. *)
+(** POST a JSON payload to the Discord webhook URL. Returns [Ok ()] on success,
+    [Error msg] on failure. On 429, sleeps for the Retry-After duration. *)
 let send_webhook ~webhook_url payload =
   let json_str = Yojson.Safe.to_string payload in
   let body = Cohttp_lwt.Body.of_string json_str in
@@ -198,41 +196,41 @@ let send_webhook ~webhook_url payload =
   let uri = Uri.of_string webhook_url in
   Lwt.catch
     (fun () ->
-       Cohttp_lwt_unix.Client.post ~headers ~body uri
-       >>= fun (resp, resp_body) ->
-       let status = Cohttp.Response.status resp in
-       let code = Cohttp.Code.code_of_status status in
-       Cohttp_lwt.Body.drain_body resp_body
-       >>= fun () ->
-       if code >= 200 && code < 300
-       then Lwt.return (Ok ())
-       else if code = 429
-       then (
-         (* Rate limited: extract Retry-After header and sleep *)
-         let retry_after =
-           match Cohttp.Header.get (Cohttp.Response.headers resp) "retry-after" with
-           | Some s ->
-             (try float_of_string s with
-              | _ -> 2.0)
-           | None -> 2.0
-         in
-         (* Cap retry_after to prevent extreme sleeps from Discord abuse penalties *)
-         let capped = min retry_after 60.0 in
-         Logging.warn_f
-           ~section
-           "Discord webhook rate limited (429), sleeping %.1fs (raw retry-after: %.1fs)"
-           capped
-           retry_after;
-         Lwt_unix.sleep capped >>= fun () -> Lwt.return (Error "rate_limited"))
-       else (
-         Logging.warn_f ~section "Discord webhook returned HTTP %d" code;
-         Lwt.return (Error (Printf.sprintf "http_%d" code))))
+      Cohttp_lwt_unix.Client.post ~headers ~body uri
+      >>= fun (resp, resp_body) ->
+      let status = Cohttp.Response.status resp in
+      let code = Cohttp.Code.code_of_status status in
+      Cohttp_lwt.Body.drain_body resp_body
+      >>= fun () ->
+      if code >= 200 && code < 300
+      then Lwt.return (Ok ())
+      else if code = 429
+      then (
+        (* Rate limited: extract Retry-After header and sleep *)
+        let retry_after =
+          match Cohttp.Header.get (Cohttp.Response.headers resp) "retry-after" with
+          | Some s ->
+            (try float_of_string s with
+             | _ -> 2.0)
+          | None -> 2.0
+        in
+        (* Cap retry_after to prevent extreme sleeps from Discord abuse penalties *)
+        let capped = min retry_after 60.0 in
+        Logging.warn_f
+          ~section
+          "Discord webhook rate limited (429), sleeping %.1fs (raw retry-after: %.1fs)"
+          capped
+          retry_after;
+        Lwt_unix.sleep capped >>= fun () -> Lwt.return (Error "rate_limited"))
+      else (
+        Logging.warn_f ~section "Discord webhook returned HTTP %d" code;
+        Lwt.return (Error (Printf.sprintf "http_%d" code))))
     (fun exn ->
-       Logging.warn_f
-         ~section
-         "Discord webhook request failed: %s"
-         (Printexc.to_string exn);
-       Lwt.return (Error (Printexc.to_string exn)))
+      Logging.warn_f
+        ~section
+        "Discord webhook request failed: %s"
+        (Printexc.to_string exn);
+      Lwt.return (Error (Printexc.to_string exn)))
 ;;
 
 (** Send with retry: up to 3 attempts, 5s backoff on transient errors. *)
@@ -258,81 +256,81 @@ let send_with_retry ~webhook_url payload =
 
 (* Consumer loop. *)
 
-(** Main consumer loop. Drains the fill event ring buffer per wakeup, batches
-    fills into webhook payloads, and sends with rate limiting. *)
+(** Main consumer loop. Drains the fill event ring buffer per wakeup, batches fills into
+    webhook payloads, and sends with rate limiting. *)
 let consumer_loop ~webhook_url () =
   let read_pos = ref (Concurrency.Fill_event_bus.get_position ()) in
   let done_p, done_u = Lwt.wait () in
   let rec loop () =
     Lwt.catch
       (fun () ->
-         if !read_pos = Concurrency.Fill_event_bus.get_position ()
-         then (
-           (* No new fills, wait for the condition variable to be signaled *)
-           Concurrency.Fill_event_bus.wait_for_fill ()
-           >>= fun () ->
-           Lwt.async loop;
-           Lwt.return_unit)
-         else (
-           (* New fills available, drain them all *)
-           let fills = ref [] in
-           let new_pos =
-             Concurrency.Fill_event_bus.iter_since !read_pos (fun fill ->
-               fills := fill :: !fills)
-           in
-           read_pos := new_pos;
-           (* Drop stale fills (>5min old) to skip replayed historical fills on reconnect *)
-           let now = Unix.gettimeofday () in
-           let max_age = 300.0 in
-           let fills =
-             List.rev !fills
-             |> List.filter (fun (f : Concurrency.Fill_event_bus.fill_event) ->
-               let age = now -. f.timestamp in
-               if age > max_age
-               then (
-                 Logging.debug_f
-                   ~section
-                   "Dropping stale fill for %s/%s (age=%.0fs)"
-                   f.venue
-                   f.symbol
-                   age;
-                 false)
-               else true)
-           in
-           if fills <> []
-           then (
-             Logging.debug_f
-               ~section
-               "Processing %d fill event(s) for Discord"
-               (List.length fills);
-             (* Split into batches of max_fills_per_message *)
-             let rec send_batches remaining =
-               match remaining with
-               | [] -> Lwt.return_unit
-               | _ ->
-                 let batch, rest =
-                   let rec take n acc = function
-                     | [] -> List.rev acc, []
-                     | _ when n = 0 -> List.rev acc, remaining
-                     | x :: xs -> take (n - 1) (x :: acc) xs
-                   in
-                   take max_fills_per_message [] remaining
-                 in
-                 (match build_webhook_payload batch with
-                  | Some payload ->
-                    send_with_retry ~webhook_url payload >>= fun () -> send_batches rest
-                  | None -> send_batches rest)
-             in
-             send_batches fills
-             >>= fun () ->
-             Lwt.async loop;
-             Lwt.return_unit)
-           else (
-             Lwt.async loop;
-             Lwt.return_unit)))
+        if !read_pos = Concurrency.Fill_event_bus.get_position ()
+        then (
+          (* No new fills, wait for the condition variable to be signaled *)
+          Concurrency.Fill_event_bus.wait_for_fill ()
+          >>= fun () ->
+          Lwt.async loop;
+          Lwt.return_unit)
+        else (
+          (* New fills available, drain them all *)
+          let fills = ref [] in
+          let new_pos =
+            Concurrency.Fill_event_bus.iter_since !read_pos (fun fill ->
+              fills := fill :: !fills)
+          in
+          read_pos := new_pos;
+          (* Drop stale fills (>5min old) to skip replayed historical fills on reconnect *)
+          let now = Unix.gettimeofday () in
+          let max_age = 300.0 in
+          let fills =
+            List.rev !fills
+            |> List.filter (fun (f : Concurrency.Fill_event_bus.fill_event) ->
+              let age = now -. f.timestamp in
+              if age > max_age
+              then (
+                Logging.debug_f
+                  ~section
+                  "Dropping stale fill for %s/%s (age=%.0fs)"
+                  f.venue
+                  f.symbol
+                  age;
+                false)
+              else true)
+          in
+          if fills <> []
+          then (
+            Logging.debug_f
+              ~section
+              "Processing %d fill event(s) for Discord"
+              (List.length fills);
+            (* Split into batches of max_fills_per_message *)
+            let rec send_batches remaining =
+              match remaining with
+              | [] -> Lwt.return_unit
+              | _ ->
+                let batch, rest =
+                  let rec take n acc = function
+                    | [] -> List.rev acc, []
+                    | _ when n = 0 -> List.rev acc, remaining
+                    | x :: xs -> take (n - 1) (x :: acc) xs
+                  in
+                  take max_fills_per_message [] remaining
+                in
+                (match build_webhook_payload batch with
+                 | Some payload ->
+                   send_with_retry ~webhook_url payload >>= fun () -> send_batches rest
+                 | None -> send_batches rest)
+            in
+            send_batches fills
+            >>= fun () ->
+            Lwt.async loop;
+            Lwt.return_unit)
+          else (
+            Lwt.async loop;
+            Lwt.return_unit)))
       (fun exn ->
-         if Lwt.is_sleeping done_p then Lwt.wakeup_later_exn done_u exn;
-         Lwt.return_unit)
+        if Lwt.is_sleeping done_p then Lwt.wakeup_later_exn done_u exn;
+        Lwt.return_unit)
   in
   Lwt.async loop;
   done_p
@@ -340,9 +338,9 @@ let consumer_loop ~webhook_url () =
 
 (* Initialization. *)
 
-(** Start the Discord notifier. Reads DISCORD_WEBHOOK_URL from the environment;
-    if unset, logs a warning and returns (no-op). Spawns the consumer loop as a
-    self-restarting Lwt.async fiber. *)
+(** Start the Discord notifier. Reads DISCORD_WEBHOOK_URL from the environment; if unset,
+    logs a warning and returns (no-op). Spawns the consumer loop as a self-restarting
+    Lwt.async fiber. *)
 let start () =
   let webhook_url =
     try
@@ -361,11 +359,11 @@ let start () =
       Lwt.catch
         (fun () -> consumer_loop ~webhook_url:url ())
         (fun exn ->
-           Logging.error_f
-             ~section
-             "Discord consumer loop crashed: %s, restarting in 10s"
-             (Printexc.to_string exn);
-           Lwt_unix.sleep 10.0 >>= fun () -> start_consumer ())
+          Logging.error_f
+            ~section
+            "Discord consumer loop crashed: %s, restarting in 10s"
+            (Printexc.to_string exn);
+          Lwt_unix.sleep 10.0 >>= fun () -> start_consumer ())
     in
     Lwt.async start_consumer
 ;;

@@ -1,7 +1,7 @@
 (* Tests for Alpaca WebSocket feed/ping wiring:
    - send_ping returns false when no connection is established (both feeds)
-   - venue profiler wiring: ping/feed recordings land under the "alpaca"
-     venue so the dashboard NETWORK page can render them *)
+   - venue profiler wiring: ping/feed recordings land under the "alpaca" venue so the
+     dashboard NETWORK page can render them *)
 
 let test_data_feed_send_ping_disconnected () =
   let result = Lwt_main.run (Alpaca.Orderbook.send_ping ~req_id:1 ~timeout_ms:100) in
@@ -13,8 +13,8 @@ let test_trading_feed_send_ping_disconnected () =
   Alcotest.(check bool) "trading feed ping not connected" false result
 ;;
 
-(** Publishes the current live window, then returns the published ws_ping /
-    ws_feed snapshots for the "alpaca" venue, or [None] when absent. *)
+(** Publishes the current live window, then returns the published ws_ping / ws_feed
+    snapshots for the "alpaca" venue, or [None] when absent. *)
 let published_venue_snapshot label =
   Network_latency.publish_all ();
   let snaps = Network_latency.snapshots "alpaca" in
@@ -58,9 +58,9 @@ let contains haystack needle =
   n = 0 || go 0
 ;;
 
-(** A top-level TradeUpdateEventV2 fill (no legacy stream/data wrapper) must
-    land in the execution store, and its ULID must become the resume cursor so
-    a reconnect issues since_id instead of replaying from scratch. *)
+(** A top-level TradeUpdateEventV2 fill (no legacy stream/data wrapper) must land in the
+    execution store, and its ULID must become the resume cursor so a reconnect issues
+    since_id instead of replaying from scratch. *)
 let test_v2_fill_ingested_and_cursor_set () =
   let symbol = "EVT_FILL/USD" in
   let json =
@@ -97,8 +97,8 @@ let test_v2_fill_ingested_and_cursor_set () =
     (contains uri "since_id=01G112NTT0XAXKDZK3AABK68TH")
 ;;
 
-(** A trade_bust reverses a prior execution and is not modeled by the fill
-    ledger: it must be surfaced but must NOT be appended as a fill. *)
+(** A trade_bust reverses a prior execution and is not modeled by the fill ledger: it must
+    be surfaced but must NOT be appended as a fill. *)
 let test_v2_bust_not_ingested () =
   let symbol = "EVT_BUST/USD" in
   let json =
@@ -125,8 +125,8 @@ let test_v2_bust_not_ingested () =
     (Alpaca.Executions.get_current_position symbol)
 ;;
 
-(** The SSE frame reader must split a multi-frame body into events and count
-    comment heartbeats, independent of the HTTP transport. *)
+(** The SSE frame reader must split a multi-frame body into events and count comment
+    heartbeats, independent of the HTTP transport. *)
 let test_sse_stream_parses_frames () =
   let symbol = "EVT_SSE/USD" in
   let body =

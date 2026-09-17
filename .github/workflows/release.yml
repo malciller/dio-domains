@@ -25,14 +25,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Wait for the CI on this exact tag to finish, so a release is never
-      # attached to a red build. build-test is the classic-flambda gate; the
-      # OxCaml image path is exercised by publish.yml on the same tag.
+      # attached to a red build. build-test-oxcaml is the only gate (the engine
+      # is OxCaml-only); the image path is exercised by publish.yml on the same
+      # tag.
       - name: Wait for CI on the tag
         id: wait
         uses: lewagon/wait-on-check-action@ccfb013c15c8afb7bf2b7c028fb74dc5a068cccc # v1.3.4
         with:
           ref: ${{ github.ref }}
-          check-name: "build-test"
+          check-name: "build-test-oxcaml"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           wait-interval: 30
           allowed-conclusions: success

@@ -14,13 +14,13 @@ let test_pair_status_conversions () =
   in
   List.iter
     (fun (status, expected_str) ->
-       let str = Kraken.Kraken_instruments_feed.status_to_string status in
-       let back_to_status = Kraken.Kraken_instruments_feed.status_of_string str in
-       Alcotest.(check string) ("status_to_string " ^ expected_str) expected_str str;
-       Alcotest.(check bool)
-         ("status_of_string roundtrip for " ^ expected_str)
-         true
-         (back_to_status = status))
+      let str = Kraken.Kraken_instruments_feed.status_to_string status in
+      let back_to_status = Kraken.Kraken_instruments_feed.status_of_string str in
+      Alcotest.(check string) ("status_to_string " ^ expected_str) expected_str str;
+      Alcotest.(check bool)
+        ("status_of_string roundtrip for " ^ expected_str)
+        true
+        (back_to_status = status))
     test_cases
 ;;
 

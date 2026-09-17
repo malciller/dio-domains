@@ -1,5 +1,4 @@
-(* Oracle_pools unit tests - pins allocation order, pass-down, cascades,
-   and sell sizing. *)
+(* Oracle_pools unit tests - pins allocation order, pass-down, cascades, and sell sizing. *)
 
 let claim ~id ~priority ~need_quote ?(resting = 0.0) () =
   { Dio_oracle.Oracle_pools.id; priority; need_quote; resting_buy_quote = resting }
@@ -9,12 +8,12 @@ let near ?(eps = 1e-9) name a b = Alcotest.(check (float eps)) name a b
 let has_id lst id = List.mem id lst
 
 (* ------------------------------------------------------------------ *)
-(* allocate                                                           *)
+(* allocate *)
 (* ------------------------------------------------------------------ *)
 
 let test_allocate_pass_down () =
-  (* Available 100: A(60) funded -> 40 left; B(50) skipped; C(30) funded
-     from what B could not use - capacity passes down. *)
+  (* Available 100: A(60) funded -> 40 left; B(50) skipped; C(30) funded from what B could
+     not use - capacity passes down. *)
   let vq =
     { Dio_oracle.Oracle_pools.available = 100.0
     ; claims =
@@ -46,8 +45,8 @@ let test_allocate_exact_fit_and_order () =
 ;;
 
 let test_allocate_resting_counts_against_availability () =
-  (* The caller passes availability net of resting buys - the engine treats
-     that number as the whole truth. *)
+  (* The caller passes availability net of resting buys - the engine treats that number as
+     the whole truth. *)
   let vq =
     { Dio_oracle.Oracle_pools.available = 20.0
     ; claims = [ claim ~id:"A" ~priority:0 ~need_quote:21.0 () ]
@@ -58,7 +57,7 @@ let test_allocate_resting_counts_against_availability () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* cascade                                                            *)
+(* cascade *)
 (* ------------------------------------------------------------------ *)
 
 let test_cascade_noop_when_fits () =
@@ -80,8 +79,8 @@ let test_cascade_single_cancel () =
     ; claim ~id:"low" ~priority:2 ~need_quote:10.0 ~resting:70.0 ()
     ]
   in
-  (* Deficit 30: lowest priority first - cancelling low's 70 covers it and
-     the engine stops there (mid keeps its order). *)
+  (* Deficit 30: lowest priority first - cancelling low's 70 covers it and the engine
+     stops there (mid keeps its order). *)
   Alcotest.(check (list string))
     "single sufficient cancel"
     [ "low" ]
@@ -100,8 +99,8 @@ let test_cascade_many_lesser_orders () =
     ; claim ~id:"low" ~priority:3 ~need_quote:10.0 ~resting:200.0 ()
     ]
   in
-  (* Available 50, need 100 -> deficit 50. Lowest first: low alone covers
-     it; the engine stops at the FIRST fit. *)
+  (* Available 50, need 100 -> deficit 50. Lowest first: low alone covers it; the engine
+     stops at the FIRST fit. *)
   Alcotest.(check (list string))
     "stops at first fit"
     [ "low" ]
@@ -110,8 +109,8 @@ let test_cascade_many_lesser_orders () =
        ~need:100.0
        ~trigger_id:"high"
        ~claims:cs);
-  (* Without the deep pool, two lesser orders together satisfy one greater -
-     and the trigger's own resting buy is never cancelled. *)
+  (* Without the deep pool, two lesser orders together satisfy one greater - and the
+     trigger's own resting buy is never cancelled. *)
   let cs2 = List.filter (fun (c : Dio_oracle.Oracle_pools.claim) -> c.id <> "low") cs in
   Alcotest.(check (list string))
     "many lesser satisfy one greater, trigger spared"
@@ -137,7 +136,7 @@ let test_cascade_impossible_gives_up () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* sell_qty_of                                                        *)
+(* sell_qty_of *)
 (* ------------------------------------------------------------------ *)
 
 let test_sell_qty () =
@@ -158,7 +157,7 @@ let test_sell_qty () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* simulate_drawdown_survival                                         *)
+(* simulate_drawdown_survival *)
 (* ------------------------------------------------------------------ *)
 
 let sim ~id ~priority ~current ~gi ~qty ?(fee = 0.0) () =
@@ -172,9 +171,9 @@ let sim ~id ~priority ~current ~gi ~qty ?(fee = 0.0) () =
 ;;
 
 let test_sim_single_strategy_exhaustion () =
-  (* current 100, gi 10%: rungs 90, 81, 72.9, ... quote 200 buys 90 + 81 =
-     171, the next rung (72.9) does not fit: k = 2, d_surv = 1 - 0.9^2 =
-     0.19 and the deepest filled rung sits at 81. *)
+  (* current 100, gi 10%: rungs 90, 81, 72.9, ... quote 200 buys 90 + 81 = 171, the next
+     rung (72.9) does not fit: k = 2, d_surv = 1 - 0.9^2 = 0.19 and the deepest filled
+     rung sits at 81. *)
   let out =
     Dio_oracle.Oracle_pools.simulate_drawdown_survival
       ~total_quote:200.0
@@ -188,9 +187,8 @@ let test_sim_single_strategy_exhaustion () =
 ;;
 
 let test_sim_priority_shared_capital () =
-  (* Quote 261, two ladders (rungs 90, 81, ...): round 1 funds A then B at
-     90 each, round 2 funds senior A's 81 rung and the pool is dry: A
-     bottoms at 81 (k=2), B at 90 (k=1). *)
+  (* Quote 261, two ladders (rungs 90, 81, ...): round 1 funds A then B at 90 each, round
+     2 funds senior A's 81 rung and the pool is dry: A bottoms at 81 (k=2), B at 90 (k=1). *)
   let out =
     Dio_oracle.Oracle_pools.simulate_drawdown_survival
       ~total_quote:261.0

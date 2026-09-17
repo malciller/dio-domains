@@ -29,7 +29,12 @@
  (public_name dio-dashboard)
  (name dashboard)
  (modes exe)
- (libraries notty-community notty-community.unix yojson unix dio.dashboard_ui))
+ (libraries
+  notty-community
+  notty-community.unix
+  yojson
+  unix
+  dio.dashboard_ui))
 
 (executable
  (package dio)

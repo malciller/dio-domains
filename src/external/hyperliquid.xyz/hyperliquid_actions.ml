@@ -6,9 +6,9 @@ open Lwt.Infix
 
 let section = "hyperliquid_actions"
 
-(** Maps an [ExTypes.order_type] to an [order_type_wire].
-    Limit orders are always posted Alo. [tif] applies only to the catch-all
-    branch for non-standard types; FOK is unsupported and degrades to IOC. *)
+(** Maps an [ExTypes.order_type] to an [order_type_wire]. Limit orders are always posted
+    Alo. [tif] applies only to the catch-all branch for non-standard types; FOK is
+    unsupported and degrades to IOC. *)
 let hl_order_type (ot : ExTypes.order_type) (tif_opt : ExTypes.time_in_force option)
   : order_type_wire
   =
@@ -30,9 +30,9 @@ let hl_order_type (ot : ExTypes.order_type) (tif_opt : ExTypes.time_in_force opt
   | _ -> Limit { tif }
 ;;
 
-(** Formats a float as a fixed-point string with at most 8 decimal places.
-    Strips trailing zeros and the decimal point if unnecessary.
-    Hyperliquid requires normalized numeric strings without trailing zeros. *)
+(** Formats a float as a fixed-point string with at most 8 decimal places. Strips trailing
+    zeros and the decimal point if unnecessary. Hyperliquid requires normalized numeric
+    strings without trailing zeros. *)
 let format_number f =
   let rounded = Printf.sprintf "%.8f" f in
   let rec strip_zeros s =
@@ -46,18 +46,18 @@ let format_number f =
   if s = "-0" then "0" else s
 ;;
 
-(** Constructs an order_wire record from generic order parameters.
-    Maps side to a boolean, formats price and size as normalized strings,
-    and defaults reduce_only to false when unspecified. *)
+(** Constructs an order_wire record from generic order parameters. Maps side to a boolean,
+    formats price and size as normalized strings, and defaults reduce_only to false when
+    unspecified. *)
 let to_hl_order_wire
-      ~qty
-      ~symbol:_
-      ~asset_index
-      ~ot
-      ~side
-      ~limit_price
-      ~reduce_only
-      ~cl_ord_id
+  ~qty
+  ~symbol:_
+  ~asset_index
+  ~ot
+  ~side
+  ~limit_price
+  ~reduce_only
+  ~cl_ord_id
   : order_wire
   =
   let b =
@@ -98,9 +98,9 @@ type amend_order_result =
   ; order_id : int64
   }
 
-(** Credentials from the environment, resolved once on first use.
-    Env vars are static for the process lifetime; lazy so the module loads
-    without them set. Missing vars raise [Failure]. *)
+(** Credentials from the environment, resolved once on first use. Env vars are static for
+    the process lifetime; lazy so the module loads without them set. Missing vars raise
+    [Failure]. *)
 let cached_credentials : (string * string) Lazy.t =
   lazy
     (let pkey =
@@ -118,8 +118,8 @@ let cached_credentials : (string * string) Lazy.t =
 
 let get_credentials () = Lazy.force cached_credentials
 
-(** Monotonically increasing nonce from wall-clock milliseconds.
-    Lock-free CAS loop on [Atomic]; contention is one retry. *)
+(** Monotonically increasing nonce from wall-clock milliseconds. Lock-free CAS loop on
+    [Atomic]; contention is one retry. *)
 let last_nonce = Atomic.make 0L
 
 let get_next_nonce () =
@@ -134,10 +134,10 @@ let get_next_nonce () =
   loop ()
 ;;
 
-(** Submits a signed action to the Hyperliquid REST /exchange endpoint.
-    Signs the msgpack-serialized action with the configured private key,
-    constructs the JSON request envelope, and performs an HTTP POST.
-    Returns Ok(json) on 2xx or Error(string) otherwise. *)
+(** Submits a signed action to the Hyperliquid REST /exchange endpoint. Signs the
+    msgpack-serialized action with the configured private key, constructs the JSON request
+    envelope, and performs an HTTP POST. Returns Ok(json) on 2xx or Error(string)
+    otherwise. *)
 let post_exchange ~testnet ~action_json ~action_msgpack ~is_mainnet =
   let pkey, _wallet = get_credentials () in
   let nonce = get_next_nonce () in
@@ -204,9 +204,9 @@ let next_ws_req_id () =
   id
 ;;
 
-(** Submits a signed action via the WebSocket "post" channel.
-    Returns [Error] immediately when disconnected. Extracts
-    data.response.payload to match the REST response shape for shared parsing. *)
+(** Submits a signed action via the WebSocket "post" channel. Returns [Error] immediately
+    when disconnected. Extracts data.response.payload to match the REST response shape for
+    shared parsing. *)
 let post_exchange_ws ~testnet:_ ~action_json ~action_msgpack ~is_mainnet =
   if not (Hyperliquid_ws.is_connected ())
   then Lwt.return (Error "Hyperliquid WS not connected - order rejected")
@@ -242,39 +242,39 @@ let post_exchange_ws ~testnet:_ ~action_json ~action_msgpack ~is_mainnet =
     Logging.debug_f ~section "Sending WS post action: req_id=%d" req_id;
     Lwt.catch
       (fun () ->
-         Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:10000
-         >>= fun resp ->
-         let open Yojson.Safe.Util in
-         let payload =
-           try resp |> member "data" |> member "response" |> member "payload" with
-           | _ -> resp
-         in
-         Logging.debug_f
-           ~section
-           "Hyperliquid order raw WS response: %s"
-           (Yojson.Safe.to_string payload);
-         Lwt.return (Ok payload))
+        Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:10000
+        >>= fun resp ->
+        let open Yojson.Safe.Util in
+        let payload =
+          try resp |> member "data" |> member "response" |> member "payload" with
+          | _ -> resp
+        in
+        Logging.debug_f
+          ~section
+          "Hyperliquid order raw WS response: %s"
+          (Yojson.Safe.to_string payload);
+        Lwt.return (Ok payload))
       (fun exn ->
-         let err = Printexc.to_string exn in
-         Logging.error_f ~section "WS post failed for req_id=%d: %s" req_id err;
-         Lwt.return (Error (Printf.sprintf "WS order failed: %s" err))))
+        let err = Printexc.to_string exn in
+        Logging.error_f ~section "WS post failed for req_id=%d: %s" req_id err;
+        Lwt.return (Error (Printf.sprintf "WS order failed: %s" err))))
 ;;
 
 (** Places a single order on Hyperliquid via WebSocket with exponential backoff retry.
-    Constructs both the JSON and msgpack representations, signs and submits them,
-    then parses the response for a resting or filled order ID. *)
+    Constructs both the JSON and msgpack representations, signs and submits them, then
+    parses the response for a resting or filled order ID. *)
 let place_order
-      ~symbol
-      ~is_buy
-      ~sz
-      ~px
-      ~is_limit:_
-      ?post_only:_
-      ?reduce_only
-      ?cl_ord_id
-      ?time_in_force
-      ~testnet
-      ()
+  ~symbol
+  ~is_buy
+  ~sz
+  ~px
+  ~is_limit:_
+  ?post_only:_
+  ?reduce_only
+  ?cl_ord_id
+  ?time_in_force
+  ~testnet
+  ()
   =
   let place_order_once () =
     let asset_index =
@@ -388,9 +388,9 @@ let place_order
     ()
 ;;
 
-(** Amends an existing order by order_id on Hyperliquid via WebSocket with retry.
-    Submits a "modify" action with updated price, size, and side.
-    Returns the original and potentially new order ID on success. *)
+(** Amends an existing order by order_id on Hyperliquid via WebSocket with retry. Submits
+    a "modify" action with updated price, size, and side. Returns the original and
+    potentially new order ID on success. *)
 let amend_order ~symbol ~order_id ~is_buy ~px ~sz ?cl_ord_id ~testnet () =
   let amend_order_once () =
     let asset_index =
@@ -495,8 +495,8 @@ let amend_order ~symbol ~order_id ~is_buy ~px ~sz ?cl_ord_id ~testnet () =
     ()
 ;;
 
-(** Cancels one or more orders by their order IDs for a given symbol.
-    Constructs a batch cancel action and submits via WebSocket with retry. *)
+(** Cancels one or more orders by their order IDs for a given symbol. Constructs a batch
+    cancel action and submits via WebSocket with retry. *)
 let cancel_orders ~symbol ~order_ids ~testnet =
   let cancel_orders_once () =
     let asset_index =
@@ -516,7 +516,7 @@ let cancel_orders ~symbol ~order_ids ~testnet =
           , `List
               (List.map
                  (fun oid ->
-                    `Assoc [ "a", `Int asset_index; "o", `Intlit (Int64.to_string oid) ])
+                   `Assoc [ "a", `Int asset_index; "o", `Intlit (Int64.to_string oid) ])
                  order_ids) )
         ]
     in

@@ -1,27 +1,25 @@
-(** Order lifecycle for the IBKR TWS API: placement, modification,
-    cancellation.
+(** Order lifecycle for the IBKR TWS API: placement, modification, cancellation.
 
     Rate limiting omitted: TWS accepts ~50 msg/s, above this adapter's rate.
 
-    Placement and modification use placeOrder (msgId 3). Fills and status
-    arrive asynchronously via orderStatus/openOrder, handled by
-    [Ibkr_executions_feed]. *)
+    Placement and modification use placeOrder (msgId 3). Fills and status arrive
+    asynchronously via orderStatus/openOrder, handled by [Ibkr_executions_feed]. *)
 
 open Lwt.Infix
 
 let section = "ibkr_actions"
 
-(** Places a new order and returns the assigned order id. Resolves the
-    contract for [symbol] before sending. *)
+(** Places a new order and returns the assigned order id. Resolves the contract for
+    [symbol] before sending. *)
 let place_order
-      conn
-      ~symbol
-      ~action (* BUY or SELL *)
-      ~qty
-      ~order_type (* "MKT", "LMT", ... *)
-      ?limit_price
-      ?(tif = "DAY")
-      ()
+  conn
+  ~symbol
+  ~action (* BUY or SELL *)
+  ~qty
+  ~order_type (* "MKT", "LMT", ... *)
+  ?limit_price
+  ?(tif = "DAY")
+  ()
   =
   Ibkr_contracts.resolve conn ~symbol
   >>= fun contract ->
@@ -51,8 +49,8 @@ let place_order
      | Some p -> Printf.sprintf " @ %.4f" p
      | None -> "")
     order_id;
-  (* placeOrder wire fields: msgId, orderId, short contract, secIdType,
-     secId, action, totalQty, orderType, lmtPrice, auxPrice, tif. *)
+  (* placeOrder wire fields: msgId, orderId, short contract, secIdType, secId, action,
+     totalQty, orderType, lmtPrice, auxPrice, tif. *)
   let msg_fields =
     [ string_of_int Ibkr_types.msg_place_order; string_of_int order_id ]
     @ Ibkr_codec.encode_contract_short contract
@@ -63,18 +61,17 @@ let place_order
   Ibkr_connection.send conn msg_fields >|= fun () -> order_id
 ;;
 
-(** Modifies an active order by re-sending placeOrder with the existing
-    [order_id]. *)
+(** Modifies an active order by re-sending placeOrder with the existing [order_id]. *)
 let modify_order
-      conn
-      ~order_id
-      ~symbol
-      ~action
-      ~qty
-      ~order_type
-      ?limit_price
-      ?(tif = "GTC")
-      ()
+  conn
+  ~order_id
+  ~symbol
+  ~action
+  ~qty
+  ~order_type
+  ?limit_price
+  ?(tif = "GTC")
+  ()
   =
   Ibkr_contracts.resolve conn ~symbol
   >>= fun contract ->

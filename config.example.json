@@ -1,5 +1,13 @@
 {
   "logging_level": "info",
+  "gc": {
+    "minor_heap_size": 524288,
+    "space_overhead": 200,
+    "max_overhead": 1000000,
+    "window_size": 10,
+    "allocation_policy": 2,
+    "major_heap_increment": 1048576
+  },
   "oracle": {
     "target_survival": 0.95,
     "min_active_dsurv": 0.0,
@@ -10,21 +18,32 @@
       "symbol": "BTC/USDC",
       "exchange": "hyperliquid",
       "qty": "0.0001",
-      "grid_interval": [0.1, 0.5],
-      "strategy": "Ladder",
+      "grid_interval": [
+        0.1,
+        0.5
+      ],
+      "strategy": "jacobs_ladder",
       "testnet": true,
       "sell_mult": "0.99",
-      "accumulation_buffer": [0.1, 0.5]
+      "cpu_priority": 10,
+      "accumulation_buffer": [
+        0.1,
+        0.5
+      ]
     },
     {
       "symbol": "SPY",
       "exchange": "alpaca",
       "qty": "0.01",
-      "grid_interval": [0.1, 0.5],
-      "strategy": "Ladder",
+      "grid_interval": [
+        0.1,
+        0.5
+      ],
+      "strategy": "jacobs_ladder",
       "testnet": true,
       "data_feed": "iex",
-      "sell_levels": true
+      "sell_levels": true,
+      "cpu_priority": 0
     }
   ]
 }

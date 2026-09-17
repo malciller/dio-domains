@@ -1,6 +1,6 @@
-(** EIP-712 structured data signing for the Hyperliquid L1 action protocol.
-    Implements domain separation, Agent struct hashing, and secp256k1 ECDSA
-    signature generation with recovery ID per the Ethereum signing convention. *)
+(** EIP-712 structured data signing for the Hyperliquid L1 action protocol. Implements
+    domain separation, Agent struct hashing, and secp256k1 ECDSA signature generation with
+    recovery ID per the Ethereum signing convention. *)
 
 module Int64 = Stdlib.Int64
 
@@ -42,9 +42,9 @@ let encode_uint64_be n =
   Bytes.to_string buf
 ;;
 
-(** Compute the Keccak-256 action hash per the Hyperliquid signing spec.
-    Concatenates: msgpack(action) || nonce(u64) || vault_address? || expires_after?
-    The vault and expiration fields are optional; vault uses a 0x00/0x01 presence tag. *)
+(** Compute the Keccak-256 action hash per the Hyperliquid signing spec. Concatenates:
+    msgpack(action) || nonce(u64) || vault_address? || expires_after? The vault and
+    expiration fields are optional; vault uses a 0x00/0x01 presence tag. *)
 let action_hash ~action_msgpack ~nonce ~vault_address ~expires_after =
   let buf = Buffer.create 128 in
   Buffer.add_string buf action_msgpack;
@@ -78,8 +78,8 @@ let keccak256_str s =
   Digestif.KECCAK_256.to_raw_string (Digestif.KECCAK_256.digest_string s)
 ;;
 
-(** Precomputed EIP-712 domain separator type hash and field hashes.
-    Domain: name="Exchange", version="1", verifyingContract=0x0. *)
+(** Precomputed EIP-712 domain separator type hash and field hashes. Domain:
+    name="Exchange", version="1", verifyingContract=0x0. *)
 let domain_type_hash =
   keccak256_str
     "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
@@ -104,7 +104,8 @@ let hash_domain ~chain_id =
   keccak256_str (Buffer.contents buf)
 ;;
 
-(** Precomputed EIP-712 type hash for the Agent struct: Agent(string source, bytes32 connectionId). *)
+(** Precomputed EIP-712 type hash for the Agent struct: Agent(string source, bytes32
+    connectionId). *)
 let agent_type_hash = keccak256_str "Agent(string source,bytes32 connectionId)"
 
 let hash_agent ~source_str ~connection_id_raw =
@@ -145,9 +146,8 @@ let bs_sub_to_string bs ofs len =
   Bytes.to_string s
 ;;
 
-(** Shared signing context: [Secp256k1.Context.create] is expensive, so it is
-    created once at module load and reused. Signing runs on the single-threaded
-    Lwt scheduler. *)
+(** Shared signing context: [Secp256k1.Context.create] is expensive, so it is created once
+    at module load and reused. Signing runs on the single-threaded Lwt scheduler. *)
 let sign_ctx = Secp256k1.Context.create [ Secp256k1.Context.Sign ]
 
 let sign_hash ~private_key_raw ~msg_hash_raw =
@@ -165,9 +165,9 @@ let sign_hash ~private_key_raw ~msg_hash_raw =
   hex_r, hex_s, v_eth
 ;;
 
-(** Derive the Ethereum address (0x-prefixed, lowercase hex) from a private key.
-    Computes the uncompressed public key, hashes it with Keccak-256,
-    and extracts the last 20 bytes as the address. *)
+(** Derive the Ethereum address (0x-prefixed, lowercase hex) from a private key. Computes
+    the uncompressed public key, hashes it with Keccak-256, and extracts the last 20 bytes
+    as the address. *)
 let address_of_private_key_hex ~private_key_hex =
   let pkey_clean =
     if String.starts_with ~prefix:"0x" private_key_hex
@@ -178,7 +178,8 @@ let address_of_private_key_hex ~private_key_hex =
   let ctx = sign_ctx in
   let seckey = Secp256k1.Key.read_sk_exn ctx (bs_of_string private_key_raw) in
   let pubkey = Secp256k1.Key.neuterize_exn ctx seckey in
-  (* Uncompressed pubkey (65 bytes: 0x04 || x || y), Keccak-256 hashed; last 20 bytes are the address. *)
+  (* Uncompressed pubkey (65 bytes: 0x04 || x || y), Keccak-256 hashed; last 20 bytes are
+     the address. *)
   let pubkey_buf = Secp256k1.Key.to_bytes ~compress:false ctx pubkey in
   let pubkey_str =
     Array1.dim pubkey_buf
@@ -195,17 +196,17 @@ let address_of_private_key_hex ~private_key_hex =
   "0x" ^ hex_of_bytes addr_bytes
 ;;
 
-(** Sign a Hyperliquid L1 action. Computes the action hash, constructs the EIP-712
-    Agent struct, produces the typed data digest, and signs with the given private key.
-    Returns (r, s, v) as hex strings and integer recovery value. *)
+(** Sign a Hyperliquid L1 action. Computes the action hash, constructs the EIP-712 Agent
+    struct, produces the typed data digest, and signs with the given private key. Returns
+    (r, s, v) as hex strings and integer recovery value. *)
 let sign_l1_action
-      ?expires_after
-      ~private_key_hex
-      ~action_msgpack
-      ~nonce
-      ~is_mainnet
-      ~vault_address
-      ()
+  ?expires_after
+  ~private_key_hex
+  ~action_msgpack
+  ~nonce
+  ~is_mainnet
+  ~vault_address
+  ()
   =
   let start_ns = Mtime_clock.now_ns () in
   let pkey_clean =

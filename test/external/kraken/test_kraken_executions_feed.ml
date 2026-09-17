@@ -16,16 +16,16 @@ let test_exec_type_conversions () =
   in
   List.iter
     (fun (exec_type, expected_str) ->
-       let str = Kraken.Kraken_executions_feed.string_of_exec_type exec_type in
-       let back_to_type = Kraken.Kraken_executions_feed.exec_type_of_string str in
-       Alcotest.(check string)
-         (Printf.sprintf "exec_type to string: %s" expected_str)
-         expected_str
-         str;
-       Alcotest.(check bool)
-         (Printf.sprintf "exec_type round-trip: %s" expected_str)
-         true
-         (back_to_type = exec_type))
+      let str = Kraken.Kraken_executions_feed.string_of_exec_type exec_type in
+      let back_to_type = Kraken.Kraken_executions_feed.exec_type_of_string str in
+      Alcotest.(check string)
+        (Printf.sprintf "exec_type to string: %s" expected_str)
+        expected_str
+        str;
+      Alcotest.(check bool)
+        (Printf.sprintf "exec_type round-trip: %s" expected_str)
+        true
+        (back_to_type = exec_type))
     test_cases
 ;;
 
@@ -71,16 +71,16 @@ let test_order_status_conversions () =
   in
   List.iter
     (fun (status, expected_str) ->
-       let str = Kraken.Kraken_executions_feed.string_of_order_status status in
-       let back_to_status = Kraken.Kraken_executions_feed.order_status_of_string str in
-       Alcotest.(check string)
-         (Printf.sprintf "order_status to string: %s" expected_str)
-         expected_str
-         str;
-       Alcotest.(check bool)
-         (Printf.sprintf "order_status round-trip: %s" expected_str)
-         true
-         (back_to_status = status))
+      let str = Kraken.Kraken_executions_feed.string_of_order_status status in
+      let back_to_status = Kraken.Kraken_executions_feed.order_status_of_string str in
+      Alcotest.(check string)
+        (Printf.sprintf "order_status to string: %s" expected_str)
+        expected_str
+        str;
+      Alcotest.(check bool)
+        (Printf.sprintf "order_status round-trip: %s" expected_str)
+        true
+        (back_to_status = status))
     test_cases
 ;;
 
@@ -304,10 +304,10 @@ let make_open_sell ~id ~symbol ~qty ~price =
 ;;
 
 let test_inject_pre_existing_open_sell () =
-  (* Regression: orders existing before process start (or beyond the WS
-     snap_orders cap) must be adoptable. The REST /OpenOrders bootstrap injects
-     them into the same cache the strategy's open-order scan reads, so
-     pre-existing sells are reserved inventory, not free. *)
+  (* Regression: orders existing before process start (or beyond the WS snap_orders cap)
+     must be adoptable. The REST /OpenOrders bootstrap injects them into the same cache
+     the strategy's open-order scan reads, so pre-existing sells are reserved inventory,
+     not free. *)
   let symbol = "PREEXIST/USD" in
   Kraken.Kraken_executions_feed.inject_open_orders
     [ make_open_sell ~id:"preexist-sell-1" ~symbol ~qty:0.75 ~price:539.67
@@ -320,15 +320,14 @@ let test_inject_pre_existing_open_sell () =
     true
     (List.exists
        (fun (o : Kraken.Kraken_executions_feed.open_order) ->
-          o.order_id = "preexist-sell-1" && abs_float (o.remaining_qty -. 0.75) < 1e-9)
+         o.order_id = "preexist-sell-1" && abs_float (o.remaining_qty -. 0.75) < 1e-9)
        orders)
 ;;
 
 let test_snapshot_hook_fires () =
-  (* Supervisor wires the REST bootstrap to this hook. Every snapshot (initial
-     subscribe and every reconnect) must fire it: snapshot reconcile removes
-     cached orders absent from the capped snapshot, including ones the
-     bootstrap restored. *)
+  (* Supervisor wires the REST bootstrap to this hook. Every snapshot (initial subscribe
+     and every reconnect) must fire it: snapshot reconcile removes cached orders absent
+     from the capped snapshot, including ones the bootstrap restored. *)
   let calls = ref 0 in
   Kraken.Kraken_executions_feed.set_on_snapshot_hook (fun () -> incr calls);
   Kraken.Kraken_executions_feed.handle_snapshot
@@ -339,9 +338,8 @@ let test_snapshot_hook_fires () =
 ;;
 
 let test_resolve_rest_pair_to_symbol () =
-  (* REST /OpenOrders [descr.pair] arrives in legacy pair form; it must map to
-     the configured symbol or the injected order lands under a key the strategy
-     never scans. *)
+  (* REST /OpenOrders [descr.pair] arrives in legacy pair form; it must map to the
+     configured symbol or the injected order lands under a key the strategy never scans. *)
   let symbols = [ "XMR/USD"; "BTC/USD"; "ETH/USD" ] in
   Alcotest.(check string)
     "altname maps to the configured symbol"

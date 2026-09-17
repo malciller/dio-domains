@@ -104,22 +104,19 @@ let orchestrator =
 
 (* Pure decision logic: no I/O, unit-testable *)
 
-(** Buy fill: update the last-buy reference for the next sell's profitability
-    check. [oid] is accepted per the store contract; OID sequencing is owned by
-    the execution layer. *)
+(** Buy fill: update the last-buy reference for the next sell's profitability check. [oid]
+    is accepted per the store contract; OID sequencing is owned by the execution layer. *)
 let apply_buy_fill t ~price ~qty ~oid =
   let _ = oid in
   { t with last_buy_fill_price = Some price; last_buy_fill_qty = Some qty }
 ;;
 
-(** Sell fill: compare against the last buy fill for profitability.
-    profit = (sell_price - last_buy_price) * paired_qty - [fees] (fees are
-    all-inclusive, both legs); when net profit > 0 it is added to
-    accumulated_profit. When accumulated_profit covers the acquisition cost of
-    the reserved base plus [buffer] (realtime, fear-and-greed driven):
-    reserved_base += oracle_qty * (1 - sell_mult) and accumulated_profit -=
-    base_cost, preserving the buffer and surplus profit in the quote ledger.
-    [fees] defaults to 0.0. *)
+(** Sell fill: compare against the last buy fill for profitability. profit = (sell_price -
+    last_buy_price) * paired_qty - [fees] (fees are all-inclusive, both legs); when net
+    profit > 0 it is added to accumulated_profit. When accumulated_profit covers the
+    acquisition cost of the reserved base plus [buffer] (realtime, fear-and-greed driven):
+    reserved_base += oracle_qty * (1 - sell_mult) and accumulated_profit -= base_cost,
+    preserving the buffer and surplus profit in the quote ledger. [fees] defaults to 0.0. *)
 let apply_sell_fill t ~price ~qty ~oid ~buffer ~sell_mult ~oracle_qty ?(fees = 0.0) () =
   let t =
     { t with
@@ -142,11 +139,11 @@ let apply_sell_fill t ~price ~qty ~oid ~buffer ~sell_mult ~oracle_qty ?(fees = 0
       let accrued_base = Float.max 0.0 (oracle_qty *. (1.0 -. sell_mult)) in
       let base_cost = accrued_base *. buy_price in
       if accrued_base > 0.0 && accumulated_profit >= base_cost +. buffer
-      then (
+      then
         { t with
           reserved_base = t.reserved_base +. accrued_base
         ; accumulated_profit = accumulated_profit -. base_cost
-        })
+        }
       else { t with accumulated_profit })
     else t
   | _ -> t
@@ -189,10 +186,10 @@ let save_async ~key t = Persistence_orchestrator.put_async orchestrator ~key t
 
 (* -- Legacy migration -------------------------------------------------- *)
 
-(** Import one legacy flat entry: accumulation fields go under a full strategy
-    key when exactly one configured strategy matches the symbol, else under
-    "migrated:{symbol}" (logged either way). Legacy sell levels are ignored
-    here; sell_levels_store has its own hook. *)
+(** Import one legacy flat entry: accumulation fields go under a full strategy key when
+    exactly one configured strategy matches the symbol, else under "migrated:[{symbol}]"
+    (logged either way). Legacy sell levels are ignored here; sell_levels_store has its
+    own hook. *)
 let migrate_entry symbol json =
   let open Yojson.Basic.Util in
   let has field = json |> member field <> `Null in

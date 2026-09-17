@@ -1,0 +1,151 @@
+-- Jacobs Ladder grid — the written-out decision procedure.
+-- Reads top to bottom; each indented block under a label is one step.
+strategy jacobs_ladder
+version 1
+
+remembers:
+  cycle.ok: bool
+  buy.active: bool
+  buy.pending: bool
+  buy.should.cancel: bool
+  buy.count.zero: bool
+  buy.count.positive: bool
+
+-- every order event routes to the shared handler and ends the cycle
+when any.order.event:
+  ev:
+    apply.order.event
+    stop
+
+when book.updates:
+
+  prepare:
+    init.venue.state
+    prepare.recovery
+    resolve.book
+    early.facts
+    cycle.ok = not $platform.price.nan and
+               not ($platform.check.stale.balance and
+                    ($platform.asset.balance.nan or $platform.quote.balance.nan))
+
+  skip.nan.price:
+    if $platform.price.nan:
+      stop
+
+  cleanup:
+    expire.amend.cooldowns
+    evict.ghost.orders
+
+  sync:
+    scan.open.orders
+
+  fee:
+    if not $platform.maker.fee.set or $platform.fee.refresh.due:
+      refresh.maker.fee
+
+  mark.stale:
+    if not $platform.price.nan and $platform.check.stale.balance and
+       ($platform.asset.balance.nan or $platform.quote.balance.nan):
+      mark.stale.cycle
+
+  buy.gate:
+    if cycle.ok:
+      expire.tif.recovery
+      cycle.facts
+      buy.active = not ($platform.oracle.halted and
+                        not ($platform.tif.recovery.pending and
+                             $now - $platform.tif.recovery.since < 900))
+      buy.pending = not $platform.has.pending.buy
+      buy.should.cancel = $platform.open.buy.count > 1 and
+                          not $platform.inflight.cancel.buy and
+                          not $platform.inflight.amend.buy and
+                          not $platform.has.recent.amend.buy
+      buy.count.zero = not ($platform.open.buy.count > 0 or $platform.has.tracked.buy)
+      buy.count.positive = $platform.open.buy.count > 0 or $platform.has.tracked.buy
+
+  buy.cancel:
+    if cycle.ok and buy.active and buy.pending and buy.should.cancel:
+      cancel.excess.buys
+
+  buy.place.plan:
+    if cycle.ok and buy.active and buy.pending and
+       not buy.should.cancel and buy.count.zero:
+      buy.place.plan
+
+  buy.place.send:
+    if cycle.ok and buy.active and buy.pending and
+       not buy.should.cancel and buy.count.zero and
+       not $platform.buy.capital.low and not $platform.buy.crossing and
+       not $platform.buy.quote.nan and not $platform.buy.cooldown and
+       not $platform.buy.inflight and $platform.buy.balance.ok:
+      buy.place.send
+
+  buy.place.send.insufficient:
+    if cycle.ok and buy.active and buy.pending and
+       not buy.should.cancel and buy.count.zero and
+       not $platform.buy.capital.low and not $platform.buy.crossing and
+       not $platform.buy.quote.nan and not $platform.buy.cooldown and
+       not $platform.buy.inflight and not $platform.buy.balance.ok and
+       $platform.quote.balance.stale:
+      buy.place.send.insufficient
+
+  buy.place.latch:
+    if cycle.ok and buy.active and buy.pending and
+       not buy.should.cancel and buy.count.zero and
+       not $platform.buy.capital.low and not $platform.buy.crossing and
+       not $platform.buy.quote.nan and not $platform.buy.cooldown and
+       not $platform.buy.inflight and not $platform.buy.balance.ok and
+       not $platform.quote.balance.stale:
+      buy.place.latch.capital.low
+
+  buy.place.warn:
+    if cycle.ok and buy.active and buy.pending and
+       not buy.should.cancel and buy.count.zero and
+       not $platform.buy.capital.low and not $platform.buy.crossing and
+       $platform.buy.quote.nan:
+      buy.place.warn.quote
+
+  buy.amend.has.sell:
+    if cycle.ok and buy.active and buy.pending and
+       not buy.should.cancel and buy.count.positive:
+      buy.amend.has.sell
+
+  buy.amend.with.sell:
+    if cycle.ok and buy.active and buy.pending and
+       not buy.should.cancel and buy.count.positive and $platform.amend.has.sell:
+      buy.amend.with.sell
+
+  buy.amend.no.sell:
+    if cycle.ok and buy.active and buy.pending and
+       not buy.should.cancel and buy.count.positive and not $platform.amend.has.sell:
+      buy.amend.no.sell
+
+  sell.prepare:
+    if cycle.ok:
+      plan.sell.order
+
+  sell.place.should:
+    if cycle.ok:
+      sell.place.should
+
+  sell.place:
+    if cycle.ok and $platform.sell.place.should:
+      sell.place.body
+
+  sell.finalize.latch:
+    if cycle.ok:
+      sell.finalize.latch
+      sell.finalize.facts
+
+  sell.excess.sweep:
+    if cycle.ok and $platform.remaintain.expired.sells and
+       $platform.sell.missing.empty and not $platform.just.filled.buy and
+       not $platform.resuming.after.balance and not $platform.buy.attempted and
+       not $platform.sell.pushed and not $platform.has.active.sell and
+       not $platform.asset.balance.nan and $platform.balance.fresh:
+      sell.excess.sweep.phase
+
+  sell.finalize.end:
+    if cycle.ok:
+      sell.finalize.end
+      stop

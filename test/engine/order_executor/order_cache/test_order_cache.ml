@@ -43,11 +43,10 @@ let test_inflight_amendments_cleanup () =
 ;;
 
 let test_amend_lifecycle_replace () =
-  (* A replace-style amendment (Hyperliquid/Alpaca: old id cancelled, new id
-     created): after the exchange confirms, the OLD id stays registered as
-     [Replaced] for the recognition window, so a late cancel event for the
-     old id is recognized as the amend's side effect and must not reset
-     tracking. *)
+  (* A replace-style amendment (Hyperliquid/Alpaca: old id cancelled, new id created):
+     after the exchange confirms, the OLD id stays registered as [Replaced] for the
+     recognition window, so a late cancel event for the old id is recognized as the
+     amend's side effect and must not reset tracking. *)
   let module A = Dio_strategies.Strategy_common.InFlightAmendments in
   let old_id = "lifecycle_old" in
   let new_id = "lifecycle_new" in
@@ -70,9 +69,8 @@ let test_amend_lifecycle_replace () =
 ;;
 
 let test_amend_lifecycle_same_id () =
-  (* An in-place amendment (Kraken: same id): no Replaced entry is retained,
-     so events for that id are always real (a genuine cancel must reset
-     tracking). *)
+  (* An in-place amendment (Kraken: same id): no Replaced entry is retained, so events for
+     that id are always real (a genuine cancel must reset tracking). *)
   let module A = Dio_strategies.Strategy_common.InFlightAmendments in
   let order_id = "lifecycle_same_id" in
   ignore (A.remove_in_flight_amendment order_id);
@@ -87,9 +85,8 @@ let test_amend_lifecycle_same_id () =
 ;;
 
 let test_amend_lifecycle_failed_is_terminal () =
-  (* A failed amendment drops the entry immediately: a follow-up cancel event
-     for the old id is handled as a real one (the failure path has already
-     reconciled tracking). *)
+  (* A failed amendment drops the entry immediately: a follow-up cancel event for the old
+     id is handled as a real one (the failure path has already reconciled tracking). *)
   let module A = Dio_strategies.Strategy_common.InFlightAmendments in
   let order_id = "lifecycle_failed" in
   ignore (A.remove_in_flight_amendment order_id);

@@ -1,7 +1,7 @@
-(* Holdings pause-state tests: the dashboard's paused status must reflect the
-   capital oracle's INACTIVE verdict (the oracle-paused state), not just the
-   grid's internal capital-low flag - an asset the oracle says cannot fund
-   its first buy is paused even when the grid state is quiet. *)
+(* Holdings pause-state tests: the dashboard's paused status must reflect the capital
+   oracle's INACTIVE verdict (the oracle-paused state), not just the grid's internal
+   capital-low flag - an asset the oracle says cannot fund its first buy is paused even
+   when the grid state is quiet. *)
 
 let strategy_json ?(oracle = `Null) ?(capital_low = false) ?(market_closed = false) () =
   `Assoc
@@ -42,8 +42,7 @@ let test_oracle_inactive () =
 ;;
 
 let test_strategy_paused () =
-  (* Paused = oracle INACTIVE, or the grid's capital-low flag, or the market
-     closed. *)
+  (* Paused = oracle INACTIVE, or the grid's capital-low flag, or the market closed. *)
   Alcotest.(check bool)
     "quiet active grid -> running"
     (Dashboard_ui.Holdings.strategy_paused (strategy_of_json (strategy_json ())))
@@ -81,8 +80,8 @@ let test_latency_format () =
   Alcotest.(check string) "2.5ms" "2.5ms" (Dashboard_ui.Theme.format_latency_us 2500.0);
   Alcotest.(check string) "2.0s" "2.0s" (Dashboard_ui.Theme.format_latency_us 2_000_000.0);
   Alcotest.(check string) "zero" "0µs" (Dashboard_ui.Theme.format_latency_us 0.0);
-  (* The sub-microsecond predicate drives the dark-green ns styling: only
-     nonzero values below 1us count (zero reads as idle, not ns). *)
+  (* The sub-microsecond predicate drives the dark-green ns styling: only nonzero values
+     below 1us count (zero reads as idle, not ns). *)
   Alcotest.(check bool) "500ns is sub-us" true (Dashboard_ui.Theme.is_sub_us 0.5);
   Alcotest.(check bool) "0.999us is sub-us" true (Dashboard_ui.Theme.is_sub_us 0.999);
   Alcotest.(check bool) "1us is not sub-us" false (Dashboard_ui.Theme.is_sub_us 1.0);
@@ -135,12 +134,12 @@ let latency_json () =
 
 let test_latency_pages () =
   let open Dashboard_ui in
-  (* Default view is the INTERNAL page; the section has room for the future
-     network metrics without widening the table. *)
+  (* Default view is the INTERNAL page; the section has room for the future network
+     metrics without widening the table. *)
   Alcotest.(check int) "starts on INTERNAL page" 0 (Latencies.current_page_index ());
   Alcotest.(check int) "two latency pages" 2 (Latencies.page_count ());
-  (* INTERNAL lists the separate oracle-pass metric first, then the per-cycle
-     segments in pipeline order, then the whole-cycle total. *)
+  (* INTERNAL lists the separate oracle-pass metric first, then the per-cycle segments in
+     pipeline order, then the whole-cycle total. *)
   Alcotest.(check (list string))
     "INTERNAL columns"
     [ "oracle"; "orderbook"; "execution"; "prep"; "strategy"; "cycle" ]
@@ -153,10 +152,9 @@ let test_latency_pages () =
      && List.mem "rest_request" net
      && List.mem "signer" net)
     true;
-  (* Every page's trend header must fit the trend column. A longer label
-     would silently overrun the fixed-width column and shift every border
-     to its right out of alignment (regression: "(ORACLE P99)" is 12 chars
-     in an 11-wide column). *)
+  (* Every page's trend header must fit the trend column. A longer label would silently
+     overrun the fixed-width column and shift every border to its right out of alignment
+     (regression: "(ORACLE P99)" is 12 chars in an 11-wide column). *)
   for i = 0 to Latencies.page_count () - 1 do
     Alcotest.(check bool)
       (Printf.sprintf "page %d trend label fits the trend column" i)
@@ -176,9 +174,8 @@ let test_latency_pages () =
 let test_latency_page_render () =
   let open Dashboard_ui in
   let json = latency_json () in
-  (* Rows stay visible across pages (freshness is checked across all pages),
-     so the not-yet-instrumented NETWORK page still renders cleanly instead
-     of blanking out. *)
+  (* Rows stay visible across pages (freshness is checked across all pages), so the
+     not-yet-instrumented NETWORK page still renders cleanly instead of blanking out. *)
   Latencies.set_page 0;
   Alcotest.(check bool)
     "INTERNAL page renders"
@@ -209,9 +206,8 @@ let test_latency_page_render () =
 ;;
 
 let test_network_latency () =
-  (* Recording network measurements and publishing windows produces the
-     NETWORK-page labels (ws_ping / ws_feed / rest_request / signer) with
-     the recorded distributions. *)
+  (* Recording network measurements and publishing windows produces the NETWORK-page
+     labels (ws_ping / ws_feed / rest_request / signer) with the recorded distributions. *)
   Network_latency.record_ping_s "kraken" 0.005;
   Network_latency.record_ping_s "kraken" 0.009;
   Network_latency.record_feed_s "kraken" 0.05;
@@ -317,9 +313,8 @@ let test_latency_persistence () =
     (Latencies.render_latencies
        180
        (Dashboard_ui.Snapshot.of_json (ping_json "AAA/USDC" ~fresh:true)));
-  (* An idle window for the same symbol keeps the last measured values on
-     screen instead of reverting to "idle" (short-lived metrics like ping
-     stay visible between windows). *)
+  (* An idle window for the same symbol keeps the last measured values on screen instead
+     of reverting to "idle" (short-lived metrics like ping stay visible between windows). *)
   let persisted =
     render_to_text
       (Latencies.render_latencies

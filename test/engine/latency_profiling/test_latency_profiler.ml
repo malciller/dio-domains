@@ -63,8 +63,8 @@ let test_overflow () =
 
 let test_sub_microsecond_ns () =
   let t = LP.create "subus" in
-  (* 100 samples of 500ns: previously truncated to 0us, now captured in the
-     nanosecond tier (500ns = 0.5us). *)
+  (* 100 samples of 500ns: previously truncated to 0us, now captured in the nanosecond
+     tier (500ns = 0.5us). *)
   for _ = 1 to 100 do
     LP.record t (Mtime.Span.of_uint64_ns 500L)
   done;
@@ -79,8 +79,8 @@ let test_sub_microsecond_ns () =
 
 let test_sub_us_mixed_with_us () =
   let t = LP.create "mixed" in
-  (* 50 samples of 500ns, 50 samples of 10us: p50 lands in the ns tier,
-     p90/p95 in the us tier. *)
+  (* 50 samples of 500ns, 50 samples of 10us: p50 lands in the ns tier, p90/p95 in the us
+     tier. *)
   for _ = 1 to 50 do
     LP.record t (Mtime.Span.of_uint64_ns 500L)
   done;
@@ -97,8 +97,8 @@ let test_sub_us_mixed_with_us () =
 
 let test_sub_us_spanning_boundary () =
   let t = LP.create "boundary" in
-  (* 40 at 500ns, 30 at 999ns, 30 at 2us: p50 lands at 999ns (last ns
-     bucket), p90/p95 cross into the us tier at 2us. *)
+  (* 40 at 500ns, 30 at 999ns, 30 at 2us: p50 lands at 999ns (last ns bucket), p90/p95
+     cross into the us tier at 2us. *)
   for _ = 1 to 40 do
     LP.record t (Mtime.Span.of_uint64_ns 500L)
   done;
@@ -139,8 +139,8 @@ let test_ns_bucket_routing () =
 
 let test_zero_ns_percentile () =
   let t = LP.create "zero" in
-  (* All samples are exactly 0ns. Percentiles must stay 0.0 rather than
-     drifting to the next ns bucket boundary (sentinel regression). *)
+  (* All samples are exactly 0ns. Percentiles must stay 0.0 rather than drifting to the
+     next ns bucket boundary (sentinel regression). *)
   for _ = 1 to 100 do
     LP.record t (Mtime.Span.of_uint64_ns 0L)
   done;
@@ -154,9 +154,9 @@ let test_zero_ns_percentile () =
 
 let test_record_ns () =
   let t = LP.create "ns_direct" in
-  (* record_ns bypasses Mtime.Span boxing: 500ns routes to the ns tier, 2.5us
-     to the coarse tier at bucket_us=1, and a backwards clock (negative) is
-     clamped to 0 rather than indexing below the histogram. *)
+  (* record_ns bypasses Mtime.Span boxing: 500ns routes to the ns tier, 2.5us to the
+     coarse tier at bucket_us=1, and a backwards clock (negative) is clamped to 0 rather
+     than indexing below the histogram. *)
   LP.record_ns t 500;
   LP.record_ns t 2500;
   LP.record_ns t 30000;
@@ -182,9 +182,9 @@ let test_record_ns_matches_record () =
 ;;
 
 let test_canary_clock_nonalloc () =
-  (* The canary's whole purpose depends on a clock that does not allocate:
-     an allocating clock would make the detector trigger its own minor GCs.
-     Read 1000 times and assert the minor-word counter does not move. *)
+  (* The canary's whole purpose depends on a clock that does not allocate: an allocating
+     clock would make the detector trigger its own minor GCs. Read 1000 times and assert
+     the minor-word counter does not move. *)
   let before = Gc.minor_words () in
   let last = ref 0 in
   let backwards = ref false in
@@ -200,8 +200,8 @@ let test_canary_clock_nonalloc () =
 
 let test_snapshot_sub_us () =
   let t = LP.create "snap" in
-  (* 10 samples of 250ns + 5 samples of 4us: the published snapshot must
-     carry nanosecond-resolution percentiles for the sub-us majority. *)
+  (* 10 samples of 250ns + 5 samples of 4us: the published snapshot must carry
+     nanosecond-resolution percentiles for the sub-us majority. *)
   for _ = 1 to 10 do
     LP.record t (Mtime.Span.of_uint64_ns 250L)
   done;
@@ -268,8 +268,8 @@ let test_fine_tier_routing () =
 ;;
 
 let test_mixed_three_tiers () =
-  (* One sample in each tier with bucket_us=10: ns (500ns), fine (5us),
-     coarse (100us). Percentiles must resolve across all three. *)
+  (* One sample in each tier with bucket_us=10: ns (500ns), fine (5us), coarse (100us).
+     Percentiles must resolve across all three. *)
   let t = LP.create ~bucket_us:10 ~max_latency_us:1000 "three-tier" in
   for _ = 1 to 100 do
     LP.record t (Mtime.Span.of_uint64_ns 500L)
@@ -311,8 +311,8 @@ let test_spike_tracking () =
 ;;
 
 let test_spike_count_coarse_bucket () =
-  (* A coarse-bucket profiler (the cycle/exec shape) must still count
-     sub-bucket spikes via its fine microsecond tier. *)
+  (* A coarse-bucket profiler (the cycle/exec shape) must still count sub-bucket spikes
+     via its fine microsecond tier. *)
   let t = LP.create ~bucket_us:1000 ~max_latency_us:2_000_000 "coarse-spikes" in
   LP.record t (Mtime.Span.of_uint64_ns 5000L);
   (* 5us, fine tier *)
@@ -328,10 +328,10 @@ let test_spike_count_coarse_bucket () =
 ;;
 
 let test_count_above_fine_and_coarse_split () =
-  (* bucket_us=10: 1-9us live in the fine microsecond tier, 10us+ in the coarse
-     tier. A threshold at the boundary must count only the coarse sample, and a
-     threshold inside the fine tier must count the fine samples at/above it -
-     this locks the start-index optimization in [count_above]. *)
+  (* bucket_us=10: 1-9us live in the fine microsecond tier, 10us+ in the coarse tier. A
+     threshold at the boundary must count only the coarse sample, and a threshold inside
+     the fine tier must count the fine samples at/above it - this locks the start-index
+     optimization in [count_above]. *)
   let t = LP.create ~bucket_us:10 ~max_latency_us:1000 "split" in
   LP.record t (Mtime.Span.of_uint64_ns 5_000L);
   (* 5us -> fine bucket 4 *)
@@ -357,35 +357,35 @@ let test_snapshot_no_threshold () =
   Alcotest.(check (float 0.001)) "max still recorded" 50.0 snap.max_us
 ;;
 
-(* Minimal snapshot builder for the spike-message tests: only the fields the
-   formatter reads are interesting; the rest are fixed sentinels. *)
+(* Minimal snapshot builder for the spike-message tests: only the fields the formatter
+   reads are interesting; the rest are fixed sentinels. *)
 let snap
-      ?(samples = 0)
-      ?(over_threshold = 0)
-      ?(max_us = 0.0)
-      ?(p99 = 0.0)
-      ?(p50 = 0.0)
-      ?max_cause
-      name
+  ?(samples = 0)
+  ?(over_threshold = 0)
+  ?(max_us = 0.0)
+  ?(p99 = 0.0)
+  ?(p50 = 0.0)
+  ?max_cause
+  name
+  : LP.snapshot
   =
-  ({ LP.name
-   ; p50
-   ; p90 = 0.0
-   ; p95 = 0.0
-   ; p99
-   ; p999 = 0.0
-   ; samples
-   ; sub_us_samples = 0
-   ; overflow = 0
-   ; max_us
-   ; over_threshold
-   ; max_cause
-   ; executions = 0
-   ; last_exec_time = 0.0
-   ; window_start = 0.0
-   ; window_end = 5.0
-   }
-   : LP.snapshot)
+  { LP.name
+  ; p50
+  ; p90 = 0.0
+  ; p95 = 0.0
+  ; p99
+  ; p999 = 0.0
+  ; samples
+  ; sub_us_samples = 0
+  ; overflow = 0
+  ; max_us
+  ; over_threshold
+  ; max_cause
+  ; executions = 0
+  ; last_exec_time = 0.0
+  ; window_start = 0.0
+  ; window_end = 5.0
+  }
 ;;
 
 let test_spike_message_silent_when_healthy () =
@@ -441,6 +441,46 @@ let test_spike_message_without_cause () =
      | None -> false)
 ;;
 
+let test_rolling_aggregates_windows () =
+  let t = LP.create ~rolling_windows:3 "rolling" in
+  (* Window 1: 10 samples at 10us. *)
+  for _ = 1 to 10 do
+    LP.record t (Mtime.Span.of_uint64_ns 10000L)
+  done;
+  let s1 = LP.snapshot_and_reset t in
+  Alcotest.(check int) "window 1 samples" 10 s1.samples;
+  Alcotest.(check (float 0.1)) "window 1 p50" 10.0 s1.p50;
+  (* Window 2: 10 samples at 20us; percentiles cover the rolling union but [samples] stays
+     per-window (so a spike alarms once, not for every window it remains in). *)
+  for _ = 1 to 10 do
+    LP.record t (Mtime.Span.of_uint64_ns 20000L)
+  done;
+  let s2 = LP.snapshot_and_reset t in
+  Alcotest.(check int) "samples stay per-window" 10 s2.samples;
+  Alcotest.(check (float 0.1)) "window 2 p50 is the union's lower half" 10.0 s2.p50;
+  (* Window 3: 10 samples at 30us; union median is now 20us. *)
+  for _ = 1 to 10 do
+    LP.record t (Mtime.Span.of_uint64_ns 30000L)
+  done;
+  let s3 = LP.snapshot_and_reset t in
+  Alcotest.(check (float 0.1)) "window 3 p50 is the union's median" 20.0 s3.p50;
+  (* Window 4 is empty: the oldest (10us) evicts, leaving 20us + 30us. *)
+  let s4 = LP.snapshot_and_reset t in
+  Alcotest.(check int) "empty window reports zero current samples" 0 s4.samples;
+  Alcotest.(check (float 0.1)) "window 4 p50 evicts the oldest" 20.0 s4.p50
+;;
+
+let test_rolling_off_is_per_window () =
+  let t = LP.create "plain" in
+  for _ = 1 to 10 do
+    LP.record t (Mtime.Span.of_uint64_ns 10000L)
+  done;
+  let s1 = LP.snapshot_and_reset t in
+  Alcotest.(check int) "non-rolling window keeps its samples" 10 s1.samples;
+  let s2 = LP.snapshot_and_reset t in
+  Alcotest.(check int) "non-rolling empty window resets" 0 s2.samples
+;;
+
 let () =
   run
     "Latency Profiler"
@@ -491,6 +531,13 @@ let () =
       , [ test_case "silent when healthy" `Quick test_spike_message_silent_when_healthy
         ; test_case "reports breaching stages" `Quick test_spike_message_reports_breaches
         ; test_case "omits cause line when absent" `Quick test_spike_message_without_cause
+        ] )
+    ; ( "rolling window"
+      , [ test_case "aggregates and evicts windows" `Quick test_rolling_aggregates_windows
+        ; test_case
+            "disabled keeps per-window semantics"
+            `Quick
+            test_rolling_off_is_per_window
         ] )
     ]
 ;;

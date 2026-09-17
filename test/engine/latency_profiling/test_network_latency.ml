@@ -1,5 +1,5 @@
-(* Tests for the feed-latency clock-offset correction and the RFC3339 parser
-   used to extract server event timestamps from feed messages. *)
+(* Tests for the feed-latency clock-offset correction and the RFC3339 parser used to
+   extract server event timestamps from feed messages. *)
 
 let check_float = Alcotest.(check (float 0.001))
 let check_us = Alcotest.(check (float 200.0))
@@ -30,10 +30,9 @@ let test_unix_of_rfc3339_invalid () =
     (Network_latency.unix_of_rfc3339 "not-a-time" = None)
 ;;
 
-(* Offset correction: with min one-way (recv - event) = 2.0s and min ping RTT
-   = 100ms, the estimated clock offset is 2.0 - 0.05 = 1.95s. A 2.0s raw
-   difference then corrects to the 50ms network floor, and a 2.1s raw
-   difference to 150ms. *)
+(* Offset correction: with min one-way (recv - event) = 2.0s and min ping RTT = 100ms, the
+   estimated clock offset is 2.0 - 0.05 = 1.95s. A 2.0s raw difference then corrects to
+   the 50ms network floor, and a 2.1s raw difference to 150ms. *)
 let assert_feed_floor_and_excess venue =
   Network_latency.publish_all ();
   match List.assoc_opt "ws_feed" (Network_latency.snapshots venue) with
@@ -65,8 +64,8 @@ let get_some = function
   | None -> Alcotest.fail "expected a latency sample"
 ;;
 
-(* A single anomalously low sample must not bias the offset forever: after the
-   sliding window (300s) passes it ages out and the estimate re-anchors. *)
+(* A single anomalously low sample must not bias the offset forever: after the sliding
+   window (300s) passes it ages out and the estimate re-anchors. *)
 let test_window_eviction_adapts () =
   let venue = "window-test" in
   Network_latency.observe_rtt ~now:0.0 venue 0.100;
@@ -77,8 +76,7 @@ let test_window_eviction_adapts () =
   check_float "outlier reads the floor" 0.05 l0;
   (* t=400 > window: the t=0 outlier is evicted, min_d re-anchors to 1.0. *)
   let l1 =
-    get_some
-      (Network_latency.corrected_one_way ~now:400.0 venue ~recv:400.0 ~event:399.0)
+    get_some (Network_latency.corrected_one_way ~now:400.0 venue ~recv:400.0 ~event:399.0)
   in
   check_float "stale outlier evicted, reads floor" 0.05 l1;
   Alcotest.(check bool)
@@ -87,9 +85,9 @@ let test_window_eviction_adapts () =
     (abs_float (l1 -. 1.05) > 0.5)
 ;;
 
-(* A feed that keeps re-sending the same event timestamp while local time
-   advances is stale, not enormously late: the freshness gate drops it instead
-   of pinning the metric at the profiler ceiling. *)
+(* A feed that keeps re-sending the same event timestamp while local time advances is
+   stale, not enormously late: the freshness gate drops it instead of pinning the metric
+   at the profiler ceiling. *)
 let test_stale_feed_rejected () =
   let venue = "stale-test" in
   Network_latency.observe_rtt ~now:0.0 venue 0.100;
@@ -130,8 +128,8 @@ let test_live_feed_accepted () =
        (Network_latency.corrected_one_way ~now:90.0 venue ~recv:90.0 ~event:89.95))
 ;;
 
-(* The latency profilers must not saturate: a 5s sample is preserved, not
-   collapsed to the old 2s ceiling. *)
+(* The latency profilers must not saturate: a 5s sample is preserved, not collapsed to the
+   old 2s ceiling. *)
 let test_large_latency_not_clamped () =
   let venue = "cap-test" in
   Network_latency.record_ping_s venue 5.0;
@@ -169,10 +167,7 @@ let () =
             "stale feed rejected by freshness gate"
             `Quick
             test_stale_feed_rejected
-        ; Alcotest.test_case
-            "live feed accepted"
-            `Quick
-            test_live_feed_accepted
+        ; Alcotest.test_case "live feed accepted" `Quick test_live_feed_accepted
         ; Alcotest.test_case
             "large latency not clamped"
             `Quick

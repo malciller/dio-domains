@@ -5,9 +5,9 @@ open Alpaca_types
 
 let section = "alpaca_rest"
 
-(** Retry policy: connection-class HTTP exceptions are retried with a short
-    backoff; HTTP 4xx venue rejections return to the caller untouched. The
-    executor delegates all retries to the exchange modules. *)
+(** Retry policy: connection-class HTTP exceptions are retried with a short backoff; HTTP
+    4xx venue rejections return to the caller untouched. The executor delegates all
+    retries to the exchange modules. *)
 let retry_http_exceptions ~f =
   Error_handling.retry_with_backoff
     ~section
@@ -34,12 +34,11 @@ let make_headers () =
 (** Records an Alpaca REST round trip in the "alpaca" venue profiler. *)
 let record_rest_span span = Network_latency.record_rest "alpaca" span
 
-(** Deadline for every REST round trip (connect + request + response), 30s.
-    Alpaca's TLS transport occasionally dies without a TCP close, leaving the
-    in-flight read wedged until the venue times out (observed 16+ min).
-    [Lwt_unix.with_timeout] cancels on expiry and closes the fd; the raised
-    [Lwt_unix.Timeout] is classified [Timeout] and retried by
-    [retry_http_exceptions]. *)
+(** Deadline for every REST round trip (connect + request + response), 30s. Alpaca's TLS
+    transport occasionally dies without a TCP close, leaving the in-flight read wedged
+    until the venue times out (observed 16+ min). [Lwt_unix.with_timeout] cancels on
+    expiry and closes the fd; the raised [Lwt_unix.Timeout] is classified [Timeout] and
+    retried by [retry_http_exceptions]. *)
 let rest_timeout_s = 30.0
 
 let json_to_float = function
@@ -100,21 +99,19 @@ let parse_order_json json =
 (** Effective time-in-force and extended-hours eligibility. Returns
     [(tif_str, mark_extended)].
 
-    Fractional equity orders are forced to [day] (Alpaca constraint); others
-    keep the requested TIF, defaulting to [gtc]. A [gtc] limit order in an
-    extended session requires GTC-for-extended enablement, else the venue
-    rejects.
+    Fractional equity orders are forced to [day] (Alpaca constraint); others keep the
+    requested TIF, defaulting to [gtc]. A [gtc] limit order in an extended session
+    requires GTC-for-extended enablement, else the venue rejects.
 
-    [mark_extended] attaches [extended_hours] for non-crypto limit orders when
-    extended trading is configured and the session is extended. Crypto never
-    eligible. *)
+    [mark_extended] attaches [extended_hours] for non-crypto limit orders when extended
+    trading is configured and the session is extended. Crypto never eligible. *)
 let effective_tif_and_extended
-      ~is_crypto
-      ~is_fractional
-      ~order_type
-      ~time_in_force
-      ~in_extended_session
-      ~use_extended
+  ~is_crypto
+  ~is_fractional
+  ~order_type
+  ~time_in_force
+  ~in_extended_session
+  ~use_extended
   =
   let type_str =
     match order_type with
@@ -138,9 +135,9 @@ let effective_tif_and_extended
   tif_str, mark_extended
 ;;
 
-(* Alpaca tick rule: >= $1.00 quotes in $0.01 increments; $0.0001 precision
-   only below $1.00. Out-of-band limits are rejected HTTP 422, so round to the
-   venue tick at submission. Applies to crypto too. *)
+(* Alpaca tick rule: >= $1.00 quotes in $0.01 increments; $0.0001 precision only below
+   $1.00. Out-of-band limits are rejected HTTP 422, so round to the venue tick at
+   submission. Applies to crypto too. *)
 let round_limit_price (price : float) =
   if Float.is_nan price || Float.is_infinite price
   then price
@@ -152,15 +149,15 @@ let round_limit_price (price : float) =
 let limit_price_json (p : float) = `String (Printf.sprintf "%.4f" (round_limit_price p))
 
 let place_order
-      ~symbol
-      ~qty
-      ~side
-      ~order_type
-      ?limit_price
-      ?time_in_force
-      ?cl_ord_id
-      ?extended_hours
-      ()
+  ~symbol
+  ~qty
+  ~side
+  ~order_type
+  ?limit_price
+  ?time_in_force
+  ?cl_ord_id
+  ?extended_hours
+  ()
   =
   let base_url = Config.rest_base_url () in
   let url = Uri.of_string (base_url ^ "/v2/orders") in
@@ -171,9 +168,8 @@ let place_order
     | Some b -> b
     | None -> !Config.extended_hours
   in
-  (* Session-aware: outside regular hours (pre/after-market, overnight, closed)
-     orders use day + extended_hours; during regular hours the requested TIF is
-     preserved. *)
+  (* Session-aware: outside regular hours (pre/after-market, overnight, closed) orders use
+     day + extended_hours; during regular hours the requested TIF is preserved. *)
   let in_extended_session =
     (not is_crypto) && not (Alpaca_market_hours.is_regular_market_open ())
   in
@@ -231,66 +227,66 @@ let place_order
   retry_http_exceptions ~f:(fun () ->
     Lwt.catch
       (fun () ->
-         let rest_start = Mtime_clock.now_ns () in
-         Lwt_unix.with_timeout rest_timeout_s (fun () ->
-           Cohttp_lwt_unix.Client.post
-             ~headers
-             ~body:(Cohttp_lwt.Body.of_string req_body)
-             url)
-         >>= fun (resp, body) ->
-         let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-         Cohttp_lwt.Body.to_string body
-         >>= fun body_str ->
-         record_rest_span
-           (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
-         if status_code >= 200 && status_code < 300
-         then (
-           try
-             let json = Yojson.Safe.from_string body_str in
-             let ord = parse_order_json json in
-             Logging.debug_f
-               ~section
-               "Placed Alpaca order %s [%s %s %.6f]: status=%s"
-               ord.id
-               ord.symbol
-               ord.side_str
-               ord.qty
-               (string_of_status ord.status);
-             let userref =
-               match ord.client_order_id with
-               | Some cid ->
-                 (try Some (int_of_string cid) with
-                  | _ -> None)
-               | None -> None
-             in
-             Lwt.return
-               (Ok
-                  { order_id = ord.id
-                  ; cl_ord_id = ord.client_order_id
-                  ; order_userref = userref
-                  })
-           with
-           | exn ->
-             let err =
-               Printf.sprintf
-                 "Failed to parse place_order response: %s"
-                 (Printexc.to_string exn)
-             in
-             Logging.error_f ~section "%s (body: %s)" err body_str;
-             Lwt.return (Error err))
-         else (
-           Logging.error_f ~section "Place order failed HTTP %d: %s" status_code body_str;
-           Lwt.return (Error (Printf.sprintf "HTTP %d: %s" status_code body_str))))
+        let rest_start = Mtime_clock.now_ns () in
+        Lwt_unix.with_timeout rest_timeout_s (fun () ->
+          Cohttp_lwt_unix.Client.post
+            ~headers
+            ~body:(Cohttp_lwt.Body.of_string req_body)
+            url)
+        >>= fun (resp, body) ->
+        let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+        Cohttp_lwt.Body.to_string body
+        >>= fun body_str ->
+        record_rest_span
+          (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
+        if status_code >= 200 && status_code < 300
+        then (
+          try
+            let json = Yojson.Safe.from_string body_str in
+            let ord = parse_order_json json in
+            Logging.debug_f
+              ~section
+              "Placed Alpaca order %s [%s %s %.6f]: status=%s"
+              ord.id
+              ord.symbol
+              ord.side_str
+              ord.qty
+              (string_of_status ord.status);
+            let userref =
+              match ord.client_order_id with
+              | Some cid ->
+                (try Some (int_of_string cid) with
+                 | _ -> None)
+              | None -> None
+            in
+            Lwt.return
+              (Ok
+                 { order_id = ord.id
+                 ; cl_ord_id = ord.client_order_id
+                 ; order_userref = userref
+                 })
+          with
+          | exn ->
+            let err =
+              Printf.sprintf
+                "Failed to parse place_order response: %s"
+                (Printexc.to_string exn)
+            in
+            Logging.error_f ~section "%s (body: %s)" err body_str;
+            Lwt.return (Error err))
+        else (
+          Logging.error_f ~section "Place order failed HTTP %d: %s" status_code body_str;
+          Lwt.return (Error (Printf.sprintf "HTTP %d: %s" status_code body_str))))
       (fun exn ->
-         (* Connection/timeout exceptions re-raise for the retry layer; others
-              become an Error. *)
-         let exn_str = Printexc.to_string exn in
-         match Error_handling.classify exn_str with
-         | Error_handling.Connection | Error_handling.Timeout -> Lwt.fail exn
-         | _ ->
-           let err = Printf.sprintf "Place order HTTP exception: %s" exn_str in
-           Logging.error_f ~section "%s" err;
-           Lwt.return (Error err)))
+        (* Connection/timeout exceptions re-raise for the retry layer; others become an
+           Error. *)
+        let exn_str = Printexc.to_string exn in
+        match Error_handling.classify exn_str with
+        | Error_handling.Connection | Error_handling.Timeout -> Lwt.fail exn
+        | _ ->
+          let err = Printf.sprintf "Place order HTTP exception: %s" exn_str in
+          Logging.error_f ~section "%s" err;
+          Lwt.return (Error err)))
 ;;
 
 let amend_order ~order_id ?qty ?limit_price ?cl_ord_id () =
@@ -318,61 +314,61 @@ let amend_order ~order_id ?qty ?limit_price ?cl_ord_id () =
   retry_http_exceptions ~f:(fun () ->
     Lwt.catch
       (fun () ->
-         let rest_start = Mtime_clock.now_ns () in
-         Lwt_unix.with_timeout rest_timeout_s (fun () ->
-           Cohttp_lwt_unix.Client.patch
-             ~headers
-             ~body:(Cohttp_lwt.Body.of_string req_body)
-             url)
-         >>= fun (resp, body) ->
-         let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-         Cohttp_lwt.Body.to_string body
-         >>= fun body_str ->
-         record_rest_span
-           (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
-         if status_code >= 200 && status_code < 300
-         then (
-           try
-             let json = Yojson.Safe.from_string body_str in
-             let ord = parse_order_json json in
-             Logging.debug_f
-               ~section
-               "Amended Alpaca order %s -> %s [%s]"
-               order_id
-               ord.id
-               ord.symbol;
-             Lwt.return
-               (Ok
-                  { original_order_id = order_id
-                  ; new_order_id = ord.id
-                  ; amend_id = Some ord.id
-                  ; cl_ord_id = ord.client_order_id
-                  })
-           with
-           | exn ->
-             let err =
-               Printf.sprintf
-                 "Failed to parse amend_order response: %s"
-                 (Printexc.to_string exn)
-             in
-             Logging.error_f ~section "%s (body: %s)" err body_str;
-             Lwt.return (Error err))
-         else (
-           Logging.error_f
-             ~section
-             "Amend order failed HTTP %d for %s: %s"
-             status_code
-             order_id
-             body_str;
-           Lwt.return (Error (Printf.sprintf "HTTP %d: %s" status_code body_str))))
+        let rest_start = Mtime_clock.now_ns () in
+        Lwt_unix.with_timeout rest_timeout_s (fun () ->
+          Cohttp_lwt_unix.Client.patch
+            ~headers
+            ~body:(Cohttp_lwt.Body.of_string req_body)
+            url)
+        >>= fun (resp, body) ->
+        let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+        Cohttp_lwt.Body.to_string body
+        >>= fun body_str ->
+        record_rest_span
+          (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
+        if status_code >= 200 && status_code < 300
+        then (
+          try
+            let json = Yojson.Safe.from_string body_str in
+            let ord = parse_order_json json in
+            Logging.debug_f
+              ~section
+              "Amended Alpaca order %s -> %s [%s]"
+              order_id
+              ord.id
+              ord.symbol;
+            Lwt.return
+              (Ok
+                 { original_order_id = order_id
+                 ; new_order_id = ord.id
+                 ; amend_id = Some ord.id
+                 ; cl_ord_id = ord.client_order_id
+                 })
+          with
+          | exn ->
+            let err =
+              Printf.sprintf
+                "Failed to parse amend_order response: %s"
+                (Printexc.to_string exn)
+            in
+            Logging.error_f ~section "%s (body: %s)" err body_str;
+            Lwt.return (Error err))
+        else (
+          Logging.error_f
+            ~section
+            "Amend order failed HTTP %d for %s: %s"
+            status_code
+            order_id
+            body_str;
+          Lwt.return (Error (Printf.sprintf "HTTP %d: %s" status_code body_str))))
       (fun exn ->
-         let exn_str = Printexc.to_string exn in
-         match Error_handling.classify exn_str with
-         | Error_handling.Connection | Error_handling.Timeout -> Lwt.fail exn
-         | _ ->
-           let err = Printf.sprintf "Amend order HTTP exception: %s" exn_str in
-           Logging.error_f ~section "%s" err;
-           Lwt.return (Error err)))
+        let exn_str = Printexc.to_string exn in
+        match Error_handling.classify exn_str with
+        | Error_handling.Connection | Error_handling.Timeout -> Lwt.fail exn
+        | _ ->
+          let err = Printf.sprintf "Amend order HTTP exception: %s" exn_str in
+          Logging.error_f ~section "%s" err;
+          Lwt.return (Error err)))
 ;;
 
 let cancel_order order_id =
@@ -383,37 +379,37 @@ let cancel_order order_id =
   retry_http_exceptions ~f:(fun () ->
     Lwt.catch
       (fun () ->
-         let rest_start = Mtime_clock.now_ns () in
-         Lwt_unix.with_timeout rest_timeout_s (fun () ->
-           Cohttp_lwt_unix.Client.delete ~headers url)
-         >>= fun (resp, body) ->
-         let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-         Cohttp_lwt.Body.to_string body
-         >>= fun body_str ->
-         record_rest_span
-           (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
-         if status_code >= 200 && status_code < 300
-         then (
-           Logging.debug_f ~section "Cancelled Alpaca order %s" order_id;
-           Lwt.return (Ok [ { order_id; cl_ord_id = None } ]))
-         else (
-           Logging.error_f
-             ~section
-             "Cancel order failed HTTP %d for %s: %s"
-             status_code
-             order_id
-             body_str;
-           Lwt.return
-             (Error
-                (Printf.sprintf "HTTP %d cancelling %s: %s" status_code order_id body_str))))
+        let rest_start = Mtime_clock.now_ns () in
+        Lwt_unix.with_timeout rest_timeout_s (fun () ->
+          Cohttp_lwt_unix.Client.delete ~headers url)
+        >>= fun (resp, body) ->
+        let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+        Cohttp_lwt.Body.to_string body
+        >>= fun body_str ->
+        record_rest_span
+          (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
+        if status_code >= 200 && status_code < 300
+        then (
+          Logging.debug_f ~section "Cancelled Alpaca order %s" order_id;
+          Lwt.return (Ok [ { order_id; cl_ord_id = None } ]))
+        else (
+          Logging.error_f
+            ~section
+            "Cancel order failed HTTP %d for %s: %s"
+            status_code
+            order_id
+            body_str;
+          Lwt.return
+            (Error
+               (Printf.sprintf "HTTP %d cancelling %s: %s" status_code order_id body_str))))
       (fun exn ->
-         let exn_str = Printexc.to_string exn in
-         match Error_handling.classify exn_str with
-         | Error_handling.Connection | Error_handling.Timeout -> Lwt.fail exn
-         | _ ->
-           let err = Printf.sprintf "Cancel order HTTP exception: %s" exn_str in
-           Logging.error_f ~section "%s" err;
-           Lwt.return (Error err)))
+        let exn_str = Printexc.to_string exn in
+        match Error_handling.classify exn_str with
+        | Error_handling.Connection | Error_handling.Timeout -> Lwt.fail exn
+        | _ ->
+          let err = Printf.sprintf "Cancel order HTTP exception: %s" exn_str in
+          Logging.error_f ~section "%s" err;
+          Lwt.return (Error err)))
 ;;
 
 let get_open_orders () =
@@ -479,11 +475,11 @@ let get_open_orders () =
   Lwt.catch
     (fun () -> fetch_all [] None)
     (fun exn ->
-       let err =
-         Printf.sprintf "Get open orders HTTP exception: %s" (Printexc.to_string exn)
-       in
-       Logging.error_f ~section "%s" err;
-       Lwt.return (Error err))
+      let err =
+        Printf.sprintf "Get open orders HTTP exception: %s" (Printexc.to_string exn)
+      in
+      Logging.error_f ~section "%s" err;
+      Lwt.return (Error err))
 ;;
 
 let get_account () =
@@ -492,52 +488,50 @@ let get_account () =
   let headers = make_headers () in
   Lwt.catch
     (fun () ->
-       let rest_start = Mtime_clock.now_ns () in
-       Lwt_unix.with_timeout rest_timeout_s (fun () ->
-         Cohttp_lwt_unix.Client.get ~headers url)
-       >>= fun (resp, body) ->
-       let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-       Cohttp_lwt.Body.to_string body
-       >>= fun body_str ->
-       record_rest_span
-         (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
-       if status_code >= 200 && status_code < 300
-       then (
-         try
-           let json = Yojson.Safe.from_string body_str in
-           let open Yojson.Safe.Util in
-           let id = json |> member "id" |> to_string_option |> Option.value ~default:"" in
-           let status =
-             json |> member "status" |> to_string_option |> Option.value ~default:""
-           in
-           let currency =
-             json |> member "currency" |> to_string_option |> Option.value ~default:""
-           in
-           let buying_power = json |> member "buying_power" |> json_to_float in
-           let cash = json |> member "cash" |> json_to_float in
-           let portfolio_value = json |> member "portfolio_value" |> json_to_float in
-           let equity = json |> member "equity" |> json_to_float in
-           Lwt.return
-             (Ok { id; status; currency; buying_power; cash; portfolio_value; equity })
-         with
-         | exn ->
-           let err =
-             Printf.sprintf
-               "Failed to parse account response: %s"
-               (Printexc.to_string exn)
-           in
-           Logging.error_f ~section "%s (body: %s)" err body_str;
-           Lwt.return (Error err))
-       else (
-         Logging.error_f ~section "Get account failed HTTP %d: %s" status_code body_str;
-         Lwt.return
-           (Error (Printf.sprintf "HTTP %d getting account: %s" status_code body_str))))
+      let rest_start = Mtime_clock.now_ns () in
+      Lwt_unix.with_timeout rest_timeout_s (fun () ->
+        Cohttp_lwt_unix.Client.get ~headers url)
+      >>= fun (resp, body) ->
+      let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+      Cohttp_lwt.Body.to_string body
+      >>= fun body_str ->
+      record_rest_span
+        (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
+      if status_code >= 200 && status_code < 300
+      then (
+        try
+          let json = Yojson.Safe.from_string body_str in
+          let open Yojson.Safe.Util in
+          let id = json |> member "id" |> to_string_option |> Option.value ~default:"" in
+          let status =
+            json |> member "status" |> to_string_option |> Option.value ~default:""
+          in
+          let currency =
+            json |> member "currency" |> to_string_option |> Option.value ~default:""
+          in
+          let buying_power = json |> member "buying_power" |> json_to_float in
+          let cash = json |> member "cash" |> json_to_float in
+          let portfolio_value = json |> member "portfolio_value" |> json_to_float in
+          let equity = json |> member "equity" |> json_to_float in
+          Lwt.return
+            (Ok { id; status; currency; buying_power; cash; portfolio_value; equity })
+        with
+        | exn ->
+          let err =
+            Printf.sprintf "Failed to parse account response: %s" (Printexc.to_string exn)
+          in
+          Logging.error_f ~section "%s (body: %s)" err body_str;
+          Lwt.return (Error err))
+      else (
+        Logging.error_f ~section "Get account failed HTTP %d: %s" status_code body_str;
+        Lwt.return
+          (Error (Printf.sprintf "HTTP %d getting account: %s" status_code body_str))))
     (fun exn ->
-       let err =
-         Printf.sprintf "Get account HTTP exception: %s" (Printexc.to_string exn)
-       in
-       Logging.error_f ~section "%s" err;
-       Lwt.return (Error err))
+      let err =
+        Printf.sprintf "Get account HTTP exception: %s" (Printexc.to_string exn)
+      in
+      Logging.error_f ~section "%s" err;
+      Lwt.return (Error err))
 ;;
 
 let get_positions () =
@@ -546,71 +540,65 @@ let get_positions () =
   let headers = make_headers () in
   Lwt.catch
     (fun () ->
-       let rest_start = Mtime_clock.now_ns () in
-       Lwt_unix.with_timeout rest_timeout_s (fun () ->
-         Cohttp_lwt_unix.Client.get ~headers url)
-       >>= fun (resp, body) ->
-       let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-       Cohttp_lwt.Body.to_string body
-       >>= fun body_str ->
-       record_rest_span
-         (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
-       if status_code >= 200 && status_code < 300
-       then (
-         try
-           let json = Yojson.Safe.from_string body_str in
-           let open Yojson.Safe.Util in
-           let items =
-             match json with
-             | `List l -> l
-             | _ -> []
-           in
-           let positions =
-             List.map
-               (fun j ->
-                  { asset_id =
-                      j
-                      |> member "asset_id"
-                      |> to_string_option
-                      |> Option.value ~default:""
-                  ; symbol =
-                      j |> member "symbol" |> to_string_option |> Option.value ~default:""
-                  ; exchange =
-                      j
-                      |> member "exchange"
-                      |> to_string_option
-                      |> Option.value ~default:""
-                  ; qty = j |> member "qty" |> json_to_float
-                  ; qty_available =
-                      (match json_to_float_opt (j |> member "qty_available") with
-                       | Some a -> a
-                       | None -> j |> member "qty" |> json_to_float)
-                  ; market_value = j |> member "market_value" |> json_to_float
-                  ; avg_entry_price = j |> member "avg_entry_price" |> json_to_float
-                  ; current_price = j |> member "current_price" |> json_to_float
-                  ; side =
-                      j |> member "side" |> to_string_option |> Option.value ~default:""
-                  })
-               items
-           in
-           Lwt.return (Ok positions)
-         with
-         | exn ->
-           let err =
-             Printf.sprintf
-               "Failed to parse positions response: %s"
-               (Printexc.to_string exn)
-           in
-           Logging.error_f ~section "%s (body: %s)" err body_str;
-           Lwt.return (Error err))
-       else (
-         Logging.error_f ~section "Get positions failed HTTP %d: %s" status_code body_str;
-         Lwt.return
-           (Error (Printf.sprintf "HTTP %d getting positions: %s" status_code body_str))))
+      let rest_start = Mtime_clock.now_ns () in
+      Lwt_unix.with_timeout rest_timeout_s (fun () ->
+        Cohttp_lwt_unix.Client.get ~headers url)
+      >>= fun (resp, body) ->
+      let status_code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+      Cohttp_lwt.Body.to_string body
+      >>= fun body_str ->
+      record_rest_span
+        (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
+      if status_code >= 200 && status_code < 300
+      then (
+        try
+          let json = Yojson.Safe.from_string body_str in
+          let open Yojson.Safe.Util in
+          let items =
+            match json with
+            | `List l -> l
+            | _ -> []
+          in
+          let positions =
+            List.map
+              (fun j ->
+                { asset_id =
+                    j |> member "asset_id" |> to_string_option |> Option.value ~default:""
+                ; symbol =
+                    j |> member "symbol" |> to_string_option |> Option.value ~default:""
+                ; exchange =
+                    j |> member "exchange" |> to_string_option |> Option.value ~default:""
+                ; qty = j |> member "qty" |> json_to_float
+                ; qty_available =
+                    (match json_to_float_opt (j |> member "qty_available") with
+                     | Some a -> a
+                     | None -> j |> member "qty" |> json_to_float)
+                ; market_value = j |> member "market_value" |> json_to_float
+                ; avg_entry_price = j |> member "avg_entry_price" |> json_to_float
+                ; current_price = j |> member "current_price" |> json_to_float
+                ; side =
+                    j |> member "side" |> to_string_option |> Option.value ~default:""
+                })
+              items
+          in
+          Lwt.return (Ok positions)
+        with
+        | exn ->
+          let err =
+            Printf.sprintf
+              "Failed to parse positions response: %s"
+              (Printexc.to_string exn)
+          in
+          Logging.error_f ~section "%s (body: %s)" err body_str;
+          Lwt.return (Error err))
+      else (
+        Logging.error_f ~section "Get positions failed HTTP %d: %s" status_code body_str;
+        Lwt.return
+          (Error (Printf.sprintf "HTTP %d getting positions: %s" status_code body_str))))
     (fun exn ->
-       let err =
-         Printf.sprintf "Get positions HTTP exception: %s" (Printexc.to_string exn)
-       in
-       Logging.error_f ~section "%s" err;
-       Lwt.return (Error err))
+      let err =
+        Printf.sprintf "Get positions HTTP exception: %s" (Printexc.to_string exn)
+      in
+      Logging.error_f ~section "%s" err;
+      Lwt.return (Error err))
 ;;

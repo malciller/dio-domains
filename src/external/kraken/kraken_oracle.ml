@@ -1,14 +1,13 @@
 (** Kraken oracle data-venue adapter.
 
-    Implements [Exchange_intf.Oracle.S]: daily OHLC (/0/public/OHLC,
-    paginated on "last"), account fees (TradeVolume via [Kraken_get_fee]),
-    trade-wallet balance (/0/private/Balance), and instrument metadata
-    (via [Kraken_instruments_feed]).
+    Implements [Exchange_intf.Oracle.S]: daily OHLC (/0/public/OHLC, paginated on "last"),
+    account fees (TradeVolume via [Kraken_get_fee]), trade-wallet balance
+    (/0/private/Balance), and instrument metadata (via [Kraken_instruments_feed]).
 
-    [parse_*] functions are pure and fixture-testable. [fetch_bars] returns
-    RAW bars in arbitrary order; the oracle sorts, de-duplicates, and
-    normalizes centrally (normalize is idempotent). HTTP calls are
-    timeout-bounded so a blackholed upstream cannot freeze the oracle pass. *)
+    [parse_*] functions are pure and fixture-testable. [fetch_bars] returns RAW bars in
+    arbitrary order; the oracle sorts, de-duplicates, and normalizes centrally (normalize
+    is idempotent). HTTP calls are timeout-bounded so a blackholed upstream cannot freeze
+    the oracle pass. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
@@ -19,19 +18,18 @@ let interval_daily = 1440
 let max_pages = 60
 let default_timeout = 10.0
 
-(** Bounded GET: a hung upstream raises after [default_timeout] instead of
-    freezing the oracle pass. *)
+(** Bounded GET: a hung upstream raises after [default_timeout] instead of freezing the
+    oracle pass. *)
 let get (uri : Uri.t) : (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t =
   Lwt_unix.with_timeout default_timeout (fun () -> Cohttp_lwt_unix.Client.get uri)
 ;;
 
-(** Bounded signed POST (the /0/private/* auth pattern used by the balance
-    snapshot). *)
+(** Bounded signed POST (the /0/private/* auth pattern used by the balance snapshot). *)
 let post_signed
-      ~(api_key : string)
-      ~(api_secret : string)
-      ~(path : string)
-      ~(body : string)
+  ~(api_key : string)
+  ~(api_secret : string)
+  ~(path : string)
+  ~(body : string)
   : (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
   =
   let nonce = Kraken_common_types.nonce () in
@@ -50,9 +48,9 @@ let post_signed
       (Uri.of_string ("https://api.kraken.com" ^ path)))
 ;;
 
-(* ---- Civil-date arithmetic (ISO date <-> unix time). No timezone
-   dependence: the oracle's calendar rules forbid mktime (which is local-time
-   dependent). Hinnant's days-from-civil, same as Oracle_calendar. *)
+(* ---- Civil-date arithmetic (ISO date <-> unix time). No timezone dependence: the
+   oracle's calendar rules forbid mktime (which is local-time dependent). Hinnant's
+   days-from-civil, same as Oracle_calendar. *)
 
 let days_from_civil y m d =
   let y = if m <= 2 then y - 1 else y in
@@ -118,9 +116,9 @@ let parse_candle (j : Yojson.Safe.t) : Exchange.Types.bar option =
   | _ -> None
 ;;
 
-(** Parse the /0/public/OHLC response body. The pair key in ["result"] is not
-    reliable (e.g. BTC/USD arrives as XBTUSD), so every list under ["result"]
-    except ["last"] is parsed. *)
+(** Parse the /0/public/OHLC response body. The pair key in ["result"] is not reliable
+    (e.g. BTC/USD arrives as XBTUSD), so every list under ["result"] except ["last"] is
+    parsed. *)
 let parse_ohlc ~(symbol : string) (json : Yojson.Safe.t) : Exchange.Types.bar list =
   let open Yojson.Safe.Util in
   let errors = member "error" json |> to_list in
@@ -141,8 +139,8 @@ let parse_ohlc ~(symbol : string) (json : Yojson.Safe.t) : Exchange.Types.bar li
 let calendar_kind = Exchange.Types.Crypto
 let fetch_calendar ~start_date:_ ~end_date:_ : string list Lwt.t = Lwt.return []
 
-(** Fetch daily OHLC back to [from] (ISO date of the first day; [None] = the
-    pair's full history), paginating on ["last"]. *)
+(** Fetch daily OHLC back to [from] (ISO date of the first day; [None] = the pair's full
+    history), paginating on ["last"]. *)
 let fetch_bars ?feed:_ ?end_date:_ ~from ~symbol () : Exchange.Types.bar list Lwt.t =
   let since = Option.fold ~none:0L ~some:unix_of_iso from in
   let rec go since acc pages =
@@ -196,13 +194,13 @@ let fetch_bars ?feed:_ ?end_date:_ ~from ~symbol () : Exchange.Types.bar list Lw
       Lwt.catch
         (fun () -> fetch)
         (fun exn ->
-           Logging.warn_f
-             ~section
-             "Kraken OHLC page failed for %s (%s), returning %d bars so far"
-             symbol
-             (Printexc.to_string exn)
-             (List.length acc);
-           Lwt.return (List.rev acc)))
+          Logging.warn_f
+            ~section
+            "Kraken OHLC page failed for %s (%s), returning %d bars so far"
+            symbol
+            (Printexc.to_string exn)
+            (List.length acc);
+          Lwt.return (List.rev acc)))
   in
   go since [] max_pages
 ;;
@@ -242,15 +240,14 @@ let normalize_asset raw =
   let upper =
     List.fold_left
       (fun value suffix ->
-         if
-           String.length value > String.length suffix
+        if String.length value > String.length suffix
            && String.sub
                 value
                 (String.length value - String.length suffix)
                 (String.length suffix)
               = suffix
-         then String.sub value 0 (String.length value - String.length suffix)
-         else value)
+        then String.sub value 0 (String.length value - String.length suffix)
+        else value)
       upper
       [ ".HOLD"; ".F"; ".B" ]
   in
@@ -281,9 +278,8 @@ let error_fields json =
   | other -> Some (Yojson.Safe.to_string other)
 ;;
 
-(** Parse the /0/private/Balance response into normalized
-    (asset, available, total) triples. The trade wallet has no hold concept,
-    so available = total. *)
+(** Parse the /0/private/Balance response into normalized (asset, available, total)
+    triples. The trade wallet has no hold concept, so available = total. *)
 let parse_balances (json : Yojson.Safe.t) : ((string * float * float) list, string) result
   =
   match error_fields json with
@@ -294,10 +290,10 @@ let parse_balances (json : Yojson.Safe.t) : ((string * float * float) list, stri
        let parsed =
          List.filter_map
            (fun (asset, value) ->
-              match number value with
-              | Some total when Float.is_finite total ->
-                Some (normalize_asset asset, nonnegative total, nonnegative total)
-              | _ -> None)
+             match number value with
+             | Some total when Float.is_finite total ->
+               Some (normalize_asset asset, nonnegative total, nonnegative total)
+             | _ -> None)
            entries
        in
        if List.length parsed = List.length entries
@@ -309,30 +305,30 @@ let parse_balances (json : Yojson.Safe.t) : ((string * float * float) list, stri
 let fetch_balances ~testnet:_ : ((string * float * float) list, string) result Lwt.t =
   Lwt.catch
     (fun () ->
-       Kraken_generate_auth_token.get_api_credentials_from_env ()
-       >>= fun (api_key, api_secret) ->
-       let path = "/0/private/Balance" in
-       let body = "nonce=" ^ Kraken_common_types.nonce () in
-       post_signed ~api_key ~api_secret ~path ~body
-       >>= fun (response, response_body) ->
-       Cohttp_lwt.Body.to_string response_body
-       >|= fun body ->
-       let status = Cohttp.Response.status response |> Cohttp.Code.code_of_status in
-       if status <> 200
-       then Error (Printf.sprintf "Kraken HTTP %d: %s" status body)
-       else (
-         try parse_balances (Yojson.Safe.from_string body) with
-         | exn ->
-           Error
-             (Printf.sprintf "Kraken response parse failed: %s" (Printexc.to_string exn))))
+      Kraken_generate_auth_token.get_api_credentials_from_env ()
+      >>= fun (api_key, api_secret) ->
+      let path = "/0/private/Balance" in
+      let body = "nonce=" ^ Kraken_common_types.nonce () in
+      post_signed ~api_key ~api_secret ~path ~body
+      >>= fun (response, response_body) ->
+      Cohttp_lwt.Body.to_string response_body
+      >|= fun body ->
+      let status = Cohttp.Response.status response |> Cohttp.Code.code_of_status in
+      if status <> 200
+      then Error (Printf.sprintf "Kraken HTTP %d: %s" status body)
+      else (
+        try parse_balances (Yojson.Safe.from_string body) with
+        | exn ->
+          Error
+            (Printf.sprintf "Kraken response parse failed: %s" (Printexc.to_string exn))))
     (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
 ;;
 
-(** Live websocket-fed balance snapshot: the authenticated balances WS feed
-    (the engine supervisor's live store) tracks the account's wallets, with
-    tradeable = the store's spendable balance. Returns [Some] triples when the
-    store holds data (the oracle runtime prefers this over the REST one-shot
-    [fetch_balances]), [None] when the store is empty/unregistered. *)
+(** Live websocket-fed balance snapshot: the authenticated balances WS feed (the engine
+    supervisor's live store) tracks the account's wallets, with tradeable = the store's
+    spendable balance. Returns [Some] triples when the store holds data (the oracle
+    runtime prefers this over the REST one-shot [fetch_balances]), [None] when the store
+    is empty/unregistered. *)
 let live_balances () : (string * float * float) list option =
   match Exchange.Registry.get "kraken" with
   | None -> None
@@ -344,11 +340,11 @@ let live_balances () : (string * float * float) list option =
       Some
         (List.map
            (fun (asset, total) ->
-              let available =
-                try Ex.get_tradeable_balance ~asset with
-                | _ -> 0.0
-              in
-              asset, available, total)
+             let available =
+               try Ex.get_tradeable_balance ~asset with
+               | _ -> 0.0
+             in
+             asset, available, total)
            balances)
 ;;
 
@@ -362,5 +358,5 @@ let init_instruments ~testnet:_ ~symbols : unit Lwt.t =
 ;;
 
 let name = "kraken"
-(* Registration happens in [Kraken_module] (a module cannot register itself:
-   the wrapped self-path would dangle). *)
+(* Registration happens in [Kraken_module] (a module cannot register itself: the wrapped
+   self-path would dangle). *)

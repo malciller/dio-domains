@@ -1,21 +1,20 @@
 (** Per-venue network latency profilers.
 
-    Measure the four NETWORK-page metrics shown under each domain row (the
-    domain's venue):
-    - ws_ping:      venue WebSocket ping/pong round trip
-    - ws_feed:      clock-corrected one-way latency of market-data feed
-                    messages (server event timestamp -> local receive)
+    Measure the four NETWORK-page metrics shown under each domain row (the domain's
+    venue):
+    - ws_ping: venue WebSocket ping/pong round trip
+    - ws_feed: clock-corrected one-way latency of market-data feed messages (server event
+      timestamp -> local receive)
     - rest_request: HTTP REST round trip (trading actions and oracle fetches)
-    - signer:       local signature generation time
+    - signer: local signature generation time
 
-    Profilers are keyed by venue name ("hyperliquid", "kraken", "lighter",
-    "alpaca"), so every connection or fetch on a venue feeds one histogram. The
-    dashboard merges these windows into the per-symbol latency map via each
-    configured symbol's exchange.
+    Profilers are keyed by venue name ("hyperliquid", "kraken", "lighter", "alpaca"), so
+    every connection or fetch on a venue feeds one histogram. The dashboard merges these
+    windows into the per-symbol latency map via each configured symbol's exchange.
 
-    [start_publisher] publishes (snapshot_and_reset) every ~10s, inside the
-    dashboard's 15s freshness tolerance, so the NETWORK page always has a fresh
-    window per metric; an idle venue reads as "idle", not "--". *)
+    [start_publisher] publishes (snapshot_and_reset) every ~10s, inside the dashboard's
+    15s freshness tolerance, so the NETWORK page always has a fresh window per metric; an
+    idle venue reads as "idle", not "--". *)
 
 open Lwt.Infix
 
@@ -32,12 +31,12 @@ type t =
 let profilers : (string, t) Hashtbl.t = Hashtbl.create 8
 let mutex = Mutex.create ()
 
-(** Coarse bucket width and upper bound for the network RTT/latency metrics.
-    1ms buckets with a 1us fine tier give exact sub-millisecond resolution and
-    a 60s range, so even a multi-second stall is represented faithfully instead
-    of saturating a low ceiling (the old 2s cap collapsed every >=2s sample to
-    a misleading "2.0s"). *)
+(** Coarse bucket width and upper bound for the network RTT/latency metrics. 1ms buckets
+    with a 1us fine tier give exact sub-millisecond resolution and a 60s range, so even a
+    multi-second stall is represented faithfully instead of saturating a low ceiling (the
+    old 2s cap collapsed every >=2s sample to a misleading "2.0s"). *)
 let network_bucket_us = 1000
+
 let network_max_latency_us = 60_000_000
 
 let create_venue_profilers venue =
@@ -57,10 +56,7 @@ let create_venue_profilers venue =
         ~max_latency_us:network_max_latency_us
         (venue ^ ":rest_request")
   ; signer =
-      Latency_profiler.create
-        ~bucket_us:1
-        ~max_latency_us:100_000
-        (venue ^ ":signer")
+      Latency_profiler.create ~bucket_us:1 ~max_latency_us:100_000 (venue ^ ":signer")
   }
 ;;
 
@@ -96,10 +92,10 @@ let[@inline always] venue_profilers venue =
     p
 ;;
 
-(** Span of [seconds] (wall-clock delta) for call sites timing with
-    [Unix.gettimeofday]. Rounds to the nearest nanosecond instead of
-    truncating, so a float-arithmetic result just under a bucket edge (e.g.
-    149.999999ms) is not silently demoted to the bucket below. *)
+(** Span of [seconds] (wall-clock delta) for call sites timing with [Unix.gettimeofday].
+    Rounds to the nearest nanosecond instead of truncating, so a float-arithmetic result
+    just under a bucket edge (e.g. 149.999999ms) is not silently demoted to the bucket
+    below. *)
 let span_of_seconds s =
   let ns = s *. 1_000_000_000.0 in
   let ns = if ns >= 0.0 then ns +. 0.5 else ns -. 0.5 in
@@ -108,30 +104,27 @@ let span_of_seconds s =
 
 (* ── Feed clock-offset correction ───────────────────────────────────────────
 
-   A feed message's one-way latency is [local_recv - server_event], but that
-   difference also contains the constant offset between the host clock and the
-   exchange clock. Ping RTT is offset-free, so the best-case one-way transit is
-   [min_rtt / 2]. Taking the minimum [local_recv - server_event] over a recent
-   window as [offset + min_transit] lets us estimate the clock offset as
-   [min_d - min_rtt/2] and recover a true one-way latency:
+   A feed message's one-way latency is [local_recv - server_event], but that difference
+   also contains the constant offset between the host clock and the exchange clock. Ping
+   RTT is offset-free, so the best-case one-way transit is [min_rtt / 2]. Taking the
+   minimum [local_recv - server_event] over a recent window as [offset + min_transit] lets
+   us estimate the clock offset as [min_d - min_rtt/2] and recover a true one-way latency:
 
-     latency = (local_recv - server_event) - (min_d - min_rtt/2)
-             = (d - min_d) + min_rtt/2
+   latency = (local_recv - server_event) - (min_d - min_rtt/2) = (d - min_d) + min_rtt/2
 
-   The minimum therefore reads as [min_rtt/2] (the network floor) and every
-   other sample as that floor plus its excess over the best case.
+   The minimum therefore reads as [min_rtt/2] (the network floor) and every other sample
+   as that floor plus its excess over the best case.
 
-   Both minima are tracked with a sliding-window min filter (a monotonic deque
-   evicting entries older than [offset_window_s]) rather than a lifetime
-   minimum. A lifetime minimum never adapts to host-clock drift or an NTP step,
-   and a single anomalously low sample biases every later reading for the life
-   of the process. The window bounds both: stale samples age out after five
-   minutes, so the estimate tracks the clocks while remaining cheap (O(1)
-   amortized) and memory-bounded. *)
+   Both minima are tracked with a sliding-window min filter (a monotonic deque evicting
+   entries older than [offset_window_s]) rather than a lifetime minimum. A lifetime
+   minimum never adapts to host-clock drift or an NTP step, and a single anomalously low
+   sample biases every later reading for the life of the process. The window bounds both:
+   stale samples age out after five minutes, so the estimate tracks the clocks while
+   remaining cheap (O(1) amortized) and memory-bounded. *)
 
 (** Sliding-window minimum ("min filter"). [push ~time ~value] keeps values in
-    non-decreasing order from front to back so the front is always the window
-    minimum; [evict ~now] drops entries older than [window_s]. *)
+    non-decreasing order from front to back so the front is always the window minimum;
+    [evict ~now] drops entries older than [window_s]. *)
 module Window_min = struct
   type t =
     { mutable a_t : float array (* sample times, increasing *)
@@ -156,7 +149,7 @@ module Window_min = struct
   let ensure_space t =
     let cap = Array.length t.a_t in
     if t.head + t.len >= cap
-    then (
+    then
       if t.head > cap / 2
       then (
         Array.blit t.a_t t.head t.a_t 0 t.len;
@@ -170,7 +163,7 @@ module Window_min = struct
         Array.blit t.a_v t.head nv 0 t.len;
         t.a_t <- nt;
         t.a_v <- nv;
-        t.head <- 0))
+        t.head <- 0)
   ;;
 
   let push t ~time ~value =
@@ -199,24 +192,24 @@ module Window_min = struct
   let min_opt t = if t.len = 0 then None else Some t.a_v.(t.head)
 end
 
-(** Rolling window over which the clock-offset minima are taken. Long enough to
-    observe the network floor, short enough to track clock drift/steps. *)
+(** Rolling window over which the clock-offset minima are taken. Long enough to observe
+    the network floor, short enough to track clock drift/steps. *)
 let offset_window_s = 300.0
+
 let offset_max_len = 20_000
 
-(** A feed sample is stale/out-of-order (not transit delay) when its server
-    event time trails the newest event seen for the venue by more than this. A
-    live feed's cross-symbol jitter is well under a second. *)
+(** A feed sample is stale/out-of-order (not transit delay) when its server event time
+    trails the newest event seen for the venue by more than this. A live feed's
+    cross-symbol jitter is well under a second. *)
 let stale_event_tolerance_s = 5.0
 
-(** Feed freshness gate. A live event-driven feed's server event timestamps
-    advance at roughly wall-clock rate; a feed replaying stale data (e.g. the
-    previous session's quotes outside market hours) keeps emitting the same old
-    timestamp while local time advances. Comparing the buffered server-event
-    span against the local-receive span over a recent window distinguishes the
-    two, so staleness is reported as "no sample" instead of as enormous latency.
-    Without this, a min-filter clock-offset estimate decays toward the window
-    length during a stale period and pins the reading at the profiler ceiling. *)
+(** Feed freshness gate. A live event-driven feed's server event timestamps advance at
+    roughly wall-clock rate; a feed replaying stale data (e.g. the previous session's
+    quotes outside market hours) keeps emitting the same old timestamp while local time
+    advances. Comparing the buffered server-event span against the local-receive span over
+    a recent window distinguishes the two, so staleness is reported as "no sample" instead
+    of as enormous latency. Without this, a min-filter clock-offset estimate decays toward
+    the window length during a stale period and pins the reading at the profiler ceiling. *)
 module Feed_freshness = struct
   let cap = 256
   let window_s = 60.0
@@ -239,8 +232,8 @@ module Feed_freshness = struct
     if t.n < cap then t.n <- t.n + 1
   ;;
 
-  (** [is_live t ~now] is true unless recent server timestamps clearly failed to
-      advance with local time, or there is too little recent data to judge. *)
+  (** [is_live t ~now] is true unless recent server timestamps clearly failed to advance
+      with local time, or there is too little recent data to judge. *)
   let is_live t ~now =
     let rmin = ref infinity
     and rmax = ref neg_infinity
@@ -298,12 +291,16 @@ let offset_state venue =
   st
 ;;
 
-(** Records a ping RTT (seconds) as a candidate for the best-case one-way
-    transit floor used by [corrected_one_way]. *)
+(** Records a ping RTT (seconds) as a candidate for the best-case one-way transit floor
+    used by [corrected_one_way]. *)
 let observe_rtt ?now venue rtt =
   if Float.is_finite rtt && rtt > 0.0
   then (
-    let now = match now with Some t -> t | None -> Unix.gettimeofday () in
+    let now =
+      match now with
+      | Some t -> t
+      | None -> Unix.gettimeofday ()
+    in
     let st = offset_state venue in
     Mutex.lock offsets_mutex;
     Window_min.push st.rtt ~time:now ~value:rtt;
@@ -311,15 +308,18 @@ let observe_rtt ?now venue rtt =
     Mutex.unlock offsets_mutex)
 ;;
 
-(** [corrected_one_way ?now venue ~recv ~event] returns the clock-offset-
-    corrected one-way latency in seconds for a fresh feed message whose server
-    event time is [event] (Unix seconds) and which was read locally at [recv]
-    (Unix seconds), or [None] when the sample is stale/out-of-order (see
-    [Feed_freshness] and [stale_event_tolerance_s]). [now] defaults to [recv]
-    and drives window eviction. Fresh samples are folded into the venue's
-    sliding-window minimum. *)
+(** [corrected_one_way ?now venue ~recv ~event] returns the clock-offset- corrected
+    one-way latency in seconds for a fresh feed message whose server event time is [event]
+    (Unix seconds) and which was read locally at [recv] (Unix seconds), or [None] when the
+    sample is stale/out-of-order (see [Feed_freshness] and [stale_event_tolerance_s]).
+    [now] defaults to [recv] and drives window eviction. Fresh samples are folded into the
+    venue's sliding-window minimum. *)
 let corrected_one_way ?now venue ~recv ~event =
-  let now = match now with Some t -> t | None -> recv in
+  let now =
+    match now with
+    | Some t -> t
+    | None -> recv
+  in
   let st = offset_state venue in
   Mutex.lock offsets_mutex;
   Feed_freshness.push st.fresh ~recv ~event;
@@ -345,9 +345,9 @@ let corrected_one_way ?now venue ~recv ~event =
   result
 ;;
 
-(** Parse an RFC3339 / ISO8601 timestamp (e.g. "2025-01-14T16:05:51.872012Z")
-    into Unix epoch seconds. Handles fractional seconds and a trailing "Z" or
-    numeric ±HH:MM offset. Returns [None] for unparseable input. *)
+(** Parse an RFC3339 / ISO8601 timestamp (e.g. "2025-01-14T16:05:51.872012Z") into Unix
+    epoch seconds. Handles fractional seconds and a trailing "Z" or numeric ±HH:MM offset.
+    Returns [None] for unparseable input. *)
 let unix_of_rfc3339 s =
   let n = String.length s in
   if n < 19
@@ -364,7 +364,7 @@ let unix_of_rfc3339 s =
       let stop = ref (String.length rest) in
       String.iteri
         (fun i c ->
-           if (c = 'Z' || c = 'z' || c = '+' || c = '-') && i < !stop then stop := i)
+          if (c = 'Z' || c = 'z' || c = '+' || c = '-') && i < !stop then stop := i)
         rest;
       let sec = float_of_string (String.sub rest 0 !stop) in
       let tz_offset =
@@ -376,12 +376,12 @@ let unix_of_rfc3339 s =
           sign *. ((float_of_int hh *. 3600.0) +. (float_of_int mm *. 60.0)))
         else 0.0
       in
-      (* Days since 1970-01-01 for the proleptic Gregorian date (Howard
-         Hinnant's days_from_civil). Avoids [Unix.mktime]/timezone entirely. *)
+      (* Days since 1970-01-01 for the proleptic Gregorian date (Howard Hinnant's
+         days_from_civil). Avoids [Unix.mktime]/timezone entirely. *)
       let yy = if mo <= 2 then y - 1 else y in
       let era = (if yy >= 0 then yy else yy - 399) / 400 in
       let yoe = yy - (era * 400) in
-      let doy = (((153 * (if mo > 2 then mo - 3 else mo + 9)) + 2) / 5) + d - 1 in
+      let doy = (((153 * if mo > 2 then mo - 3 else mo + 9) + 2) / 5) + d - 1 in
       let doe = (yoe * 365) + (yoe / 4) - (yoe / 100) + doy in
       let days = (era * 146097) + doe - 719468 in
       let epoch =
@@ -409,27 +409,35 @@ let record_feed_s venue s = record_feed venue (span_of_seconds s)
 let record_rest_s venue s = record_rest venue (span_of_seconds s)
 
 (** [record_feed_event_s venue ~event ?recv ()] records one fresh feed message's
-    clock-corrected one-way latency. [event] is the server event timestamp in
-    Unix seconds; [recv] defaults to the current wall time. Stale/out-of-order
-    samples are dropped rather than recorded. *)
+    clock-corrected one-way latency. [event] is the server event timestamp in Unix
+    seconds; [recv] defaults to the current wall time. Stale/out-of-order samples are
+    dropped rather than recorded. *)
 let record_feed_event_s venue ~event ?recv () =
-  let recv = match recv with Some r -> r | None -> Unix.gettimeofday () in
+  let recv =
+    match recv with
+    | Some r -> r
+    | None -> Unix.gettimeofday ()
+  in
   match corrected_one_way venue ~recv ~event with
   | Some lat -> record_feed_s venue lat
   | None -> ()
 ;;
 
-(** [record_feed_event_ms venue ~event_ms ?recv ()] is [record_feed_event_s]
-    for server timestamps expressed in milliseconds since epoch. *)
+(** [record_feed_event_ms venue ~event_ms ?recv ()] is [record_feed_event_s] for server
+    timestamps expressed in milliseconds since epoch. *)
 let record_feed_event_ms venue ~event_ms ?recv () =
-  let recv = match recv with Some r -> r | None -> Unix.gettimeofday () in
+  let recv =
+    match recv with
+    | Some r -> r
+    | None -> Unix.gettimeofday ()
+  in
   match corrected_one_way venue ~recv ~event:(event_ms /. 1000.0) with
   | Some lat -> record_feed_s venue lat
   | None -> ()
 ;;
 
-(** Most recent published windows for [venue], in the label order the dashboard's
-    NETWORK page expects. Empty when the venue has no profilers yet. *)
+(** Most recent published windows for [venue], in the label order the dashboard's NETWORK
+    page expects. Empty when the venue has no profilers yet. *)
 let snapshots venue =
   match Hashtbl.find_opt profilers venue with
   | None -> []
@@ -446,49 +454,48 @@ let all_venue_snapshots () =
   Hashtbl.fold (fun venue _ acc -> (venue, snapshots venue) :: acc) profilers []
 ;;
 
-(** Network window publication cadence, in seconds. Shared by the background
-    loop and the spike-log window label so the two cannot drift. *)
+(** Network window publication cadence, in seconds. Shared by the background loop and the
+    spike-log window label so the two cannot drift. *)
 let publish_interval_seconds = 10.0
 
-(** Advance every venue profiler's window, publishing an immutable snapshot for
-    the dashboard. Safe from any thread; profilers hold an internal mutex for the
-    atomic publish. When [log_spikes] is set, each venue emits at most one INFO
-    line naming the network metrics with a sample at or above [threshold_us].
-    Gated by the caller so the network tail can be silenced while internal ops
-    are profiled. *)
+(** Advance every venue profiler's window, publishing an immutable snapshot for the
+    dashboard. Safe from any thread; profilers hold an internal mutex for the atomic
+    publish. When [log_spikes] is set, each venue emits at most one INFO line naming the
+    network metrics with a sample at or above [threshold_us]. Gated by the caller so the
+    network tail can be silenced while internal ops are profiled. *)
 let publish_all ?(log_spikes = false) ?(threshold_us = 10.0) () =
   Hashtbl.iter
     (fun venue p ->
-       let ping =
-         Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.ping
-       in
-       let feed =
-         Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.feed
-       in
-       let rest =
-         Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.rest
-       in
-       let signer =
-         Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.signer
-       in
-       if log_spikes
-       then (
-         match
-           Latency_profiler.spike_message
-             ~key:venue
-             ~window_seconds:publish_interval_seconds
-             ~threshold_us
-             [ "WS_PING", ping; "WS_FEED", feed; "REST", rest; "SIGNER", signer ]
-         with
-         | None -> ()
-         | Some msg -> Logging.info_f ~section "%s" msg))
+      let ping =
+        Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.ping
+      in
+      let feed =
+        Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.feed
+      in
+      let rest =
+        Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.rest
+      in
+      let signer =
+        Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.signer
+      in
+      if log_spikes
+      then (
+        match
+          Latency_profiler.spike_message
+            ~key:venue
+            ~window_seconds:publish_interval_seconds
+            ~threshold_us
+            [ "WS_PING", ping; "WS_FEED", feed; "REST", rest; "SIGNER", signer ]
+        with
+        | None -> ()
+        | Some msg -> Logging.info_f ~section "%s" msg))
     profilers
 ;;
 
-(** Background publisher: advance all venue windows every
-    [publish_interval_seconds] so the dashboard always has a fresh NETWORK page.
-    Runs as an Lwt fiber; call once at engine startup. [log_spikes] controls
-    whether windows also emit spike logs (see [publish_all]). *)
+(** Background publisher: advance all venue windows every [publish_interval_seconds] so
+    the dashboard always has a fresh NETWORK page. Runs as an Lwt fiber; call once at
+    engine startup. [log_spikes] controls whether windows also emit spike logs (see
+    [publish_all]). *)
 let start_publisher ?(log_spikes = false) ?(threshold_us = 10.0) () =
   let rec loop () =
     Lwt_unix.sleep publish_interval_seconds

@@ -107,13 +107,12 @@ let test_max_gap () =
        ])
 ;;
 
-(* ---- Source normalization (Oracle_calendar.normalize_bars) ----
-   Real @142 (UBTC/USDC) fixture: the pre-listing placeholder run
-   (2025-02-03..2025-02-13: fabricated constant candles 6,969,696 / 7,979,573
-   with zero or dust volume) plus the first real trading day whose open/high
-   (240,000) never traded (close 97,578) - exactly the rows observed from
-   candleSnapshot that made the oracle read a 99.3% drawdown and a $7.98M
-   peak. The normalization is shared by every venue's fetch path. *)
+(* ---- Source normalization (Oracle_calendar.normalize_bars) ---- Real @142 (UBTC/USDC)
+   fixture: the pre-listing placeholder run (2025-02-03..2025-02-13: fabricated constant
+   candles 6,969,696 / 7,979,573 with zero or dust volume) plus the first real trading day
+   whose open/high (240,000) never traded (close 97,578) - exactly the rows observed from
+   candleSnapshot that made the oracle read a 99.3% drawdown and a $7.98M peak. The
+   normalization is shared by every venue's fetch path. *)
 
 let mk_bar ~date ~open_ ~high ~low ~close ~volume =
   Dio_oracle.Oracle_types.{ date; open_; high; low; close; volume }
@@ -197,23 +196,21 @@ let test_normalize_drops_fabricated_placeholders () =
     "ascending dates"
     [| "2025-02-14"; "2025-02-15"; "2025-02-16"; "2025-02-17" |]
     dates;
-  (* The phantom $7.98M peak is gone: the drawdown the oracle would now
-     report is the fixture's mild drift, not the fabricated 99.3%. *)
+  (* The phantom $7.98M peak is gone: the drawdown the oracle would now report is the
+     fixture's mild drift, not the fabricated 99.3%. *)
   let series =
     Dio_oracle.Oracle_types.
       { symbol = "BTC/USDC"; calendar_kind = Crypto; bars = clean; gaps = [] }
   in
-  let refs =
-    Option.get (Dio_oracle.Oracle_core.references_of ~bars:series.bars)
-  in
+  let refs = Option.get (Dio_oracle.Oracle_core.references_of ~bars:series.bars) in
   (* The close-peak -> subsequent-low drawdown of the mild drift fixture. *)
   Alcotest.(check bool) "no phantom 99% drawdown" true (refs.max_drawdown_pct < 0.05)
 ;;
 
 let test_normalize_keeps_carried_zero_volume () =
-  (* A zero-volume day whose price is carried near the real market is kept:
-     normalization must only remove FABRICATED levels, not dead-but-real
-     days (dropping them would fabricate gaps that fail max_gap). *)
+  (* A zero-volume day whose price is carried near the real market is kept: normalization
+     must only remove FABRICATED levels, not dead-but-real days (dropping them would
+     fabricate gaps that fail max_gap). *)
   let clean, dropped, clamped =
     Dio_oracle.Oracle_calendar.normalize_bars
       (placeholder_bars ()
@@ -237,8 +234,8 @@ let test_normalize_keeps_carried_zero_volume () =
 ;;
 
 let test_normalize_garbage_only_series_empties () =
-  (* A series that is ALL fabricated placeholders normalizes to nothing:
-     an empty history is INACTIVE - a garbage decision would be worse. *)
+  (* A series that is ALL fabricated placeholders normalizes to nothing: an empty history
+     is INACTIVE - a garbage decision would be worse. *)
   let clean, dropped, _ =
     Dio_oracle.Oracle_calendar.normalize_bars (placeholder_bars ())
   in
@@ -247,8 +244,8 @@ let test_normalize_garbage_only_series_empties () =
 ;;
 
 let test_normalize_real_series_untouched () =
-  (* A clean liquid series (flat rows, mild drift) must pass through
-     untouched: no drops, no clamps. *)
+  (* A clean liquid series (flat rows, mild drift) must pass through untouched: no drops,
+     no clamps. *)
   let mk i =
     let date = Printf.sprintf "2026-0%d-%02d" ((i / 28) + 1) ((i mod 28) + 1) in
     let close = 60000.0 +. (float_of_int i *. 10.0) in
@@ -269,10 +266,9 @@ let test_normalize_real_series_untouched () =
 ;;
 
 let test_normalize_long_horizon_100x_kept () =
-  (* Regression: a series that genuinely appreciated ~8000x (BTC ~$1k in
-     2017 vs ~$40k+ median; ETH ~$90 in late 2018) must KEEP its early
-     cheap-era rows. The outlier judge is local (nearest real-trading
-     neighbor), never a global median. *)
+  (* Regression: a series that genuinely appreciated ~8000x (BTC ~$1k in 2017 vs ~$40k+
+     median; ETH ~$90 in late 2018) must KEEP its early cheap-era rows. The outlier judge
+     is local (nearest real-trading neighbor), never a global median. *)
   let rows = ref [] in
   for year = 2015 to 2026 do
     for month = 1 to 12 do

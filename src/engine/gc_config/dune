@@ -1,0 +1,4 @@
+(library
+ (name gc_config)
+ (public_name dio.gc_config)
+ (modules Gc_config))

@@ -68,15 +68,15 @@ let tpsl_to_string = function
   | Sl -> "sl"
 ;;
 
-(** Pack a numeric ID using the most compact MsgPack integer tag.
-    Falls back to Int64 encoding if the value exceeds OCaml int range. *)
+(** Pack a numeric ID using the most compact MsgPack integer tag. Falls back to Int64
+    encoding if the value exceeds OCaml int range. *)
 let pack_id id =
   try Int (Int64.to_int id) with
   | _ -> Int64 id
 ;;
 
-(** Serialize an order type to its MsgPack map representation.
-    Limit orders encode TIF; trigger orders encode price, market flag, and TP/SL. *)
+(** Serialize an order type to its MsgPack map representation. Limit orders encode TIF;
+    trigger orders encode price, market flag, and TP/SL. *)
 let pack_order_type_wire = function
   | Limit l -> Map [ String "limit", Map [ String "tif", String (tif_to_string l.tif) ] ]
   | Trigger t ->
@@ -90,8 +90,8 @@ let pack_order_type_wire = function
       ]
 ;;
 
-(** Serialize an order_wire to a MsgPack map.
-    Appends the optional cloid field only when present. *)
+(** Serialize an order_wire to a MsgPack map. Appends the optional cloid field only when
+    present. *)
 let pack_order_wire (ow : order_wire) =
   let fields =
     [ String "a", Int ow.a
@@ -130,8 +130,8 @@ let pack_modify_action ~oid ~order =
     ]
 ;;
 
-(** Pack a batch order modification action with the given grouping mode.
-    Each element is an (oid, order_wire) pair. *)
+(** Pack a batch order modification action with the given grouping mode. Each element is
+    an (oid, order_wire) pair. *)
 let pack_batch_modify_action ~modifies ~grouping =
   let pack_one (oid, ord) =
     Map [ String "oid", pack_id oid; String "order", pack_order_wire ord ]
@@ -153,12 +153,13 @@ let pack_cancel_action ~(cancels : cancel_wire list) : t =
       , List
           (List.map
              (fun (c : cancel_wire) ->
-                Map [ String "a", Int c.a; String "o", pack_id c.o ])
+               Map [ String "a", Int c.a; String "o", pack_id c.o ])
              cancels) )
     ]
 ;;
 
-(** Pack a cancel action for a list of cancel_by_cloid_wire entries keyed by client order ID. *)
+(** Pack a cancel action for a list of cancel_by_cloid_wire entries keyed by client order
+    ID. *)
 let pack_cancel_by_cloid_action ~(cancels : cancel_by_cloid_wire list) : t =
   Map
     [ String "type", String "cancelByCloid"
@@ -166,13 +167,13 @@ let pack_cancel_by_cloid_action ~(cancels : cancel_by_cloid_wire list) : t =
       , List
           (List.map
              (fun (c : cancel_by_cloid_wire) ->
-                Map [ String "a", Int c.a; String "cloid", String c.cloid ])
+               Map [ String "a", Int c.a; String "cloid", String c.cloid ])
              cancels) )
     ]
 ;;
 
-(** Pack a USD class transfer action between spot and perp sub-accounts.
-    [amount] is a decimal string; [to_perp] selects the transfer direction. *)
+(** Pack a USD class transfer action between spot and perp sub-accounts. [amount] is a
+    decimal string; [to_perp] selects the transfer direction. *)
 let pack_usd_class_transfer_action ~amount ~to_perp =
   Map
     [ String "type", String "usdClassTransfer"

@@ -1,8 +1,6 @@
-(**
-   Kraken authenticated balances WebSocket feed.
-   Maintains per-asset balance state in atomic variables for lock-free reads;
-   mutated by WebSocket balance snapshot and update messages.
-*)
+(** Kraken authenticated balances WebSocket feed. Maintains per-asset balance state in
+    atomic variables for lock-free reads; mutated by WebSocket balance snapshot and update
+    messages. *)
 
 open Lwt.Infix
 open Concurrency
@@ -11,8 +9,8 @@ let section = "kraken_balances"
 
 open Kraken_common_types
 
-(** Normalizes asset names by stripping staking/earn suffixes (e.g. BTC.HOLD -> BTC)
-    and mapping legacy Kraken REST codes (e.g. XXBT -> BTC). *)
+(** Normalizes asset names by stripping staking/earn suffixes (e.g. BTC.HOLD -> BTC) and
+    mapping legacy Kraken REST codes (e.g. XXBT -> BTC). *)
 let normalize_asset asset =
   let base =
     if String.contains asset '.'
@@ -51,8 +49,8 @@ module BalanceStore = struct
     ; last_updated : float
     }
 
-  (* Upper bound on wallet entries per asset to prevent unbounded memory growth.
-     Kraken broadcasts events across wallet types: spot, earn, transfer, margin. *)
+  (* Upper bound on wallet entries per asset to prevent unbounded memory growth. Kraken
+     broadcasts events across wallet types: spot, earn, transfer, margin. *)
   let max_wallets = 10
 
   type t =
@@ -60,7 +58,7 @@ module BalanceStore = struct
       wallets : (string, wallet_balance) Hashtbl.t
     ; mutex : Mutex.t
     ; total_balance : float Atomic.t
-      (* Cached sum of all wallet balances for this asset. *)
+        (* Cached sum of all wallet balances for this asset. *)
     ; trading_balance :
         float Atomic.t (* Cached sum of trading (non-earn) wallet balances. *)
     ; last_updated : float Atomic.t
@@ -107,8 +105,8 @@ module BalanceStore = struct
       let to_remove = ref [] in
       Hashtbl.iter
         (fun k _ ->
-           if (not (is_ws_earn_key k)) && String.starts_with ~prefix:"earn/" k
-           then to_remove := k :: !to_remove)
+          if (not (is_ws_earn_key k)) && String.starts_with ~prefix:"earn/" k
+          then to_remove := k :: !to_remove)
         store.wallets;
       List.iter (Hashtbl.remove store.wallets) !to_remove;
       Hashtbl.replace store.wallets wallet_key wallet_data)
@@ -128,10 +126,10 @@ module BalanceStore = struct
       let oldest_time = ref Float.infinity in
       Hashtbl.iter
         (fun k (v : wallet_balance) ->
-           if v.last_updated < !oldest_time
-           then (
-             oldest_time := v.last_updated;
-             oldest_key := k))
+          if v.last_updated < !oldest_time
+          then (
+            oldest_time := v.last_updated;
+            oldest_key := k))
         store.wallets;
       if !oldest_key <> "" then Hashtbl.remove store.wallets !oldest_key);
     let total =
@@ -140,7 +138,7 @@ module BalanceStore = struct
     let trading =
       Hashtbl.fold
         (fun _ wallet acc ->
-           if wallet.wallet_type = "earn" then acc else acc +. wallet.balance)
+          if wallet.wallet_type = "earn" then acc else acc +. wallet.balance)
         store.wallets
         0.0
     in
@@ -155,8 +153,8 @@ module BalanceStore = struct
 
   let get_total_balance store = Atomic.get store.total_balance
 
-  (** Returns the wall-clock timestamp of the last wallet update for this
-      asset (0.0 = never updated). Used for balance-snapshot staleness. *)
+  (** Returns the wall-clock timestamp of the last wallet update for this asset (0.0 =
+      never updated). Used for balance-snapshot staleness. *)
   let get_last_updated store = Atomic.get store.last_updated
 
   let get_all store =
@@ -294,8 +292,8 @@ let notify_ready () =
     ()
 ;;
 
-(** Blocks until all [assets] have balance data or [timeout_seconds] elapses.
-    Returns true if all assets were populated, false on timeout. *)
+(** Blocks until all [assets] have balance data or [timeout_seconds] elapses. Returns true
+    if all assets were populated, false on timeout. *)
 let wait_for_balance_data_lwt assets timeout_seconds =
   let deadline = Unix.gettimeofday () +. timeout_seconds in
   let rec loop () =
@@ -319,8 +317,8 @@ let wait_for_balance_data_lwt assets timeout_seconds =
 
 let wait_for_balance_data = wait_for_balance_data_lwt
 
-(** Evicts dynamically discovered assets exceeding [dynamic_assets_cap].
-    Statically configured assets are never removed. *)
+(** Evicts dynamically discovered assets exceeding [dynamic_assets_cap]. Statically
+    configured assets are never removed. *)
 let cleanup_dynamic_assets () =
   Mutex.lock balance_stores_mutex;
   Mutex.lock configured_assets_mutex;
@@ -330,25 +328,25 @@ let cleanup_dynamic_assets () =
   let dynamic = ref [] in
   List.iter
     (fun asset ->
-       if Hashtbl.mem configured_assets asset
-       then configured := asset :: !configured
-       else dynamic := asset :: !dynamic)
+      if Hashtbl.mem configured_assets asset
+      then configured := asset :: !configured
+      else dynamic := asset :: !dynamic)
     !all_assets;
   let dynamic_with_times =
     List.map
       (fun asset ->
-         let last_update =
-           try
-             Mutex.lock balance_update_mutex;
-             let time = Hashtbl.find last_balance_update asset in
-             Mutex.unlock balance_update_mutex;
-             time
-           with
-           | Not_found ->
-             Mutex.unlock balance_update_mutex;
-             0.0 (* Never updated; lowest eviction priority. *)
-         in
-         last_update)
+        let last_update =
+          try
+            Mutex.lock balance_update_mutex;
+            let time = Hashtbl.find last_balance_update asset in
+            Mutex.unlock balance_update_mutex;
+            time
+          with
+          | Not_found ->
+            Mutex.unlock balance_update_mutex;
+            0.0 (* Never updated; lowest eviction priority. *)
+        in
+        last_update)
       !dynamic
   in
   let dynamic_sorted =
@@ -365,11 +363,11 @@ let cleanup_dynamic_assets () =
   let removed_count = List.length dynamic_to_remove in
   List.iter
     (fun asset ->
-       Hashtbl.remove balance_stores asset;
-       Mutex.lock balance_update_mutex;
-       Hashtbl.remove last_balance_update asset;
-       Mutex.unlock balance_update_mutex;
-       Logging.debug_f ~section "Removed dynamic balance asset: %s" asset)
+      Hashtbl.remove balance_stores asset;
+      Mutex.lock balance_update_mutex;
+      Hashtbl.remove last_balance_update asset;
+      Mutex.unlock balance_update_mutex;
+      Logging.debug_f ~section "Removed dynamic balance asset: %s" asset)
     dynamic_to_remove;
   Mutex.unlock configured_assets_mutex;
   Mutex.unlock balance_stores_mutex;
@@ -410,48 +408,48 @@ let parse_snapshot json on_heartbeat =
     let data = member "data" json |> to_list in
     List.iter
       (fun asset_data ->
-         try
-           let asset = member "asset" asset_data |> to_string in
-           let base_asset = normalize_asset asset in
-           let store = get_balance_store base_asset in
-           let wallets = member "wallets" asset_data |> to_list in
-           List.iter
-             (fun wallet ->
-                try
-                  let wallet_type = member "type" wallet |> to_string in
-                  let wallet_id = member "id" wallet |> to_string in
-                  let balance = member "balance" wallet |> to_float in
-                  BalanceStore.update_wallet store balance wallet_type wallet_id asset;
-                  Logging.debug_f
-                    ~section
-                    "Balance snapshot wallet: %s %s/%s = %.8f"
-                    asset
-                    wallet_type
-                    wallet_id
-                    balance
-                with
-                | exn ->
-                  Logging.warn_f
-                    ~section
-                    "Failed to parse wallet in snapshot: %s"
-                    (Printexc.to_string exn))
-             wallets;
-           update_balance_timestamp base_asset;
-           notify_ready ();
-           let total_balance = BalanceStore.get_balance store in
-           Logging.debug_f
-             ~section
-             "Balance snapshot total: %s = %.8f"
-             base_asset
-             total_balance;
-           (* Signal heartbeat to confirm connection liveness. *)
-           on_heartbeat ()
-         with
-         | exn ->
-           Logging.warn_f
-             ~section
-             "Failed to parse balance snapshot item: %s"
-             (Printexc.to_string exn))
+        try
+          let asset = member "asset" asset_data |> to_string in
+          let base_asset = normalize_asset asset in
+          let store = get_balance_store base_asset in
+          let wallets = member "wallets" asset_data |> to_list in
+          List.iter
+            (fun wallet ->
+              try
+                let wallet_type = member "type" wallet |> to_string in
+                let wallet_id = member "id" wallet |> to_string in
+                let balance = member "balance" wallet |> to_float in
+                BalanceStore.update_wallet store balance wallet_type wallet_id asset;
+                Logging.debug_f
+                  ~section
+                  "Balance snapshot wallet: %s %s/%s = %.8f"
+                  asset
+                  wallet_type
+                  wallet_id
+                  balance
+              with
+              | exn ->
+                Logging.warn_f
+                  ~section
+                  "Failed to parse wallet in snapshot: %s"
+                  (Printexc.to_string exn))
+            wallets;
+          update_balance_timestamp base_asset;
+          notify_ready ();
+          let total_balance = BalanceStore.get_balance store in
+          Logging.debug_f
+            ~section
+            "Balance snapshot total: %s = %.8f"
+            base_asset
+            total_balance;
+          (* Signal heartbeat to confirm connection liveness. *)
+          on_heartbeat ()
+        with
+        | exn ->
+          Logging.warn_f
+            ~section
+            "Failed to parse balance snapshot item: %s"
+            (Printexc.to_string exn))
       data;
     (* Mark pre-initialized zero-balance assets as updated if untouched. *)
     let now = Unix.time () in
@@ -460,15 +458,15 @@ let parse_snapshot json on_heartbeat =
     Mutex.unlock balance_stores_mutex;
     List.iter
       (fun asset ->
-         let store = get_balance_store asset in
-         if Atomic.get store.last_updated <= 0.0
-         then (
-           Atomic.set store.last_updated now;
-           update_balance_timestamp asset;
-           Logging.debug_f
-             ~section
-             "Balance snapshot: Marked zero-balance asset %s as updated"
-             asset))
+        let store = get_balance_store asset in
+        if Atomic.get store.last_updated <= 0.0
+        then (
+          Atomic.set store.last_updated now;
+          update_balance_timestamp asset;
+          Logging.debug_f
+            ~section
+            "Balance snapshot: Marked zero-balance asset %s as updated"
+            asset))
       all_assets;
     notify_ready ();
     maybe_cleanup_after_balance_update ();
@@ -489,43 +487,43 @@ let parse_update json on_heartbeat =
     let data = member "data" json |> to_list in
     List.iter
       (fun ledger_tx ->
-         try
-           let asset = member "asset" ledger_tx |> to_string in
-           let balance = member "balance" ledger_tx |> to_float in
-           let amount = member "amount" ledger_tx |> to_float in
-           let tx_type = member "type" ledger_tx |> to_string in
-           let wallet_type = member "wallet_type" ledger_tx |> to_string in
-           let wallet_id = member "wallet_id" ledger_tx |> to_string in
-           let base_asset = normalize_asset asset in
-           let store = get_balance_store base_asset in
-           BalanceStore.update_wallet store balance wallet_type wallet_id asset;
-           update_balance_timestamp base_asset;
-           notify_ready ();
-           let balance_data = BalanceStore.get_all store in
-           let event_data =
-             { asset = base_asset
-             ; balance = balance_data.balance
-             ; wallet_type = balance_data.wallet_type
-             ; wallet_id = balance_data.wallet_id
-             ; last_updated = balance_data.last_updated
-             }
-           in
-           BalanceUpdateEventBus.publish balance_update_event_bus event_data;
-           Logging.debug_f
-             ~section
-             "Balance update: %s %+.8f (new: %.8f) [%s]"
-             asset
-             amount
-             balance
-             tx_type;
-           (* Signal heartbeat to confirm connection liveness. *)
-           on_heartbeat ()
-         with
-         | exn ->
-           Logging.warn_f
-             ~section
-             "Failed to parse balance update item: %s"
-             (Printexc.to_string exn))
+        try
+          let asset = member "asset" ledger_tx |> to_string in
+          let balance = member "balance" ledger_tx |> to_float in
+          let amount = member "amount" ledger_tx |> to_float in
+          let tx_type = member "type" ledger_tx |> to_string in
+          let wallet_type = member "wallet_type" ledger_tx |> to_string in
+          let wallet_id = member "wallet_id" ledger_tx |> to_string in
+          let base_asset = normalize_asset asset in
+          let store = get_balance_store base_asset in
+          BalanceStore.update_wallet store balance wallet_type wallet_id asset;
+          update_balance_timestamp base_asset;
+          notify_ready ();
+          let balance_data = BalanceStore.get_all store in
+          let event_data =
+            { asset = base_asset
+            ; balance = balance_data.balance
+            ; wallet_type = balance_data.wallet_type
+            ; wallet_id = balance_data.wallet_id
+            ; last_updated = balance_data.last_updated
+            }
+          in
+          BalanceUpdateEventBus.publish balance_update_event_bus event_data;
+          Logging.debug_f
+            ~section
+            "Balance update: %s %+.8f (new: %.8f) [%s]"
+            asset
+            amount
+            balance
+            tx_type;
+          (* Signal heartbeat to confirm connection liveness. *)
+          on_heartbeat ()
+        with
+        | exn ->
+          Logging.warn_f
+            ~section
+            "Failed to parse balance update item: %s"
+            (Printexc.to_string exn))
       data;
     maybe_cleanup_after_balance_update ();
     Some ()
@@ -574,8 +572,8 @@ let handle_message_json json on_heartbeat =
   | exn -> Logging.error_f ~section "Error handling message: %s" (Printexc.to_string exn)
 ;;
 
-(** Parse-domain body: parse and dispatch without publishing a tick (the WS
-    fiber owns tick accounting). Used by the uniform venue decoder. *)
+(** Parse-domain body: parse and dispatch without publishing a tick (the WS fiber owns
+    tick accounting). Used by the uniform venue decoder. *)
 let process_parse_domain_frame message =
   try
     let json = Yojson.Safe.from_string message in
@@ -604,11 +602,10 @@ let handle_message message on_heartbeat =
       message
 ;;
 
-(** Quote value held in resting BUY orders across every pair priced in
-    [quote_asset]: sum of remaining_qty * limit_price. Kraken wallet snapshots
-    report TOTAL balances, so this hold is subtracted on read to obtain the
-    tradeable figure; a buy hold reduces tradeable quote as a sell hold
-    reduces tradeable base. *)
+(** Quote value held in resting BUY orders across every pair priced in [quote_asset]: sum
+    of remaining_qty * limit_price. Kraken wallet snapshots report TOTAL balances, so this
+    hold is subtracted on read to obtain the tradeable figure; a buy hold reduces
+    tradeable quote as a sell hold reduces tradeable base. *)
 let get_pending_buy_quote_value quote_asset =
   let suffix = "/" ^ quote_asset in
   let all_symbols = Kraken_executions_feed.get_all_symbols () in
@@ -618,17 +615,17 @@ let get_pending_buy_quote_value quote_asset =
   in
   List.fold_left
     (fun acc (o : Kraken_executions_feed.open_order) ->
-       match o.side with
-       | Kraken_executions_feed.Buy ->
-         acc +. (o.remaining_qty *. Option.value o.limit_price ~default:0.0)
-       | Kraken_executions_feed.Sell -> acc)
+      match o.side with
+      | Kraken_executions_feed.Buy ->
+        acc +. (o.remaining_qty *. Option.value o.limit_price ~default:0.0)
+      | Kraken_executions_feed.Sell -> acc)
     0.0
     open_orders
 ;;
 
-(** Base quantity held in resting SELL orders across every pair whose base
-    is [asset] (e.g. "XMR" over "XMR/USD"). Kraken wallet snapshots report
-    TOTAL balances, so this hold is subtracted to obtain the tradeable figure. *)
+(** Base quantity held in resting SELL orders across every pair whose base is [asset]
+    (e.g. "XMR" over "XMR/USD"). Kraken wallet snapshots report TOTAL balances, so this
+    hold is subtracted to obtain the tradeable figure. *)
 let get_pending_sell_qty base_asset =
   let prefix = base_asset ^ "/" in
   let all_symbols = Kraken_executions_feed.get_all_symbols () in
@@ -638,9 +635,9 @@ let get_pending_sell_qty base_asset =
   in
   List.fold_left
     (fun acc (o : Kraken_executions_feed.open_order) ->
-       match o.side with
-       | Kraken_executions_feed.Sell -> acc +. o.remaining_qty
-       | Kraken_executions_feed.Buy -> acc)
+      match o.side with
+      | Kraken_executions_feed.Sell -> acc +. o.remaining_qty
+      | Kraken_executions_feed.Buy -> acc)
     0.0
     open_orders
 ;;
@@ -651,42 +648,41 @@ let poll_earn_allocations () =
   let fetch_once () =
     Lwt.catch
       (fun () ->
-         Kraken_get_fee.get_api_credentials_from_env ()
-         >>= fun (api_key, api_secret) ->
-         let path = "/0/private/Earn/Allocations" in
-         let nonce = Kraken_common_types.nonce () in
-         let encoded_body =
-           Uri.encoded_of_query
-             [ "nonce", [ nonce ]; "hide_zero_allocations", [ "true" ] ]
-         in
-         let signature =
-           Kraken_common_types.sign ~secret:api_secret ~path ~body:encoded_body ~nonce
-         in
-         let headers =
-           Cohttp.Header.of_list
-             [ "API-Key", api_key
-             ; "API-Sign", signature
-             ; "Content-Type", "application/x-www-form-urlencoded"
-             ]
-         in
-         let rest_start = Mtime_clock.now_ns () in
-         Lwt_unix.with_timeout 10.0 (fun () ->
-           Cohttp_lwt_unix.Client.post
-             ~headers
-             ~body:(Cohttp_lwt.Body.of_string encoded_body)
-             (Uri.of_string (endpoint ^ path)))
-         >>= fun (resp, body) ->
-         Cohttp_lwt.Body.to_string body
-         >>= fun body_str ->
-         Network_latency.record_rest
-           "kraken"
-           (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
-         let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-         if status <> 200
-         then
-           Lwt.return
-             (Error (Printf.sprintf "Earn/Allocations HTTP %d: %s" status body_str))
-         else Lwt.return (Ok body_str))
+        Kraken_get_fee.get_api_credentials_from_env ()
+        >>= fun (api_key, api_secret) ->
+        let path = "/0/private/Earn/Allocations" in
+        let nonce = Kraken_common_types.nonce () in
+        let encoded_body =
+          Uri.encoded_of_query [ "nonce", [ nonce ]; "hide_zero_allocations", [ "true" ] ]
+        in
+        let signature =
+          Kraken_common_types.sign ~secret:api_secret ~path ~body:encoded_body ~nonce
+        in
+        let headers =
+          Cohttp.Header.of_list
+            [ "API-Key", api_key
+            ; "API-Sign", signature
+            ; "Content-Type", "application/x-www-form-urlencoded"
+            ]
+        in
+        let rest_start = Mtime_clock.now_ns () in
+        Lwt_unix.with_timeout 10.0 (fun () ->
+          Cohttp_lwt_unix.Client.post
+            ~headers
+            ~body:(Cohttp_lwt.Body.of_string encoded_body)
+            (Uri.of_string (endpoint ^ path)))
+        >>= fun (resp, body) ->
+        Cohttp_lwt.Body.to_string body
+        >>= fun body_str ->
+        Network_latency.record_rest
+          "kraken"
+          (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
+        let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+        if status <> 200
+        then
+          Lwt.return
+            (Error (Printf.sprintf "Earn/Allocations HTTP %d: %s" status body_str))
+        else Lwt.return (Ok body_str))
       (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
   in
   Error_handling.retry_with_backoff
@@ -728,45 +724,45 @@ let poll_earn_allocations () =
          in
          List.iter
            (fun allocation ->
-              try
-                let asset = member "native_asset" allocation |> to_string in
-                let strategy_id = member "strategy_id" allocation |> to_string in
-                let base_asset = normalize_asset asset in
-                let amount_allocated = member "amount_allocated" allocation in
-                let total = member "total" amount_allocated in
-                let native_val = float_member "native" total in
-                if native_val > 0.0
-                then (
-                  let pending_sell = get_pending_sell_qty base_asset in
-                  let adjusted_val = max 0.0 (native_val -. pending_sell) in
-                  let store = get_balance_store base_asset in
-                  BalanceStore.update_wallet store adjusted_val "earn" strategy_id asset;
-                  update_balance_timestamp base_asset;
-                  let balance_data = BalanceStore.get_all store in
-                  let event_data =
-                    { asset = base_asset
-                    ; balance = balance_data.balance
-                    ; wallet_type = balance_data.wallet_type
-                    ; wallet_id = balance_data.wallet_id
-                    ; last_updated = balance_data.last_updated
-                    }
-                  in
-                  BalanceUpdateEventBus.publish balance_update_event_bus event_data;
-                  Logging.debug_f
-                    ~section
-                    "Updated Kraken %s Vault balance from REST (%s): %.8f (raw: %.8f, \
-                     pending_sell: %.8f)"
-                    base_asset
-                    strategy_id
-                    adjusted_val
-                    native_val
-                    pending_sell)
-              with
-              | e ->
-                Logging.warn_f
-                  ~section
-                  "Failed to parse Earn allocation: %s"
-                  (Printexc.to_string e))
+             try
+               let asset = member "native_asset" allocation |> to_string in
+               let strategy_id = member "strategy_id" allocation |> to_string in
+               let base_asset = normalize_asset asset in
+               let amount_allocated = member "amount_allocated" allocation in
+               let total = member "total" amount_allocated in
+               let native_val = float_member "native" total in
+               if native_val > 0.0
+               then (
+                 let pending_sell = get_pending_sell_qty base_asset in
+                 let adjusted_val = max 0.0 (native_val -. pending_sell) in
+                 let store = get_balance_store base_asset in
+                 BalanceStore.update_wallet store adjusted_val "earn" strategy_id asset;
+                 update_balance_timestamp base_asset;
+                 let balance_data = BalanceStore.get_all store in
+                 let event_data =
+                   { asset = base_asset
+                   ; balance = balance_data.balance
+                   ; wallet_type = balance_data.wallet_type
+                   ; wallet_id = balance_data.wallet_id
+                   ; last_updated = balance_data.last_updated
+                   }
+                 in
+                 BalanceUpdateEventBus.publish balance_update_event_bus event_data;
+                 Logging.debug_f
+                   ~section
+                   "Updated Kraken %s Vault balance from REST (%s): %.8f (raw: %.8f, \
+                    pending_sell: %.8f)"
+                   base_asset
+                   strategy_id
+                   adjusted_val
+                   native_val
+                   pending_sell)
+             with
+             | e ->
+               Logging.warn_f
+                 ~section
+                 "Failed to parse Earn allocation: %s"
+                 (Printexc.to_string e))
            allocations_list;
          notify_ready ();
          Lwt.return_unit
@@ -782,7 +778,8 @@ let poll_earn_allocations () =
     Lwt.return_unit
 ;;
 
-(** Deprecated message handler stub. Connection management is handled by [Kraken_trading_client]. *)
+(** Deprecated message handler stub. Connection management is handled by
+    [Kraken_trading_client]. *)
 let start_message_handler _conn _token _on_failure _on_heartbeat = Lwt.return_unit
 
 (** Subscribes to the balances channel on the unified authenticated WebSocket connection.
@@ -834,8 +831,8 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
   Lwt.return_unit
 ;;
 
-(** Pre-creates balance stores for the given assets and default fiat currencies.
-    Must be called before the WebSocket feed begins producing messages. *)
+(** Pre-creates balance stores for the given assets and default fiat currencies. Must be
+    called before the WebSocket feed begins producing messages. *)
 let initialize assets =
   Logging.debug_f ~section "Initializing balances feed for %d assets" (List.length assets);
   let assets = List.map normalize_asset assets in
@@ -852,11 +849,11 @@ let initialize assets =
   Mutex.lock balance_stores_mutex;
   List.iter
     (fun asset ->
-       if not (Hashtbl.mem balance_stores asset)
-       then (
-         let store = BalanceStore.create () in
-         Hashtbl.add balance_stores asset store;
-         Logging.debug_f ~section "Created thread-safe balance store for %s" asset))
+      if not (Hashtbl.mem balance_stores asset)
+      then (
+        let store = BalanceStore.create () in
+        Hashtbl.add balance_stores asset store;
+        Logging.debug_f ~section "Created thread-safe balance store for %s" asset))
     all_assets;
   Mutex.unlock balance_stores_mutex;
   Atomic.set initialized true;
@@ -869,18 +866,18 @@ let check_stale_balances assets =
   let stale_count = ref 0 in
   List.iter
     (fun asset ->
-       if is_balance_stale asset Kraken_common_types.default_balance_staleness_threshold_s
-       then (
-         Logging.warn_f ~section "Balance data for %s is stale (>5 minutes old)" asset;
-         incr stale_count)
-       else Logging.debug_f ~section "Balance data for %s is fresh" asset)
+      if is_balance_stale asset Kraken_common_types.default_balance_staleness_threshold_s
+      then (
+        Logging.warn_f ~section "Balance data for %s is stale (>5 minutes old)" asset;
+        incr stale_count)
+      else Logging.debug_f ~section "Balance data for %s is fresh" asset)
     assets;
   if !stale_count > 0
   then Logging.warn_f ~section "%d assets have stale balance data" !stale_count
 ;;
 
-(** Deprecated reconnection stub retained for interface compatibility.
-    Reconnection is now managed by [Kraken_trading_client] via heartbeat monitoring. *)
+(** Deprecated reconnection stub retained for interface compatibility. Reconnection is now
+    managed by [Kraken_trading_client] via heartbeat monitoring. *)
 let restart_connection () = Lwt.return_unit
 
 (** Returns a stream and close function for subscribing to balance update events. *)

@@ -1,6 +1,5 @@
-(** Resolves symbols to IBKR contracts via reqContractDetails, with a
-    mutex-guarded cache so repeated symbol lookups are O(1).
-    ETFs are modeled as secType STK on SMART in USD. *)
+(** Resolves symbols to IBKR contracts via reqContractDetails, with a mutex-guarded cache
+    so repeated symbol lookups are O(1). ETFs are modeled as secType STK on SMART in USD. *)
 
 open Lwt.Infix
 
@@ -14,9 +13,9 @@ let cache_mutex = Mutex.create ()
 (** Request id counter for reqContractDetails. *)
 let next_req_id = Atomic.make 9000
 
-(** Sends reqContractDetails for [symbol] and waits (up to 10s) for the
-    response. Caches the result on success. The returned contract
-    includes conId, minTick, and trading attributes. *)
+(** Sends reqContractDetails for [symbol] and waits (up to 10s) for the response. Caches
+    the result on success. The returned contract includes conId, minTick, and trading
+    attributes. *)
 let resolve conn ~symbol =
   Mutex.lock cache_mutex;
   let cached = Hashtbl.find_opt cache symbol in
@@ -33,10 +32,9 @@ let resolve conn ~symbol =
       Ibkr_dispatcher.register_req_handler
         ~req_id
         ~on_data:(fun fields ->
-          (* Server version >= 176 omits the leading version field.
-             Field order: reqId, symbol, secType, lastTradeDate, strike,
-             right, exchange, currency, localSymbol, marketName,
-             tradingClass, conId, minTick, multiplier. *)
+          (* Server version >= 176 omits the leading version field. Field order: reqId,
+             symbol, secType, lastTradeDate, strike, right, exchange, currency,
+             localSymbol, marketName, tradingClass, conId, minTick, multiplier. *)
           let _req_id, fields = Ibkr_codec.read_int fields in
           let symbol_resp, fields = Ibkr_codec.read_string fields in
           let sec_type, fields = Ibkr_codec.read_string fields in
@@ -74,9 +72,8 @@ let resolve conn ~symbol =
         ~on_end:(fun () ->
           Logging.debug_f ~section "Contract details end for reqId=%d" req_id)
     in
-    (* reqContractDetails fields: msgId 9, version 8, reqId, contract,
-       includeExpired, secIdType, secId, issuerId (required for server
-       version >= 176). *)
+    (* reqContractDetails fields: msgId 9, version 8, reqId, contract, includeExpired,
+       secIdType, secId, issuerId (required for server version >= 176). *)
     let lookup_contract = Ibkr_types.make_stk_contract ~symbol in
     let msg_fields =
       [ string_of_int Ibkr_types.msg_req_contract_details
@@ -117,8 +114,7 @@ let get_cached ~symbol =
   r
 ;;
 
-(** (price_decimals, qty_decimals) for [symbol]; price decimals derive
-    from minTick. *)
+(** (price_decimals, qty_decimals) for [symbol]; price decimals derive from minTick. *)
 let get_precision ~symbol =
   match get_cached ~symbol with
   | Some c ->
@@ -134,7 +130,7 @@ let get_precision ~symbol =
       else 4
     in
     Some (price_dec, 0)
-    (* Quantity precision is zero: fractional shares are unsupported
-       for the ETF contracts this module routes. *)
+    (* Quantity precision is zero: fractional shares are unsupported for the ETF contracts
+       this module routes. *)
   | None -> None
 ;;

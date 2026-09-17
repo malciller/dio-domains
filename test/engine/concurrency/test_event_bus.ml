@@ -18,15 +18,13 @@ let test_event_publish_subscribe () =
     Lwt.async (fun () ->
       let rec loop () =
         Lwt.pick
-          [
-            (Lwt_stream.get subscription.stream
+          [ (Lwt_stream.get subscription.stream
              >>= function
              | Some event ->
                received := event :: !received;
                Lwt.return `Continue
              | None -> Lwt.return `Stop)
-          ;
-            (Lwt_condition.wait finished >>= fun () -> Lwt.return `Stop)
+          ; (Lwt_condition.wait finished >>= fun () -> Lwt.return `Stop)
           ]
         >>= function
         | `Continue -> loop ()

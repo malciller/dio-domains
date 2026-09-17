@@ -1,7 +1,13 @@
 module LP = Latency_profiler
 module SC = Dio_strategies.Strategy_common
-module SG = Dio_strategies.Jacobs_ladder
+module SG = Dio_strategies.Strategy_api
 module FC = Dio_strategies.Fee_cache
+module SR = Dio_strategies.Strategy_runtime
+module SF = Dio_strategies.Strategy_file
+module SL = Dio_strategies.Strategy_loader
+module SA = Dio_strategies.Strategy_actions_cycle
+module SCE = Dio_strategies.Strategy_cycle_engine
+module SS = Dio_strategies.Strategy_state
 
 (* ── helpers ──────────────────────────────────────────────────────────────── *)
 
@@ -35,14 +41,7 @@ let print_results results =
   Printf.eprintf "%s\n" sep;
   List.iter
     (fun (name, n, p50, p90, p99, total_ms) ->
-       Printf.eprintf
-         "%-40s %8d %10.2f %10.2f %10.2f %10.2f\n"
-         name
-         n
-         p50
-         p90
-         p99
-         total_ms)
+      Printf.eprintf "%-40s %8d %10.2f %10.2f %10.2f %10.2f\n" name n p50 p90 p99 total_ms)
     results;
   Printf.eprintf "%s\n\n" sep
 ;;
@@ -228,12 +227,142 @@ let bench_duplicate_key_gen () =
   name, n, LP.percentile p 0.50, LP.percentile p 0.90, LP.percentile p 0.99, total_ms
 ;;
 
+(* Per-cycle interpreter overhead for the real strategy file: the file's steps, guards,
+   gate/fact publication and dispatch, with a no-op engine context (the stateful action
+   bodies need live state and are measured separately via the dashboard phases). *)
+let bench_strategy_cycle () =
+  let name = "strategy_run_cycle_real_file" in
+  let path =
+    match Sys.getenv_opt "DUNE_SOURCEROOT" with
+    | Some root -> Filename.concat root "strategies/jacobs_ladder.strategy"
+    | None -> "strategies/jacobs_ladder.strategy"
+  in
+  match SL.parse_file ~path with
+  | Error e ->
+    Printf.eprintf "bench: %s\n%!" e;
+    name, 0, 0.0, 0.0, 0.0, 0.0
+  | Ok file ->
+    let ctx = SCE.create () in
+    let module H = SA.Make (SCE) in
+    let handlers = H.handler ctx in
+    let rt = SR.create ~handlers file in
+    let event = SR.make_event "book_update" [] in
+    let n = 200_000 in
+    let p = LP.create ~max_latency_us:100_000 name in
+    let w0 = Gc.minor_words () in
+    let total_ms =
+      wall_ms (fun () ->
+        run_bench p n (fun () ->
+          ignore (SR.run_cycle ~collect:false rt ~price:100.0 ~now:1.0 ~event)))
+    in
+    let words = (Gc.minor_words () -. w0) /. float n in
+    Printf.printf "  %s: %.1f words/cycle (interpreter core)\n%!" name words;
+    name, n, LP.percentile p 0.50, LP.percentile p 0.90, LP.percentile p 0.99, total_ms
+;;
+
+(* Synthetic asset used by the strategy-body benchmarks. *)
+let bench_asset : SS.trading_config =
+  { exchange = "kraken"
+  ; symbol = "BENCH/USD"
+  ; qty = "1.0"
+  ; grid_interval = 1.0
+  ; sell_mult = "1.0"
+  ; strategy = "jacobs_ladder"
+  ; maker_fee = None
+  ; taker_fee = None
+  ; accumulation_buffer = 0.0
+  ; base_accumulation = false
+  ; sell_levels_persistence = false
+  }
+;;
+
+(* Feed scan + ledger reconcile with 11 resting orders (10 sells, 1 buy). *)
+let bench_sync_scan () =
+  let name = "sync_open_orders_48_orders" in
+  let state = SG.get_strategy_state "BENCH/USD" in
+  let ecfg = SG.get_exchange_config "kraken" in
+  state.persisted_sell_levels <- List.init 48 (fun i -> 100.0 +. float i, 1.0);
+  (* Seed a realistic ledger: 48 live sell commitments + resting open sells. *)
+  for i = 1 to 48 do
+    SG.upsert_sell_commitment
+      ~state
+      ~id:(Printf.sprintf "sell-%d" i)
+      ~price:(100.0 +. float i)
+      ~qty:1.0
+      ~seen:true
+      ~acked:true
+  done;
+  for i = 1 to 48 do
+    Dio_strategies.Strategy_sell_orders.push
+      state.open_sell_orders
+      (Printf.sprintf "sell-%d" i)
+      (100.0 +. float i)
+      1.0
+  done;
+  let it f =
+    for i = 1 to 48 do
+      f (Printf.sprintf "sell-%d" i) 1.0 (100.0 +. float i) "sell" None
+    done;
+    f "buy-1" 1.0 99.0 "buy" None
+  in
+  let n = 200_000 in
+  let p = LP.create ~max_latency_us:100_000 name in
+  let total_ms =
+    wall_ms (fun () ->
+      run_bench p n (fun () ->
+        ignore
+          (SG.sync_open_orders
+             ~state
+             ~now:1.0
+             ~asset:bench_asset
+             ~bid_price:99.0
+             ~lot_qty:1.0
+             ~iter_open_orders:it
+             ~get_open_orders_generation:
+               (let g = ref 0 in
+                fun () ->
+                  incr g;
+                  !g)
+             ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
+             ~ecfg)))
+  in
+  name, n, LP.percentile p 0.50, LP.percentile p 0.90, LP.percentile p 0.99, total_ms
+;;
+
+(* Sell-leg fact derivation with 3 persisted levels to reconcile. *)
+let bench_sell_prepare () =
+  let name = "sell_leg_prepare" in
+  let state = SG.get_strategy_state "BENCH/USD" in
+  let ecfg = SG.get_exchange_config "kraken" in
+  let persisted_reconcile = [], [ 100.0, 1.0; 101.0, 1.0; 102.0, 1.0 ] in
+  let n = 200_000 in
+  let p = LP.create ~max_latency_us:100_000 name in
+  let total_ms =
+    wall_ms (fun () ->
+      run_bench p n (fun () ->
+        ignore
+          (SG.sell_leg_prepare
+             ~persisted_reconcile
+             ~state
+             ~now:1.0
+             ~asset:bench_asset
+             ~bid_price:99.0
+             ~ask_price:100.0
+             ~asset_balance:10.0
+             ~buy_attempted:false
+             ~oracle_halted:false
+             ~ecfg
+             ~locked_in_sells:0.0
+             ~base_balance_age:(Some 1.0))))
+  in
+  name, n, LP.percentile p 0.50, LP.percentile p 0.90, LP.percentile p 0.99, total_ms
+;;
+
 (* ── entry point ──────────────────────────────────────────────────────────── *)
 
 let () =
   Random.self_init ();
-  (* Preserve real stderr for results; mute instrument-feed WARN spam during
-     benchmarks. *)
+  (* Preserve real stderr for results; mute instrument-feed WARN spam during benchmarks. *)
   let real_err = Unix.dup Unix.stderr in
   let devnull = Unix.openfile "/dev/null" [ Unix.O_WRONLY ] 0 in
   Unix.dup2 devnull Unix.stderr;
@@ -251,6 +380,9 @@ let () =
     ; bench_grid_price_calc ()
     ; bench_state_warmup ()
     ; bench_duplicate_key_gen ()
+    ; bench_strategy_cycle ()
+    ; bench_sync_scan ()
+    ; bench_sell_prepare ()
     ]
   in
   (* Restore stderr so benchmark output is not suppressed by the test runner. *)

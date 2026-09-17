@@ -25,7 +25,7 @@ let test_parse_trading_config_defaults () =
     (1.0, 1.0)
     config.grid_interval;
   Alcotest.(check string) "sell_mult default" "1.0" config.sell_mult;
-  Alcotest.(check string) "strategy" "Ladder" config.strategy;
+  Alcotest.(check string) "strategy preserved" "Ladder" config.strategy;
   Alcotest.(check (option (float 0.001))) "maker_fee none" None config.maker_fee;
   Alcotest.(check (option (float 0.001))) "taker_fee none" None config.taker_fee;
   Alcotest.(check (option string)) "min_usd_balance none" None config.min_usd_balance;
@@ -38,6 +38,7 @@ let test_parse_trading_config_optional_fields () =
   in
   let json = Yojson.Basic.from_string json_str in
   let config = Dio_engine.Config.parse_config json in
+  Alcotest.(check string) "strategy preserved verbatim" "grid" config.strategy;
   Alcotest.(check (option string)) "min_usd_balance" (Some "100") config.min_usd_balance;
   Alcotest.(check (option string)) "max_exposure" (Some "500") config.max_exposure
 ;;
@@ -167,8 +168,8 @@ let test_parse_oracle_config_assets () =
 ;;
 
 let test_oracle_asset_keys_validation () =
-  (* Asset override entries accept only the three per-asset knobs; global
-     cadence knobs and unknown keys are rejected. *)
+  (* Asset override entries accept only the three per-asset knobs; global cadence knobs
+     and unknown keys are rejected. *)
   let allowed = Dio_engine.Config.known_oracle_asset_keys in
   let good = Yojson.Basic.from_string {|{"target_survival": 0.98}|} in
   let bad = Yojson.Basic.from_string {|{"refresh_seconds": 60.0}|} in
@@ -217,9 +218,8 @@ let test_latency_spike_report_parse () =
 ;;
 
 let test_to_float_opt_accepts_int () =
-  (* Regression: integer JSON literals ("latency_spike_threshold_us": 10) must
-     not crash startup via an uncaught Yojson Type_error from
-     [to_float_option]. *)
+  (* Regression: integer JSON literals ("latency_spike_threshold_us": 10) must not crash
+     startup via an uncaught Yojson Type_error from [to_float_option]. *)
   let open Dio_engine.Config in
   Alcotest.(check (option (float 1e-9)))
     "int accepted"
@@ -233,6 +233,20 @@ let test_to_float_opt_accepts_int () =
   Alcotest.(check (option (float 1e-9))) "string absent" None (to_float_opt (`String "x"))
 ;;
 
+let test_parse_trading_config_cpu_priority () =
+  let default =
+    Dio_engine.Config.parse_config
+      (Yojson.Basic.from_string {|{"symbol": "X/USD", "qty": "1", "strategy": "Ladder"}|})
+  in
+  Alcotest.(check int) "cpu_priority defaults to 0" 0 default.cpu_priority;
+  let explicit =
+    Dio_engine.Config.parse_config
+      (Yojson.Basic.from_string
+         {|{"symbol": "Y/USD", "qty": "1", "strategy": "Ladder", "cpu_priority": 7}|})
+  in
+  Alcotest.(check int) "explicit cpu_priority parsed" 7 explicit.cpu_priority
+;;
+
 let () =
   Alcotest.run
     "Config"
@@ -243,6 +257,7 @@ let () =
             "optional fields"
             `Quick
             test_parse_trading_config_optional_fields
+        ; Alcotest.test_case "cpu priority" `Quick test_parse_trading_config_cpu_priority
         ] )
     ; ( "logging_config"
       , [ Alcotest.test_case "valid logging" `Quick test_parse_logging_config_valid

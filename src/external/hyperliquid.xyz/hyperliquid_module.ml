@@ -1,6 +1,6 @@
-(** Exchange_intf implementation for the Hyperliquid L1 DEX.
-    Bridges Hyperliquid-specific WebSocket feeds, REST actions, and instrument
-    metadata into the exchange-agnostic interface consumed by strategies. *)
+(** Exchange_intf implementation for the Hyperliquid L1 DEX. Bridges Hyperliquid-specific
+    WebSocket feeds, REST actions, and instrument metadata into the exchange-agnostic
+    interface consumed by strategies. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
@@ -24,13 +24,12 @@ module Hyperliquid_impl = struct
   (* Per-process counter for unique client order ids. *)
   let cloid_nonce_counter = Atomic.make 0
 
-  (** Builds a unique client order id tagged with the strategy userref.
-      Trailing 16 hex digits (low 64 bits, read by the executions feed's
-      userref recovery): bits 63..56 = userref tag, bits 55..0 = nonce
-      (unix seconds masked to 36 bits << 20 | per-process counter, 20 bits).
-      The time component makes the cloid unique across restarts, so the
-      placement retry loop is idempotent: every attempt of one logical order
-      reuses the same cloid, and two orders never share one. *)
+  (** Builds a unique client order id tagged with the strategy userref. Trailing 16 hex
+      digits (low 64 bits, read by the executions feed's userref recovery): bits 63..56 =
+      userref tag, bits 55..0 = nonce (unix seconds masked to 36 bits << 20 | per-process
+      counter, 20 bits). The time component makes the cloid unique across restarts, so the
+      placement retry loop is idempotent: every attempt of one logical order reuses the
+      same cloid, and two orders never share one. *)
   let next_unique_cloid (uref : int) : string =
     let counter =
       Int64.of_int (Atomic.fetch_and_add cloid_nonce_counter 1 land 0xF_FFFF)
@@ -51,8 +50,8 @@ module Hyperliquid_impl = struct
     Printf.sprintf "0x%032Lx" low64
   ;;
 
-  (* Per-symbol fee cache. Maps symbol to (perp_maker, perp_taker, spot_maker, spot_taker).
-     Populated once during initialize_fees and read on every get_fees call. *)
+  (* Per-symbol fee cache. Maps symbol to (perp_maker, perp_taker, spot_maker,
+     spot_taker). Populated once during initialize_fees and read on every get_fees call. *)
   let fee_cache : (string, float * float * float * float) Hashtbl.t = Hashtbl.create 16
 
   (* Type conversion helpers: Hyperliquid-specific variants to Exchange_intf.Types *)
@@ -84,27 +83,26 @@ module Hyperliquid_impl = struct
     | Hyperliquid_executions_feed.Sell -> Types.Sell
   ;;
 
-  (** Place a new order on Hyperliquid.
-      Market orders are emulated as aggressive IOC limit orders with 5% slippage.
-      Prices and quantities are rounded to the instrument's tick and lot size
-      before submission. *)
+  (** Place a new order on Hyperliquid. Market orders are emulated as aggressive IOC limit
+      orders with 5% slippage. Prices and quantities are rounded to the instrument's tick
+      and lot size before submission. *)
   let place_order
-        ~token:_
-        (* Unused: Hyperliquid authenticates via wallet address and private key from env *)
-        ~order_type
-        ~side
-        ~qty
-        ~symbol
-        ?limit_price
-        ?time_in_force
-        ?post_only
-        ?reduce_only
-        ?order_userref
-        ?cl_ord_id
-        ?trigger_price:_
-        ?display_qty:_
-        ?retry_config:_
-        ()
+    ~token:_
+    (* Unused: Hyperliquid authenticates via wallet address and private key from env *)
+    ~order_type
+    ~side
+    ~qty
+    ~symbol
+    ?limit_price
+    ?time_in_force
+    ?post_only
+    ?reduce_only
+    ?order_userref
+    ?cl_ord_id
+    ?trigger_price:_
+    ?display_qty:_
+    ?retry_config:_
+    ()
     =
     let is_limit =
       match order_type with
@@ -122,8 +120,8 @@ module Hyperliquid_impl = struct
       | None ->
         (match order_type with
          | Types.Market ->
-           (* Hyperliquid has no native market order type.
-                 Emulate via IOC limit order with 5% slippage from current BBO. *)
+           (* Hyperliquid has no native market order type. Emulate via IOC limit order
+              with 5% slippage from current BBO. *)
            (match Hyperliquid_orderbook_feed.get_best_bid_ask symbol with
             | Some (bid, _, ask, _) ->
               if side_bool
@@ -157,9 +155,9 @@ module Hyperliquid_impl = struct
         (match cl_ord_id with
          | Some explicit -> Some explicit
          | None ->
-           (* Unique per-order cloid makes the placement retry loop idempotent
-              (a post-acceptance timeout replays the same cloid rather than
-              landing a second order) and keeps concurrent orders distinct. *)
+           (* Unique per-order cloid makes the placement retry loop idempotent (a
+              post-acceptance timeout replays the same cloid rather than landing a second
+              order) and keeps concurrent orders distinct. *)
            Some (next_unique_cloid uref))
       | None -> cl_ord_id
     in
@@ -178,8 +176,8 @@ module Hyperliquid_impl = struct
     >|= function
     | Ok res ->
       let order_id_str = Int64.to_string res.Hyperliquid_actions.order_id in
-      (* Inject into open_orders so immediate amendments can resolve the order;
-           otherwise it is invisible until the next webData2 push (~1.5s). *)
+      (* Inject into open_orders so immediate amendments can resolve the order; otherwise
+         it is invisible until the next webData2 push (~1.5s). *)
       let hl_side =
         match side with
         | Types.Buy -> Hyperliquid_executions_feed.Buy
@@ -201,21 +199,21 @@ module Hyperliquid_impl = struct
     | Error e -> Error e
   ;;
 
-  (** Amend an existing order (cancel-replace on Hyperliquid).
-      Looks up the current order state from the executions feed to fill in
-      any parameters not explicitly provided by the caller. *)
+  (** Amend an existing order (cancel-replace on Hyperliquid). Looks up the current order
+      state from the executions feed to fill in any parameters not explicitly provided by
+      the caller. *)
   let amend_order
-        ~token:_
-        ~order_id
-        ?cl_ord_id
-        ?qty
-        ?limit_price
-        ?post_only:_
-        ?trigger_price:_
-        ?display_qty:_
-        ?symbol
-        ?retry_config:_
-        ()
+    ~token:_
+    ~order_id
+    ?cl_ord_id
+    ?qty
+    ?limit_price
+    ?post_only:_
+    ?trigger_price:_
+    ?display_qty:_
+    ?symbol
+    ?retry_config:_
+    ()
     =
     match symbol with
     | None -> Lwt.return (Error "Symbol is required for Hyperliquid amendment")
@@ -246,7 +244,7 @@ module Hyperliquid_impl = struct
              (match cl_ord_id with
               | Some explicit -> Some explicit
               | None ->
-                 (* New cancel-replace leg gets its own unique cloid. *)
+                (* New cancel-replace leg gets its own unique cloid. *)
                 Some (next_unique_cloid uref))
            | None -> cl_ord_id
          in
@@ -262,11 +260,11 @@ module Hyperliquid_impl = struct
          >|= (function
           | Ok res ->
             let new_order_id_str = Int64.to_string res.amend_id in
-             (* Do NOT inject the new OID: the old OID persists until the WS
-                cancel arrives, so adding it would show duplicate open orders
-                and trigger spurious cancel-all logic. The inflight_amend
-                counter bridges the REST-to-WS gap. Remove only the old OID on
-                ID change, to block a late WS "open" event from re-adding it. *)
+            (* Do NOT inject the new OID: the old OID persists until the WS cancel
+               arrives, so adding it would show duplicate open orders and trigger spurious
+               cancel-all logic. The inflight_amend counter bridges the REST-to-WS gap.
+               Remove only the old OID on ID change, to block a late WS "open" event from
+               re-adding it. *)
             if new_order_id_str <> order_id
             then Hyperliquid_executions_feed.remove_open_order ~symbol:sym ~order_id;
             Ok
@@ -278,17 +276,17 @@ module Hyperliquid_impl = struct
           | Error e -> Error e))
   ;;
 
-  (** Cancel one or more orders by order ID.
-      Orders are grouped by symbol for Hyperliquid's per-coin cancel endpoint.
-      Each symbol group is processed sequentially to avoid shared-state races. *)
+  (** Cancel one or more orders by order ID. Orders are grouped by symbol for
+      Hyperliquid's per-coin cancel endpoint. Each symbol group is processed sequentially
+      to avoid shared-state races. *)
   let cancel_orders
-        ~token:_
-        ?order_ids
-        ?cl_ord_ids:_
-        ?order_userrefs:_
-        ?symbol:_
-        ?retry_config:_
-        ()
+    ~token:_
+    ?order_ids
+    ?cl_ord_ids:_
+    ?order_userrefs:_
+    ?symbol:_
+    ?retry_config:_
+    ()
     =
     match order_ids with
     | None -> Lwt.return (Ok [])
@@ -297,14 +295,14 @@ module Hyperliquid_impl = struct
       let symbol_map = Hashtbl.create 4 in
       List.iter
         (fun id ->
-           match Hyperliquid_executions_feed.find_order_everywhere id with
-           | Some o ->
-             let existing =
-               try Hashtbl.find symbol_map o.symbol with
-               | _ -> []
-             in
-             Hashtbl.replace symbol_map o.symbol (id :: existing)
-           | None -> ())
+          match Hyperliquid_executions_feed.find_order_everywhere id with
+          | Some o ->
+            let existing =
+              try Hashtbl.find symbol_map o.symbol with
+              | _ -> []
+            in
+            Hashtbl.replace symbol_map o.symbol (id :: existing)
+          | None -> ())
         ids;
       (* Process symbol groups sequentially to avoid concurrent mutation of shared state *)
       let symbol_groups =
@@ -312,25 +310,25 @@ module Hyperliquid_impl = struct
       in
       Lwt_list.fold_left_s
         (fun (results_acc, errors_acc) (symbol, ids_for_symbol) ->
-           Hyperliquid_actions.cancel_orders
-             ~symbol
-             ~order_ids:(List.map Int64.of_string ids_for_symbol)
-             ~testnet:(Atomic.get is_testnet)
-           >|= function
-           | Ok () ->
-             (* Proactively remove cancelled orders from open_orders.
-                 Prevents ghost entries if the orderUpdates WS message is delayed or lost. *)
-             List.iter
-               (fun id ->
-                  Hyperliquid_executions_feed.remove_open_order ~symbol ~order_id:id)
-               ids_for_symbol;
-             let new_results =
-               List.map
-                 (fun id -> { Types.order_id = id; cl_ord_id = None })
-                 ids_for_symbol
-             in
-             new_results @ results_acc, errors_acc
-           | Error e -> results_acc, e :: errors_acc)
+          Hyperliquid_actions.cancel_orders
+            ~symbol
+            ~order_ids:(List.map Int64.of_string ids_for_symbol)
+            ~testnet:(Atomic.get is_testnet)
+          >|= function
+          | Ok () ->
+            (* Proactively remove cancelled orders from open_orders. Prevents ghost
+               entries if the orderUpdates WS message is delayed or lost. *)
+            List.iter
+              (fun id ->
+                Hyperliquid_executions_feed.remove_open_order ~symbol ~order_id:id)
+              ids_for_symbol;
+            let new_results =
+              List.map
+                (fun id -> { Types.order_id = id; cl_ord_id = None })
+                ids_for_symbol
+            in
+            new_results @ results_acc, errors_acc
+          | Error e -> results_acc, e :: errors_acc)
         ([], [])
         symbol_groups
       >>= fun (results, errors) ->
@@ -344,14 +342,14 @@ module Hyperliquid_impl = struct
   let subscribe_orderbook ~symbols =
     Lwt_list.iter_s
       (fun symbol ->
-         let _ = Hyperliquid_orderbook_feed.ensure_store symbol in
-         let _ = Hyperliquid_executions_feed.get_symbol_store symbol in
-         let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
-         Hyperliquid_ws.subscribe
-           (`Assoc
-               [ "method", `String "subscribe"
-               ; "subscription", `Assoc [ "type", `String "l2Book"; "coin", `String coin ]
-               ]))
+        let _ = Hyperliquid_orderbook_feed.ensure_store symbol in
+        let _ = Hyperliquid_executions_feed.get_symbol_store symbol in
+        let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
+        Hyperliquid_ws.subscribe
+          (`Assoc
+            [ "method", `String "subscribe"
+            ; "subscription", `Assoc [ "type", `String "l2Book"; "coin", `String coin ]
+            ]))
       symbols
   ;;
 
@@ -376,11 +374,10 @@ module Hyperliquid_impl = struct
   (* Hyperliquid's tradeable figure is already hold-netted. *)
   let get_available_balance_fast = get_tradeable_balance_fast
 
-  (** Age in seconds of the balance snapshot for [asset], or [None] before the
-      first update. Keyed on spendable wallets: the store-wide timestamp is
-      also bumped by the ~10s staking poller, which cannot change the tradeable
-      figure. Falls back to the store-wide timestamp when no spendable record
-      exists. *)
+  (** Age in seconds of the balance snapshot for [asset], or [None] before the first
+      update. Keyed on spendable wallets: the store-wide timestamp is also bumped by the
+      ~10s staking poller, which cannot change the tradeable figure. Falls back to the
+      store-wide timestamp when no spendable record exists. *)
   let get_balance_age_fast ~asset =
     let store = Hyperliquid_balances.get_balance_store asset in
     fun () ->
@@ -402,8 +399,8 @@ module Hyperliquid_impl = struct
     let assets = Hyperliquid_balances.get_all_assets () in
     List.filter_map
       (fun asset ->
-         let bal = Hyperliquid_balances.get_total_balance asset in
-         if bal > 0.0 then Some (asset, bal) else None)
+        let bal = Hyperliquid_balances.get_total_balance asset in
+        if bal > 0.0 then Some (asset, bal) else None)
       assets
   ;;
 
@@ -429,17 +426,17 @@ module Hyperliquid_impl = struct
     let orders = Hyperliquid_executions_feed.get_open_orders symbol in
     List.map
       (fun (o : Hyperliquid_executions_feed.open_order) ->
-         { Types.order_id = o.order_id
-         ; symbol = o.symbol
-         ; side = side_of_hyperliquid_side o.side
-         ; qty = o.order_qty
-         ; cum_qty = o.cum_qty
-         ; remaining_qty = o.remaining_qty
-         ; limit_price = o.limit_price
-         ; status = status_of_hyperliquid_status o.order_status
-         ; user_ref = o.order_userref
-         ; cl_ord_id = o.cl_ord_id
-         })
+        { Types.order_id = o.order_id
+        ; symbol = o.symbol
+        ; side = side_of_hyperliquid_side o.side
+        ; qty = o.order_qty
+        ; cum_qty = o.cum_qty
+        ; remaining_qty = o.remaining_qty
+        ; limit_price = o.limit_price
+        ; status = status_of_hyperliquid_status o.order_status
+        ; user_ref = o.order_userref
+        ; cl_ord_id = o.cl_ord_id
+        })
       orders
   ;;
 
@@ -488,8 +485,12 @@ module Hyperliquid_impl = struct
         f o.order_id limit_price o.remaining_qty side_str o.order_userref)
   ;;
 
-  let get_open_orders_generation ~symbol:_ =
-    Hyperliquid_executions_feed.get_orders_generation ()
+  let get_open_orders_generation ~symbol =
+    Hyperliquid_executions_feed.get_orders_generation_for_symbol symbol
+  ;;
+
+  let drain_open_order_changes ~symbol =
+    Hyperliquid_executions_feed.drain_open_order_changes ~symbol
   ;;
 
   let get_execution_feed_position ~symbol =
@@ -511,22 +512,22 @@ module Hyperliquid_impl = struct
     let events = Hyperliquid_executions_feed.read_execution_events symbol start_pos in
     List.filter_map
       (fun (e : Hyperliquid_executions_feed.execution_event) ->
-         match e.exec_type with
-         | Hyperliquid_executions_feed.Filled ->
-           None (* Deduplicate: rely on userEvents Trade event *)
-         | _ ->
-           Some
-             { Types.order_id = e.order_id
-             ; order_status = status_of_hyperliquid_status e.order_status
-             ; limit_price = e.limit_price
-             ; side = side_of_hyperliquid_side e.side
-             ; remaining_qty = max 0.0 (e.order_qty -. e.cum_qty)
-             ; filled_qty = e.cum_qty
-             ; avg_price = e.avg_price
-             ; timestamp = e.timestamp
-             ; is_amended = e.exec_type = Hyperliquid_executions_feed.Amended
-             ; cl_ord_id = e.cl_ord_id
-             })
+        match e.exec_type with
+        | Hyperliquid_executions_feed.Filled ->
+          None (* Deduplicate: rely on userEvents Trade event *)
+        | _ ->
+          Some
+            { Types.order_id = e.order_id
+            ; order_status = status_of_hyperliquid_status e.order_status
+            ; limit_price = e.limit_price
+            ; side = side_of_hyperliquid_side e.side
+            ; remaining_qty = max 0.0 (e.order_qty -. e.cum_qty)
+            ; filled_qty = e.cum_qty
+            ; avg_price = e.avg_price
+            ; timestamp = e.timestamp
+            ; is_amended = e.exec_type = Hyperliquid_executions_feed.Amended
+            ; cl_ord_id = e.cl_ord_id
+            })
       events
   ;;
 
@@ -565,15 +566,13 @@ module Hyperliquid_impl = struct
     let events = Hyperliquid_orderbook_feed.read_orderbook_events symbol start_pos in
     List.map
       (fun (ob : Hyperliquid_orderbook_feed.orderbook) ->
-         let map_levels levels =
-           Array.map
-             (fun (l : Hyperliquid_orderbook_feed.level) -> l.price, l.size)
-             levels
-         in
-         { Types.bids = map_levels ob.bids
-         ; asks = map_levels ob.asks
-         ; timestamp = ob.timestamp
-         })
+        let map_levels levels =
+          Array.map (fun (l : Hyperliquid_orderbook_feed.level) -> l.price, l.size) levels
+        in
+        { Types.bids = map_levels ob.bids
+        ; asks = map_levels ob.asks
+        ; timestamp = ob.timestamp
+        })
       events
   ;;
 
@@ -594,8 +593,8 @@ module Hyperliquid_impl = struct
            })
   ;;
 
-  (** Zero-allocation top-of-book iterator. Reads price/size directly
-      from Hyperliquid level records without building converted arrays. *)
+  (** Zero-allocation top-of-book iterator. Reads price/size directly from Hyperliquid
+      level records without building converted arrays. *)
   let iter_top_of_book_events ~symbol ~start_pos f =
     Hyperliquid_orderbook_feed.iter_orderbook_events
       symbol
@@ -658,18 +657,16 @@ module Hyperliquid_impl = struct
       ~testnet:(Atomic.get is_testnet)
   ;;
 
-  (* Uniform decode entry: l2Book frames go through the zero-alloc TOB parser.
-     Control channels (pong/responses/subscriber fan-out) touch Lwt and stay in
-     the WS layer. *)
+  (* Uniform decode entry: l2Book frames go through the zero-alloc TOB parser. Control
+     channels (pong/responses/subscriber fan-out) touch Lwt and stay in the WS layer. *)
   let decode_frame content =
     if String.starts_with ~prefix:"{\"channel\":\"l2Book\"," content
     then Hyperliquid_orderbook_feed.process_raw_market_data content
   ;;
 end
 
-(** WebSocket-based initialization routines.
-    These helpers coordinate between the WS transport layer and the
-    domain-specific feed modules during startup. *)
+(** WebSocket-based initialization routines. These helpers coordinate between the WS
+    transport layer and the domain-specific feed modules during startup. *)
 let wait_for_ws_connected () =
   (* Delegates to the Lwt_mvar-based wait in hyperliquid_ws. No polling. *)
   Hyperliquid_ws.wait_for_connected ()
@@ -679,60 +676,53 @@ let initialize_instruments_ws () =
   let section = "hyperliquid_startup" in
   Lwt.catch
     (fun () ->
-       wait_for_ws_connected ()
-       >>= fun () ->
-       let open Yojson.Safe.Util in
-       let req_id_perp = Hyperliquid_actions.next_ws_req_id () in
-       let ws_frame_perp =
-         `Assoc
-           [ "method", `String "post"
-           ; "id", `Int req_id_perp
-           ; ( "request"
-             , `Assoc
-                 [ "type", `String "info"; "payload", `Assoc [ "type", `String "meta" ] ]
-             )
-           ]
-       in
-       let extract_ws_payload resp =
-         try
-           let p = resp |> member "data" |> member "response" |> member "payload" in
-           let d = member "data" p in
-           if d = `Null then p else d
-         with
-         | _ -> resp
-       in
-       Hyperliquid_ws.send_request
-         ~json:ws_frame_perp
-         ~req_id:req_id_perp
-         ~timeout_ms:5000
-       >>= fun resp_perp ->
-       let payload_perp = extract_ws_payload resp_perp in
-       let req_id_spot = Hyperliquid_actions.next_ws_req_id () in
-       let ws_frame_spot =
-         `Assoc
-           [ "method", `String "post"
-           ; "id", `Int req_id_spot
-           ; ( "request"
-             , `Assoc
-                 [ "type", `String "info"
-                 ; "payload", `Assoc [ "type", `String "spotMeta" ]
-                 ] )
-           ]
-       in
-       Hyperliquid_ws.send_request
-         ~json:ws_frame_spot
-         ~req_id:req_id_spot
-         ~timeout_ms:5000
-       >>= fun resp_spot ->
-       let payload_spot = extract_ws_payload resp_spot in
-       Hyperliquid_instruments_feed.process_meta_response payload_perp payload_spot)
+      wait_for_ws_connected ()
+      >>= fun () ->
+      let open Yojson.Safe.Util in
+      let req_id_perp = Hyperliquid_actions.next_ws_req_id () in
+      let ws_frame_perp =
+        `Assoc
+          [ "method", `String "post"
+          ; "id", `Int req_id_perp
+          ; ( "request"
+            , `Assoc
+                [ "type", `String "info"; "payload", `Assoc [ "type", `String "meta" ] ] )
+          ]
+      in
+      let extract_ws_payload resp =
+        try
+          let p = resp |> member "data" |> member "response" |> member "payload" in
+          let d = member "data" p in
+          if d = `Null then p else d
+        with
+        | _ -> resp
+      in
+      Hyperliquid_ws.send_request ~json:ws_frame_perp ~req_id:req_id_perp ~timeout_ms:5000
+      >>= fun resp_perp ->
+      let payload_perp = extract_ws_payload resp_perp in
+      let req_id_spot = Hyperliquid_actions.next_ws_req_id () in
+      let ws_frame_spot =
+        `Assoc
+          [ "method", `String "post"
+          ; "id", `Int req_id_spot
+          ; ( "request"
+            , `Assoc
+                [ "type", `String "info"
+                ; "payload", `Assoc [ "type", `String "spotMeta" ]
+                ] )
+          ]
+      in
+      Hyperliquid_ws.send_request ~json:ws_frame_spot ~req_id:req_id_spot ~timeout_ms:5000
+      >>= fun resp_spot ->
+      let payload_spot = extract_ws_payload resp_spot in
+      Hyperliquid_instruments_feed.process_meta_response payload_perp payload_spot)
     (fun exn ->
-       Logging.error_f
-         ~section
-         "Failed to fetch instruments via WS: %s"
-         (Printexc.to_string exn);
-       Hyperliquid_instruments_feed.notify_ready ();
-       Lwt.return_unit)
+      Logging.error_f
+        ~section
+        "Failed to fetch instruments via WS: %s"
+        (Printexc.to_string exn);
+      Hyperliquid_instruments_feed.notify_ready ();
+      Lwt.return_unit)
 ;;
 
 let parse_json_float json =
@@ -764,28 +754,28 @@ let poll_staking_balance () =
     let fetch_once () =
       Lwt.catch
         (fun () ->
-           let url = Uri.of_string (base_url ^ "/info") in
-           let req_body =
-             `Assoc [ "type", `String "delegatorSummary"; "user", `String wallet ]
-           in
-           let body_str = Yojson.Safe.to_string req_body in
-           let body = Cohttp_lwt.Body.of_string body_str in
-           let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
-           Lwt_unix.with_timeout 10.0 (fun () ->
-             Cohttp_lwt_unix.Client.post ~headers ~body url)
-           >>= fun (resp, resp_body) ->
-           Cohttp_lwt.Body.to_string resp_body
-           >>= fun body_str ->
-           let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-           if status >= 200 && status < 300
-           then Lwt.return (Ok body_str)
-           else
-             Lwt.return
-               (Error
-                  (Printf.sprintf
-                     "Hyperliquid staking request HTTP %d: %s"
-                     status
-                     body_str)))
+          let url = Uri.of_string (base_url ^ "/info") in
+          let req_body =
+            `Assoc [ "type", `String "delegatorSummary"; "user", `String wallet ]
+          in
+          let body_str = Yojson.Safe.to_string req_body in
+          let body = Cohttp_lwt.Body.of_string body_str in
+          let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
+          Lwt_unix.with_timeout 10.0 (fun () ->
+            Cohttp_lwt_unix.Client.post ~headers ~body url)
+          >>= fun (resp, resp_body) ->
+          Cohttp_lwt.Body.to_string resp_body
+          >>= fun body_str ->
+          let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+          if status >= 200 && status < 300
+          then Lwt.return (Ok body_str)
+          else
+            Lwt.return
+              (Error
+                 (Printf.sprintf
+                    "Hyperliquid staking request HTTP %d: %s"
+                    status
+                    body_str)))
         (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
     in
     Error_handling.retry_with_backoff
@@ -799,8 +789,9 @@ let poll_staking_balance () =
       (try
          let json = Yojson.Safe.from_string body_str in
          let open Yojson.Safe.Util in
-         (* delegatorSummary: {delegated, undelegated, totalPendingWithdrawal,
-              nPendingWithdrawals} (info-endpoint docs). *)
+         (* delegatorSummary:
+            [{delegated, undelegated, totalPendingWithdrawal, nPendingWithdrawals}]
+            (info-endpoint docs). *)
          let delegated = parse_json_float (member "delegated" json) in
          let undelegated = parse_json_float (member "undelegated" json) in
          let pending_withdrawal =
@@ -852,11 +843,11 @@ let start_staking_balance_poller () =
     Lwt.catch
       (fun () -> poll_staking_balance ())
       (fun exn ->
-         Logging.error_f
-           ~section:"hyperliquid_startup"
-           "Staking poller loop exception: %s"
-           (Printexc.to_string exn);
-         Lwt.return_unit)
+        Logging.error_f
+          ~section:"hyperliquid_startup"
+          "Staking poller loop exception: %s"
+          (Printexc.to_string exn);
+        Lwt.return_unit)
     >>= fun () -> Lwt_unix.sleep 10.0 >>= fun () -> loop ()
   in
   Lwt.async loop
@@ -890,72 +881,72 @@ let fetch_spot_balances_ws () =
     in
     Lwt.catch
       (fun () ->
-         wait_for_ws_connected ()
-         >>= fun () ->
-         Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:5000
-         >>= fun resp_frame ->
-         let open Yojson.Safe.Util in
-         let response_node =
-           try resp_frame |> member "data" |> member "response" with
-           | _ -> `Null
-         in
-         let payload =
-           try response_node |> member "payload" with
-           | _ -> `Null
-         in
-         let balances_node =
-           try payload |> member "data" |> member "balances" with
-           | _ -> `Null
-         in
-         if balances_node = `Null
-         then (
-           Logging.warn_f
-             ~section
-             "Balances node is null! Raw WS response: %s"
-             (Yojson.Safe.to_string resp_frame);
-           Hyperliquid_balances.notify_ready ();
-           Lwt.return_unit)
-         else (
-           let balances = balances_node |> to_list in
-           List.iter
-             (fun item ->
-                try
-                  let raw_coin = member "coin" item |> to_string in
-                  let coin = Hyperliquid_balances.canonicalize_coin raw_coin in
-                  let total = parse_json_float (member "total" item) in
-                  (* Same available/total semantics as the spotState
-                     subscription: the grid can only spend total - hold. *)
-                  let hold = parse_json_float (member "hold" item) in
-                  let available = max 0.0 (total -. hold) in
-                  let store = Hyperliquid_balances.get_balance_store coin in
-                  Hyperliquid_balances.BalanceStore.update_wallet
-                    store
-                    ~available
-                    ~total
-                    "spot"
-                    "account";
-                  Logging.debug_f
-                    ~section
-                    "Initial Spot %s balance: %.6f avail / %.6f total"
-                    coin
-                    available
-                    total
-                with
-                | exn ->
-                  Logging.warn_f
-                    ~section
-                    "Failed to parse spot balance entry: %s"
-                    (Printexc.to_string exn))
-             balances;
-           Hyperliquid_balances.notify_ready ();
-           Lwt.return_unit))
+        wait_for_ws_connected ()
+        >>= fun () ->
+        Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:5000
+        >>= fun resp_frame ->
+        let open Yojson.Safe.Util in
+        let response_node =
+          try resp_frame |> member "data" |> member "response" with
+          | _ -> `Null
+        in
+        let payload =
+          try response_node |> member "payload" with
+          | _ -> `Null
+        in
+        let balances_node =
+          try payload |> member "data" |> member "balances" with
+          | _ -> `Null
+        in
+        if balances_node = `Null
+        then (
+          Logging.warn_f
+            ~section
+            "Balances node is null! Raw WS response: %s"
+            (Yojson.Safe.to_string resp_frame);
+          Hyperliquid_balances.notify_ready ();
+          Lwt.return_unit)
+        else (
+          let balances = balances_node |> to_list in
+          List.iter
+            (fun item ->
+              try
+                let raw_coin = member "coin" item |> to_string in
+                let coin = Hyperliquid_balances.canonicalize_coin raw_coin in
+                let total = parse_json_float (member "total" item) in
+                (* Same available/total semantics as the spotState subscription: the grid
+                   can only spend total - hold. *)
+                let hold = parse_json_float (member "hold" item) in
+                let available = max 0.0 (total -. hold) in
+                let store = Hyperliquid_balances.get_balance_store coin in
+                Hyperliquid_balances.BalanceStore.update_wallet
+                  store
+                  ~available
+                  ~total
+                  "spot"
+                  "account";
+                Logging.debug_f
+                  ~section
+                  "Initial Spot %s balance: %.6f avail / %.6f total"
+                  coin
+                  available
+                  total
+              with
+              | exn ->
+                Logging.warn_f
+                  ~section
+                  "Failed to parse spot balance entry: %s"
+                  (Printexc.to_string exn))
+            balances;
+          Hyperliquid_balances.notify_ready ();
+          Lwt.return_unit))
       (fun exn ->
-         Logging.error_f
-           ~section
-           "Failed to fetch spot balances via WS: %s"
-           (Printexc.to_string exn);
-         Hyperliquid_balances.notify_ready ();
-         Lwt.return_unit))
+        Logging.error_f
+          ~section
+          "Failed to fetch spot balances via WS: %s"
+          (Printexc.to_string exn);
+        Hyperliquid_balances.notify_ready ();
+        Lwt.return_unit))
 ;;
 
 let fetch_open_orders_ws () =
@@ -982,40 +973,41 @@ let fetch_open_orders_ws () =
     in
     Lwt.catch
       (fun () ->
-         wait_for_ws_connected ()
-         >>= fun () ->
-         Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:5000
-         >>= fun resp_frame ->
-         Logging.debug_f
-           ~section
-           "Raw open orders response: %s"
-           (Yojson.Safe.to_string resp_frame);
-         let open Yojson.Safe.Util in
-         (* Extract payload from data.response.payload.data, falling back to data.response.payload *)
-         let response_node =
-           try resp_frame |> member "data" |> member "response" with
-           | _ -> `Null
-         in
-         let payload =
-           try response_node |> member "payload" with
-           | _ -> `Null
-         in
-         let data_node =
-           try payload |> member "data" with
-           | _ -> `Null
-         in
-         let orders_json = if data_node <> `Null then data_node else payload in
-         Hyperliquid_executions_feed.inject_open_orders orders_json;
-         (* Signal that the open-order snapshot has been fully injected.
-         Domain workers block on this event instead of a fixed wall-clock delay. *)
-         Hyperliquid_executions_feed.set_startup_snapshot_done ();
-         Lwt.return_unit)
+        wait_for_ws_connected ()
+        >>= fun () ->
+        Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:5000
+        >>= fun resp_frame ->
+        Logging.debug_f
+          ~section
+          "Raw open orders response: %s"
+          (Yojson.Safe.to_string resp_frame);
+        let open Yojson.Safe.Util in
+        (* Extract payload from data.response.payload.data, falling back to
+           data.response.payload *)
+        let response_node =
+          try resp_frame |> member "data" |> member "response" with
+          | _ -> `Null
+        in
+        let payload =
+          try response_node |> member "payload" with
+          | _ -> `Null
+        in
+        let data_node =
+          try payload |> member "data" with
+          | _ -> `Null
+        in
+        let orders_json = if data_node <> `Null then data_node else payload in
+        Hyperliquid_executions_feed.inject_open_orders orders_json;
+        (* Signal that the open-order snapshot has been fully injected. Domain workers
+           block on this event instead of a fixed wall-clock delay. *)
+        Hyperliquid_executions_feed.set_startup_snapshot_done ();
+        Lwt.return_unit)
       (fun exn ->
-         Logging.error_f
-           ~section
-           "Failed to fetch open orders via WS: %s"
-           (Printexc.to_string exn);
-         Lwt.return_unit))
+        Logging.error_f
+          ~section
+          "Failed to fetch open orders via WS: %s"
+          (Printexc.to_string exn);
+        Lwt.return_unit))
 ;;
 
 (* Register Hyperliquid_impl with the exchange registry at module load time *)
@@ -1028,6 +1020,6 @@ let () =
     Hyperliquid_impl.decode_frame
 ;;
 
-(* Register the oracle data-venue adapter (historical candles, fees, spot
-   balances, instruments for the capital oracle) at load time. *)
+(* Register the oracle data-venue adapter (historical candles, fees, spot balances,
+   instruments for the capital oracle) at load time. *)
 let () = Exchange.Oracle.Registry.register (module Hyperliquid_oracle)
