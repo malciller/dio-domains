@@ -91,12 +91,14 @@ let buy_cancel_excess
   ~cycle
   ~effective_buy_count
   =
-  Logging.info_f
-    ~section
-    "Found %d buy orders for %s, cancelling all buy orders to maintain single buy order \
-     policy"
-    effective_buy_count
-    asset.symbol;
+  (* A cancel+replace amendment (Hyperliquid/Alpaca) transiently lists BOTH the old id and
+     the replacement, which trips the ">1 buys" branch. The old id is covered by the
+     registry's [Pending]/[Replaced] phase; the replacement id is not registered at all,
+     so without [is_replacement_target] it would be treated as a duplicate and cancelled -
+     racing the amend (the amend then fails "order not found") and leaving buy tracking
+     pointed at a dead order. Track what we actually cancelled so tracking is only cleared
+     for orders that really left the book. *)
+  let cancelled = ref [] in
   iter_open_orders (fun order_id _ _ side_str userref_opt ->
     let is_our_strategy =
       match userref_opt with
@@ -105,13 +107,9 @@ let buy_cancel_excess
     in
     if is_our_strategy && side_str = "buy"
     then (
-      (* An amend on Alpaca is cancel+create under the hood: while it is in flight the
-         open-order scan transiently lists both the old id and the replacement, which
-         trips the ">1 buys" branch below. Cancelling the old id then races the amend (the
-         cancel is ignored or bounced), so skip orders that are mid-amendment - the amend
-         replaces them. *)
       let is_mid_amend =
-        InFlightAmendments.is_in_flight order_id
+        InFlightAmendments.is_amend_lifecycle_active order_id
+        || InFlightAmendments.is_replacement_target order_id
         || List.exists
              (fun (id, _, _, _) ->
                String.starts_with ~prefix:"pending_amend_" id
@@ -121,7 +119,7 @@ let buy_cancel_excess
       in
       if is_mid_amend
       then
-        Logging.info_f
+        Logging.debug_f
           ~section
           "Skipping cancel of mid-amendment buy order %s for %s (amend will replace it)"
           order_id
@@ -131,13 +129,35 @@ let buy_cancel_excess
           create_cancel_order order_id asset.symbol Ladder asset.exchange
         in
         ignore (push_order ~now ~state cancel_order);
+        cancelled := order_id :: !cancelled;
         Logging.info_f
           ~section
           "Cancelling excess buy order: %s for %s"
           order_id
           asset.symbol)));
-  state.last_buy_order_id <- None;
-  state.last_buy_order_price <- None;
+  if !cancelled <> []
+  then
+    Logging.info_f
+      ~section
+      "Found %d buy orders for %s, cancelled all cancellable buy orders to maintain \
+       single buy order policy"
+      effective_buy_count
+      asset.symbol
+  else
+    Logging.debug_f
+      ~section
+      "Found %d buy orders for %s, all mid-amendment - no cancellable excess"
+      effective_buy_count
+      asset.symbol;
+  (* Only clear tracking when the tracked order itself was cancelled. If every candidate
+     was mid-amendment (or the tracked id was the protected one), the resting buy (or its
+     in-flight amend) is still live; clearing here would orphan it until the next feed
+     scan adopts the best buy. *)
+  (match state.last_buy_order_id with
+   | Some tracked when List.exists (String.equal tracked) !cancelled ->
+     state.last_buy_order_id <- None;
+     state.last_buy_order_price <- None
+   | _ -> ());
   state.last_cycle <- cycle
 ;;
 

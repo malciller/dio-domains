@@ -5279,6 +5279,212 @@ let test_sync_open_orders_generation_skip () =
   check int "generation change rescans" 2 !scan_calls
 ;;
 
+let test_sync_open_orders_skip_readopts_best_buy () =
+  (* A generation skip must still republish the cached best buy. When tracking was cleared
+     (excess-cancel / amend clearance) and the feed is otherwise unchanged, the adoption
+     block has to re-track the resting buy from the cache; otherwise the buy leg sees a
+     resting buy with no id and can neither amend nor replace it (the no-buy stall). *)
+  let open Dio_strategies.Strategy_api in
+  let symbol = "SKIP_BESTBUY/USD" in
+  let state = get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.cached_ecfg <- get_exchange_config "kraken";
+  Hashtbl.clear state.sell_commitments;
+  Hashtbl.reset state.amend_cooldowns;
+  Sell_orders.clear state.open_sell_orders;
+  state.open_orders_scan_valid <- false;
+  state.inflight_buy <- false;
+  state.inflight_amend_buy <- false;
+  state.inflight_cancel_buy <- false;
+  state.last_buy_order_id <- None;
+  state.last_buy_order_price <- None;
+  let asset =
+    { exchange = "kraken"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = false
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = get_exchange_config "kraken" in
+  let gen = ref 11 in
+  let iter_orders f = f "buy-1" 99.0 1.0 "buy" None in
+  let sync iter =
+    sync_open_orders
+      ~state
+      ~now:100.0
+      ~asset
+      ~bid_price:100.0
+      ~lot_qty:1.0
+      ~iter_open_orders:iter
+      ~get_open_orders_generation:(fun () -> !gen)
+      ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
+      ~ecfg
+  in
+  ignore (sync iter_orders);
+  check string "best buy cached after the full scan" "buy-1" state.cached_best_buy_id;
+  (* Tracking cleared while the feed stays unchanged: the skip cycle must re-adopt. *)
+  state.last_buy_order_id <- None;
+  state.last_buy_order_price <- None;
+  let boom _ = failwith "scan must be skipped" in
+  ignore (sync boom);
+  check
+    (option string)
+    "resting buy re-adopted from the cache on a skip cycle"
+    (Some "buy-1")
+    state.last_buy_order_id
+;;
+
+let test_buy_cancel_excess_spares_amend_replacement () =
+  (* Regression: a Hyperliquid/Alpaca cancel+replace transiently lists the old id and the
+     replacement. The excess-buy cancel must not cancel either: the old id is covered by
+     the amend lifecycle, and the replacement id only by [is_replacement_target]. Before
+     this guard the strategy cancelled its own replacement, the amend then failed "order
+     not found", and buy tracking was pointed at a dead order - the no-buy stall. *)
+  let open Dio_strategies.Strategy_api in
+  let module IA = Dio_strategies.Strategy_common.InFlightAmendments in
+  let symbol = "EXCESS_AMEND/USD" in
+  let state = get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.pending_orders <- [];
+  state.last_buy_order_id <- Some "buy-new";
+  state.last_buy_order_price <- Some 99.0;
+  state.inflight_buy <- false;
+  state.inflight_amend_buy <- false;
+  state.inflight_cancel_buy <- false;
+  let asset =
+    { exchange = "hyperliquid"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = false
+    ; sell_levels_persistence = false
+    }
+  in
+  let buffer = get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  ignore (IA.remove_in_flight_amendment "buy-old");
+  ignore (IA.remove_in_flight_amendment "buy-new");
+  ignore (IA.add_in_flight_amendment "buy-old");
+  IA.note_amendment_succeeded ~old_id:"buy-old" ~new_id:"buy-new";
+  let feed = [ "buy-old", 99.0, 1.0, "buy", None; "buy-new", 99.0, 1.0, "buy", None ] in
+  let iter f = List.iter (fun (o, p, q, s, u) -> f o p q s u) feed in
+  drain ();
+  Dio_strategies.Strategy_decision.buy_cancel_excess
+    ~state
+    ~now:100.0
+    ~asset
+    ~iter_open_orders:iter
+    ~cycle:1
+    ~effective_buy_count:2;
+  check
+    bool
+    "no cancel is issued for the amend's old id or its replacement"
+    true
+    (get_pending_orders 100 = []);
+  check
+    (option string)
+    "buy tracking is preserved (replacement still resting)"
+    (Some "buy-new")
+    state.last_buy_order_id;
+  check
+    bool
+    "replacement id is recognized as an amend target"
+    true
+    (IA.is_replacement_target "buy-new");
+  (* Control: with no live amend, a genuine duplicate is cancelled and tracking cleared. *)
+  ignore (IA.remove_in_flight_amendment "buy-old");
+  ignore (IA.remove_in_flight_amendment "buy-new");
+  drain ();
+  Dio_strategies.Strategy_decision.buy_cancel_excess
+    ~state
+    ~now:100.0
+    ~asset
+    ~iter_open_orders:iter
+    ~cycle:2
+    ~effective_buy_count:2;
+  check int "both duplicate buys are cancelled" 2 (List.length (get_pending_orders 100));
+  check
+    (option string)
+    "buy tracking cleared after the cancels"
+    None
+    state.last_buy_order_id
+;;
+
+let test_tracked_buy_fill_clears_pending_place_token () =
+  (* If the placement Ack is lost or arrives after a fast fill, the [pending_buy_] token
+     would make [buy_leg_facts] report an in-flight buy forever and stop the buy leg. A
+     fill for our tracked buy is terminal for the placement, so it must drop the token. *)
+  let open Dio_strategies.Strategy_api in
+  let module S = Dio_strategies.Strategy_common in
+  let pending_buy_token (state : Dio_strategies.Strategy_state.strategy_state) =
+    List.exists
+      (fun (id, _, _, _) -> String.starts_with ~prefix:"pending_buy_" id)
+      state.pending_orders
+  in
+  let setup symbol =
+    Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+    let state = get_strategy_state symbol in
+    state.exchange_id <- "hyperliquid";
+    state.grid_qty <- 0.5;
+    state.maker_fee <- 0.0004;
+    state.cached_sell_mult <- 0.999;
+    state.reserved_base <- 0.0;
+    state.position_base <- 0.0;
+    state.buy_credits_since_balance <- [];
+    Strategy.set_startup_replay_done symbol;
+    state
+  in
+  let tracked = setup "FILL_TOKEN/BTC/USDC" in
+  tracked.last_buy_order_id <- Some "fill-buy-1";
+  tracked.pending_orders <- [ "pending_buy_62000.00", S.Buy, 62000.0, 0.0 ];
+  Strategy.handle_order_filled
+    ~now:0.0
+    "FILL_TOKEN/BTC/USDC"
+    "fill-buy-1"
+    S.Buy
+    ~fill_price:62000.0
+    ~fill_qty:0.5
+    None;
+  check
+    bool
+    "tracked buy fill clears the pending placement token"
+    false
+    (pending_buy_token tracked);
+  (* Control: a fill for an order we do not track must not clear a concurrent placement. *)
+  let other = setup "FILL_TOKEN2/BTC/USDC" in
+  other.last_buy_order_id <- None;
+  other.pending_orders <- [ "pending_buy_99000.00", S.Buy, 99000.0, 0.0 ];
+  Strategy.handle_order_filled
+    ~now:0.0
+    "FILL_TOKEN2/BTC/USDC"
+    "external-buy"
+    S.Buy
+    ~fill_price:99000.0
+    ~fill_qty:0.5
+    None;
+  check
+    bool
+    "untracked fill leaves a pending placement token"
+    true
+    (pending_buy_token other)
+;;
+
 let test_sync_open_orders_delta_equivalence () =
   (* A drained per-order delta must produce exactly the same derived state as a fresh full
      scan of the final feed. Exercises add / amend / remove on the buy and sell sides, the
@@ -6399,6 +6605,18 @@ let () =
             "sync_open_orders skips scan when generation unchanged"
             `Quick
             test_sync_open_orders_generation_skip
+        ; test_case
+            "sync skip republishes the cached best buy"
+            `Quick
+            test_sync_open_orders_skip_readopts_best_buy
+        ; test_case
+            "buy excess-cancel spares an amend replacement"
+            `Quick
+            test_buy_cancel_excess_spares_amend_replacement
+        ; test_case
+            "tracked buy fill clears a stale placement token"
+            `Quick
+            test_tracked_buy_fill_clears_pending_place_token
         ; test_case
             "sync_open_orders delta matches full scan"
             `Quick
