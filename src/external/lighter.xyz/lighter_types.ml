@@ -103,10 +103,13 @@ let round_price ~price_decimals price =
 ;;
 
 (** Round quantity down to the exchange's valid precision for a given market. Uses floor
-    to prevent over-allocation. *)
+    to prevent over-allocation. A relative epsilon is added before the floor so binary
+    representation error cannot drop an on-lot quantity a full step (e.g.
+    [0.0003 *. 1e5 = 29.999999999999996]). *)
 let round_qty ~size_decimals qty =
   let multiplier = 10.0 ** float_of_int size_decimals in
-  floor (qty *. multiplier) /. multiplier
+  let scaled = qty *. multiplier in
+  floor (scaled +. (1e-9 *. Float.max 1.0 (Float.abs scaled))) /. multiplier
 ;;
 
 (** Lighter transaction type codes. *)

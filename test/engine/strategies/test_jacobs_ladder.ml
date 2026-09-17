@@ -5,6 +5,9 @@ module Sell_orders = Dio_strategies.Strategy_sell_orders
    resolves as in production (the 1e-9 fractional increment behind dust-level pruning). *)
 let () = ignore Alpaca.Module.Alpaca_impl.name
 
+(* Same for Hyperliquid, so lot-size metadata (szDecimals) resolves in the venue tests. *)
+let () = ignore Hyperliquid.Module.Hyperliquid_impl.name
+
 (* Seeds the id-keyed sell-commitment ledger from the legacy list fixture form. *)
 let set_sell_commitments tbl entries =
   Hashtbl.clear tbl;
@@ -6628,6 +6631,28 @@ let test_terminal_sell_fill_releases_full_commitment () =
     (not (Sell_orders.exists_id state.open_sell_orders "part-oid"))
 ;;
 
+let test_venue_round_qty_lot_epsilon () =
+  (* Regression: a quantity that is exactly on a lot boundary must not be knocked down a
+     full step by binary representation error. BTC/USDC has szDecimals = 5 (lot 1e-5), so
+     0.0003 *. 1e5 = 29.999999999999996 must still round to 0.0003, not 0.00029. *)
+  Hyperliquid.Instruments_feed.register_test_instrument
+    ~symbol:"VQ_BTC/USDC"
+    ~sz_decimals:5;
+  let inc =
+    Dio_strategies.Strategy_venue.get_qty_increment_val "VQ_BTC/USDC" "hyperliquid"
+  in
+  Alcotest.(check (float 1e-12)) "venue lot increment resolved" 1e-5 inc;
+  Alcotest.(check (float 1e-9))
+    "venue round_qty keeps an on-lot BTC quantity"
+    0.0003
+    (Dio_strategies.Strategy_venue.round_qty 0.0003 "VQ_BTC/USDC" "hyperliquid");
+  (* Genuinely sub-lot fractions still floor down. *)
+  Alcotest.(check (float 1e-9))
+    "venue round_qty floors a sub-lot fraction"
+    0.00034
+    (Dio_strategies.Strategy_venue.round_qty 0.000349 "VQ_BTC/USDC" "hyperliquid")
+;;
+
 let () =
   run
     "Jacobs Ladder"
@@ -7027,6 +7052,12 @@ let () =
             "multi-strategy isolation (BTC + HYPE)"
             `Quick
             test_accumulation_multi_strategy_isolation
+        ] )
+    ; ( "venue"
+      , [ test_case
+            "round_qty keeps on-lot quantities (lot epsilon)"
+            `Quick
+            test_venue_round_qty_lot_epsilon
         ] )
     ]
 ;;
