@@ -593,20 +593,28 @@ Concrete module and integration work, with per-module status. Milestone 1's firs
 | Module | Responsibility | Layer | Status |
 |---|---|---|---|
 | `strategy_actions.ml` | registry, `t`, schema types, `register`/`find` | protocol | done |
-| `strategy_actions_builtin.ml` | declares the §4.3 inventory (schemas) | actions | done (metadata; handlers pending) |
-| `strategy_actions_grid.ml` | grid decision-action handlers (faithful wrappers of reference grid functions) + orchestration actions (`grid_prepare`/`grid_cleanup`/`grid_sync`/`grid_refresh_fee`/`grid_guard`/`grid_buy`/`grid_sell`) via `Make` | actions | fine orchestration decomposed + replay-verified; legs still coarse |
+| `strategy_actions_builtin.ml` | declares the §4.3 inventory (schemas) | actions | done |
+| `strategy_actions_cycle.ml` / `strategy_cycle_engine.ml` | grid decision-action handlers (faithful wrappers of reference grid functions) + orchestration actions via `Make (Strategy_cycle_engine)`; `Strategy_cycle_engine` is the interpreter context holding per-cycle strategy inputs and implementing the reference actions (`prepare`/`cleanup`/`sync`/`refresh_fee`/`guard`/`buy_*`/`sell_*`), shared by the live domain loop and offline replay | actions | fine orchestration decomposed + replay-verified |
 | `strategy_file.ml` | JSON → AST (triggers/params/state/steps) | protocol | done |
 | `strategy_expr.ml` | expression engine: `$ref` scanning + tokenizer/parser/evaluator (arithmetic, comparison, boolean) and string templates | protocol | done |
-| `strategy_compile.ml` | static validation against the registry | protocol | done (validation); compile-to-closures pending |
-| `strategy_cli.ml` | `dio strategy validate <file>` | tooling | done |
-| `strategy_guard.ml` | guard evaluation over an expression `env` + facts (event/side/capacity/pending/engine/cooldown) | protocol | done (closure compile pending) |
-| `strategy_runtime.ml` | per-instance state, env, cycle runner, action dispatch, step-local bindings, engine caps | protocol | done (synthetic; engine caps + exchange handlers pending) |
-| `strategy_protocol.ml` | implements `Strategy_common.S` over a compiled instance | protocol | pending |
+| `strategy_compile.ml` | static validation against the registry | protocol | done |
+| `strategy_cli.ml` | `dio strategy validate/diff <file>` | tooling | done |
+| `strategy_guard.ml` | guard evaluation over an expression `env` + facts (event/side/capacity/pending/engine/cooldown) | protocol | done |
+| `strategy_runtime.ml` | per-instance state, env, cycle runner, action dispatch, step-local bindings, engine caps | protocol | done |
+| `strategy_fact_slots.ml` | fixed, interned platform fact/gate slots addressed by file guards | protocol | done |
+| `strategy_protocol.ml` (not created) | implements `Strategy_common.S` over a compiled instance | protocol | superseded — the domain loop invokes the compiled instance (`strategy_runtime` + `strategy_cycle_engine`) directly |
 | `platform_accounting.ml` | central accounting: grace, ghost, freshness, ceilings, pending, reservation | platform | partial (constants, freshness cutoff, sell-hold overlays; ghost/recovery, reserve-dip ceiling, reservation pending) |
 | `exchange_capabilities.ml` | per-venue capability descriptors (extracted from the grid flag matrix) | platform | done |
 | `strategy_event_recorder.ml` | record per-cycle observations (venue open orders, emitted intents, state, persistence) into a trace | test | done |
 | `strategy_equivalence.ml` | trace diff / equivalence decision + deterministic replay API | test | done |
 | `strategy_trace.ml` | observable trace types + comparison + JSON persistence | test | done |
+
+> **Source layout.** All of the above live in one wrapped library
+> `src/engine/strategies/` (`dio.strategies`), physically grouped into the
+> subdirs `core/` (legacy reference), `platform/`, `actions/`, `protocol/`, and
+> `harness/`. `(include_subdirs unqualified)` keeps module identity equal to the
+> basename, so the grouping is organizational only. See
+> `src/engine/strategies/README.md`.
 
 ### 9.2 Existing modules to touch
 
