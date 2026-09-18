@@ -38,17 +38,5 @@ let () =
     speclist
     (fun _ -> ())
     "dio-dashboard [--socket /tmp/dio-<pid>.sock] [--config config.json] [--theme <id>]";
-  (* First load theme from config.json (or ~/.dio_theme) *)
-  Dashboard_ui.Theme.load_saved_theme ~config_file:!config_file ();
-  (* If explicit CLI --theme is passed, override and save *)
-  if !theme_override <> ""
-  then
-    if not (Dashboard_ui.Theme.set_theme_by_id !theme_override)
-    then (
-      Printf.eprintf
-        "Unknown theme '%s'. Run with '--theme list' to see available themes.\n%!"
-        !theme_override;
-      exit 1)
-    else Dashboard_ui.Theme.save_theme !theme_override;
-  Dashboard_ui.App.run ~config_file:!config_file ()
+  Dashboard_ui.App.run ~config_file:!config_file ~theme_override:!theme_override ()
 ;;

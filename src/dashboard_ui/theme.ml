@@ -1222,71 +1222,92 @@ let prev_theme () =
   !active_theme_ref
 ;;
 
-(* Theme persistence *)
-let config_paths () =
-  let home =
-    try Sys.getenv "HOME" with
-    | _ -> "."
-  in
-  [ home ^ "/.dio_theme"; "./.dio_theme" ]
-;;
+(* Theme persistence: the engine config file is the single source of truth. The theme is
+   read from its ["theme"] field and written back to it; there is no side-car file. *)
 
-let save_theme id =
-  try
-    let home =
-      try Sys.getenv "HOME" with
-      | _ -> "."
-    in
-    let oc = open_out (home ^ "/.dio_theme") in
-    output_string oc (id ^ "\n");
-    close_out oc
-  with
-  | _ -> ()
-;;
+exception Unknown_theme of string
 
-let load_saved_theme ?(config_file = "config.json") () =
-  let loaded_from_config = ref false in
-  (* 1. Check config.json paths (including /app/config.json in Docker) for a "theme" key. *)
-  let config_candidates =
-    [ config_file; "./config.json"; "/app/config.json"; "../config.json" ]
-  in
-  let rec try_configs = function
-    | [] -> ()
-    | path :: rest ->
-      if Sys.file_exists path
-      then (
-        try
-          let json = Yojson.Basic.from_file path in
-          match json |?> "theme" with
-          | `String theme_str when String.trim theme_str <> "" ->
-            if set_theme_by_id theme_str then loaded_from_config := true
-          | _ -> try_configs rest
-        with
-        | _ -> try_configs rest)
-      else try_configs rest
-  in
-  try_configs config_candidates;
-  (* 2. Fall back to ~/.dio_theme when config.json specifies no theme. *)
-  if not !loaded_from_config
+(** Load the ["theme"] field from the engine config file. An absent or empty field keeps
+    the default theme; a value that matches no known theme raises [Unknown_theme] rather
+    than silently falling back. *)
+let load_theme_from_config ?(config_file = "config.json") () =
+  if Sys.file_exists config_file
   then (
-    let rec try_paths = function
-      | [] -> ()
-      | p :: rest ->
-        if Sys.file_exists p
-        then (
-          try
-            let line =
-              let ic = open_in p in
-              Fun.protect
-                ~finally:(fun () -> close_in_noerr ic)
-                (fun () -> String.trim (input_line ic))
-            in
-            ignore (set_theme_by_id line)
-          with
-          | _ -> try_paths rest)
-        else try_paths rest
+    let json =
+      try Yojson.Basic.from_file config_file with
+      | exn ->
+        raise
+          (Failure
+             (Printf.sprintf
+                "cannot read config '%s': %s"
+                config_file
+                (Printexc.to_string exn)))
     in
-    try_paths (config_paths ()))
+    match json |?> "theme" with
+    | `String theme_str when String.trim theme_str <> "" ->
+      if not (set_theme_by_id theme_str) then raise (Unknown_theme theme_str)
+    | _ -> ())
+;;
+
+(** Set the top-level ["theme"] field in the config file, leaving the rest of the file
+    untouched. Returns false when the file is missing/unwritable or has no top-level theme
+    key to replace. *)
+let save_theme ?(config_file = "config.json") id =
+  try
+    let lines =
+      let ic = open_in config_file in
+      Fun.protect
+        ~finally:(fun () -> close_in_noerr ic)
+        (fun () ->
+          let rec read acc =
+            match input_line ic with
+            | line -> read (line :: acc)
+            | exception End_of_file -> List.rev acc
+          in
+          read [])
+    in
+    let key = "\"theme\"" in
+    let found = ref false in
+    let out =
+      List.map
+        (fun line ->
+          if !found
+          then line
+          else (
+            let trimmed = String.trim line in
+            if String.starts_with ~prefix:key trimmed && String.contains trimmed ':'
+            then (
+              found := true;
+              let indent =
+                let n = ref 0 in
+                while !n < String.length line && (line.[!n] = ' ' || line.[!n] = '\t') do
+                  incr n
+                done;
+                String.sub line 0 !n
+              in
+              let comma =
+                String.length trimmed > 0
+                && Char.equal trimmed.[String.length trimmed - 1] ','
+              in
+              Printf.sprintf "%s\"theme\": \"%s\"%s" indent id (if comma then "," else ""))
+            else line))
+        lines
+    in
+    if not !found
+    then false
+    else (
+      let oc = open_out config_file in
+      Fun.protect
+        ~finally:(fun () -> close_out_noerr oc)
+        (fun () ->
+          List.iter
+            (fun l ->
+              output_string oc l;
+              output_char oc '\n')
+            out);
+      true)
+  with
+  | _ -> false
 ;;
 
 (* Dynamic getters & top-level compatibility attributes *)

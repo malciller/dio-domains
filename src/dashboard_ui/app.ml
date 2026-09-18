@@ -160,9 +160,28 @@ let assem_extract (assem : frame_assembler) : string option =
       Some frame))
 ;;
 
-let run ?(config_file = "config.json") () =
-  (* Load the saved theme from config.json or ~/.dio_theme. *)
-  Theme.load_saved_theme ~config_file ();
+let run ?(config_file = "config.json") ?(theme_override = "") () =
+  (* The engine config file is the single source of truth for the theme. *)
+  (try Theme.load_theme_from_config ~config_file () with
+   | Theme.Unknown_theme id ->
+     Printf.eprintf
+       "Unknown theme '%s' in %s. Run 'dio-dashboard --theme list' to see the available \
+        themes.\n\
+        %!"
+       id
+       config_file;
+     exit 1);
+  (* An explicit --theme wins over the config value and is written back to the config. *)
+  if theme_override <> ""
+  then
+    if not (Theme.set_theme_by_id theme_override)
+    then (
+      Printf.eprintf
+        "Unknown theme '%s'. Run 'dio-dashboard --theme list' to see the available themes.\n\
+         %!"
+        theme_override;
+      exit 1)
+    else ignore (Theme.save_theme ~config_file theme_override);
   (* DIO_MOTION=off|0|false|no enables reduced motion; DIO_FPS (> 0) caps the animated
      frame rate (default 30). *)
   (match Sys.getenv_opt "DIO_MOTION" with
@@ -520,7 +539,7 @@ let run ?(config_file = "config.json") () =
                   Theme.set_theme_by_index !theme_cursor_idx
                 | `Key_enter ->
                   Theme.set_theme_by_index !theme_cursor_idx;
-                  Theme.save_theme (Theme.current ()).id;
+                  ignore (Theme.save_theme ~config_file (Theme.current ()).id);
                   theme_modal_open := false
                 | `Key_theme | `Key_back ->
                   (* Cancel: revert to the original theme. *)
