@@ -4,8 +4,8 @@
 # The published image deliberately ships without a configuration. The engine
 # needs /app/config.json to start; without it the process would fail deep in
 # the config parser, so this guard turns that into a clear message. The
-# dashboard attaches to a running engine over the Unix domain socket and does
-# not need a config of its own.
+# dashboard attaches to a running engine over the Unix domain socket; it reads
+# its theme from the same config, so mount that too (see dio-dash.sh).
 set -eu
 
 config_path="${DIO_CONFIG_PATH:-/app/config.json}"

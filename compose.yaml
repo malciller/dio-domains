@@ -65,7 +65,7 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
     volumes:
-      - ./config.json:/app/config.json
+      - ./config.json:/app/config.json:ro
       - dio-sock:/var/run/dio
     environment:
       TERM: xterm-256color

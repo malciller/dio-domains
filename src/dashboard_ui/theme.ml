@@ -1222,8 +1222,8 @@ let prev_theme () =
   !active_theme_ref
 ;;
 
-(* Theme persistence: the engine config file is the single source of truth. The theme is
-   read from its ["theme"] field and written back to it; there is no side-car file. *)
+(* Theme: the engine config file is the single source of truth. The theme is read from its
+   ["theme"] field; there is no side-car file and no write-back. *)
 
 exception Unknown_theme of string
 
@@ -1231,8 +1231,14 @@ exception Unknown_theme of string
     the default theme; a value that matches no known theme raises [Unknown_theme] rather
     than silently falling back. *)
 let load_theme_from_config ?(config_file = "config.json") () =
-  if Sys.file_exists config_file
-  then (
+  if not (Sys.file_exists config_file)
+  then
+    Printf.eprintf
+      "dio-dashboard: no config at '%s'; using the default theme. Mount the engine \
+       config to set it.\n\
+       %!"
+      config_file
+  else (
     let json =
       try Yojson.Basic.from_file config_file with
       | exn ->
@@ -1247,67 +1253,6 @@ let load_theme_from_config ?(config_file = "config.json") () =
     | `String theme_str when String.trim theme_str <> "" ->
       if not (set_theme_by_id theme_str) then raise (Unknown_theme theme_str)
     | _ -> ())
-;;
-
-(** Set the top-level ["theme"] field in the config file, leaving the rest of the file
-    untouched. Returns false when the file is missing/unwritable or has no top-level theme
-    key to replace. *)
-let save_theme ?(config_file = "config.json") id =
-  try
-    let lines =
-      let ic = open_in config_file in
-      Fun.protect
-        ~finally:(fun () -> close_in_noerr ic)
-        (fun () ->
-          let rec read acc =
-            match input_line ic with
-            | line -> read (line :: acc)
-            | exception End_of_file -> List.rev acc
-          in
-          read [])
-    in
-    let key = "\"theme\"" in
-    let found = ref false in
-    let out =
-      List.map
-        (fun line ->
-          if !found
-          then line
-          else (
-            let trimmed = String.trim line in
-            if String.starts_with ~prefix:key trimmed && String.contains trimmed ':'
-            then (
-              found := true;
-              let indent =
-                let n = ref 0 in
-                while !n < String.length line && (line.[!n] = ' ' || line.[!n] = '\t') do
-                  incr n
-                done;
-                String.sub line 0 !n
-              in
-              let comma =
-                String.length trimmed > 0
-                && Char.equal trimmed.[String.length trimmed - 1] ','
-              in
-              Printf.sprintf "%s\"theme\": \"%s\"%s" indent id (if comma then "," else ""))
-            else line))
-        lines
-    in
-    if not !found
-    then false
-    else (
-      let oc = open_out config_file in
-      Fun.protect
-        ~finally:(fun () -> close_out_noerr oc)
-        (fun () ->
-          List.iter
-            (fun l ->
-              output_string oc l;
-              output_char oc '\n')
-            out);
-      true)
-  with
-  | _ -> false
 ;;
 
 (* Dynamic getters & top-level compatibility attributes *)
