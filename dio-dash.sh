@@ -14,6 +14,9 @@ set -euo pipefail
 IMAGE="dio"
 NAME="dio_dashboard"
 SOCK_VOL="dio-sock"
+# Engine config (holds the "theme" field). deploy.sh keeps it in the persistent
+# data dir; override with DIO_DATA_DIR when it lives elsewhere.
+CONFIG_FILE="${DIO_DATA_DIR:-${HOME}/dio-data}/config.json"
 
 case "${1:-}" in
   stop)
@@ -45,9 +48,21 @@ fi
 # Stale exited container holds the name — remove it so the run below succeeds.
 docker rm -f "${NAME}" >/dev/null 2>&1 || true
 
+# The dashboard reads its theme from the engine config, which lives in the persistent data
+# dir. Mount it read-only so the container can load the configured theme; a theme picked in
+# the TUI is session-only. Without this mount the container has no config.json and silently
+# falls back to the default theme.
+CONFIG_MOUNT=()
+if [[ -f "${CONFIG_FILE}" ]]; then
+  CONFIG_MOUNT=(-v "${CONFIG_FILE}:/app/config.json:ro")
+else
+  echo "WARNING: ${CONFIG_FILE} not found — dashboard will use the default theme." >&2
+fi
+
 echo "Starting dashboard container ${NAME}…"
 exec docker run --rm -it \
   --name "${NAME}" \
   -v "${SOCK_VOL}:/var/run/dio" \
+  ${CONFIG_MOUNT[@]+"${CONFIG_MOUNT[@]}"} \
   -e TERM="${TERM:-xterm-256color}" \
   "${IMAGE}" dio-dashboard "$@"

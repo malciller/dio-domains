@@ -171,7 +171,7 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
        id
        config_file;
      exit 1);
-  (* An explicit --theme wins over the config value and is written back to the config. *)
+  (* An explicit --theme wins over the config value for this session. *)
   if theme_override <> ""
   then
     if not (Theme.set_theme_by_id theme_override)
@@ -180,8 +180,7 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
         "Unknown theme '%s'. Run 'dio-dashboard --theme list' to see the available themes.\n\
          %!"
         theme_override;
-      exit 1)
-    else ignore (Theme.save_theme ~config_file theme_override);
+      exit 1);
   (* DIO_MOTION=off|0|false|no enables reduced motion; DIO_FPS (> 0) caps the animated
      frame rate (default 30). *)
   (match Sys.getenv_opt "DIO_MOTION" with
@@ -539,7 +538,6 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
                   Theme.set_theme_by_index !theme_cursor_idx
                 | `Key_enter ->
                   Theme.set_theme_by_index !theme_cursor_idx;
-                  ignore (Theme.save_theme ~config_file (Theme.current ()).id);
                   theme_modal_open := false
                 | `Key_theme | `Key_back ->
                   (* Cancel: revert to the original theme. *)
