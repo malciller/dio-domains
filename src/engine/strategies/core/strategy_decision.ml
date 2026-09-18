@@ -229,7 +229,13 @@ let buy_place_plan
     Sell_orders.exists_price_leq
       state.open_sell_orders
       (if bid_price > 0.0 then Float.max buy_price bid_price else buy_price)
-    || Hashtbl.length state.evicted_orders > 0
+    (* Only an evicted *sell* is a wash-trade hazard. An evicted buy is a venue-confirmed
+       terminal buy (filled/canceled amend failure); counting it here deferred every
+       replacement buy for the full eviction TTL. *)
+    || Hashtbl.fold
+         (fun _ (_expiry, side) acc -> acc || side = Sell)
+         state.evicted_orders
+         false
   in
   Strategy_state.sub_stop state Strategy_state.Bplan_sells _bp_sells;
   let quote_nan = Float.is_nan quote_balance in

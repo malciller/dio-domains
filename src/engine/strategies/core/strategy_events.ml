@@ -1262,7 +1262,7 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
          cancel+replace. The TTL mirrors the cleanup window used by [sync_open_orders];
          the entry is harmless once the order also leaves the venue cache. *)
       if is_already_terminal
-      then Hashtbl.replace state.evicted_orders order_id (now +. 900.0);
+      then Hashtbl.replace state.evicted_orders order_id (now +. 900.0, side);
       if is_order_gone
       then (
         let cancel_order =
