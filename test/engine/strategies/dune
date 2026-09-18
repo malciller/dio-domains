@@ -21,15 +21,6 @@
 (rule
  (copy ../../../strategies/jacobs_ladder.strategy jacobs_ladder.strategy))
 
-(rule
- (copy ../../../strategies/dip_scalper.strategy dip_scalper.strategy))
-
-(test
- (name test_dip_scalper)
- (modules test_dip_scalper)
- (libraries dio.strategies alcotest)
- (deps dip_scalper.strategy))
-
 (test
  (name test_strategy_script)
  (modules test_strategy_script)
