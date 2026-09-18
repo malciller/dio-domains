@@ -5429,6 +5429,185 @@ let test_sync_open_orders_skip_readopts_best_buy () =
     state.last_buy_order_id
 ;;
 
+let test_terminal_buy_not_readopted_on_skip () =
+  (* REGRESSION (BOTZ wedge): a buy the strategy already knows is terminal (filled) can
+     still be listed by the venue's open-order feed - the REST snapshot and the trade
+     stream are independent, so a snapshot taken before the fill propagated resurrects the
+     id. The generation-skip path republishes the cached best buy without rescanning, so
+     without a terminal purge the filled id is re-adopted as the resting buy and
+     re-amended every cycle: a doomed venue-terminal amend whose failure re-evicts and
+     clears tracking, forever, while the buy leg never places a replacement. *)
+  let open Dio_strategies.Strategy_api in
+  let symbol = "TERM_SKIP/USD" in
+  let state = get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.cached_ecfg <- get_exchange_config "alpaca";
+  Hashtbl.clear state.sell_commitments;
+  Hashtbl.reset state.amend_cooldowns;
+  Sell_orders.clear state.open_sell_orders;
+  state.open_orders_scan_valid <- false;
+  state.inflight_buy <- false;
+  state.inflight_amend_buy <- false;
+  state.inflight_cancel_buy <- false;
+  state.last_buy_order_id <- None;
+  state.last_buy_order_price <- None;
+  let asset =
+    { exchange = "alpaca"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = false
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = get_exchange_config "alpaca" in
+  let gen = ref 31 in
+  let iter_orders f = f "ghost-buy" 99.0 1.0 "buy" None in
+  let sync ?(changes = []) iter =
+    sync_open_orders
+      ~state
+      ~now:100.0
+      ~asset
+      ~bid_price:100.0
+      ~lot_qty:1.0
+      ~iter_open_orders:iter
+      ~get_open_orders_generation:(fun () -> !gen)
+      ~drain_open_order_changes:(fun ~symbol:_ -> changes, false)
+      ~ecfg
+  in
+  let obc1, _h1, _lib1, _lis1, _cs1, _op1, _mp1 = sync iter_orders in
+  check int "ghost buy counted by the full scan" 1 obc1;
+  check string "ghost buy cached as best" "ghost-buy" state.cached_best_buy_id;
+  (* The fill is applied (processed_fills) while the venue feed still lists the id. *)
+  Hashtbl.replace state.processed_fills "ghost-buy" ();
+  let obc2, _h2, _lib2, _lis2, _cs2, _op2, _mp2 = sync (fun _ -> failwith "must skip") in
+  check int "terminal buy purged from the count on a skip cycle" 0 obc2;
+  check int "cached open-buy count purged" 0 state.cached_open_buy_count;
+  check string "cached best buy cleared" "" state.cached_best_buy_id;
+  check
+    bool
+    "feed index no longer holds the terminal buy"
+    false
+    (Hashtbl.mem state.feed_buy_index "ghost-buy");
+  check
+    (option string)
+    "terminal buy is not re-adopted as the resting buy"
+    None
+    state.last_buy_order_id;
+  (* A later delta add for the same terminal id must not resurrect it either. *)
+  incr gen;
+  let obc3, _h3, _lib3, _lis3, _cs3, _op3, _mp3 =
+    sync
+      ~changes:[ "ghost-buy", Some (Some 99.0, 1.0, "buy", None) ]
+      (fun _ -> failwith "delta path must not rescan")
+  in
+  check int "terminal buy not re-added by a delta" 0 obc3;
+  check
+    bool
+    "terminal buy still absent from the feed index after a delta"
+    false
+    (Hashtbl.mem state.feed_buy_index "ghost-buy")
+;;
+
+let test_evicted_buy_does_not_block_fresh_buy () =
+  (* A venue-confirmed terminal BUY eviction must not latch the wash-trade buy block: only
+     an evicted sell is a crossing hazard. Before this, any eviction deferred the fresh
+     buy for the full 900s eviction TTL, so a filled/canceled buy ghost left the symbol
+     buyless even after the feed cleared it. *)
+  let open Dio_strategies.Strategy_api in
+  let asset symbol =
+    { exchange = "kraken"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 0.5
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = false
+    ; sell_levels_persistence = false
+    }
+  in
+  let plan symbol evicted_side =
+    let state = get_strategy_state symbol in
+    state.exchange_id <- "kraken";
+    state.grid_qty <- 1.0;
+    state.capital_low <- false;
+    state.just_filled_buy <- false;
+    state.resuming_after_balance_flag <- false;
+    Hashtbl.reset state.evicted_orders;
+    Hashtbl.reset state.amend_cooldowns;
+    Sell_orders.clear state.open_sell_orders;
+    (match evicted_side with
+     | Some side -> Hashtbl.replace state.evicted_orders "evicted-1" (200.0, side)
+     | None -> ());
+    buy_place_plan
+      ~state
+      ~now:100.0
+      ~asset:(asset symbol)
+      ~bid_price:100.0
+      ~ask_price:100.0
+      ~quote_balance:1000.0
+      ~oracle_halted:false
+      ~cycle:1
+      ~locked_in_buys:0.0
+      ~closest_sell_order_initial:None
+  in
+  check
+    bool
+    "evicted BUY does not set the crossing (wash-trade) flag"
+    false
+    (plan "EVB/USD" (Some Dio_strategies.Strategy_common.Buy)).bp_crossing;
+  check
+    bool
+    "evicted SELL still sets the crossing (wash-trade) flag"
+    true
+    (plan "EVS/USD" (Some Dio_strategies.Strategy_common.Sell)).bp_crossing;
+  check
+    bool
+    "no eviction leaves the crossing flag clear"
+    false
+    (plan "EVN/USD" None).bp_crossing
+;;
+
+let test_terminal_amend_eviction_records_side () =
+  (* The eviction entry carries the side so the fresh-buy crossing guard can distinguish a
+     terminal buy (ignore) from a terminal sell (wash-trade hazard). *)
+  let open Dio_strategies.Strategy_api in
+  let symbol = "EVSIDE/USD" in
+  let state = get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  Hashtbl.reset state.evicted_orders;
+  let buffer = get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Strategy_api.Strategy.handle_order_amendment_failed
+    ~now:100.0
+    symbol
+    "evside-1"
+    Dio_strategies.Strategy_common.Sell
+    {|Fallback cancel_order failed: HTTP 422 cancelling evside-1: {"code":42210000,"message":"order is already in \"canceled\" state"}|};
+  (match Hashtbl.find_opt state.evicted_orders "evside-1" with
+   | Some (_expiry, side) ->
+     check
+       bool
+       "terminal amend eviction records the sell side"
+       true
+       (side = Dio_strategies.Strategy_common.Sell)
+   | None -> failwith "expected an eviction entry");
+  drain ()
+;;
+
 let test_buy_cancel_excess_spares_amend_replacement () =
   (* Regression: a Hyperliquid/Alpaca cancel+replace transiently lists the old id and the
      replacement. The excess-buy cancel must not cancel either: the old id is covered by
@@ -6719,6 +6898,18 @@ let () =
             "sync skip republishes the cached best buy"
             `Quick
             test_sync_open_orders_skip_readopts_best_buy
+        ; test_case
+            "terminal buy is purged and not re-adopted on a skip"
+            `Quick
+            test_terminal_buy_not_readopted_on_skip
+        ; test_case
+            "evicted buy does not block a fresh buy"
+            `Quick
+            test_evicted_buy_does_not_block_fresh_buy
+        ; test_case
+            "terminal amend eviction records the order side"
+            `Quick
+            test_terminal_amend_eviction_records_side
         ; test_case
             "buy excess-cancel spares an amend replacement"
             `Quick

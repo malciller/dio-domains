@@ -136,8 +136,11 @@ type strategy_state =
   ; mutable last_cleanup_time : float
   ; mutable inflight_buy : bool (* true while buy Place is pending ack or reject *)
   ; mutable inflight_sell : bool (* true while sell Place is pending ack or reject *)
-  ; mutable evicted_orders : (string, float) Hashtbl.t
-      (* order_id -> expiry_ts; blocks rebuilt orders *)
+  ; mutable evicted_orders : (string, float * order_side) Hashtbl.t
+      (* order_id -> (expiry_ts, side); blocks rebuilt orders. The side is recorded so the
+         fresh-buy wash-trade guard can count only evicted *sells*: a buy eviction is a
+         venue-confirmed terminal buy (filled/canceled) and must not block a replacement
+         buy. *)
   ; mutable asset_low : bool
       (* set when asset balance is insufficient for next sell; pauses sell and buy *)
   ; mutable last_sell_block_reason : string

@@ -469,7 +469,7 @@ let evict_ghost_orders ~state ~now =
   then (
     let to_remove = ref [] in
     Hashtbl.iter
-      (fun k v -> if now > v then to_remove := k :: !to_remove)
+      (fun k (v, _side) -> if now > v then to_remove := k :: !to_remove)
       state.evicted_orders;
     List.iter (Hashtbl.remove state.evicted_orders) !to_remove)
 ;;
@@ -477,6 +477,60 @@ let evict_ghost_orders ~state ~now =
 let cleanup_pending_and_cooldowns ~state ~now ~(asset : trading_config) =
   expire_amend_cooldowns ~state ~now ~asset;
   evict_ghost_orders ~state ~now
+;;
+
+(** True when [order_id] is known terminal to the strategy regardless of what the venue's
+    open-order feed reports: evicted (a venue-terminal amend failure) or already filled
+    ([processed_fills]). Such an id must never be adopted as the resting buy. *)
+let is_terminal_order state order_id =
+  Hashtbl.mem state.evicted_orders order_id || Hashtbl.mem state.processed_fills order_id
+;;
+
+(** Recompute the cached best buy from the persistent buy index. Called when the current
+    best leaves, via a delta retraction or a terminal-order purge. *)
+let recompute_cached_best_buy state =
+  let best_id = ref "" in
+  let best_p = Array.make 1 0.0 in
+  Hashtbl.iter
+    (fun id (p, _) ->
+      if p > best_p.(0)
+      then (
+        best_id := id;
+        best_p.(0) <- p))
+    state.feed_buy_index;
+  state.cached_best_buy_id <- !best_id;
+  state.cached_best_buy_price <- best_p.(0)
+;;
+
+(** Drop indexed buys the strategy already knows are terminal ([is_terminal_order]). The
+    venue's REST snapshot and its trade stream are independent feeds, so a snapshot taken
+    before a fill propagates can resurrect a filled order in the local open-order cache -
+    and the generation-skip path republishes the cached best buy without rescanning.
+    Without this purge the stale id is re-adopted as the resting buy and re-amended every
+    cycle: a doomed venue-terminal amend whose failure re-evicts and clears tracking,
+    forever, while the buy leg never places a replacement. O(open buys) per cycle. Returns
+    the number purged. *)
+let purge_terminal_feed_buys ~state =
+  let to_drop =
+    Hashtbl.fold
+      (fun id (price, qty) acc ->
+        if is_terminal_order state id then (id, price, qty) :: acc else acc)
+      state.feed_buy_index
+      []
+  in
+  if to_drop = []
+  then 0
+  else (
+    let best_dropped = ref false in
+    List.iter
+      (fun (id, price, qty) ->
+        Hashtbl.remove state.feed_buy_index id;
+        state.cached_open_buy_count <- state.cached_open_buy_count - 1;
+        state.cached_locked_in_buys <- state.cached_locked_in_buys -. (price *. qty);
+        if state.cached_best_buy_id = id then best_dropped := true)
+      to_drop;
+    if !best_dropped then recompute_cached_best_buy state;
+    List.length to_drop)
 ;;
 
 (** Apply a drained per-order delta (venue change log) to the persistent feed indexes, the
@@ -514,19 +568,6 @@ let apply_open_order_delta ~state ~now_time ~ecfg ~changes =
     state.cached_closest_sell_order
     <- (if !best_id = "" then None else Some (!best_id, best_p.(0)))
   in
-  let recompute_best_buy () =
-    let best_id = ref "" in
-    let best_p = Array.make 1 0.0 in
-    Hashtbl.iter
-      (fun id (p, _) ->
-        if p > best_p.(0)
-        then (
-          best_id := id;
-          best_p.(0) <- p))
-      state.feed_buy_index;
-    state.cached_best_buy_id <- !best_id;
-    state.cached_best_buy_price <- best_p.(0)
-  in
   let recompute_recent_amend () =
     let found = ref false in
     Hashtbl.iter
@@ -544,7 +585,7 @@ let apply_open_order_delta ~state ~now_time ~ecfg ~changes =
          state.cached_open_buy_count <- state.cached_open_buy_count - 1;
          state.cached_locked_in_buys <- state.cached_locked_in_buys -. (p *. q);
          Hashtbl.remove state.feed_buy_index oid;
-         if state.cached_best_buy_id = oid then recompute_best_buy ();
+         if state.cached_best_buy_id = oid then recompute_cached_best_buy state;
          if state.cached_has_recent_amend_buy then recompute_recent_amend ()
        | None -> ());
       (match Hashtbl.find_opt state.feed_sell_index oid with
@@ -569,6 +610,7 @@ let apply_open_order_delta ~state ~now_time ~ecfg ~changes =
           qty > 0.0
           && is_our
           && (evicted_empty || not (Hashtbl.mem state.evicted_orders oid))
+          && not (Hashtbl.mem state.processed_fills oid)
         | None -> false
       in
       if keep
@@ -670,6 +712,18 @@ let sync_open_orders
     <- List.filter (fun (_, _, ts) -> now_time -. ts < 10.0) state.recently_injected_sells;
     if List.length state.recently_injected_sells > 20
     then state.recently_injected_sells <- take 20 state.recently_injected_sells);
+  (* Reconcile the persistent buy index against orders the strategy already knows are
+     terminal before any cache-skip/delta publication. A venue snapshot can re-list a
+     filled order, and the skip path republishes [cached_best_buy_id] without rescanning,
+     so the purge must run every cycle, not only on a full scan. *)
+  let purged = purge_terminal_feed_buys ~state in
+  if purged > 0
+  then
+    Logging.debug_f
+      ~section
+      "Purged %d terminal buy order(s) still listed in the %s open-orders feed"
+      purged
+      asset.symbol;
   let best_buy_price = ref 0.0 in
   let best_buy_id = ref "" in
   let open_buy_count_from_scan = ref 0 in
@@ -782,6 +836,7 @@ let sync_open_orders
       if qty > 0.0
          && is_our_strategy
          && (evicted_empty || not (Hashtbl.mem state.evicted_orders oid))
+         && not (Hashtbl.mem state.processed_fills oid)
       then
         if side_str = "buy"
         then (
@@ -989,7 +1044,10 @@ let sync_open_orders
         | Some expiry -> now < expiry
         | None -> false
       in
-      if not recent_amend
+      (* Defense-in-depth: the purge above should already have dropped any terminal id
+         from the index/cache, but never adopt one even if a future path republishes it -
+         the adopt -> doomed amend -> evict loop is what wedged the symbol. *)
+      if (not recent_amend) && not (is_terminal_order state best_order_id)
       then (
         add_tracked_order_id state best_order_id;
         state.last_buy_order_price <- Some best_price;
