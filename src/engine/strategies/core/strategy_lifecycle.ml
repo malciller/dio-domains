@@ -363,7 +363,15 @@ let evaluate_asset_low_recovery
           (asset_available +. unreflected -. state.reserved_base -. unnetted_hold)
       else asset_bal -. state.reserved_base -. committed_sell
     in
-    let balance_actually_changed = asset_balance > state.last_seen_asset_balance in
+    (* Compare the fill-aware ledger, not the raw venue snapshot. A just-filled buy raises
+       [asset_bal] through the un-reflected credit before the balance feed nets it, and
+       that fill is exactly the balance recovery this flag is waiting for. Testing the raw
+       snapshot made the credit invisible, so a latched [asset_low] stayed set until the
+       feed caught up (by then the credit had been consumed, and available could have
+       re-crossed the threshold the other way). [last_seen_asset_balance] still tracks the
+       raw snapshot for [reconcile_position], so the increase is measured against the
+       venue's last confirmed figure and a still-pending credit keeps the flag clearable. *)
+    let balance_actually_changed = asset_bal > state.last_seen_asset_balance in
     state.last_seen_asset_balance <- asset_balance;
     let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Sell" in
     let should_clear =

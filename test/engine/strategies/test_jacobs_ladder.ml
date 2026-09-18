@@ -2035,6 +2035,56 @@ let test_position_asset_low_recovery_sees_pending_credit () =
     state.resuming_after_balance_flag
 ;;
 
+let test_position_kraken_asset_low_recovery_sees_pending_credit () =
+  (* Kraken gates recovery on a balance increase. That increase must be read off the
+     fill-aware ledger: a just-filled buy raises [position_base + unreflected] before the
+     poll nets it, and gating on the raw snapshot left [asset_low] latched through the
+     whole credit window - buys kept amending while sells stayed wedged. *)
+  let symbol = "LEDGER17/XMR/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "kraken";
+  state.reserved_base <- 0.0096;
+  state.position_base <- 0.046;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 999.0;
+  state.last_seen_asset_balance <- 0.046;
+  state.buy_credits_since_balance <- [ 1000.5, 0.04 ];
+  state.attributed_balance_increase <- 0.0;
+  state.asset_low <- true;
+  state.inflight_sell <- true;
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "kraken"
+    ; symbol
+    ; qty = "0.04"
+    ; grid_interval = 0.16
+    ; sell_mult = "0.98"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0016
+    ; taker_fee = None
+    ; accumulation_buffer = 0.3
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
+  Dio_strategies.Strategy_api.evaluate_asset_low_recovery
+    ~state
+    ~now:1001.0
+    ~base_balance_age:(Some 0.5)
+    ~ecfg
+    ~asset
+    ~asset_balance:0.046
+    ~lot_qty:0.04
+    ~unnetted_hold:0.0;
+  check
+    bool
+    "kraken asset_low clears on the fill-aware ledger though the raw poll is unchanged"
+    false
+    state.asset_low;
+  check bool "recovery clears the in-flight sell latch" false state.inflight_sell
+;;
+
 let test_position_sell_hold_releases_fifo_on_netting () =
   (* A resting sell's hold is retired only by an observed tradeable drop, and drops retire
      the OLDEST hold first. Per-hold baselines were gameable: an older hold netting
@@ -7097,6 +7147,10 @@ let () =
             "asset_low recovery uses the fill-aware ledger"
             `Quick
             test_position_asset_low_recovery_sees_pending_credit
+        ; test_case
+            "kraken asset_low recovery sees the pending buy credit"
+            `Quick
+            test_position_kraken_asset_low_recovery_sees_pending_credit
         ; test_case
             "sell hold netting retires the oldest hold FIFO, buys never do"
             `Quick
