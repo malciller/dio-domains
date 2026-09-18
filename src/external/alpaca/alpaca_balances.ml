@@ -96,7 +96,7 @@ let update_balances () =
     let new_marks = Hashtbl.create 16 in
     let new_available = Hashtbl.create 16 in
     Hashtbl.replace new_balances "USD" acc.cash;
-    Hashtbl.replace new_total "USD" acc.equity;
+    Hashtbl.replace new_total "USD" acc.cash;
     Hashtbl.replace new_available "USD" acc.cash;
     Hashtbl.replace new_balances "USDC" acc.cash;
     Hashtbl.replace new_available "USDC" acc.cash;
