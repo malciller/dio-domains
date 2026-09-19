@@ -133,6 +133,7 @@ let publish ~(on_publish : string list -> decision list -> unit) (fresh : decisi
         | None -> true
         | Some old ->
           old.active <> d.active
+          || old.cancel_resting_buys <> d.cancel_resting_buys
           || Float.abs (old.grid_interval -. d.grid_interval) > 1e-12
           || Float.abs (old.buy_qty -. d.buy_qty) > 1e-12
           || Float.abs (old.sell_qty -. d.sell_qty) > 1e-12)
@@ -443,24 +444,6 @@ let split_symbol (symbol : string) : string * string =
   | None -> symbol, "USD"
   | Some i ->
     String.sub symbol 0 i, String.sub symbol (i + 1) (String.length symbol - i - 1)
-;;
-
-(** Quote tied in resting buys for one asset: fold of the in-process open order registry
-    (remaining qty x limit price). Zero network. *)
-let committed_buy_value ~(exchange : string) ~(symbol : string) : float =
-  match Exchange.Registry.get exchange with
-  | None -> 0.0
-  | Some (module Ex) ->
-    Ex.fold_open_orders ~symbol ~init:0.0 ~f:(fun acc (o : Exchange.Types.open_order) ->
-      if o.side = Exchange.Types.Buy && o.remaining_qty > 0.0
-      then
-        acc
-        +. (o.remaining_qty
-            *.
-            match o.limit_price with
-            | Some p -> p
-            | None -> 0.0)
-      else acc)
 ;;
 
 (** Whether one asset currently has a resting buy order on exchange. Zero network. *)
@@ -814,8 +797,12 @@ let string_of_branch = function
 ;;
 
 (** One venue re-resolve: walk the account's strategies in config order, size each against
-    the entire remaining pool, deduct each funded need, and fire the cancellation cascade
-    for starved strategies. *)
+    the free pool remaining at its turn, and deduct each funded need. A starved survivor
+    (survival met but next buy does not fit) reclaims its shortfall by flagging the
+    minimum set of lower-priority resting buys for cancellation; the freed quote is
+    reserved for it and lower-priority strategies are held inactive until the cancels land
+    and the cancel event wakes the next pass to fund it. Resting buys are already
+    committed, so they do not consume free quote. *)
 let run_account_pass
   ~(config : runtime_config)
   ~(account : account)
@@ -866,6 +853,38 @@ let run_account_pass
         task_rows
     in
     let total_venue_quote = pool +. committed_venue_buys in
+    let key_of_task (t : Oracle_tasks.task) =
+      Printf.sprintf "%s|%s" t.exchange t.symbol
+    in
+    (* Per-strategy reclaim candidates: the lower-priority (later config position)
+       strategies holding resting buys, precomputed once. The cascade draws only from
+       these, so a senior strategy can never reclaim a peer's or its own capital. *)
+    let lower_claims =
+      let indexed = List.mapi (fun i row -> i, row) task_rows in
+      List.map
+        (fun (i, ((t : Oracle_tasks.task), _, _, _, _)) ->
+          let claims =
+            List.filter_map
+              (fun (j, ((lt : Oracle_tasks.task), (_, lcommitted, _), _, _, _)) ->
+                if j > i && lcommitted > 0.0
+                then
+                  Some
+                    { Oracle_pools.id = key_of_task lt
+                    ; priority = j
+                    ; need_quote = 0.0
+                    ; resting_buy_quote = lcommitted
+                    }
+                else None)
+              indexed
+          in
+          key_of_task t, claims)
+        indexed
+    in
+    (* One reclaim wave per pass: once a starved senior strategy has a feasible
+       cancellation plan, lower-priority strategies are held inactive until the cancels
+       land and the cancel event wakes a fresh pass. *)
+    let reclaim_active = ref false in
+    let flagged : string list ref = ref [] in
     let remaining = ref pool in
     let built
       : (Oracle_tasks.task * decision * float * float * Oracle_pipeline.outcome option)
@@ -982,20 +1001,66 @@ let run_account_pass
                 ; updated_at = Unix.gettimeofday ()
                 }
               in
+              let need = d.buy_qty *. current in
+              let key = key_of_task t in
+              let survival_active =
+                o.resolution.d_surv >= min_active_dsurv || resting_buy
+              in
+              let d =
+                if List.mem key !flagged
+                then
+                  { d with
+                    active = false
+                  ; reason = "capital reallocated to higher-priority strategy"
+                  }
+                else if d.active
+                then (
+                  (* Funded strategies tie their next buy's quote; starved ones pass
+                     capacity down. Resting buys are already committed in the pool, so
+                     only fresh active placements consume free quote. *)
+                  if (not resting_buy) && need <= !remaining +. 1e-9
+                  then remaining := !remaining -. need;
+                  d)
+                else if survival_active && not !reclaim_active
+                then (
+                  (* Starved survivor: evaluate lower-priority resting buys and cancel the
+                     minimum set that frees this strategy's shortfall. On success the
+                     freed quote is reserved for this strategy, lower-priority strategies
+                     are held inactive for the rest of the pass, and the cancel event
+                     wakes the next pass to fund it - no timed run required. *)
+                  let claims =
+                    Option.value (List.assoc_opt key lower_claims) ~default:[]
+                  in
+                  let available = !remaining in
+                  let plan =
+                    Oracle_pools.cascade ~available ~need ~trigger_id:key ~claims
+                  in
+                  if plan <> []
+                  then (
+                    reclaim_active := true;
+                    flagged := List.rev_append plan !flagged;
+                    remaining := 0.0;
+                    Logging.info_f
+                      ~section
+                      "cancellation cascade for %s/%s (need $%.2f vs $%.2f available): \
+                       cancelling resting buys of [%s]"
+                      t.exchange
+                      t.symbol
+                      need
+                      available
+                      (String.concat ", " plan);
+                    { d with
+                      active = false
+                    ; reason = "awaiting reactivation: quote does not cover buy"
+                    })
+                  else d)
+                else d
+              in
               record_asset_latency t.symbol (span_from t_asset) (fun () ->
                 if d.active then "active" else "inactive");
-              let need = d.buy_qty *. current in
-              (* Funded strategies tie their next buy's quote; starved ones pass capacity
-                 down. Resting buys are already committed in the pool, so only fresh
-                 active placements consume free quote. *)
-              if d.active && (not resting_buy) && need <= !remaining +. 1e-9
-              then remaining := !remaining -. need;
               built := (t, d, need, current, Some o) :: !built))
       task_rows;
     let built_rev = List.rev !built in
-    let key_of_task (t : Oracle_tasks.task) =
-      Printf.sprintf "%s|%s" t.exchange t.symbol
-    in
     let global_index (lt : Oracle_tasks.task) =
       let rec pos (k : int) (l : Oracle_tasks.task list) : int =
         match l with
@@ -1057,62 +1122,6 @@ let run_account_pass
           else t, { d with d_surv = 0.0 }, need, current, outcome)
         built_rev
     in
-    (* Cancellation cascade: a starved strategy (survival met but next buy does not fit)
-       cancels lower-priority resting buys until its need fits. The trigger's own orders
-       are never cancelled. If no combination fits, resolution proceeds to the
-       next-highest priority and capacity stays with its owners. Cancelled strategies
-       re-evaluate on the cancel event this pass triggers, resuming iff quote covers their
-       buy. *)
-    let rec drop n = function
-      | l when n <= 0 -> l
-      | [] -> []
-      | _ :: r -> drop (n - 1) r
-    in
-    let flagged : string list ref = ref [] in
-    List.iter
-      (fun ((t, d, need, _current, outcome) :
-             Oracle_tasks.task * decision * float * float * Oracle_pipeline.outcome option) ->
-        match outcome with
-        | None -> ()
-        | Some _ when d.active -> ()
-        | Some _ ->
-          let lower = drop (global_index t + 1) tasks in
-          let claims =
-            lower
-            |> List.filter (fun (lt : Oracle_tasks.task) ->
-              committed_buy_value ~exchange:lt.exchange ~symbol:lt.symbol > 0.0)
-            |> List.map (fun (lt : Oracle_tasks.task) ->
-              (* Global config index: higher index = lower seniority, so descending sort
-                 cancels the least senior first. *)
-              { Oracle_pools.id = key_of_task lt
-              ; priority = global_index lt
-              ; need_quote = 0.0
-              ; resting_buy_quote =
-                  committed_buy_value ~exchange:lt.exchange ~symbol:lt.symbol
-              })
-          in
-          let plan =
-            Oracle_pools.cascade
-              ~available:!remaining
-              ~need
-              ~trigger_id:(key_of_task t)
-              ~claims
-          in
-          if plan <> []
-          then (
-            flagged := List.rev_append plan !flagged;
-            Logging.info_f
-              ~section
-              "cancellation cascade for %s/%s (need $%.2f vs $%.2f available): \
-               cancelling resting buys of [%s]"
-              t.exchange
-              t.symbol
-              need
-              !remaining
-              (String.concat ", " plan);
-            ())
-          else ())
-      built_rev;
     Lwt.return
       (List.map
          (fun ((_, d, _, _, _) :
