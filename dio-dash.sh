@@ -37,7 +37,7 @@ case "${1:-}" in
 esac
 
 is_running() {
-  [[ "$(docker ps -a --filter "name=^/${NAME}$" --format '{{.Running}}')" == "true" ]]
+  [[ "$(docker inspect -f '{{.State.Running}}' "${NAME}" 2>/dev/null)" == "true" ]]
 }
 
 if is_running; then
