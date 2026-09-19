@@ -15,6 +15,11 @@ Authoring and tooling:
 - `dio strategy validate <file>`: static check of a `.strategy` or `.json` file.
 - `dio strategy compile <file.strategy> [-o out.json]`: lower to the AST; optionally
   emit the JSON render for inspection/diffing.
+- `dio strategy lsp`: minimal Language Server Protocol server over stdio
+  ([Strategy_lsp](harness/strategy_lsp.ml)) driving in-editor validation. The
+  companion VS Code extension lives in `editors/vscode-strategy`: TextMate
+  grammar for syntax highlighting plus a dependency-free LSP client that
+  surfaces the same diagnostics `validate` reports.
 - Binding is by convention: `config.json` names a strategy, and the loader tries
   `strategies/<name>.strategy` then `strategies/<name>.json`.
 

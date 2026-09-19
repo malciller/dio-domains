@@ -1,0 +1,84 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "strategy",
+  "scopeName": "source.strategy",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#refs" },
+    { "include": "#numbers" },
+    { "include": "#booleans" },
+    { "include": "#labels" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "match": "(--|//|#).*$",
+          "name": "comment.line.strategy"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "begin": "\"",
+          "end": "\"",
+          "name": "string.quoted.double.strategy",
+          "patterns": [
+            {
+              "match": "\\\\(.)",
+              "name": "constant.character.escape.strategy"
+            }
+          ]
+        }
+      ]
+    },
+    "refs": {
+      "match": "\\$[a-zA-Z][a-zA-Z0-9._]*",
+      "name": "variable.other.ref.strategy"
+    },
+    "numbers": {
+      "match": "\\b(\\d+(\\.\\d+)?([eE][+-]?\\d+)?)\\b",
+      "name": "constant.numeric.strategy"
+    },
+    "booleans": {
+      "match": "\\b(true|false)\\b",
+      "name": "constant.language.boolean.strategy"
+    },
+    "labels": {
+      "patterns": [
+        {
+          "match": "^(\\s*when\\s+)([a-zA-Z][a-zA-Z0-9._]*)(\\s*:)",
+          "captures": {
+            "1": { "name": "keyword.control.strategy" },
+            "2": { "name": "entity.name.function.trigger.strategy" },
+            "3": { "name": "punctuation.separator.strategy" }
+          }
+        },
+        {
+          "match": "^(\\s*)([a-zA-Z][a-zA-Z0-9._]*)(\\s*:)",
+          "captures": {
+            "2": { "name": "entity.name.function.step.strategy" },
+            "3": { "name": "punctuation.separator.strategy" }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "match": "\\b(strategy|version|remembers|tunable|when|if|otherwise|else|stop|let|bind|persist|and|or|not)\\b",
+      "name": "keyword.control.strategy"
+    },
+    "types": {
+      "match": "\\b(bool|int|float|string|decimal_str|range)\\b",
+      "name": "storage.type.strategy"
+    },
+    "operators": {
+      "match": "==|!=|<=|>=|&&|\\|\\||=|\\+|-|\\*|/|<|>",
+      "name": "keyword.operator.strategy"
+    }
+  }
+}

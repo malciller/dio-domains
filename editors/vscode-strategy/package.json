@@ -1,0 +1,51 @@
+{
+  "name": "dio-strategy",
+  "displayName": "Dio Strategy",
+  "description": "Syntax highlighting and validation for .strategy files, via the `dio strategy lsp` server.",
+  "version": "0.1.0",
+  "publisher": "dio-trading",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "main": "./client/extension.js",
+  "activationEvents": [
+    "onLanguage:strategy"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "strategy",
+        "aliases": [
+          "Dio Strategy",
+          "strategy"
+        ],
+        "extensions": [
+          ".strategy"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "strategy",
+        "scopeName": "source.strategy",
+        "path": "./syntaxes/strategy.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Dio Strategy",
+      "properties": {
+        "dioStrategy.binary": {
+          "type": "string",
+          "default": "dio",
+          "description": "Path to the dio binary used for `dio strategy lsp`. Set this if dio is not on PATH."
+        }
+      }
+    }
+  }
+}

@@ -8,7 +8,8 @@ let usage =
   "Usage:\n\
   \  dio strategy validate <file>\n\
   \  dio strategy compile <file.strategy> [-o out.json]\n\
-  \  dio strategy diff <a> <b>"
+  \  dio strategy diff <a> <b>\n\
+  \  dio strategy lsp"
 ;;
 
 let print_diagnostic (d : Strategy_compile.diagnostic) =
@@ -96,6 +97,7 @@ let maybe_run (argv : string array) : int option =
     in
     Some (compile_file file output)
   | _ :: "strategy" :: "diff" :: a :: b :: _ -> Some (diff_files a b)
+  | _ :: "strategy" :: "lsp" :: _ -> Some (Strategy_lsp.run ())
   | _ :: "strategy" :: _ ->
     Printf.eprintf "%s\n" usage;
     Some 2

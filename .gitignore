@@ -21,7 +21,8 @@ proxy/cloudflare/node_modules/
 *.csv
 *.txt
 *.html
-.vscode/
+.vscode/*
+!.vscode/settings.json
 .cursor/
 __pycache__
 *.pdf
@@ -32,6 +33,10 @@ utils/
 reference/
 data/
 uniswap/
+node_modules/
+# Packaged VS Code extension artifact (rebuilt with `npx @vscode/vsce package` in
+# editors/vscode-strategy); the source under editors/ stays tracked.
+*.vsix
 # Files containing detailed information about the compilation (generated
 # by `ocamlc`/`ocamlopt` when invoked using the option `-bin-annot`).
 # These files are typically useful for code inspection tools
