@@ -140,6 +140,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
   let a_text = t.a_text in
   let a_bright = t.a_bright in
   let a_green = t.a_green in
+  let a_green_dark = t.a_green_dark in
   let a_red = t.a_red in
   let a_yellow = t.a_yellow in
   let a_cyan = t.a_cyan in
@@ -327,6 +328,57 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
           ; I.string a_text (format_usd quote_bal)
           ]
     in
+    (* Latency row: the asset's own INTERNAL (in-process) and NETWORK (exchange
+       round-trip) windows, keyed per-symbol in the snapshot's [latencies]. Shows the p99
+       of the headline metrics with the same warn/crit coloring as the ENGINE LATENCY
+       table ([latencies.ml]). *)
+    let latency_row =
+      let lat_metrics =
+        Option.value ~default:[] (List.assoc_opt a.symbol snapshot.latencies)
+      in
+      let lat_p99 label =
+        match List.assoc_opt label lat_metrics with
+        | Some (m : Snapshot.latency_metric) when m.samples > 0 -> Some m.p99
+        | _ -> None
+      in
+      let sev_attr label f =
+        let warn_us, crit_us =
+          match label with
+          | "cycle" -> 50.0, 100.0
+          | "oracle" | "orderbook" | "prep" | "strategy" | "execution" -> 10.0, 20.0
+          | "ws_ping" -> 20_000.0, 100_000.0
+          | "ws_feed" -> 50_000.0, 200_000.0
+          | "rest_request" -> 100_000.0, 500_000.0
+          | "signer" -> 1_000.0, 10_000.0
+          | _ -> 50.0, 100.0
+        in
+        if f > crit_us then a_red else if f >= warn_us then a_yellow else a_green
+      in
+      let lat_cell label =
+        match lat_p99 label with
+        | Some f ->
+          let attr = if Theme.is_sub_us f then a_green_dark else sev_attr label f in
+          I.string attr (format_latency_us f)
+        | None -> I.string a_dim "--"
+      in
+      let item label short =
+        I.hcat [ I.string a_label (" " ^ short ^ " "); lat_cell label ]
+      in
+      I.hcat
+        [ I.string a_label " Latency: "
+        ; I.string a_dim "INT "
+        ; item "oracle" "ORACLE"
+        ; I.string a_dim " │ "
+        ; item "cycle" "TOTAL"
+        ; I.string a_dim " │ "
+        ; I.string a_dim "NET "
+        ; item "ws_feed" "FEED"
+        ; I.string a_dim " │ "
+        ; item "ws_ping" "PING"
+        ; I.string a_dim " │ "
+        ; item "signer" "SIGN"
+        ]
+    in
     let summary_card =
       (* Oracle line (rendered only when a decision exists): ACTIVE/INACTIVE verdict (the
          oracle-paused state), sizing, and reason. *)
@@ -387,6 +439,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         I.vcat
           [ close_row w (I.hcat [ I.string a_border " │"; r1 ])
           ; close_row w (I.hcat [ I.string a_border " │"; r2 ])
+          ; close_row w (I.hcat [ I.string a_border " │"; latency_row ])
           ]
       in
       match oracle_line with
