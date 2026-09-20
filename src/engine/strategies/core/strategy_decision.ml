@@ -856,6 +856,8 @@ type sell_pre =
   ; sp_alpaca_available : float
   ; sp_available_base : float
   ; sp_committed_sell : float
+  ; sp_unnetted_hold : float
+  ; sp_unreflected_credit : float
   ; sp_reserve_headroom : float
   ; sp_inventory_basis : float
   ; sp_inventory_ok : bool
@@ -1158,6 +1160,8 @@ let sell_leg_prepare
   ; sp_alpaca_available = alpaca_available
   ; sp_available_base = available_base
   ; sp_committed_sell = committed_sell
+  ; sp_unnetted_hold = unnetted_hold
+  ; sp_unreflected_credit = unreflected_credit
   ; sp_reserve_headroom = reserve_headroom
   ; sp_inventory_basis = inventory_basis
   ; sp_inventory_ok = inventory_ok
@@ -1197,6 +1201,8 @@ let sell_place_body
   let alpaca_available = pre.sp_alpaca_available in
   let ledger_balance = pre.sp_ledger_balance in
   let committed_sell = pre.sp_committed_sell in
+  let unnetted_hold = pre.sp_unnetted_hold in
+  let unreflected_credit = pre.sp_unreflected_credit in
   let capital_exhausted = pre.sp_capital_exhausted in
   let halt_inventory_check = pre.sp_halt_inventory_check in
   let missing_after_reconcile = pre.sp_missing_after_reconcile in
@@ -1284,11 +1290,25 @@ let sell_place_body
     if ecfg.use_reserved_base_guard
     then (
       let rounded_avail = round_qty available asset.symbol asset.exchange in
+      (* The surplus sweep sizes a triggered sell to the WHOLE non-reserved balance. Its
+         basis ([available]) is the venue figure overlaid by the un-netted buy credits,
+         and on a hold-netted venue [committed_sell] collapses to the short
+         [unnetted_hold] overlay. Under a burst the figure momentarily over-reports (a buy
+         is credited before the feed nets it, and a sell fill does not decrement the
+         ledger on accumulation venues), so sweeping the full available can offer base
+         that already left - dipping into reserved_base. The sweep therefore runs only
+         while both feed-lag overlays are clear; with an un-netted sell hold or buy credit
+         outstanding the owed 1:1 lot is placed and the hold guard re-armed. *)
+      let sweep_eligible =
+        (not is_alpaca)
+        && target_sell_qty_override = None
+        && not ecfg.remaintain_expired_sells
+      in
+      let sizing_basis_clean = unnetted_hold <= 1e-12 && unreflected_credit <= 1e-12 in
       if available >= target_q -. 1e-6 && target_q > 0.0
       then
-        if (not is_alpaca)
-           && target_sell_qty_override = None
-           && (not ecfg.remaintain_expired_sells)
+        if sweep_eligible
+           && sizing_basis_clean
            && rounded_avail >= target_q
            && rounded_avail >= min_order_size -. 1e-9
         then (
@@ -1303,7 +1323,21 @@ let sell_place_body
             min_order_size;
           rounded_avail, true)
         else if target_q >= min_order_size -. 1e-9
-        then target_q, true
+        then (
+          if sweep_eligible
+             && (not sizing_basis_clean)
+             && rounded_avail > target_q +. 1e-9
+          then
+            Logging.debug_f
+              ~section
+              "Sell order capped for %s at the owed qty %.8f (surplus %.8f withheld): \
+               sizing basis un-netted (hold %.8f, credit %.8f)"
+              asset.symbol
+              target_q
+              rounded_avail
+              unnetted_hold
+              unreflected_credit;
+          target_q, true)
         else (
           log_sell_block
             ~state
