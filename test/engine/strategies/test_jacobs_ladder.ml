@@ -1028,6 +1028,148 @@ let test_unnetted_sell_hold_ignores_buy_increase () =
   drain ()
 ;;
 
+let test_surplus_sweep_capped_under_buy_burst () =
+  (* REGRESSION (reserved_base oversell, BTC/USDC 1% wick): within one balance-feed lag
+     window a buy fill is credited to the sizing overlay before the feed nets it, while a
+     sell fill does not decrement the ledger on an accumulation venue. The surplus sweep
+     then sized a triggered sell to the WHOLE non-reserved float - base that had already
+     left - and the sell dipped into reserved_base (the third sell was 2x the 1:1 lot).
+     The sweep now runs only on a caught-up basis: with a buy credit outstanding (or a
+     fresh buy), the owed 1:1 lot is placed and the hold guard re-armed. A caught-up basis
+     still sweeps, so the feature is preserved. *)
+  let symbol = "BURST_CAP/BTC/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:5;
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.0003;
+  state.maker_fee <- 0.0;
+  state.cached_sell_mult <- 0.999;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.cached_qty_increment <- 0.00001;
+  state.reserved_base <- 0.05;
+  state.accumulated_profit <- 0.0;
+  Sell_orders.clear state.open_sell_orders;
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- false;
+  state.position_base <- 0.05;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 0.0;
+  state.last_seen_asset_balance <- 0.05;
+  state.buy_credits_since_balance <- [];
+  state.attributed_balance_increase <- 0.0;
+  state.last_balance_delta <- 0.0;
+  state.sell_holds_since_balance <- [];
+  state.last_buy_fill_price <- None;
+  state.last_buy_fill_qty <- None;
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done symbol;
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.0003"
+    ; grid_interval = 0.16
+    ; sell_mult = "0.999"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.25
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  let lot = 0.0003 in
+  let placed_sell_qty () =
+    List.fold_left
+      (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+        match o.operation, o.side with
+        | Place, Sell when o.symbol = symbol -> acc +. o.qty
+        | _ -> acc)
+      0.0
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
+  in
+  let run_sell_leg ~now ~asset_balance ~buy_attempted ~oracle_halted =
+    Dio_strategies.Strategy_api.evaluate_sell_leg
+      ~persisted_reconcile:
+        (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
+      ~state
+      ~now
+      ~asset
+      ~bid_price:80095.0
+      ~ask_price:80095.1
+      ~asset_balance
+      ~buy_attempted
+      ~oracle_halted
+      ~ecfg
+      ~locked_in_sells:0.0
+      ~base_balance_age:None
+  in
+  drain ();
+  (* Two buy fills land inside one feed lag; the venue figure is still the fully-reserved
+     0.05, so the sizer's only inventory is the two un-netted buy credits (2 lots). *)
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
+    ~now:100.0
+    symbol
+    "burst_cap_buy_0"
+    Dio_strategies.Strategy_common.Buy
+    ~fill_price:80095.0
+    ~fill_qty:lot
+    None;
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
+    ~now:100.5
+    symbol
+    "burst_cap_buy_1"
+    Dio_strategies.Strategy_common.Buy
+    ~fill_price:80095.0
+    ~fill_qty:lot
+    None;
+  check
+    bool
+    "two un-netted buy credits are pending"
+    true
+    (abs_float
+       (List.fold_left (fun a (_, q) -> a +. q) 0.0 state.buy_credits_since_balance
+        -. (2.0 *. lot))
+     < 1e-12);
+  run_sell_leg ~now:101.0 ~asset_balance:0.05 ~buy_attempted:true ~oracle_halted:false;
+  let burst_qty = placed_sell_qty () in
+  check bool "a sell is placed on the burst tick" true (burst_qty > 0.0);
+  check
+    bool
+    "the burst sell is capped at the owed 1:1 lot (no sweep into reserved_base)"
+    true
+    (abs_float (burst_qty -. lot) < 1e-9);
+  drain ();
+  (* Caught-up basis (feed reflects the buys, no pending credit): the sweep still runs. *)
+  state.just_filled_buy <- false;
+  state.buy_credits_since_balance <- [];
+  state.attributed_balance_increase <- 0.0;
+  state.sell_holds_since_balance <- [];
+  state.position_base <- 0.0506;
+  state.last_seen_asset_balance <- 0.0506;
+  state.inflight_sell <- false;
+  ignore
+    (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+       state.duplicate_key_sell);
+  Sell_orders.clear state.open_sell_orders;
+  state.pending_orders <- [];
+  run_sell_leg ~now:102.0 ~asset_balance:0.0506 ~buy_attempted:false ~oracle_halted:true;
+  let swept_qty = placed_sell_qty () in
+  check
+    bool
+    "a caught-up basis still sweeps the non-reserved surplus"
+    true
+    (swept_qty > lot +. 1e-9);
+  drain ()
+;;
+
 let test_ghost_buy_suppressed_within_ack_grace () =
   (* REGRESSION (rapid-fill churn): a just-acked buy is not yet listed by the open-orders
      feed. The old scan saw zero open buys, no in-flight flag (the ack cleared it), and no
@@ -7071,6 +7213,10 @@ let () =
             "buy-fill increase does not release the unnetted sell hold"
             `Quick
             test_unnetted_sell_hold_ignores_buy_increase
+        ; test_case
+            "surplus sweep is capped at the owed lot during a buy burst"
+            `Quick
+            test_surplus_sweep_capped_under_buy_burst
         ; test_case
             "freshly acked buy is not purged as a ghost within the grace"
             `Quick
