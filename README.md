@@ -70,7 +70,8 @@ background work stays on efficiency cores, and real-time `SCHED_FIFO` priority i
 available through `DIO_TRADING_RT_PRIO` on a dedicated host. The strategy
 interpreter resolves action handlers at load, prewarms guards, and hoists
 per-cycle closures out of the steady state. The OxCaml flambda2 build uses
-`local_` allocation mode, and CI fails on any compiler alert.
+`local_` allocation mode, and CI fails on a compiler `Alert` emitted while
+building and running the test suite.
 
 Latency and allocation are observable through every phase of the cycle:
 
@@ -96,9 +97,12 @@ when book.updates:
 ```
 
 `dio strategy validate <file>` checks a strategy statically.
-`dio strategy compile <file.strategy>` emits its JSON form. The
-[strategy script guide](https://diophantsolutions.com/dio/STRATEGY/) documents
-the language and the action vocabulary.
+`dio strategy compile <file.strategy>` emits its JSON form.
+`dio strategy replay <file>` runs one against a recorded trace.
+`dio strategy lsp` serves the language server the editor extension talks to.
+
+The [strategy script guide](https://diophantsolutions.com/dio/STRATEGY/)
+documents the language and the action vocabulary.
 
 ## Documentation
 
