@@ -60,8 +60,13 @@ type domain_state =
       domains than trading CPUs): the domain stays unpinned and shares. *)
   }
 
-(** Global registry mapping domain keys to their supervisor state. *)
-let domain_registry : (string, domain_state) Hashtbl.t = Hashtbl.create 32
+(* Global registry mapping domain keys to their supervisor state. Inserted and removed
+   under [registry_mutex] by the supervisor, but read by each trading Domain at the top of
+   its loop to fetch its own state — that read bypassed the lock, so a domain restarting
+   while another reads was a live resize race. Copy-on-write makes the read lock-free. *)
+let domain_registry : (string, domain_state) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:32 ()
+;;
 
 let registry_mutex = Mutex.create ()
 
@@ -474,7 +479,11 @@ let asset_domain_worker
       asset_with_fees.symbol
       asset_with_fees.strategy;
     let key = domain_key asset_with_fees in
-    let state = Hashtbl.find domain_registry key in
+    let state =
+      match Ds.Cow_table.find_opt domain_registry key with
+      | Some st -> st
+      | None -> failwith (Printf.sprintf "domain state missing for key %s" key)
+    in
     Logging.debug_f
       ~section
       "Entering domain loop for %s. is_running=%B"
@@ -1969,7 +1978,7 @@ let register_domain asset =
     }
   in
   Mutex.lock registry_mutex;
-  Hashtbl.replace domain_registry key state;
+  Ds.Cow_table.set domain_registry key state;
   Mutex.unlock registry_mutex;
   state
 ;;
@@ -2152,7 +2161,7 @@ let supervisor_loop config fee_fetcher =
       (* Re-check shutdown flag after waking *)
       if Atomic.get shutdown_requested then raise Exit;
       Mutex.lock registry_mutex;
-      let domains = Hashtbl.to_seq_values domain_registry |> List.of_seq in
+      let domains = Ds.Cow_table.fold (fun _ st acc -> st :: acc) domain_registry ~init:[] in
       Mutex.unlock registry_mutex;
       List.iter
         (fun state ->
@@ -2236,7 +2245,7 @@ let spawn_supervised_domains_for_assets
   Config.apply_gc_config ();
   (* Spawn the initial domain for each registered asset *)
   Mutex.lock registry_mutex;
-  let all_states = Hashtbl.to_seq_values domain_registry |> List.of_seq in
+  let all_states = Ds.Cow_table.fold (fun _ st acc -> st :: acc) domain_registry ~init:[] in
   Mutex.unlock registry_mutex;
   List.iter (fun state -> ignore (start_domain config state fee_fetcher)) all_states;
   (* Launch the supervisor monitoring thread *)
@@ -2249,14 +2258,14 @@ let spawn_supervised_domains_for_assets
 let get_domain_status () =
   Mutex.lock registry_mutex;
   let status =
-    Hashtbl.fold
+    Ds.Cow_table.fold
       (fun key state acc ->
         let running = Atomic.get state.is_running in
         let restart_count = Atomic.get state.restart_count in
         let last_restart = Atomic.get state.last_restart in
         (key, (running, restart_count, last_restart)) :: acc)
       domain_registry
-      []
+      ~init:[]
   in
   Mutex.unlock registry_mutex;
   status
@@ -2265,7 +2274,7 @@ let get_domain_status () =
 (** Clear the domain registry. Intended for test teardown only. *)
 let clear_domain_registry () =
   Mutex.lock registry_mutex;
-  Hashtbl.clear domain_registry;
+  Ds.Cow_table.clear domain_registry;
   Mutex.unlock registry_mutex
 ;;
 
@@ -2302,7 +2311,7 @@ let stop_all_domains () =
   (* Set shutdown flag to prevent supervisor from restarting domains *)
   Atomic.set shutdown_requested true;
   Mutex.lock registry_mutex;
-  let all_states = Hashtbl.to_seq_values domain_registry |> List.of_seq in
+  let all_states = Ds.Cow_table.fold (fun _ st acc -> st :: acc) domain_registry ~init:[] in
   Mutex.unlock registry_mutex;
   List.iter stop_domain all_states;
   (* Poll until all domains have stopped or timeout expires *)

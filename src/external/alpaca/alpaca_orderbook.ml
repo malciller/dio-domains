@@ -182,17 +182,17 @@ module SymbolStore = struct
   ;;
 end
 
-let stores : (string, SymbolStore.t) Hashtbl.t = Hashtbl.create 16
+let stores = Ds.Cow_table.create ~shard_count:32 ()
 let stores_mutex = Mutex.create ()
 
 let get_or_create_store symbol =
   Mutex.lock stores_mutex;
   let store =
-    match Hashtbl.find_opt stores symbol with
+    match Ds.Cow_table.find_opt stores symbol with
     | Some s -> s
     | None ->
       let s = SymbolStore.create symbol 1024 in
-      Hashtbl.replace stores symbol s;
+      Ds.Cow_table.set stores symbol s;
       s
   in
   Mutex.unlock stores_mutex;
@@ -209,7 +209,7 @@ let last_pong_time = ref 0.0
 let pong_condition = Lwt_condition.create ()
 
 let get_best_bid_ask symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> SymbolStore.get_best_bid_ask store
   | None ->
     (match Alpaca_balances.get_position_price symbol with
@@ -223,7 +223,7 @@ let get_best_bid_ask_fast symbol =
 ;;
 
 let get_current_position symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> SymbolStore.get_current_position store
   | None -> 0
 ;;
@@ -236,25 +236,25 @@ let get_current_position_fast symbol =
 (** [true] once a quote with a non-zero side has populated [symbol]. Ignores freshness so
     an illiquid symbol remains present between ticks. *)
 let has_orderbook_data symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> SymbolStore.has_data store
   | None -> false
 ;;
 
 let read_orderbook_events symbol start_pos =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> SymbolStore.read_events store start_pos
   | None -> []
 ;;
 
 let get_recent_trades symbol count =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> SymbolStore.get_recent_trades store count
   | None -> []
 ;;
 
 let iter_orderbook_events symbol start_pos f =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> SymbolStore.iter_events store start_pos f
   | None -> start_pos
 ;;

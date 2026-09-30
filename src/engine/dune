@@ -3,6 +3,7 @@
  (public_name dio.engine)
  (libraries
   yojson
+  dio.data_structures
   logging
   dio.kraken
   dio.ibkr

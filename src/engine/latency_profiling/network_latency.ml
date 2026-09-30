@@ -28,7 +28,14 @@ type t =
   ; signer : Latency_profiler.t
   }
 
-let profilers : (string, t) Hashtbl.t = Hashtbl.create 8
+(* Per-venue profiler registry. Insertion was under [mutex] while the 10s publisher and
+   the dashboard read it without one — latent rather than live, because every caller today
+   passes one of the four hardcoded venue names that [venue_profilers] short-circuits, but
+   it arms the moment anyone records a custom venue. Copy-on-write closes it for good. *)
+let profilers : (string, t) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:8 ()
+;;
+
 let mutex = Mutex.create ()
 
 (** Coarse bucket width and upper bound for the network RTT/latency metrics. 1ms buckets
@@ -66,10 +73,10 @@ let lighter_profilers = create_venue_profilers "lighter"
 let alpaca_profilers = create_venue_profilers "alpaca"
 
 let () =
-  Hashtbl.replace profilers "hyperliquid" hl_profilers;
-  Hashtbl.replace profilers "kraken" kraken_profilers;
-  Hashtbl.replace profilers "lighter" lighter_profilers;
-  Hashtbl.replace profilers "alpaca" alpaca_profilers
+  Ds.Cow_table.set profilers "hyperliquid" hl_profilers;
+  Ds.Cow_table.set profilers "kraken" kraken_profilers;
+  Ds.Cow_table.set profilers "lighter" lighter_profilers;
+  Ds.Cow_table.set profilers "alpaca" alpaca_profilers
 ;;
 
 let[@inline always] venue_profilers venue =
@@ -81,11 +88,11 @@ let[@inline always] venue_profilers venue =
   | _ ->
     Mutex.lock mutex;
     let p =
-      match Hashtbl.find_opt profilers venue with
+      match Ds.Cow_table.find_opt profilers venue with
       | Some p -> p
       | None ->
         let p = create_venue_profilers venue in
-        Hashtbl.replace profilers venue p;
+        Ds.Cow_table.set profilers venue p;
         p
     in
     Mutex.unlock mutex;
@@ -439,7 +446,7 @@ let record_feed_event_ms venue ~event_ms ?recv () =
 (** Most recent published windows for [venue], in the label order the dashboard's NETWORK
     page expects. Empty when the venue has no profilers yet. *)
 let snapshots venue =
-  match Hashtbl.find_opt profilers venue with
+  match Ds.Cow_table.find_opt profilers venue with
   | None -> []
   | Some p ->
     [ "ws_ping", Latency_profiler.published_snapshot p.ping
@@ -451,7 +458,7 @@ let snapshots venue =
 
 (** All venues with measured activity: (venue, label windows). *)
 let all_venue_snapshots () =
-  Hashtbl.fold (fun venue _ acc -> (venue, snapshots venue) :: acc) profilers []
+  Ds.Cow_table.fold (fun venue _ acc -> (venue, snapshots venue) :: acc) profilers ~init:[]
 ;;
 
 (** Network window publication cadence, in seconds. Shared by the background loop and the
@@ -464,7 +471,7 @@ let publish_interval_seconds = 10.0
     network metrics with a sample at or above [threshold_us]. Gated by the caller so the
     network tail can be silenced while internal ops are profiled. *)
 let publish_all ?(log_spikes = false) ?(threshold_us = 10.0) () =
-  Hashtbl.iter
+  Ds.Cow_table.iter
     (fun venue p ->
       let ping =
         Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.ping
@@ -489,7 +496,7 @@ let publish_all ?(log_spikes = false) ?(threshold_us = 10.0) () =
         with
         | None -> ()
         | Some msg -> Logging.info_f ~section "%s" msg))
-    profilers
+  profilers
 ;;
 
 (** Background publisher: advance all venue windows every [publish_interval_seconds] so

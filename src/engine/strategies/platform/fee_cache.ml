@@ -31,9 +31,66 @@ let in_flight : (string, unit Lwt.t) Hashtbl.t = Hashtbl.create 32
 (** Guards all reads and writes to [in_flight]. *)
 let in_flight_mutex = Mutex.create ()
 
-(** Default entry TTL in seconds (600s = 10 minutes). *)
-let default_ttl = 600.0
+(* --- observability -------------------------------------------------------------
+   Hit/miss counting is per-domain via [Domain.DLS] rather than a global [Atomic.int]. A
+   shared counter would be a single contended cache line written by every strategy domain
+   on every fee lookup, which is precisely the kind of cross-domain interference these
+   lock-free reads exist to avoid — trading hot-path throughput for telemetry is the wrong
+   direction. Domain-local counters are plain non-atomic ints with no shared state at all;
+   [stats] folds them across the registry.
 
+   OxCaml flags [Domain.DLS] as [unsafe_multidomain] because a DLS value may be shared
+   across domains. That does not apply here: each domain creates and owns its own
+   [counters] record and no other domain ever reads it directly — [stats] only sums the
+   two int fields as a monitoring approximation. Same reasoning as [Logging]'s section
+   cache. *)
+
+[@@@alert "-unsafe_multidomain"]
+
+type counters =
+  { mutable hits : int
+  ; mutable misses : int
+  ; mutable next : counters list (** Registry link; written once at creation. *)
+  }
+
+let counters_registry : counters list Atomic.t = Atomic.make []
+
+let new_counters () =
+  let c = { hits = 0; misses = 0; next = [] } in
+  let rec loop () =
+    let old = Atomic.get counters_registry in
+    c.next <- old;
+    if not (Atomic.compare_and_set counters_registry old (c :: old)) then loop ()
+  in
+  loop ();
+  c
+;;
+
+let counters : counters Domain.DLS.key = Domain.DLS.new_key new_counters
+
+let[@inline] note_lookup hit =
+  let c = Domain.DLS.get counters in
+  if hit then c.hits <- c.hits + 1 else c.misses <- c.misses + 1
+;;
+
+let stores = Atomic.make 0
+let sweeps = Atomic.make 0
+
+(** Default entry TTL in seconds (600s = 10 minutes). *)
+let default_ttl = Concurrency.Cache_limits.fee_cache_ttl
+
+(** Minimum seconds between expiry sweeps.
+
+    The keyspace is bounded by configuration (one entry per exchange x configured symbol),
+    so the map cannot grow without limit and a sweep is purely memory reclamation, not a
+    correctness requirement — [is_valid] already rejects stale entries on read. Running
+    the full O(n) [StringMap.filter] on every write therefore bought nothing and cost a
+    full map rebuild per store, repeated for every CAS retry when several domains
+    refreshed concurrently. Sweeping at most once per interval keeps the bound while
+    taking the O(n) pass off the write path entirely. *)
+let sweep_interval = Concurrency.Cache_limits.fee_cache_sweep_interval
+
+let last_sweep = Atomic.make 0.0
 let make_key exchange symbol = exchange ^ "|" ^ symbol
 
 (** Returns [true] if [entry] has not exceeded its TTL. *)
@@ -54,8 +111,12 @@ let get_maker_fee ~exchange ~symbol =
   let key = make_key exchange symbol in
   let map = Atomic.get fee_cache in
   match StringMap.find_opt key map with
-  | Some entry when is_valid entry -> Some entry.maker_fee
-  | _ -> None
+  | Some entry when is_valid entry ->
+    note_lookup true;
+    Some entry.maker_fee
+  | _ ->
+    note_lookup false;
+    None
 ;;
 
 (** Looks up the cached taker fee for [(exchange, symbol)]. Returns [Some fee] on a valid
@@ -64,19 +125,34 @@ let get_taker_fee ~exchange ~symbol =
   let key = make_key exchange symbol in
   let map = Atomic.get fee_cache in
   match StringMap.find_opt key map with
-  | Some entry when is_valid entry -> Some entry.taker_fee
-  | _ -> None
+  | Some entry when is_valid entry ->
+    note_lookup true;
+    Some entry.taker_fee
+  | _ ->
+    note_lookup false;
+    None
 ;;
 
-(** Inserts or replaces the fee entry for [(exchange, symbol)]. Evicts expired entries
-    opportunistically. *)
+(** Inserts or replaces the fee entry for [(exchange, symbol)].
+
+    Lock-free. The O(n) expiry sweep is claimed once per [sweep_interval] by CAS on
+    [last_sweep], independently of the map CAS, so no matter how many domains refresh
+    concurrently exactly one of them per interval pays for the filter; every other store
+    is a single [StringMap.add]. On a losing map-CAS retry the already-decided sweep is
+    simply re-run, which is idempotent and rare. *)
 let store_fees ~exchange ~symbol ~maker_fee ~taker_fee ~ttl_seconds =
   let key = make_key exchange symbol in
   let entry = { maker_fee; taker_fee; timestamp = Unix.time (); ttl_seconds } in
+  let claimed =
+    let prev = Atomic.get last_sweep in
+    entry.timestamp -. prev >= sweep_interval
+    && Atomic.compare_and_set last_sweep prev entry.timestamp
+  in
+  if claimed then Atomic.incr sweeps;
+  Atomic.incr stores;
   let rec loop () =
     let map = Atomic.get fee_cache in
-    let clean_map = evict_expired map in
-    let new_map = StringMap.add key entry clean_map in
+    let new_map = StringMap.add key entry (if claimed then evict_expired map else map) in
     if Atomic.compare_and_set fee_cache map new_map then () else loop ()
   in
   loop ();
@@ -216,21 +292,83 @@ let refresh_async symbol =
     promise)
 ;;
 
-(** Performs one-time startup initialization. Logs the configured TTL. *)
-let init () =
-  Logging.debug_f ~section "Fee cache initialized with TTL %.0f seconds" default_ttl
+let clear () =
+  Atomic.set fee_cache StringMap.empty;
+  Atomic.set last_sweep 0.0
 ;;
 
-(** Removes all entries from the cache. Intended for test teardown. *)
-let clear () = Atomic.set fee_cache StringMap.empty
+type stats =
+  { entries : int (** Keys currently held, valid or not. *)
+  ; valid : int (** Keys still inside their TTL. *)
+  ; expired : int (** Keys past TTL, awaiting the next sweep. *)
+  ; hits : int (** Lookups served from cache, summed over all domains. *)
+  ; misses : int (** Lookups that found nothing valid. *)
+  ; stores : int (** [store_fees] calls since process start. *)
+  ; sweeps : int (** Expiry sweeps actually run. *)
+  ; in_flight : int (** Async refreshes currently pending. *)
+  }
 
-(** Returns [(total_entries, valid_entries)] for monitoring. Counts entries that have not
-    yet exceeded their TTL as valid. *)
+(** Cache health for monitoring. Surfaced on the dashboard.
+
+    Hit and miss counters live in domain-local storage and are summed here across the
+    registry, so the totals are a benignly-racy snapshot: a counter belonging to another
+    domain may be read mid-increment. That is fine for a monitoring gauge and costs the
+    hot path nothing. *)
 let stats () =
   let map = Atomic.get fee_cache in
-  let count = StringMap.cardinal map in
-  let valid_count =
+  let entries = StringMap.cardinal map in
+  let valid =
     StringMap.fold (fun _ entry acc -> if is_valid entry then acc + 1 else acc) map 0
   in
-  count, valid_count
+  let hits = ref 0 in
+  let misses = ref 0 in
+  List.iter
+    (fun (c : counters) ->
+      hits := !hits + c.hits;
+      misses := !misses + c.misses)
+    (Atomic.get counters_registry);
+  let in_flight =
+    Mutex.lock in_flight_mutex;
+    Hashtbl.length in_flight
+  in
+  { entries
+  ; valid
+  ; expired = entries - valid
+  ; hits = !hits
+  ; misses = !misses
+  ; stores = Atomic.get stores
+  ; sweeps = Atomic.get sweeps
+  ; in_flight
+  }
+;;
+
+(** Publishes this cache's health to [Concurrency.Cache_metrics]. The provider is a pure
+    read of the atomics plus the domain-local counters, so it is safe to call from the
+    dashboard's snapshot path. *)
+let publish_metrics () =
+  Concurrency.Cache_metrics.register "engine.fee_cache" (fun () ->
+    let s = stats () in
+    let total = s.hits + s.misses in
+    { Concurrency.Cache_metrics.name = "engine.fee_cache"
+    ; metrics =
+        [ "entries", Concurrency.Cache_metrics.Count s.entries
+        ; "valid", Concurrency.Cache_metrics.Count s.valid
+        ; "expired", Concurrency.Cache_metrics.Count s.expired
+        ; "in_flight", Concurrency.Cache_metrics.Count s.in_flight
+        ; "hits", Concurrency.Cache_metrics.Count s.hits
+        ; "misses", Concurrency.Cache_metrics.Count s.misses
+        ; ( "hit_rate"
+          , Concurrency.Cache_metrics.Ratio
+              (Concurrency.Cache_metrics.hit_ratio s.hits total) )
+        ; "stores", Concurrency.Cache_metrics.Count s.stores
+        ; "sweeps", Concurrency.Cache_metrics.Count s.sweeps
+        ]
+    })
+;;
+
+(** Performs one-time startup initialization: logs the configured TTL and registers this
+    cache with the metrics registry so it appears on the dashboard. *)
+let init () =
+  Logging.debug_f ~section "Fee cache initialized with TTL %.0f seconds" default_ttl;
+  publish_metrics ()
 ;;

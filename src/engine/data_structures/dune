@@ -1,0 +1,16 @@
+; Leaf library: no library dependencies at all.
+;
+; `Cow_table` is the copy-on-write sharded map that most of the engine's read-mostly
+; caches are built on. It lives here, rather than in `concurrency`, because two
+; lower-level libraries need it and both sit *below* `concurrency` in the dependency
+; graph — `logging` (which everything, including `concurrency`, depends on) and
+; `latency_profiling`. Putting it in `concurrency` would have made their use of it a
+; dependency cycle, and duplicating the implementation in each would leave three copies
+; of the trickiest code in the repo.
+;
+; Keep this library dependency-free. It is the bottom of the graph.
+(library
+ (name ds)
+ (public_name dio.data_structures)
+ ; the wrapped alias module is `Ds`, so call sites read `Ds.Cow_table`
+ (modules Cow_table))

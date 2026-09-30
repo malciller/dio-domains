@@ -568,6 +568,26 @@ let json_of_parse_worker () =
     ]
 ;;
 
+(** Cache health across every component that registered a provider.
+
+    Sourced from [Concurrency.Cache_metrics] rather than by importing each venue's cache,
+    so adding or moving a cache does not require touching the dashboard. Providers are
+    registered by the owning module, so this only reports caches that are actually live. *)
+let json_of_caches () =
+  (* Idempotent: ensures the event-bus aggregate is registered even if nothing has
+     referenced Event_bus yet. *)
+  Concurrency.Event_bus.publish_metrics ();
+  let json_of_metric = function
+    | Concurrency.Cache_metrics.Count n -> `Int n
+    | Concurrency.Cache_metrics.Ratio r -> `Float r
+    | Concurrency.Cache_metrics.Micros us -> `Int us
+  in
+  Concurrency.Cache_metrics.snapshot ()
+  |> List.map (fun (s : Concurrency.Cache_metrics.sample) ->
+    s.name, `Assoc (List.map (fun (k, v) -> k, json_of_metric v) s.metrics))
+  |> List.sort (fun (a, _) (b, _) -> String.compare a b)
+;;
+
 let build_snapshot () =
   let now = Unix.gettimeofday () in
   let uptime = now -. !engine_start_time in
@@ -822,6 +842,7 @@ let build_snapshot () =
     ; "latencies", json_of_domain_latencies ()
     ; "oracle_latency", json_of_oracle_latency ()
     ; "parse_worker", json_of_parse_worker ()
+    ; "caches", `Assoc (json_of_caches ())
     ]
 ;;
 

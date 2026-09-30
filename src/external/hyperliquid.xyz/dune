@@ -2,6 +2,7 @@
  (name hyperliquid)
  (public_name dio.hyperliquid)
  (libraries
+  dio.data_structures
   yojson
   base64
   digestif.c

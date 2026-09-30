@@ -233,13 +233,13 @@ module SymbolExecStore = struct
   ;;
 end
 
-let stores : (string, SymbolExecStore.t) Hashtbl.t = Hashtbl.create 16
+let stores = Ds.Cow_table.create ~shard_count:32 ()
 let stores_mutex = Mutex.create ()
 
 (** Per-symbol generation for [symbol], or [-1] when the store does not exist yet so the
     consumer's rescan gate forces a scan until the first snapshot. *)
 let get_orders_generation_for_symbol symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some s -> Atomic.get s.SymbolExecStore.open_orders_generation
   | None -> -1
 ;;
@@ -249,7 +249,7 @@ let get_orders_generation_for_symbol symbol =
     [(limit_price, remaining_qty, side, order_userref)] for an add/replace and [None] for
     a removal. [overflow] (or a missing store) means the caller must do a full rescan. *)
 let drain_open_order_changes ~symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store ->
     let changes, overflow = SymbolExecStore.drain_changes store in
     ( List.rev_map
@@ -275,11 +275,11 @@ let drain_open_order_changes ~symbol =
 let get_or_create_store symbol =
   Mutex.lock stores_mutex;
   let store =
-    match Hashtbl.find_opt stores symbol with
+    match Ds.Cow_table.find_opt stores symbol with
     | Some s -> s
     | None ->
       let s = SymbolExecStore.create symbol 1024 in
-      Hashtbl.replace stores symbol s;
+      Ds.Cow_table.set stores symbol s;
       s
   in
   Mutex.unlock stores_mutex;
@@ -308,7 +308,7 @@ let trade_events_backfill_s = 900.0
 let sse_idle_failure_s = 60.0
 
 let get_open_order symbol order_id =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store ->
     let orders = Atomic.get store.open_orders_cache in
     List.find_opt (fun (o : open_order_internal) -> o.order_id = order_id) orders
@@ -316,7 +316,7 @@ let get_open_order symbol order_id =
 ;;
 
 let remove_open_order symbol order_id =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store ->
     Mutex.lock store.mutex;
     let existed = Hashtbl.mem store.open_orders order_id in
@@ -330,20 +330,20 @@ let remove_open_order symbol order_id =
 ;;
 
 let get_open_orders symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> Atomic.get store.open_orders_cache
   | None -> []
 ;;
 
 let get_all_symbols () =
   Mutex.lock stores_mutex;
-  let syms = Hashtbl.fold (fun k _ acc -> k :: acc) stores [] in
+  let syms = Ds.Cow_table.fold (fun k _ acc -> k :: acc) stores ~init:[] in
   Mutex.unlock stores_mutex;
   syms
 ;;
 
 let get_current_position symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> Atomic.get store.write_pos
   | None -> 0
 ;;
@@ -354,7 +354,7 @@ let get_current_position_fast symbol =
 ;;
 
 let has_execution_data symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> Atomic.get store.initial_data_received
   | None -> false
 ;;
@@ -365,7 +365,7 @@ let has_execution_data_fast symbol =
 ;;
 
 let read_execution_events symbol start_pos =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store ->
     let current_pos = Atomic.get store.write_pos in
     let start_idx = max start_pos (current_pos - store.capacity) in
@@ -379,7 +379,7 @@ let read_execution_events symbol start_pos =
 ;;
 
 let iter_execution_events symbol start_pos f =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store ->
     let current_pos = Atomic.get store.write_pos in
     let start_idx = max start_pos (current_pos - store.capacity) in
@@ -392,7 +392,7 @@ let iter_execution_events symbol start_pos f =
 ;;
 
 let fold_open_orders symbol ~init ~f =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store ->
     let snapshot = Atomic.get store.open_orders_cache in
     List.fold_left (fun acc o -> f acc o) init snapshot
@@ -414,14 +414,12 @@ let bootstrap_open_orders () =
         Hashtbl.replace grouped o.symbol (o :: existing))
       orders;
     Mutex.lock stores_mutex;
-    Hashtbl.iter
-      (fun sym store ->
+    Ds.Cow_table.iter (fun sym store ->
         let sym_orders =
           try Hashtbl.find grouped sym with
           | _ -> []
         in
-        SymbolExecStore.set_open_orders_snapshot store sym_orders)
-      stores;
+        SymbolExecStore.set_open_orders_snapshot store sym_orders) stores;
     Mutex.unlock stores_mutex;
     Logging.debug_f
       ~section
@@ -431,7 +429,7 @@ let bootstrap_open_orders () =
   | Error err ->
     Logging.error_f ~section "Failed to bootstrap open orders: %s" err;
     Mutex.lock stores_mutex;
-    Hashtbl.iter (fun _store_sym store -> SymbolExecStore.mark_ready store) stores;
+    Ds.Cow_table.iter (fun _store_sym store -> SymbolExecStore.mark_ready store) stores;
     Mutex.unlock stores_mutex;
     Lwt.return_unit
 ;;

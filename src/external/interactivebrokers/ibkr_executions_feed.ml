@@ -54,7 +54,7 @@ type symbol_store =
       consumer to do a full rescan. *)
   }
 
-let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 32
+let symbol_stores = Ds.Cow_table.create ~shard_count:32 ()
 let initialization_mutex = Mutex.create ()
 let ready_condition = Lwt_condition.create ()
 
@@ -64,12 +64,12 @@ let order_to_symbol : (int, string) Hashtbl.t = Hashtbl.create 64
 let global_mutex = Mutex.create ()
 
 let get_symbol_store symbol =
-  match Hashtbl.find_opt symbol_stores symbol with
+  match Ds.Cow_table.find_opt symbol_stores symbol with
   | Some store -> store
   | None ->
     Mutex.lock initialization_mutex;
     let store =
-      match Hashtbl.find_opt symbol_stores symbol with
+      match Ds.Cow_table.find_opt symbol_stores symbol with
       | Some s -> s
       | None ->
         let s =
@@ -83,7 +83,7 @@ let get_symbol_store symbol =
           ; changes_overflow = Atomic.make false
           }
         in
-        Hashtbl.replace symbol_stores symbol s;
+        Ds.Cow_table.set symbol_stores symbol s;
         s
     in
     Mutex.unlock initialization_mutex;
@@ -127,7 +127,7 @@ let drain_changes store =
     a removal. IBKR carries no userref, so it is always [None]. [overflow] (or a missing
     store) means the caller must do a full rescan. *)
 let drain_open_order_changes ~symbol =
-  match Hashtbl.find_opt symbol_stores symbol with
+  match Ds.Cow_table.find_opt symbol_stores symbol with
   | Some store ->
     let changes, overflow = drain_changes store in
     ( List.rev_map
@@ -515,7 +515,7 @@ let request_open_orders conn =
 (** Return all symbols that have initialized execution stores. *)
 let get_all_symbols () =
   Mutex.lock initialization_mutex;
-  let symbols = Hashtbl.fold (fun symbol _ acc -> symbol :: acc) symbol_stores [] in
+  let symbols = Ds.Cow_table.fold (fun symbol _ acc -> symbol :: acc) symbol_stores ~init:[] in
   Mutex.unlock initialization_mutex;
   symbols
 ;;
@@ -573,16 +573,14 @@ let[@inline always] has_execution_data_fast symbol =
 (** Marks every initialized symbol store ready. Called on openOrderEnd after the startup
     snapshot, so waiters do not block on symbols with no executions yet. *)
 let mark_ready_all () =
-  Hashtbl.iter
-    (fun symbol store ->
+  Ds.Cow_table.iter (fun symbol store ->
       if not (Atomic.get store.ready)
       then (
         Logging.debug_f
           ~section
           "Marking executions feed ready for %s (snapshot complete)"
           symbol;
-        notify_ready store))
-    symbol_stores
+        notify_ready store)) symbol_stores
 ;;
 
 (** Pre-creates stores for [symbols] and registers handlers. *)

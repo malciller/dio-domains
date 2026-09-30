@@ -43,3 +43,7 @@
   (alias ../supervisor/runtest))
  (action
   (run %{exe:bench.exe})))
+
+(executable
+ (name cow_read)
+ (libraries dio.concurrency dio.latency_profiling))

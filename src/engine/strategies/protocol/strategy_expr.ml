@@ -27,37 +27,51 @@ type ref_ =
     (the same shared predicate appears in many guards).
 
     All domains load strategy files and mutate runtime state concurrently, so the table
-    cannot be mutated in place: an unsynchronized [Hashtbl] shared across OCaml 5 domains
-    is undefined behavior (a concurrent resize can wedge a lookup in a long probe), which
-    shows up as exactly the kind of intermittent per-thread CPU stall we were chasing.
+    cannot be an in-place-mutated [Hashtbl]: an unsynchronized [Hashtbl] shared across
+    OCaml 5 domains is undefined behavior (a concurrent resize can wedge a lookup in a
+    long probe), which shows up as exactly the kind of intermittent per-thread CPU stall
+    we were chasing.
 
-    The table is therefore append-only and published as an immutable snapshot via
-    [Atomic]. Hits (the entire runtime path) are lock-free: they read the current snapshot
-    and never touch the mutex, so concurrent domains cannot convoy on each other. Only a
-    miss (a genuinely new key, which happens while files are parsed and on first use)
-    takes [key_intern_mutex] and republishes a copy; a published table is never mutated
-    again, so a reader that captured the previous snapshot still reads it safely. *)
-let key_intern : (string, int) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 256)
+    It is therefore a [Cow_table], which splits the keyspace across immutable buckets
+    published through per-bucket [Atomic]s. That gives both properties we need:
+
+    - Hits (the entire runtime path) are lock-free, allocation-free, and never convoy: one
+      bucket index, one [Atomic.get], one [Hashtbl.find].
+    - A miss copies only the bucket it lands in, not the whole table. The previous scheme
+      republished a full [Hashtbl.copy] per miss, so interning n keys allocated O(n^2)
+      entries in the major heap and, worse, every concurrent miss re-did that work under a
+      global mutex.
+
+    Only a miss (a genuinely new key, which happens while files are parsed and on first
+    use) takes [key_intern_mutex]. Holding it is what makes the [key_next] bump atomic: a
+    get-then-set on an [Atomic] is not atomic as a pair, so two domains racing there could
+    hand out the same slot, or move the counter backwards and hand out a duplicate later.
+    A published bucket is never mutated again, so a reader that captured the previous
+    bucket still reads it safely.
+
+    Slots are never recycled. Evicting a key would invalidate every [ref_.slot] that
+    captured it, so this table is append-only by construction — the right shape for an
+    intern table, and a reminder that LRU would be actively wrong here. *)
+let key_intern : (string, int) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:Concurrency.Cache_limits.strategy_intern_buckets ()
+;;
 
 let key_intern_mutex = Mutex.create ()
 let key_next = Atomic.make 0
 
 let intern_key (s : string) : int =
-  let t = Atomic.get key_intern in
-  match Hashtbl.find t s with
-  | i -> i
-  | exception Not_found ->
+  let t = Ds.Cow_table.find_opt key_intern s in
+  match t with
+  | Some i -> i
+  | None ->
     Mutex.lock key_intern_mutex;
-    let t = Atomic.get key_intern in
     let i =
-      match Hashtbl.find t s with
-      | i -> i
-      | exception Not_found ->
+      match Ds.Cow_table.find_opt key_intern s with
+      | Some i -> i
+      | None ->
         let i = Atomic.get key_next in
         Atomic.set key_next (i + 1);
-        let t' = Hashtbl.copy t in
-        Hashtbl.replace t' s i;
-        Atomic.set key_intern t';
+        Ds.Cow_table.set key_intern s i;
         i
     in
     Mutex.unlock key_intern_mutex;

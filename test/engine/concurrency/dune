@@ -5,3 +5,11 @@
 (test
  (name test_concurrency_primitives)
  (libraries dio.concurrency alcotest))
+
+(test
+ (name test_cow_table)
+ (libraries dio.concurrency alcotest))
+
+(test
+ (name test_fifo_index)
+ (libraries dio.concurrency alcotest))

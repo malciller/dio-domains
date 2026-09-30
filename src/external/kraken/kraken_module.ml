@@ -17,8 +17,17 @@ module Kraken_impl = struct
   let section = "kraken_module"
 
   (** In-memory cache mapping symbol to (maker_fee, taker_fee). Populated once at startup
-      by [initialize_fees]. *)
-  let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16
+      by [initialize_fees], read on every fill by the execution feeds.
+
+      A [Cow_table], not a [Hashtbl]: the writes land on the startup fiber while the
+      execution feeds read from their own domains, and an unsynchronized [Hashtbl] read
+      concurrent with a resize is undefined behavior. The keyspace is the configured
+      symbol list, so the bucket count below is comfortably oversized. Note this is the
+      venue-level, no-TTL fee view; [Dio_strategies.Fee_cache] is the separate
+      engine-level cache that strategies read. *)
+  let fee_cache : (string, float * float) Ds.Cow_table.t =
+    Ds.Cow_table.create ~shard_count:Concurrency.Cache_limits.kraken_fee_cache_buckets ()
+  ;;
 
   (** Maps a unified [Types.order_type] to the Kraken API string representation. *)
   let string_of_order_type = function
@@ -557,9 +566,9 @@ module Kraken_impl = struct
     | None -> price
   ;;
 
-  (** Returns [(maker_fee option, taker_fee option)] from the local fee cache. *)
+  (** Returns [(maker_fee option, taker_fee option)] from the local fee cache. Lock-free. *)
   let get_fees ~symbol =
-    match Hashtbl.find_opt fee_cache symbol with
+    match Ds.Cow_table.find_opt fee_cache symbol with
     | Some f -> Some (fst f), Some (snd f)
     | None -> None, None
   ;;
@@ -574,7 +583,7 @@ module Kraken_impl = struct
         | Some info ->
           let maker = Option.value info.maker_fee ~default:0.0 in
           let taker = Option.value info.taker_fee ~default:0.0 in
-          Hashtbl.replace fee_cache symbol (maker, taker)
+          Ds.Cow_table.set fee_cache symbol (maker, taker)
         | None -> ())
       symbols
   ;;

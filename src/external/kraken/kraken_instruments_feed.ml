@@ -74,10 +74,22 @@ type pair_info =
   ; last_updated : float (** Unix timestamp of last cache write. *)
   }
 
-(** In-memory symbol-to-[pair_info] cache. Protected by [cache_mutex]. *)
-let pair_cache : (string, pair_info) Hashtbl.t = Hashtbl.create 32
+(** In-memory symbol-to-[pair_info] cache.
 
-let cache_mutex = Lwt_mutex.create ()
+    The keyspace is the venue's whole pair universe (several hundred symbols), but the
+    read side is the hottest instrument lookup in the engine: [get_price_increment] and
+    friends are called on every strategy decision cycle and on every order encode, from
+    whichever domain happens to be running.
+
+    It is therefore a [Cow_table], not a [Hashtbl]. A plain [Hashtbl] shared across
+    domains cannot be read while another domain writes it — the WS/REST warm-up inserts
+    cause resizes, which rewrite the bucket array in place, and a concurrent reader can
+    observe a torn bucket pointer. Reads here take no lock at all: each bucket is an
+    immutable table published through its own [Atomic], and a published bucket is never
+    mutated again. Writes copy only the one bucket they touch. *)
+let pair_cache : (string, pair_info) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:Concurrency.Cache_limits.kraken_pair_cache_buckets ()
+;;
 
 (** Parses a single pair JSON object (WebSocket schema) into a [pair_info]. Returns [None]
     if any required field is missing or malformed. *)
@@ -104,38 +116,42 @@ let parse_pair_info json : pair_info option =
   | _ -> None
 ;;
 
-(** Insert or replace [info] in [pair_cache] under [cache_mutex]. Logs a warning on status
-    transitions and a debug line on first insertion. *)
+(** Inserts or replaces [info] in [pair_cache]. Logs a warning on status transitions and a
+    debug line on first insertion.
+
+    No mutex: [Cow_table.set] is lock-free. The [prev_status] read used only to decide
+    what to log, so reading it outside the write is harmless — a concurrent writer may
+    make a transition line go missing, which costs a log line and nothing else. *)
 let update_pair_info info =
-  Lwt_mutex.with_lock cache_mutex (fun () ->
-    let prev_status =
-      Hashtbl.find_opt pair_cache info.symbol |> Option.map (fun p -> p.status)
-    in
-    Hashtbl.replace pair_cache info.symbol info;
-    (match prev_status with
-     | Some prev when prev <> info.status ->
-       Logging.warn_f
-         ~section
-         "Pair %s status changed: %s -> %s"
-         info.symbol
-         (status_to_string prev)
-         (status_to_string info.status)
-     | None ->
-       Logging.debug_f
-         ~section
-         "Pair %s initialized: status=%s, qty_min=%.8f, price_inc=%.8f"
-         info.symbol
-         (status_to_string info.status)
-         info.qty_min
-         info.price_increment
-     | _ -> ());
-    Lwt.return_unit)
+  let prev_status =
+    Ds.Cow_table.find_opt pair_cache info.symbol
+    |> Option.map (fun p -> p.status)
+  in
+  Ds.Cow_table.set pair_cache info.symbol info;
+  (match prev_status with
+   | Some prev when prev <> info.status ->
+     Logging.warn_f
+       ~section
+       "Pair %s status changed: %s -> %s"
+       info.symbol
+       (status_to_string prev)
+       (status_to_string info.status)
+   | None ->
+     Logging.debug_f
+       ~section
+       "Pair %s initialized: status=%s, qty_min=%.8f, price_inc=%.8f"
+       info.symbol
+       (status_to_string info.status)
+       info.qty_min
+       info.price_increment
+   | _ -> ());
+  Lwt.return_unit
 ;;
 
-(** Looks up [symbol] in the pair cache. Acquires [cache_mutex]. *)
+(** Looks up [symbol] in the pair cache. Lock-free; the [Lwt] wrapper is kept for
+    interface stability with callers that compose it into an effect chain. *)
 let get_pair_info symbol : pair_info option Lwt.t =
-  Lwt_mutex.with_lock cache_mutex (fun () ->
-    Lwt.return (Hashtbl.find_opt pair_cache symbol))
+  Lwt.return (Ds.Cow_table.find_opt pair_cache symbol)
 ;;
 
 (** Returns [true] if [symbol] exists in the cache with [Online] status. *)
@@ -379,23 +395,23 @@ let initialize_symbols symbols : unit Lwt.t =
   fetch_from_rest symbols
 ;;
 
-(** Returns [(price_precision, qty_precision)] for [symbol], or [None]. Synchronous; reads
-    [pair_cache] without acquiring [cache_mutex]. *)
+(** The synchronous instrument lookups below are the hottest reads in the engine — called
+    on every strategy decision cycle and every order encode — so they are lock-free and
+    allocation-free. They are safe against the REST/WS warm-up writes because [pair_cache]
+    publishes immutable buckets; see the [Cow_table] note above. *)
+
+(** Returns [(price_precision, qty_precision)] for [symbol], or [None]. *)
 let get_precision_info symbol : (int * int) option =
-  try
-    Hashtbl.find_opt pair_cache symbol
-    |> Option.map (fun info -> info.price_precision, info.qty_precision)
-  with
-  | _ -> None
+  match Ds.Cow_table.find_opt pair_cache symbol with
+  | Some info -> Some (info.price_precision, info.qty_precision)
+  | None -> None
 ;;
 
-(** Returns the minimum price tick size for [symbol], or [None]. Synchronous; reads
-    [pair_cache] without acquiring [cache_mutex]. *)
+(** Returns the minimum price tick size for [symbol], or [None]. *)
 let get_price_increment symbol : float option =
-  try
-    Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.price_increment)
-  with
-  | _ -> None
+  match Ds.Cow_table.find_opt pair_cache symbol with
+  | Some info -> Some info.price_increment
+  | None -> None
 ;;
 
 (** Returns the price precision for [symbol]. Raises [Failure] if not cached. *)
@@ -405,18 +421,26 @@ let get_price_precision_exn symbol : int =
   | None -> failwith (Printf.sprintf "No price precision found for symbol %s" symbol)
 ;;
 
-(** Returns the minimum order quantity for [symbol], or [None]. Synchronous; reads
-    [pair_cache] without acquiring [cache_mutex]. *)
+(** Returns the minimum order quantity for [symbol], or [None]. *)
 let get_qty_min symbol : float option =
-  try Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.qty_min) with
-  | _ -> None
+  match Ds.Cow_table.find_opt pair_cache symbol with
+  | Some info -> Some info.qty_min
+  | None -> None
 ;;
 
-(** Returns the minimum quantity step size for [symbol], or [None]. Synchronous; reads
-    [pair_cache] without acquiring [cache_mutex]. *)
+(** Returns the minimum quantity step size for [symbol], or [None]. *)
 let get_qty_increment symbol : float option =
-  try
-    Hashtbl.find_opt pair_cache symbol |> Option.map (fun info -> info.qty_increment)
-  with
-  | _ -> None
+  match Ds.Cow_table.find_opt pair_cache symbol with
+  | Some info -> Some info.qty_increment
+  | None -> None
+;;
+
+(** Number of pairs currently cached. For monitoring. *)
+let cache_size () = Ds.Cow_table.length pair_cache
+
+let () =
+  Concurrency.Cache_metrics.register "kraken.pair_cache" (fun () ->
+    { Concurrency.Cache_metrics.name = "kraken.pair_cache"
+    ; metrics = [ "entries", Concurrency.Cache_metrics.Count (cache_size ()) ]
+    })
 ;;

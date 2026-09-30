@@ -2,6 +2,7 @@
  (name lighter)
  (public_name dio.lighter)
  (libraries
+  dio.data_structures
   yojson
   lwt
   lwt.unix

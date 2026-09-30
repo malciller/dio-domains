@@ -51,12 +51,20 @@ let pace () =
    oracle re-attempts the whole history each refresh, which keeps the block alive. On the
    all-empty signature the symbol is remembered for [soft_block_backoff] seconds and its
    requests are skipped entirely. *)
-let soft_blocked_until : (string, float) Hashtbl.t = Hashtbl.create 64
+(* [yahoo_mutex] serialises the *sequential request walk*; it does not cover these two
+   tables, whose writes happen outside that critical section while the oracle's concurrent
+   per-symbol passes read them. Both were plain Hashtbls, so a symbol being soft-blocked
+   was a resize racing a lookup. Copy-on-write, which is cheap here because writes are
+   rare (one per detected block, one per newly-empty symbol, for the life of the process). *)
+let soft_blocked_until : (string, float) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:64 ()
+;;
+
 let soft_block_backoff = 300.0
 
 let remember_block ~(symbol : string) ~(windows : int) =
   let until = Unix.gettimeofday () +. soft_block_backoff in
-  Hashtbl.replace soft_blocked_until symbol until;
+  Ds.Cow_table.set soft_blocked_until symbol until;
   Logging.warn_f
     ~section
     "Yahoo served %d empty response(s) for %s (soft-blocked/rate-limited IP); backing \
@@ -125,16 +133,21 @@ let classify_exn (exn : exn) : [ `Missing_data | `Fatal ] =
 (** Per-symbol cache of the confirmed-empty history prefix: the latest end date for which
     Yahoo answered "no data in [requested start, end]". Fetches clamp their start past it.
     Process-lifetime; the oracle re-fetches deep history every pass. *)
-let no_data_before : (string, string) Hashtbl.t = Hashtbl.create 16
+(* Monotonic: only ever moves earlier. Copy-on-write for the same reason as
+   [soft_blocked_until] — written outside [yahoo_mutex] while other symbols' passes read
+   it. *)
+let no_data_before : (string, string) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:16 ()
+;;
 
 let known_empty_before ~(symbol : string) : string option =
-  Hashtbl.find_opt no_data_before symbol
+  Ds.Cow_table.find_opt no_data_before symbol
 ;;
 
 let remember_empty ~(symbol : string) (date : string) =
-  match Hashtbl.find_opt no_data_before symbol with
+  match Ds.Cow_table.find_opt no_data_before symbol with
   | Some prev when prev >= date -> ()
-  | _ -> Hashtbl.replace no_data_before symbol date
+  | _ -> Ds.Cow_table.set no_data_before symbol date
 ;;
 
 let number_of_json = function
@@ -301,7 +314,7 @@ let fetch_daily ?(start_date = "2016-01-01") ~(symbol : string) ~(end_date : str
   else (
     (* Soft-block memory (see [remember_block]): while backed off, do not even attempt the
        requests, so the pass does not keep the block alive. *)
-    match Hashtbl.find_opt soft_blocked_until symbol with
+    match Ds.Cow_table.find_opt soft_blocked_until symbol with
     | Some until when Unix.gettimeofday () < until ->
       Logging.debug_f
         ~section
