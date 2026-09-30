@@ -773,7 +773,7 @@ let fees_now (t : Oracle_tasks.task) : Oracle_core.fee_model =
     match t.config.maker_fee with
     | Some f -> f
     | None ->
-      (match Hashtbl.find_opt Oracle_fees.fee_cache (t.exchange, t.symbol) with
+      (match Oracle_fees.cached_fees ~exchange:t.exchange ~symbol:t.symbol with
        | Some (m, _) -> m
        | None -> fst (Oracle_fees.venue_default_fees t.exchange t.symbol))
   in

@@ -24,9 +24,18 @@ let published_cache : (string, pair_info) Hashtbl.t Atomic.t =
   Atomic.make (Hashtbl.create 128)
 ;;
 
-(** Republish the current [pair_cache] as an immutable snapshot. Caller holds
-    [cache_mutex]. *)
-let publish_cache () = Atomic.set published_cache (Hashtbl.copy pair_cache)
+(** Republish the current [pair_cache] as an immutable snapshot.
+
+    The copy reads the whole table, so it must happen *inside* [cache_mutex]. All three
+    call sites used to unlock first and copy afterwards — an unsynchronized traversal of a
+    table another Domain could be inserting into, which contradicts this function's own
+    contract. The copy now runs under the lock. [cache_mutex] is held only during the
+    once-per-refresh metadata reload, never on a read path, so the extra hold costs
+    nothing measurable. *)
+let publish_cache_locked () =
+  Atomic.set published_cache (Hashtbl.copy pair_cache);
+  Mutex.unlock cache_mutex
+;;
 
 let is_ready = Atomic.make false
 let ready_condition = Lwt_condition.create ()
@@ -116,8 +125,7 @@ let process_meta_response payload_perp payload_spot =
               "Failed to parse spot item: %s"
               (Printexc.to_string exn))
         universe_spot;
-      Mutex.unlock cache_mutex;
-      publish_cache ();
+      publish_cache_locked ();
       Logging.debug_f
         ~section
         "Initialized Hyperliquid instrument feed via WS payload with %d perps and %d \
@@ -148,8 +156,7 @@ let initialize symbols =
       let info = { symbol; sz_decimals; max_leverage; asset_index } in
       Hashtbl.replace pair_cache symbol info)
     symbols;
-  Mutex.unlock cache_mutex;
-  publish_cache ();
+  publish_cache_locked ();
   Logging.debug_f
     ~section
     "Initialized Hyperliquid instruments feed with %d mock symbols"
@@ -169,8 +176,7 @@ let register_test_instrument ~symbol ~sz_decimals =
   (match String.split_on_char '/' symbol with
    | base :: _ when base <> symbol -> Hashtbl.replace pair_cache base info
    | _ -> ());
-  Mutex.unlock cache_mutex;
-  publish_cache ()
+  publish_cache_locked ()
 ;;
 
 (** Looks up instrument info by symbol from the published snapshot (lock-free). Falls back

@@ -591,12 +591,12 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
              mappings, handler closures, and IO channels would otherwise accumulate across
              cycles. *)
           let%lwt () =
-            match !Ibkr.Module.connection with
+            match Atomic.get Ibkr.Module.connection with
             | Some old_conn ->
               Logging.info
                 ~section
                 "[ibkr_gateway] Disconnecting old connection before reconnect";
-              Ibkr.Module.connection := None;
+              Atomic.set Ibkr.Module.connection None;
               Ibkr.Connection.disconnect old_conn
             | None -> Lwt.return_unit
           in
@@ -608,7 +608,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
               ~port:!Ibkr.Module.Config.gateway_port
               ~client_id:Ibkr.Module.Config.client_id
           in
-          Ibkr.Module.connection := Some conn;
+          Atomic.set Ibkr.Module.connection (Some conn);
           Ibkr.Connection.connect_with_retry conn ~max_attempts:5
           >>= fun () ->
           Ibkr.Dispatcher.initialize conn;
@@ -621,7 +621,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
             ~on_message:Ibkr.Dispatcher.dispatch
             ~on_disconnect:(fun reason ->
               let is_current =
-                match !Ibkr.Module.connection with
+                match Atomic.get Ibkr.Module.connection with
                 | Some c -> c == conn
                 | None -> false
               in
@@ -752,7 +752,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                  Disconnect cleanly; handle by market hours. *)
               let error_msg = Printexc.to_string exn in
               let%lwt () = Ibkr.Connection.disconnect conn in
-              Ibkr.Module.connection := None;
+              Atomic.set Ibkr.Module.connection None;
               if not (Ibkr.Market_hours.is_market_open ())
               then (
                 (* Market closed: do not escalate the circuit breaker. Schedule a deferred

@@ -38,7 +38,11 @@ let monitor_loop () =
           if (not !last_market_open) && current_open
           then (
             try
-              let ibkr_conn = Hashtbl.find connections "ibkr_gateway" in
+              let ibkr_conn =
+                match Supervisor_types.find_connection "ibkr_gateway" with
+                | Some c -> c
+                | None -> raise Not_found
+              in
               let ibkr_state = get_state ibkr_conn in
               match ibkr_state with
               | Connected ->

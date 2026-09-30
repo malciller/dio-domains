@@ -52,20 +52,28 @@ type lifecycle_event =
       }
   | Cancel_cleanup of { order_id : string }
 
-let event_queues : (string, lifecycle_event LockFreeQueue.t) Hashtbl.t = Hashtbl.create 16
+(* Per-symbol lifecycle-event queues. Read at the top of every strategy cycle from every
+   trading Domain and inserted from the Lwt domain, so this was a Hashtbl written under a
+   mutex and read without one — on the hottest path in the engine. A Cow_table makes the
+   read lock-free and allocation-free; the mutex stays so two Domains cannot both build a
+   queue for the same symbol and orphan one of them. *)
+let event_queues : (string, lifecycle_event LockFreeQueue.t) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:16 ()
+;;
+
 let event_queues_mutex = Mutex.create ()
 
 let get_event_queue symbol =
-  match Hashtbl.find_opt event_queues symbol with
+  match Ds.Cow_table.find_opt event_queues symbol with
   | Some q -> q
   | None ->
     Mutex.lock event_queues_mutex;
     let q =
-      match Hashtbl.find_opt event_queues symbol with
+      match Ds.Cow_table.find_opt event_queues symbol with
       | Some q -> q
       | None ->
         let q = LockFreeQueue.create () in
-        Hashtbl.replace event_queues symbol q;
+        Ds.Cow_table.set event_queues symbol q;
         q
     in
     Mutex.unlock event_queues_mutex;

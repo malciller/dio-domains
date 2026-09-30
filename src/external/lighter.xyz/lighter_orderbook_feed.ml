@@ -39,10 +39,10 @@ type store =
   ; ob_mutex : Mutex.t
   }
 
-let stores : (string, store) Hashtbl.t = Hashtbl.create 32
+let stores = Ds.Cow_table.create ~shard_count:32 ()
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
-let get_store symbol = Hashtbl.find_opt stores symbol
+let get_store symbol = Ds.Cow_table.find_opt stores symbol
 
 let notify_ready store =
   if not (Atomic.get store.ready)
@@ -289,7 +289,7 @@ let process_orderbook_update ~market_index json =
 ;;
 
 let[@inline always] get_latest_orderbook symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> RingBuffer.read_latest store.buffer
   | None -> None
 ;;
@@ -318,7 +318,7 @@ let[@inline always] get_best_bid_ask_fast symbol =
 
 (** Snapshots written after ring buffer position [last_pos]. *)
 let[@inline always] read_orderbook_events symbol last_pos =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> RingBuffer.read_since store.buffer last_pos
   | None -> []
 ;;
@@ -326,14 +326,14 @@ let[@inline always] read_orderbook_events symbol last_pos =
 (** Applies [f] to each snapshot after [last_pos] without intermediate allocations;
     returns the new cursor. *)
 let[@inline always] iter_orderbook_events symbol last_pos f =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> RingBuffer.iter_since store.buffer last_pos f
   | None -> last_pos
 ;;
 
 (** Current ring buffer write position for [symbol]. *)
 let[@inline always] get_current_position symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> RingBuffer.get_position store.buffer
   | None -> 0
 ;;
@@ -345,7 +345,7 @@ let[@inline always] get_current_position_fast symbol =
 ;;
 
 let has_orderbook_data symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> Atomic.get store.ready
   | None -> false
 ;;
@@ -365,7 +365,7 @@ let initialize symbols =
   List.iter
     (fun symbol ->
       Mutex.lock initialization_mutex;
-      if not (Hashtbl.mem stores symbol)
+      if not (Ds.Cow_table.mem stores symbol)
       then (
         let store =
           { buffer = RingBuffer.create ring_buffer_size
@@ -375,7 +375,7 @@ let initialize symbols =
           ; ob_mutex = Mutex.create ()
           }
         in
-        Hashtbl.add stores symbol store);
+        Ds.Cow_table.set stores symbol store);
       Mutex.unlock initialization_mutex;
       Logging.debug_f ~section "Created Lighter orderbook buffer for %s" symbol)
     symbols

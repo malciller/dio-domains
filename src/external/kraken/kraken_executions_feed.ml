@@ -189,7 +189,7 @@ type symbol_store =
   }
 
 (** Global symbol-to-store mapping. *)
-let symbol_stores : (string, symbol_store) Hashtbl.t = Hashtbl.create 64
+let symbol_stores = Ds.Cow_table.create ~shard_count:32 ()
 
 (** Monotonic counter bumped on every open-orders snapshot publish. The balances feed
     scans every symbol store on each balance read (twice per executable cycle); keying a
@@ -199,49 +199,39 @@ let orders_generation : int Atomic.t = Atomic.make 0
 
 let[@inline] get_orders_generation () = Atomic.get orders_generation
 
-(** Global order ID to symbol mapping with adaptive cap and FIFO eviction. Requires
-    global_orders_mutex. *)
-let order_to_symbol : (string, string * side) Hashtbl.t = Hashtbl.create 16
+(* Global order id -> (symbol, side) mapping, bounded and FIFO-evicted. Backing store for
+   [Concurrency.Fifo_index]; see that module for why this is FIFO rather than LRU, and why
+   queue membership has to be tracked explicitly when callers also retire ids out of band.
+   Requires [global_orders_mutex]. *)
+let order_to_symbol =
+  Concurrency.Fifo_index.create ~label:(section ^ "/order_to_symbol")
+    ~cap:Concurrency.Cache_limits.order_index_startup_cap ()
+;;
 
-(** FIFO queue for O(1) oldest-entry eviction. *)
-let order_to_symbol_queue : string Queue.t = Queue.create ()
-
-(** Mutable cap; uncapped (max_int) during startup, locked after the initial snapshot. *)
-let order_to_symbol_cap : int ref = ref max_int
+let () = Concurrency.Fifo_index.publish_metrics order_to_symbol ~name:"kraken.order_to_symbol"
 
 let order_to_symbol_startup_done = Atomic.make false
 
-(** Inserts an order ID to symbol mapping. Evicts the oldest entry via FIFO when exceeding
-    cap. Caller must hold global_orders_mutex. *)
+(** Inserts an order ID to symbol mapping, evicting oldest-first past the cap. Caller must
+    hold [global_orders_mutex]. *)
 let add_to_order_to_symbol order_id symbol side =
-  if not (Hashtbl.mem order_to_symbol order_id)
-  then Queue.push order_id order_to_symbol_queue;
-  Hashtbl.replace order_to_symbol order_id (symbol, side);
-  if Atomic.get order_to_symbol_startup_done
-  then
-    while Hashtbl.length order_to_symbol > !order_to_symbol_cap do
-      if Queue.is_empty order_to_symbol_queue
-      then order_to_symbol_cap := Hashtbl.length order_to_symbol
-      else (
-        let oldest = Queue.pop order_to_symbol_queue in
-        Hashtbl.remove order_to_symbol oldest)
-    done
+  Concurrency.Fifo_index.set order_to_symbol ~key:order_id ~value:(symbol, side)
 ;;
 
-(** Locks the adaptive cap after the startup snapshot. Cap = max(32, observed * 1.5 + 1).
-    Executes once. *)
+(** Retires an order ID. Caller must hold [global_orders_mutex]. *)
+let retire_from_order_to_symbol order_id =
+  Concurrency.Fifo_index.remove order_to_symbol order_id
+;;
+
+(** Tunes the cap after the startup snapshot: max(32, observed * 1.5 + 1). Executes once.
+    The bound already exists before this runs; this only adjusts it. *)
 let lock_order_to_symbol_cap () =
   if not (Atomic.exchange order_to_symbol_startup_done true)
   then (
     (* Caller (handle_snapshot) already holds global_orders_mutex. *)
-    let observed = Hashtbl.length order_to_symbol in
-    let cap = max 32 (observed + (observed / 2) + 1) in
-    order_to_symbol_cap := cap;
-    Logging.debug_f
-      ~section
-      "order_to_symbol adaptive cap locked at %d (observed %d entries at startup)"
-      cap
-      observed)
+    let observed = Concurrency.Fifo_index.length order_to_symbol in
+    Concurrency.Fifo_index.lock_cap order_to_symbol ~observed
+      ~floor:Concurrency.Cache_limits.order_index_min_cap)
 ;;
 
 (** Mutex protecting the global order-to-symbol index. *)
@@ -256,12 +246,12 @@ let initialization_mutex = Mutex.create ()
 (** Retrieves or lazily creates a per-symbol store. Wait-free on the hot path after
     initial creation. *)
 let get_symbol_store symbol =
-  match Hashtbl.find_opt symbol_stores symbol with
+  match Ds.Cow_table.find_opt symbol_stores symbol with
   | Some store -> store
   | None ->
     Mutex.lock initialization_mutex;
     let store =
-      match Hashtbl.find_opt symbol_stores symbol with
+      match Ds.Cow_table.find_opt symbol_stores symbol with
       | Some s -> s
       | None ->
         let s =
@@ -275,7 +265,7 @@ let get_symbol_store symbol =
           ; changes_overflow = Atomic.make false
           }
         in
-        Hashtbl.add symbol_stores symbol s;
+        Ds.Cow_table.set symbol_stores symbol s;
         Logging.debug_f ~section "Created execution store for %s" symbol;
         s
     in
@@ -312,7 +302,7 @@ let drain_changes store =
     [(limit_price, remaining_qty, side, order_userref)] for an add/replace and [None] for
     a removal. [overflow] (or a missing store) means the caller must do a full rescan. *)
 let drain_open_order_changes ~symbol =
-  match Hashtbl.find_opt symbol_stores symbol with
+  match Ds.Cow_table.find_opt symbol_stores symbol with
   | Some store ->
     let changes, overflow = drain_changes store in
     ( List.rev_map
@@ -404,7 +394,7 @@ let[@inline always] has_open_order symbol order_id =
     O(1) lookup. *)
 let find_order_everywhere order_id =
   Mutex.lock global_orders_mutex;
-  let symbol_opt = Hashtbl.find_opt order_to_symbol order_id in
+  let symbol_opt = Concurrency.Fifo_index.find_opt order_to_symbol order_id in
   Mutex.unlock global_orders_mutex;
   match symbol_opt with
   | None -> None
@@ -451,37 +441,21 @@ let update_open_order_price ~symbol ~order_id ~new_price =
 let get_all_symbols () =
   Mutex.lock global_orders_mutex;
   let symbols = ref [] in
-  Hashtbl.iter (fun symbol _store -> symbols := symbol :: !symbols) symbol_stores;
+  Ds.Cow_table.iter (fun symbol _store -> symbols := symbol :: !symbols) symbol_stores;
   let result = !symbols in
   Mutex.unlock global_orders_mutex;
   result
 ;;
 
-(** Periodic maintenance that purges orphaned order_to_symbol_queue entries. Terminal
-    events remove map entries but cannot efficiently remove queue entries; this rebuilds
-    the queue retaining only entries still present in the map. *)
+(** Periodic maintenance that drops superseded entries from the eviction queue. Terminal
+    events retire ids from the index but cannot cheaply remove their queue records, so the
+    queue accumulates them until this pass. [Fifo_index.trim_queue] keeps exactly the
+    entries whose admission is still current, preserving eviction order. *)
 let cleanup_stale_orders () =
   Mutex.lock global_orders_mutex;
-  let original_queue_len = Queue.length order_to_symbol_queue in
-  if original_queue_len > 0
-  then (
-    let temp = Queue.create () in
-    Queue.iter
-      (fun order_id ->
-        if Hashtbl.mem order_to_symbol order_id then Queue.push order_id temp)
-      order_to_symbol_queue;
-    Queue.clear order_to_symbol_queue;
-    Queue.transfer temp order_to_symbol_queue;
-    let removed = original_queue_len - Queue.length order_to_symbol_queue in
-    if removed > 0
-    then
-      Logging.debug_f
-        ~section
-        "Purged %d orphaned entries from order_to_symbol_queue (was %d, now %d)"
-        removed
-        original_queue_len
-        (Queue.length order_to_symbol_queue));
-  Mutex.unlock global_orders_mutex
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock global_orders_mutex)
+    (fun () -> ignore (Concurrency.Fifo_index.trim_queue order_to_symbol))
 ;;
 
 (** Idempotent Lwt_mvar cleanup signal. Prevents continuation stacking when triggers
@@ -727,7 +701,7 @@ let update_open_orders store (event : execution_event) =
       if is_terminal_status
       then (
         Mutex.lock global_orders_mutex;
-        Hashtbl.remove order_to_symbol event.order_id;
+        retire_from_order_to_symbol event.order_id;
         Mutex.unlock global_orders_mutex);
       log_action
       := if is_terminal_status then `Removed_terminal else `Removed_zero_qty remaining_qty)
@@ -860,7 +834,7 @@ let parse_execution_event json =
       | Some s -> Some (s, None)
       | None ->
         Mutex.lock global_orders_mutex;
-        let s = Hashtbl.find_opt order_to_symbol order_id in
+        let s = Concurrency.Fifo_index.find_opt order_to_symbol order_id in
         Mutex.unlock global_orders_mutex;
         (match s with
          | Some (sym, side) -> Some (sym, Some side)
@@ -1148,7 +1122,7 @@ let handle_snapshot json on_heartbeat =
           if was_present
           then (
             Mutex.lock global_orders_mutex;
-            Hashtbl.remove order_to_symbol order_id;
+            retire_from_order_to_symbol order_id;
             Mutex.unlock global_orders_mutex;
             Logging.debug_f
               ~section

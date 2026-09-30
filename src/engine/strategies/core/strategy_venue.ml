@@ -107,24 +107,33 @@ let ibkr_commission ~qty ~price =
   Float.max min_fee (Float.min raw max_fee)
 ;;
 
-let _exchange_module_cache : (string, (module Exchange.S)) Hashtbl.t = Hashtbl.create 4
+(* Venue dispatch memo tables. Both were plain Hashtbls read and written with no lock from
+   every trading Domain — [get_exchange_module] alone is called twice per strategy cycle
+   (venue_available_base and venue_gross_base), so a resize racing a lookup was reachable
+   on the hot path. Now Cow_tables: lock-free reads, and a miss copies one shard rather
+   than the whole map. Keyspace is the four registered venues, so the bounds are fixed. *)
+let _exchange_module_cache : (string, (module Exchange.S)) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:4 ()
+;;
 
 let get_exchange_module exchange =
-  match Hashtbl.find_opt _exchange_module_cache exchange with
+  match Ds.Cow_table.find_opt _exchange_module_cache exchange with
   | Some m -> Some m
   | None ->
     (match Exchange.Registry.get exchange with
      | Some m ->
-       Hashtbl.replace _exchange_module_cache exchange m;
+       Ds.Cow_table.set _exchange_module_cache exchange m;
        Some m
      | None -> None)
 ;;
 
-let _round_price_fn_cache : (string, float -> float) Hashtbl.t = Hashtbl.create 8
+let _round_price_fn_cache : (string, float -> float) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:8 ()
+;;
 
 let get_round_price_fn symbol exchange =
   let key = symbol ^ "|" ^ exchange in
-  match Hashtbl.find_opt _round_price_fn_cache key with
+  match Ds.Cow_table.find_opt _round_price_fn_cache key with
   | Some f -> f
   | None ->
     let f =
@@ -132,7 +141,7 @@ let get_round_price_fn symbol exchange =
       | Some (module Ex : Exchange.S) -> fun p -> Ex.round_price ~symbol ~price:p
       | None -> Float.round
     in
-    Hashtbl.replace _round_price_fn_cache key f;
+    Ds.Cow_table.set _round_price_fn_cache key f;
     f
 ;;
 

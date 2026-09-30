@@ -42,24 +42,28 @@ type store =
   ; tob : tob_cache Atomic.t
   }
 
-let stores : (string, store) Hashtbl.t = Hashtbl.create 32
+let stores = Ds.Cow_table.create ~shard_count:32 ()
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Coin-to-symbol resolution cache, populated at [initialize] to avoid [resolve_symbol] +
-    [Hashtbl.mem] per tick. Only the WS thread writes (at init); domain workers never
-    access it. *)
-let coin_to_symbol : (string, string) Hashtbl.t = Hashtbl.create 32
+(* Coin-to-symbol resolution cache, avoiding [resolve_symbol] + a store probe per tick.
+   The comment here used to claim "only the WS thread writes (at init)", but
+   [find_registered_symbol] writes it on the live tick path the first time it sees each
+   coin, with no lock, while other readers and Domains resolve concurrently. Copy-on-write
+   makes that safe and keeps the lookup allocation-free. *)
+let coin_to_symbol : (string, string) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:32 ()
+;;
 
 (** Returns the store for [symbol], creating one if absent. Uses double-checked locking
     via [initialization_mutex] for thread safety. *)
 let ensure_store symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> store
   | None ->
     Mutex.lock initialization_mutex;
     let store =
-      match Hashtbl.find_opt stores symbol with
+      match Ds.Cow_table.find_opt stores symbol with
       | Some store -> store
       | None ->
         let store =
@@ -75,7 +79,7 @@ let ensure_store symbol =
                 }
           }
         in
-        Hashtbl.add stores symbol store;
+        Ds.Cow_table.set stores symbol store;
         store
     in
     Mutex.unlock initialization_mutex;
@@ -93,21 +97,21 @@ let notify_ready store =
 let find_registered_symbol coin =
   (* Fast path: check the cached coin_to_symbol table first. This avoids resolve_symbol +
      Hashtbl.mem on every tick. *)
-  match Hashtbl.find_opt coin_to_symbol coin with
+  match Ds.Cow_table.find_opt coin_to_symbol coin with
   | Some _ as r -> r
   | None ->
     (* Slow path: resolve via instruments feed and probe stores. *)
     (match Hyperliquid_instruments_feed.resolve_symbol coin with
      | Some symbol ->
-       if Hashtbl.mem stores symbol
+       if Ds.Cow_table.mem stores symbol
        then (
-         Hashtbl.replace coin_to_symbol coin symbol;
+         Ds.Cow_table.set coin_to_symbol coin symbol;
          Some symbol)
        else (
          let usdc_symbol = symbol ^ "/USDC" in
-         if Hashtbl.mem stores usdc_symbol
+         if Ds.Cow_table.mem stores usdc_symbol
          then (
-           Hashtbl.replace coin_to_symbol coin usdc_symbol;
+           Ds.Cow_table.set coin_to_symbol coin usdc_symbol;
            Some usdc_symbol)
          else None)
      | None -> None)
@@ -357,7 +361,7 @@ let[@inline always] parse_orderbook symbol msg =
 ;;
 
 let[@inline always] get_latest_orderbook symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store ->
     (match RingBuffer.read_latest store.buffer with
      | Some msg -> Some (parse_orderbook symbol msg)
@@ -368,7 +372,7 @@ let[@inline always] get_latest_orderbook symbol =
 (** Read top-of-book from the atomic snapshot cache (zero allocation, lock-free, and free
     of torn reads per L4). *)
 let[@inline always] get_best_bid_ask symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store ->
     let t = Atomic.get store.tob in
     if t.tob_valid then Some (t.bid_px, t.bid_sz, t.ask_px, t.ask_sz) else None
@@ -389,7 +393,7 @@ let[@inline always] get_best_bid_ask_fast symbol =
 (** Returns all orderbook snapshots written since [last_pos], parsing the raw messages
     lazily on read. *)
 let[@inline always] read_orderbook_events symbol last_pos =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store ->
     List.map (parse_orderbook symbol) (RingBuffer.read_since store.buffer last_pos)
   | None -> []
@@ -399,7 +403,7 @@ let[@inline always] read_orderbook_events symbol last_pos =
     lazily on read and without intermediate list allocation. Returns the new cursor
     position. *)
 let[@inline always] iter_orderbook_events symbol last_pos f =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store ->
     ignore
       (RingBuffer.iter_since store.buffer last_pos (fun msg ->
@@ -411,7 +415,7 @@ let[@inline always] iter_orderbook_events symbol last_pos f =
 
 (** Returns the current ring buffer write position for [symbol]. *)
 let[@inline always] get_current_position symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> RingBuffer.get_position store.buffer
   | None -> 0
 ;;
@@ -422,7 +426,7 @@ let[@inline always] get_current_position_fast symbol =
 ;;
 
 let has_orderbook_data symbol =
-  match Hashtbl.find_opt stores symbol with
+  match Ds.Cow_table.find_opt stores symbol with
   | Some store -> Atomic.get store.ready
   | None -> false
 ;;
@@ -487,7 +491,7 @@ let initialize symbols =
       (* Pre-populate coin_to_symbol cache for known symbols. Resolves coin identifiers at
          startup so the hot path hits the cache. *)
       let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
-      if coin <> "" then Hashtbl.replace coin_to_symbol coin symbol;
+      if coin <> "" then Ds.Cow_table.set coin_to_symbol coin symbol;
       Logging.debug_f
         ~section
         "Created Hyperliquid orderbook buffer for %s (coin=%s)"

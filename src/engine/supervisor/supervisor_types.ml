@@ -46,6 +46,17 @@ let registry_mutex = Mutex.create ()
 
 (** Snapshots the connection list under [registry_mutex], then applies [f] to the snapshot
     outside the critical section. *)
+(** Single-name lookup under [registry_mutex].
+
+    Exists because the one caller that needed a name lookup used to reach into [connections]
+    directly, skipping the lock every other access takes. *)
+let find_connection name =
+  Mutex.lock registry_mutex;
+  let found = Hashtbl.find_opt connections name in
+  Mutex.unlock registry_mutex;
+  found
+;;
+
 let with_connections_list f =
   Mutex.lock registry_mutex;
   let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in

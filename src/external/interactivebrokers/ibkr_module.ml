@@ -100,11 +100,15 @@ module Config = struct
   ;;
 end
 
-(** Active gateway connection handle. *)
-let connection = ref None
+(* Active gateway connection handle. Written by the Lwt domain on every
+   (re)connect and read from trading Domains when placing orders. A plain [ref] let a
+   Domain observe the None window mid-reconnect and fail an otherwise valid order with
+   "IBKR connection not initialized". An [Atomic] makes the read see either the old or the
+   new connection, never a torn or absent one. *)
+let connection : Ibkr_connection.t option Atomic.t = Atomic.make None
 
 let get_conn () =
-  match !connection with
+  match Atomic.get connection with
   | Some c -> c
   | None -> failwith "IBKR connection not initialized"
 ;;

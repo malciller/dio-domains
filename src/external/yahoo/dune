@@ -2,6 +2,7 @@
  (name yahoo)
  (public_name dio.yahoo)
  (libraries
+  dio.data_structures
   unix
   yojson
   lwt

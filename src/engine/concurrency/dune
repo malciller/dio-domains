@@ -5,11 +5,15 @@
   lwt
   lwt.unix
   unix
+  dio.data_structures
   dio.logging
   dio.gc_config
   dio.latency_profiling)
  (modules
+  Cache_limits
+  Cache_metrics
   Event_bus
+  Fifo_index
   Ring_buffer
   Tick_event_bus
   Exchange_wakeup

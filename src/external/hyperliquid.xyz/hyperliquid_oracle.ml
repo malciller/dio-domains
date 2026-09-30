@@ -96,9 +96,13 @@ let spot_meta_fetched_at : float ref = ref 0.0
 let spot_meta_mutex = Mutex.create ()
 let spot_meta_ttl = 6.0 *. 3600.0
 
-(* Symbols already reported as having no spot pair this run, to avoid re-logging the same
-   warning on every oracle pass. Warn once, then debug. *)
-let warned_no_spot_history : (string, unit) Hashtbl.t = Hashtbl.create 32
+(* Symbols already reported as having no spot pair, to avoid re-logging the same warning on
+   every oracle pass. Membership is tested and updated without a lock while the oracle
+   refresh runs, so it is copy-on-write. The keyspace is the configured symbol set, so the
+   map stays small. *)
+let warned_no_spot_history : (string, unit) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:32 ()
+;;
 
 (** Extracts (feed_symbol, candle_coin) mappings from a spotMeta response. [feed_symbol] =
     canonicalized base (UBTC/UETH/USOL) ^ "/" ^ quote. [candle_coin] = the universe
@@ -267,8 +271,8 @@ let fetch_bars ?feed:_ ?end_date:_ ~from ~symbol () : Exchange.Types.bar list Lw
   Mutex.unlock spot_meta_mutex;
   match coin_of_symbol ~pairs symbol with
   | None ->
-    let first = not (Hashtbl.mem warned_no_spot_history symbol) in
-    if first then Hashtbl.add warned_no_spot_history symbol ();
+    let first = not (Ds.Cow_table.mem warned_no_spot_history symbol) in
+    if first then Ds.Cow_table.set warned_no_spot_history symbol ();
     if first
     then
       Logging.warn_f

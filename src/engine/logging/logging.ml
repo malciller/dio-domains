@@ -124,19 +124,29 @@ let section_color_code name =
 ;;
 
 (* Per-section log level configuration. *)
+(* [min_level] is immutable. A section record is published into a copy-on-write registry,
+   so a level change installs a *new* record rather than mutating one that other Domains may
+   be reading concurrently. Mutating it in place would be a cross-domain write racing the
+   per-log-line read in [will_log]. *)
 type section =
   { name : string
-  ; mutable min_level : level
+  ; min_level : level
   }
 
 (* Global mutable configuration state. *)
 let global_min_level = ref INFO
-let sections = Hashtbl.create 32
 let use_colors = ref true
 let output_channel = ref stderr
-let enabled_sections = ref []
-let enabled_set : (string, unit) Hashtbl.t = Hashtbl.create 16
 let quiet_mode = ref false
+
+(* Explicitly-enabled section names, or [] to allow all. Read on every [will_log], i.e. on
+   every log attempt from every Domain. It used to be mirrored into an unsynchronized
+   Hashtbl that [set_enabled_sections] cleared and refilled in place — a reader could see
+   it mid-rebuild and wrongly conclude a section was disabled. A plain immutable list
+   removes the race and is cheaper than the hash lookup it replaces: the overwhelmingly
+   common case is [], which both [= []] and the length check answer in constant time with
+   no allocation, and the enabled case scans a list of a handful of names. *)
+let enabled_sections : string list ref = ref []
 
 (* ---- Line width ---- [configured_width] overrides all (None = auto). Auto mode detects
    the width from the output fd via [Notty_unix.winsize], cached ~1s so terminal resizes
@@ -203,11 +213,7 @@ let log_callback : (level -> string -> string -> unit Lwt.t) ref =
   ref (fun _level _section _message -> Lwt.return_unit)
 ;;
 
-let set_enabled_sections secs =
-  enabled_sections := secs;
-  Hashtbl.reset enabled_set;
-  List.iter (fun s -> Hashtbl.replace enabled_set s ()) secs
-;;
+let set_enabled_sections secs = enabled_sections := secs
 
 let set_quiet_mode quiet = quiet_mode := quiet
 let set_log_callback callback = log_callback := callback
@@ -216,23 +222,46 @@ let set_log_callback callback = log_callback := callback
     concurrent workers. *)
 let output_mutex = Mutex.create ()
 
-(** Guards the [sections] registry only; separate from [output_mutex] so [get_section] on
-    the trading hot path (via [will_log], on a Domain.DLS cache miss) never blocks behind
-    the drain thread's [output_mutex], held across a potentially blocking [flush]. *)
+(* Section registry. Reached from [will_log] on every log attempt in every Domain (on a
+   Domain.DLS cache miss), and previously written under a mutex while read without one — a
+   resize racing a lookup, on the logging path.
+
+   This is an atomic pointer to a copy-on-write map rather than the shared
+   [Ds.Cow_table]: [logging] is the root of the dependency graph ([concurrency]
+   and most of the engine depend on it), so it cannot depend on [concurrency]. Copying the
+   whole map on insert is the right trade here anyway — the keyspace is the handful of
+   distinct section names in the source, each inserted once, so the quadratic-ish copy cost
+   is a few dozen whole-map copies for the life of the process. A published map is never
+   mutated again, so the read needs no lock.
+
+   The mutex still serialises insertion so two Domains cannot both publish a record for the
+   same name and orphan one. It is separate from [output_mutex] so [get_section] never
+   blocks behind the drain thread's flush. *)
+let sections : (string, section) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 32)
+
 let sections_mutex = Mutex.create ()
 
 let get_section name =
-  match Hashtbl.find_opt sections name with
+  let snapshot = Atomic.get sections in
+  match Hashtbl.find_opt snapshot name with
   | Some s -> s
   | None ->
     Mutex.lock sections_mutex;
     let s =
-      match Hashtbl.find_opt sections name with
+      match Hashtbl.find_opt (Atomic.get sections) name with
       | Some s -> s
       | None ->
         let s = { name; min_level = !global_min_level } in
-        Hashtbl.replace sections name s;
-        s
+        let rec publish () =
+          let current = Atomic.get sections in
+          match Hashtbl.find_opt current name with
+          | Some existing -> existing
+          | None ->
+            let next = Hashtbl.copy current in
+            Hashtbl.replace next name s;
+            if Atomic.compare_and_set sections current next then s else publish ()
+        in
+        publish ()
     in
     Mutex.unlock sections_mutex;
     s
@@ -254,7 +283,8 @@ let will_log level section_name =
       Domain.DLS.set tls_section_cache (section_name, s);
       s)
   in
-  (Hashtbl.length enabled_set = 0 || Hashtbl.mem enabled_set section_name)
+  let enabled = !enabled_sections in
+  (enabled = [] || List.mem section_name enabled)
   && level_to_int level >= level_to_int sec.min_level
   && level_to_int level >= level_to_int !global_min_level
 ;;
@@ -510,7 +540,8 @@ let start_async_drain () =
    and writes + flushes synchronously for immediate visibility. *)
 let log_sync level section_name message =
   let section = get_section section_name in
-  if (Hashtbl.length enabled_set <> 0 && not (Hashtbl.mem enabled_set section_name))
+  let enabled = !enabled_sections in
+  if (enabled <> [] && not (List.mem section_name enabled))
      || level_to_int level < level_to_int section.min_level
      || level_to_int level < level_to_int !global_min_level
   then ()
@@ -614,7 +645,22 @@ let critical ~section msg =
 (* Global and per-section configuration accessors. *)
 let init () = ()
 let set_level level = global_min_level := level
-let set_section_level name level = (get_section name).min_level <- level
+(* Installs a replacement record rather than mutating the published one, so a Domain
+   reading the old record sees a consistent old level rather than a torn write. *)
+let set_section_level name level =
+  let cur = get_section name in
+  if cur.min_level <> level then (
+    let rec publish () =
+      let current = Atomic.get sections in
+      match Hashtbl.find_opt current name with
+      | None -> ()
+      | Some live when live.min_level = level -> ()
+      | Some live ->
+        let next = Hashtbl.copy current in
+        Hashtbl.replace next name { live with min_level = level };
+        if not (Atomic.compare_and_set sections current next) then publish ()
+    in
+    publish ())
 let set_colors enabled = use_colors := enabled
 let set_output channel = output_channel := channel
 let get_level () = !global_min_level

@@ -2,6 +2,7 @@
  (name kraken)
  (public_name dio.kraken)
  (libraries
+  dio.data_structures
   yojson
   base64
   digestif.c

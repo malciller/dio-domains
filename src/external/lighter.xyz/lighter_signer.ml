@@ -476,8 +476,17 @@ let initialize ~base_url ~private_key ~key_index ~acct_index =
 
 (* Auth token caching *)
 
-let cached_auth_token : string option ref = ref None
-let auth_token_expiry = ref 0.0
+(* Token and expiry were two separate [ref]s read together on every signed order. A Domain
+   could observe the new token with the old expiry (or the reverse), because storing a
+   string pointer and storing a float are not one atomic act. Publishing them as a single
+   immutable record makes the pair consistent: a reader sees the whole previous pair or the
+   whole new one. *)
+type auth_token =
+  { token : string
+  ; expiry : float
+  }
+
+let cached_auth_token : auth_token option Atomic.t = Atomic.make None
 
 (** Mints an auth token with a 7h deadline and caches it for 6.5h. Returns "" on failure. *)
 let refresh_auth_token () =
@@ -492,9 +501,9 @@ let refresh_auth_token () =
       Logging.error_f ~section "CreateAuthToken returned empty token";
       "")
     else (
-      cached_auth_token := Some token;
-      auth_token_expiry := Unix.gettimeofday () +. (6.5 *. 3600.0);
-      Logging.info_f ~section "Auth token refreshed, valid until %.0f" !auth_token_expiry;
+      let expiry = Unix.gettimeofday () +. (6.5 *. 3600.0) in
+      Atomic.set cached_auth_token (Some { token; expiry });
+      Logging.info_f ~section "Auth token refreshed, valid until %.0f" expiry;
       token)
   with
   | exn ->
@@ -503,8 +512,8 @@ let refresh_auth_token () =
 ;;
 
 let get_auth_token () =
-  match !cached_auth_token with
-  | Some token when Unix.gettimeofday () < !auth_token_expiry -> token
+  match Atomic.get cached_auth_token with
+  | Some t when Unix.gettimeofday () < t.expiry -> t.token
   | _ -> refresh_auth_token ()
 ;;
 

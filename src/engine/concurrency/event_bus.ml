@@ -36,6 +36,44 @@ let register ops =
 (** Iterate all registered buses. Snapshot taken once via [Atomic.get]. *)
 let iter_buses f = List.iter f (Atomic.get registry)
 
+(* Aggregate subscriber counts across every registered bus. The per-bus [stats] hooks were
+   built and registered but nothing ever read them, so a fan-out problem — subscribers
+   force-closed because a bounded stream filled — was invisible. Surfaced through
+   [Cache_metrics] so it lands on the dashboard beside the other caches.
+
+   Deliberately one row rather than one row per topic: buses are created per connection
+   and per reconnect, so a per-topic registry would grow without bound and the dashboard
+   would fill with dead topics. [topics_with_closed] is the actionable signal — it counts
+   the topics currently losing subscribers without naming them. *)
+let publish_metrics () =
+  Cache_metrics.register "engine.event_bus" (fun () ->
+      let buses = Atomic.get registry in
+      let total = ref 0 in
+      let active = ref 0 in
+      let closed = ref 0 in
+      let topics_with_closed = ref 0 in
+      List.iter
+        (fun ops ->
+          let bus_total, bus_active, bus_closed = ops.stats () in
+          total := !total + bus_total;
+          active := !active + bus_active;
+          closed := !closed + bus_closed;
+          if bus_closed > 0 then incr topics_with_closed)
+        buses;
+      { Cache_metrics.name = "engine.event_bus"
+      ; metrics =
+          [ "buses", Cache_metrics.Count (List.length buses)
+          ; "subscribers", Cache_metrics.Count !total
+          ; "active", Cache_metrics.Count !active
+          ; "closed", Cache_metrics.Count !closed
+          ; "topics_with_closed", Cache_metrics.Count !topics_with_closed
+          ; ( "closed_ratio"
+            , Cache_metrics.Ratio
+                (if !total = 0 then 0.0 else float !closed /. float !total) )
+          ]
+      })
+;;
+
 module Make (Payload : PAYLOAD) = struct
   type snapshot = Payload.t
 
@@ -121,6 +159,9 @@ module Make (Payload : PAYLOAD) = struct
       ; cleanup = (fun () -> cleanup_stale_subscribers bus ())
       ; stats = (fun () -> get_subscriber_stats bus)
       };
+    (* The global registry is the source of truth for [publish_metrics]; no per-bus row is
+       registered here, since buses are created per connection and per reconnect and that
+       would grow the metrics registry without bound. *)
     bus
   ;;
 

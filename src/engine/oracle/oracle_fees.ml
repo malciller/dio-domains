@@ -19,8 +19,24 @@ let section = "oracle_fees"
 let fallback_maker_fee = 0.0016
 let fallback_taker_fee = 0.0026
 
-(** Per-process cache of resolved (maker, taker) fees per (exchange, symbol). *)
-let fee_cache : (string * string, float * float) Hashtbl.t = Hashtbl.create 16
+(** Per-process cache of resolved (maker, taker) fees per (exchange, symbol).
+
+    This used to be a second, unsynchronized [Hashtbl] shadowing
+    [Dio_strategies.Fee_cache], which is the cache the strategy hot path actually reads —
+    two tables for one fact, only one of them safe to touch concurrently. The oracle now
+    memoises through [Cow_table] and still publishes into [Fee_cache], which keeps the two
+    concerns separate but no longer racy: this table suppresses repeat network fetches,
+    [Fee_cache] is the TTL-aware view strategies consult. *)
+let fee_cache : (string * string, float * float) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:Concurrency.Cache_limits.oracle_fee_cache_buckets ()
+;;
+
+(** Memoised (maker, taker) for [(exchange, symbol)], or [None] if never resolved.
+    Lock-free and allocation-free; this is the oracle's hot-path read, called once per
+    asset per decision pass. *)
+let cached_fees ~(exchange : string) ~(symbol : string) : (float * float) option =
+  Ds.Cow_table.find_opt fee_cache (exchange, symbol)
+;;
 
 (** Venue default (maker, taker) for [exchange]/[symbol]: the registered adapter's
     [default_fees] when available, else the generic fallback. *)
@@ -57,7 +73,7 @@ let load_dotenv () =
 let resolved_fees ~(exchange : string) ~(symbol : string) ~(testnet : bool)
   : (float * float) Lwt.t
   =
-  match Hashtbl.find_opt fee_cache (exchange, symbol) with
+  match Ds.Cow_table.find_opt fee_cache (exchange, symbol) with
   | Some fees -> Lwt.return fees
   | None ->
     load_dotenv ();
@@ -73,7 +89,7 @@ let resolved_fees ~(exchange : string) ~(symbol : string) ~(testnet : bool)
           (fst (venue_default_fees exchange symbol) *. 100.0);
         Lwt.return (venue_default_fees exchange symbol))
     >|= fun fees ->
-    Hashtbl.replace fee_cache (exchange, symbol) fees;
+    Ds.Cow_table.set fee_cache (exchange, symbol) fees;
     fees
 ;;
 

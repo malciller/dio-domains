@@ -16,6 +16,7 @@
  (name dio_strategies)
  (public_name dio.strategies)
  (libraries
+  dio.data_structures
   yojson
   logging
   dio.persistence
@@ -23,6 +24,7 @@
   dio.hyperliquid
   dio.lighter
   dio.latency_profiling
+  dio.concurrency
   lwt
   lwt.unix
   unix)
