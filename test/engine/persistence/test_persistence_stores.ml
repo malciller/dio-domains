@@ -160,21 +160,27 @@ let test_accumulation_round_trip () =
     Alcotest.(check (float 1e-12)) "missing loads default" 0.0 missing.A.reserved_base)
 ;;
 
+(* [put_async] publishes to the read cache before returning, so the level count is fixed
+   by the time the call returns. The poll only exists to report "never landed" instead of
+   a level-count mismatch. *)
+let wait_for_levels ~key ~expected =
+  let rec wait n =
+    if List.length (S.load ~key) = expected
+    then ()
+    else if n = 0
+    then failwith "async save never landed"
+    else (
+      Thread.delay 0.01;
+      wait (n - 1))
+  in
+  wait 500
+;;
+
 let test_sell_levels_round_trip_and_adopt () =
   with_hermetic_dir (fun _dir ->
     let key = S.key_of ~strategy:"Ladder" ~symbol:"QQQ" ~venue:"alpaca" in
     S.save_async ~key [ { S.price = 149.0; qty = 0.25 }; { S.price = 150.0; qty = 0.25 } ];
-    (* save_async is drained by a background domain; poll briefly. *)
-    let rec wait n =
-      if n = 0
-      then failwith "async save never landed"
-      else if List.length (S.load ~key) = 2
-      then ()
-      else (
-        Thread.delay 0.01;
-        wait (n - 1))
-    in
-    wait 500;
+    wait_for_levels ~key ~expected:2;
     let loaded = S.load ~key in
     Alcotest.(check int) "two levels" 2 (List.length loaded);
     Alcotest.(check (float 1e-12)) "sorted desc head" 150.0 (List.hd loaded).S.price;
@@ -182,10 +188,38 @@ let test_sell_levels_round_trip_and_adopt () =
     S.adopt_exchange_order ~key { S.price = 149.0; qty = 0.25 };
     Alcotest.(check int) "duplicate adoption ignored" 2 (List.length (S.load ~key));
     S.adopt_exchange_order ~key { S.price = 151.0; qty = 0.25 };
+    wait_for_levels ~key ~expected:3;
     Alcotest.(check int) "new level adopted" 3 (List.length (S.load ~key));
     (* Removal drops matching levels only. *)
     S.remove_levels ~key ~levels:[ { S.price = 151.0; qty = 0.25 } ];
+    wait_for_levels ~key ~expected:2;
     Alcotest.(check int) "level removed" 2 (List.length (S.load ~key)))
+;;
+
+(* The async writer used to re-apply its drained snapshot to the read cache, overwriting
+   any [put_async] that landed in between, so a read could return an older snapshot than
+   the last save. A round per save gives the writer the chance to interleave.
+
+   Own key: [with_hermetic_dir] points the store at a fresh file but does not reset the
+   in-memory cache, so reusing another test's key would start from its levels. *)
+let test_async_save_never_regresses_reads () =
+  with_hermetic_dir (fun _dir ->
+    let key = S.key_of ~strategy:"Ladder" ~symbol:"REGRESS" ~venue:"alpaca" in
+    let rounds = 300 in
+    let regressions = ref 0 in
+    for round = 1 to rounds do
+      let price = 100.0 +. float_of_int round in
+      S.adopt_exchange_order ~key { S.price; qty = 0.25 };
+      let top = List.hd (S.load ~key) in
+      if abs_float (top.S.price -. price) > 1e-4 then incr regressions
+    done;
+    Alcotest.(check int) "reads never regress to an older snapshot" 0 !regressions;
+    (* Every round adopted a distinct price, so all of them are still there. *)
+    Alcotest.(check int) "every adopted level retained" rounds (List.length (S.load ~key));
+    Alcotest.(check (float 1e-12))
+      "newest level is the head"
+      (100.0 +. float_of_int rounds)
+      (List.hd (S.load ~key)).S.price)
 ;;
 
 let test_salvage_recovers_hand_edited_double_document () =
@@ -328,6 +362,9 @@ let () =
     ; ( "round_trip"
       , [ "accumulation", `Quick, test_accumulation_round_trip
         ; "sell_levels adopt/remove", `Quick, test_sell_levels_round_trip_and_adopt
+        ; ( "async save never regresses reads"
+          , `Quick
+          , test_async_save_never_regresses_reads )
         ] )
     ; ( "corruption"
       , [ ( "hand-edited double document salvaged"

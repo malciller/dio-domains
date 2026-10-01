@@ -295,7 +295,14 @@ let put t ~key value =
 
 (** Coalesced async save, latest-wins per key. Each snapshot carries full state, so the
     queue is a table that overwrites and the worker writes each key once. This collapses
-    redundant full-file rewrites when a hot loop marks the store dirty every cycle. *)
+    redundant full-file rewrites when a hot loop marks the store dirty every cycle.
+
+    The worker does not touch [t.cache]. [put_async] is the only producer, and it publishes
+    to the cache synchronously before enqueueing, so re-applying [pending] here only ever
+    raced it: the drain captures [pending] under the queue lock and applies it in a separate
+    critical section, so a [put_async] landing in between got its newer value overwritten by
+    the older snapshot. Reads then went backwards — for the sell-levels store, the strategy
+    resting on a previous cycle's levels. *)
 let rec background_worker t () =
   Mutex.lock t.save_queue_mutex;
   while Hashtbl.length t.save_queue = 0 do
@@ -304,9 +311,6 @@ let rec background_worker t () =
   let pending = Hashtbl.copy t.save_queue in
   Hashtbl.reset t.save_queue;
   Mutex.unlock t.save_queue_mutex;
-  Mutex.lock t.cache_mutex;
-  Hashtbl.iter (fun k v -> Hashtbl.replace t.cache k v) pending;
-  Mutex.unlock t.cache_mutex;
   (try
      Hashtbl.iter
        (fun k v ->

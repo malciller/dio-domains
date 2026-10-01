@@ -11,7 +11,8 @@
 
     - A read is one array index, one [Atomic.get] and one array probe — lock-free,
       allocation-free, and safe against a concurrent writer, because a published shard is
-      never mutated again.
+      never mutated again. ([find_opt] boxes the value into a fresh option per hit;
+      [find_default] destructures in place and allocates nothing.)
     - A write copies only the shard it lands in and CAS-replaces that one slot, so the
       copy cost is O(size of one shard) rather than O(size of the whole map). The obvious
       alternative — [Hashtbl.copy] of the entire table per insert — is quadratic in the
@@ -85,13 +86,15 @@ let shard_copy s =
   { slots = Array.copy s.slots; mask = s.mask; shift = s.shift; count = s.count }
 ;;
 
+(** Returns the slot cell holding [k], or [None]. Returning the cell lets [find_default]
+    destructure it instead of re-boxing. *)
 let shard_find s h k =
   let slots = s.slots in
   let mask = s.mask in
   let rec probe i =
     match slots.(i) with
     | None -> None
-    | Some (k', v) -> if k' = k then Some v else probe ((i + 1) land mask)
+    | Some (k', _) as cell -> if k' = k then cell else probe ((i + 1) land mask)
   in
   probe (slot_start s h)
 ;;
@@ -169,13 +172,24 @@ let[@inline] shard_index t h = h land t.mask
 
 let find_opt t k =
   let h = Hashtbl.hash k in
-  shard_find (Atomic.get t.shards.(shard_index t h)) h k
+  match shard_find (Atomic.get t.shards.(shard_index t h)) h k with
+  | Some (_, v) -> Some v
+  | None -> None
+;;
+
+(** [find_default t k ~default], allocation-free. Same result as [find_opt] with an
+    [Option.get ~default], for read paths that already have a fallback in hand. *)
+let find_default t k ~default =
+  let h = Hashtbl.hash k in
+  match shard_find (Atomic.get t.shards.(shard_index t h)) h k with
+  | Some (_, v) -> v
+  | None -> default
 ;;
 
 let find t k =
   let h = Hashtbl.hash k in
   match shard_find (Atomic.get t.shards.(shard_index t h)) h k with
-  | Some v -> v
+  | Some (_, v) -> v
   | None -> raise Not_found
 ;;
 
@@ -190,7 +204,7 @@ let set t k v =
   let rec loop () =
     let old = Atomic.get t.shards.(i) in
     match shard_find old h k with
-    | Some v' when v' == v -> ()
+    | Some (_, v') when v' == v -> ()
     | _ ->
       (* Copy only this shard, mutate the copy privately, then publish it. *)
       let next = shard_copy old in
@@ -207,38 +221,73 @@ let add_if_absent t k v =
   let i = shard_index t h in
   let rec loop () =
     let old = Atomic.get t.shards.(i) in
-    if shard_find old h k <> None
-    then false
-    else (
+    match shard_find old h k with
+    | Some _ -> false
+    | None ->
       let next = shard_copy old in
       shard_write next h k v;
-      if Atomic.compare_and_set t.shards.(i) old next then true else loop ())
+      if Atomic.compare_and_set t.shards.(i) old next then true else loop ()
   in
   loop ()
 ;;
 
-(** Drops [k] if present. Lock-free. *)
+(** [true] when [h] lies in the cyclic half-open range (i, j] — the slots a key homed at
+    [h] traverses on its way to [j]. An entry whose home is in that range is already
+    reachable without the hole at [i] and must stay put; otherwise its only route to [j]
+    runs through the hole, so pulling it back preserves reachability. *)
+let[@inline] cyclically_between i j h =
+  if i <= j then h > i && h <= j else h <= j || h > i
+;;
+
+(** Drops [k] if present. Lock-free.
+
+    Backward-shift deletion (Knuth 6.4R), not a bare hole. [None] is the probe sequence's
+    end marker, so a hole punched in front of a colliding entry orphans it: [find_opt]
+    reports absent for a binding still in the shard, and a later [set] installs a second
+    copy, double-counting [count]. Instead each following entry that depends on the hole
+    moves back into it and the hole walks forward, until it reaches an empty slot.
+    The 50% load cap guarantees one exists, so no cluster-length bound is needed. *)
 let remove t k =
   let h = Hashtbl.hash k in
   let i = shard_index t h in
   let rec loop () =
     let old = Atomic.get t.shards.(i) in
-    if shard_find old h k = None
-    then ()
-    else (
+    match shard_find old h k with
+    | None -> ()
+    | Some _ ->
       let next = shard_copy old in
       let slots = next.slots in
       let mask = next.mask in
-      let rec probe i =
+      let shift = next.shift in
+      let rec unlink i =
         match slots.(i) with
         | Some (k', _) when k' = k ->
           slots.(i) <- None;
-          next.count <- next.count - 1
-        | Some _ -> probe ((i + 1) land mask)
+          next.count <- next.count - 1;
+          (* Where the empty slot currently is: starts at the slot just vacated and walks
+             forward as entries are pulled back over it. *)
+          let hole = ref i in
+          let rec pull j =
+            match slots.(j) with
+            | None -> () (* Cluster ends: the hole is in its final position. *)
+            | Some (k', v') ->
+              let home = (Hashtbl.hash k' lsr shift) land mask in
+              if cyclically_between !hole j home
+              then pull ((j + 1) land mask)
+              else (
+                (* [k'] probed past the hole, so [j] is only reachable while the hole is
+                   there. Move it back and continue from the hole it leaves. *)
+                slots.(!hole) <- Some (k', v');
+                slots.(j) <- None;
+                hole := j;
+                pull ((j + 1) land mask))
+          in
+          pull ((i + 1) land mask)
+        | Some _ -> unlink ((i + 1) land mask)
         | None -> ()
       in
-      probe (slot_start next h);
-      if not (Atomic.compare_and_set t.shards.(i) old next) then loop ())
+      unlink (slot_start next h);
+      if not (Atomic.compare_and_set t.shards.(i) old next) then loop ()
   in
   loop ()
 ;;

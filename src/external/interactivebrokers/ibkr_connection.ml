@@ -9,15 +9,20 @@ open Lwt.Infix
 let section = "ibkr_connection"
 
 (** Connection state: socket, IO channels, negotiated server version, order id counter,
-    and the write mutex. *)
+    and the write mutex.
+
+    Owned by the connection's Lwt domain. Everything a trading domain also reaches is an
+    [Atomic]: the order id counter (allocated from per-asset domains), the cached account
+    id, the liveness flag they poll, and the output channel [write_raw] reads per send.
+    [ic] and [socket] stay plain mutable — only this domain opens and closes them. *)
 type t =
   { mutable socket : Lwt_unix.file_descr option
   ; mutable ic : Lwt_io.input_channel option
-  ; mutable oc : Lwt_io.output_channel option
+  ; oc : Lwt_io.output_channel option Atomic.t
   ; mutable server_version : int
-  ; mutable next_order_id : int
-  ; mutable account_id : string
-  ; mutable connected : bool
+  ; next_order_id : int Atomic.t
+  ; account_id : string Atomic.t
+  ; connected : bool Atomic.t
   ; host : string
   ; port : int
   ; client_id : int
@@ -29,11 +34,11 @@ type t =
 let create ~host ~port ~client_id =
   { socket = None
   ; ic = None
-  ; oc = None
+  ; oc = Atomic.make None
   ; server_version = 0
-  ; next_order_id = 0
-  ; account_id = ""
-  ; connected = false
+  ; next_order_id = Atomic.make 0
+  ; account_id = Atomic.make ""
+  ; connected = Atomic.make false
   ; host
   ; port
   ; client_id
@@ -43,19 +48,38 @@ let create ~host ~port ~client_id =
 
 (** Connection status: true once the TCP socket is bound and the TWS handshake is
     complete. *)
-let is_connected t = t.connected
+let is_connected t = Atomic.get t.connected
 
-(** Returns the next order id, incrementing the local counter. The starting value is
-    supplied by TWS during the handshake. Single threaded use only: no synchronization
-    here. *)
-let get_next_order_id t =
-  let id = t.next_order_id in
-  t.next_order_id <- id + 1;
-  id
+(** Returns the next order id and advances the counter.
+
+    Atomic because placement runs on per-asset trading domains, not this one: a
+    read-then-increment hands the same id to two domains, and TWS rejects the duplicate
+    while our id->symbol index loses a binding.
+
+    Forward only. TWS supplies the starting value via nextValidId and re-supplies it on
+    reconnect, where it can be *lower* than ids already placed in this process whose orders
+    are still working, so the floor is raised and never lowered. *)
+let get_next_order_id t = Atomic.fetch_and_add t.next_order_id 1
+
+(** Adopts the server-supplied starting order id, raising the floor to [id]. Ignores a
+    value below the current counter; those ids may belong to working orders. *)
+let set_next_order_id t id =
+  let rec raise_floor () =
+    let cur = Atomic.get t.next_order_id in
+    if cur >= id
+    then ()
+    else if Atomic.compare_and_set t.next_order_id cur id
+    then ()
+    else raise_floor ()
+  in
+  raise_floor ()
 ;;
 
 (** Account id cached from the managedAccounts message. *)
-let get_account_id t = t.account_id
+let get_account_id t = Atomic.get t.account_id
+
+(** Records the account id reported by the gateway. *)
+let set_account_id t id = Atomic.set t.account_id id
 
 (** Server version negotiated during the handshake. *)
 let get_server_version t = t.server_version
@@ -96,17 +120,23 @@ let read_message ic =
     >|= fun () -> Ibkr_codec.decode_fields (Bytes.sub_string !msg_buf 0 len))
 ;;
 
-(** Writes raw bytes under the write mutex so frames are not interleaved. No-op with an
-    error log when disconnected. *)
+(** Raised by [send] when the socket is not open. A failed write, not a sent one. *)
+exception Not_connected
+
+(** Writes raw bytes under the write mutex so frames are not interleaved.
+
+    Fails with [Not_connected] when there is no output channel. Returning unit instead is
+    what let [place_order] hand back an order id for a frame that was never written: the
+    caller had no way to tell sent from dropped. *)
 let write_raw t bytes =
-  match t.oc with
+  match Atomic.get t.oc with
   | Some oc ->
     Lwt_mutex.with_lock t.write_mutex (fun () ->
       Lwt_io.write_from_exactly oc bytes 0 (Bytes.length bytes)
       >>= fun () -> Lwt_io.flush oc)
   | None ->
     Logging.error ~section "Cannot write: not connected";
-    Lwt.return_unit
+    Lwt.fail Not_connected
 ;;
 
 (** Encodes [fields] and writes the frame. *)
@@ -174,8 +204,8 @@ let connect t =
       let oc = Lwt_io.of_fd ~mode:Lwt_io.output fd in
       t.socket <- Some fd;
       t.ic <- Some ic;
-      t.oc <- Some oc;
-      t.connected <- true;
+      Atomic.set t.oc (Some oc);
+      Atomic.set t.connected true;
       handshake t
       >>= fun () ->
       Logging.info ~section "Handshake complete, awaiting nextValidId";
@@ -186,15 +216,15 @@ let connect t =
       >>= fun () ->
       t.socket <- None;
       t.ic <- None;
-      t.oc <- None;
-      t.connected <- false;
+      Atomic.set t.oc None;
+      Atomic.set t.connected false;
       Lwt.fail exn)
 ;;
 
 (** Closes the IO channels and socket and marks the connection down. Channel/socket
     cleanup errors are swallowed. *)
 let disconnect t =
-  t.connected <- false;
+  Atomic.set t.connected false;
   let close_ic =
     match t.ic with
     | Some ic ->
@@ -203,9 +233,9 @@ let disconnect t =
     | None -> Lwt.return_unit
   in
   let close_oc =
-    match t.oc with
+    match Atomic.get t.oc with
     | Some oc ->
-      t.oc <- None;
+      Atomic.set t.oc None;
       Lwt.catch (fun () -> Lwt_io.close oc) (fun _ -> Lwt.return_unit)
     | None -> Lwt.return_unit
   in
@@ -235,7 +265,7 @@ let start_reader t ~on_message ~on_disconnect =
   | Some ic ->
     let stream =
       Lwt_stream.from (fun () ->
-        if not t.connected
+        if not (Atomic.get t.connected)
         then Lwt.return_none
         else
           Lwt.catch
@@ -273,12 +303,12 @@ let start_reader t ~on_message ~on_disconnect =
           Concurrency.Lwt_util.consume_stream process_fields stream
           >>= fun () ->
           Logging.warn ~section "Connection closed by gateway (EOF)";
-          t.connected <- false;
+          Atomic.set t.connected false;
           on_disconnect "Connection closed by gateway (EOF)";
           Lwt.return_unit)
         (fun exn ->
           Logging.error_f ~section "Reader error: %s" (Printexc.to_string exn);
-          t.connected <- false;
+          Atomic.set t.connected false;
           on_disconnect (Printf.sprintf "Reader error: %s" (Printexc.to_string exn));
           Lwt.return_unit))
 ;;

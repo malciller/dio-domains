@@ -32,17 +32,18 @@ let stores = Ds.Cow_table.create ~shard_count:32 ()
 let ready_condition = Lwt_condition.create ()
 
 (* reqId -> symbol routing for market data responses. This had no lock at all: the
-   dispatcher wrote entries and [reset] cleared the table from the Lwt domain while
-   trading Domains read it. Copy-on-write, so a reader never observes a resize. The key
-   space is the in-flight request id window, which the feed bounds itself. *)
-let req_id_to_symbol : (int, string) Ds.Cow_table.t =
-  Ds.Cow_table.create ~shard_count:32 ()
-;;
+   dispatcher wrote entries and [reset] cleared the table from the Lwt domain while trading
+   Domains read it.
+
+   reqIds come from [next_req_id] below, so the key is an index rather than a string to hash
+   (see [Ds.Id_table]). The read side runs on every market-data tick, and unsubscribe is a
+   single store that cannot strand a neighbouring reqId. *)
+let req_id_to_symbol : string Ds.Id_table.t = Ds.Id_table.create ()
 
 let next_req_id = Atomic.make 2000
 
 (** Clears reqId mappings; called before reconnecting. *)
-let clear_req_ids () = Ds.Cow_table.clear req_id_to_symbol
+let clear_req_ids () = Ds.Id_table.clear req_id_to_symbol
 
 let ensure_store symbol =
   match Ds.Cow_table.find_opt stores symbol with
@@ -95,7 +96,7 @@ let handle_market_depth fields =
   let side, fields = Ibkr_codec.read_int fields in
   let price, fields = Ibkr_codec.read_float fields in
   let size, _fields = Ibkr_codec.read_float fields in
-  match Ds.Cow_table.find_opt req_id_to_symbol req_id with
+  match Ds.Id_table.find_opt req_id_to_symbol req_id with
   | None -> ()
   | Some symbol ->
     let store = ensure_store symbol in
@@ -123,7 +124,7 @@ let handle_tick_price fields =
     tick_type
     price
     size;
-  match Ds.Cow_table.find_opt req_id_to_symbol req_id with
+  match Ds.Id_table.find_opt req_id_to_symbol req_id with
   | None -> ()
   | Some symbol ->
     let store = ensure_store symbol in
@@ -178,7 +179,7 @@ let handle_tick_size fields =
     req_id
     tick_type
     size;
-  match Ds.Cow_table.find_opt req_id_to_symbol req_id with
+  match Ds.Id_table.find_opt req_id_to_symbol req_id with
   | None -> ()
   | Some symbol ->
     let store = ensure_store symbol in
@@ -201,7 +202,7 @@ let request_snapshot conn ~contract =
   let symbol = contract.Ibkr_types.symbol in
   let _store = ensure_store symbol in
   let req_id = Atomic.fetch_and_add next_req_id 1 in
-  Ds.Cow_table.set req_id_to_symbol req_id symbol;
+  Ds.Id_table.set req_id_to_symbol req_id symbol;
   Logging.info_f ~section "Requesting L1 snapshot seed for %s (reqId=%d)" symbol req_id;
   let msg_fields =
     [ string_of_int Ibkr_types.msg_req_mkt_data
@@ -233,7 +234,7 @@ let subscribe conn ~contract =
   then (
     (* STK/ETF on SMART doesn't support L2 depth: fallback to L1 Top-Of-Book reqMktData *)
     let req_id = Atomic.fetch_and_add next_req_id 1 in
-    Ds.Cow_table.set req_id_to_symbol req_id symbol;
+    Ds.Id_table.set req_id_to_symbol req_id symbol;
     Logging.info_f
       ~section
       "Falling back to L1 ticker feed for %s (STK on %s L2 not supported)"
@@ -260,7 +261,7 @@ let subscribe conn ~contract =
     Ibkr_connection.send conn msg_fields)
   else (
     let req_id = Atomic.fetch_and_add next_req_id 1 in
-    Ds.Cow_table.set req_id_to_symbol req_id symbol;
+    Ds.Id_table.set req_id_to_symbol req_id symbol;
     Logging.info_f
       ~section
       "Subscribing to orderbook for %s (reqId=%d, depth=%d)"

@@ -608,10 +608,14 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
               ~port:!Ibkr.Module.Config.gateway_port
               ~client_id:Ibkr.Module.Config.client_id
           in
-          Atomic.set Ibkr.Module.connection (Some conn);
+          (* Publish only once the socket is up. Publishing first left a window where a
+             trading domain could resolve a connection with no output channel; [send] then
+             reported success for a frame it never wrote, and the strategy tracked an order
+             the gateway never received. Failing fast is correct here. *)
           Ibkr.Connection.connect_with_retry conn ~max_attempts:5
           >>= fun () ->
           Ibkr.Dispatcher.initialize conn;
+          Atomic.set Ibkr.Module.connection (Some conn);
           (* openOrderEnd marks execution stores ready. Must be set after initialize
              (which clears state) and before request_open_orders fires, avoiding a
              dependency cycle in the lib. *)

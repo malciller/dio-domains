@@ -1,6 +1,8 @@
-(* Test-only use of [Unix.putenv] to exercise COLUMNS handling; single-threaded test
-   process. OxCaml [unsafe_multidomain] alert acknowledged. *)
+(* Test-only use of [Unix.putenv] to exercise COLUMNS handling. The section-level
+   invalidation test needs a second Domain to show the republished level is visible outside
+   the Domain that logged first, hence [do_not_spawn_domains] acknowledged too. *)
 [@@@alert "-unsafe_multidomain"]
+[@@@alert "-do_not_spawn_domains"]
 
 let test_log_levels () =
   Logging.debug ~section:"test_logging" "Debug message";
@@ -102,6 +104,52 @@ let test_section_level_filtering () =
   Logging.critical ~section:"strict_section" "Visible critical";
   Logging.set_level Logging.INFO;
   Alcotest.(check bool) "section level filtering works" true true
+;;
+
+(* A section's level is published by installing a *new* record rather than mutating the
+   published one, which is what keeps the per-log-line read race-free. The cost is that
+   every Domain caches the record it last looked up, so without invalidation the new level
+   is invisible to any Domain that has already logged that section — usually all of them.
+
+   [will_log] is the predicate that decides whether a line is emitted, and it consults
+   that cache, so asserting on it directly is the tightest statement of the property: log
+   once (populating the cache), change the level, then assert the same Domain now filters
+   differently. *)
+let test_section_level_change_visible_after_caching () =
+  let section = "relevel_section" in
+  (* The global floor gates first, so it has to admit DEBUG for the section level to decide. *)
+  Logging.set_level Logging.DEBUG;
+  Logging.set_section_level section Logging.DEBUG;
+  (* Populate this Domain's cached record for [section]. *)
+  Alcotest.(check bool)
+    "debug admitted before the change"
+    true
+    (Logging.will_log Logging.DEBUG section);
+  Logging.set_section_level section Logging.ERROR;
+  Alcotest.(check bool)
+    "debug rejected after the change, in the domain that cached it"
+    false
+    (Logging.will_log Logging.DEBUG section);
+  Alcotest.(check bool)
+    "error still admitted after the change"
+    true
+    (Logging.will_log Logging.ERROR section);
+  (* The change must reach a Domain that has never seen the section, too. *)
+  let other =
+    Domain.spawn (fun () ->
+      Logging.set_section_level section Logging.DEBUG;
+      let admitted = Logging.will_log Logging.DEBUG section in
+      Logging.set_section_level section Logging.ERROR;
+      if Logging.will_log Logging.DEBUG section then admitted else false)
+  in
+  Alcotest.(check bool)
+    "a fresh domain agrees with the new level"
+    false
+    (Domain.join other);
+  (* Restore for other tests. *)
+  Logging.set_section_level section Logging.INFO;
+  Logging.set_level Logging.INFO;
+  Alcotest.(check bool) "restored" true (Logging.will_log Logging.INFO section)
 ;;
 
 let test_section_enable_filtering () =
@@ -394,6 +442,10 @@ let () =
               "section level filtering"
               `Quick
               test_section_level_filtering
+          ; Alcotest.test_case
+              "section level change reaches cached domains"
+              `Quick
+              test_section_level_change_visible_after_caching
           ; Alcotest.test_case
               "section enable filtering"
               `Quick
