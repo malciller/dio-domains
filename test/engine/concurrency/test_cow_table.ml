@@ -1,5 +1,7 @@
 (* Coverage for the copy-on-write sharded map.
    - semantics: set/find/find_opt/mem/add_if_absent/remove/length/clear/fold
+   - deletion: intra-shard probe chains survive a remove (the hazard a hole-punching
+     delete cannot survive, because an empty slot terminates the probe)
    - concurrency: many domains writing and reading disjoint and shared keyspaces at once,
      which is the hazard a plain Hashtbl cannot survive (in-place resize during a read). *)
 
@@ -12,19 +14,13 @@ let test_basics () =
   Ds.Cow_table.set t "a" 1;
   Ds.Cow_table.set t "b" 2;
   Ds.Cow_table.set t "a" 10;
-  Alcotest.(check (option int))
-    "find_opt a"
-    (Some 10)
-    (Ds.Cow_table.find_opt t "a");
+  Alcotest.(check (option int)) "find_opt a" (Some 10) (Ds.Cow_table.find_opt t "a");
   Alcotest.(check int) "find b" 2 (Ds.Cow_table.find t "b");
   Alcotest.(check (option int)) "missing" None (Ds.Cow_table.find_opt t "zz");
   Alcotest.(check bool) "mem a" true (Ds.Cow_table.mem t "a");
   Alcotest.(check bool) "mem zz" false (Ds.Cow_table.mem t "zz");
   Alcotest.(check int) "length" 2 (Ds.Cow_table.length t);
-  Alcotest.(check bool)
-    "add_if_absent new"
-    true
-    (Ds.Cow_table.add_if_absent t "c" 3);
+  Alcotest.(check bool) "add_if_absent new" true (Ds.Cow_table.add_if_absent t "c" 3);
   Alcotest.(check bool)
     "add_if_absent existing"
     false
@@ -52,8 +48,7 @@ let test_bucket_count_rounding () =
   Alcotest.(check int)
     "64 -> 64"
     64
-    (Ds.Cow_table.shard_count
-       (Ds.Cow_table.create ~shard_count:64 ()));
+    (Ds.Cow_table.shard_count (Ds.Cow_table.create ~shard_count:64 ()));
   Alcotest.(check int)
     "1 -> 1"
     1
@@ -112,10 +107,7 @@ let test_concurrent_read_write () =
   List.iter Domain.join handles;
   Alcotest.(check int) "no torn reads" 0 (Atomic.get bad);
   Alcotest.(check bool) "readers made progress" true (Atomic.get reads > 0);
-  Alcotest.(check int)
-    "all keys present"
-    (domains * per_domain)
-    (Ds.Cow_table.length t);
+  Alcotest.(check int) "all keys present" (domains * per_domain) (Ds.Cow_table.length t);
   (* Spot-check every key landed. *)
   let missing = ref 0 in
   for d = 0 to domains - 1 do
@@ -154,6 +146,96 @@ let test_concurrent_same_key () =
        | Some v -> string_of_int v)
 ;;
 
+(* Deletion must not orphan a key that probed past the removed one. One shard makes every
+   key share a probe sequence, forcing the collision instead of hoping a multi-shard table
+   produces one. *)
+let test_remove_preserves_probe_chain () =
+  let t = Ds.Cow_table.create ~shard_count:1 () in
+  let n = 200 in
+  let key i = "k" ^ string_of_int i in
+  for i = 0 to n - 1 do
+    Ds.Cow_table.set t (key i) i
+  done;
+  (* Any key that probed past a hole reports absent here. *)
+  for i = 0 to n - 1 do
+    if i mod 2 = 0 then Ds.Cow_table.remove t (key i)
+  done;
+  let missing =
+    List.fold_left
+      (fun acc i ->
+        if i mod 2 = 0
+        then acc
+        else (
+          match Ds.Cow_table.find_opt t (key i) with
+          | Some v when v = i -> acc
+          | _ -> i :: acc))
+      []
+      (List.init n (fun i -> i))
+  in
+  Alcotest.(check (list int))
+    "survivors reachable after interleaved removes"
+    []
+    (List.sort compare missing);
+  Alcotest.(check int) "length reflects removals" (n / 2) (Ds.Cow_table.length t);
+  (* Reinserting a removed key must not resurrect its probe neighbours or double the count. *)
+  Ds.Cow_table.set t (key 0) 0;
+  Alcotest.(check int) "reinsert keeps count" ((n / 2) + 1) (Ds.Cow_table.length t);
+  let odd_keys = List.filter (fun i -> i mod 2 = 1) (List.init n (fun i -> i)) in
+  let still_missing =
+    List.filter
+      (fun i ->
+        match Ds.Cow_table.find_opt t (key i) with
+        | Some v -> v <> i
+        | None -> true)
+      odd_keys
+  in
+  Alcotest.(check (list int)) "reinsert leaves others intact" [] still_missing
+;;
+
+(* Remove and reinsert repeatedly, in a table small enough that growth happens
+   mid-sequence. Growth rehashes with the same [slot_start] derivation, so a backward-shift
+   delete that mis-tracked a home slot would show up as a key lost across a resize. *)
+let test_remove_across_growth () =
+  let t = Ds.Cow_table.create ~shard_count:1 () in
+  let key i = "g" ^ string_of_int i in
+  (* Model the live set alongside the operations rather than re-deriving the schedule. *)
+  let live = Hashtbl.create 64 in
+  let rounds = 40 in
+  for round = 1 to rounds do
+    Ds.Cow_table.set t (key round) round;
+    Hashtbl.replace live round ();
+    if round mod 3 = 0
+    then (
+      Ds.Cow_table.remove t (key (round - 1));
+      Hashtbl.remove live (round - 1))
+  done;
+  let expected =
+    List.filter (fun i -> Hashtbl.mem live i) (List.init (rounds + 1) (fun i -> i))
+  in
+  Alcotest.(check int)
+    "length matches live set"
+    (List.length expected)
+    (Ds.Cow_table.length t);
+  let wrong =
+    List.filter
+      (fun i ->
+        match Ds.Cow_table.find_opt t (key i) with
+        | Some v -> v <> i
+        | None -> true)
+      expected
+  in
+  Alcotest.(check (list int)) "no key lost across growth" [] wrong;
+  (* Removed keys must really be gone, or the count assertion could be satisfied by a
+     duplicate binding instead. *)
+  let resurrected =
+    List.filter
+      (fun i -> i > 0 && not (Hashtbl.mem live i))
+      (List.filter (fun i -> i > 0) (List.init (rounds + 1) (fun i -> i)))
+    |> List.filter (fun i -> Ds.Cow_table.find_opt t (key i) <> None)
+  in
+  Alcotest.(check (list int)) "removed keys stay removed" [] resurrected
+;;
+
 let () =
   Alcotest.run
     "cow_table"
@@ -161,6 +243,13 @@ let () =
       , [ Alcotest.test_case "basics" `Quick test_basics
         ; Alcotest.test_case "bucket count rounding" `Quick test_bucket_count_rounding
         ; Alcotest.test_case "fold and clear" `Quick test_fold_and_clear
+        ] )
+    ; ( "deletion"
+      , [ Alcotest.test_case
+            "remove preserves probe chain"
+            `Quick
+            test_remove_preserves_probe_chain
+        ; Alcotest.test_case "remove across growth" `Quick test_remove_across_growth
         ] )
     ; ( "concurrency"
       , [ Alcotest.test_case "concurrent read/write" `Quick test_concurrent_read_write

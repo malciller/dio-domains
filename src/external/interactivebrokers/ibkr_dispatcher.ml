@@ -20,31 +20,33 @@ type req_handler =
    marker arrives. Both were unsynchronized Hashtbls: registered and cleared by the Lwt
    domain ([reset] runs before every reconnect) while dispatch and response handling run
    concurrently. A [reset] overlapping an in-flight dispatch was a live resize race.
-   Copy-on-write, so dispatch reads never block and never see a torn table. *)
-let handlers : (int, handler) Ds.Cow_table.t =
-  Ds.Cow_table.create ~shard_count:32 ()
-;;
 
-let req_handlers : (int, req_handler) Ds.Cow_table.t =
-  Ds.Cow_table.create ~shard_count:32 ()
-;;
+   Both keys are integers the venue hands us, so they are indexed rather than hashed (see
+   [Ds.Id_table]). That also fixes the delete side: a reqId handler is removed on every
+   completed request, and a linear-probe table that loses one strands the waiter, because
+   the end marker is what signals its condition. *)
+let handlers : handler Ds.Id_table.t = Ds.Id_table.create ()
 
-(** Active connection, set by [initialize] and cleared by [reset]. *)
-let connection : Ibkr_connection.t option ref = ref None
+let req_handlers : req_handler Ds.Id_table.t = Ds.Id_table.create ()
+
+(** Active connection, set by [initialize] and cleared by [reset]. Atomic because trading
+    domains reach it through [Ibkr_module.get_conn] to place orders, while the connection
+    domain republishes it on every reconnect. *)
+let connection : Ibkr_connection.t option Atomic.t = Atomic.make None
 
 (** Registers a handler for [msg_id], replacing any existing one. *)
-let register_handler ~msg_id ~handler:h = Ds.Cow_table.set handlers msg_id h
+let register_handler ~msg_id ~handler:h = Ds.Id_table.set handlers msg_id h
 
 (** Registers a reqId-correlated handler and returns the condition that is signaled when
     the response sequence ends. *)
 let register_req_handler ~req_id ~on_data ~on_end =
   let condition = Lwt_condition.create () in
-  Ds.Cow_table.set req_handlers req_id { on_data; on_end; condition };
+  Ds.Id_table.set req_handlers req_id { on_data; on_end; condition };
   condition
 ;;
 
 (** Removes the reqId-correlated handler; call after completion to avoid leaking entries. *)
-let remove_req_handler ~req_id = Ds.Cow_table.remove req_handlers req_id
+let remove_req_handler ~req_id = Ds.Id_table.remove req_handlers req_id
 
 (** Callback fired when the initial open-order snapshot ends. Set via this reference
     (rather than a module dependency) so the executions feed can finalize state without a
@@ -54,18 +56,18 @@ let on_open_orders_end : (unit -> unit) option ref = ref None
 (** Clears all handlers and connection state. Called before connecting so stale
     registrations do not survive a reconnect. *)
 let reset () =
-  Ds.Cow_table.clear handlers;
-  Ds.Cow_table.clear req_handlers;
-  connection := None;
+  Ds.Id_table.clear handlers;
+  Ds.Id_table.clear req_handlers;
+  Atomic.set connection None;
   on_open_orders_end := None;
   Logging.info ~section "Dispatcher state reset (handlers cleared)"
 ;;
 
-let set_connection conn = connection := Some conn
+let set_connection conn = Atomic.set connection (Some conn)
 
 (** Active connection; fails if not yet initialized. *)
 let get_connection () =
-  match !connection with
+  match Atomic.get connection with
   | Some conn -> conn
   | None -> failwith "IBKR dispatcher: connection not initialized"
 ;;
@@ -74,7 +76,7 @@ let get_connection () =
     leading field as a reqId into [req_handlers]. *)
 let dispatch ~msg_id ~fields =
   Logging.debug_f ~section "<<< msg_id=%d fields=%d" msg_id (List.length fields);
-  match Ds.Cow_table.find_opt handlers msg_id with
+  match Ds.Id_table.find_opt handlers msg_id with
   | Some handler ->
     (try handler fields with
      | exn ->
@@ -91,7 +93,7 @@ let dispatch ~msg_id ~fields =
          try int_of_string req_id_str with
          | _ -> -1
        in
-       (match Ds.Cow_table.find_opt req_handlers req_id with
+       (match Ds.Id_table.find_opt req_handlers req_id with
         | Some rh ->
           (try rh.on_data fields with
            | exn ->
@@ -116,7 +118,7 @@ let handle_next_valid_id fields =
   let _version, fields = Ibkr_codec.read_int fields in
   let order_id, _fields = Ibkr_codec.read_int fields in
   let conn = get_connection () in
-  conn.next_order_id <- order_id;
+  Ibkr_connection.set_next_order_id conn order_id;
   Logging.info_f ~section "Next valid order ID: %d" order_id
 ;;
 
@@ -131,7 +133,7 @@ let handle_managed_accounts fields =
     | a :: _ -> String.trim a
     | [] -> accounts
   in
-  conn.account_id <- account;
+  Ibkr_connection.set_account_id conn account;
   Logging.info_f ~section "Managed account: %s" account
 ;;
 
@@ -162,10 +164,10 @@ let handle_error fields =
     then Logging.error_f ~section "Order error [%d] id=%d: %s" code id message
     else Logging.warn_f ~section "Gateway error [%d] id=%d: %s" code id message;
     (* Signal any request blocked on this id so it fails promptly. *)
-    match Ds.Cow_table.find_opt req_handlers id with
+    match Ds.Id_table.find_opt req_handlers id with
     | Some rh ->
       Lwt_condition.signal rh.condition ();
-      Ds.Cow_table.remove req_handlers id
+      Ds.Id_table.remove req_handlers id
     | None -> ())
 ;;
 
@@ -178,11 +180,11 @@ let handle_end_marker ~req_id_index fields =
       try int_of_string req_id_str with
       | _ -> -1
     in
-    (match Ds.Cow_table.find_opt req_handlers req_id with
+    (match Ds.Id_table.find_opt req_handlers req_id with
      | Some rh ->
        rh.on_end ();
        Lwt_condition.signal rh.condition ();
-       Ds.Cow_table.remove req_handlers req_id
+       Ds.Id_table.remove req_handlers req_id
      | None -> ())
   | None -> ()
 ;;
@@ -203,7 +205,7 @@ let register_core_handlers () =
         try int_of_string req_id_str with
         | _ -> -1
       in
-      (match Ds.Cow_table.find_opt req_handlers req_id with
+      (match Ds.Id_table.find_opt req_handlers req_id with
        | Some rh ->
          (try rh.on_data fields with
           | exn ->

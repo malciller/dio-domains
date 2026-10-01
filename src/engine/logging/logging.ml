@@ -127,11 +127,21 @@ let section_color_code name =
 (* [min_level] is immutable. A section record is published into a copy-on-write registry,
    so a level change installs a *new* record rather than mutating one that other Domains may
    be reading concurrently. Mutating it in place would be a cross-domain write racing the
-   per-log-line read in [will_log]. *)
+   per-log-line read in [will_log].
+
+   The cost of that immutability is aliasing: every Domain caches the record it last looked
+   up, so a republished level is invisible to any Domain that has already logged that
+   section. [sections_generation] is bumped on each republish and the cache records the
+   generation it was filled under, so a stale entry costs one integer comparison instead of
+   a Hashtbl lookup. *)
 type section =
   { name : string
   ; min_level : level
   }
+
+(* Bumped whenever a section's level is republished, invalidating every Domain's cached
+   record. Uncontended [Atomic.get] is a plain load. *)
+let sections_generation = Atomic.make 0
 
 (* Global mutable configuration state. *)
 let global_min_level = ref INFO
@@ -268,19 +278,24 @@ let get_section name =
 ;;
 
 let dummy_section = { name = ""; min_level = CRITICAL }
-let tls_section_cache = Domain.DLS.new_key (fun () -> "", dummy_section)
+
+(* (section name, record, generation the record was current under). *)
+let tls_section_cache = Domain.DLS.new_key (fun () -> ("", dummy_section, -1))
 
 (** [true] when [level] passes both the section and global minimum filters; guards
     allocation on disabled paths. Domain.DLS caches the last section lookup, eliminating
     Hashtbl overhead on the hot path. *)
 let will_log level section_name =
-  let last_name, section = Domain.DLS.get tls_section_cache in
+  let generation = Atomic.get sections_generation in
+  let last_name, section, last_generation = Domain.DLS.get tls_section_cache in
   let sec =
-    if section_name == last_name || String.equal section_name last_name
+    if
+      last_generation = generation
+      && (section_name == last_name || String.equal section_name last_name)
     then section
     else (
       let s = get_section section_name in
-      Domain.DLS.set tls_section_cache (section_name, s);
+      Domain.DLS.set tls_section_cache (section_name, s, generation);
       s)
   in
   let enabled = !enabled_sections in
@@ -658,7 +673,11 @@ let set_section_level name level =
       | Some live ->
         let next = Hashtbl.copy current in
         Hashtbl.replace next name { live with min_level = level };
-        if not (Atomic.compare_and_set sections current next) then publish ()
+        if Atomic.compare_and_set sections current next then
+          (* Invalidate cached records, or the new level applies only to Domains that have
+             not logged this section yet. *)
+          Atomic.incr sections_generation
+        else publish ()
     in
     publish ())
 let set_colors enabled = use_colors := enabled

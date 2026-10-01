@@ -58,10 +58,12 @@ let symbol_stores = Ds.Cow_table.create ~shard_count:32 ()
 let initialization_mutex = Mutex.create ()
 let ready_condition = Lwt_condition.create ()
 
-(** Order id -> symbol map used to route execution messages. *)
-let order_to_symbol : (int, string) Hashtbl.t = Hashtbl.create 64
+(** Order id -> symbol map used to route execution messages.
 
-let global_mutex = Mutex.create ()
+   Was a [Hashtbl] behind one module-wide mutex, taken on every lookup — and a lookup runs
+   per execution message, putting a process-wide lock on the fill path. The key is a
+   venue-assigned integer, so it is indexed and needs no lock (see [Ds.Id_table]). *)
+let order_to_symbol : string Ds.Id_table.t = Ds.Id_table.create ()
 
 let get_symbol_store symbol =
   match Ds.Cow_table.find_opt symbol_stores symbol with
@@ -157,27 +159,14 @@ let notify_ready store =
 ;;
 
 (** Maps [order_id] to [symbol] (mutex-guarded). *)
-let register_order ~order_id ~symbol =
-  Mutex.lock global_mutex;
-  Hashtbl.replace order_to_symbol order_id symbol;
-  Mutex.unlock global_mutex
-;;
+let register_order ~order_id ~symbol = Ds.Id_table.set order_to_symbol order_id symbol;;
 
 (** Symbol for [order_id], or [None]. *)
-let resolve_symbol order_id =
-  Mutex.lock global_mutex;
-  let r = Hashtbl.find_opt order_to_symbol order_id in
-  Mutex.unlock global_mutex;
-  r
-;;
+let resolve_symbol order_id = Ds.Id_table.find_opt order_to_symbol order_id;;
 
 (** Removes [order_id] from the map; call when the order reaches a terminal state so
     long-running processes do not leak entries. *)
-let unregister_order ~order_id =
-  Mutex.lock global_mutex;
-  Hashtbl.remove order_to_symbol order_id;
-  Mutex.unlock global_mutex
-;;
+let unregister_order ~order_id = Ds.Id_table.remove order_to_symbol order_id;;
 
 (** Applies an execution event to the tracked open-order state: removes terminal or fully
     filled orders, otherwise updates fill quantities. *)
