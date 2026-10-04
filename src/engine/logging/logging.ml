@@ -125,15 +125,15 @@ let section_color_code name =
 
 (* Per-section log level configuration. *)
 (* [min_level] is immutable. A section record is published into a copy-on-write registry,
-   so a level change installs a *new* record rather than mutating one that other Domains may
-   be reading concurrently. Mutating it in place would be a cross-domain write racing the
-   per-log-line read in [will_log].
+   so a level change installs a *new* record rather than mutating one that other Domains
+   may be reading concurrently. Mutating it in place would be a cross-domain write racing
+   the per-log-line read in [will_log].
 
-   The cost of that immutability is aliasing: every Domain caches the record it last looked
-   up, so a republished level is invisible to any Domain that has already logged that
-   section. [sections_generation] is bumped on each republish and the cache records the
-   generation it was filled under, so a stale entry costs one integer comparison instead of
-   a Hashtbl lookup. *)
+   The cost of that immutability is aliasing: every Domain caches the record it last
+   looked up, so a republished level is invisible to any Domain that has already logged
+   that section. [sections_generation] is bumped on each republish and the cache records
+   the generation it was filled under, so a stale entry costs one integer comparison
+   instead of a Hashtbl lookup. *)
 type section =
   { name : string
   ; min_level : level
@@ -224,7 +224,6 @@ let log_callback : (level -> string -> string -> unit Lwt.t) ref =
 ;;
 
 let set_enabled_sections secs = enabled_sections := secs
-
 let set_quiet_mode quiet = quiet_mode := quiet
 let set_log_callback callback = log_callback := callback
 
@@ -236,19 +235,18 @@ let output_mutex = Mutex.create ()
    Domain.DLS cache miss), and previously written under a mutex while read without one — a
    resize racing a lookup, on the logging path.
 
-   This is an atomic pointer to a copy-on-write map rather than the shared
-   [Ds.Cow_table]: [logging] is the root of the dependency graph ([concurrency]
-   and most of the engine depend on it), so it cannot depend on [concurrency]. Copying the
-   whole map on insert is the right trade here anyway — the keyspace is the handful of
-   distinct section names in the source, each inserted once, so the quadratic-ish copy cost
-   is a few dozen whole-map copies for the life of the process. A published map is never
-   mutated again, so the read needs no lock.
+   This is an atomic pointer to a copy-on-write map rather than the shared [Ds.Cow_table]:
+   [logging] is the root of the dependency graph ([concurrency] and most of the engine
+   depend on it), so it cannot depend on [concurrency]. Copying the whole map on insert is
+   the right trade here anyway — the keyspace is the handful of distinct section names in
+   the source, each inserted once, so the quadratic-ish copy cost is a few dozen whole-map
+   copies for the life of the process. A published map is never mutated again, so the read
+   needs no lock.
 
-   The mutex still serialises insertion so two Domains cannot both publish a record for the
-   same name and orphan one. It is separate from [output_mutex] so [get_section] never
+   The mutex still serialises insertion so two Domains cannot both publish a record for
+   the same name and orphan one. It is separate from [output_mutex] so [get_section] never
    blocks behind the drain thread's flush. *)
 let sections : (string, section) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 32)
-
 let sections_mutex = Mutex.create ()
 
 let get_section name =
@@ -280,7 +278,7 @@ let get_section name =
 let dummy_section = { name = ""; min_level = CRITICAL }
 
 (* (section name, record, generation the record was current under). *)
-let tls_section_cache = Domain.DLS.new_key (fun () -> ("", dummy_section, -1))
+let tls_section_cache = Domain.DLS.new_key (fun () -> "", dummy_section, -1)
 
 (** [true] when [level] passes both the section and global minimum filters; guards
     allocation on disabled paths. Domain.DLS caches the last section lookup, eliminating
@@ -289,9 +287,8 @@ let will_log level section_name =
   let generation = Atomic.get sections_generation in
   let last_name, section, last_generation = Domain.DLS.get tls_section_cache in
   let sec =
-    if
-      last_generation = generation
-      && (section_name == last_name || String.equal section_name last_name)
+    if last_generation = generation
+       && (section_name == last_name || String.equal section_name last_name)
     then section
     else (
       let s = get_section section_name in
@@ -660,11 +657,13 @@ let critical ~section msg =
 (* Global and per-section configuration accessors. *)
 let init () = ()
 let set_level level = global_min_level := level
+
 (* Installs a replacement record rather than mutating the published one, so a Domain
    reading the old record sees a consistent old level rather than a torn write. *)
 let set_section_level name level =
   let cur = get_section name in
-  if cur.min_level <> level then (
+  if cur.min_level <> level
+  then (
     let rec publish () =
       let current = Atomic.get sections in
       match Hashtbl.find_opt current name with
@@ -673,13 +672,16 @@ let set_section_level name level =
       | Some live ->
         let next = Hashtbl.copy current in
         Hashtbl.replace next name { live with min_level = level };
-        if Atomic.compare_and_set sections current next then
+        if Atomic.compare_and_set sections current next
+        then
           (* Invalidate cached records, or the new level applies only to Domains that have
              not logged this section yet. *)
           Atomic.incr sections_generation
         else publish ()
     in
     publish ())
+;;
+
 let set_colors enabled = use_colors := enabled
 let set_output channel = output_channel := channel
 let get_level () = !global_min_level
@@ -731,4 +733,52 @@ let load_dotenv ?(path = ".env") () =
           done
         with
         | End_of_file -> ())
+;;
+
+(** Reads [key] from a [.env] file without touching the process environment. Returns
+    [None] when the file is missing or the key is absent. Same parsing rules as
+    {!load_dotenv}; the last occurrence wins. *)
+let get_dotenv_var ?(path = ".env") (key : string) : string option =
+  match
+    try Some (open_in path) with
+    | Sys_error _ -> None
+  with
+  | None -> None
+  | Some ic ->
+    Fun.protect
+      ~finally:(fun () -> close_in_noerr ic)
+      (fun () ->
+        let found = ref None in
+        (try
+           while true do
+             let line = String.trim (input_line ic) in
+             if line <> "" && line.[0] <> '#'
+             then (
+               let line =
+                 if String.starts_with ~prefix:"export " line
+                 then String.trim (String.sub line 7 (String.length line - 7))
+                 else line
+               in
+               match String.index_opt line '=' with
+               | None -> ()
+               | Some i ->
+                 let k = String.trim (String.sub line 0 i) in
+                 if String.equal k key
+                 then (
+                   let value =
+                     String.trim (String.sub line (i + 1) (String.length line - i - 1))
+                   in
+                   let value =
+                     let n = String.length value in
+                     if n >= 2
+                        && ((value.[0] = '"' && value.[n - 1] = '"')
+                            || (value.[0] = '\'' && value.[n - 1] = '\''))
+                     then String.sub value 1 (n - 2)
+                     else value
+                   in
+                   found := Some value))
+           done
+         with
+         | End_of_file -> ());
+        !found)
 ;;

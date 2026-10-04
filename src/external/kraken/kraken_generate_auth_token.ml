@@ -13,20 +13,17 @@ open Logging
 let endpoint = "https://api.kraken.com"
 let section = "kraken_generate_auth_token"
 
-(** Loads .env into the process environment if present, then reads [KRAKEN_API_KEY] and
-    [KRAKEN_API_SECRET]. Returns both values as a pair. Raises [Failure] if either
-    variable is missing or empty. *)
+(** Reads [KRAKEN_API_KEY] and [KRAKEN_API_SECRET] from [.env], falling back to the
+    process environment only if the file does not define one. Raises [Failure] if either
+    value is missing or empty. *)
 let get_api_credentials_from_env () : (string * string) Lwt.t =
-  Lwt.catch
-    (fun () ->
-      Logging.load_dotenv ~path:".env" ();
-      Lwt.return_unit)
-    (fun _ -> Lwt.return_unit)
-  >>= fun () ->
   let get_env var =
-    match Sys.getenv_opt var with
+    match Logging.get_dotenv_var ~path:".env" var with
     | Some v when v <> "" -> Lwt.return v
-    | _ -> Lwt.fail_with (Printf.sprintf "Missing environment variable: %s" var)
+    | _ ->
+      (match Sys.getenv_opt var with
+       | Some v when v <> "" -> Lwt.return v
+       | _ -> Lwt.fail_with (Printf.sprintf "Missing environment variable: %s" var))
   in
   Lwt.both (get_env "KRAKEN_API_KEY") (get_env "KRAKEN_API_SECRET")
 ;;
