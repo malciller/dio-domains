@@ -26,20 +26,17 @@ type fee_info =
     expected by the Kraken API. *)
 let symbol_to_kraken_pair = String.(fun s -> uppercase_ascii (trim s))
 
-(** Loads the .env file (if present) and reads [KRAKEN_API_KEY] and [KRAKEN_API_SECRET]
-    from the process environment. Fails with [Lwt.fail_with] if either variable is
-    missing. *)
+(** Reads [KRAKEN_API_KEY] and [KRAKEN_API_SECRET] from [.env], falling back to the
+    process environment only if the file does not define one. Fails with [Lwt.fail_with]
+    if either value is missing. *)
 let get_api_credentials_from_env () : (string * string) Lwt.t =
-  Lwt.catch
-    (fun () ->
-      Logging.load_dotenv ~path:".env" ();
-      Lwt.return_unit)
-    (fun _ -> Lwt.return_unit)
-  >>= fun () ->
   let get_env var =
-    match Sys.getenv_opt var with
-    | Some v -> Lwt.return v
-    | None -> Lwt.fail_with (Printf.sprintf "Missing environment variable: %s" var)
+    match Logging.get_dotenv_var ~path:".env" var with
+    | Some v when v <> "" -> Lwt.return v
+    | _ ->
+      (match Sys.getenv_opt var with
+       | Some v when v <> "" -> Lwt.return v
+       | _ -> Lwt.fail_with (Printf.sprintf "Missing environment variable: %s" var))
   in
   Lwt.both (get_env "KRAKEN_API_KEY") (get_env "KRAKEN_API_SECRET")
 ;;
