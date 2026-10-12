@@ -66,9 +66,14 @@ let grown_to ~page_size dir p =
     while !new_len <= p do
       new_len := !new_len * 2
     done;
-    (* [Array.init], not [Array.make]: [make] evaluates its element once and fills every
-       slot with that value. *)
-    let next = Array.init !new_len (fun _ -> Atomic.make (Array.make page_size None)) in
+    (* Each slot needs its own [Atomic] — two slots sharing one would alias, so a write to
+       id 300 would clobber id 44. But they can all wrap the *same* empty array: a write
+       copies the array before [Atomic.compare_and_set], and a published page is never
+       mutated, so the shared array stays empty. [Array.init], not [Array.make]: [make]
+       would fill every slot with one [Atomic], aliasing them all. Allocating a fresh page
+       per slot instead would cost ~17GB to address a sparse 10^9-scale id. *)
+    let empty = Array.make page_size None in
+    let next = Array.init !new_len (fun _ -> Atomic.make empty) in
     Array.blit dir 0 next 0 old_len;
     next)
 ;;
@@ -235,13 +240,13 @@ let clear t =
   Atomic.set t.count 0
 ;;
 
-(** Ids whose negative value [set] ignored. Non-zero means a venue sent an id that violates
-    the protocol. *)
+(** Ids whose negative value [set] ignored. Non-zero means a venue sent an id that
+    violates the protocol. *)
 let dropped_negative t = Atomic.get t.dropped_negative
 
 (** Folds over the live bindings as [f id v acc]. Not a consistent snapshot under
-    concurrent writes. An index loop rather than [Array.iteri] because the id comes from the
-    offset, which [Array.iteri]'s element argument would make redundant. *)
+    concurrent writes. An index loop rather than [Array.iteri] because the id comes from
+    the offset, which [Array.iteri]'s element argument would make redundant. *)
 let fold f t ~init =
   let acc = ref init in
   let dir = Atomic.get t.dir in
