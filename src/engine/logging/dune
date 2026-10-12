@@ -1,6 +1,18 @@
 (library
  (name logging)
  (public_name dio.logging)
- (libraries dio.data_structures lwt.unix unix notty-community.unix)
+ (modules logging)
+ (libraries dio.data_structures yojson lwt.unix unix notty-community.unix)
  (preprocess
   (pps lwt_ppx)))
+
+; Decision-flow telemetry layered on top of [logging]: renders the structured
+; multi-line "what is the engine deciding" blocks and owns their throttling. Kept
+; separate from [logging] because dune treats [logging] as that library's sole
+; exported main module.
+
+(library
+ (name flow_log)
+ (public_name dio.flow_log)
+ (modules flow_log)
+ (libraries logging))

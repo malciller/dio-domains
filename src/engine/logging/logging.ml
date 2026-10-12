@@ -547,6 +547,107 @@ let start_async_drain () =
     ())
 ;;
 
+(* ---- Recent-log ring (dashboard log panel) ------------------------------- *)
+
+(** A captured log record: severity, section, and the raw message with ANSI stripped. The
+    dashboard is out-of-process, so the ring is shipped over the snapshot/delta channel
+    rather than read from this process's stderr. Captured only after the level/section
+    filters admit the line, so the panel mirrors the configured log stream exactly. *)
+type log_record =
+  { lr_seq : int
+  ; lr_ts : float
+  ; lr_level : level
+  ; lr_section : string
+  ; lr_message : string
+  }
+
+let log_ring_capacity = 500
+let log_ring : log_record Queue.t = Queue.create ()
+let log_ring_mutex = Mutex.create ()
+let log_seq_counter = ref 0
+
+(* Capture is off until a dashboard client attaches (see [set_capture_enabled]), so an
+   engine with no dashboard attached pays nothing beyond one atomic read per log line. *)
+let capture_enabled = Atomic.make false
+let set_capture_enabled b = Atomic.set capture_enabled b
+let capture_is_enabled () = Atomic.get capture_enabled
+
+(* Drop ANSI CSI sequences (ESC [ ... final-byte) so panel rows carry no escape codes. *)
+let strip_ansi s =
+  let b = Buffer.create (String.length s) in
+  let n = String.length s in
+  let i = ref 0 in
+  while !i < n do
+    if !i + 1 < n && s.[!i] = '\027' && s.[!i + 1] = '['
+    then (
+      i := !i + 2;
+      while !i < n && not (s.[!i] >= '@' && s.[!i] <= '~') do
+        incr i
+      done;
+      if !i < n then incr i)
+    else (
+      Buffer.add_char b s.[!i];
+      incr i)
+  done;
+  Buffer.contents b
+;;
+
+let record_log level section_name message =
+  Mutex.lock log_ring_mutex;
+  if Queue.length log_ring >= log_ring_capacity then ignore (Queue.pop log_ring);
+  incr log_seq_counter;
+  Queue.push
+    { lr_seq = !log_seq_counter
+    ; lr_ts = Unix.gettimeofday ()
+    ; lr_level = level
+    ; lr_section = section_name
+    ; lr_message = strip_ansi message
+    }
+    log_ring;
+  Mutex.unlock log_ring_mutex
+;;
+
+(** Record [message] at [level]/[section_name] for the dashboard, when capture is on. *)
+let[@inline] capture_log level section_name message =
+  if Atomic.get capture_enabled then record_log level section_name message
+;;
+
+let log_record_to_json r =
+  `Assoc
+    [ "seq", `Int r.lr_seq
+    ; "ts", `Float r.lr_ts
+    ; "level", `String (level_to_string r.lr_level)
+    ; "section", `String r.lr_section
+    ; "message", `String r.lr_message
+    ]
+;;
+
+(** Recent log records, oldest first, for the 500 ms snapshot backfill. *)
+let recent_json () =
+  Mutex.lock log_ring_mutex;
+  let entries = List.of_seq (Queue.to_seq log_ring) in
+  Mutex.unlock log_ring_mutex;
+  `List (List.map log_record_to_json entries)
+;;
+
+(** Records newer than [since], as a [type="log"] frame:
+    [(latest_seq, fresh_count, json)]. *)
+let delta ~since =
+  Mutex.lock log_ring_mutex;
+  let latest = !log_seq_counter in
+  let fresh =
+    List.filter (fun r -> r.lr_seq > since) (List.of_seq (Queue.to_seq log_ring))
+  in
+  Mutex.unlock log_ring_mutex;
+  ( latest
+  , List.length fresh
+  , `Assoc
+      [ "type", `String "log"
+      ; "seq", `Int latest
+      ; "entries", `List (List.map log_record_to_json fresh)
+      ] )
+;;
+
 (* Core logging function. Domain-safe. All levels except CRITICAL are pushed to the async
    queue with no synchronous I/O and no caller-side draining. CRITICAL drains the queue
    and writes + flushes synchronously for immediate visibility. *)
@@ -560,6 +661,7 @@ let log_sync level section_name message =
   else if !quiet_mode
   then ()
   else (
+    capture_log level section_name message;
     let formatted = format_line level section_name message in
     if level = CRITICAL
     then (
@@ -638,6 +740,7 @@ let critical_async_f ~section (fmt : ('a, unit, string, unit) format4) =
   then
     Printf.ksprintf
       (fun msg ->
+        capture_log CRITICAL section msg;
         let formatted = format_line CRITICAL section msg in
         start_async_drain ();
         log_async_urgent formatted)
@@ -682,7 +785,14 @@ let set_section_level name level =
     publish ())
 ;;
 
+(** Whether ANSI color output is enabled, so higher-level formatters (e.g. {!Flow_log})
+    can decide whether to embed colors in the message body. *)
 let set_colors enabled = use_colors := enabled
+
+(** Whether ANSI color output is enabled, so higher-level formatters (e.g. {!Flow_log})
+    can decide whether to embed colors in the message body. *)
+let colors_enabled () = !use_colors
+
 let set_output channel = output_channel := channel
 let get_level () = !global_min_level
 let get_section_level name = (get_section name).min_level

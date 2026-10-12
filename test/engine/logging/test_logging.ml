@@ -1,6 +1,6 @@
 (* Test-only use of [Unix.putenv] to exercise COLUMNS handling. The section-level
-   invalidation test needs a second Domain to show the republished level is visible outside
-   the Domain that logged first, hence [do_not_spawn_domains] acknowledged too. *)
+   invalidation test needs a second Domain to show the republished level is visible
+   outside the Domain that logged first, hence [do_not_spawn_domains] acknowledged too. *)
 [@@@alert "-unsafe_multidomain"]
 [@@@alert "-do_not_spawn_domains"]
 
@@ -117,7 +117,8 @@ let test_section_level_filtering () =
    differently. *)
 let test_section_level_change_visible_after_caching () =
   let section = "relevel_section" in
-  (* The global floor gates first, so it has to admit DEBUG for the section level to decide. *)
+  (* The global floor gates first, so it has to admit DEBUG for the section level to
+     decide. *)
   Logging.set_level Logging.DEBUG;
   Logging.set_section_level section Logging.DEBUG;
   (* Populate this Domain's cached record for [section]. *)
@@ -424,6 +425,30 @@ let demo_format () =
     samples
 ;;
 
+(* ---- dashboard capture ring ---- *)
+
+let test_log_capture_ring () =
+  let open Yojson.Basic.Util in
+  Logging.set_colors false;
+  Logging.set_capture_enabled true;
+  Logging.info ~section:"capture_test" "hello capture";
+  let entries =
+    match Logging.recent_json () with
+    | `List l -> l
+    | _ -> []
+  in
+  let found =
+    List.exists
+      (fun e ->
+        e |> member "section" |> to_string = "capture_test"
+        && e |> member "message" |> to_string = "hello capture"
+        && e |> member "level" |> to_string = "INFO")
+      entries
+  in
+  Logging.set_capture_enabled false;
+  Alcotest.(check bool) "captured line present" true found
+;;
+
 let () =
   if Array.exists (( = ) "--demo") Sys.argv
   then demo_format ()
@@ -455,6 +480,7 @@ let () =
         , [ Alcotest.test_case "colors" `Quick test_colors
           ; Alcotest.test_case "output redirection" `Quick test_output_redirection
           ; Alcotest.test_case "section management" `Quick test_section_management
+          ; Alcotest.test_case "dashboard capture ring" `Quick test_log_capture_ring
           ] )
       ; ( "format"
         , [ Alcotest.test_case "no full date" `Quick test_format_line_no_full_date

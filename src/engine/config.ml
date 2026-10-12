@@ -31,6 +31,16 @@ type logging_config =
   (** Fixed log-wrap width. None = auto: TTY width, else `COLUMNS` env var, else 200. *)
   }
 
+(** Optional top-level "flow_log" section: the opt-in decision-flow telemetry stream
+    rendered by {!Flow_log}. Absent = disabled (production default). *)
+type flow_log_config =
+  { enabled : bool
+  ; min_interval_seconds : float
+  ; heartbeat_seconds : float
+  ; pulse_seconds : float
+  ; price_ticks : bool
+  }
+
 type gc_config =
   { minor_heap_size : int
   ; space_overhead : int
@@ -53,6 +63,7 @@ type latency_spike_report =
 type config =
   { cycle_mod : int
   ; logging : logging_config
+  ; flow_log : flow_log_config
   ; gc : gc_config option
   ; trading : trading_config list
   ; oracle : Dio_oracle.Oracle_runtime.runtime_config option
@@ -141,6 +152,17 @@ let known_top_level_keys =
   ; "fng_check_threshold"
   ; "theme"
   ; "strategy_trace"
+  ; "flow_log"
+  ; "alert_level"
+  ]
+;;
+
+let known_flow_log_keys =
+  [ "enabled"
+  ; "min_interval_seconds"
+  ; "heartbeat_seconds"
+  ; "pulse_seconds"
+  ; "price_ticks"
   ]
 ;;
 
@@ -429,6 +451,46 @@ let parse_logging_config json : logging_config =
   { level; sections; width }
 ;;
 
+(** [DIO_FLOW_LOG] env kill/boost switch for a quick demo without editing config.json. *)
+let flow_log_env_enabled () =
+  match Sys.getenv_opt "DIO_FLOW_LOG" with
+  | Some s ->
+    (match String.lowercase_ascii (String.trim s) with
+     | "1" | "true" | "on" | "yes" -> true
+     | _ -> false)
+  | None -> false
+;;
+
+(** Parses the optional "flow_log" object. Absent = disabled unless [DIO_FLOW_LOG] is set.
+    Exits on unknown sub-keys. *)
+let parse_flow_log_config json : flow_log_config =
+  let open Yojson.Basic.Util in
+  match json |> member "flow_log" with
+  | `Null ->
+    { enabled = flow_log_env_enabled ()
+    ; min_interval_seconds = 0.2
+    ; heartbeat_seconds = 5.0
+    ; pulse_seconds = 5.0
+    ; price_ticks = true
+    }
+  | f ->
+    if validate_keys ~context:"flow_log" ~allowed:known_flow_log_keys f then exit 1;
+    let enabled =
+      f
+      |> member "enabled"
+      |> to_bool_option
+      |> Option.value ~default:(flow_log_env_enabled ())
+    in
+    let optf key default = f |> member key |> to_float_opt |> Option.value ~default in
+    { enabled
+    ; min_interval_seconds = optf "min_interval_seconds" 0.2
+    ; heartbeat_seconds = optf "heartbeat_seconds" 5.0
+    ; pulse_seconds = optf "pulse_seconds" 5.0
+    ; price_ticks =
+        f |> member "price_ticks" |> to_bool_option |> Option.value ~default:true
+    }
+;;
+
 (** Parses the optional "gc" object into OCaml GC tuning parameters. Returns [None] when
     the key is absent. Exits on unknown sub-keys. *)
 let parse_gc_config json : gc_config option =
@@ -527,6 +589,7 @@ let read_config () : config =
       json |> member "cycle_mod" |> to_int_option |> Option.value ~default:10000
     in
     let logging = parse_logging_config json in
+    let flow_log = parse_flow_log_config json in
     let gc = parse_gc_config json in
     let oracle = parse_oracle_config json in
     let trading = json |> member "trading" |> to_list |> List.map parse_config in
@@ -540,8 +603,8 @@ let read_config () : config =
         | None ->
           Logging.critical_f
             ~section
-            "Strategy file for %s/%s does not exist (tried strategies/<name>.strategy and \
-             strategies/<name>.json). Strategy files must be deployed alongside \
+            "Strategy file for %s/%s does not exist (tried strategies/<name>.strategy \
+             and strategies/<name>.json). Strategy files must be deployed alongside \
              config.json (e.g. /app/strategies); refusing to start with no strategy \
              bound."
             t.exchange
@@ -609,6 +672,7 @@ let read_config () : config =
     in
     { cycle_mod
     ; logging
+    ; flow_log
     ; gc
     ; oracle
     ; trading
@@ -629,6 +693,13 @@ let read_config () : config =
     Logging.warn_f ~section "Cannot read config.json: %s, using defaults" msg;
     { cycle_mod = 10000
     ; logging = { level = Logging.INFO; sections = []; width = None }
+    ; flow_log =
+        { enabled = flow_log_env_enabled ()
+        ; min_interval_seconds = 0.2
+        ; heartbeat_seconds = 5.0
+        ; pulse_seconds = 5.0
+        ; price_ticks = true
+        }
     ; gc = None
     ; oracle = None
     ; trading = []

@@ -777,12 +777,66 @@ let asset_domain_worker
         match get_tob_fn () with
         | Some (bid_price, bid_size, ask_price, ask_size) ->
           let changed = bid_price <> !tob_bid || ask_price <> !tob_ask in
+          let prev_mid = !current_price in
           tob_bid := bid_price;
           tob_ask := ask_price;
           tob_bsize := bid_size;
           tob_asize := ask_size;
-          current_price := (bid_price +. ask_price) /. 2.0;
-          if changed then should_execute_strategy := true
+          let mid = (bid_price +. ask_price) /. 2.0 in
+          current_price := mid;
+          if changed
+          then (
+            should_execute_strategy := true;
+            (* Decision-flow tick stream (opt-in): the raw top-of-book update, one block
+               per observed tick, tagged with the asset's strategy and live sizing. This
+               is the market-data firehose — deliberately unthrottled. *)
+            if Flow_log.enabled ()
+            then (
+              let delta_bp =
+                if prev_mid > 0.0 then (mid -. prev_mid) /. prev_mid *. 10000.0 else 0.0
+              in
+              let dir =
+                if delta_bp > 0.0 then "▲" else if delta_bp < 0.0 then "▼" else "·"
+              in
+              let spr_bp =
+                if mid > 0.0 then (ask_price -. bid_price) /. mid *. 10000.0 else 0.0
+              in
+              let imb =
+                if bid_size +. ask_size > 0.0
+                then bid_size /. (bid_size +. ask_size)
+                else 0.0
+              in
+              let strat_ctx =
+                match cached_grid_state, !grid_strategy_asset_ref with
+                | Some s, Some a ->
+                  Printf.sprintf
+                    "%s · qty %.6g · gi %.4f%%"
+                    asset_with_fees.strategy
+                    s.grid_qty
+                    a.grid_interval
+                | _, _ -> asset_with_fees.strategy
+              in
+              Flow_log.tick
+                ~section:asset_with_fees.symbol
+                ~headline:
+                  (Printf.sprintf
+                     "%s · mid %.4f · %+.2fbp %s"
+                     asset_with_fees.symbol
+                     mid
+                     delta_bp
+                     dir)
+                ~fields:
+                  [ ( "book"
+                    , Printf.sprintf
+                        "bid %.4f×%.4g · ask %.4f×%.4g · spr %.2fbp · imb %.2f"
+                        bid_price
+                        bid_size
+                        ask_price
+                        ask_size
+                        spr_bp
+                        imb )
+                  ; "strat", strat_ctx
+                  ]))
         | None -> ());
       let t2 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
       let alloc_at_t2 =
@@ -1933,6 +1987,94 @@ let asset_domain_worker
       then (
         last_window_time := now_flush;
         publish_windows ());
+      (* Decision-flow telemetry (opt-in: [flow_log.enabled], else a single boolean read).
+         A structured digest of this cycle's decision, throttled so an unchanged decision
+         signature collapses to the heartbeat and a changed signal/oracle/gate state emits
+         immediately. The whole block is skipped when disabled. *)
+      if Flow_log.enabled ()
+      then (
+        let mid = !current_price in
+        let bid = !tob_bid
+        and ask = !tob_ask in
+        let bsz = !tob_bsize
+        and asz = !tob_asize in
+        let has_oracle = Option.is_some oracle_decision in
+        let oracle_active =
+          match oracle_decision with
+          | Some d -> d.active
+          | None -> false
+        in
+        let signature =
+          Printf.sprintf
+            "%.4f|%b|%b|%b|%b|%b"
+            mid
+            should_execute
+            has_oracle
+            oracle_active
+            oracle_halted
+            equity_market_closed
+        in
+        let us ns = Latency_profiler.format_us (float ns /. 1000.0) in
+        Flow_log.digest
+          ~section:asset_with_fees.symbol
+          ~key:asset_with_fees.symbol
+          ~signature
+          ~category:(if should_execute then Flow_log.Signal else Flow_log.Gate)
+          ~headline:
+            (Printf.sprintf
+               "%s · cycle #%d%s"
+               asset_with_fees.symbol
+               !cycle_count
+               (if should_execute then " · EXEC" else ""))
+          ~fields:(fun () ->
+            let spread_bps = if mid > 0.0 then (ask -. bid) /. mid *. 10000.0 else nan in
+            let imb = if bsz +. asz > 0.0 then bsz /. (bsz +. asz) else nan in
+            let book =
+              if Float.is_nan mid
+              then "no book yet"
+              else
+                Printf.sprintf
+                  "bid %.4f×%.4g · ask %.4f×%.4g · mid %.4f · spr %.2fbp · imb %.2f"
+                  bid
+                  bsz
+                  ask
+                  asz
+                  mid
+                  spread_bps
+                  imb
+            in
+            let oracle =
+              match oracle_decision with
+              | Some d ->
+                Printf.sprintf
+                  "%s · qty %.6g · gi %.4f%% · D_surv %.1f%%"
+                  (if d.active then "ACTIVE" else "INACTIVE")
+                  d.buy_qty
+                  d.grid_interval
+                  (d.d_surv *. 100.0)
+              | None -> "pending (no decision yet)"
+            in
+            let gate =
+              Printf.sprintf
+                "exec %s · market %s · oracle-gate %s · buys %s"
+                (if should_execute then "ARMED" else "IDLE")
+                (if equity_market_closed then "CLOSED" else "OPEN")
+                (if !oracle_gate_open then "OPEN" else "CLOSED")
+                (if oracle_halted then "HALTED" else "clear")
+            in
+            let base = [ "book", book; "oracle", oracle; "gate", gate ] in
+            if latency_this_cycle
+            then
+              base
+              @ [ ( "lat"
+                  , Printf.sprintf
+                      "ob %s · prep %s · strat %s · total %s"
+                      (us (t2 - t1))
+                      (us (!t3_strategy - t3))
+                      (us (t4 - !t3_strategy))
+                      (us (t4 - t1)) )
+                ]
+            else base));
       (* Blocks until a producer signals new data or data is ready. Uses the cached
          has_exec_fn closure to avoid a Hashtbl lookup. [wait_since] returns immediately
          if a producer signalled while this cycle ran, so a racing signal is not lost to
@@ -2161,7 +2303,9 @@ let supervisor_loop config fee_fetcher =
       (* Re-check shutdown flag after waking *)
       if Atomic.get shutdown_requested then raise Exit;
       Mutex.lock registry_mutex;
-      let domains = Ds.Cow_table.fold (fun _ st acc -> st :: acc) domain_registry ~init:[] in
+      let domains =
+        Ds.Cow_table.fold (fun _ st acc -> st :: acc) domain_registry ~init:[]
+      in
       Mutex.unlock registry_mutex;
       List.iter
         (fun state ->
@@ -2245,7 +2389,9 @@ let spawn_supervised_domains_for_assets
   Config.apply_gc_config ();
   (* Spawn the initial domain for each registered asset *)
   Mutex.lock registry_mutex;
-  let all_states = Ds.Cow_table.fold (fun _ st acc -> st :: acc) domain_registry ~init:[] in
+  let all_states =
+    Ds.Cow_table.fold (fun _ st acc -> st :: acc) domain_registry ~init:[]
+  in
   Mutex.unlock registry_mutex;
   List.iter (fun state -> ignore (start_domain config state fee_fetcher)) all_states;
   (* Launch the supervisor monitoring thread *)
@@ -2311,7 +2457,9 @@ let stop_all_domains () =
   (* Set shutdown flag to prevent supervisor from restarting domains *)
   Atomic.set shutdown_requested true;
   Mutex.lock registry_mutex;
-  let all_states = Ds.Cow_table.fold (fun _ st acc -> st :: acc) domain_registry ~init:[] in
+  let all_states =
+    Ds.Cow_table.fold (fun _ st acc -> st :: acc) domain_registry ~init:[]
+  in
   Mutex.unlock registry_mutex;
   List.iter stop_domain all_states;
   (* Poll until all domains have stopped or timeout expires *)

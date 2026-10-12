@@ -188,7 +188,16 @@ let render_latency_title w =
       metric_pages
   in
   let hint = I.string t.a_dim "←/→" in
-  let prefix = I.hcat (left :: (tabs @ [ hint; I.string A.(bg t.c_bg) " " ])) in
+  (* Panel selector: LATENCY is active here, LOGS is the alternative reached with `v`.
+     Shown on both panels so the swap is discoverable from the default view. *)
+  let selector =
+    I.hcat
+      [ I.string t.a_dim "  │ "
+      ; I.string A.(fg t.c_label ++ bg t.c_bg) "LATENCY"
+      ; I.string t.a_dim " · LOGS (v) "
+      ]
+  in
+  let prefix = I.hcat (left :: (tabs @ [ hint; selector; I.string A.(bg t.c_bg) " " ])) in
   let len = I.width prefix in
   let pad_count = max 0 (w - len - 1) in
   let left_rgb = t.accent_rgb in

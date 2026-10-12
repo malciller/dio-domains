@@ -181,6 +181,20 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
          %!"
         theme_override;
       exit 1);
+  (* The severity that raises the alert popup, from the top-level `alert_level` config key
+     (off | info | warn | error | critical). Default warn. *)
+  let alerts_threshold =
+    if not (Sys.file_exists config_file)
+    then Alerts.Warn
+    else (
+      try
+        let j = Yojson.Basic.from_file config_file in
+        match Yojson.Basic.Util.member "alert_level" j with
+        | `String s -> Alerts.threshold_of_string s
+        | _ -> Alerts.Warn
+      with
+      | _ -> Alerts.Warn)
+  in
   (* DIO_MOTION=off|0|false|no enables reduced motion; DIO_FPS (> 0) caps the animated
      frame rate (default 30). *)
   (match Sys.getenv_opt "DIO_MOTION" with
@@ -229,9 +243,50 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
   let snapshot = ref (Snapshot.of_json (`Assoc [])) in
   let last_raw = ref "" in
   let has_cached_data = ref false in
+  (* Live log feed. Seeded from each full snapshot's [flow_log] backfill, then extended by
+     the engine's fast [type="flow"] delta frames so the panel scrolls at the record rate
+     rather than jumping once per 500 ms snapshot. Bounded to keep memory flat. *)
+  let feed_entries : Snapshot.log_entry list ref = ref [] in
+  let feed_last_seq = ref 0 in
+  let feed_cap = 500 in
+  (* Unacknowledged alerts (batched, newest first) and a cursor so each log line is
+     evaluated once. The popup opens on the first qualifying line and stays until the user
+     acknowledges it. *)
+  let alerts_ref : Alerts.entry list ref = ref [] in
+  let alerts_last_seq = ref 0 in
+  let alerts_modal_open = ref false in
+  (* Feed newly-seen log lines through the alert threshold; opens the popup on any hit. *)
+  let note_alerts (entries : Snapshot.log_entry list) =
+    let fresh =
+      List.filter (fun (e : Snapshot.log_entry) -> e.le_seq > !alerts_last_seq) entries
+    in
+    if fresh <> []
+    then (
+      List.iter
+        (fun (e : Snapshot.log_entry) ->
+          if e.le_seq > !alerts_last_seq then alerts_last_seq := e.le_seq)
+        fresh;
+      let added = ref false in
+      List.iter
+        (fun (e : Snapshot.log_entry) ->
+          if Alerts.notifies alerts_threshold e.le_level
+          then (
+            alerts_ref
+            := Alerts.add
+                 !alerts_ref
+                 ~level:e.le_level
+                 ~section:e.le_section
+                 ~message:e.le_message;
+            added := true))
+        fresh;
+      if !added then alerts_modal_open := true)
+  in
   let quit = ref false in
   let input_buf = Bytes.create 64 in
   let view_mode_ref = ref `MainView in
+  (* Which panel occupies the shared main-view slot: the latency table or the flow feed.
+     Toggled with `v`. *)
+  let panel_ref = ref `Latency in
   let selected_index_ref = ref 0 in
   let theme_modal_open = ref false in
   let theme_cursor_idx = ref 0 in
@@ -273,6 +328,7 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
           | '=' | '+' -> parse (i + 1) (`Key_zoom_in :: acc)
           | '-' | '_' -> parse (i + 1) (`Key_zoom_out :: acc)
           | 'b' | 'B' | '\b' | '\127' -> parse (i + 1) (`Key_back :: acc)
+          | 'v' | 'V' -> parse (i + 1) (`Key_view :: acc)
           | _ -> parse (i + 1) acc))
     in
     List.rev (parse 0 [])
@@ -372,7 +428,9 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
                 !snapshot
             ; Recent_fills_feed.render_fills w !snapshot
             ; Memory.render_memory w !snapshot
-            ; Latencies.render_latencies w !snapshot
+            ; (match !panel_ref with
+               | `Logs -> Log_feed.render_logs w !snapshot !feed_entries
+               | `Latency -> Latencies.render_latencies w !snapshot)
             ; Footer.render_footer w !snapshot
             ]
           |> I.hsnap ~align:`Left w
@@ -390,14 +448,20 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
         then I.hsnap ~align:`Middle w content_img
         else I.hsnap ~align:`Left w content_img
       in
-      let img =
+      (* Overlay stack (top first): alerts modal, then theme modal, over the base view. *)
+      let base = I.(content_img </> I.char A.(bg t.c_bg) ' ' w h) in
+      let base =
         if !theme_modal_open
-        then (
-          let modal_overlay =
+        then
+          I.(
             Theme.render_theme_modal ~target_w:w ~target_h:h ~cursor_idx:!theme_cursor_idx
-          in
-          I.(modal_overlay </> content_img </> I.char A.(bg t.c_bg) ' ' w h))
-        else I.(content_img </> I.char A.(bg t.c_bg) ' ' w h)
+            </> base)
+        else base
+      in
+      let img =
+        if !alerts_modal_open && !alerts_ref <> []
+        then I.(Alerts.render_modal ~target_w:w ~target_h:h !alerts_ref </> base)
+        else base
       in
       let scratch = Buffer.create 65536 in
       Render.to_buffer scratch Cap.ansi (0, 0) (w, I.height img) img;
@@ -526,7 +590,15 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
           let asset_count = List.length assets in
           List.iter
             (fun action ->
-              if !theme_modal_open
+              if !alerts_modal_open
+              then (
+                (* Acknowledge and clear: Enter or Esc dismisses the alert popup. *)
+                match action with
+                | `Key_enter | `Key_back ->
+                  alerts_modal_open := false;
+                  alerts_ref := []
+                | _ -> ())
+              else if !theme_modal_open
               then (
                 let num_themes = Theme.theme_count () in
                 match action with
@@ -570,6 +642,11 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
                        let asset = List.nth assets idx in
                        view_mode_ref := `DetailView asset.key)
                    | `Key_back -> quit := true
+                   | `Key_view ->
+                     panel_ref
+                     := (match !panel_ref with
+                          | `Latency -> `Logs
+                          | `Logs -> `Latency)
                    | `Key_left -> Latencies.prev_page ()
                    | `Key_right -> Latencies.next_page ()
                    | _ -> ())
@@ -631,16 +708,46 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
             | None -> ()
             | Some msg ->
               (try
-                 if msg <> !last_raw
-                 then (
-                   let new_snapshot = Snapshot.of_json (Yojson.Basic.from_string msg) in
-                   last_raw := msg;
-                   snapshot := new_snapshot;
-                   has_cached_data := true;
-                   Anim.note_activity ();
-                   Asset_graph.record_all_prices new_snapshot;
-                   Latencies.ingest new_snapshot;
-                   dirty := true)
+                 let json = Yojson.Basic.from_string msg in
+                 match Snapshot.frame_type json with
+                 | "log" ->
+                   (* Fast delta: append the new records (dedup against the last id seen). *)
+                   let seq, fresh = Snapshot.parse_log_frame json in
+                   let fresh =
+                     List.filter
+                       (fun (e : Snapshot.log_entry) -> e.le_seq > !feed_last_seq)
+                       fresh
+                   in
+                   note_alerts fresh;
+                   if fresh <> []
+                   then (
+                     let all = !feed_entries @ fresh in
+                     let len = List.length all in
+                     feed_entries
+                     := if len > feed_cap
+                        then List.filteri (fun i _ -> i >= len - feed_cap) all
+                        else all;
+                     feed_last_seq := seq;
+                     dirty := true)
+                 | _ ->
+                   if msg <> !last_raw
+                   then (
+                     let new_snapshot = Snapshot.of_json json in
+                     last_raw := msg;
+                     snapshot := new_snapshot;
+                     note_alerts new_snapshot.logs;
+                     (* Backfill the feed from the snapshot, keeping the id cursor
+                        monotonic so the next delta does not duplicate these entries. *)
+                     feed_entries := new_snapshot.logs;
+                     List.iter
+                       (fun (e : Snapshot.log_entry) ->
+                         if e.le_seq > !feed_last_seq then feed_last_seq := e.le_seq)
+                       new_snapshot.logs;
+                     has_cached_data := true;
+                     Anim.note_activity ();
+                     Asset_graph.record_all_prices new_snapshot;
+                     Latencies.ingest new_snapshot;
+                     dirty := true)
                with
                | _ -> ());
               take_frames ()

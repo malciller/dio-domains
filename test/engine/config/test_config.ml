@@ -77,6 +77,25 @@ let test_parse_logging_config_empty_sections () =
   Alcotest.(check (list string)) "empty sections string" [] config.sections
 ;;
 
+let test_parse_flow_log_config () =
+  let json =
+    Yojson.Basic.from_string
+      {|{"flow_log": {"enabled": true, "min_interval_seconds": 0.5, "heartbeat_seconds": 2.0, "pulse_seconds": 0.0}}|}
+  in
+  let c = Dio_engine.Config.parse_flow_log_config json in
+  Alcotest.(check bool) "enabled" true c.enabled;
+  Alcotest.(check (float 0.0001)) "min_interval" 0.5 c.min_interval_seconds;
+  Alcotest.(check (float 0.0001)) "heartbeat" 2.0 c.heartbeat_seconds;
+  Alcotest.(check (float 0.0001)) "pulse" 0.0 c.pulse_seconds;
+  Alcotest.(check bool) "price_ticks defaults on" true c.price_ticks;
+  (* An absent section is disabled unless the DIO_FLOW_LOG demo switch is set. *)
+  let absent = Dio_engine.Config.parse_flow_log_config (Yojson.Basic.from_string "{}") in
+  Alcotest.(check bool)
+    "absent follows env switch"
+    (Dio_engine.Config.flow_log_env_enabled ())
+    absent.enabled
+;;
+
 let test_read_config_defaults () =
   (* Precondition: config.json absent. *)
   let config = Dio_engine.Config.read_config () in
@@ -271,6 +290,7 @@ let () =
             `Quick
             test_parse_logging_config_empty_sections
         ] )
+    ; "flow_log", [ Alcotest.test_case "parse section" `Quick test_parse_flow_log_config ]
     ; ( "oracle"
       , [ Alcotest.test_case "parse full section" `Quick test_parse_oracle_config_full
         ; Alcotest.test_case

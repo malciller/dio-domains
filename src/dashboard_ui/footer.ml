@@ -67,7 +67,7 @@ let render_footer w (snapshot : Snapshot.t) =
   let left_space = I.string A.(bg t.c_bg) "  " in
   let right_space = I.string A.(bg t.c_bg) " " in
   let theme_tag = "t: " ^ t.name in
-  let left_text = "q: quit  │  ←/→ latency  │  " in
+  let left_text = "q: quit  │  v: latency/logs  │  ←/→ pages  │  " in
   let base_imgs =
     [ left_space
     ; I.string A.(bg t.c_panel) " "

@@ -5,6 +5,7 @@
   yojson
   dio.data_structures
   logging
+  flow_log
   dio.kraken
   dio.ibkr
   dio.alpaca
