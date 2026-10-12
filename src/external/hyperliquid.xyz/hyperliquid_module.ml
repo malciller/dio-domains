@@ -738,6 +738,16 @@ let parse_json_float json =
   | _ -> 0.0
 ;;
 
+(** Staking figures reported at INFO by the last successful poll, as
+    [(delegated, undelegated, pendingWithdrawal)]. The poll runs every 10s and the figures
+    rarely move, so [None] (nothing logged yet) and a change log at INFO and an unchanged
+    repeat stays at DEBUG. Without this the steady state is one INFO line per poll. *)
+let last_staking_reported : (float * float * float) option Atomic.t = Atomic.make None
+
+let same_staking_figures (a, b, c) (a', b', c') =
+  Float.equal a a' && Float.equal b b' && Float.equal c c'
+;;
+
 let poll_staking_balance () =
   let section = "hyperliquid_startup" in
   let testnet = Atomic.get Hyperliquid_impl.is_testnet in
@@ -819,15 +829,34 @@ let poll_staking_balance () =
            ~total:pending_withdrawal
            "staking"
            "pending_withdrawal";
-         Logging.info_f
-           ~section
-           "Updated Hyperliquid HYPE staking balance: delegated=%.6f, undelegated=%.6f, \
-            pendingWithdrawal=%.6f (total=%.6f, staked=%.6f)"
-           delegated
-           undelegated
-           pending_withdrawal
-           (Hyperliquid_balances.get_total_balance "HYPE")
-           (Hyperliquid_balances.get_staked_balance "HYPE");
+         let observed = delegated, undelegated, pending_withdrawal in
+         let first_or_changed =
+           match Atomic.get last_staking_reported with
+           | Some prev -> not (same_staking_figures prev observed)
+           | None -> true
+         in
+         Atomic.set last_staking_reported (Some observed);
+         let total = Hyperliquid_balances.get_total_balance "HYPE" in
+         let staked = Hyperliquid_balances.get_staked_balance "HYPE" in
+         if first_or_changed
+         then
+           Logging.info_f
+             ~section
+             "Hyperliquid HYPE staking balance: delegated=%.6f, undelegated=%.6f, \
+              pendingWithdrawal=%.6f (total=%.6f, staked=%.6f)"
+             delegated
+             undelegated
+             pending_withdrawal
+             total
+             staked
+         else
+           Logging.debug_f
+             ~section
+             "Hyperliquid HYPE staking balance unchanged: delegated=%.6f, staked=%.6f \
+              (total=%.6f)"
+             delegated
+             staked
+             total;
          Lwt.return_unit
        with
        | exn ->
