@@ -188,6 +188,42 @@ let test_tradeable_balance_nets_open_order_holds () =
     (Kraken.Kraken_module.Kraken_impl.get_tradeable_balance ~asset:base)
 ;;
 
+let test_staked_balance_is_earn_not_trading () =
+  (* Kraken reports earn/vault funds in their own wallets. [total] includes them and
+     [trading] excludes them, so [get_staked_balance] must report the difference: the
+     dashboard's ACCUM QTY is [staked + venue-available free], and a hard-coded 0.0 here
+     silently dropped every Kraken earn balance from that sum. *)
+  let asset = "EARN_TEST" in
+  let store = Kraken.Kraken_balances_feed.get_balance_store asset in
+  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 10.0 "spot" "main" asset;
+  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 7.5 "earn" "flexible" asset;
+  Alcotest.(check (float 1e-6))
+    "staked reports the earn wallet"
+    7.5
+    (Kraken.Kraken_module.Kraken_impl.get_staked_balance ~asset);
+  Alcotest.(check (float 1e-6))
+    "tradeable excludes the earn wallet"
+    10.0
+    (Kraken.Kraken_module.Kraken_impl.get_tradeable_balance ~asset);
+  Alcotest.(check (float 1e-6))
+    "total includes the earn wallet"
+    17.5
+    (Kraken.Kraken_module.Kraken_impl.get_total_balance ~asset);
+  (* No earn wallet -> staked is zero. *)
+  let plain = "EARN_NONE_TEST" in
+  let plain_store = Kraken.Kraken_balances_feed.get_balance_store plain in
+  Kraken.Kraken_balances_feed.BalanceStore.update_wallet
+    plain_store
+    3.0
+    "spot"
+    "main"
+    plain;
+  Alcotest.(check (float 1e-6))
+    "staked is zero without an earn wallet"
+    0.0
+    (Kraken.Kraken_module.Kraken_impl.get_staked_balance ~asset:plain)
+;;
+
 let test_balance_data_structure () =
   (* balance_data record fields. *)
   let test_data =
@@ -264,6 +300,12 @@ let () =
             "open-order holds net out of tradeable balance"
             `Quick
             test_tradeable_balance_nets_open_order_holds
+        ] )
+    ; ( "staked balance"
+      , [ Alcotest.test_case
+            "earn wallets are staked, not tradeable"
+            `Quick
+            test_staked_balance_is_earn_not_trading
         ] )
     ; ( "concurrency"
       , [ Alcotest.test_case

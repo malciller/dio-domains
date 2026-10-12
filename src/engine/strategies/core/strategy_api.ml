@@ -136,6 +136,7 @@ let expire_amend_cooldowns = Strategy_lifecycle.expire_amend_cooldowns
 let evict_ghost_orders = Strategy_lifecycle.evict_ghost_orders
 let reconcile_position = Strategy_lifecycle.reconcile_position
 let evaluate_asset_low_recovery = Strategy_lifecycle.evaluate_asset_low_recovery
+let venue_gross_base = Strategy_lifecycle.venue_gross_base
 let evaluate_capital_low_recovery = Strategy_lifecycle.evaluate_capital_low_recovery
 let unnetted_sell_hold = Strategy_lifecycle.unnetted_sell_hold
 let execute_strategy = Strategy_decision.execute_strategy

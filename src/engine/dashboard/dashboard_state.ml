@@ -190,6 +190,13 @@ let json_of_market_data exchange symbol base_asset quote_currency =
       try Ex.get_tradeable_balance ~asset:base_asset with
       | _ -> 0.0
     in
+    (* Venue-authoritative immediately-sellable base. A venue that cannot produce one
+       yields [nan], emitted as JSON null so the dashboard can tell "unknown" from "zero"
+       and fall back rather than silently zeroing the accumulation. *)
+    let available_balance =
+      try Ex.get_available_balance_fast ~asset:base_asset () with
+      | _ -> Float.nan
+    in
     let quote_balance =
       try Ex.get_total_balance ~asset:quote_currency with
       | _ -> 0.0
@@ -329,6 +336,8 @@ let json_of_market_data exchange symbol base_asset quote_currency =
       ; "base_balance", `Float base_balance
       ; "staked_balance", `Float staked_balance
       ; "tradeable_balance", `Float tradeable_balance
+      ; ( "available_balance"
+        , if Float.is_finite available_balance then `Float available_balance else `Null )
       ; "quote_balance", `Float quote_balance
       ; "bids", bids_json
       ; "asks", asks_json
@@ -734,6 +743,10 @@ let build_snapshot () =
                   try Ex.get_tradeable_balance ~asset with
                   | _ -> bal
                 in
+                let available_balance =
+                  try Ex.get_available_balance_fast ~asset () with
+                  | _ -> Float.nan
+                in
                 (* Open sell orders for this symbol; also query all symbol stores for this
                    asset to catch orders under alternative symbol keys. *)
                 let open_orders = Ex.get_open_orders ~symbol in
@@ -817,6 +830,10 @@ let build_snapshot () =
                     ; "balance", `Float bal
                     ; "staked_balance", `Float staked_balance
                     ; "tradeable_balance", `Float tradeable_balance
+                    ; ( "available_balance"
+                      , if Float.is_finite available_balance
+                        then `Float available_balance
+                        else `Null )
                     ; "bid", bid_json
                     ; "ask", ask_json
                     ; "bids", bids_json

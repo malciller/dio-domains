@@ -69,6 +69,80 @@ let test_strategy_paused () =
     false
 ;;
 
+let test_accum_qty () =
+  let open Dashboard_ui.Holdings in
+  (* The live HYPE case: 2.0127387 staked, spot total 8.56795596 of which 8.45 is locked
+     in 61 resting sells, so 0.11795596 free. The venue's own figures give the sum. *)
+  Alcotest.(check (float 1e-9))
+    "staked + venue-available free base"
+    2.13069466
+    (accum_qty_of
+       ~staked:2.0127387
+       ~pending:8.45
+       ~available:(Some 0.11795596)
+       10.58069466);
+  (* A locally-tracked sell that over-counts the exchange hold used to clamp the whole
+     free-spot term to zero, silently leaving only the staked balance on screen. The venue
+     figure is immune to that over-count. *)
+  Alcotest.(check (float 1e-9))
+    "over-counted pending cannot drop the free-spot term"
+    2.13069466
+    (accum_qty_of
+       ~staked:2.0127387
+       ~pending:8.60
+       ~available:(Some 0.11795596)
+       10.58069466);
+  (* Without a venue figure the legacy estimate is still used, clamp and all. *)
+  Alcotest.(check (float 1e-9))
+    "fallback clamps when pending over-counts"
+    2.0127387
+    (accum_qty_of ~staked:2.0127387 ~pending:8.60 ~available:None 10.58069466);
+  Alcotest.(check (float 1e-9))
+    "fallback sums when pending is accurate"
+    2.13069466
+    (accum_qty_of ~staked:2.0127387 ~pending:8.45 ~available:None 10.58069466);
+  (* Non-staking venue: staked is 0 and accum is the venue's free base. *)
+  Alcotest.(check (float 1e-9))
+    "no staking, venue available"
+    0.5
+    (accum_qty_of ~staked:0.0 ~pending:99.0 ~available:(Some 0.5) 3.0)
+;;
+
+let test_available_balance_parse () =
+  let open Dashboard_ui in
+  let market_json avail =
+    `Assoc
+      [ "bid", `Float 1.0
+      ; "ask", `Float 1.0
+      ; "base_asset", `String "HYPE"
+      ; "base_balance", `Float 10.58
+      ; "staked_balance", `Float 2.0127387
+      ; "available_balance", avail
+      ]
+  in
+  let strat avail =
+    Snapshot.parse_strategy
+      "HYPE/USDC"
+      (`Assoc
+        [ "exchange", `String "hyperliquid"
+        ; "strategy", `Assoc [ "type", `String "Ladder" ]
+        ; "market", market_json avail
+        ])
+  in
+  Alcotest.(check (option (float 1e-9)))
+    "available_balance parses"
+    (Some 0.11795596)
+    (strat (`Float 0.11795596)).market.available_balance;
+  Alcotest.(check (option (float 1e-9)))
+    "JSON null available_balance is None"
+    None
+    (strat `Null).market.available_balance;
+  Alcotest.(check (option (float 1e-9)))
+    "absent available_balance is None"
+    None
+    (strat (`Assoc [])).market.available_balance
+;;
+
 let test_latency_format () =
   (* Sub-microsecond latencies must render at nanosecond level. *)
   Alcotest.(check string) "500ns" "500ns" (Dashboard_ui.Theme.format_latency_us 0.5);
@@ -355,6 +429,18 @@ let () =
             "paused = oracle OR capital-low OR market closed"
             `Quick
             test_strategy_paused
+        ] )
+    ; ( "accum quantity"
+      , [ Alcotest.test_case
+            "staked + venue-available free base, no clamp collapse"
+            `Quick
+            test_accum_qty
+        ] )
+    ; ( "snapshot parsing"
+      , [ Alcotest.test_case
+            "available_balance distinguishes zero from unknown"
+            `Quick
+            test_available_balance_parse
         ] )
     ; ( "latency formatting"
       , [ Alcotest.test_case

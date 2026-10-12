@@ -335,6 +335,11 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
       if has_hyperliquid
       then (
         Hyperliquid.Balances.initialize ~testnet:hyperliquid_testnet all_assets;
+        (* Start the staking-balance poller directly. It must not be nested inside the
+           fire-and-forget spot-balance fetch, which the enclosing
+           [Lwt_main.run (initialize_feeds ())] can return past before the first poll
+           lands, leaving the staked balance at 0 with no diagnosis. *)
+        Hyperliquid.Module.start_staking_balance_poller ();
         Lwt.async (fun () -> Hyperliquid.Module.fetch_spot_balances_ws ()));
       if has_ibkr then Ibkr.Balances.initialize ();
       if has_lighter
@@ -610,8 +615,8 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
           in
           (* Publish only once the socket is up. Publishing first left a window where a
              trading domain could resolve a connection with no output channel; [send] then
-             reported success for a frame it never wrote, and the strategy tracked an order
-             the gateway never received. Failing fast is correct here. *)
+             reported success for a frame it never wrote, and the strategy tracked an
+             order the gateway never received. Failing fast is correct here. *)
           Ibkr.Connection.connect_with_retry conn ~max_attempts:5
           >>= fun () ->
           Ibkr.Dispatcher.initialize conn;

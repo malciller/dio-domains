@@ -198,6 +198,11 @@ module Alpaca_impl = struct
       perform_rest_amend ()
       >>= function
       | Ok res -> Lwt.return (Ok res)
+      | Error e when Alpaca_rest.is_retriable_http_exception e ->
+        (* Transport failure (timeout/connection) that survived the REST retry loop: the
+           amend may already have landed venue-side. Do not cancel-and-replace, which
+           could duplicate the order; reconciliation will heal it. *)
+        Lwt.return (Error e)
       | Error e ->
         (match find_existing (), qty, limit_price with
          | Some existing, Some q, Some lp ->

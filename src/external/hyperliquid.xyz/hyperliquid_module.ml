@@ -10,8 +10,11 @@ module Hyperliquid_impl = struct
   let name = "hyperliquid"
   let section = "hyperliquid_module"
 
-  (* Testnet/mainnet toggle. Atomic for safe concurrent reads from feed threads. *)
-  let is_testnet = Atomic.make true
+  (* Testnet/mainnet toggle. Atomic for safe concurrent reads from feed threads. Defaults
+     to mainnet: the engine sets this from config before any feed starts, but a reader
+     that races that call must not silently point at the testnet endpoint, where a mainnet
+     wallet's staking summary parses to nothing and the staked balance silently reads 0. *)
+  let is_testnet = Atomic.make false
 
   let set_testnet testnet =
     Atomic.set is_testnet testnet;
@@ -816,7 +819,7 @@ let poll_staking_balance () =
            ~total:pending_withdrawal
            "staking"
            "pending_withdrawal";
-         Logging.debug_f
+         Logging.info_f
            ~section
            "Updated Hyperliquid HYPE staking balance: delegated=%.6f, undelegated=%.6f, \
             pendingWithdrawal=%.6f (total=%.6f, staked=%.6f)"
@@ -855,8 +858,6 @@ let start_staking_balance_poller () =
 
 let fetch_spot_balances_ws () =
   let section = "hyperliquid_startup" in
-  (* Start staking poller loop asynchronously, independent of WS status *)
-  start_staking_balance_poller ();
   let wallet =
     match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
     | Some w -> w

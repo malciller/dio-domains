@@ -90,11 +90,52 @@ let update_balances () =
     Alpaca_rest.get_positions ()
     >>= fun pos_res ->
     (* Build new snapshots entirely before publishing; readers never observe a
-       half-updated table. *)
-    let new_balances = Hashtbl.create 16 in
-    let new_total = Hashtbl.create 16 in
-    let new_marks = Hashtbl.create 16 in
-    let new_available = Hashtbl.create 16 in
+       half-updated table. On a positions-fetch failure, retain the last known positions
+       rather than publishing an empty set: a transport blip must not make held inventory
+       vanish (which would let the strategy re-buy or fail to sell). *)
+    let new_balances, new_total, new_marks, new_available =
+      match pos_res with
+      | Ok positions ->
+        let new_balances = Hashtbl.create 16 in
+        let new_total = Hashtbl.create 16 in
+        let new_marks = Hashtbl.create 16 in
+        let new_available = Hashtbl.create 16 in
+        if positions <> []
+        then
+          Logging.debug_f
+            ~section
+            "Alpaca loaded %d active position(s)"
+            (List.length positions);
+        (* Mark prices are a fallback reference when the WS quote stream is quiet (e.g.
+           IEX closed pre/after-market). Live WS quotes in Alpaca_orderbook take
+           precedence. *)
+        List.iter
+          (fun (p : Alpaca_types.position_record) ->
+            Hashtbl.replace new_balances p.symbol p.qty;
+            Hashtbl.replace new_total p.symbol p.qty;
+            Hashtbl.replace new_available p.symbol p.qty_available;
+            if p.current_price > 0.0
+            then Hashtbl.replace new_marks p.symbol p.current_price;
+            Logging.debug_f
+              ~section
+              "Alpaca Position [%s]: qty=%.4f, avg_entry=%.2f, current_price=%.2f, \
+               mkt_val=%.2f"
+              p.symbol
+              p.qty
+              p.avg_entry_price
+              p.current_price
+              p.market_value)
+          positions;
+        new_balances, new_total, new_marks, new_available
+      | Error err ->
+        Logging.warn_f ~section "Failed to fetch positions during balance poll: %s" err;
+        ( Hashtbl.copy (Atomic.get balances)
+        , Hashtbl.copy (Atomic.get total_balances)
+        , Hashtbl.copy (Atomic.get position_marks)
+        , Hashtbl.copy (Atomic.get available_balances) )
+    in
+    (* Cash is always fresh from the successful account call; positions/marks are either a
+       fresh snapshot or the retained previous one. *)
     Hashtbl.replace new_balances "USD" acc.cash;
     Hashtbl.replace new_total "USD" acc.cash;
     Hashtbl.replace new_available "USD" acc.cash;
@@ -108,35 +149,6 @@ let update_balances () =
       acc.cash
       acc.equity
       acc.portfolio_value;
-    (match pos_res with
-     | Ok positions ->
-       if positions <> []
-       then
-         Logging.debug_f
-           ~section
-           "Alpaca loaded %d active position(s)"
-           (List.length positions);
-       (* Mark prices are a fallback reference when the WS quote stream is quiet (e.g. IEX
-          closed pre/after-market). Live WS quotes in Alpaca_orderbook take precedence. *)
-       List.iter
-         (fun (p : Alpaca_types.position_record) ->
-           Hashtbl.replace new_balances p.symbol p.qty;
-           Hashtbl.replace new_total p.symbol p.qty;
-           Hashtbl.replace new_available p.symbol p.qty_available;
-           if p.current_price > 0.0
-           then Hashtbl.replace new_marks p.symbol p.current_price;
-           Logging.debug_f
-             ~section
-             "Alpaca Position [%s]: qty=%.4f, avg_entry=%.2f, current_price=%.2f, \
-              mkt_val=%.2f"
-             p.symbol
-             p.qty
-             p.avg_entry_price
-             p.current_price
-             p.market_value)
-         positions
-     | Error err ->
-       Logging.warn_f ~section "Failed to fetch positions during balance poll: %s" err);
     Atomic.set balances new_balances;
     Atomic.set total_balances new_total;
     Atomic.set available_balances new_available;

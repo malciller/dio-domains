@@ -1806,6 +1806,66 @@ let test_position_buy_credit_and_sell_hold_cancel () =
   drain ()
 ;;
 
+let test_venue_gross_base_reads_base_asset_store () =
+  (* Balance stores are keyed by base asset, but [asset.symbol] is the pair. Passing the
+     pair straight through resolved to an empty store, so the gross basis was silently
+     [None] on every Hyperliquid spot strategy - the venue this path exists for. *)
+  let base_asset = "VGB_TEST" in
+  let symbol = base_asset ^ "/USDC" in
+  let store = Hyperliquid.Balances.get_balance_store base_asset in
+  Hyperliquid.Balances.BalanceStore.update_wallet
+    store
+    ~available:8.45
+    ~total:8.45
+    "spot"
+    "account";
+  Hyperliquid.Balances.BalanceStore.update_wallet
+    store
+    ~available:2.01
+    ~total:2.01
+    "staking"
+    "delegated";
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.15"
+    ; grid_interval = 0.75
+    ; sell_mult = "0.98"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
+    }
+  in
+  (* The trap: the pair-keyed store holds nothing. *)
+  check
+    (float 1e-9)
+    "pair-keyed store is empty"
+    0.0
+    (Hyperliquid.Balances.get_total_balance symbol);
+  (* total 10.46 - staked 2.01 = gross 8.45, above the 0.11795596 spendable figure. *)
+  (match
+     Dio_strategies.Strategy_api.venue_gross_base
+       ~hold_netted:true
+       ~asset
+       ~spendable:0.11795596
+   with
+   | Some gross ->
+     check (float 1e-6) "gross resolves from the base-asset store" 8.45 gross
+   | None -> fail "expected Some gross, got None (pair symbol used for the lookup?)");
+  check
+    bool
+    "non-hold-netted venues never read the venue gross"
+    true
+    (Dio_strategies.Strategy_api.venue_gross_base
+       ~hold_netted:false
+       ~asset
+       ~spendable:0.11795596
+     = None)
+;;
+
 let test_position_gross_reconcile_flat_message_clears_overlays () =
   (* REGRESSION (dip-cascade oversell): on a hold-netted venue a buy fill and a
      same-window sell hold cancel in the tradeable figure, so the balance message nets to
@@ -7269,6 +7329,10 @@ let () =
             "gross reconcile clears buy credit and sell hold on a flat message"
             `Quick
             test_position_gross_reconcile_flat_message_clears_overlays
+        ; test_case
+            "venue gross reads the base-asset store, not the pair key"
+            `Quick
+            test_venue_gross_base_reads_base_asset_store
         ; test_case
             "credit decays when the feed goes silent past the grace"
             `Quick
