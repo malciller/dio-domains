@@ -58,7 +58,7 @@ jobs:
       DIO_BASE_IMAGE: dio-oxcaml-base:5.2.0minus40
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Guard against committed .env files
         # The real .env is gitignored; only .env.example may be committed.
@@ -88,7 +88,7 @@ jobs:
 
       - name: Set up Buildx (GitHub-hosted runners)
         if: github.server_url == 'https://github.com'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # --- Base image (OxCaml compiler + opam deps) ---
       # On GitHub-hosted runners (ephemeral) the GitHub Actions cache backend
@@ -97,7 +97,7 @@ jobs:
       # the `docker image inspect` guard skips a rebuild entirely.
       - name: Build OxCaml base image (GitHub-hosted runners)
         if: github.server_url == 'https://github.com'
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile.base
@@ -203,7 +203,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history + tags: the next version is derived from the highest
           # existing v* tag.
@@ -268,7 +268,7 @@ jobs:
         # Every tag that passes CI ships as a Release immediately; no drafts.
         # `generate_release_notes` fills the body from the PRs and commits
         # merged since the previous tag.
-        uses: softprops/action-gh-release@64df7ca660f0a62e71442d521755ff05b68b9b9b # v2.0.1
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.version.outputs.version }}
           generate_release_notes: true
@@ -303,12 +303,12 @@ jobs:
       IMAGE: ghcr.io/${{ github.repository }}
       TAG: ${{ needs.release.outputs.version }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.release.outputs.version }}
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
         run: |
@@ -320,7 +320,7 @@ jobs:
       # not pay the ~40 min compiler rebuild. No cache-to here: a tag-scoped
       # write would duplicate ~3.4 GB and overflow the 10 GB repo limit.
       - name: Build OxCaml base image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile.base
