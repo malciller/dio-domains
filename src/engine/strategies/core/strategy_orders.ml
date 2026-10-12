@@ -35,6 +35,82 @@ let record_emitted (order : strategy_order) =
       }
 ;;
 
+(** Emit an emitted order intent to the decision-flow stream (opt-in). Centralized here so
+    every place/amend/cancel — the canonical "order sent" moment — becomes one block,
+    regardless of which strategy branch produced it. Places and cancels are discrete and
+    always shown; amends are deduplicated per symbol/side so a trailing buy does not
+    repeat the same rung. No-op when the flow layer is disabled (a single boolean read). *)
+let emit_flow_order (order : strategy_order) =
+  if Flow_log.enabled ()
+  then (
+    let side_str =
+      match order.side with
+      | Buy -> "BUY"
+      | Sell -> "SELL"
+    in
+    let price_str =
+      match order.price with
+      | Some p -> Printf.sprintf "%.4f" p
+      | None -> "mkt"
+    in
+    let venue_str =
+      Printf.sprintf
+        "%s · tif %s%s"
+        order.exchange
+        order.time_in_force
+        (if order.post_only then " · post-only" else "")
+    in
+    let fields () =
+      match order.operation with
+      | Cancel -> [ "venue", venue_str; "id", Option.value order.order_id ~default:"?" ]
+      | Place | Amend ->
+        [ "venue", venue_str
+        ; "qty", Printf.sprintf "%.8g" order.qty
+        ; "px", price_str
+        ; ( "id"
+          , match order.order_id with
+            | Some i -> i
+            | None -> "new" )
+        ; "strat", string_of_strategy_id order.strategy
+        ]
+    in
+    match order.operation with
+    | Cancel ->
+      Flow_log.event
+        ~section:order.symbol
+        ~category:Flow_log.Cancel
+        ~headline:
+          (Printf.sprintf
+             "%s cancel %s"
+             side_str
+             (Option.value order.order_id ~default:"?"))
+        ~fields:(fields ())
+    | Place ->
+      Flow_log.event
+        ~section:order.symbol
+        ~category:Flow_log.Send
+        ~headline:
+          (Printf.sprintf
+             "%s %s @ %s"
+             side_str
+             (Printf.sprintf "%.8g" order.qty)
+             price_str)
+        ~fields:(fields ())
+    | Amend ->
+      Flow_log.digest
+        ~section:order.symbol
+        ~key:(order.symbol ^ ":amend:" ^ side_str)
+        ~signature:(Printf.sprintf "%s|%.8g|%s" side_str order.qty price_str)
+        ~category:Flow_log.Amend
+        ~headline:
+          (Printf.sprintf
+             "%s %s -> %s"
+             side_str
+             (Printf.sprintf "%.8g" order.qty)
+             price_str)
+        ~fields)
+;;
+
 let create_place_order dup_key asset_symbol side qty price post_only strategy exchange =
   let ecfg = get_exchange_config exchange in
   { operation = Place
@@ -121,6 +197,7 @@ let push_order ~now ?state order =
           state.last_order_time <- now;
           if order.side = Buy then state.inflight_cancel_buy <- true;
           record_emitted order;
+          emit_flow_order order;
           true
         | None ->
           Logging.warn_f
@@ -152,6 +229,7 @@ let push_order ~now ?state order =
         OrderSignal.broadcast ();
         Order_actions.incr order.symbol;
         record_emitted order;
+        emit_flow_order order;
         let state =
           match state with
           | Some s -> s

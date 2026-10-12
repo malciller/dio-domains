@@ -8,7 +8,7 @@
 
 (test
  (name test_dashboard_snapshot)
- (libraries dio.dashboard_ui alcotest))
+ (libraries dio.dashboard_ui notty-community alcotest))
 
 (executable
  (name bench_dashboard)
@@ -18,3 +18,7 @@
   notty-community.unix
   yojson
   unix))
+
+(executable
+ (name preview_log_panel)
+ (libraries dio.dashboard_ui notty-community yojson))

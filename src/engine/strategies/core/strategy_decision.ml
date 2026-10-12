@@ -130,19 +130,24 @@ let buy_cancel_excess
         in
         ignore (push_order ~now ~state cancel_order);
         cancelled := order_id :: !cancelled;
-        Logging.info_f
-          ~section
-          "Cancelling excess buy order: %s for %s"
-          order_id
-          asset.symbol)));
+        (* [push_order] emits the CANCEL block when the flow layer is on. *)
+        if not (Flow_log.enabled ())
+        then
+          Logging.info_f
+            ~section
+            "Cancelling excess buy order: %s for %s"
+            order_id
+            asset.symbol)));
   if !cancelled <> []
-  then
-    Logging.info_f
-      ~section
-      "Found %d buy orders for %s, cancelled all cancellable buy orders to maintain \
-       single buy order policy"
-      effective_buy_count
-      asset.symbol
+  then (
+    if not (Flow_log.enabled ())
+    then
+      Logging.info_f
+        ~section
+        "Found %d buy orders for %s, cancelled all cancellable buy orders to maintain \
+         single buy order policy"
+        effective_buy_count
+        asset.symbol)
   else
     Logging.debug_f
       ~section
@@ -273,12 +278,16 @@ let buy_place_send ~state ~now ~(asset : trading_config) ~qty ~buy_price =
     state.last_buy_order_price <- Some buy_price;
     state.tif_recovery_pending <- false;
     state.force_buy_reanchor <- false;
-    Logging.info_f
-      ~section
-      "Placed buy order for %s: %.8f @ %.4f"
-      asset.symbol
-      qty
-      buy_price;
+    (* When the decision-flow layer is on, [push_order] already emitted a SEND block for
+       this intent; skip the plain line so placement is not logged twice. *)
+    if not (Flow_log.enabled ())
+    then
+      Logging.info_f
+        ~section
+        "Placed buy order for %s: %.8f @ %.4f"
+        asset.symbol
+        qty
+        buy_price;
     true)
   else false
 ;;
@@ -834,16 +843,20 @@ let evaluate_excess_sweep
           then arm_sell_hold ~state ~qty:delta ~now;
           (* A real qty increase is a meaningful execution event; a rounding-dust sweep
              that leaves the top rung unchanged is internal churn and belongs at DEBUG,
-             not in the INFO stream. *)
-          (if delta > 1e-9 then Logging.info_f else Logging.debug_f)
-            ~section
-            "Excess inventory sweep for %s: amended top rung @ %.4f %.8f -> %.8f (+%.8f \
-             excess)"
-            asset.symbol
-            top_open_price
-            top_open_qty
-            target_q
-            delta))
+             not in the INFO stream. When the flow layer is on, [push_order] already
+             emitted the AMEND block for this sweep. *)
+          if Flow_log.enabled ()
+          then ()
+          else
+            (if delta > 1e-9 then Logging.info_f else Logging.debug_f)
+              ~section
+              "Excess inventory sweep for %s: amended top rung @ %.4f %.8f -> %.8f \
+               (+%.8f excess)"
+              asset.symbol
+              top_open_price
+              top_open_qty
+              target_q
+              delta))
   | _ -> ()
 ;;
 
@@ -1465,12 +1478,15 @@ let sell_place_body
           <- dedupe_persisted_sell_levels
                (state.persisted_sell_levels @ [ sell_price, effective_sell_qty ]);
           state.persistence_dirty <- true);
-        Logging.info_f
-          ~section
-          "Placed sell order for %s: %.8f @ %.4f"
-          asset.symbol
-          effective_sell_qty
-          sell_price)
+        (* [push_order] emits the SEND block when the flow layer is on. *)
+        if not (Flow_log.enabled ())
+        then
+          Logging.info_f
+            ~section
+            "Placed sell order for %s: %.8f @ %.4f"
+            asset.symbol
+            effective_sell_qty
+            sell_price)
       else
         log_sell_block ~state ~now ~symbol:asset.symbol (fun () ->
           "order dispatch rejected (duplicate in-flight placement key)"))

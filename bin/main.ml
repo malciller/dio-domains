@@ -497,6 +497,56 @@ let init_order_executor_async () =
 (** Start the Discord fill notifier as a background Lwt fiber. *)
 let init_discord_notifier () = Discord.Notifier.start ()
 
+(** Aggregate every domain's most recent latency window into one cross-symbol pulse line:
+    throughput, tail latency, and the stop-the-world pause. Read-only and lock-free (the
+    snapshots are published atomics), safe to call from the main Lwt loop. *)
+let emit_flow_pulse ~window_seconds =
+  let snapshots = Dio_engine.Domain_spawner.get_domain_profiler_snapshots () in
+  let domains = List.length snapshots in
+  if domains > 0
+  then (
+    let samples = ref 0
+    and execs = ref 0
+    and worst_p99 = ref 0.0
+    and worst_max = ref 0.0 in
+    List.iter
+      (fun (_symbol, snaps) ->
+        List.iter
+          (fun (label, snap_opt) ->
+            match snap_opt with
+            | None -> ()
+            | Some (s : Latency_profiler.snapshot) ->
+              if String.equal label "cycle"
+              then (
+                samples := !samples + s.samples;
+                if s.p99 > !worst_p99 then worst_p99 := s.p99;
+                if s.max_us > !worst_max then worst_max := s.max_us)
+              else if String.equal label "execution"
+              then execs := !execs + s.samples)
+          snaps)
+      snapshots;
+    let window = Float.max 0.001 window_seconds in
+    let cyc_per_s = float !samples /. window in
+    let stw_us = float (Canary.last_window_max_ns ()) /. 1000.0 in
+    Flow_log.pulse
+      ~headline:
+        (Printf.sprintf "%d domains · %.1fk cycles/s" domains (cyc_per_s /. 1000.0))
+      ~fields:
+        [ ( "rate"
+          , Printf.sprintf
+              "%.1fk cyc/s · %d exec/window · pool %d"
+              (cyc_per_s /. 1000.0)
+              !execs
+              domains )
+        ; ( "tail"
+          , Printf.sprintf
+              "p99 %s · max %s · stw %s"
+              (Latency_profiler.format_us !worst_p99)
+              (Latency_profiler.format_us !worst_max)
+              (Latency_profiler.format_us stw_us) )
+        ])
+;;
+
 let () =
   (* Strategy-file tooling (e.g. `dio strategy validate <file>`) runs without booting the
      engine. `replay` needs the engine (config + venue registry), so it is handled here. *)
@@ -533,6 +583,25 @@ let () =
   Logging.set_level config.logging.level;
   Logging.set_enabled_sections config.logging.sections;
   Logging.set_width config.logging.width;
+  (* Decision-flow telemetry (opt-in): configure the throttle/renderer before any domain
+     spawns. Disabled costs one boolean read per cycle; when on, each domain emits a
+     throttled structured digest and the main loop emits a cross-symbol pulse. *)
+  Flow_log.configure
+    { Flow_log.enabled = config.flow_log.enabled
+    ; min_interval_s = config.flow_log.min_interval_seconds
+    ; heartbeat_s = config.flow_log.heartbeat_seconds
+    ; pulse_s = config.flow_log.pulse_seconds
+    ; price_ticks = config.flow_log.price_ticks
+    };
+  if config.flow_log.enabled
+  then
+    Logging.info_f
+      ~section:"main"
+      "Decision-flow telemetry ON (min %.2fs · heartbeat %.1fs · pulse %.1fs · ticks %s)"
+      config.flow_log.min_interval_seconds
+      config.flow_log.heartbeat_seconds
+      config.flow_log.pulse_seconds
+      (if config.flow_log.price_ticks then "on" else "off");
   (* Register configured strategies with the persistence layer, then run the
      one-shot legacy migration: flat symbol-keyed accumulated_state.json is split
      into accumulation_state.json and sell_levels_state.json under
@@ -603,6 +672,26 @@ let () =
           Lwt.return_unit)
       in
       loop ())
+  in
+  (* Cross-symbol decision-flow pulse (opt-in): one aggregated line every [pulse_seconds]
+     showing throughput, tail latency, and stop-the-world pause across all domains. *)
+  let _flow_pulse : unit =
+    if (not config.flow_log.enabled) || config.flow_log.pulse_seconds <= 0.0
+    then ()
+    else
+      ignore
+        (Lwt.async (fun () ->
+           let rec loop () =
+             Lwt_unix.sleep config.flow_log.pulse_seconds
+             >>= fun () ->
+             if Atomic.get shutdown_requested
+             then Lwt.return_unit
+             else (
+               emit_flow_pulse ~window_seconds:config.latency_window_seconds;
+               Lwt.async loop;
+               Lwt.return_unit)
+           in
+           loop ()))
   in
   (* Seed the CSPRNG backend (mirage-crypto-rng) for cryptographic operations. *)
   Mirage_crypto_rng_unix.use_default ();

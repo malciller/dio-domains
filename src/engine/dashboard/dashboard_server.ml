@@ -57,13 +57,28 @@ type watch_entry =
 (** Mutable list of watch-mode client entries. *)
 let watch_clients : watch_entry list ref = ref []
 
-(** Cached serialized snapshot and its generation timestamp. Reused across 500 ms
-    broadcast ticks to avoid repeated Yojson serialization; invalidated after
-    [snapshot_cache_max_age] seconds so displayed data stays within ~1s of real-time. *)
+(** Cached serialized snapshot and its generation timestamp. Reused across broadcast ticks
+    to avoid repeated Yojson serialization; invalidated after [snapshot_cache_max_age]
+    seconds so each full-snapshot tick rebuilds. *)
 let snapshot_cache_str = ref ""
 
 let snapshot_cache_time = ref 0.0
-let snapshot_cache_max_age = 0.9
+let snapshot_cache_max_age = 0.45
+
+(* Broadcast cadence. The full state snapshot (large: every strategy, book, latency) goes
+   out every [full_snapshot_interval]; between those, only a small flow-delta frame every
+   [broadcast_tick] so the dashboard's log feed streams at the record rate instead of
+   arriving in half-second clumps. One fiber drives both cadences, so writes to a client's
+   channel never interleave. *)
+let full_snapshot_interval = 0.5
+let broadcast_tick = 0.05
+let last_full_time = ref 0.0
+
+(* Cursor into the log ring: the newest record id already broadcast as a delta. *)
+let log_last_seq = ref 0
+
+(** Capture engine log lines into the dashboard ring only while a client is attached. *)
+let refresh_capture () = Logging.set_capture_enabled (!watch_clients <> [])
 
 (* The client is a render loop, not a health probe: pongs run on a fixed 1s cadence, but a
    slow frame, large snapshot parse, or GC pause can stretch a gap. 8s gives generous
@@ -74,11 +89,13 @@ let idle_read_timeout = 10.0 (* seconds waiting for a command before dropping cl
 (** Close a client fd, ignoring errors if already closed. *)
 let close_fd fd = Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit)
 
-(** Periodic broadcaster: push state to all watch-mode clients every 500 ms, using the
-    snapshot cache when valid and rebuilding otherwise. On write failure, wake the
-    client's cancel resolver to unblock its reader and close its fd. *)
+(** Periodic broadcaster: every [broadcast_tick], push either a full state snapshot (on
+    the [full_snapshot_interval] cadence) or a small flow-delta frame carrying only
+    entries newer than [flow_last_seq]. Nothing is sent on a tick with no full snapshot
+    due and no fresh flow entries. On write failure, wake the client's cancel resolver to
+    unblock its reader and close its fd. *)
 let rec state_broadcaster () =
-  let%lwt () = Lwt_unix.sleep 0.5 in
+  let%lwt () = Lwt_unix.sleep broadcast_tick in
   let current_clients = !watch_clients in
   (if current_clients <> []
    then
@@ -104,38 +121,55 @@ let rec state_broadcaster () =
              current_clients
          in
          watch_clients := live_clients;
-         (* Use cached snapshot if within max age; otherwise regenerate. *)
-         let json_str =
-           if now -. !snapshot_cache_time < snapshot_cache_max_age
-              && !snapshot_cache_str <> ""
-           then !snapshot_cache_str
+         refresh_capture ();
+         let payload_opt =
+           if now -. !last_full_time >= full_snapshot_interval
+           then (
+             (* Full snapshot (cached within [snapshot_cache_max_age]). *)
+             last_full_time := now;
+             let s =
+               if now -. !snapshot_cache_time < snapshot_cache_max_age
+                  && !snapshot_cache_str <> ""
+               then !snapshot_cache_str
+               else (
+                 let s = Dashboard_state.snapshot_to_string () in
+                 snapshot_cache_str := s;
+                 snapshot_cache_time := now;
+                 s)
+             in
+             Some s)
            else (
-             let s = Dashboard_state.snapshot_to_string () in
-             snapshot_cache_str := s;
-             snapshot_cache_time := now;
-             s)
+             (* Fast path: only entries recorded since the last frame. Skipped when there
+                is nothing new, so an idle engine is silent. *)
+             let latest, fresh_count, json = Logging.delta ~since:!log_last_seq in
+             log_last_seq := latest;
+             if fresh_count > 0 then Some (Yojson.Basic.to_string json) else None)
          in
-         (* Broadcast in parallel; on write failure or timeout, signal cancel and close
-            fd. *)
-         let%lwt surviving =
-           Lwt_list.filter_map_p
-             (fun entry ->
-               Lwt.catch
-                 (fun () ->
-                   Lwt.pick
-                     [ (send_response entry.oc json_str >|= fun () -> Some entry)
-                     ; (let%lwt () = Lwt_unix.sleep 1.0 in
-                        Lwt.fail (Failure "write timeout"))
-                     ])
-                 (fun _ ->
-                   (try Lwt.wakeup entry.cancel () with
-                    | Invalid_argument _ -> ());
-                   let%lwt () = close_fd entry.fd in
-                   Lwt.return_none))
-             live_clients
-         in
-         watch_clients := surviving;
-         Lwt.return_unit)
+         match payload_opt with
+         | None -> Lwt.return_unit
+         | Some json_str ->
+           (* Broadcast in parallel; on write failure or timeout, signal cancel and close
+              fd. *)
+           let%lwt surviving =
+             Lwt_list.filter_map_p
+               (fun entry ->
+                 Lwt.catch
+                   (fun () ->
+                     Lwt.pick
+                       [ (send_response entry.oc json_str >|= fun () -> Some entry)
+                       ; (let%lwt () = Lwt_unix.sleep 1.0 in
+                          Lwt.fail (Failure "write timeout"))
+                       ])
+                   (fun _ ->
+                     (try Lwt.wakeup entry.cancel () with
+                      | Invalid_argument _ -> ());
+                     let%lwt () = close_fd entry.fd in
+                     Lwt.return_none))
+               live_clients
+           in
+           watch_clients := surviving;
+           refresh_capture ();
+           Lwt.return_unit)
        (fun exn ->
          Logging.error_f
            ~section
@@ -185,6 +219,7 @@ let handle_client ~fd ~cancel_promise (ic, oc) =
             let pong_time = ref (Unix.gettimeofday ()) in
             let entry = { oc; fd; cancel = cancel_resolver; last_pong = pong_time } in
             watch_clients := entry :: !watch_clients;
+            refresh_capture ();
             (* Block until client sends 'Q', disconnects, or is cancelled by the
                broadcaster detecting a write failure or heartbeat timeout. *)
             let wait_for_quit () =
@@ -219,6 +254,7 @@ let handle_client ~fd ~cancel_promise (ic, oc) =
             in
             (* Unsubscribe from broadcast list. *)
             watch_clients := List.filter (fun e -> e.fd != fd) !watch_clients;
+            refresh_capture ();
             Lwt.return_unit
           | 'Q' -> Lwt.return_unit (* Graceful close *)
           | _ ->
@@ -274,6 +310,7 @@ let start ~start_time =
           (fun () ->
             (* Remove from watch list in case handle_client didn't clean up. *)
             watch_clients := List.filter (fun e -> e.fd != client_fd) !watch_clients;
+            refresh_capture ();
             active_clients := !active_clients - 1;
             Logging.info_f
               ~section

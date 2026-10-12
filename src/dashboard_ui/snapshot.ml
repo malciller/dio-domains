@@ -99,6 +99,14 @@ type fill =
   ; timestamp : float
   }
 
+type log_entry =
+  { le_seq : int
+  ; le_ts : float
+  ; le_level : string
+  ; le_section : string
+  ; le_message : string
+  }
+
 type latency_metric =
   { p50 : float
   ; p90 : float
@@ -154,6 +162,7 @@ type t =
   ; latencies : (string * (string * latency_metric) list) list
   ; oracle_latency : (string * latency_metric) list
   ; assets : selectable_asset list
+  ; logs : log_entry list
   }
 
 let mid_of bid ask = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask
@@ -292,6 +301,24 @@ let parse_fill j =
   }
 ;;
 
+let parse_log_entry j =
+  { le_seq = j |?> "seq" |> to_int_d 0
+  ; le_ts = j |?> "ts" |> to_float_d 0.0
+  ; le_level = j |?> "level" |> to_string_d "INFO"
+  ; le_section = j |?> "section" |> to_string_d ""
+  ; le_message = j |?> "message" |> to_string_d ""
+  }
+;;
+
+(** The frame kind: "log" for a fast delta, "snapshot" (or absent) for a full state. *)
+let frame_type j = j |?> "type" |> to_string_d "snapshot"
+
+(** A [type="log"] delta frame: the new records and the newest id. *)
+let parse_log_frame j =
+  let entries = j |?> "entries" |> to_list_d |> List.map parse_log_entry in
+  j |?> "seq" |> to_int_d 0, entries
+;;
+
 let parse_latency_metric j =
   { p50 = j |?> "p50" |> to_float_d 0.0
   ; p90 = j |?> "p90" |> to_float_d 0.0
@@ -426,6 +453,7 @@ let of_json json =
     | `Assoc l -> List.map (fun (label, m) -> label, parse_latency_metric m) l
     | _ -> []
   in
+  let logs = json |?> "logs" |> to_list_d |> List.map parse_log_entry in
   let memory = parse_memory (json |?> "memory") in
   let timestamp = json |?> "timestamp" |> to_float_d 0.0 in
   let uptime_s = json |?> "uptime_s" |> to_float_d 0.0 in
@@ -446,5 +474,6 @@ let of_json json =
   ; latencies
   ; oracle_latency
   ; assets
+  ; logs
   }
 ;;

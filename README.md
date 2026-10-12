@@ -11,7 +11,7 @@ Each traded asset runs in its own OCaml domain. Order intents go through a
 lock-free executor, and market data arrives on lock-free ring buffers. A
 capital-survival oracle sizes each position from the asset's all-time drawdown
 history. A terminal dashboard connects to the running engine over a Unix domain
-socket.
+socket, with latency and log views and an alert popup for warnings and errors.
 
 [![ci](https://github.com/malciller/dio-domains/actions/workflows/ci.yml/badge.svg)](https://github.com/malciller/dio-domains/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/malciller/dio-domains)](https://github.com/malciller/dio-domains/releases)
@@ -60,7 +60,7 @@ and [deployment](https://diophantsolutions.com/dio/DEPLOYMENT/).
 | Executable | Function |
 | --- | --- |
 | `dio` | The engine. Trades the instruments in `config.json`. |
-| `dio-dashboard` | Terminal UI. Connects to a running engine over the Unix domain socket. |
+| `dio-dashboard` | Terminal UI. Connects to a running engine over the Unix domain socket. Latency and log views (press `v`), and an alert popup for warnings and errors. |
 | `dio-oracle` | Runs the sizing pipeline offline and prints the decision surface. |
 
 ## Performance

@@ -1,6 +1,14 @@
 {
   "theme": "tokyo-night",
+  "alert_level": "warn",
   "logging_level": "info",
+  "flow_log": {
+    "enabled": false,
+    "min_interval_seconds": 0.2,
+    "heartbeat_seconds": 5.0,
+    "pulse_seconds": 5.0,
+    "price_ticks": true
+  },
   "gc": {
     "minor_heap_size": 524288,
     "space_overhead": 200,

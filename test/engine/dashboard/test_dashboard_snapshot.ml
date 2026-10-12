@@ -179,6 +179,88 @@ let test_latency_and_oracle_parsing () =
   | None -> Alcotest.fail "missing oracle pass metric"
 ;;
 
+let test_log_parsing () =
+  let json =
+    `Assoc
+      [ "timestamp", `Float 1000.0
+      ; ( "logs"
+        , `List
+            [ `Assoc
+                [ "seq", `Int 7
+                ; "ts", `Float 12.5
+                ; "level", `String "WARN"
+                ; "section", `String "kraken_get_fee"
+                ; "message", `String "fee cache miss"
+                ]
+            ] )
+      ]
+  in
+  let s = Snapshot.of_json json in
+  match s.logs with
+  | [ e ] ->
+    Alcotest.(check int) "seq" 7 e.le_seq;
+    Alcotest.(check string) "level" "WARN" e.le_level;
+    Alcotest.(check string) "section" "kraken_get_fee" e.le_section;
+    Alcotest.(check string) "message" "fee cache miss" e.le_message;
+    Alcotest.(check (float 1e-9)) "ts" 12.5 e.le_ts
+  | _ -> Alcotest.fail "expected exactly one log entry"
+;;
+
+let test_alert_thresholds () =
+  let w = Alerts.threshold_of_string "warn" in
+  Alcotest.(check bool) "warn notifies warn" true (Alerts.notifies w "WARN");
+  Alcotest.(check bool) "warn notifies error" true (Alerts.notifies w "ERROR");
+  Alcotest.(check bool) "warn notifies critical" true (Alerts.notifies w "CRITICAL");
+  Alcotest.(check bool) "warn rejects info" false (Alerts.notifies w "INFO");
+  Alcotest.(check bool) "warn rejects debug" false (Alerts.notifies w "DEBUG");
+  Alcotest.(check bool)
+    "off notifies nothing"
+    false
+    (Alerts.notifies Alerts.Off "CRITICAL");
+  Alcotest.(check bool)
+    "critical only"
+    false
+    (Alerts.notifies (Alerts.threshold_of_string "critical") "ERROR");
+  Alcotest.(check bool)
+    "critical admits critical"
+    true
+    (Alerts.notifies (Alerts.threshold_of_string "critical") "CRITICAL");
+  Alcotest.(check bool)
+    "unknown defaults to warn"
+    true
+    (Alerts.threshold_of_string "bogus" = Alerts.Warn)
+;;
+
+let test_alert_batching () =
+  let e = Alerts.add [] ~level:"error" ~section:"s" ~message:"boom" in
+  let e = Alerts.add e ~level:"ERROR" ~section:"s" ~message:"boom" in
+  Alcotest.(check int) "identical lines batched into one row" 1 (List.length e);
+  (match e with
+   | [ row ] -> Alcotest.(check int) "count bumped" 2 row.a_count
+   | _ -> Alcotest.fail "expected exactly one batched row");
+  let e = Alerts.add e ~level:"WARN" ~section:"s" ~message:"different" in
+  Alcotest.(check int) "distinct line added" 2 (List.length e)
+;;
+
+let test_alert_modal_renders () =
+  let entries =
+    [ { Alerts.a_level = "CRITICAL"
+      ; a_section = "main"
+      ; a_message = "SIGTERM received; beginning graceful shutdown"
+      ; a_count = 1
+      }
+    ; { Alerts.a_level = "ERROR"
+      ; a_section = "order_executor"
+      ; a_message = "place rejected for SOL/USDC: insufficient margin"
+      ; a_count = 3
+      }
+    ]
+  in
+  let img = Alerts.render_modal ~target_w:120 ~target_h:40 entries in
+  Alcotest.(check int) "modal fills target width" 120 (Notty.I.width img);
+  Alcotest.(check int) "modal fills target height" 40 (Notty.I.height img)
+;;
+
 let () =
   Alcotest.run
     "dashboard_snapshot"
@@ -204,6 +286,10 @@ let () =
             "latency and oracle parsing"
             `Quick
             test_latency_and_oracle_parsing
+        ; Alcotest.test_case "log parsing" `Quick test_log_parsing
+        ; Alcotest.test_case "alert thresholds" `Quick test_alert_thresholds
+        ; Alcotest.test_case "alert batching" `Quick test_alert_batching
+        ; Alcotest.test_case "alert modal renders" `Quick test_alert_modal_renders
         ] )
     ]
 ;;

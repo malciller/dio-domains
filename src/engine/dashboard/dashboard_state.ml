@@ -860,6 +860,7 @@ let build_snapshot () =
     ; "oracle_latency", json_of_oracle_latency ()
     ; "parse_worker", json_of_parse_worker ()
     ; "caches", `Assoc (json_of_caches ())
+    ; "logs", Logging.recent_json ()
     ]
 ;;
 
