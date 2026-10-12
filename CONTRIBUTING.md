@@ -32,7 +32,11 @@ The docs pages cover how the pieces fit:
 2. Branch from `main`. Keep the change small. Add tests that fail without it.
 3. Open a PR that references the issue. The `build-test-oxcaml` CI job has to
    pass.
-4. The maintainer cuts releases. A merged PR shows up in the next `v*` tag.
+4. Merging to `main` releases automatically. Once `build-test-oxcaml`
+   passes, CI cuts the next `v*` tag (a patch bump), publishes a GitHub
+   Release, and pushes the container image. To bump minor or major instead,
+   include `[minor]` or `[major]` in the merged commit message (or run the
+   `ci` workflow manually with the `bump` input). No manual tagging is needed.
 
 Questions go through the issue tracker:
 <https://github.com/malciller/dio-domains/issues>. Never paste API keys,

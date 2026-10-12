@@ -1,11 +1,39 @@
 name: ci
+
+# One pipeline, no cross-workflow waiting. A push to main runs build-test first
+# and, only if it is green, cuts the next version (tag + GitHub Release) and
+# publishes the container image. Because release and publish are jobs in *this*
+# run rather than separate workflows triggered by a tag, nothing has to poll
+# for CI and there is nothing to time out. Branch and PR pushes run build-test
+# only.
+#
+# Versioning: every green main push bumps the patch version (v0.2.3 -> v0.2.4),
+# unless the pushed commit message contains `[minor]` or `[major]`, or a
+# workflow_dispatch run passes an explicit `bump`. minor/major reset the lower
+# components to 0. The tag is the source of truth and is pushed here with
+# GITHUB_TOKEN, which is safe precisely because no downstream workflow listens
+# for it.
 on:
   push:
     branches: ["**"]
-    # Tags are release gates: build-test-oxcaml on the exact commit that the
-    # release workflow waits for before publishing a GitHub Release.
-    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump for this manual run"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+
+# A newer push supersedes an in-flight run on a branch or PR, but main runs are
+# serialized rather than cancelled so a release is never torn in half and two
+# quick pushes cannot race to the same tag.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build-test-oxcaml:
@@ -154,3 +182,204 @@ jobs:
             echo "::error::OxCaml build emitted compiler alerts; see log above"
             exit 1
           fi
+
+  release:
+    # Cut a version for every green push to main (and manual dispatches on
+    # main). The tag is pushed with GITHUB_TOKEN inside this run, so no PAT is
+    # needed and no other workflow has to poll for the build-test check. Re-runs
+    # on an already-tagged commit are idempotent: they reuse the existing tag.
+    #
+    # Scoped to GitHub: the same workflow file also runs on the self-hosted
+    # Gitea mirror, which must not try to publish a GitHub Release or expect the
+    # GitHub-only secrets.
+    needs: build-test-oxcaml
+    if: >-
+      github.server_url == 'https://github.com'
+      && github.ref == 'refs/heads/main'
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Full history + tags: the next version is derived from the highest
+          # existing v* tag.
+          fetch-depth: 0
+
+      - name: Compute next version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          BUMP_INPUT: ${{ github.event.inputs.bump }}
+        run: |
+          set -euo pipefail
+
+          # Idempotent re-runs: if HEAD is already tagged, reuse that version
+          # instead of bumping again to a tag that points at the same commit.
+          existing="$(git tag --points-at HEAD --list 'v*' | sort -V | tail -n1)"
+          if [ -n "$existing" ]; then
+            echo "HEAD already tagged $existing; reusing it."
+            echo "version=$existing" >> "$GITHUB_OUTPUT"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Bump type: explicit dispatch input, else a commit-message marker,
+          # else patch.
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "$BUMP_INPUT" ]; then
+            bump="$BUMP_INPUT"
+          else
+            msg="$(git log -1 --pretty=%B)"
+            if printf '%s' "$msg" | grep -qiE '\[major\]'; then
+              bump=major
+            elif printf '%s' "$msg" | grep -qiE '\[minor\]'; then
+              bump=minor
+            else
+              bump=patch
+            fi
+          fi
+
+          latest="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+          latest="${latest:-v0.0.0}"
+          ver="${latest#v}"
+          IFS='.' read -r major minor patch <<< "$ver"
+          major="${major:-0}"; minor="${minor:-0}"; patch="${patch:-0}"
+          case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          new="v${major}.${minor}.${patch}"
+          echo "bump=$bump latest=$latest new=$new"
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        if: steps.version.outputs.created == 'true'
+        run: |
+          git tag "${{ steps.version.outputs.version }}"
+          git push origin "${{ steps.version.outputs.version }}"
+
+      - name: Publish release
+        if: steps.version.outputs.created == 'true'
+        # Every tag that passes CI ships as a Release immediately; no drafts.
+        # `generate_release_notes` fills the body from the PRs and commits
+        # merged since the previous tag.
+        uses: softprops/action-gh-release@64df7ca660f0a62e71442d521755ff05b68b9b9b # v2.0.1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          make_latest: true
+          prerelease: false
+
+  publish:
+    # Builds the release image and pushes it to GitHub Container Registry, then
+    # mirrors it to Docker Hub when the DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
+    # repository secrets are set. The mirror is skipped when they are absent, so
+    # the release never depends on Docker Hub.
+    #
+    # The package must be public. If it is ever recreated private, set
+    # visibility back to public in the repository's package settings (Package
+    # settings -> Danger Zone -> change visibility); see docs/RISK.md.
+    #
+    # Tags published:
+    #   ghcr.io/<owner>/<repo>:<version>   (the version cut by the release job)
+    #   ghcr.io/<owner>/<repo>:latest
+    #   docker.io/<DOCKERHUB_USERNAME>/dio-domains:<version>    (when secrets set)
+    #   docker.io/<DOCKERHUB_USERNAME>/dio-domains:latest
+    needs: release
+    if: needs.release.result == 'success'
+    # The OxCaml base bootstrap needs >= 16 GB RAM; GitHub-hosted ubuntu-latest
+    # provides that. Same caveat as the build-test job.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DIO_BASE_IMAGE: dio-oxcaml-base:5.2.0minus40
+      IMAGE: ghcr.io/${{ github.repository }}
+      TAG: ${{ needs.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.release.outputs.version }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Base image (OxCaml compiler + all opam deps). Reads the default gha
+      # cache scope that the build-test job writes from main, so a release does
+      # not pay the ~40 min compiler rebuild. No cache-to here: a tag-scoped
+      # write would duplicate ~3.4 GB and overflow the 10 GB repo limit.
+      - name: Build OxCaml base image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile.base
+          load: true
+          tags: ${{ env.DIO_BASE_IMAGE }}
+          cache-from: type=gha
+
+      # Application image. Built with the default (daemon) builder so it can
+      # see the base image that the previous step loaded into the daemon's
+      # image store rather than the container builder's (see the build-test job
+      # for the full explanation of this split).
+      - name: Build and push application image
+        run: |
+          DOCKER_BUILDKIT=1 docker buildx build --builder default \
+            --progress=plain \
+            --build-arg "DIO_BASE_IMAGE=$DIO_BASE_IMAGE" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "$IMAGE:$TAG" \
+            -t "$IMAGE:latest" \
+            --push .
+
+      # Optional mirror to Docker Hub (public registry search). Runs only when
+      # the DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets are set.
+      # Create a Docker Hub access token with Read & Write scope.
+      - name: Mirror to Docker Hub
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DH_USER" ] || [ -z "$DH_TOKEN" ]; then
+            echo "Docker Hub secrets not set; skipping mirror."
+            exit 0
+          fi
+          echo "$DH_TOKEN" | docker login -u "$DH_USER" --password-stdin
+          repo="docker.io/$DH_USER/dio-domains"
+          docker image inspect "$IMAGE:$TAG" >/dev/null 2>&1 || docker pull "$IMAGE:$TAG"
+          docker tag "$IMAGE:$TAG" "$repo:$TAG"
+          docker tag "$IMAGE:$TAG" "$repo:latest"
+          docker push "$repo:$TAG"
+          docker push "$repo:latest"
+          echo "Mirrored to $repo:$TAG and $repo:latest"
+
+      - name: Summary
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          {
+            echo "### Published image"
+            echo
+            echo '```'
+            echo "$IMAGE:$TAG"
+            echo "$IMAGE:latest"
+            if [ -n "$DH_USER" ]; then
+              echo "docker.io/$DH_USER/dio-domains:$TAG"
+              echo "docker.io/$DH_USER/dio-domains:latest"
+            fi
+            echo '```'
+            echo
+            echo "The package is public. If it is private, change visibility in"
+            echo "the package settings; see docs/RISK.md."
+          } >> "$GITHUB_STEP_SUMMARY"
