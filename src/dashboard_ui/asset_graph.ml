@@ -191,6 +191,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         ; asks = b.asks
         ; base_balance = b.balance
         ; staked_balance = b.staked_balance
+        ; available_balance = b.available_balance
         ; sell_orders = b.sell_orders
         }
     in
@@ -235,9 +236,13 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     in
     let staked_bal = market.staked_balance in
     (* [staked_bal] is part of [base_bal] but non-tradeable, so it is never reduced by the
-       pending sell quantity. *)
+       pending sell quantity. Prefers the venue's own hold-netted available figure. *)
     let accum_qty =
-      staked_bal +. Float.max 0.0 (base_bal -. staked_bal -. pending_sell_qty)
+      Holdings.accum_qty_of
+        ~staked:staked_bal
+        ~pending:pending_sell_qty
+        ~available:market.available_balance
+        base_bal
     in
     let accum_val = accum_qty *. mid in
     (* Buy orders: real exchange orders, else a synthetic strategy target. *)

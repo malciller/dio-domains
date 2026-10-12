@@ -7,11 +7,24 @@ let oracle_inactive = Snapshot.oracle_inactive
 
 let strategy_paused = Snapshot.strategy_paused
 
+(** Free (uncommitted) base. Prefer [available], the venue's own hold-netted figure (total
+    minus the base locked in resting orders, staking excluded): it is authoritative and
+    needs no local bookkeeping. Only fall back to the [base - staked - pending] estimate
+    when the venue reports nothing (older snapshots, venues with no available figure),
+    because that estimate double-nets the exchange hold already inside [base] and clamps
+    to zero whenever a stale locally-tracked sell over-counts [pending], silently dropping
+    the whole free-spot term. *)
+let free_base_of ~staked ~pending ~available base =
+  match available with
+  | Some a when Float.is_finite a && a >= 0.0 -> a
+  | _ -> Float.max 0.0 (base -. staked -. pending)
+;;
+
 (** Accumulated quantity: inventory not committed to a resting sell. [staked] is part of
-    [base] but non-tradeable, so it is never reduced by [pending].
-    @return [staked] + max 0.0 ([base] - [staked] - [pending]) *)
-let accum_qty_of ~staked ~pending base =
-  staked +. Float.max 0.0 (base -. staked -. pending)
+    [base] but non-tradeable, so it is never reduced by a resting sell.
+    @return [staked] + {!free_base_of} *)
+let accum_qty_of ~staked ~pending ~available base =
+  staked +. free_base_of ~staked ~pending ~available base
 ;;
 
 let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
@@ -112,7 +125,11 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         sell_orders
     in
     let accum_holding =
-      accum_qty_of ~staked:staked_bal ~pending:pending_sell_qty base_bal
+      accum_qty_of
+        ~staked:staked_bal
+        ~pending:pending_sell_qty
+        ~available:s.market.available_balance
+        base_bal
     in
     let accum_hold_value = accum_holding *. mid in
     let buy_dist_pct =
@@ -428,7 +445,12 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let accum_holding =
       if is_quote
       then 0.0
-      else accum_qty_of ~staked:staked_bal ~pending:pending_sell_qty balance
+      else
+        accum_qty_of
+          ~staked:staked_bal
+          ~pending:pending_sell_qty
+          ~available:b.available_balance
+          balance
     in
     let accum_hold_value = accum_holding *. mid in
     let closest_sell_dist_pct =
@@ -744,7 +766,11 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
             sell_orders
         in
         let accum_holding =
-          accum_qty_of ~staked:staked_bal ~pending:pending_sell_qty base_bal
+          accum_qty_of
+            ~staked:staked_bal
+            ~pending:pending_sell_qty
+            ~available:s.market.available_balance
+            base_bal
         in
         let accum_hold_value = accum_holding *. mid in
         ( up_acc +. strat_up
@@ -773,7 +799,12 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
           let accum_holding =
             if is_quote
             then 0.0
-            else accum_qty_of ~staked:b.staked_balance ~pending:pending_sell_qty b.balance
+            else
+              accum_qty_of
+                ~staked:b.staked_balance
+                ~pending:pending_sell_qty
+                ~available:b.available_balance
+                b.balance
           in
           let accum_hold_value = accum_holding *. mid in
           ( up_acc +. bal_up

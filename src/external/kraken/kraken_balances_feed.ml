@@ -257,6 +257,14 @@ let[@inline always] get_total_balance asset =
   BalanceStore.get_total_balance store
 ;;
 
+(** Returns the earn/staked balance for [asset]: funds held in earn wallets, which are
+    part of the total but not tradeable. Kraken wallet snapshots report gross balances, so
+    this is the total minus the trading (non-earn) figure. *)
+let[@inline always] get_staked_balance asset =
+  let store = get_balance_store asset in
+  Float.max 0.0 (BalanceStore.get_total_balance store -. BalanceStore.get_balance store)
+;;
+
 (** Returns a [balance_data] record with aggregated balances for [asset]. *)
 let get_balance_data asset =
   let asset = normalize_asset asset in

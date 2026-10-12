@@ -298,12 +298,22 @@ let venue_gross_base ~(hold_netted : bool) ~(asset : trading_config) ~spendable 
   else (
     match get_exchange_module asset.exchange with
     | Some (module Ex : Exchange.S) ->
+      (* Balance stores are keyed by base asset, but [asset.symbol] is the pair
+         ("HYPE/USDC"). Reading the pair key resolves to an empty store and returns 0, so
+         the gross basis was silently unavailable ([None]) on every slashed-pair venue -
+         i.e. every Hyperliquid spot strategy, the venue this path exists for. Take the
+         base asset before the lookup. Slash-less symbols ("SMH") pass through unchanged. *)
+      let base_asset =
+        match String.split_on_char '/' asset.symbol with
+        | base :: _ -> base
+        | [] -> asset.symbol
+      in
       let total =
-        try Ex.get_total_balance ~asset:asset.symbol with
+        try Ex.get_total_balance ~asset:base_asset with
         | _ -> Float.nan
       in
       let staked =
-        try Ex.get_staked_balance ~asset:asset.symbol with
+        try Ex.get_staked_balance ~asset:base_asset with
         | _ -> Float.nan
       in
       if Float.is_nan total || Float.is_nan staked

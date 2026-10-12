@@ -34,6 +34,56 @@ let test_non_finite_pass_through () =
     true
 ;;
 
+(* Transport failures (timeout / connection) must be retriable; venue rejections and parse
+   errors must not, so a permanent failure fails fast instead of sleeping through the
+   backoff. *)
+let test_retriable_classification () =
+  let check name expected err =
+    Alcotest.(check bool) name expected (Alpaca.Rest.is_retriable_http_exception err)
+  in
+  check "timeout retriable" true "Get positions HTTP exception: Lwt_unix.Timeout";
+  check
+    "connection retriable"
+    true
+    "Get open orders HTTP exception: Unix.Unix_error(ECONNRESET, \"read\", \"\")";
+  check "422 terminal" false "HTTP 422 getting positions: sub-penny";
+  check "parse terminal" false "Failed to parse positions response: bad json"
+;;
+
+(* The retry loop must actually re-invoke [f] on a timeout. Regression guard: previously
+   the lambdas re-raised transport exceptions, which bypassed [retry_with_backoff]
+   entirely, so timeouts were never retried. *)
+let test_retry_retries_timeout () =
+  let attempts = ref 0 in
+  let result =
+    Lwt_main.run
+      (Alpaca.Rest.retry_http_exceptions ~f:(fun () ->
+         incr attempts;
+         if !attempts = 1
+         then Lwt.return (Error "Get positions HTTP exception: Lwt_unix.Timeout")
+         else Lwt.return (Ok "recovered")))
+  in
+  Alcotest.(check int) "retried once" 2 !attempts;
+  match result with
+  | Ok s -> Alcotest.(check string) "recovered value" "recovered" s
+  | Error e -> Alcotest.failf "expected Ok, got Error %s" e
+;;
+
+(* A terminal rejection must be returned after a single attempt, with no backoff sleep. *)
+let test_retry_stops_on_rejection () =
+  let attempts = ref 0 in
+  let result =
+    Lwt_main.run
+      (Alpaca.Rest.retry_http_exceptions ~f:(fun () ->
+         incr attempts;
+         Lwt.return (Error "HTTP 422 getting positions: sub-penny")))
+  in
+  Alcotest.(check int) "attempted once" 1 !attempts;
+  match result with
+  | Ok _ -> Alcotest.fail "expected Error"
+  | Error _ -> ()
+;;
+
 let () =
   Alcotest.run
     "alpaca_rest"
@@ -48,6 +98,11 @@ let () =
             test_keeps_sub_penny_below_one_dollar
         ; Alcotest.test_case "on-tick pass-through" `Quick test_exact_prices_pass_through
         ; Alcotest.test_case "non-finite pass-through" `Quick test_non_finite_pass_through
+        ] )
+    ; ( "retry policy"
+      , [ Alcotest.test_case "classification" `Quick test_retriable_classification
+        ; Alcotest.test_case "retries timeout" `Quick test_retry_retries_timeout
+        ; Alcotest.test_case "stops on rejection" `Quick test_retry_stops_on_rejection
         ] )
     ]
 ;;

@@ -23,4 +23,4 @@
 
 (test
  (name test_alpaca_rest)
- (libraries dio.alpaca alcotest))
+ (libraries dio.alpaca lwt alcotest))

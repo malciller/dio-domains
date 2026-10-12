@@ -5,18 +5,26 @@ open Alpaca_types
 
 let section = "alpaca_rest"
 
-(** Retry policy: connection-class HTTP exceptions are retried with a short backoff; HTTP
-    4xx venue rejections return to the caller untouched. The executor delegates all
-    retries to the exchange modules. *)
+(** True for transport-class failures worth retrying: connection errors and
+    request/deadline timeouts. HTTP 4xx venue rejections (and parse errors) are terminal. *)
+let is_retriable_http_exception e =
+  match Error_handling.classify e with
+  | Error_handling.Connection | Error_handling.Timeout -> true
+  | _ -> false
+;;
+
+(** Retry policy: transport-class HTTP failures (connection errors and request/deadline
+    timeouts) are retried with a short backoff; HTTP 4xx venue rejections return to the
+    caller untouched. [f] must return [Error] for such failures rather than re-raising:
+    [retry_with_backoff] only inspects the [Error] payload, so a raised exception would
+    bypass the loop entirely and never be retried. The executor delegates all retries to
+    the exchange modules. *)
 let retry_http_exceptions ~f =
   Error_handling.retry_with_backoff
     ~section
     ~config:Error_handling.default_retry_config
     ~f
-    ~is_retriable_override:(fun e ->
-      match Error_handling.classify e with
-      | Error_handling.Connection -> true
-      | _ -> false)
+    ~is_retriable_override:is_retriable_http_exception
     ()
 ;;
 
@@ -278,15 +286,15 @@ let place_order
           Logging.error_f ~section "Place order failed HTTP %d: %s" status_code body_str;
           Lwt.return (Error (Printf.sprintf "HTTP %d: %s" status_code body_str))))
       (fun exn ->
-        (* Connection/timeout exceptions re-raise for the retry layer; others become an
-           Error. *)
+        (* Return the failure as [Error] so [retry_http_exceptions] can classify and retry
+           transport-class failures; re-raising would bypass the retry loop. Retriable
+           failures are logged by the retry layer on each attempt. *)
         let exn_str = Printexc.to_string exn in
-        match Error_handling.classify exn_str with
-        | Error_handling.Connection | Error_handling.Timeout -> Lwt.fail exn
-        | _ ->
-          let err = Printf.sprintf "Place order HTTP exception: %s" exn_str in
-          Logging.error_f ~section "%s" err;
-          Lwt.return (Error err)))
+        let err = Printf.sprintf "Place order HTTP exception: %s" exn_str in
+        (match Error_handling.classify exn_str with
+         | Error_handling.Connection | Error_handling.Timeout -> ()
+         | _ -> Logging.error_f ~section "%s" err);
+        Lwt.return (Error err)))
 ;;
 
 let amend_order ~order_id ?qty ?limit_price ?cl_ord_id () =
@@ -362,13 +370,13 @@ let amend_order ~order_id ?qty ?limit_price ?cl_ord_id () =
             body_str;
           Lwt.return (Error (Printf.sprintf "HTTP %d: %s" status_code body_str))))
       (fun exn ->
+        (* Return [Error] so the retry loop can retry transport-class failures. *)
         let exn_str = Printexc.to_string exn in
-        match Error_handling.classify exn_str with
-        | Error_handling.Connection | Error_handling.Timeout -> Lwt.fail exn
-        | _ ->
-          let err = Printf.sprintf "Amend order HTTP exception: %s" exn_str in
-          Logging.error_f ~section "%s" err;
-          Lwt.return (Error err)))
+        let err = Printf.sprintf "Amend order HTTP exception: %s" exn_str in
+        (match Error_handling.classify exn_str with
+         | Error_handling.Connection | Error_handling.Timeout -> ()
+         | _ -> Logging.error_f ~section "%s" err);
+        Lwt.return (Error err)))
 ;;
 
 let cancel_order order_id =
@@ -403,16 +411,16 @@ let cancel_order order_id =
             (Error
                (Printf.sprintf "HTTP %d cancelling %s: %s" status_code order_id body_str))))
       (fun exn ->
+        (* Return [Error] so the retry loop can retry transport-class failures. *)
         let exn_str = Printexc.to_string exn in
-        match Error_handling.classify exn_str with
-        | Error_handling.Connection | Error_handling.Timeout -> Lwt.fail exn
-        | _ ->
-          let err = Printf.sprintf "Cancel order HTTP exception: %s" exn_str in
-          Logging.error_f ~section "%s" err;
-          Lwt.return (Error err)))
+        let err = Printf.sprintf "Cancel order HTTP exception: %s" exn_str in
+        (match Error_handling.classify exn_str with
+         | Error_handling.Connection | Error_handling.Timeout -> ()
+         | _ -> Logging.error_f ~section "%s" err);
+        Lwt.return (Error err)))
 ;;
 
-let get_open_orders () =
+let get_open_orders_once () =
   let base_url = Config.rest_base_url () in
   let headers = make_headers () in
   let rec fetch_all acc until_id =
@@ -482,7 +490,10 @@ let get_open_orders () =
       Lwt.return (Error err))
 ;;
 
-let get_account () =
+(** [get_open_orders] with transport-failure retries. *)
+let get_open_orders () = retry_http_exceptions ~f:get_open_orders_once
+
+let get_account_once () =
   let base_url = Config.rest_base_url () in
   let url = Uri.of_string (base_url ^ "/v2/account") in
   let headers = make_headers () in
@@ -534,7 +545,10 @@ let get_account () =
       Lwt.return (Error err))
 ;;
 
-let get_positions () =
+(** [get_account] with transport-failure retries. *)
+let get_account () = retry_http_exceptions ~f:get_account_once
+
+let get_positions_once () =
   let base_url = Config.rest_base_url () in
   let url = Uri.of_string (base_url ^ "/v2/positions") in
   let headers = make_headers () in
@@ -602,3 +616,6 @@ let get_positions () =
       Logging.error_f ~section "%s" err;
       Lwt.return (Error err))
 ;;
+
+(** [get_positions] with transport-failure retries. *)
+let get_positions () = retry_http_exceptions ~f:get_positions_once

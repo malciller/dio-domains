@@ -33,6 +33,9 @@ type market =
   ; base_balance : float
   ; staked_balance : float
   ; tradeable_balance : float
+  (** Venue-authoritative immediately-sellable base (total minus the base locked in
+      resting orders, staking excluded). [None] when the venue did not report one. *)
+  ; available_balance : float option
   ; quote_balance : float
   ; bids : level list
   ; asks : level list
@@ -76,6 +79,7 @@ type balance =
   ; balance : float
   ; staked_balance : float
   ; tradeable_balance : float
+  ; available_balance : float option
   ; bid : float
   ; ask : float
   ; mid : float
@@ -154,6 +158,14 @@ type t =
 
 let mid_of bid ask = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask
 
+(** Numeric field as an option: [None] when absent or JSON [null], so callers can tell
+    "the venue reported zero" from "the venue reported nothing". *)
+let to_float_opt = function
+  | `Float f -> Some f
+  | `Int i -> Some (float_of_int i)
+  | _ -> None
+;;
+
 let parse_order j =
   let price = j |?> "price" |> to_float_d 0.0 in
   let qty = j |?> "qty" |> to_float_d 0.0 in
@@ -193,6 +205,7 @@ let parse_market j =
   ; base_balance = j |?> "base_balance" |> to_float_d 0.0
   ; staked_balance = j |?> "staked_balance" |> to_float_d 0.0
   ; tradeable_balance = j |?> "tradeable_balance" |> to_float_d 0.0
+  ; available_balance = j |?> "available_balance" |> to_float_opt
   ; quote_balance = j |?> "quote_balance" |> to_float_d 0.0
   ; bids = parse_levels (j |?> "bids")
   ; asks = parse_levels (j |?> "asks")
@@ -255,6 +268,7 @@ let parse_balance j =
   ; balance = j |?> "balance" |> to_float_d 0.0
   ; staked_balance = j |?> "staked_balance" |> to_float_d 0.0
   ; tradeable_balance = j |?> "tradeable_balance" |> to_float_d 0.0
+  ; available_balance = j |?> "available_balance" |> to_float_opt
   ; bid
   ; ask
   ; mid = mid_of bid ask
