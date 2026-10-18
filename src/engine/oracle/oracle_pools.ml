@@ -90,6 +90,20 @@ let cascade
     | None -> [] (* No combination fits: give up this round. *))
 ;;
 
+(** Reclaim-reservation hold. When a senior strategy's cancelled quote is draining back
+    into the venue pool, the cancel lands on the balance feed *after* the order leaves the
+    exec feed's order store. In that window the senior has no resting buy left to point a
+    fresh cascade at, while a strictly-lower-priority strategy could re-fund from the
+    quote being freed - the cancel/replace cascade. [reserved_priority] is the senior's
+    config position (smaller = higher priority), or [None] when no reservation stands.
+    Returns [true] when [priority] must be held inactive so it cannot re-place the quote
+    being released. *)
+let held_for_reservation ~(reserved_priority : int option) ~(priority : int) : bool =
+  match reserved_priority with
+  | None -> false
+  | Some rp -> priority > rp
+;;
+
 (** Sell size from the venue base pool: base balance minus reserved_base (already excluded
     by the execution layer's available_trading_balance) minus base tied in resting sells.
     Never capital-gated. *)

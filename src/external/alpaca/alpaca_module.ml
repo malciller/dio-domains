@@ -257,6 +257,7 @@ module Alpaca_impl = struct
      sizing uses this. Gross [get_balance] is retained for the ledger and oracle. *)
   let get_available_balance_fast ~asset () = Alpaca_balances.get_available_balance asset
   let get_balance_age_fast ~asset:_ () = Alpaca_balances.get_balance_age ()
+  let get_balance_updated_at ~asset:_ = Alpaca_balances.get_balance_updated_at ()
   let get_total_balance ~asset = Alpaca_balances.get_total_balance asset
   let get_staked_balance ~asset:_ = 0.0
   let get_all_balances () = Alpaca_balances.get_all_balances ()
@@ -349,6 +350,7 @@ module Alpaca_impl = struct
         ; filled_qty = e.filled_qty
         ; avg_price = e.avg_price
         ; timestamp = e.timestamp
+        ; venue_time = e.venue_time
         ; is_amended = e.is_amended
         ; cl_ord_id = e.cl_ord_id
         })
@@ -369,6 +371,7 @@ module Alpaca_impl = struct
            ; filled_qty = e.filled_qty
            ; avg_price = e.avg_price
            ; timestamp = e.timestamp
+           ; venue_time = e.venue_time
            ; is_amended = e.is_amended
            ; cl_ord_id = e.cl_ord_id
            })

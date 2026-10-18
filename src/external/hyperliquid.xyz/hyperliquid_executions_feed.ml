@@ -66,6 +66,11 @@ type execution_event =
   ; last_price : float option
   ; fee : float option
   ; cl_ord_id : string option
+  ; venue_time : float
+  (** The venue's own time for this event, or 0.0 for events the feed synthesises locally
+      (optimistic injection, cancel detection, reconcile sweeps) where no venue time
+      exists. The capital oracle needs a venue time to judge whether the venue's balance
+      figure has already incorporated the event; a local clock cannot answer that. *)
   }
 
 (** Lock-free ring buffer used for execution event storage. *)
@@ -111,19 +116,24 @@ let initialization_mutex = Mutex.create ()
     updating the index per event. *)
 let order_index_mutex = Mutex.create ()
 
-(** order_id to symbol index with adaptive capacity and FIFO eviction. Callers must hold
-    [order_index_mutex]. *)
 (* Global order_id -> symbol index, bounded and FIFO-evicted. Backing store for
    [Concurrency.Fifo_index]; see that module for why this is FIFO rather than LRU and why
    queue membership is tracked explicitly. *)
+
+(** order_id to symbol index with adaptive capacity and FIFO eviction. Callers must hold
+    [order_index_mutex]. *)
 let order_to_symbol =
-  Concurrency.Fifo_index.create ~label:(section ^ "/order_to_symbol")
-    ~cap:Concurrency.Cache_limits.order_index_startup_cap ()
+  Concurrency.Fifo_index.create
+    ~label:(section ^ "/order_to_symbol")
+    ~cap:Concurrency.Cache_limits.order_index_startup_cap
+    ()
 ;;
 
 let () =
-  Concurrency.Fifo_index.publish_metrics order_to_symbol
+  Concurrency.Fifo_index.publish_metrics
+    order_to_symbol
     ~name:"hyperliquid.order_to_symbol"
+;;
 
 let order_to_symbol_startup_done = Atomic.make false
 
@@ -146,14 +156,16 @@ let retire_from_order_to_symbol order_id =
 ;;
 
 (** Tune the cap from the volume seen once the startup snapshot is fully consumed:
-    max(1024, observed * 1.5 + 1). Idempotent; only the first invocation takes effect.
-    The bound already exists before this runs; this only adjusts it. *)
+    max(1024, observed * 1.5 + 1). Idempotent; only the first invocation takes effect. The
+    bound already exists before this runs; this only adjusts it. *)
 let mark_startup_complete () =
   if not (Atomic.exchange order_to_symbol_startup_done true)
   then (
     (* Precondition: order_index_mutex is held by the caller (inject_open_orders). *)
     let observed = Concurrency.Fifo_index.length order_to_symbol in
-    Concurrency.Fifo_index.lock_cap order_to_symbol ~observed
+    Concurrency.Fifo_index.lock_cap
+      order_to_symbol
+      ~observed
       ~floor:Concurrency.Cache_limits.order_index_hyperliquid_min_cap)
 ;;
 
@@ -732,6 +744,7 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
     ; cum_cost = 0.0
     ; avg_price = 0.0
     ; timestamp = now
+    ; venue_time = 0.0
     ; trade_id = None
     ; last_qty = None
     ; last_price = None
@@ -782,11 +795,13 @@ let find_registered_symbol coin =
   let result = ref None in
   let exact = ref None in
   Mutex.lock initialization_mutex;
-  Ds.Cow_table.iter (fun registered_symbol _ ->
+  Ds.Cow_table.iter
+    (fun registered_symbol _ ->
       if String.starts_with ~prefix:(coin ^ "/") registered_symbol
       then result := Some registered_symbol
       else if registered_symbol = coin
-      then exact := Some registered_symbol) stores;
+      then exact := Some registered_symbol)
+    stores;
   Mutex.unlock initialization_mutex;
   match !result with
   | Some symbol -> Some symbol
@@ -955,6 +970,7 @@ let process_order_updates data_json =
               ; cum_cost = new_cum_cost
               ; avg_price = new_avg_price
               ; timestamp = now
+              ; venue_time = action_time
               ; trade_id = None
               ; last_qty = (if status = "filled" then Some qty else None)
               ; last_price = (if status = "filled" then Some price else None)
@@ -1166,6 +1182,7 @@ let process_user_events data_json =
                     ; cum_cost
                     ; avg_price
                     ; timestamp = action_time
+                    ; venue_time = action_time
                     ; trade_id = Some tid
                     ; last_qty = Some size
                     ; last_price = Some price
@@ -1300,6 +1317,7 @@ let process_user_events data_json =
              ; cum_cost = current_order.cum_cost
              ; avg_price = current_order.avg_price
              ; timestamp = now
+             ; venue_time = 0.0
              ; trade_id = None
              ; last_qty = None
              ; last_price = None
@@ -1474,6 +1492,7 @@ let inject_open_orders data_json =
               ; cum_cost = 0.0
               ; avg_price = 0.0
               ; timestamp = timestamp_ms /. 1000.0
+              ; venue_time = timestamp_ms /. 1000.0
               ; trade_id = None
               ; last_qty = None
               ; last_price = None
@@ -1502,7 +1521,9 @@ let inject_open_orders data_json =
     Logging.debug_f ~section "Injected %d initial open orders from snapshot" !count;
     let stale_orders = ref [] in
     Mutex.lock initialization_mutex;
-    let all_symbols = Ds.Cow_table.fold (fun symbol _ acc -> symbol :: acc) stores ~init:[] in
+    let all_symbols =
+      Ds.Cow_table.fold (fun symbol _ acc -> symbol :: acc) stores ~init:[]
+    in
     Mutex.unlock initialization_mutex;
     List.iter
       (fun symbol ->
@@ -1531,6 +1552,7 @@ let inject_open_orders data_json =
           ; cum_cost = cached_order.cum_cost
           ; avg_price = cached_order.avg_price
           ; timestamp = Unix.gettimeofday ()
+          ; venue_time = 0.0
           ; trade_id = None
           ; last_qty = None
           ; last_price = None

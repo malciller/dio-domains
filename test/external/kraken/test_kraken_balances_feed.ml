@@ -162,6 +162,7 @@ let test_tradeable_balance_nets_open_order_holds () =
     ; order_userref = None
     ; cl_ord_id = None
     ; timestamp = Unix.gettimeofday ()
+    ; venue_time = 0.0
     }
   in
   Kraken.Kraken_executions_feed.update_open_orders

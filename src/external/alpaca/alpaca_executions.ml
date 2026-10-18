@@ -45,6 +45,10 @@ type execution_event_internal =
   ; timestamp : float
   ; is_amended : bool
   ; cl_ord_id : string option
+  ; venue_time : float
+  (** The venue's own time for this event, or 0.0 when the payload carried none and
+      [timestamp] fell back to wall-clock. The capital oracle needs the venue time to
+      judge whether the venue's balance figure has incorporated this event. *)
   }
 
 let status_of_alpaca_status = function
@@ -106,6 +110,7 @@ module SymbolExecStore = struct
           ; timestamp = 0.0
           ; is_amended = false
           ; cl_ord_id = None
+          ; venue_time = 0.0
           }
     ; capacity
     ; write_pos = Atomic.make 0
@@ -414,12 +419,14 @@ let bootstrap_open_orders () =
         Hashtbl.replace grouped o.symbol (o :: existing))
       orders;
     Mutex.lock stores_mutex;
-    Ds.Cow_table.iter (fun sym store ->
+    Ds.Cow_table.iter
+      (fun sym store ->
         let sym_orders =
           try Hashtbl.find grouped sym with
           | _ -> []
         in
-        SymbolExecStore.set_open_orders_snapshot store sym_orders) stores;
+        SymbolExecStore.set_open_orders_snapshot store sym_orders)
+      stores;
     Mutex.unlock stores_mutex;
     Logging.debug_f
       ~section
@@ -495,6 +502,14 @@ let apply_trade_update json =
        | _ -> Option.value ord.limit_price ~default:0.0)
     | _ -> Option.value ord.limit_price ~default:0.0
   in
+  (* Alpaca stamps the trade update itself; prefer that over our arrival time so the
+     capital oracle can tell whether the venue has already applied the event. Absent or
+     unparseable => 0.0 (unknown), never a local clock. *)
+  let venue_time =
+    match json |> member "timestamp" |> to_string_option with
+    | Some s -> Option.value (Network_latency.unix_of_rfc3339 s) ~default:0.0
+    | None -> 0.0
+  in
   let exec_event =
     { order_id = ord.id
     ; symbol = ord.symbol
@@ -507,6 +522,7 @@ let apply_trade_update json =
     ; timestamp = Unix.time ()
     ; is_amended
     ; cl_ord_id = ord.client_order_id
+    ; venue_time
     }
   in
   (* Fail-closed on money fields for fill-class events: price<=0, filled_qty<=0,

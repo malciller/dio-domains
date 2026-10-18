@@ -166,12 +166,36 @@ let test_venue_contract () =
     (min_notional ~symbol:"BTC/USDC");
   Alcotest.(check (float 1e-9)) "perp min_notional = 0" 0.0 (min_notional ~symbol:"BTC");
   Alcotest.(check string) "default quote USDC" "USDC" default_quote;
-  (* The live WS "USDC" store mixes perp margin with spot; the oracle pool counts spot
-     only, so the adapter deliberately has no live snapshot. *)
+  (* Cold start: no spotState has landed, so there is no live snapshot and the runtime
+     falls back to REST rather than sizing against a fabricated zero. *)
   Alcotest.(check bool)
-    "no live balance snapshot (REST spot authoritative)"
+    "no live snapshot before the first spotState frame"
     true
-    (live_balances () = None)
+    (live_balances () = None);
+  (* Once spotState lands, the adapter serves the live spot view: spot capital only and
+     hold-netted. Perp margin is a separate wallet the balance store excludes. *)
+  let store = Hyperliquid.Balances.get_balance_store "CONTRACT/USDC" in
+  Hyperliquid.Balances.BalanceStore.update_wallet
+    store
+    ~available:80.0
+    ~total:100.0
+    "spot"
+    "account";
+  let has_contract =
+    match live_balances () with
+    | None -> false
+    | Some balances ->
+      List.exists
+        (fun (asset, available, total) ->
+          String.equal asset "CONTRACT/USDC"
+          && Float.abs (available -. 80.0) < 1e-6
+          && Float.abs (total -. 100.0) < 1e-6)
+        balances
+  in
+  Alcotest.(check bool)
+    "live spot snapshot served once spot data arrives"
+    true
+    has_contract
 ;;
 
 let () =

@@ -870,7 +870,8 @@ let asset_domain_worker
                    ~testnet:asset_with_fees.testnet
                    ~side:event.side
                    ~value:
-                     (event.remaining_qty *. Option.value event.limit_price ~default:0.0);
+                     (event.remaining_qty *. Option.value event.limit_price ~default:0.0)
+                   ~event_time:event.venue_time;
                  let side =
                    match event.side with
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
@@ -924,7 +925,8 @@ let asset_domain_worker
                    ~fee:
                      (Option.value asset_with_fees.maker_fee ~default:0.001
                       *. event.filled_qty
-                      *. event.avg_price);
+                      *. event.avg_price)
+                   ~event_time:event.venue_time;
                  let side =
                    match event.side with
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy

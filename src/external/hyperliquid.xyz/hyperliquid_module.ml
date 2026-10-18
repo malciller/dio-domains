@@ -395,6 +395,22 @@ module Hyperliquid_impl = struct
       if last > 0.0 then Some (Unix.gettimeofday () -. last) else None
   ;;
 
+  (** Venue time at which the tradeable figure for [asset] last changed, or [None] before
+      the first update. Keyed on spendable wallets to match [get_balance_age_fast]: the
+      store-wide timestamp is also bumped by the ~10s staking poller, which cannot move
+      the tradeable figure. A caller comparing this against an event time learns whether
+      the venue has processed that fill or cancel, without reading a clock. *)
+  let get_balance_updated_at ~asset =
+    let store = Hyperliquid_balances.get_balance_store asset in
+    let spendable = Hyperliquid_balances.BalanceStore.get_spendable_last_updated store in
+    let last =
+      if spendable > 0.0
+      then spendable
+      else Hyperliquid_balances.BalanceStore.get_last_updated store
+    in
+    if last > 0.0 then Some last else None
+  ;;
+
   let get_total_balance ~asset = Hyperliquid_balances.get_total_balance asset
   let get_staked_balance ~asset = Hyperliquid_balances.get_staked_balance asset
 
@@ -528,6 +544,7 @@ module Hyperliquid_impl = struct
             ; filled_qty = e.cum_qty
             ; avg_price = e.avg_price
             ; timestamp = e.timestamp
+            ; venue_time = e.venue_time
             ; is_amended = e.exec_type = Hyperliquid_executions_feed.Amended
             ; cl_ord_id = e.cl_ord_id
             })
@@ -552,6 +569,7 @@ module Hyperliquid_impl = struct
              ; filled_qty = e.cum_qty
              ; avg_price = e.avg_price
              ; timestamp = e.timestamp
+             ; venue_time = e.venue_time
              ; is_amended = e.exec_type = Hyperliquid_executions_feed.Amended
              ; cl_ord_id = e.cl_ord_id
              })

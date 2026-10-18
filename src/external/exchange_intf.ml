@@ -125,6 +125,15 @@ module Types = struct
     ; filled_qty : float (** Cumulative filled quantity. *)
     ; avg_price : float (** Volume-weighted average fill price. *)
     ; timestamp : float (** Unix timestamp of the execution report. *)
+    ; venue_time : float
+    (** The venue's own time for this execution report, or 0.0 when the feed knows only
+        its own arrival time.
+
+        The capital oracle compares this against the time its balance figure last moved,
+        to decide whether the venue has already incorporated that fill or cancel. An
+        arrival timestamp cannot answer that question - it is always later than the
+        balance update it would be compared against - so feeds that cannot source a venue
+        time MUST report 0.0 here rather than substitute a local clock. *)
     ; is_amended : bool
     (** True when this event is an in-place amendment confirmation (Kraken
         exec_type=amended), not a genuine new-order acknowledgment. Domain workers must
@@ -277,6 +286,14 @@ module type HOT_READS = sig
 
   (** O(1) lock-free closure for balance-snapshot age. *)
   val get_balance_age_fast : asset:string -> unit -> float option
+
+  (** O(1) lock-free absolute venue time at which the cached tradeable figure for [asset]
+      last changed, or [None] when the venue does not track it. Covers every input to that
+      figure - including holds sourced from the open-orders feed on hold-netted venues -
+      so a caller can tell whether the venue has incorporated a specific fill or cancel by
+      comparing it against the time the event was recorded. Unlike {!get_balance_age_fast}
+      it is a timestamp, not an age, so the comparison needs no clock read. *)
+  val get_balance_updated_at : asset:string -> float option
 
   (** O(1) atomic open-orders generation ([-1] = treat as always-changed). *)
   val get_open_orders_generation : symbol:string -> int
@@ -672,15 +689,14 @@ module Oracle = struct
     val init_instruments : testnet:bool -> symbols:string list -> unit Lwt.t
 
     (** One-shot snapshot from the venue's LIVE websocket-fed balance store as (asset,
-        available, total) triples, or [None] when the venue has no live store or its store
-        semantics do not match the oracle's REST balance view. The oracle runtime prefers
-        this (in-process websocket data, no standalone HTTP round-trip) and falls back to
-        [fetch_balances] on [None].
+        available, total) triples, or [None] when the venue has no live store yet, holds
+        no data, or its store semantics do not match the oracle's REST balance view. The
+        oracle runtime prefers this (in-process websocket data, no standalone HTTP
+        round-trip) and falls back to [fetch_balances] on [None].
 
-        Hyperliquid deliberately returns [None]: its live "USDC" store aggregates perp
-        clearinghouse USDC with the spot wallet, while the oracle pool counts spot capital
-        only (perp margin is not grid capital). REST spotClearinghouseState stays
-        authoritative there. *)
+        Hyperliquid returns its spot wallet only (["spot/account"]): perp clearinghouse
+        margin is a separate wallet the balance store already excludes and is not grid
+        capital. [None] until the first [spotState] frame lands. *)
     val live_balances : unit -> (string * float * float) list option
 
     (** Default quote asset for symbols written without an explicit quote (e.g. "BTC" ->

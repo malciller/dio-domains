@@ -180,6 +180,36 @@ let has_balance_data asset =
   Atomic.get store.last_updated > 0.0
 ;;
 
+(** Spot-only [(asset, available, total)] triples for the capital oracle: for each asset,
+    the ["spot/account"] wallet exactly as the venue reports it
+    ([available = total - hold]). This is the live equivalent of the REST
+    [spotClearinghouseState] view the oracle previously had to poll — spot capital only,
+    with perp margin confined to a separate ["perp/account"] wallet that
+    {!BalanceStore.is_excluded_wallet} keeps out of the tradeable figure.
+
+    Empty until [spotState] has delivered its first snapshot. Callers must treat [] as "no
+    live data yet" and fall back, never as a zero balance: a fabricated zero here reads as
+    no capital and halts the buy leg. *)
+let spot_balances () : (string * float * float) list =
+  Mutex.lock balance_stores_mutex;
+  let assets = Hashtbl.fold (fun asset _ acc -> asset :: acc) balance_stores [] in
+  Mutex.unlock balance_stores_mutex;
+  List.filter_map
+    (fun asset ->
+      let store = get_balance_store asset in
+      Mutex.lock store.mutex;
+      let spot : (float * float) option =
+        Hashtbl.fold
+          (fun _ (w : BalanceStore.wallet_balance) acc ->
+            if String.equal w.wallet_type "spot" then Some (w.balance, w.total) else acc)
+          store.wallets
+          None
+      in
+      Mutex.unlock store.mutex;
+      Option.map (fun (available, total) -> asset, available, total) spot)
+    assets
+;;
+
 let wait_until_ready () =
   if Atomic.get is_ready
   then Lwt.return_true

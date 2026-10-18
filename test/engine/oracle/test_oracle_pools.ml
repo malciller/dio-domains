@@ -136,6 +136,37 @@ let test_cascade_impossible_gives_up () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* held_for_reservation *)
+(* ------------------------------------------------------------------ *)
+
+let test_reservation_no_hold_without_reservation () =
+  Alcotest.(check bool)
+    "no reservation holds nobody"
+    (Dio_oracle.Oracle_pools.held_for_reservation ~reserved_priority:None ~priority:3)
+    false
+;;
+
+let test_reservation_holds_strictly_lower_priority () =
+  (* Senior at position 1: it and everything above it run; everything below is held. *)
+  let held p =
+    Dio_oracle.Oracle_pools.held_for_reservation ~reserved_priority:(Some 1) ~priority:p
+  in
+  Alcotest.(check bool) "senior itself not held" (held 1) false;
+  Alcotest.(check bool) "higher priority not held" (held 0) false;
+  Alcotest.(check bool) "immediate junior held" (held 2) true;
+  Alcotest.(check bool) "deep junior held" (held 9) true
+;;
+
+let test_reservation_highest_senior_holds_all_juniors () =
+  let held p =
+    Dio_oracle.Oracle_pools.held_for_reservation ~reserved_priority:(Some 0) ~priority:p
+  in
+  Alcotest.(check bool) "the senior itself is never held" (held 0) false;
+  Alcotest.(check bool) "every junior is held" (held 1) true;
+  Alcotest.(check bool) "every junior is held (2)" (held 2) true
+;;
+
+(* ------------------------------------------------------------------ *)
 (* sell_qty_of *)
 (* ------------------------------------------------------------------ *)
 
@@ -247,6 +278,20 @@ let () =
         ; Alcotest.test_case "single cancel" `Quick test_cascade_single_cancel
         ; Alcotest.test_case "many lesser orders" `Quick test_cascade_many_lesser_orders
         ; Alcotest.test_case "impossible gives up" `Quick test_cascade_impossible_gives_up
+        ] )
+    ; ( "reservation hold"
+      , [ Alcotest.test_case
+            "no reservation holds nobody"
+            `Quick
+            test_reservation_no_hold_without_reservation
+        ; Alcotest.test_case
+            "holds strictly lower priority"
+            `Quick
+            test_reservation_holds_strictly_lower_priority
+        ; Alcotest.test_case
+            "highest senior holds all juniors"
+            `Quick
+            test_reservation_highest_senior_holds_all_juniors
         ] )
     ; "sell qty", [ Alcotest.test_case "pool arithmetic" `Quick test_sell_qty ]
     ; ( "drawdown sim"

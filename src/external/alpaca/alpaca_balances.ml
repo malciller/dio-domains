@@ -31,6 +31,14 @@ let get_balance_age () =
   if lu > 0.0 then Some (Unix.gettimeofday () -. lu) else None
 ;;
 
+(** Venue time of the last successful poll, or [None] before the first. One poll publishes
+    balances, available quantities, and positions together, so this single timestamp
+    covers every input to the tradeable figure. *)
+let get_balance_updated_at () =
+  let lu = Atomic.get last_update in
+  if lu > 0.0 then Some lu else None
+;;
+
 let get_balance asset =
   let t = Atomic.get balances in
   let key = if asset = "USDC" then "USD" else asset in
