@@ -96,8 +96,8 @@ let spot_meta_fetched_at : float ref = ref 0.0
 let spot_meta_mutex = Mutex.create ()
 let spot_meta_ttl = 6.0 *. 3600.0
 
-(* Symbols already reported as having no spot pair, to avoid re-logging the same warning on
-   every oracle pass. Membership is tested and updated without a lock while the oracle
+(* Symbols already reported as having no spot pair, to avoid re-logging the same warning
+   on every oracle pass. Membership is tested and updated without a lock while the oracle
    refresh runs, so it is copy-on-write. The keyspace is the configured symbol set, so the
    map stays small. *)
 let warned_no_spot_history : (string, unit) Ds.Cow_table.t =
@@ -470,10 +470,22 @@ let fetch_balances ~testnet : ((string * float * float) list, string) result Lwt
      | Ok spot_json -> parse_spot_balances spot_json)
 ;;
 
-(** Always [None]: the WS-fed "USDC" store aggregates perp clearinghouse USDC with the
-    spot wallet, whereas the oracle pool is spot-only. REST spotClearinghouseState remains
-    authoritative; the runtime falls back to [fetch_balances]. *)
-let live_balances () : (string * float * float) list option = None
+(** Live spot balances from the WebSocket-fed store: per asset, the ["spot/account"]
+    wallet's [(available, total)] — the same spot-only, hold-netted view REST
+    [spotClearinghouseState] returns, but in-process and kept current by [spotState]
+    pushes. Perp margin lives in a separate ["perp/account"] wallet that the store
+    excludes from its tradeable figure, so it cannot leak into the spot pool.
+
+    [None] while the store holds no spot wallet yet (cold start, before the first
+    [spotState] frame), so the runtime falls back to REST rather than sizing against a
+    fabricated zero. Once populated this is authoritative and no HTTP round-trip is made,
+    which also removes the dependency on the REST balance cache that could pin the pool to
+    a startup snapshot. *)
+let live_balances () : (string * float * float) list option =
+  match Hyperliquid_balances.spot_balances () with
+  | [] -> None
+  | balances -> Some balances
+;;
 
 let default_quote = "USDC"
 

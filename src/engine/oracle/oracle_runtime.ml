@@ -501,35 +501,75 @@ type pool_event =
   ; pe_delta_base : float
   ; pe_base_asset : string
   ; pe_cause : string
-  ; pe_baseline : int (** Balance epoch the delta was measured against. *)
+  ; pe_quote_updated_at : float
+  (** The account's tradeable-figure timestamp for its quote asset at the moment the event
+      was recorded (0.0 = the venue cannot report one). *)
+  ; pe_event_time : float
+  (** The venue's own time for the execution report (0.0 = the feed could only stamp its
+      own arrival, which cannot prove the figure has incorporated the event). *)
   }
 
 let event_mutex = Mutex.create ()
 let event_queue_cap = 16_384
+
+(** Per-account cap on unconfirmed deltas. Retirement now requires venue evidence - the
+    figure moving to or past the event time - so an account whose venue reports neither
+    side would otherwise accumulate deltas for the life of the process. Such deltas can
+    never be resolved either way, and the oldest are dropped, mirroring [event_queue_cap]. *)
+let pending_per_account_cap = 256
+
 let event_queue : pool_event Queue.t = Queue.create ()
 let pending_pool_adjustments : (string, pool_event list) Hashtbl.t = Hashtbl.create 8
-let balance_epoch : int Atomic.t = Atomic.make 0
+
+(** Venue time at which [exchange]'s tradeable figure for [asset] last moved, or 0.0 when
+    the venue does not track it. Covers every input to that figure, holds included, so
+    comparing it against an event's recorded value answers "has the venue incorporated
+    this fill or cancel?". Lock-free atomic reads only; no clock. *)
+let tradeable_updated_at ~(exchange : string) ~(asset : string) : float =
+  match Exchange.Registry.get exchange with
+  | None -> 0.0
+  | Some (module Ex) -> Option.value (Ex.get_balance_updated_at ~asset) ~default:0.0
+;;
 
 let account_key_of ~(exchange : string) ~(testnet : bool) ~(quote : string) : string =
   Printf.sprintf "%s|%s|%s" exchange (string_of_bool testnet) quote
 ;;
 
-let enqueue_pool_event account ~delta_quote ~delta_base ~base_asset cause =
-  Mutex.lock event_mutex;
-  if Queue.length event_queue >= event_queue_cap
-  then (
-    Logging.warn_f ~section "pool event queue full; dropping oldest events";
-    Queue.clear event_queue);
-  Queue.push
-    { pe_account = account
-    ; pe_delta_quote = delta_quote
-    ; pe_delta_base = delta_base
-    ; pe_base_asset = base_asset
-    ; pe_cause = cause
-    ; pe_baseline = Atomic.get balance_epoch
-    }
-    event_queue;
-  Mutex.unlock event_mutex
+(** [true] when the venue's figure has already moved to or past the event at the moment we
+    are about to record it, so the snapshot the oracle reads already includes the fill or
+    cancel and no delta should be queued at all. *)
+let already_incorporated ~(event_time : float) ~(quote_updated_at : float) =
+  event_time > 0.0 && quote_updated_at >= event_time
+;;
+
+let enqueue_pool_event
+  account
+  ~delta_quote
+  ~delta_base
+  ~base_asset
+  ~quote_updated_at
+  ~event_time
+  cause
+  =
+  if already_incorporated ~event_time ~quote_updated_at
+  then ()
+  else (
+    Mutex.lock event_mutex;
+    if Queue.length event_queue >= event_queue_cap
+    then (
+      Logging.warn_f ~section "pool event queue full; dropping oldest events";
+      Queue.clear event_queue);
+    Queue.push
+      { pe_account = account
+      ; pe_delta_quote = delta_quote
+      ; pe_delta_base = delta_base
+      ; pe_base_asset = base_asset
+      ; pe_cause = cause
+      ; pe_quote_updated_at = quote_updated_at
+      ; pe_event_time = event_time
+      }
+      event_queue;
+    Mutex.unlock event_mutex)
 ;;
 
 (** Moves queued events into the per-account pending adjustment table. Called at the top
@@ -544,7 +584,13 @@ let drain_pool_events () =
       let l =
         Hashtbl.find_opt pending_pool_adjustments e.pe_account |> Option.value ~default:[]
       in
-      Hashtbl.replace pending_pool_adjustments e.pe_account (e :: l))
+      let l = e :: l in
+      Hashtbl.replace
+        pending_pool_adjustments
+        e.pe_account
+        (if List.length l > pending_per_account_cap
+         then List.filteri (fun i _ -> i < pending_per_account_cap) l
+         else l))
     (List.rev events)
 ;;
 
@@ -560,6 +606,7 @@ let notify_fill
   ~(filled_qty : float)
   ~(avg_price : float)
   ~(fee : float)
+  ~(event_time : float)
   =
   let base, quote = split_symbol symbol in
   let value = filled_qty *. avg_price in
@@ -573,6 +620,8 @@ let notify_fill
     ~delta_quote:dq
     ~delta_base:db
     ~base_asset:base
+    ~quote_updated_at:(tradeable_updated_at ~exchange ~asset:quote)
+    ~event_time
     "fill";
   request_pass ()
 ;;
@@ -586,6 +635,7 @@ let notify_order_cancel
   ~(testnet : bool)
   ~(side : Exchange.Types.order_side)
   ~(value : float)
+  ~(event_time : float)
   =
   let base, quote = split_symbol symbol in
   if side = Exchange.Types.Buy
@@ -595,32 +645,57 @@ let notify_order_cancel
       ~delta_quote:(Float.max 0.0 value)
       ~delta_base:0.0
       ~base_asset:base
+      ~quote_updated_at:(tradeable_updated_at ~exchange ~asset:quote)
+      ~event_time
       "order_cancel";
   request_pass ()
 ;;
 
-(** Pending quote/base deltas valid for [epoch]: measured at the current balance epoch (a
-    fresher authoritative snapshot already includes them - older deltas are dropped, never
-    double-counted). *)
-let pending_deltas account epoch =
+(** A delta is redundant once the venue's tradeable figure for the account's quote asset
+    has moved to or past the venue's own time for the event: the figure then demonstrably
+    incorporates the fill or cancel.
+
+    [pe_event_time] is the venue's execution time (0.0 when the feed could only stamp its
+    own arrival, which cannot prove anything and is therefore never substituted).
+    Comparing the figure's timestamp against it - rather than against the value the figure
+    had when we recorded the event - is what closes the feed-ordering race: when the
+    balance feed delivers first, the figure has already moved past the event, so the delta
+    is dropped instead of being layered on top of a snapshot that already contains it.
+
+    Both sides are venue-reported absolute times compared against each other, so this
+    needs no clock read. With no venue time (0.0) we fall back to "has the figure moved
+    since we recorded the event", the best available signal there. *)
+let confirmed (e : pool_event) ~(quote_updated_at : float) =
+  if e.pe_event_time > 0.0
+  then quote_updated_at >= e.pe_event_time
+  else e.pe_quote_updated_at > 0.0 && quote_updated_at > e.pe_quote_updated_at
+;;
+
+(** Pending quote deltas to overlay on the account's snapshot, plus the per-event list for
+    callers that also need base deltas. Confirmed deltas are dropped in passing. *)
+let pending_deltas account ~(quote_updated_at : float) =
   match Hashtbl.find_opt pending_pool_adjustments account with
   | None -> 0.0, []
   | Some events ->
     let kept, dq =
       List.fold_left
         (fun (kept, dq) (e : pool_event) ->
-          if e.pe_baseline = epoch then e :: kept, dq +. e.pe_delta_quote else kept, dq)
+          if confirmed e ~quote_updated_at
+          then kept, dq
+          else e :: kept, dq +. e.pe_delta_quote)
         ([], 0.0)
         events
     in
     dq, kept
 ;;
 
-let prune_pending account epoch =
+let prune_pending account ~(quote_updated_at : float) =
   match Hashtbl.find_opt pending_pool_adjustments account with
   | None -> ()
   | Some events ->
-    let kept = List.filter (fun (e : pool_event) -> e.pe_baseline = epoch) events in
+    let kept =
+      List.filter (fun (e : pool_event) -> not (confirmed e ~quote_updated_at)) events
+    in
     if kept = []
     then Hashtbl.remove pending_pool_adjustments account
     else Hashtbl.replace pending_pool_adjustments account kept
@@ -678,7 +753,6 @@ let group_by_account (tasks : Oracle_tasks.task list)
     the initial pass. *)
 type pool_state =
   { snap : Oracle_balances.snapshot
-  ; ps_epoch : int
   ; fetched_at : float
   }
 
@@ -697,14 +771,10 @@ let refresh_balance_of_task (task : Oracle_tasks.task) : unit Lwt.t =
       | Error error ->
         Logging.warn_f ~section "balance refresh failed for %s: %s" id error
       | Ok snapshot ->
-        Atomic.incr balance_epoch;
         Hashtbl.replace
           pool_cache
           id
-          { snap = snapshot
-          ; ps_epoch = Atomic.get balance_epoch
-          ; fetched_at = Unix.gettimeofday ()
-          })
+          { snap = snapshot; fetched_at = Unix.gettimeofday () })
     (fun exn ->
       Logging.warn_f
         ~section
@@ -715,32 +785,32 @@ let refresh_balance_of_task (task : Oracle_tasks.task) : unit Lwt.t =
 ;;
 
 (** Per-account balance view for one pass: live-store snapshot when present, else the
-    cached snapshot, plus the epoch its in-process deltas were measured against. Built
-    once per account rather than 2-4 times per asset (each rebuild is O(balances x
-    symbols)). *)
+    cached snapshot, plus the venue time the account's quote-asset tradeable figure last
+    moved - the reference a pending delta is judged redundant against. Built once per
+    account rather than 2-4 times per asset (each rebuild is O(balances x symbols)). *)
 type account_snapshot =
   { acs_snap : Oracle_balances.snapshot
-  ; acs_epoch : int
+  ; acs_quote_updated_at : float
   }
 
 let account_snapshot_of (a : account) : account_snapshot option =
   let id = account_id a in
+  let quote_updated_at = tradeable_updated_at ~exchange:a.a_exchange ~asset:a.a_quote in
+  let acs_of snap = { acs_snap = snap; acs_quote_updated_at = quote_updated_at } in
   match
     Oracle_balances.snapshot_of_live_store ~exchange:a.a_exchange ~testnet:a.a_testnet ()
   with
-  | Some snap -> Some { acs_snap = snap; acs_epoch = Atomic.get balance_epoch }
-  | None ->
-    Option.map
-      (fun p -> { acs_snap = p.snap; acs_epoch = p.ps_epoch })
-      (Hashtbl.find_opt pool_cache id)
+  | Some snap -> Some (acs_of snap)
+  | None -> Option.map (fun p -> acs_of p.snap) (Hashtbl.find_opt pool_cache id)
 ;;
 
 (** Available quote within a hoisted snapshot: live/cached balance plus the in-process
-    pending deltas measured at the snapshot's epoch. Zero network. *)
+    pending deltas the venue has not yet incorporated. Zero network, zero clock. *)
 let available_quote_in (a : account) (acs : account_snapshot) : float =
   let id = account_id a in
-  let dq, pending = pending_deltas id acs.acs_epoch in
-  if pending <> [] then prune_pending id acs.acs_epoch;
+  let quote_updated_at = acs.acs_quote_updated_at in
+  let dq, pending = pending_deltas id ~quote_updated_at in
+  if pending <> [] then prune_pending id ~quote_updated_at;
   Float.max 0.0 (Oracle_balances.available_quote acs.acs_snap ~quote:a.a_quote +. dq)
 ;;
 
@@ -749,8 +819,9 @@ let available_quote_in (a : account) (acs : account_snapshot) : float =
     Resting sells are subtracted separately. *)
 let available_base_in (a : account) ~(symbol : string) (acs : account_snapshot) : float =
   let id = account_id a in
+  let quote_updated_at = acs.acs_quote_updated_at in
   let base, _ = split_symbol symbol in
-  let _, pending = pending_deltas id acs.acs_epoch in
+  let _, pending = pending_deltas id ~quote_updated_at in
   let db =
     List.fold_left
       (fun acc (e : pool_event) ->
@@ -758,7 +829,7 @@ let available_base_in (a : account) ~(symbol : string) (acs : account_snapshot) 
       0.0
       pending
   in
-  if pending <> [] then prune_pending id acs.acs_epoch;
+  if pending <> [] then prune_pending id ~quote_updated_at;
   Float.max 0.0 (Oracle_balances.available_asset acs.acs_snap ~asset:base +. db)
 ;;
 
@@ -802,7 +873,43 @@ let string_of_branch = function
     minimum set of lower-priority resting buys for cancellation; the freed quote is
     reserved for it and lower-priority strategies are held inactive until the cancels land
     and the cancel event wakes the next pass to fund it. Resting buys are already
-    committed, so they do not consume free quote. *)
+    committed, so they do not consume free quote.
+
+    Once a cascade is issued for a senior, a per-account reservation is kept across passes
+    (see [reclaim_reservations]) so every strictly-lower-priority strategy stays held
+    inactive until the senior is actually funded - not merely for the one pass that issued
+    the cancel. Without it the store/pool window (order gone from the exec feed before the
+    balance feed grows) let a junior re-fund from the quote being freed, restarting the
+    cascade. *)
+
+(* ------------------------------------------------------------------ *)
+(* Priority reclaim reservations *)
+(* ------------------------------------------------------------------ *)
+
+(** Wall-clock lifetime of a reclaim reservation. Between a cascade being issued and the
+    freed quote appearing in the account pool there is a window: the venue cancels the
+    order (the exec feed drops it from the order store) before the balance feed reflects
+    the released quote. During that window the senior strategy has no resting buy left to
+    point the cascade at (its claim list reads empty), so it cannot re-flag, while a
+    lower-priority strategy would otherwise be funded from the very quote being freed -
+    producing a cancel/replace cascade that only resolves when the balance eventually
+    catches up. The reservation holds every lower-priority strategy inactive across passes
+    until the senior is funded, bounded by this timeout as a backstop against a cancel
+    that never lands. *)
+let reclaim_reservation_ttl = 120.0
+
+(** A senior strategy's standing claim on capital being released by a lower-priority
+    cancel. *)
+type reclaim_reservation =
+  { rr_senior : string (** [key_of_task] of the senior awaiting the freed quote. *)
+  ; rr_reserved : float (** Quote reserved for it (its next buy's need). *)
+  ; rr_issued_at : float (** Unix time the cascade was issued. *)
+  }
+
+(** Per-account reservation, keyed by [account_id]. Written and read only on the pass
+    loop. *)
+let reclaim_reservations : (string, reclaim_reservation) Hashtbl.t = Hashtbl.create 8
+
 let run_account_pass
   ~(config : runtime_config)
   ~(account : account)
@@ -826,6 +933,20 @@ let run_account_pass
          (decisions ()))
   | Some acs ->
     let pool = available_quote_in account acs in
+    let acct_id = account_id account in
+    let now = Unix.gettimeofday () in
+    (* Drop a stale reservation (a cancel that never landed within its TTL) so
+       lower-priority strategies are not held indefinitely, then read the live one for
+       this account. See [reclaim_reservations]. *)
+    let reservation =
+      match Hashtbl.find_opt reclaim_reservations acct_id with
+      | Some r when now -. r.rr_issued_at <= reclaim_reservation_ttl -> Some r
+      | Some _ ->
+        Hashtbl.remove reclaim_reservations acct_id;
+        None
+      | None -> None
+    in
+    let reserved_senior = Option.map (fun r -> r.rr_senior) reservation in
     (* Open-order summaries and config bounds are invariant across the pass, so resolve
        them once here instead of 2-3x in the sizing loop. *)
     let task_rows =
@@ -855,6 +976,27 @@ let run_account_pass
     let total_venue_quote = pool +. committed_venue_buys in
     let key_of_task (t : Oracle_tasks.task) =
       Printf.sprintf "%s|%s" t.exchange t.symbol
+    in
+    (* Account-local priority by key (config presentation order), matching the walk order
+       the reclaim logic uses. *)
+    let priority_of_key : (string, int) Hashtbl.t = Hashtbl.create 8 in
+    List.iteri
+      (fun i ((t : Oracle_tasks.task), _, _, _, _) ->
+        Hashtbl.replace priority_of_key (key_of_task t) i)
+      task_rows;
+    (* Standing reservation for a senior whose cancelled quote is draining: every strategy
+       of strictly lower priority is held until it funds. Dropped when the senior is no
+       longer among this account's tasks. *)
+    let reserved_priority =
+      ref
+        (match reserved_senior with
+         | Some k ->
+           (match Hashtbl.find_opt priority_of_key k with
+            | Some p -> Some p
+            | None ->
+              Hashtbl.remove reclaim_reservations acct_id;
+              None)
+         | None -> None)
     in
     (* Per-strategy reclaim candidates: the lower-priority (later config position)
        strategies holding resting buys, precomputed once. The cascade draws only from
@@ -1006,8 +1148,25 @@ let run_account_pass
               let survival_active =
                 o.resolution.d_surv >= min_active_dsurv || resting_buy
               in
+              let is_reserved_senior =
+                match reserved_senior with
+                | Some k -> String.equal k key
+                | None -> false
+              in
+              let priority = Hashtbl.find priority_of_key key in
               let d =
-                if List.mem key !flagged
+                if Oracle_pools.held_for_reservation
+                     ~reserved_priority:!reserved_priority
+                     ~priority
+                then
+                  (* The reserved senior's cascade is draining and this strategy ranks
+                     below it. Hold it inactive so it cannot re-place from the very quote
+                     being freed (see [Oracle_pools.held_for_reservation]). *)
+                  { d with
+                    active = false
+                  ; reason = "capital reserved for higher-priority strategy"
+                  }
+                else if List.mem key !flagged
                 then
                   { d with
                     active = false
@@ -1020,6 +1179,19 @@ let run_account_pass
                      only fresh active placements consume free quote. *)
                   if (not resting_buy) && need <= !remaining +. 1e-9
                   then remaining := !remaining -. need;
+                  (* The reserved senior just funded: the reclaim completed, release the
+                     cross-pass hold so lower-priority strategies resume normally. *)
+                  if is_reserved_senior
+                  then (
+                    Hashtbl.remove reclaim_reservations acct_id;
+                    reserved_priority := None;
+                    Logging.info_f
+                      ~section
+                      "reclaim reservation cleared for %s/%s: %s funded ($%.2f reserved)"
+                      t.exchange
+                      t.symbol
+                      key
+                      (Option.fold ~none:0.0 ~some:(fun r -> r.rr_reserved) reservation));
                   d)
                 else if survival_active && not !reclaim_active
                 then (
@@ -1040,6 +1212,17 @@ let run_account_pass
                     reclaim_active := true;
                     flagged := List.rev_append plan !flagged;
                     remaining := 0.0;
+                    (* Reserve the freed quote for this senior across passes. The cancel
+                       lands on the exec feed before the balance feed reflects the
+                       released quote; in that window the senior has no resting buy left
+                       to point the cascade at, while lower-priority strategies could
+                       re-fund from the same quote. The reservation holds them until the
+                       senior funds (or the TTL backstop expires). *)
+                    Hashtbl.replace
+                      reclaim_reservations
+                      acct_id
+                      { rr_senior = key; rr_reserved = need; rr_issued_at = now };
+                    reserved_priority := Some priority;
                     Logging.info_f
                       ~section
                       "cancellation cascade for %s/%s (need $%.2f vs $%.2f available): \
@@ -1053,8 +1236,20 @@ let run_account_pass
                       active = false
                     ; reason = "awaiting reactivation: quote does not cover buy"
                     })
-                  else d)
-                else d
+                  else
+                    (* No fresh claim to cancel - typically the freed order already left
+                       the store while the pool has not yet grown. The standing
+                       reservation keeps every lower-priority strategy held across the
+                       next passes so the released quote is not handed back to them. *)
+                    d)
+                else (
+                  (* Inactive and no longer survival-eligible: any standing reservation
+                     for this strategy is moot. *)
+                  if is_reserved_senior && not survival_active
+                  then (
+                    Hashtbl.remove reclaim_reservations acct_id;
+                    reserved_priority := None);
+                  d)
               in
               record_asset_latency t.symbol (span_from t_asset) (fun () ->
                 if d.active then "active" else "inactive");

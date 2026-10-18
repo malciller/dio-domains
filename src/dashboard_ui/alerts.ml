@@ -5,9 +5,13 @@ open Theme
     of the dashboard until the user acknowledges them.
 
     Batching is what keeps this from spamming: identical lines (same severity/section/
-    message) collapse into one row with a `×N` counter, and the row count is bounded, so a
-    storm of the same error is one line, not thousands. The severity that triggers the
-    popup is configurable via the top-level `alert_level` config key. *)
+    message) collapse into one row with a `x N` counter, and the row count is bounded, so
+    a storm of the same error is one line, not thousands. The severity that triggers the
+    popup is configurable via the top-level `alert_level` config key.
+
+    The modal is deliberately loud: a red double-line frame, a filled title bar, a
+    blinking acknowledge hint, and (via {!App}) a dimmed background behind it, so it
+    cannot be mistaken for part of the dashboard. *)
 
 (** Which severities raise the popup. Default [Warn] (WARN and above). *)
 type threshold =
@@ -134,20 +138,25 @@ type row =
 let render_modal ~target_w ~target_h (entries : entry list) =
   let t = Theme.current () in
   let n = List.length entries in
-  let modal_w = max 46 (min (target_w - 6) 96) in
-  let modal_w = min modal_w (max 12 target_w) in
-  let inner_w = max 8 (modal_w - 4) in
+  let modal_w = max 48 (min (target_w - 6) 100) in
+  let modal_w = min modal_w (max 16 target_w) in
+  let inner_w = max 10 (modal_w - 2) in
   let level_w = 9 in
   let section_w = 13 in
-  let msg_w = max 8 (inner_w - level_w - section_w - 2) in
-  let title_str = Printf.sprintf " ╭── ⚠  ALERTS (%d) " n in
-  let title_img = I.string A.(fg t.c_red ++ bg t.c_panel ++ st bold) title_str in
-  let fill_top = max 0 (modal_w - I.width title_img - 1) in
+  (* Inner content layout: " " + level + " " + section + " " + message. *)
+  let msg_w = max 8 (inner_w - level_w - section_w - 3) in
+  let a_frame = A.(fg t.c_red ++ bg t.c_panel) in
+  let a_panel = A.(bg t.c_panel) in
+  (* Title bar: black on red, filled to the inner width. *)
+  let title_str = Printf.sprintf " ⚠  ALERTS (%d) " n in
+  let title_img = I.string A.(fg black ++ bg t.c_red ++ st bold) title_str in
+  let title_pad = max 0 (inner_w - I.width title_img) in
   let top_row =
     I.hcat
-      [ title_img
-      ; I.string A.(fg t.c_border ++ bg t.c_panel) (repeat_str "─" fill_top)
-      ; I.string A.(fg t.c_border ++ bg t.c_panel) "╮"
+      [ I.string a_frame "╔"
+      ; title_img
+      ; I.string A.(bg t.c_red) (String.make title_pad ' ')
+      ; I.string a_frame "╗"
       ]
   in
   let rows =
@@ -169,16 +178,23 @@ let render_modal ~target_w ~target_h (entries : entry list) =
           segs)
       entries
   in
-  let max_body = max 3 (target_h - 7) in
+  let max_body = max 3 (target_h - 8) in
   let shown =
     if List.length rows <= max_body
     then rows
     else List.filteri (fun i _ -> i < max_body) rows
   in
   let overflow = List.length rows - List.length shown in
+  let wrap_inner (inner : I.t) =
+    let pad = max 0 (inner_w - I.width inner) in
+    I.hcat
+      [ I.string a_frame "║"
+      ; inner
+      ; I.string a_panel (String.make pad ' ')
+      ; I.string a_frame "║"
+      ]
+  in
   let body_row (r : row) =
-    let row_bg = t.c_panel in
-    let a_b = A.(fg t.c_border ++ bg row_bg) in
     let cols =
       if r.r_first
       then (
@@ -187,58 +203,49 @@ let render_modal ~target_w ~target_h (entries : entry list) =
         in
         I.hcat
           [ I.string
-              A.(fg (level_color t r.r_level) ++ bg row_bg ++ st bold)
+              A.(fg (level_color t r.r_level) ++ bg t.c_panel ++ st bold)
               (pad_right level_w (truncate_string level_w lvl))
-          ; I.string a_b " "
+          ; I.string a_panel " "
           ; I.string
-              A.(fg t.c_bright ++ bg row_bg)
+              A.(fg t.c_bright ++ bg t.c_panel)
               (pad_right section_w (truncate_string section_w r.r_section))
-          ; I.string a_b " "
+          ; I.string a_panel " "
           ])
-      else I.string a_b (String.make (level_w + section_w + 2) ' ')
+      else I.string a_panel (String.make (level_w + section_w + 2) ' ')
     in
-    let content =
-      I.hcat [ I.string a_b " │ "; cols; I.string A.(t.a_text ++ bg row_bg) r.r_text ]
-    in
-    let pad = max 0 (modal_w - 3 - I.width content) in
-    I.hcat [ content; I.string A.(bg row_bg) (String.make pad ' '); I.string a_b "│" ]
+    wrap_inner
+      (I.hcat
+         [ I.string a_panel " "; cols; I.string A.(t.a_text ++ bg t.c_panel) r.r_text ])
   in
   let body_rows = List.map body_row shown in
   let overflow_row =
     if overflow > 0
-    then (
-      let s = Printf.sprintf "  … +%d more (acknowledge to clear)" overflow in
-      [ I.hcat
-          [ I.string A.(fg t.c_border ++ bg t.c_panel) " │ "
-          ; I.string A.(t.a_dim ++ bg t.c_panel) (pad_right inner_w s)
-          ; I.string A.(fg t.c_border ++ bg t.c_panel) "│"
-          ]
-      ])
+    then
+      [ wrap_inner
+          (I.string
+             A.(t.a_dim ++ bg t.c_panel)
+             ("  … +" ^ string_of_int overflow ^ " more (acknowledge to clear)"))
+      ]
     else []
   in
   let div_row =
     I.hcat
-      [ I.string A.(fg t.c_border ++ bg t.c_panel) " ├"
-      ; I.string A.(fg t.c_border ++ bg t.c_panel) (repeat_str "─" (modal_w - 3))
-      ; I.string A.(fg t.c_border ++ bg t.c_panel) "┤"
+      [ I.string a_frame "╟"
+      ; I.string a_frame (repeat_str "─" inner_w)
+      ; I.string a_frame "╢"
       ]
   in
-  let hint_str = "  Enter / Esc : acknowledge" in
-  let hint_img = I.string A.(fg t.c_dim ++ bg t.c_panel) hint_str in
-  let pad_hint = max 0 (inner_w + 1 - I.width hint_img) in
   let hint_row =
-    I.hcat
-      [ I.string A.(fg t.c_border ++ bg t.c_panel) " │ "
-      ; hint_img
-      ; I.string A.(bg t.c_panel) (String.make pad_hint ' ')
-      ; I.string A.(fg t.c_border ++ bg t.c_panel) "│"
-      ]
+    wrap_inner
+      (I.string
+         A.(fg t.c_red ++ bg t.c_panel ++ st bold ++ st blink)
+         "  Enter / Esc : acknowledge")
   in
   let bot_row =
     I.hcat
-      [ I.string A.(fg t.c_border ++ bg t.c_panel) " ╰"
-      ; I.string A.(fg t.c_border ++ bg t.c_panel) (repeat_str "─" (modal_w - 3))
-      ; I.string A.(fg t.c_border ++ bg t.c_panel) "╯"
+      [ I.string a_frame "╚"
+      ; I.string a_frame (repeat_str "═" inner_w)
+      ; I.string a_frame "╝"
       ]
   in
   let modal_content =

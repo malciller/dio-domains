@@ -205,6 +205,48 @@ let test_unchanged_resend_does_not_refresh_freshness () =
     (get_spendable_last_updated store > spot_ts)
 ;;
 
+let test_spot_balances_is_spot_only_and_hold_netted () =
+  (* The oracle's live view must be spot capital only, hold-netted, and must OMIT an asset
+     that has no spot wallet — so a perp-only asset is absent (falls back to REST) rather
+     than reported as a zero balance, which would halt the buy leg. *)
+  let asset = "SPOTVIEW/USDC" in
+  let store = Hyperliquid.Balances.get_balance_store asset in
+  Hyperliquid.Balances.BalanceStore.update_wallet
+    store
+    ~available:80.0
+    ~total:100.0
+    "spot"
+    "account";
+  Hyperliquid.Balances.BalanceStore.update_wallet
+    store
+    ~available:500.0
+    ~total:500.0
+    "perp"
+    "account";
+  let find a =
+    List.find_opt
+      (fun (a', _, _) -> String.equal a' a)
+      (Hyperliquid.Balances.spot_balances ())
+  in
+  (match find asset with
+   | Some (_, available, total) ->
+     Alcotest.(check (float 0.001)) "spot available is total minus hold" 80.0 available;
+     Alcotest.(check (float 0.001)) "spot total is the wallet total" 100.0 total
+   | None -> Alcotest.fail "spot asset missing from spot_balances");
+  let perp_only = "PERPONLY/USDC" in
+  let pstore = Hyperliquid.Balances.get_balance_store perp_only in
+  Hyperliquid.Balances.BalanceStore.update_wallet
+    pstore
+    ~available:500.0
+    ~total:500.0
+    "perp"
+    "account";
+  Alcotest.(check bool)
+    "perp-only asset is absent from the spot view"
+    true
+    (find perp_only = None)
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Balances"
@@ -230,6 +272,10 @@ let () =
             "unchanged whole-account re-send does not refresh another asset"
             `Quick
             test_unchanged_resend_does_not_refresh_freshness
+        ; Alcotest.test_case
+            "spot_balances is spot-only and hold-netted"
+            `Quick
+            test_spot_balances_is_spot_only_and_hold_netted
         ] )
     ]
 ;;

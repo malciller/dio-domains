@@ -158,6 +158,7 @@ let get_open_orders ~symbols () : Kraken_executions_feed.execution_event list Lw
                     ; order_userref = userref_opt
                     ; cl_ord_id = cl_ord_id_opt
                     ; timestamp = Unix.gettimeofday ()
+                    ; venue_time = 0.0
                     }
                 with
                 | e ->

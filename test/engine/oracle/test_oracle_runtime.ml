@@ -135,6 +135,79 @@ let test_default_config_spec_values () =
   Alcotest.(check bool) "no assets by default" (c.assets = []) true
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* Pool deltas retire against venue freshness *)
+(* ------------------------------------------------------------------ *)
+
+let test_pending_delta_retires_when_venue_confirms () =
+  (* A cancel releases quote in process before the venue's tradeable figure reflects it,
+     so the delta bridges that lag. It retires at exactly the point the figure reaches the
+     venue's own time for the event - the figure then demonstrably incorporates the
+     release. Both sides are venue times; neither is a clock read. *)
+  let account = "delta_test|false|USDC" in
+  Dio_oracle.Oracle_runtime.enqueue_pool_event
+    account
+    ~delta_quote:42.0
+    ~delta_base:0.0
+    ~base_asset:"HYPE"
+    ~quote_updated_at:900.0
+    ~event_time:1000.0
+    "order_cancel";
+  Dio_oracle.Oracle_runtime.drain_pool_events ();
+  let dq0, kept0 =
+    Dio_oracle.Oracle_runtime.pending_deltas account ~quote_updated_at:900.0
+  in
+  near "delta applies while the figure predates the event" dq0 42.0;
+  Alcotest.(check int) "one event pending" 1 (List.length kept0);
+  let dq1, kept1 =
+    Dio_oracle.Oracle_runtime.pending_deltas account ~quote_updated_at:1000.0
+  in
+  near "delta retires once the figure reaches the event time" dq1 0.0;
+  Alcotest.(check int) "no events pending" 0 (List.length kept1)
+;;
+
+let test_pending_delta_not_queued_when_already_incorporated () =
+  (* The balance feed delivered first: the figure has already moved past the event, so the
+     snapshot the oracle reads already contains the release. Queueing the delta here is
+     the feed-ordering race, and it would count the release twice. *)
+  let account = "delta_race|false|USDC" in
+  Dio_oracle.Oracle_runtime.enqueue_pool_event
+    account
+    ~delta_quote:42.0
+    ~delta_base:0.0
+    ~base_asset:"HYPE"
+    ~quote_updated_at:1005.0
+    ~event_time:1000.0
+    "order_cancel";
+  Dio_oracle.Oracle_runtime.drain_pool_events ();
+  let dq, kept =
+    Dio_oracle.Oracle_runtime.pending_deltas account ~quote_updated_at:1005.0
+  in
+  near "no delta is queued for an already-incorporated release" dq 0.0;
+  Alcotest.(check int) "nothing pending" 0 (List.length kept)
+;;
+
+let test_pending_delta_kept_when_venue_cannot_confirm () =
+  (* No venue time (0.0) and no figure freshness (0.0): nothing can prove the snapshot
+     incorporates the event, so the delta stays applied rather than being dropped on a
+     guess - these are precisely the venues where the optimistic delta is load-bearing. *)
+  let account = "delta_untracked|false|USDC" in
+  Dio_oracle.Oracle_runtime.enqueue_pool_event
+    account
+    ~delta_quote:7.0
+    ~delta_base:1.5
+    ~base_asset:"HYPE"
+    ~quote_updated_at:0.0
+    ~event_time:0.0
+    "order_cancel";
+  Dio_oracle.Oracle_runtime.drain_pool_events ();
+  let dq, kept =
+    Dio_oracle.Oracle_runtime.pending_deltas account ~quote_updated_at:1_000_000.0
+  in
+  near "an unconfirmable delta is kept, never dropped on a guess" dq 7.0;
+  Alcotest.(check int) "still pending" 1 (List.length kept)
+;;
+
 let () =
   Alcotest.run
     "oracle_runtime"
@@ -145,6 +218,20 @@ let () =
         ] )
     ; "symbols", [ Alcotest.test_case "split base/quote" `Quick test_split_symbol ]
     ; "sell sizing", [ Alcotest.test_case "pool arithmetic" `Quick test_sell_qty_of ]
+    ; ( "pool deltas"
+      , [ Alcotest.test_case
+            "retires when the figure reaches the venue event time"
+            `Quick
+            test_pending_delta_retires_when_venue_confirms
+        ; Alcotest.test_case
+            "not queued when the figure already moved past the event"
+            `Quick
+            test_pending_delta_not_queued_when_already_incorporated
+        ; Alcotest.test_case
+            "kept when the venue cannot confirm"
+            `Quick
+            test_pending_delta_kept_when_venue_cannot_confirm
+        ] )
     ; ( "publish"
       , [ Alcotest.test_case "read APIs stable" `Quick test_publish_and_decision_for
         ; Alcotest.test_case "spec defaults" `Quick test_default_config_spec_values

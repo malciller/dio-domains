@@ -132,6 +132,11 @@ type execution_event =
   ; order_userref : int option
   ; cl_ord_id : string option
   ; timestamp : float
+  ; venue_time : float
+  (** The venue's own time for this event, or 0.0 when the payload carried none and
+      [timestamp] fell back to wall-clock. The capital oracle needs the venue time to
+      judge whether the venue's balance figure has incorporated this event; a wall-clock
+      fallback must never be passed off as one. *)
   }
 
 (** Event bus for publishing individual order updates. *)
@@ -199,16 +204,28 @@ let orders_generation : int Atomic.t = Atomic.make 0
 
 let[@inline] get_orders_generation () = Atomic.get orders_generation
 
+(** Wall clock of the last open-orders snapshot publish (0.0 = none yet). The hold
+    component of a hold-netted venue's tradeable figure moves with this, independently of
+    the balances feed - a cancel releases the hold without touching the balances feed - so
+    tradeable-figure freshness must consider the newer of the two. *)
+let orders_snapshot_at : float Atomic.t = Atomic.make 0.0
+
+let[@inline] get_orders_snapshot_at () = Atomic.get orders_snapshot_at
+
 (* Global order id -> (symbol, side) mapping, bounded and FIFO-evicted. Backing store for
    [Concurrency.Fifo_index]; see that module for why this is FIFO rather than LRU, and why
    queue membership has to be tracked explicitly when callers also retire ids out of band.
    Requires [global_orders_mutex]. *)
 let order_to_symbol =
-  Concurrency.Fifo_index.create ~label:(section ^ "/order_to_symbol")
-    ~cap:Concurrency.Cache_limits.order_index_startup_cap ()
+  Concurrency.Fifo_index.create
+    ~label:(section ^ "/order_to_symbol")
+    ~cap:Concurrency.Cache_limits.order_index_startup_cap
+    ()
 ;;
 
-let () = Concurrency.Fifo_index.publish_metrics order_to_symbol ~name:"kraken.order_to_symbol"
+let () =
+  Concurrency.Fifo_index.publish_metrics order_to_symbol ~name:"kraken.order_to_symbol"
+;;
 
 let order_to_symbol_startup_done = Atomic.make false
 
@@ -230,7 +247,9 @@ let lock_order_to_symbol_cap () =
   then (
     (* Caller (handle_snapshot) already holds global_orders_mutex. *)
     let observed = Concurrency.Fifo_index.length order_to_symbol in
-    Concurrency.Fifo_index.lock_cap order_to_symbol ~observed
+    Concurrency.Fifo_index.lock_cap
+      order_to_symbol
+      ~observed
       ~floor:Concurrency.Cache_limits.order_index_min_cap)
 ;;
 
@@ -278,7 +297,8 @@ let get_symbol_store symbol =
 let[@inline] publish_open_orders_cache store =
   let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
   Atomic.set store.open_orders_cache snapshot;
-  Atomic.incr orders_generation
+  Atomic.incr orders_generation;
+  Atomic.set orders_snapshot_at (Unix.gettimeofday ())
 ;;
 
 (** Record an order whose state changed, for delta consumption by the strategy. [Some o]
@@ -979,14 +999,20 @@ let parse_execution_event json =
            | Some order -> order.cl_ord_id
            | None -> None)
       in
-      (* Extract the accurate timestamp from the payload instead of using wall-clock time. *)
-      let timestamp =
+      (* Extract the accurate timestamp from the payload instead of using wall-clock time.
+         [venue_time] records whether a venue time was actually present, so the wall-clock
+         fallback is never mistaken for one by the capital oracle's freshness comparison. *)
+      let venue_time, timestamp =
         match member "last_update_time" json |> to_string_option with
-        | Some s -> parse_rfc3339_utc s
+        | Some s ->
+          let t = parse_rfc3339_utc s in
+          t, t
         | None ->
           (match member "timestamp" json |> to_string_option with
-           | Some s -> parse_rfc3339_utc s
-           | None -> Unix.gettimeofday ())
+           | Some s ->
+             let t = parse_rfc3339_utc s in
+             t, t
+           | None -> 0.0, Unix.gettimeofday ())
       in
       (* Log when processing a minimal event (symbol resolved from cache). *)
       if symbol_opt = None
@@ -1016,6 +1042,7 @@ let parse_execution_event json =
         ; order_userref
         ; cl_ord_id
         ; timestamp
+        ; venue_time
         }
   with
   | exn ->

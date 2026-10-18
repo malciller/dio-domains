@@ -460,7 +460,23 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
       in
       let img =
         if !alerts_modal_open && !alerts_ref <> []
-        then I.(Alerts.render_modal ~target_w:w ~target_h:h !alerts_ref </> base)
+        then (
+          (* Dim the dashboard behind the alert with a checkerboard scrim (opaque dark
+             cells alternating with transparent ones), so the red modal clearly reads as a
+             modal and the still-visible dashboard reads as background. Notty has no
+             opacity, so a dither is the closest thing to a fade. *)
+          let scrim_cell = I.char A.(bg black) ' ' 1 1 in
+          let hollow = I.void 1 1 in
+          let row_a =
+            I.hcat (List.init w (fun x -> if x land 1 = 0 then scrim_cell else hollow))
+          in
+          let row_b =
+            I.hcat (List.init w (fun x -> if x land 1 = 1 then scrim_cell else hollow))
+          in
+          let scrim =
+            I.vcat (List.init h (fun y -> if y land 1 = 0 then row_a else row_b))
+          in
+          I.(Alerts.render_modal ~target_w:w ~target_h:h !alerts_ref </> scrim </> base))
         else base
       in
       let scratch = Buffer.create 65536 in

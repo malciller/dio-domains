@@ -100,11 +100,11 @@ module Config = struct
   ;;
 end
 
-(* Active gateway connection handle. Written by the Lwt domain on every
-   (re)connect and read from trading Domains when placing orders. A plain [ref] let a
-   Domain observe the None window mid-reconnect and fail an otherwise valid order with
-   "IBKR connection not initialized". An [Atomic] makes the read see either the old or the
-   new connection, never a torn or absent one. *)
+(* Active gateway connection handle. Written by the Lwt domain on every (re)connect and
+   read from trading Domains when placing orders. A plain [ref] let a Domain observe the
+   None window mid-reconnect and fail an otherwise valid order with "IBKR connection not
+   initialized". An [Atomic] makes the read see either the old or the new connection,
+   never a torn or absent one. *)
 let connection : Ibkr_connection.t option Atomic.t = Atomic.make None
 
 let get_conn () =
@@ -361,6 +361,7 @@ module Ibkr_impl = struct
   (* No freshness tracking: unknown age (treated as stale by strategies, which preserves
      the previous attempt-anyway behavior). *)
   let get_balance_age_fast ~asset:_ () = None
+  let get_balance_updated_at ~asset:_ = None
   let get_total_balance ~asset = Ibkr_balances.get_balance ~asset
   let get_staked_balance ~asset:_ = 0.0
   let get_all_balances () = Ibkr_balances.get_all_balances ()
@@ -483,6 +484,7 @@ module Ibkr_impl = struct
         ; filled_qty = e.filled_qty
         ; avg_price = e.avg_fill_price
         ; timestamp = e.timestamp
+        ; venue_time = 0.0
         ; is_amended = false
         ; cl_ord_id = None
         })
@@ -503,6 +505,7 @@ module Ibkr_impl = struct
            ; filled_qty = e.filled_qty
            ; avg_price = e.avg_fill_price
            ; timestamp = e.timestamp
+           ; venue_time = 0.0
            ; is_amended = false
            ; cl_ord_id = None
            })

@@ -138,6 +138,7 @@ let test_execution_event_structure () =
     ; order_userref = Some 1
     ; cl_ord_id = None
     ; timestamp = Unix.time ()
+    ; venue_time = 0.0
     }
   in
   Alcotest.(check string) "execution event order_id" "order123" test_event.order_id;
@@ -300,6 +301,7 @@ let make_open_sell ~id ~symbol ~qty ~price =
   ; order_userref = None
   ; cl_ord_id = None
   ; timestamp = Unix.gettimeofday ()
+  ; venue_time = 0.0
   }
 ;;
 

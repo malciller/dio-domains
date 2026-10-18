@@ -226,6 +226,7 @@ module Lighter_impl = struct
   (* No freshness tracking: unknown age (treated as stale by strategies, which preserves
      the previous attempt-anyway behavior). *)
   let get_balance_age_fast ~asset:_ () = None
+  let get_balance_updated_at ~asset:_ = None
   let get_total_balance ~asset = Lighter_balances.get_balance asset
   let get_staked_balance ~asset:_ = 0.0
   let get_all_balances () = Lighter_balances.get_all_balances ()
@@ -346,6 +347,7 @@ module Lighter_impl = struct
         ; filled_qty = e.cum_qty
         ; avg_price = e.avg_price
         ; timestamp = e.timestamp
+        ; venue_time = 0.0
         ; is_amended = e.is_amended
         ; cl_ord_id = e.cl_ord_id
         })
@@ -366,6 +368,7 @@ module Lighter_impl = struct
            ; filled_qty = e.cum_qty
            ; avg_price = e.avg_price
            ; timestamp = e.timestamp
+           ; venue_time = 0.0
            ; is_amended = e.is_amended
            ; cl_ord_id = e.cl_ord_id
            })
