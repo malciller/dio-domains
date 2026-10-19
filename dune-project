@@ -4,8 +4,8 @@
 
 ; dio.opam is maintained by hand: the application's OCaml dependencies now live
 ; in vendor/ and are separate in-tree packages, so auto-generating opam files
-; would emit one package per vendored library. Only the native secp256k1
-; dependency remains in dio.opam.
+; would emit one package per vendored library. No external OCaml library is
+; required; libsecp256k1 remains a native system dependency.
 (generate_opam_files false)
 
 (source
@@ -25,7 +25,6 @@
  (depends
   ocaml
   dune
-  secp256k1
   (odoc :with-doc))
  (tags
   ("trading" "finance" "multicore" "ocaml" "domains")))
@@ -76,16 +75,13 @@
  (name alcotest))
 
 (package
- (name integers))
-
-(package
- (name ctypes))
-
-(package
- (name ctypes-foreign))
-
-(package
  (name mtime))
+
+(package
+ (name secp256k1))
+
+(package
+ (name lighter_ffi))
 
 (package
  (name yojson))

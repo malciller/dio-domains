@@ -46,7 +46,8 @@ RUN eval $(opam env) \
 # The precompiled Go signer (lighter-go) statically bundles go-ethereum,
 # gnark-crypto and a Go stdlib; those modules dominate image CVE scans and are
 # reported against the published image even though the library is only loaded
-# when a Lighter symbol is configured (ctypes dlopen, lazily). It is therefore
+# when a Lighter symbol is configured (dlopen via lighter_ffi, lazily). It is
+# therefore
 # EXCLUDED from the default image. Re-include it for a Lighter deployment with:
 #   docker build --build-arg INCLUDE_LIGHTER_SIGNER=1 ...
 FROM builder AS lighter_signer
@@ -80,7 +81,6 @@ FROM ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca0
 #    more unfixed legacy CVEs).
 RUN DEBIAN_FRONTEND=noninteractive apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       libffi8 \
        libssl3t64 \
        libstdc++6 \
        libgcc-s1 \
@@ -118,13 +118,7 @@ COPY --from=builder /app/strategies /app/strategies
 #     libraries; the opam manifest is generated from the exact build switch.
 COPY THIRD_PARTY_LICENSES third_party/ /usr/share/licenses/dio/
 COPY --from=builder /app/opam-packages.txt /usr/share/licenses/dio/opam-packages.txt
-RUN mkdir -p /usr/share/licenses/dio/vendor
 COPY vendor/README.md /usr/share/licenses/dio/
-COPY vendor/base64/LICENSE vendor/ctypes/LICENSE vendor/integers/LICENSE.md \
-     vendor/lwt/LICENSE.md vendor/lwt_ssl/COPYING vendor/mtime/LICENSE.md \
-     vendor/msgpck/LICENSE.md vendor/notty/LICENSE.md vendor/ssl/COPYING \
-     vendor/uutf/LICENSE.md vendor/yojson/LICENSE.md \
-     /usr/share/licenses/dio/vendor/
 
 # 5d. Starter kit. Lets someone with only the image create a working setup
 #     without cloning the repository.

@@ -178,8 +178,8 @@ let address_of_private_key_hex ~private_key_hex =
   let ctx = sign_ctx in
   let seckey = Secp256k1.Key.read_sk_exn ctx (bs_of_string private_key_raw) in
   let pubkey = Secp256k1.Key.neuterize_exn ctx seckey in
-  (* Uncompressed pubkey (65 bytes: 0x04 || x || y), Keccak-256 hashed; last 20 bytes are
-     the address. *)
+  (* The uncompressed pubkey is 0x04 || x || y. Ethereum hashes x || y, so drop the SEC1
+     prefix before Keccak-256; the last 20 bytes are the address. *)
   let pubkey_buf = Secp256k1.Key.to_bytes ~compress:false ctx pubkey in
   let pubkey_str =
     Array1.dim pubkey_buf
@@ -190,7 +190,7 @@ let address_of_private_key_hex ~private_key_hex =
     done;
     Bytes.to_string s
   in
-  let hash = Digestif.KECCAK_256.digest_string pubkey_str in
+  let hash = Digestif.KECCAK_256.digest_string (String.sub pubkey_str 1 64) in
   let hash_raw = Digestif.KECCAK_256.to_raw_string hash in
   let addr_bytes = String.sub hash_raw 12 20 in
   "0x" ^ hex_of_bytes addr_bytes

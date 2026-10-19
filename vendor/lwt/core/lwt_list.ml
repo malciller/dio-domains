@@ -1,210 +1,59 @@
-(* This file is part of Lwt, released under the MIT license. See LICENSE.md for
-   details, or visit https://github.com/ocsigen/lwt/blob/master/LICENSE.md. *)
-
-
-
-(* A survey and measurements of more optimized implementations can be found at:
-
-    https://jsthomas.github.io/map-comparison.html
-
-   See discussion in https://github.com/ocsigen/lwt/pull/347. *)
-let tail_recursive_map f l =
-  List.rev (List.rev_map f l)
-
-let tail_recursive_mapi_rev f l =
-  let rec inner acc i = function
-    | [] -> acc
-    | hd::tl -> (inner [@ocaml.tailcall]) ((f i hd)::acc) (i + 1) tl
-  in
-  inner [] 0 l
-
 open Lwt.Infix
 
-let rec iter_s f l =
-  match l with
-  | [] ->
-    Lwt.return_unit
-  | x :: l ->
-    Lwt.apply f x >>= fun () ->
-    iter_s f l
+let rec iter_s f = function
+  | [] -> Lwt.return_unit
+  | x :: xs -> f x >>= fun () -> iter_s f xs
+;;
 
-let iter_p f l =
-  let ts = List.rev_map (Lwt.apply f) l in
-  Lwt.join ts
+let iter f xs =
+  iter_s
+    (fun x ->
+      f x;
+      Lwt.return_unit)
+    xs
+;;
 
-let rec iteri_s i f l =
-  match l with
-  | [] ->
-    Lwt.return_unit
-  | x :: l ->
-    Lwt.apply (f i) x >>= fun () ->
-    iteri_s (i + 1) f l
-
-let iteri_s f l = iteri_s 0 f l
-
-let iteri_p f l =
-  let f' i = Lwt.apply (f i) in
-  let ts = tail_recursive_mapi_rev f' l in
-  Lwt.join ts
-
-let map_s f l =
-  let rec inner acc = function
-    | [] -> List.rev acc |> Lwt.return
-    | hd::tl ->
-      Lwt.apply f hd >>= fun r ->
-      (inner [@ocaml.tailcall]) (r::acc) tl
+(* The functions are all started before the results are collected, so the operations
+   overlap even though collection is sequential. *)
+let map_p f xs =
+  let promises = List.map f xs in
+  let rec collect acc = function
+    | [] -> Lwt.return (List.rev acc)
+    | p :: ps -> p >>= fun v -> collect (v :: acc) ps
   in
-  inner [] l
+  collect [] promises
+;;
 
-let rec _collect_rev acc = function
-  | [] ->
-    Lwt.return acc
-  | t::ts ->
-    t >>= fun i ->
-    (_collect_rev [@ocaml.tailcall]) (i::acc) ts
+let iter_p f xs = map_p f xs >|= fun _ -> ()
 
-let map_p f l =
-  let ts = List.rev_map (Lwt.apply f) l in
-  _collect_rev [] ts
+let rec map_s f = function
+  | [] -> Lwt.return []
+  | x :: xs -> f x >>= fun v -> map_s f xs >|= fun vs -> v :: vs
+;;
 
-let filter_map_s f l =
-  let rec inner acc = function
-    | []     -> List.rev acc |> Lwt.return
-    | hd::tl ->
-      Lwt.apply f hd >>= function
-      | Some v -> (inner [@ocaml.tailcall]) (v::acc) tl
-      | None -> (inner [@ocaml.tailcall]) acc tl
+let mapi_s f xs =
+  let rec loop i = function
+    | [] -> Lwt.return []
+    | x :: xs -> f i x >>= fun v -> loop (i + 1) xs >|= fun vs -> v :: vs
   in
-  inner [] l
+  loop 0 xs
+;;
 
-let filter_map_p f l =
-  let rec _collect_optional_rev acc = function
-  | []    -> Lwt.return acc
-  | t::ts ->
-    t >>= function
-    | Some v -> (_collect_optional_rev [@ocaml.tailcall]) (v::acc) ts
-    | None -> (_collect_optional_rev [@ocaml.tailcall]) acc ts
-  in
-  let ts = List.rev_map (Lwt.apply f) l in
-  _collect_optional_rev [] ts
+let rec fold_left_s f acc = function
+  | [] -> Lwt.return acc
+  | x :: xs -> f acc x >>= fun acc -> fold_left_s f acc xs
+;;
 
-let mapi_s f l =
-  let rec inner acc i = function
-    | []     -> List.rev acc |> Lwt.return
-    | hd::tl ->
-      Lwt.apply (f i) hd >>= fun v ->
-      (inner [@ocaml.tailcall]) (v::acc) (i+1) tl
-  in
-  inner [] 0 l
+let rec filter_map_s f = function
+  | [] -> Lwt.return []
+  | x :: xs ->
+    f x
+    >>= fun v ->
+    filter_map_s f xs
+    >|= fun vs ->
+    (match v with
+     | Some v -> v :: vs
+     | None -> vs)
+;;
 
-let mapi_p f l =
-  let f' i = Lwt.apply (f i) in
-  let ts = tail_recursive_mapi_rev f' l in
-  _collect_rev [] ts
-
-let rec rev_map_append_s acc f l =
-  match l with
-  | [] ->
-    Lwt.return acc
-  | x :: l ->
-    Lwt.apply f x >>= fun x ->
-    rev_map_append_s (x :: acc) f l
-
-let rev_map_s f l =
-  rev_map_append_s [] f l
-
-let rec rev_map_append_p acc f l =
-  match l with
-  | [] ->
-    acc
-  | x :: l ->
-    rev_map_append_p
-      (Lwt.apply f x >>= fun x ->
-       acc >|= fun l ->
-       x :: l) f l
-
-let rev_map_p f l =
-  rev_map_append_p Lwt.return_nil f l
-
-let rec fold_left_s f acc l =
-  match l with
-  | [] ->
-    Lwt.return acc
-  | x :: l ->
-    Lwt.apply (f acc) x >>= fun acc ->
-    (fold_left_s [@ocaml.tailcall]) f acc l
-
-let fold_right_s f l acc =
-  let rec inner f a = function
-    | []     -> Lwt.return a
-    | hd::tl -> (Lwt.apply (f hd) a) >>= fun a' ->
-      (inner [@ocaml.tailcall]) f a' tl
-  in
-  inner f acc (List.rev l)
-
-let rec for_all_s f l =
-  match l with
-  | [] ->
-    Lwt.return_true
-  | x :: l ->
-    Lwt.apply f x >>= function
-    | true ->
-      (for_all_s [@ocaml.tailcall]) f l
-    | false ->
-      Lwt.return_false
-
-let for_all_p f l =
-  map_p f l >>= fun bl -> List.for_all (fun x -> x) bl |> Lwt.return
-
-let rec exists_s f l =
-  match l with
-  | [] ->
-    Lwt.return_false
-  | x :: l ->
-    Lwt.apply f x >>= function
-    | true ->
-      Lwt.return_true
-    | false ->
-      (exists_s [@ocaml.tailcall]) f l
-
-let exists_p f l =
-  map_p f l >>= fun bl -> List.exists (fun x -> x) bl |> Lwt.return
-
-let rec find_s f l =
-  match l with
-  | [] ->
-    Lwt.fail Not_found
-  | x :: l ->
-    Lwt.apply f x >>= function
-    | true ->
-      Lwt.return x
-    | false ->
-      (find_s [@ocaml.tailcall]) f l
-
-let _optionalize f x =
-  f x >>= fun b -> if b then Lwt.return (Some x) else Lwt.return_none
-
-let filter_s f l =
-  filter_map_s (_optionalize f) l
-
-let filter_p f l =
-   filter_map_p (_optionalize f) l
-
-let partition_s f l =
-  let rec inner acc1 acc2 = function
-    | []     -> Lwt.return (List.rev acc1, List.rev acc2)
-    | hd::tl -> Lwt.apply f hd >>= fun b ->
-        if b then
-          inner (hd::acc1) acc2 tl
-        else
-          inner acc1 (hd::acc2) tl
-  in
-  inner [] [] l
-
-let partition_p f l =
-  let g x = Lwt.apply f x >>= fun b -> Lwt.return (b, x) in
-  map_p g l >>= fun tl ->
-  let group1 = tail_recursive_map snd @@ List.filter fst tl in
-  let group2 =
-    tail_recursive_map snd @@ List.filter (fun x -> not @@ fst x) tl in
-  Lwt.return (group1, group2)
+let filter_map_p f xs = map_p f xs >|= fun vs -> List.filter_map (fun v -> v) vs

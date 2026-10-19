@@ -21,14 +21,13 @@ ENV QEMU_CPU=host
 USER root
 
 # 1. System dependencies (build-time C header libraries & tools)
-#    libffi is for ctypes; libssl is for the vendored ssl bindings; the rest
-#    are for building libsecp256k1 and native OCaml stubs.
+#    libssl is for the vendored ssl bindings; the rest are for building
+#    libsecp256k1 and native OCaml stubs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     m4 \
     g++ \
     make \
-    libffi-dev \
     libssl-dev \
     autoconf \
     automake \
@@ -83,10 +82,11 @@ RUN eval $(opam env) \
 # 4. Copy project descriptors (needed for dependency resolution)
 COPY --chown=opam:opam dio.opam dune-project ./
 
-# 5. Install the remaining OCaml dependency.
+# 5. Install the build toolchain.
 #    Every application OCaml library now lives under vendor/ and is built by
-#    dune from this source tree. secp256k1 is intentionally kept as the audited
-#    native signing library.
+#    dune from this source tree. The only remaining native dependency,
+#    libsecp256k1, is built in step 2. No application OCaml library comes from
+#    opam.
 RUN --mount=type=cache,target=/home/opam/.opam/download-cache,uid=1000,gid=1000 \
     eval $(opam env) \
     && opam install -y -j $(nproc) . --deps-only --with-test --no-depexts
