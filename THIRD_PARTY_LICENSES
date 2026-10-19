@@ -118,72 +118,61 @@ Copyright (c) Vincent Bernardoff and contributors
 3.2 Vendored OCaml sources
 --------------------------------------------------------------------------------
 
-The OxCaml-compatible copies of lwt, ssl, lwt_ssl, base64, mtime, yojson,
-msgpck, notty-community, uutf, ctypes and integers now live under vendor/ and
-are built by this repository. Exact versions, licenses and applied patches are
-listed in vendor/README.md. The remaining vendor libraries (digestif, uri,
-ipaddr, conduit-lwt-unix, cohttp, cohttp-lwt, cohttp-lwt-unix, websocket,
-alcotest and mirage-crypto-rng) are original implementations written for dio
-and are covered by this repository's LICENSE.
+No third-party OCaml source is vendored any more. Every library listed in
+section 4 is an original implementation written for dio and is covered by this
+repository's LICENSE: lwt, lwt.unix, digestif, base64, mtime, msgpck, yojson,
+uutf, uri, ipaddr, conduit-lwt-unix, cohttp, cohttp-lwt, cohttp-lwt-unix,
+websocket, alcotest, mirage-crypto-rng, notty, ssl, lwt_ssl, secp256k1 and
+lighter_ffi.
 
 ================================================================================
 4. In-tree OCaml libraries
 ================================================================================
 
 These libraries are built from source in this repository (vendor/) and
-statically linked into dio, dio-dashboard and dio-oracle. The only OCaml
-library linked from opam is secp256k1; its build-time-only dependencies
-(base, stdio, dune-configurator) are not linked. The compiler runtime is the
-external toolchain component.
+statically linked into dio, dio-dashboard and dio-oracle. No OCaml library is
+linked from opam; the compiler runtime is the external toolchain component.
+The remaining native dependency is libsecp256k1, covered in section 2.2 and
+used through the in-tree binding in vendor/secp256k1.
 
 Component             Location              License                    Upstream
 --------------------- --------------------- -------------------------- --------------------------
-lwt, lwt.unix         vendor/lwt            MIT                        ocaml-lwt 6.0.0+ox
-ssl                   vendor/ssl            LGPL-2.1 + OpenSSL exc.    ocaml-ssl 0.7.0
-lwt_ssl               vendor/lwt_ssl        LGPL-2.1 + OpenSSL exc.    lwt_ssl 1.2.0
-base64                vendor/base64         ISC                        base64 3.5.2
-mtime                 vendor/mtime          ISC                        mtime 2.2.0
-yojson                vendor/yojson         BSD-3-Clause               yojson 2.2.2+ox
-msgpck                vendor/msgpck         ISC                        msgpck 1.7
-notty-community       vendor/notty          ISC                        notty 0.2.4
-uutf                  vendor/uutf           ISC                        uutf 1.0.4+ox
-ctypes                vendor/ctypes         MIT                        ctypes 0.24.0+ox
-integers              vendor/integers       MIT                        integers 0.8.0
-secp256k1             opam                  MIT                        secp256k1 0.5.0
+
+The secp256k1 OCaml binding in vendor/secp256k1 and the Go-signer binding in
+vendor/lighter_ffi are original code written for dio. The native libsecp256k1
+and the prebuilt Lighter Go signer are covered in section 2.
 
 The following vendor directories are original implementations written for dio
-and are covered by this repository's LICENSE: digestif, uri, ipaddr,
-conduit-lwt-unix, cohttp, cohttp-lwt, cohttp-lwt-unix, websocket, alcotest and
-mirage-crypto-rng.
+and are covered by this repository's LICENSE: lwt, lwt.unix, digestif, base64,
+mtime, msgpck, yojson, uutf, uri, ipaddr, conduit-lwt-unix, cohttp, cohttp-lwt,
+cohttp-lwt-unix, websocket, alcotest, mirage-crypto-rng, notty, ssl, lwt_ssl,
+secp256k1 and lighter_ffi.
 
 Build-, test-, and documentation-only dependencies that are not shipped:
 dune (MIT), dune-configurator (MIT), odoc (ISC).
 
-Full texts: MIT, ISC, BSD-2-Clause and BSD-3-Clause are in section 6. The
-LGPL-2.1 + OpenSSL exemption texts are in vendor/ssl/COPYING and
-vendor/lwt_ssl/COPYING. Per-library license files are also kept alongside each
-vendored source tree.
+Full texts: MIT, ISC, BSD-2-Clause and BSD-3-Clause are in section 6.
 
 
 ================================================================================
 5. Container base OS and runtime system libraries
 ================================================================================
 
-Base image: Ubuntu 22.04 LTS (pinned by digest in Dockerfile).
+Build base image: Ubuntu 22.04 LTS (ocaml/opam, pinned by digest).
+Runtime image: Ubuntu 24.04 LTS (pinned by digest).
 
-Runtime packages installed into the image: libffi8, libgmp10, libpcre3,
-libssl3, libpq5, zlib1g, libjemalloc2, ca-certificates, netbase.
+Runtime packages installed into the image: libssl3t64, libstdc++6, libgcc-s1,
+libjemalloc2, ca-certificates, netbase. libsecp256k1 is built from source in the
+base stage and copied into the runtime image (section 2.2). The Go Lighter
+signer is the prebuilt shared library described in section 2.1.
 
 These are unmodified Ubuntu packages. Each package's copyright and license text
 is installed by the distribution at /usr/share/doc/<package>/copyright inside
 the image. Principal licenses:
 
-  libffi8          MIT
-  libgmp10         LGPL-3.0-or-later or GPL-2.0-or-later
-  libpcre3         BSD-3-Clause
-  libssl3          Apache-2.0
-  libpq5           PostgreSQL
-  zlib1g           Zlib
+  libssl3t64       Apache-2.0
+  libstdc++6       GPL-3.0-or-later with GCC runtime exception
+  libgcc-s1        GPL-3.0-or-later with GCC runtime exception
   libjemalloc2     BSD-2-Clause
   ca-certificates  MPL-2.0
   netbase          GPL-2.0

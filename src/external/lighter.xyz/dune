@@ -14,8 +14,7 @@
   dio.ws_lwt
   conduit-lwt-unix
   ipaddr.unix
-  ctypes
-  ctypes-foreign
+  lighter_ffi
   mtime
   mtime.clock.os
   concurrency

@@ -7,7 +7,7 @@
  (name mtime_clock)
  (public_name mtime.clock.os)
  (modules mtime_clock)
- (libraries mtime unix)
+ (libraries mtime)
  (foreign_stubs
   (language c)
   (names mtime_clock_stubs)))

@@ -1,0 +1,7 @@
+(library
+ (name lighter_ffi)
+ (public_name lighter_ffi)
+ (modules lighter_ffi)
+ (foreign_stubs
+  (language c)
+  (names lighter_ffi_stubs)))
