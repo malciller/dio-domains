@@ -94,6 +94,7 @@ module BalanceStore = struct
     let wallet_key = wallet_type ^ "/" ^ wallet_id ^ "/" ^ original_asset in
     let now = Unix.time () in
     let wallet_data = { balance; wallet_type; wallet_id; last_updated = now } in
+    let prev_trading = Atomic.get store.trading_balance in
     Mutex.lock store.mutex;
     let is_updating_ws_earn =
       wallet_type = "earn"
@@ -145,7 +146,8 @@ module BalanceStore = struct
     Atomic.set store.total_balance total;
     Atomic.set store.trading_balance trading;
     Atomic.set store.last_updated now;
-    Mutex.unlock store.mutex
+    Mutex.unlock store.mutex;
+    if trading <> prev_trading then Concurrency.Oracle_wakeup.notify_balance ()
   ;;
 
   (** Returns the trading balance for this asset. *)

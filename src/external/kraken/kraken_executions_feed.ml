@@ -298,7 +298,10 @@ let[@inline] publish_open_orders_cache store =
   let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
   Atomic.set store.open_orders_cache snapshot;
   Atomic.incr orders_generation;
-  Atomic.set orders_snapshot_at (Unix.gettimeofday ())
+  Atomic.set orders_snapshot_at (Unix.gettimeofday ());
+  (* Claim edge: allocation sizes against resting buys, so a book change is an oracle
+     input even without a fill or terminal event. *)
+  Concurrency.Oracle_wakeup.notify_orders ()
 ;;
 
 (** Record an order whose state changed, for delta consumption by the strategy. [Some o]
@@ -1192,6 +1195,7 @@ let handle_update json on_heartbeat =
           Atomic.set store.last_event_time event.timestamp;
           notify_ready store;
           Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
+          Concurrency.Oracle_wakeup.notify_exec ();
           (* The order update event bus is backed by Lwt streams (single-domain), so
              publishing from the Parse_worker domain is safe only with zero subscribers.
              The guard skips the publish in that case and warns once if a subscriber

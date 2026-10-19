@@ -235,6 +235,11 @@ type materialized_state = { m_epoch : int }
 
 let materialized_ref : materialized_state option Atomic.t = Atomic.make None
 let materialized () = Atomic.get materialized_ref
+
+(** Signalled when the first refresh materializes, so startup waits on the event rather
+    than polling. *)
+let materialized_condition : unit Lwt_condition.t = Lwt_condition.create ()
+
 let refresh_fiber : unit Lwt.t option ref = ref None
 let refresh_generation : int Atomic.t = Atomic.make 0
 let get_refresh_generation () = Atomic.get refresh_generation
@@ -342,12 +347,16 @@ let wake_pending = Atomic.make false
 (** Reusable one-byte payload; [Unix.write] never mutates it. *)
 let wake_byte = Bytes.make 1 '\x00'
 
+(** The pass loop sets this while it is computing. A producer that rings the doorbell
+    during a pass only bumps [pass_requested]; the loop's post-pass predicate recheck
+    consumes it, so no pipe write (and no syscall) is needed. *)
+let pass_running = Atomic.make false
+
 (** Requests a pass and wakes the oracle loop. Safe from any domain: the counter increment
-    and the coalesced non-blocking pipe write are the only effects, and neither touches
-    Lwt. *)
+    and, only when the consumer is parked, one coalesced non-blocking pipe write. *)
 let request_pass () =
   Atomic.incr pass_requested;
-  if not (Atomic.exchange wake_pending true)
+  if (not (Atomic.get pass_running)) && not (Atomic.exchange wake_pending true)
   then (
     try ignore (Unix.write wake_write_fd wake_byte 0 1) with
     | Unix.Unix_error (Unix.EAGAIN, _, _) -> ()
@@ -416,6 +425,21 @@ let rec wait_until ~(deadline : float) ~(generation : int) () =
         ; (Lwt_unix.sleep (Float.max 0.0 (deadline -. now)) >|= fun () -> ())
         ]
       >>= fun () -> wait_until ~deadline ~generation ()))
+;;
+
+(** Event-only wait for the control loop: blocks until a pass request or shutdown. No
+    deadline, because every input transition rings the doorbell. The periodic history /
+    balance refresh still calls [request_pass] when it completes, so a restarted or
+    recovered feed also wakes the loop. *)
+let rec wait_event ~(generation : int) () =
+  if is_stopped () || pass_requested_changed generation
+  then Lwt.return_unit
+  else (
+    start_waker ();
+    let w = Lwt_condition.wait wake_condition in
+    if is_stopped () || pass_requested_changed generation
+    then Lwt_condition.broadcast wake_condition ();
+    w >|= (fun () -> ()) >>= fun () -> wait_event ~generation ())
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -595,10 +619,13 @@ let drain_pool_events () =
 ;;
 
 (** A fill returns/consumes quote AND base: a buy consumes value+fee of quote and credits
-    filled base; a sell credits value-fee and debits the sold base. Wakes the runtime -
-    deltas are applied in process, so the decision never waits on a network balance
-    refresh. *)
-let notify_fill
+    filled base; a sell credits value-fee and debits the sold base.
+
+    These are the oracle's own apply functions: the pass loop drains the venue execution
+    rings and calls them directly, so no payload, lock, or allocation crosses a producer
+    thread. [notify_fill] / [notify_order_cancel] remain as the public one-shot form for
+    tests and non-ring callers. *)
+let apply_fill
   ~(exchange : string)
   ~(symbol : string)
   ~(testnet : bool)
@@ -622,14 +649,27 @@ let notify_fill
     ~base_asset:base
     ~quote_updated_at:(tradeable_updated_at ~exchange ~asset:quote)
     ~event_time
-    "fill";
+    "fill"
+;;
+
+let notify_fill
+  ~(exchange : string)
+  ~(symbol : string)
+  ~(testnet : bool)
+  ~(side : Exchange.Types.order_side)
+  ~(filled_qty : float)
+  ~(avg_price : float)
+  ~(fee : float)
+  ~(event_time : float)
+  =
+  apply_fill ~exchange ~symbol ~testnet ~side ~filled_qty ~avg_price ~fee ~event_time;
   request_pass ()
 ;;
 
 (** A canceled/rejected/expired order releases committed capital: a canceled BUY returns
     its remaining committed value (remaining_qty x limit price); a canceled sell releases
-    base inventory, never quote. Wakes the runtime. *)
-let notify_order_cancel
+    base inventory, never quote. *)
+let apply_order_cancel
   ~(exchange : string)
   ~(symbol : string)
   ~(testnet : bool)
@@ -647,8 +687,114 @@ let notify_order_cancel
       ~base_asset:base
       ~quote_updated_at:(tradeable_updated_at ~exchange ~asset:quote)
       ~event_time
-      "order_cancel";
+      "order_cancel"
+;;
+
+let notify_order_cancel
+  ~(exchange : string)
+  ~(symbol : string)
+  ~(testnet : bool)
+  ~(side : Exchange.Types.order_side)
+  ~(value : float)
+  ~(event_time : float)
+  =
+  apply_order_cancel ~exchange ~symbol ~testnet ~side ~value ~event_time;
   request_pass ()
+;;
+
+(** Install the doorbell. Producer threads only bump a generation and ring this; the
+    oracle drains the real state (execution rings, balance stores, open-order caches) on
+    its own thread. No callbacks with payloads, no producer-side locks. *)
+let install_doorbell () = Concurrency.Oracle_wakeup.set_wake request_pass
+
+(** One drain of every task's execution ring. Each reader keeps its own absolute cursor,
+    so the domain and the oracle can both consume the same lock-free ring without
+    interfering. Runs only on the pass loop. *)
+let exec_cursors : (string * string, int) Hashtbl.t = Hashtbl.create 16
+
+(** Start every cursor at the venue ring's current end. Events that happened before the
+    oracle started are already represented by the live balance store; replaying them would
+    double-count on a supervisor restart. Events after this point are applied by the first
+    pass (and [confirmed] drops any the balance store already reflects). *)
+let init_exec_cursors (tasks : Oracle_tasks.task list) =
+  List.iter
+    (fun (t : Oracle_tasks.task) ->
+      match Exchange.Registry.get t.exchange with
+      | None -> ()
+      | Some (module Ex) ->
+        Hashtbl.replace
+          exec_cursors
+          (t.exchange, t.symbol)
+          (Ex.get_execution_feed_position ~symbol:t.symbol))
+    tasks
+;;
+
+let maker_fee_of ~exchange ~symbol =
+  match Oracle_fees.cached_fees ~exchange ~symbol with
+  | Some (m, _) -> Float.max 0.0 m
+  | None -> Float.max 0.0 (fst (Oracle_fees.venue_default_fees exchange symbol))
+;;
+
+(** Last cumulative filled quantity applied per order. Partial fills arrive with a
+    cumulative figure, so applying the raw event would double-count every earlier partial
+    once the terminal fill lands. Only the delta since the previous event is a pool move. *)
+let exec_fill_cum : (string, float) Hashtbl.t = Hashtbl.create 64
+
+let apply_fill_delta ~exchange ~symbol ~testnet ~(e : Exchange.Types.execution_event) =
+  let prev = Option.value (Hashtbl.find_opt exec_fill_cum e.order_id) ~default:0.0 in
+  let delta_qty = Float.max 0.0 (e.filled_qty -. prev) in
+  if delta_qty > 0.0
+  then
+    apply_fill
+      ~exchange
+      ~symbol
+      ~testnet
+      ~side:e.side
+      ~filled_qty:delta_qty
+      ~avg_price:e.avg_price
+      ~fee:(maker_fee_of ~exchange ~symbol *. delta_qty *. e.avg_price)
+      ~event_time:e.venue_time;
+  match e.order_status with
+  | Exchange.Types.Filled -> Hashtbl.remove exec_fill_cum e.order_id
+  | _ -> Hashtbl.replace exec_fill_cum e.order_id e.filled_qty
+;;
+
+let drain_execution_events (tasks : Oracle_tasks.task list) =
+  List.iter
+    (fun (t : Oracle_tasks.task) ->
+      match Exchange.Registry.get t.exchange with
+      | None -> ()
+      | Some (module Ex) ->
+        let key = t.exchange, t.symbol in
+        let start = Option.value (Hashtbl.find_opt exec_cursors key) ~default:0 in
+        let next =
+          Ex.iter_execution_events
+            ~symbol:t.symbol
+            ~start_pos:start
+            (fun (e : Exchange.Types.execution_event) ->
+               match e.order_status with
+               | Exchange.Types.Filled | Exchange.Types.PartiallyFilled ->
+                 apply_fill_delta
+                   ~exchange:t.exchange
+                   ~symbol:t.symbol
+                   ~testnet:t.config.testnet
+                   ~e
+               | Exchange.Types.Canceled
+               | Exchange.Types.Rejected
+               | Exchange.Types.Expired ->
+                 Hashtbl.remove exec_fill_cum e.order_id;
+                 apply_order_cancel
+                   ~exchange:t.exchange
+                   ~symbol:t.symbol
+                   ~testnet:t.config.testnet
+                   ~side:e.side
+                   ~value:(e.remaining_qty *. Option.value e.limit_price ~default:0.0)
+                   ~event_time:e.venue_time
+               | Exchange.Types.Pending | Exchange.Types.New | Exchange.Types.Unknown _ ->
+                 ())
+        in
+        Hashtbl.replace exec_cursors key next)
+    tasks
 ;;
 
 (** A delta is redundant once the venue's tradeable figure for the account's quote asset
@@ -886,25 +1032,30 @@ let string_of_branch = function
 (* Priority reclaim reservations *)
 (* ------------------------------------------------------------------ *)
 
-(** Wall-clock lifetime of a reclaim reservation. Between a cascade being issued and the
-    freed quote appearing in the account pool there is a window: the venue cancels the
-    order (the exec feed drops it from the order store) before the balance feed reflects
-    the released quote. During that window the senior strategy has no resting buy left to
-    point the cascade at (its claim list reads empty), so it cannot re-flag, while a
-    lower-priority strategy would otherwise be funded from the very quote being freed -
-    producing a cancel/replace cascade that only resolves when the balance eventually
-    catches up. The reservation holds every lower-priority strategy inactive across passes
-    until the senior is funded, bounded by this timeout as a backstop against a cancel
-    that never lands. *)
-let reclaim_reservation_ttl = 120.0
-
 (** A senior strategy's standing claim on capital being released by a lower-priority
-    cancel. *)
+    cancel.
+
+    The reservation is released by the event that decides it: every flagged resting buy
+    leaving the venue's open-order book (cancelled or filled). That is read from the live
+    open-order store on the next pass - no wall clock, no TTL. If the buy is still
+    resting, the capital is still committed and holding the juniors is the correct state. *)
 type reclaim_reservation =
   { rr_senior : string (** [key_of_task] of the senior awaiting the freed quote. *)
   ; rr_reserved : float (** Quote reserved for it (its next buy's need). *)
-  ; rr_issued_at : float (** Unix time the cascade was issued. *)
+  ; rr_cancelled_keys : string list
+  (** Strategies whose resting buys the cascade flagged. The reservation clears when none
+      of them still has a resting buy. *)
   }
+
+(** [true] when [key]'s flagged resting buy has left the book. Reads the venue's live
+    open-order cache, which is already the allocation input. *)
+let reclaim_claim_released key =
+  match String.split_on_char '|' key with
+  | [ exchange; symbol ] ->
+    let resting_buy, committed, _ = open_orders_summary ~exchange ~symbol in
+    (not resting_buy) || committed <= 1e-9
+  | _ -> true
+;;
 
 (** Per-account reservation, keyed by [account_id]. Written and read only on the pass
     loop. *)
@@ -934,17 +1085,23 @@ let run_account_pass
   | Some acs ->
     let pool = available_quote_in account acs in
     let acct_id = account_id account in
-    let now = Unix.gettimeofday () in
-    (* Drop a stale reservation (a cancel that never landed within its TTL) so
-       lower-priority strategies are not held indefinitely, then read the live one for
-       this account. See [reclaim_reservations]. *)
+    (* Release the hold only when the actual release event is visible: every flagged
+       resting buy has left the open-order book. A still-resting buy means the capital is
+       still committed, so holding the juniors remains correct. *)
     let reservation =
       match Hashtbl.find_opt reclaim_reservations acct_id with
-      | Some r when now -. r.rr_issued_at <= reclaim_reservation_ttl -> Some r
-      | Some _ ->
-        Hashtbl.remove reclaim_reservations acct_id;
-        None
       | None -> None
+      | Some r ->
+        if List.exists (fun key -> not (reclaim_claim_released key)) r.rr_cancelled_keys
+        then Some r
+        else (
+          Hashtbl.remove reclaim_reservations acct_id;
+          Logging.info_f
+            ~section
+            "reclaim reservation released for %s: flagged resting buys are gone (%s)"
+            acct_id
+            r.rr_senior;
+          None)
     in
     let reserved_senior = Option.map (fun r -> r.rr_senior) reservation in
     (* Open-order summaries and config bounds are invariant across the pass, so resolve
@@ -1216,12 +1373,12 @@ let run_account_pass
                        lands on the exec feed before the balance feed reflects the
                        released quote; in that window the senior has no resting buy left
                        to point the cascade at, while lower-priority strategies could
-                       re-fund from the same quote. The reservation holds them until the
-                       senior funds (or the TTL backstop expires). *)
+                       re-fund from the same quote. The reservation clears when the
+                       flagged resting buys leave the book. *)
                     Hashtbl.replace
                       reclaim_reservations
                       acct_id
-                      { rr_senior = key; rr_reserved = need; rr_issued_at = now };
+                      { rr_senior = key; rr_reserved = need; rr_cancelled_keys = plan };
                     reserved_priority := Some priority;
                     Logging.info_f
                       ~section
@@ -1343,6 +1500,14 @@ let run_pass
   ~(on_publish : string list -> decision list -> unit)
   : unit Lwt.t
   =
+  (* Consume the venue execution rings first: fills and terminal cancels are pool deltas
+     that this pass must size against. Each reader owns its cursor, so the domain's own
+     drain is unaffected. Then move the queued deltas into the per-account pending table
+     that [available_quote_in] overlays on the live snapshot. Without this drain the
+     deltas stayed in [event_queue] forever and the pool only moved when the balance store
+     happened to update - the source of the multi-minute reactivation delay. *)
+  drain_execution_events tasks;
+  drain_pool_events ();
   let started = Mtime_clock.now_ns () in
   let groups = group_by_account tasks in
   Lwt_list.fold_left_s
@@ -1402,6 +1567,7 @@ let refresh_once ~(offline : bool) ~(tasks : Oracle_tasks.task list) : unit Lwt.
   Latency_profiler.record (Lazy.force engine_profs).prof_balance (span_from t_bal);
   Atomic.incr refresh_generation;
   Atomic.set materialized_ref (Some { m_epoch = Atomic.get refresh_generation });
+  Lwt_condition.broadcast materialized_condition ();
   Latency_profiler.record (Lazy.force engine_profs).prof_fetch (span_from started);
   let _ = Latency_profiler.snapshot_and_reset (Lazy.force engine_profs).prof_balance in
   let _ = Latency_profiler.snapshot_and_reset (Lazy.force engine_profs).prof_fetch in
@@ -1431,9 +1597,10 @@ let rec refresh_loop
 (* Main loop *)
 (* ------------------------------------------------------------------ *)
 
-(** Runs the oracle until shutdown: initial background refresh, then a wake-driven pass
-    loop. Events (fills, cancels, balance changes, [request_pass]) coalesce into single
-    re-resolves; the refresh cadence is the fallback poll. Returns when [shutdown] is
+(** Runs the oracle until shutdown: initial background refresh, then an event-driven pass
+    loop. Venue state transitions (execution events, balance changes, open-order/claim
+    changes) ring the doorbell; passes coalesce a burst into one re-resolve. There is no
+    control-path timeout - the loop blocks on the doorbell. Returns when [shutdown] is
     requested. *)
 let run_loop
   ~(config : runtime_config)
@@ -1442,6 +1609,7 @@ let run_loop
   ()
   : unit Lwt.t
   =
+  install_doorbell ();
   let tasks, unsupported =
     Oracle_tasks.resolve_tasks
       ~symbol:""
@@ -1450,6 +1618,7 @@ let run_loop
       ~trading
       ~offline:false
   in
+  init_exec_cursors tasks;
   List.iter
     (fun (sym, exch) ->
       Logging.warn_f
@@ -1485,7 +1654,11 @@ let run_loop
   let rec wait_initial_refresh () =
     if Option.is_some (Atomic.get materialized_ref) || is_stopped ()
     then Lwt.return ()
-    else Lwt_unix.sleep 0.05 >>= wait_initial_refresh
+    else (
+      let w = Lwt_condition.wait materialized_condition in
+      if Option.is_some (Atomic.get materialized_ref) || is_stopped ()
+      then Lwt_condition.broadcast materialized_condition ();
+      w >>= wait_initial_refresh)
   in
   wait_initial_refresh ()
   >>= fun () ->
@@ -1496,18 +1669,14 @@ let run_loop
       Lwt.return ())
     else (
       (* Capture the wake generation BEFORE running the pass. A [request_pass] that lands
-         while the pass is running (e.g. the balance refresh completing) must wake the
-         next pass immediately; capturing it after the pass loses that wake and the loop
-         sleeps the full deadline - which is how an account whose balances arrived
-         mid-pass stayed without a decision until the next refresh/F&G change. *)
+         while the pass is running must be consumed by the post-pass predicate recheck;
+         the producer skips the pipe write while [pass_running] is set. *)
       let generation = Atomic.get pass_requested in
+      Atomic.set pass_running true;
       run_pass ~config ~tasks ~on_publish
       >>= fun () ->
-      wait_until
-        ~deadline:(Unix.gettimeofday () +. (Float.max 1.0 config.refresh_seconds /. 4.0))
-        ~generation
-        ()
-      >>= loop)
+      Atomic.set pass_running false;
+      wait_event ~generation () >>= loop)
   in
   loop ()
 ;;

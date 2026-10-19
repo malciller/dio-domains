@@ -208,6 +208,61 @@ let test_pending_delta_kept_when_venue_cannot_confirm () =
   Alcotest.(check int) "still pending" 1 (List.length kept)
 ;;
 
+let test_partial_fill_delta_is_incremental () =
+  (* Venue execution events carry a CUMULATIVE filled_qty. Applying the terminal event's
+     raw figure after a partial event would count the partial twice and overstate the
+     quote the oracle believes it has. Only the delta since the previous event may move
+     the pool. *)
+  let event ~order_id ~status ~filled =
+    { Dio_exchange.Exchange_intf.Types.order_id
+    ; order_status = status
+    ; limit_price = Some 100.0
+    ; side = Dio_exchange.Exchange_intf.Types.Buy
+    ; remaining_qty = 1.0 -. filled
+    ; filled_qty = filled
+    ; avg_price = 100.0
+    ; timestamp = 1000.0
+    ; venue_time = 0.0
+    ; is_amended = false
+    ; cl_ord_id = None
+    }
+  in
+  let exchange = "kraken" in
+  let symbol = "HYPE/USDC" in
+  let account = "kraken|false|USDC" in
+  Dio_oracle.Oracle_runtime.apply_fill_delta
+    ~exchange
+    ~symbol
+    ~testnet:false
+    ~e:
+      (event
+         ~order_id:"partial-delta-test"
+         ~status:Dio_exchange.Exchange_intf.Types.PartiallyFilled
+         ~filled:0.4);
+  Dio_oracle.Oracle_runtime.apply_fill_delta
+    ~exchange
+    ~symbol
+    ~testnet:false
+    ~e:
+      (event
+         ~order_id:"partial-delta-test"
+         ~status:Dio_exchange.Exchange_intf.Types.Filled
+         ~filled:1.0);
+  Dio_oracle.Oracle_runtime.drain_pool_events ();
+  let dq, kept = Dio_oracle.Oracle_runtime.pending_deltas account ~quote_updated_at:0.0 in
+  let db =
+    List.fold_left
+      (fun acc (e : Dio_oracle.Oracle_runtime.pool_event) -> acc +. e.pe_delta_base)
+      0.0
+      kept
+  in
+  near "exactly one unit of base credited" db 1.0;
+  Alcotest.(check bool)
+    "exactly one unit of quote debited (plus fees)"
+    (dq < -99.9 && dq > -101.0)
+    true
+;;
+
 let () =
   Alcotest.run
     "oracle_runtime"
@@ -231,6 +286,10 @@ let () =
             "kept when the venue cannot confirm"
             `Quick
             test_pending_delta_kept_when_venue_cannot_confirm
+        ; Alcotest.test_case
+            "partial fill delta is incremental"
+            `Quick
+            test_partial_fill_delta_is_incremental
         ] )
     ; ( "publish"
       , [ Alcotest.test_case "read APIs stable" `Quick test_publish_and_decision_for

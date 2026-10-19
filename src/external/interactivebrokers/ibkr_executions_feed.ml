@@ -104,7 +104,8 @@ let[@inline] get_orders_generation () = Atomic.get orders_generation
 let[@inline] publish_open_orders_cache store =
   let snapshot = Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
   Atomic.set store.open_orders_cache snapshot;
-  Atomic.incr orders_generation
+  Atomic.incr orders_generation;
+  Concurrency.Oracle_wakeup.notify_orders ()
 ;;
 
 (** Record an order whose state changed, for delta consumption by the strategy. [Some o]
@@ -213,7 +214,8 @@ let update_open_orders symbol (event : execution_event) =
   Mutex.unlock store.orders_mutex;
   RingBuffer.write store.events_buffer event;
   notify_ready store;
-  Concurrency.Exchange_wakeup.signal ~symbol
+  Concurrency.Exchange_wakeup.signal ~symbol;
+  Concurrency.Oracle_wakeup.notify_exec ()
 ;;
 
 (** orderStatus handler. Fields: orderId, status, filled, remaining, avgFillPrice, permId,
