@@ -863,8 +863,7 @@ let asset_domain_worker
                match event.order_status with
                | Types.Canceled | Types.Rejected | Types.Expired ->
                  should_execute_strategy := true;
-                 (* The venue feed publishes the terminal event to the capital oracle's
-                    execution ring directly; no domain-cycle hop. *)
+                 (* The feed publishes terminal events to the oracle's ring directly. *)
                  let side =
                    match event.side with
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
@@ -904,8 +903,7 @@ let asset_domain_worker
                      ()
                | Types.Filled ->
                  should_execute_strategy := true;
-                 (* The venue feed publishes the fill to the capital oracle's execution
-                    ring directly; no domain-cycle hop. *)
+                 (* The feed publishes fills to the oracle's ring directly. *)
                  let side =
                    match event.side with
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy

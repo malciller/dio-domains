@@ -9,8 +9,8 @@
    Hot path is pure arithmetic over in-process state:
    - history is cached and refreshed on the [refresh_seconds] background poll;
    - balances come from the websocket-fed live store, else the last fetched snapshot,
-     adjusted in process by fill/cancel deltas (notify_fill / notify_order_cancel), so
-     events never wait on network;
+     adjusted in process by the fill/cancel deltas drained from the venue execution rings,
+     so events never wait on network;
    - live prices read the in-process top-of-book with a sane-band check against the last
      bar close.
 
@@ -319,13 +319,13 @@ let pass_requested : int Atomic.t = Atomic.make 0
 
 (** Domain-safe wake channel for [request_pass].
 
-    [request_pass] is called from per-symbol domain workers ([notify_fill] /
-    [notify_order_cancel] run inside the execution cycle); [wait_until] runs on the main
-    Lwt domain. [Lwt_condition] is not safe off the Lwt domain: a worker would race the
-    scheduler on Lwt's unsynchronized waiter list and a wake could run the oracle
-    continuation on the trading domain's stack, inflating execution latency. Instead a
-    self-pipe (as in [Strategy_common.OrderSignal]) lets a non-blocking byte write from
-    any domain wake the Lwt read without touching Lwt internals. *)
+    [request_pass] is called from venue feed threads and domain workers (the
+    [Oracle_wakeup] doorbell); [wait_event] runs on the main Lwt domain. [Lwt_condition]
+    is not safe off the Lwt domain: a worker would race the scheduler on Lwt's
+    unsynchronized waiter list and a wake could run the oracle continuation on the trading
+    domain's stack, inflating execution latency. Instead a self-pipe (as in
+    [Strategy_common.OrderSignal]) lets a non-blocking byte write from any domain wake the
+    Lwt read without touching Lwt internals. *)
 let wake_read_fd, wake_write_fd =
   let r, w = Unix.pipe ~cloexec:true () in
   Unix.set_nonblock r;
@@ -341,7 +341,7 @@ let wake_lwt_read_fd =
 
 (** Coalesces multiple [request_pass] calls into a single pipe write. The monotonically
     increasing [pass_requested] counter carries the actual wake semantics, so dropping a
-    coalesced byte is always recovered by the predicate recheck in [wait_until]. *)
+    coalesced byte is always recovered by the waiter's predicate recheck. *)
 let wake_pending = Atomic.make false
 
 (** Reusable one-byte payload; [Unix.write] never mutates it. *)
@@ -365,14 +365,13 @@ let request_pass () =
 ;;
 
 (** Lwt-side wake fan-out, touched only on the main Lwt domain: the pump fiber below
-    drains the self-pipe and broadcasts this condition; every [wait_until] waits on it.
-    Domain workers never touch Lwt.
+    drains the self-pipe and broadcasts this condition; the pass and refresh waiters park
+    on it. Domain workers never touch Lwt.
 
     A self-pipe read fd is single-reader: two concurrent [Lwt_unix.wait_read] waiters
-    (pass loop and refresh loop both call [wait_until]) could race to consume one
-    coalesced byte, leaving the loser parked to its deadline. Funnelling wakes through one
-    pump fiber and broadcasting a condition gives all-waiter wake semantics without Lwt
-    calls from a worker domain. *)
+    (pass loop and refresh loop) could race to consume one coalesced byte, leaving the
+    loser parked. Funnelling wakes through one pump fiber and broadcasting a condition
+    gives all-waiter wake semantics without Lwt calls from a worker domain. *)
 let wake_condition : unit Lwt_condition.t = Lwt_condition.create ()
 
 let waker_started = Atomic.make false
@@ -380,7 +379,7 @@ let waker_started = Atomic.make false
 (** Single reader of the self-pipe. Drains every pending byte, clears [wake_pending], then
     broadcasts to all Lwt waiters. Because the broadcast happens after each drain, a
     [request_pass] that coalesces into an existing pending byte is still covered by this
-    iteration's broadcast (or by the predicate re-check in [wait_until]). *)
+    iteration's broadcast (or by the waiter's predicate re-check). *)
 let rec pump_wake () =
   Lwt_unix.wait_read wake_lwt_read_fd
   >>= fun () ->
@@ -621,10 +620,8 @@ let drain_pool_events () =
 (** A fill returns/consumes quote AND base: a buy consumes value+fee of quote and credits
     filled base; a sell credits value-fee and debits the sold base.
 
-    These are the oracle's own apply functions: the pass loop drains the venue execution
-    rings and calls them directly, so no payload, lock, or allocation crosses a producer
-    thread. [notify_fill] / [notify_order_cancel] remain as the public one-shot form for
-    tests and non-ring callers. *)
+    The pass loop drains the venue execution rings and calls these directly; no payload,
+    lock, or allocation crosses a producer thread. *)
 let apply_fill
   ~(exchange : string)
   ~(symbol : string)
@@ -652,20 +649,6 @@ let apply_fill
     "fill"
 ;;
 
-let notify_fill
-  ~(exchange : string)
-  ~(symbol : string)
-  ~(testnet : bool)
-  ~(side : Exchange.Types.order_side)
-  ~(filled_qty : float)
-  ~(avg_price : float)
-  ~(fee : float)
-  ~(event_time : float)
-  =
-  apply_fill ~exchange ~symbol ~testnet ~side ~filled_qty ~avg_price ~fee ~event_time;
-  request_pass ()
-;;
-
 (** A canceled/rejected/expired order releases committed capital: a canceled BUY returns
     its remaining committed value (remaining_qty x limit price); a canceled sell releases
     base inventory, never quote. *)
@@ -690,26 +673,7 @@ let apply_order_cancel
       "order_cancel"
 ;;
 
-let notify_order_cancel
-  ~(exchange : string)
-  ~(symbol : string)
-  ~(testnet : bool)
-  ~(side : Exchange.Types.order_side)
-  ~(value : float)
-  ~(event_time : float)
-  =
-  apply_order_cancel ~exchange ~symbol ~testnet ~side ~value ~event_time;
-  request_pass ()
-;;
-
-(** Install the doorbell. Producer threads only bump a generation and ring this; the
-    oracle drains the real state (execution rings, balance stores, open-order caches) on
-    its own thread. No callbacks with payloads, no producer-side locks. *)
-let install_doorbell () = Concurrency.Oracle_wakeup.set_wake request_pass
-
-(** One drain of every task's execution ring. Each reader keeps its own absolute cursor,
-    so the domain and the oracle can both consume the same lock-free ring without
-    interfering. Runs only on the pass loop. *)
+(** Absolute read position per [(exchange, symbol)] for the execution-ring drain. *)
 let exec_cursors : (string * string, int) Hashtbl.t = Hashtbl.create 16
 
 (** Start every cursor at the venue ring's current end. Events that happened before the
@@ -759,6 +723,8 @@ let apply_fill_delta ~exchange ~symbol ~testnet ~(e : Exchange.Types.execution_e
   | _ -> Hashtbl.replace exec_fill_cum e.order_id e.filled_qty
 ;;
 
+(** Drain every task's execution ring. Each reader keeps its own absolute cursor, so the
+    domain and the oracle can consume the same lock-free ring independently. *)
 let drain_execution_events (tasks : Oracle_tasks.task list) =
   List.iter
     (fun (t : Oracle_tasks.task) ->
@@ -1047,8 +1013,7 @@ type reclaim_reservation =
       of them still has a resting buy. *)
   }
 
-(** [true] when [key]'s flagged resting buy has left the book. Reads the venue's live
-    open-order cache, which is already the allocation input. *)
+(** Reads the venue's live open-order cache, which is already the allocation input. *)
 let reclaim_claim_released key =
   match String.split_on_char '|' key with
   | [ exchange; symbol ] ->
@@ -1085,9 +1050,6 @@ let run_account_pass
   | Some acs ->
     let pool = available_quote_in account acs in
     let acct_id = account_id account in
-    (* Release the hold only when the actual release event is visible: every flagged
-       resting buy has left the open-order book. A still-resting buy means the capital is
-       still committed, so holding the juniors remains correct. *)
     let reservation =
       match Hashtbl.find_opt reclaim_reservations acct_id with
       | None -> None
@@ -1373,8 +1335,7 @@ let run_account_pass
                        lands on the exec feed before the balance feed reflects the
                        released quote; in that window the senior has no resting buy left
                        to point the cascade at, while lower-priority strategies could
-                       re-fund from the same quote. The reservation clears when the
-                       flagged resting buys leave the book. *)
+                       re-fund from the same quote. *)
                     Hashtbl.replace
                       reclaim_reservations
                       acct_id
@@ -1501,11 +1462,9 @@ let run_pass
   : unit Lwt.t
   =
   (* Consume the venue execution rings first: fills and terminal cancels are pool deltas
-     that this pass must size against. Each reader owns its cursor, so the domain's own
-     drain is unaffected. Then move the queued deltas into the per-account pending table
-     that [available_quote_in] overlays on the live snapshot. Without this drain the
-     deltas stayed in [event_queue] forever and the pool only moved when the balance store
-     happened to update - the source of the multi-minute reactivation delay. *)
+     this pass must size against. Each reader owns its cursor, so the domain's drain is
+     unaffected. Then move the queued deltas into the per-account pending table that
+     [available_quote_in] overlays on the live snapshot. *)
   drain_execution_events tasks;
   drain_pool_events ();
   let started = Mtime_clock.now_ns () in
@@ -1609,7 +1568,7 @@ let run_loop
   ()
   : unit Lwt.t
   =
-  install_doorbell ();
+  Concurrency.Oracle_wakeup.set_wake request_pass;
   let tasks, unsupported =
     Oracle_tasks.resolve_tasks
       ~symbol:""
@@ -1668,9 +1627,8 @@ let run_loop
       Logging.info ~section "oracle runtime stopped";
       Lwt.return ())
     else (
-      (* Capture the wake generation BEFORE running the pass. A [request_pass] that lands
-         while the pass is running must be consumed by the post-pass predicate recheck;
-         the producer skips the pipe write while [pass_running] is set. *)
+      (* Capture before the pass so a request landing mid-pass is consumed by the
+         post-pass predicate recheck. *)
       let generation = Atomic.get pass_requested in
       Atomic.set pass_running true;
       run_pass ~config ~tasks ~on_publish

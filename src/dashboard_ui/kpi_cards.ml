@@ -136,8 +136,8 @@ let render_kpi_cards w (s : Snapshot.t) =
   in
   let card2 = "SYSTEM ENGINE", c2_row1, c2_row2 in
   (* Oracle engine latency from the runtime's per-pass window (p50/p99 of the last
-     completed pass); fresh when the window ended within 600s. Passes are event-driven, so
-     on a quiet book the last window can be older than the previous fixed cadence. *)
+     completed pass); fresh when the window ended within 600s. A quiet book can leave the
+     window older than that. *)
   let oracle_lat = List.assoc_opt "pass" s.oracle_latency in
   let oracle_p50, oracle_p99, oracle_fresh =
     match oracle_lat with

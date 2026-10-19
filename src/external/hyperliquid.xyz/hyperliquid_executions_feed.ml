@@ -172,7 +172,7 @@ let publish_open_orders_cache store =
   Atomic.set store.open_orders_cache snapshot;
   Atomic.incr store.open_orders_generation;
   Atomic.incr orders_generation;
-  Concurrency.Oracle_wakeup.notify_orders ()[@@inline ]
+  Concurrency.Oracle_wakeup.notify_orders ()
 let get_orders_generation_for_symbol symbol =
   match Ds.Cow_table.find_opt stores symbol with
   | Some store -> Atomic.get store.open_orders_generation

@@ -242,6 +242,7 @@ jobs:
           fi
 
           latest="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+          echo "previous=$latest" >> "$GITHUB_OUTPUT"
           latest="${latest:-v0.0.0}"
           ver="${latest#v}"
           IFS='.' read -r major minor patch <<< "$ver"
@@ -256,6 +257,26 @@ jobs:
           echo "version=$new" >> "$GITHUB_OUTPUT"
           echo "created=true" >> "$GITHUB_OUTPUT"
 
+      - name: Read commit message
+        if: steps.version.outputs.created == 'true'
+        id: commit
+        env:
+          PREVIOUS: ${{ steps.version.outputs.previous }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          {
+            echo "body<<COMMIT_MESSAGE_EOF"
+            git log -1 --pretty=%B
+            echo ""
+            if [ -n "$PREVIOUS" ]; then
+              echo "**Full Changelog**: https://github.com/${REPOSITORY}/compare/${PREVIOUS}...${VERSION}"
+            else
+              echo "**Full Changelog**: https://github.com/${REPOSITORY}/commits/${VERSION}"
+            fi
+            echo "COMMIT_MESSAGE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create and push tag
         if: steps.version.outputs.created == 'true'
         run: |
@@ -265,12 +286,12 @@ jobs:
       - name: Publish release
         if: steps.version.outputs.created == 'true'
         # Every tag that passes CI ships as a Release immediately; no drafts.
-        # `generate_release_notes` fills the body from the PRs and commits
-        # merged since the previous tag.
+        # The body is the commit message that produced the release, followed by
+        # a compare link so the full history is one click away.
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.version.outputs.version }}
-          generate_release_notes: true
+          body: ${{ steps.commit.outputs.body }}
           make_latest: true
           prerelease: false
 

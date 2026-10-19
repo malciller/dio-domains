@@ -129,7 +129,6 @@ module SymbolExecStore = struct
     Atomic.set t.open_orders_cache snapshot;
     Atomic.incr t.open_orders_generation;
     Atomic.incr orders_generation;
-    (* Claim edge: allocation sizes against resting buys. *)
     Concurrency.Oracle_wakeup.notify_orders ()
   ;;
 
