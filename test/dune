@@ -16,15 +16,19 @@
 
 (subdir engine/domain_spawner)
 
-(subdir external/kraken)
+(subdir integrations/venues/kraken)
 
-(subdir external/ibkr)
+(subdir integrations/venues/ibkr)
 
-(subdir external/alpaca)
+(subdir integrations/venues/alpaca)
 
-(subdir external/cmc)
+(subdir integrations/venues/hyperliquid)
 
-(subdir external/lighter)
+(subdir integrations/venues/lighter)
+
+(subdir integrations/market_data/coinmarketcap)
+
+(subdir integrations/market_data/yahoo)
 
 (subdir order_cache)
 
@@ -32,6 +36,6 @@
 
 (subdir engine/persistence)
 
-(subdir external/discord)
+(subdir integrations/notify/discord)
 
-(subdir external/ws_lwt)
+(subdir integrations/transport/ws_lwt)

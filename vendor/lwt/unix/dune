@@ -1,6 +1,0 @@
-(library
- (name lwt_unix)
- (public_name lwt.unix)
- (synopsis "Unix support for Lwt")
- (wrapped false)
- (libraries bigarray lwt threads unix))

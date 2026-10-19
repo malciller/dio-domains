@@ -63,6 +63,22 @@ and [deployment](https://diophantsolutions.com/dio/DEPLOYMENT/).
 | `dio-dashboard` | Terminal UI. Connects to a running engine over the Unix domain socket. Latency and log views (press `v`), and an alert popup for warnings and errors. |
 | `dio-oracle` | Runs the sizing pipeline offline and prints the decision surface. |
 
+## Repository layout
+
+| Path | Contents |
+| --- | --- |
+| `src/engine/` | Trading core: config, domain spawner, order executor, strategies, oracle, supervisor, persistence, concurrency, logging, latency profiling. |
+| `src/integrations/` | First-party adapters to external services: `venues/` (Kraken, Hyperliquid, Lighter, IBKR, Alpaca), `market_data/` (Yahoo, CoinMarketCap), `notify/` (Discord), and `transport/` (client WebSocket connection). |
+| `src/dashboard_ui/` | Terminal dashboard renderer. |
+| `src/foundation/` | Internally owned support libraries, grouped by capability. Public names are `dio.*` (for example `dio.lwt`, `dio.cohttp`); see [`src/foundation/README.md`](src/foundation/README.md). |
+| `native/` | Prebuilt native binaries that are not built from source here (the Lighter signer). |
+| `licenses/` | Third-party notices and provenance, including the native-library licenses. |
+| `bin/` | The `dio`, `dio-dashboard`, and `dio-oracle` executables. |
+| `test/` | Test suites mirroring `src/`. |
+| `strategies/` | Strategy scripts loaded by name from `config.json`. |
+| `proxy/` | Optional Cloudflare relay for Lighter traffic. |
+| `editors/` | VS Code extension for the strategy language. |
+
 ## Performance
 
 dio targets high-frequency trading. Trading domains pin to performance cores,
@@ -84,11 +100,14 @@ Latency and allocation are observable through every phase of the cycle:
 ## Dependencies
 
 Every OCaml library used by the engine, exchange adapters, dashboard and tests
-is built from source in [`vendor/`](vendor/README.md). No OCaml library is
-taken from opam. OpenSSL, libsecp256k1 and libffi remain system/native
-libraries, and the OxCaml compiler and Dune remain toolchain dependencies.
-`vendor/README.md` lists versions, licenses and the patches applied to each
-vendored tree.
+is built from source in [`src/foundation/`](src/foundation/README.md). No OCaml library is
+taken from opam. Each foundation library has a `dio.*` public name (`dio.lwt`,
+`dio.cohttp`, …), so a dune stanza never looks like an upstream dependency.
+OpenSSL, libsecp256k1 and jemalloc remain system/native libraries, and the
+OxCaml compiler and Dune remain toolchain dependencies. [`src/foundation/README.md`](src/foundation/README.md)
+describes the layout and ownership rules;
+[`licenses/THIRD_PARTY_LICENSES`](licenses/THIRD_PARTY_LICENSES) carries the
+provenance and native-library notices.
 
 ## Strategy files
 

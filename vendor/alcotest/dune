@@ -1,5 +1,0 @@
-(library
- (name alcotest)
- (public_name alcotest)
- (wrapped false)
- (modules alcotest))

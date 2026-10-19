@@ -1,10 +1,10 @@
 (test
  (name test_logging)
- (libraries dio.logging yojson alcotest lwt.unix))
+ (libraries dio.logging dio.yojson alcotest dio.lwt.unix))
 
 (test
  (name test_flow_log)
- (libraries flow_log dio.logging yojson alcotest))
+ (libraries flow_log dio.logging dio.yojson alcotest))
 
 (executable
  (name preview_flow)

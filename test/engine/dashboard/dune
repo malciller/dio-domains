@@ -4,21 +4,21 @@
 
 (test
  (name test_dashboard_holdings)
- (libraries dio.dashboard_ui dio.latency_profiling mtime alcotest))
+ (libraries dio.dashboard_ui dio.latency_profiling dio.mtime alcotest))
 
 (test
  (name test_dashboard_snapshot)
- (libraries dio.dashboard_ui notty-community alcotest))
+ (libraries dio.dashboard_ui dio.notty alcotest))
 
 (executable
  (name bench_dashboard)
  (libraries
   dio.dashboard_ui
-  notty-community
-  notty-community.unix
-  yojson
+  dio.notty
+  dio.notty.unix
+  dio.yojson
   unix))
 
 (executable
  (name preview_log_panel)
- (libraries dio.dashboard_ui notty-community yojson))
+ (libraries dio.dashboard_ui dio.notty dio.yojson))

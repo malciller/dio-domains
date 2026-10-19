@@ -1,0 +1,6 @@
+(library
+ (name notty)
+ (public_name dio.notty)
+ (wrapped false)
+ (modules notty)
+ (libraries dio.uutf))

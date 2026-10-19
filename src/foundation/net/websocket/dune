@@ -1,0 +1,6 @@
+(library
+ (name websocket)
+ (public_name dio.websocket)
+ (wrapped false)
+ (modules websocket)
+ (libraries dio.base64 dio.cohttp dio.digestif dio.lwt dio.uri))

@@ -1,3 +1,0 @@
-(test
- (name test_json_scan)
- (libraries dio.json alcotest))

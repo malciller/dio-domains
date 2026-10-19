@@ -1,0 +1,6 @@
+(library
+ (name cohttp_lwt)
+ (public_name dio.cohttp-lwt)
+ (wrapped false)
+ (modules cohttp_lwt)
+ (libraries dio.cohttp dio.lwt))

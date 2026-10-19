@@ -1,0 +1,9 @@
+(library
+ (name notty_unix)
+ (public_name dio.notty.unix)
+ (wrapped false)
+ (modules notty_unix)
+ (libraries notty unix)
+ (foreign_stubs
+  (language c)
+  (names winsize)))

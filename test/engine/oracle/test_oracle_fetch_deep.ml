@@ -3,7 +3,8 @@
    synthesized.
 
    The merge lives in [Oracle_fetch] (it builds [Oracle_types.series], the oracle's own
-   domain type); the Yahoo client itself is tested in test/external/yahoo/test_yahoo.ml. *)
+   domain type); the Yahoo client itself is tested in
+   test/integrations/market_data/yahoo/test_yahoo.ml. *)
 
 open Dio_oracle
 

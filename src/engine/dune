@@ -2,11 +2,12 @@
  (name dio_engine)
  (public_name dio.engine)
  (libraries
-  yojson
+  dio.yojson
   dio.data_structures
   logging
   flow_log
   dio.kraken
+  dio.hyperliquid
   dio.ibkr
   dio.alpaca
   dio.strategies

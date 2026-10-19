@@ -2,12 +2,11 @@
 
 (name dio)
 
-; dio.opam is maintained by hand: the application's OCaml dependencies now live
-; in vendor/ and are separate in-tree packages, so auto-generating opam files
-; would emit one package per vendored library. No external runtime OCaml
-; library is required; dune and dune-configurator are build tools (the latter
-; drives the in-tree ssl/secp256k1 discovery rules), and libsecp256k1 remains a
-; native system dependency.
+; One package: every foundation library is an internal component of dio, not a
+; separately published opam package. Public library names are namespaced under
+; [dio.] (dio.lwt, dio.cohttp, ...), so a stanza never looks like an external
+; dependency. dio.opam is maintained by hand because it records the native
+; system dependency that dune cannot infer.
 (generate_opam_files false)
 
 (source
@@ -32,70 +31,8 @@
  (tags
   ("trading" "finance" "multicore" "ocaml" "domains")))
 
-; In-tree replacements for the OCaml libraries the engine used to take from
-; opam. The public names are kept identical so no application dune stanza or
-; source reference has to change.
-(package
- (name lwt))
-
-(package
- (name base64))
-
-(package
- (name ssl))
-
-(package
- (name lwt_ssl))
-
-(package
- (name uri))
-
-(package
- (name ipaddr))
-
-(package
- (name cohttp))
-
-(package
- (name cohttp-lwt))
-
-(package
- (name cohttp-lwt-unix))
-
-(package
- (name conduit-lwt-unix))
-
-(package
- (name websocket))
-
-(package
- (name uutf))
-
-(package
- (name notty-community))
-
-(package
- (name alcotest))
-
-(package
- (name mtime))
-
-(package
- (name secp256k1))
-
-(package
- (name lighter_ffi))
-
-(package
- (name yojson))
-
-(package
- (name msgpck))
-
-(package
- (name digestif))
-
-(package
- (name mirage-crypto-rng))
+; Foundation libraries are components of the single [dio] package. Their public
+; names live under [dio.] (for example [dio.lwt], [dio.cohttp]) and install as
+; part of that package; they are not separately distributable.
 
 ; See the complete stanza docs at https://dune.readthedocs.io/en/stable/reference/dune-project/index.html

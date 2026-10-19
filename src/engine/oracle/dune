@@ -17,10 +17,10 @@
  (libraries
   dio.data_structures
   unix
-  yojson
-  lwt
-  mtime
-  mtime.clock.os
+  dio.yojson
+  dio.lwt
+  dio.mtime
+  dio.mtime.clock.os
   dio.logging
   dio.strategies
   dio.concurrency

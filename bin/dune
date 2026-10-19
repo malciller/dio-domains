@@ -19,9 +19,9 @@
   flow_log
   dio.ws_lwt
   dio.runtime_compat
-  lwt
+  dio.lwt
   supervisor
-  mirage-crypto-rng.unix)
+  dio.mirage-crypto-rng.unix)
 )
 
 (executable
@@ -30,9 +30,9 @@
  (name dashboard)
  (modes exe)
  (libraries
-  notty-community
-  notty-community.unix
-  yojson
+  dio.notty
+  dio.notty.unix
+  dio.yojson
   unix
   dio.dashboard_ui))
 
@@ -43,8 +43,8 @@
  (modes exe)
  (libraries
   unix
-  yojson
-  lwt
+  dio.yojson
+  dio.lwt
   dio.oracle
   dio.engine
   dio.strategies

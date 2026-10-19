@@ -1,0 +1,4 @@
+(library
+ (name msgpck)
+ (public_name dio.msgpck)
+ (modules msgpck))

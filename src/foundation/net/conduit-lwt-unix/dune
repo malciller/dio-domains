@@ -1,0 +1,6 @@
+(library
+ (name conduit_lwt_unix)
+ (public_name dio.conduit-lwt-unix)
+ (wrapped false)
+ (modules conduit_lwt_unix)
+ (libraries dio.ipaddr dio.lwt.unix dio.lwt_ssl dio.ssl unix))
