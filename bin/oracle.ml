@@ -11,10 +11,16 @@
 let usage =
   {|dio-oracle [options]
 
+Sizing uses the REAL per-venue account balance by default (the quote pool is the
+venue's actual available quote, shared across the venue's assets exactly as the live
+runtime allocates it). --cache-only only affects history, not balances.
+
 Options:
   --symbol SYM    Analyze only SYM (default: every trading entry).
-  --quote FLOAT   Synthetic quote pool per asset (default 10000.0).
-  --base FLOAT    Synthetic base balance for sell sizing (default 0.0).
+  --quote FLOAT   Force a synthetic quote pool per asset (disables live balances).
+  --base FLOAT    Force a synthetic base balance for sell sizing.
+  --synthetic     Force synthetic pools (default quote 10000, base 0).
+  --live          Use live venue balances (default).
   --cache-only    Use only disk-cached history; never touch the network.
   --json          Emit machine-readable JSON instead of a table.
   --help          This text.
@@ -27,11 +33,18 @@ type args =
   ; mutable base : float
   ; mutable cache_only : bool
   ; mutable json : bool
+  ; mutable live : bool
   }
 
 let parse_args () =
   let a =
-    { symbol = ""; quote = 10_000.0; base = 0.0; cache_only = false; json = false }
+    { symbol = ""
+    ; quote = 10_000.0
+    ; base = 0.0
+    ; cache_only = false
+    ; json = false
+    ; live = true
+    }
   in
   let rec go = function
     | [] -> ()
@@ -43,9 +56,17 @@ let parse_args () =
       go r
     | "--quote" :: v :: r ->
       a.quote <- Float.of_string v;
+      a.live <- false;
       go r
     | "--base" :: v :: r ->
       a.base <- Float.of_string v;
+      a.live <- false;
+      go r
+    | "--synthetic" :: r ->
+      a.live <- false;
+      go r
+    | "--live" :: r ->
+      a.live <- true;
       go r
     | "--cache-only" :: r ->
       a.cache_only <- true;
@@ -59,6 +80,20 @@ let parse_args () =
   in
   go (Array.to_list Sys.argv |> List.tl);
   a
+;;
+
+(** Quote currency of a symbol: "BTC/USDC" -> "USDC"; a bare ticker (Alpaca) -> "USD". *)
+let quote_currency_of_symbol symbol =
+  match String.rindex_opt symbol '/' with
+  | Some i -> String.sub symbol (i + 1) (String.length symbol - i - 1)
+  | None -> "USD"
+;;
+
+(** Base asset of a symbol: "BTC/USDC" -> "BTC"; a bare ticker (Alpaca) -> the ticker. *)
+let base_asset_of_symbol symbol =
+  match String.rindex_opt symbol '/' with
+  | Some i -> String.sub symbol 0 i
+  | None -> symbol
 ;;
 
 (** Per-asset effective knobs: the engine config's "oracle" section with its assets
@@ -92,6 +127,10 @@ type row =
   { exchange : string
   ; symbol : string
   ; current : float (** Live price used for the replay (0.0 when unusable). *)
+  ; quote_used : float (** Quote pool the decision was sized against. *)
+  ; base_used : float (** Base balance available for sell sizing. *)
+  ; maker : float (** Maker fee used by the survival walk. *)
+  ; priority : int (** Config presentation order; venue pool allocation order. *)
   ; outcome : Dio_oracle.Oracle_pipeline.outcome option
   ; error : string
   }
@@ -99,6 +138,9 @@ type row =
 let analyze_one
   ~(args : args)
   ~(config : Dio_engine.Config.config option)
+  ~(available_quote : float)
+  ~(available_asset : float)
+  ~(priority : int)
   (tc : Dio_strategies.Strategy_common.trading_config)
   : row Lwt.t
   =
@@ -122,6 +164,10 @@ let analyze_one
           { exchange = tc.exchange
           ; symbol = tc.symbol
           ; current
+          ; quote_used = available_quote
+          ; base_used = available_asset
+          ; maker = 0.0
+          ; priority
           ; outcome = None
           ; error = "no usable close in history"
           }
@@ -153,8 +199,8 @@ let analyze_one
           ; symbol = tc.symbol
           ; bars = series.bars
           ; current_price = current
-          ; available_quote = args.quote
-          ; sell_qty = 0.0
+          ; available_quote
+          ; sell_qty = available_asset
           ; bounds
           ; target_survival
           ; min_active_dsurv
@@ -168,6 +214,10 @@ let analyze_one
             { exchange = tc.exchange
             ; symbol = tc.symbol
             ; current
+            ; quote_used = available_quote
+            ; base_used = available_asset
+            ; maker
+            ; priority
             ; outcome = None
             ; error = "no references"
             }
@@ -176,6 +226,10 @@ let analyze_one
             { exchange = tc.exchange
             ; symbol = tc.symbol
             ; current
+            ; quote_used = available_quote
+            ; base_used = available_asset
+            ; maker
+            ; priority
             ; outcome = Some o
             ; error = ""
             }))
@@ -184,6 +238,10 @@ let analyze_one
         { exchange = tc.exchange
         ; symbol = tc.symbol
         ; current = 0.0
+        ; quote_used = available_quote
+        ; base_used = available_asset
+        ; maker = 0.0
+        ; priority
         ; outcome = None
         ; error = Printexc.to_string exn
         })
@@ -197,30 +255,29 @@ let string_of_outcome (r : row) (o : Dio_oracle.Oracle_pipeline.outcome) =
       ~d_surv:o.resolution.d_surv
   in
   Printf.sprintf
-    "%-18s %-11s d_surv %.3f exhaust %12.6g | floor %12.6g ath %12.6g atl %12.6g mdd \
-     %5.1f%%"
+    "%-18s %-11s d_surv %.3f exhaust %12.6g | quote %12.6g floor %12.6g ath %12.6g atl \
+     %12.6g mdd %5.1f%%"
     (Dio_oracle.Oracle_runtime.string_of_regime o.runway.regime)
     (Dio_oracle.Oracle_runtime.string_of_branch o.resolution.branch)
     o.resolution.d_surv
     exhaust
+    r.quote_used
     o.runway.floor_price
     o.refs.ath
     o.refs.atl
     (o.refs.max_drawdown_pct *. 100.0)
 ;;
 
-let sell_qty_of_args (args : args) =
-  Dio_oracle.Oracle_pools.sell_qty_of
-    ~base_balance:args.base
-    ~reserved_base:0.0
-    ~resting_sell_base:0.0
-;;
-
 let print_table rows args =
   Printf.printf
-    "synthetic pools: quote %.2f base %.6g (per asset)\n\n"
-    args.quote
-    args.base;
+    "%s\n\n"
+    (if args.live
+     then "pools: REAL per-venue balances (quote shared across the venue's assets)"
+     else
+       Printf.sprintf
+         "pools: SYNTHETIC quote %.2f base %.6g (per asset)"
+         args.quote
+         args.base);
   Printf.printf
     " %-14s %-14s %-7s %10s %12s %12s  %s\n"
     "EXCHANGE"
@@ -252,7 +309,7 @@ let print_table rows args =
           (if d.active then "yes" else "no")
           d.grid_interval
           d.buy_qty
-          (sell_qty_of_args args)
+          r.base_used
           (string_of_outcome r o))
     rows
 ;;
@@ -261,7 +318,12 @@ let print_json rows args =
   let rows_json =
     List.map
       (fun (r : row) ->
-        let common = [ "exchange", `String r.exchange; "symbol", `String r.symbol ] in
+        let common =
+          [ "exchange", `String r.exchange
+          ; "symbol", `String r.symbol
+          ; "live_balances", `Bool args.live
+          ]
+        in
         match r.outcome with
         | None -> `Assoc (common @ [ "error", `String r.error ])
         | Some o ->
@@ -271,7 +333,8 @@ let print_json rows args =
              @ [ "active", `Bool d.active
                ; "grid_interval", `Float d.grid_interval
                ; "buy_qty", `Float d.buy_qty
-               ; "sell_qty", `Float (sell_qty_of_args args)
+               ; "sell_qty", `Float r.base_used
+               ; "quote_used", `Float r.quote_used
                ; "d_surv", `Float o.resolution.d_surv
                ; ( "exhaustion_price"
                  , `Float
@@ -292,6 +355,59 @@ let print_json rows args =
       rows
   in
   print_endline (Yojson.Basic.to_string (`List rows_json))
+;;
+
+(** Mirror the live runtime's shared venue drawdown simulation. The CLI hands every asset
+    on a venue the venue's full quote pool (as the runtime does for each asset's own
+    decision); this then walks the venue's active assets in config order, allocating one
+    rung at a time until the venue's real quote is exhausted, and overrides each active
+    row's [d_surv] with the shared-capital result. *)
+let apply_venue_shared_sim (rows : row list) : row list =
+  let groups : (string, row list) Hashtbl.t = Hashtbl.create 8 in
+  List.iter
+    (fun (r : row) ->
+      let key = String.lowercase_ascii r.exchange in
+      let prior = Option.value (Hashtbl.find_opt groups key) ~default:[] in
+      Hashtbl.replace groups key (r :: prior))
+    rows;
+  let override : (string, float) Hashtbl.t = Hashtbl.create 8 in
+  Hashtbl.iter
+    (fun _key group_rows ->
+      let group_rows = List.rev group_rows in
+      let total_quote =
+        match group_rows with
+        | r :: _ -> r.quote_used
+        | [] -> 0.0
+      in
+      let sims =
+        List.filter_map
+          (fun (r : row) ->
+            match r.outcome with
+            | Some o when o.decision.active ->
+              Some
+                { Dio_oracle.Oracle_pools.id = Printf.sprintf "%s|%s" r.exchange r.symbol
+                ; priority = r.priority
+                ; current = r.current
+                ; grid_interval = o.decision.grid_interval
+                ; buy_qty = o.decision.buy_qty
+                ; maker_fee = r.maker
+                }
+            | _ -> None)
+          group_rows
+      in
+      List.iter
+        (fun (id, (o : Dio_oracle.Oracle_pools.sim_outcome)) ->
+          Hashtbl.replace override id o.d_surv)
+        (Dio_oracle.Oracle_pools.simulate_drawdown_survival ~total_quote sims))
+    groups;
+  List.map
+    (fun (r : row) ->
+      let id = Printf.sprintf "%s|%s" r.exchange r.symbol in
+      match r.outcome, Hashtbl.find_opt override id with
+      | Some o, Some d when o.decision.active ->
+        { r with outcome = Some { o with resolution = { o.resolution with d_surv = d } } }
+      | _ -> r)
+    rows
 ;;
 
 (* Force the venue adapter modules to link: each registers its oracle adapter into
@@ -342,8 +458,91 @@ let () =
               else Lwt.return ())
             tcs)
        >>= fun () ->
-       Lwt_list.map_s (analyze_one ~args ~config:(Some config)) tcs
+       (* Resolve the quote/base pool each asset is sized against: the venue's REAL
+          account balance by default (shared across the venue's assets), or a synthetic
+          pool when --synthetic / --quote / --base was given. *)
+       let bal_cache
+         : (string * bool, Dio_oracle.Oracle_balances.snapshot option) Hashtbl.t
+         =
+         Hashtbl.create 8
+       in
+       Lwt_list.mapi_s
+         (fun i (tc : Dio_strategies.Strategy_common.trading_config) ->
+           if not args.live
+           then Lwt.return (i, tc, args.quote, args.base)
+           else (
+             let key = String.lowercase_ascii tc.exchange, tc.testnet in
+             let got =
+               match Hashtbl.find_opt bal_cache key with
+               | Some cached -> Lwt.return cached
+               | None ->
+                 Lwt.catch
+                   (fun () ->
+                     Dio_oracle.Oracle_balances.fetch_account_live
+                       ~exchange:tc.exchange
+                       ~testnet:tc.testnet
+                       ()
+                     >|= function
+                     | Ok snapshot -> Some snapshot
+                     | Error e ->
+                       Printf.eprintf
+                         "oracle: balance fetch failed for %s: %s\n"
+                         tc.exchange
+                         e;
+                       None)
+                   (fun exn ->
+                     Printf.eprintf
+                       "oracle: balance fetch exception for %s: %s\n"
+                       tc.exchange
+                       (Printexc.to_string exn);
+                     Lwt.return None)
+                 >|= fun res ->
+                 Hashtbl.replace bal_cache key res;
+                 res
+             in
+             got
+             >|= fun snap ->
+             match snap with
+             | Some snapshot ->
+               let quote =
+                 Dio_oracle.Oracle_balances.available_quote
+                   snapshot
+                   ~quote:(quote_currency_of_symbol tc.symbol)
+               in
+               let base =
+                 Dio_oracle.Oracle_balances.available_asset
+                   snapshot
+                   ~asset:(base_asset_of_symbol tc.symbol)
+               in
+               if quote > 0.0
+               then i, tc, quote, base
+               else (
+                 Printf.eprintf
+                   "oracle: %s has no available %s; sizing against 0 (pass --synthetic \
+                    to fabricate a pool)\n"
+                   tc.symbol
+                   (quote_currency_of_symbol tc.symbol);
+                 i, tc, 0.0, base)
+             | None ->
+               Printf.eprintf
+                 "oracle: no live balance for %s; sizing against 0 (pass --synthetic to \
+                  fabricate a pool)\n"
+                 tc.exchange;
+               i, tc, 0.0, 0.0))
+         tcs
+       >>= fun sized ->
+       Lwt_list.map_s
+         (fun (i, (tc : Dio_strategies.Strategy_common.trading_config), quote, base) ->
+           analyze_one
+             ~args
+             ~config:(Some config)
+             ~available_quote:quote
+             ~available_asset:base
+             ~priority:i
+             tc)
+         sized
        >>= fun rows ->
+       let rows = apply_venue_shared_sim rows in
        if args.json then print_json rows args else print_table rows args;
        Lwt.return ())
 ;;

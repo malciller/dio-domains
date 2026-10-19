@@ -106,7 +106,8 @@ THE SOFTWARE.
 
 src/external/ws_lwt/ws_lwt.ml is a client-only replacement derived from the lwt
 wrapper of the websocket library, version 2.17. The wire framing is delegated to
-Websocket.Make, so the format is unchanged.
+Websocket.Make in vendor/websocket, an in-tree RFC 6455 implementation, so the
+format is unchanged.
 
 Source:  https://github.com/vbmithr/ocaml-websocket
 License: ISC
@@ -114,64 +115,54 @@ License: ISC
 Copyright (c) Vincent Bernardoff and contributors
 
 --------------------------------------------------------------------------------
-3.2 opam overlay patches (oxcaml-port/opam-overlay)
+3.2 Vendored OCaml sources
 --------------------------------------------------------------------------------
 
-Patches that adapt these releases to the OxCaml compiler. The patched packages
-are built into the image.
-
-  cohttp 4.0.0, cohttp-lwt 4.0.0, cohttp-lwt-unix 4.0.0
-    Source:  https://github.com/mirage/ocaml-cohttp
-    License: ISC
-    Copyright (c) the ocaml-cohttp authors (Anil Madhavapeddy, David Sheets,
-      Thomas Gazagnaire, David Scott, and contributors)
-
-  digestif 1.3.1
-    Source:  https://github.com/mirage/digestif
-    License: MIT
-    Copyright (c) Eyyüb Sari, Romain Calascibetta
-
-  msgpck 1.7
-    Source:  https://github.com/vbmithr/ocaml-msgpck
-    License: ISC
-    Copyright (c) Vincent Bernardoff
-
+The OxCaml-compatible copies of lwt, ssl, lwt_ssl, base64, mtime, yojson,
+msgpck, notty-community, uutf, ctypes and integers now live under vendor/ and
+are built by this repository. Exact versions, licenses and applied patches are
+listed in vendor/README.md. The remaining vendor libraries (digestif, uri,
+ipaddr, conduit-lwt-unix, cohttp, cohttp-lwt, cohttp-lwt-unix, websocket,
+alcotest and mirage-crypto-rng) are original implementations written for dio
+and are covered by this repository's LICENSE.
 
 ================================================================================
-4. OCaml libraries linked into the binaries
+4. In-tree OCaml libraries
 ================================================================================
 
-These are installed from opam and statically linked into dio and
-dio-dashboard. Transitive dependencies ship with them under the same set of
-licenses; the exact set installed at build time is listed in
-/usr/share/licenses/dio/opam-packages.txt.
+These libraries are built from source in this repository (vendor/) and
+statically linked into dio, dio-dashboard and dio-oracle. The only OCaml
+library linked from opam is secp256k1; its build-time-only dependencies
+(base, stdio, dune-configurator) are not linked. The compiler runtime is the
+external toolchain component.
 
-Component             License                                    Copyright
---------------------- ------------------------------------------ --------------------------
-yojson                BSD-3-Clause                               Martin Jambon
-lwt                   MIT                                        Jérôme Vouillon, Jérémie Dimino
-lwt_ssl               LGPL-2.1 + OpenSSL exemption               Jérôme Vouillon, Jérémie Dimino
-mirage-crypto-rng     BSD-2-Clause                               David Kaloper, Hannes Mehnert
-cohttp-lwt-unix       ISC                                        Anil Madhavapeddy and contributors
-websocket             ISC                                        Vincent Bernardoff
-base64                ISC                                        Thomas Gazagnaire and contributors
-digestif              MIT                                        Eyyüb Sari, Romain Calascibetta
-uri                   ISC                                        Anil Madhavapeddy and contributors
-conduit-lwt-unix      ISC                                        Anil Madhavapeddy and contributors
-ipaddr                ISC                                        David Sheets and contributors
-mtime                 ISC                                        The mtime programmers
-secp256k1             MIT                                        Davide Gessa and contributors
-msgpck                ISC                                        Vincent Bernardoff
-ctypes                MIT                                        Jeremy Yallop
-ctypes-foreign        MIT                                        Jeremy Yallop
-notty-community        ISC                                        David Kaloper
+Component             Location              License                    Upstream
+--------------------- --------------------- -------------------------- --------------------------
+lwt, lwt.unix         vendor/lwt            MIT                        ocaml-lwt 6.0.0+ox
+ssl                   vendor/ssl            LGPL-2.1 + OpenSSL exc.    ocaml-ssl 0.7.0
+lwt_ssl               vendor/lwt_ssl        LGPL-2.1 + OpenSSL exc.    lwt_ssl 1.2.0
+base64                vendor/base64         ISC                        base64 3.5.2
+mtime                 vendor/mtime          ISC                        mtime 2.2.0
+yojson                vendor/yojson         BSD-3-Clause               yojson 2.2.2+ox
+msgpck                vendor/msgpck         ISC                        msgpck 1.7
+notty-community       vendor/notty          ISC                        notty 0.2.4
+uutf                  vendor/uutf           ISC                        uutf 1.0.4+ox
+ctypes                vendor/ctypes         MIT                        ctypes 0.24.0+ox
+integers              vendor/integers       MIT                        integers 0.8.0
+secp256k1             opam                  MIT                        secp256k1 0.5.0
+
+The following vendor directories are original implementations written for dio
+and are covered by this repository's LICENSE: digestif, uri, ipaddr,
+conduit-lwt-unix, cohttp, cohttp-lwt, cohttp-lwt-unix, websocket, alcotest and
+mirage-crypto-rng.
 
 Build-, test-, and documentation-only dependencies that are not shipped:
-dune (MIT), lwt_ppx (MIT), alcotest (ISC), odoc (ISC).
+dune (MIT), dune-configurator (MIT), odoc (ISC).
 
-Full texts: MIT, ISC, BSD-2-Clause, and BSD-3-Clause are in section 6.
-lwt_ssl is LGPL-2.1 with the OpenSSL exemption; its full text is in
-third_party/lwt_ssl-COPYING (which also contains the complete LGPL-2.1).
+Full texts: MIT, ISC, BSD-2-Clause and BSD-3-Clause are in section 6. The
+LGPL-2.1 + OpenSSL exemption texts are in vendor/ssl/COPYING and
+vendor/lwt_ssl/COPYING. Per-library license files are also kept alongside each
+vendored source tree.
 
 
 ================================================================================

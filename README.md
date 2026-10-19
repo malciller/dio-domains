@@ -81,6 +81,15 @@ Latency and allocation are observable through every phase of the cycle:
   descheduling that per-domain GC counters miss.
 - Per-cycle GC counters attribute a spike to collector activity or to CPU work.
 
+## Dependencies
+
+Every OCaml library used by the engine, exchange adapters, dashboard and tests
+is built from source in [`vendor/`](vendor/README.md). The only OCaml library
+still taken from opam is the audited `secp256k1` signing library. OpenSSL and
+libffi remain system/native libraries, and the OxCaml compiler and Dune remain
+toolchain dependencies. `vendor/README.md` lists versions, licenses and the
+patches applied to each vendored tree.
+
 ## Strategy files
 
 Each entry in `config.json` names a strategy, for example

@@ -33,8 +33,9 @@ let get_api_credentials_from_env () : (string * string) Lwt.t =
     API error arrays, or unexpected response structure. Uses [Kraken_common_types.sign]
     for HMAC-SHA512 nonce-based request authentication. *)
 let get_token () : string Lwt.t =
-  get_api_credentials_from_env ()
-  >>= fun (api_key, api_secret) ->
+  Kraken_common_types.with_private_request (fun () ->
+    get_api_credentials_from_env ()
+    >>= fun (api_key, api_secret) ->
   let path = "/0/private/GetWebSocketsToken" in
   let nonce = Kraken_common_types.nonce () in
   let body_str = "nonce=" ^ nonce in
@@ -74,5 +75,5 @@ let get_token () : string Lwt.t =
        | `String token -> Lwt.return token
        | _ ->
          error_f ~section "Unexpected response format: %s" (Yojson.Safe.to_string json);
-         Lwt.fail_with "Invalid Kraken API response"))
+         Lwt.fail_with "Invalid Kraken API response")))
 ;;

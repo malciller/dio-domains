@@ -33,3 +33,5 @@
 (subdir engine/persistence)
 
 (subdir external/discord)
+
+(subdir external/ws_lwt)

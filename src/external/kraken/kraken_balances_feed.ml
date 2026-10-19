@@ -706,12 +706,13 @@ let get_pending_sell_qty base_asset =
 let poll_earn_allocations () =
   let endpoint = "https://api.kraken.com" in
   let fetch_once () =
-    Lwt.catch
-      (fun () ->
-        Kraken_get_fee.get_api_credentials_from_env ()
-        >>= fun (api_key, api_secret) ->
-        let path = "/0/private/Earn/Allocations" in
-        let nonce = Kraken_common_types.nonce () in
+    Kraken_common_types.with_private_request (fun () ->
+      Lwt.catch
+        (fun () ->
+          Kraken_get_fee.get_api_credentials_from_env ()
+          >>= fun (api_key, api_secret) ->
+          let path = "/0/private/Earn/Allocations" in
+          let nonce = Kraken_common_types.nonce () in
         let encoded_body =
           Uri.encoded_of_query [ "nonce", [ nonce ]; "hide_zero_allocations", [ "true" ] ]
         in
@@ -742,13 +743,18 @@ let poll_earn_allocations () =
         then
           Lwt.return
             (Error (Printf.sprintf "Earn/Allocations HTTP %d: %s" status body_str))
+        else if Error_handling.string_contains body_str "EAPI:Invalid nonce"
+        then Lwt.return (Error "Earn/Allocations EAPI:Invalid nonce")
         else Lwt.return (Ok body_str))
-      (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
+      (fun exn -> Lwt.return (Error (Printexc.to_string exn))))
   in
   Error_handling.retry_with_backoff
     ~section
     ~config:Error_handling.default_retry_config
     ~f:fetch_once
+    ~is_retriable_override:(fun err ->
+      Error_handling.is_retriable_error err
+      || Error_handling.string_contains err "Invalid nonce")
     ()
   >>= function
   | Ok body_str ->

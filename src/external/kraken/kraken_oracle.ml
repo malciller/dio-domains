@@ -30,9 +30,9 @@ let post_signed
   ~(api_secret : string)
   ~(path : string)
   ~(body : string)
+  ~(nonce : string)
   : (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
   =
-  let nonce = Kraken_common_types.nonce () in
   let signature = Kraken_common_types.sign ~secret:api_secret ~path ~body ~nonce in
   let headers =
     Cohttp.Header.of_list
@@ -303,13 +303,15 @@ let parse_balances (json : Yojson.Safe.t) : ((string * float * float) list, stri
 ;;
 
 let fetch_balances ~testnet:_ : ((string * float * float) list, string) result Lwt.t =
-  Lwt.catch
-    (fun () ->
-      Kraken_generate_auth_token.get_api_credentials_from_env ()
-      >>= fun (api_key, api_secret) ->
-      let path = "/0/private/Balance" in
-      let body = "nonce=" ^ Kraken_common_types.nonce () in
-      post_signed ~api_key ~api_secret ~path ~body
+  Kraken_common_types.with_private_request (fun () ->
+    Lwt.catch
+      (fun () ->
+        Kraken_generate_auth_token.get_api_credentials_from_env ()
+        >>= fun (api_key, api_secret) ->
+        let path = "/0/private/Balance" in
+        let nonce = Kraken_common_types.nonce () in
+        let body = "nonce=" ^ nonce in
+        post_signed ~api_key ~api_secret ~path ~body ~nonce
       >>= fun (response, response_body) ->
       Cohttp_lwt.Body.to_string response_body
       >|= fun body ->
@@ -321,7 +323,7 @@ let fetch_balances ~testnet:_ : ((string * float * float) list, string) result L
         | exn ->
           Error
             (Printf.sprintf "Kraken response parse failed: %s" (Printexc.to_string exn))))
-    (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
+      (fun exn -> Lwt.return (Error (Printexc.to_string exn))))
 ;;
 
 (** Live websocket-fed balance snapshot: the authenticated balances WS feed (the engine

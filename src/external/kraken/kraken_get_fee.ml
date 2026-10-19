@@ -46,8 +46,9 @@ let get_api_credentials_from_env () : (string * string) Lwt.t =
     converts them to decimal fractions (0.26 -> 0.0026). Returns [None] on HTTP error, API
     error, missing pair data, or parse failure. *)
 let get_fee_info symbol : fee_info option Lwt.t =
-  Lwt.catch
-    (fun () ->
+  Kraken_common_types.with_private_request (fun () ->
+    Lwt.catch
+      (fun () ->
       get_api_credentials_from_env ()
       >>= fun (api_key, api_secret) ->
       let path = "/0/private/TradeVolume" in
@@ -154,13 +155,13 @@ let get_fee_info symbol : fee_info option Lwt.t =
                   symbol
                   pair_key;
                 Lwt.return_none)))
-    (fun exn ->
-      Logging.error_f
-        ~section
-        "Failed to fetch account fees for %s: %s"
-        symbol
-        (Printexc.to_string exn);
-      Lwt.return_none)
+      (fun exn ->
+        Logging.error_f
+          ~section
+          "Failed to fetch account fees for %s: %s"
+          symbol
+          (Printexc.to_string exn);
+        Lwt.return_none))
 ;;
 
 (** Maps [get_fee_info] over a list of symbols sequentially, returning an association list

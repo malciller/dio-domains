@@ -2,5 +2,4 @@
  (name ibkr)
  (public_name dio.ibkr)
  (libraries dio.data_structures lwt lwt.unix logging threads dio.concurrency dio.exchange)
- (preprocess
-  (pps lwt_ppx)))
+)

@@ -2066,16 +2066,21 @@ let asset_domain_worker
             in
             let base = [ "book", book; "oracle", oracle; "gate", gate ] in
             if latency_this_cycle
-            then
+            then (
+              (* On idle cycles [strat_end_ns] is never stamped (it is zero), so do not
+                 subtract it from [t1]: STRAT is zero and TOTAL is the PREP span. *)
+              let strat_ns = if should_execute then t4 - !t3_strategy else 0 in
+              let total_end_ns = if should_execute then t4 else !t3_strategy in
+              let total_ns = total_end_ns - t1 in
               base
               @ [ ( "lat"
                   , Printf.sprintf
                       "ob %s · prep %s · strat %s · total %s"
                       (us (t2 - t1))
                       (us (!t3_strategy - t3))
-                      (us (t4 - !t3_strategy))
-                      (us (t4 - t1)) )
-                ]
+                      (us strat_ns)
+                      (us total_ns) )
+                ])
             else base));
       (* Blocks until a producer signals new data or data is ready. Uses the cached
          has_exec_fn closure to avoid a Hashtbl lookup. [wait_since] returns immediately

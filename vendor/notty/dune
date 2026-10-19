@@ -1,0 +1,7 @@
+(library
+ (name notty)
+ (public_name notty-community)
+ (wrapped false)
+ (modules notty notty_grapheme_cluster notty_uucp notty_uucp_data)
+ (private_modules notty_grapheme_cluster notty_uucp notty_uucp_data)
+ (libraries uutf))

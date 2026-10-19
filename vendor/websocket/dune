@@ -1,0 +1,6 @@
+(library
+ (name websocket)
+ (public_name websocket)
+ (wrapped false)
+ (modules websocket)
+ (libraries base64 cohttp digestif lwt uri))

@@ -118,6 +118,13 @@ COPY --from=builder /app/strategies /app/strategies
 #     libraries; the opam manifest is generated from the exact build switch.
 COPY THIRD_PARTY_LICENSES third_party/ /usr/share/licenses/dio/
 COPY --from=builder /app/opam-packages.txt /usr/share/licenses/dio/opam-packages.txt
+RUN mkdir -p /usr/share/licenses/dio/vendor
+COPY vendor/README.md /usr/share/licenses/dio/
+COPY vendor/base64/LICENSE vendor/ctypes/LICENSE vendor/integers/LICENSE.md \
+     vendor/lwt/LICENSE.md vendor/lwt_ssl/COPYING vendor/mtime/LICENSE.md \
+     vendor/msgpck/LICENSE.md vendor/notty/LICENSE.md vendor/ssl/COPYING \
+     vendor/uutf/LICENSE.md vendor/yojson/LICENSE.md \
+     /usr/share/licenses/dio/vendor/
 
 # 5d. Starter kit. Lets someone with only the image create a working setup
 #     without cloning the repository.

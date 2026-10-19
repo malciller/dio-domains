@@ -1,0 +1,4 @@
+(library
+ (name base64)
+ (public_name base64)
+ (modules base64))
