@@ -4,8 +4,10 @@
 
 ; dio.opam is maintained by hand: the application's OCaml dependencies now live
 ; in vendor/ and are separate in-tree packages, so auto-generating opam files
-; would emit one package per vendored library. No external OCaml library is
-; required; libsecp256k1 remains a native system dependency.
+; would emit one package per vendored library. No external runtime OCaml
+; library is required; dune and dune-configurator are build tools (the latter
+; drives the in-tree ssl/secp256k1 discovery rules), and libsecp256k1 remains a
+; native system dependency.
 (generate_opam_files false)
 
 (source
@@ -25,6 +27,7 @@
  (depends
   ocaml
   dune
+  dune-configurator
   (odoc :with-doc))
  (tags
   ("trading" "finance" "multicore" "ocaml" "domains")))
