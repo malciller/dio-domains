@@ -253,6 +253,9 @@ let process_market_data json =
                        "Failed to parse spotState entry: %s"
                        (Printexc.to_string exn)) balances
           with | _ -> () in
+        (* The oracle sizes against this spot view. A new frame is a capital input; the
+           oracle re-reads the store on its own thread. *)
+        Concurrency.Oracle_wakeup.notify_balance ();
         notify_ready ()
     | _ -> ()
 let _processor_task =

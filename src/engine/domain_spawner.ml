@@ -297,7 +297,10 @@ let asset_domain_worker
        failed cancel leaves the pool permanently short. *)
     let reclaim_cancel_issued = ref false in
     let reclaim_cancel_at = ref 0.0 in
-    let reclaim_retry_seconds = 15.0 in
+    (* Watchdog only: the normal reclaim path is the cancel's terminal execution event,
+       which clears [eligible] and re-arms the latch on the same cycle. This bound only
+       covers a dispatch that produced no event at all. *)
+    let reclaim_retry_seconds = 1.0 in
     (* One-shot warning: startup-window-elapsed withhold messages fire at most once per
        domain (see the closed-gate branch below). *)
     let no_signal_warned = ref false in
@@ -860,18 +863,8 @@ let asset_domain_worker
                match event.order_status with
                | Types.Canceled | Types.Rejected | Types.Expired ->
                  should_execute_strategy := true;
-                 (* A canceled/rejected/expired order changes the live pool: notify the
-                    capital oracle with released committed capital (a canceled BUY returns
-                    remaining_qty x limit price) so it re-sizes in-process without a
-                    network wait. *)
-                 Oracle_runtime.notify_order_cancel
-                   ~exchange:asset_with_fees.exchange
-                   ~symbol:asset_with_fees.symbol
-                   ~testnet:asset_with_fees.testnet
-                   ~side:event.side
-                   ~value:
-                     (event.remaining_qty *. Option.value event.limit_price ~default:0.0)
-                   ~event_time:event.venue_time;
+                 (* The venue feed publishes the terminal event to the capital oracle's
+                    execution ring directly; no domain-cycle hop. *)
                  let side =
                    match event.side with
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
@@ -911,22 +904,8 @@ let asset_domain_worker
                      ()
                | Types.Filled ->
                  should_execute_strategy := true;
-                 (* A fill consumes/returns quote: notify the capital oracle with the pool
-                    delta so it re-sizes the asset and the account's priority order
-                    in-process, without a network balance refresh (lock-free, microsecond
-                    wake). *)
-                 Oracle_runtime.notify_fill
-                   ~exchange:asset_with_fees.exchange
-                   ~symbol:asset_with_fees.symbol
-                   ~testnet:asset_with_fees.testnet
-                   ~side:event.side
-                   ~filled_qty:event.filled_qty
-                   ~avg_price:event.avg_price
-                   ~fee:
-                     (Option.value asset_with_fees.maker_fee ~default:0.001
-                      *. event.filled_qty
-                      *. event.avg_price)
-                   ~event_time:event.venue_time;
+                 (* The venue feed publishes the fill to the capital oracle's execution
+                    ring directly; no domain-cycle hop. *)
                  let side =
                    match event.side with
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy

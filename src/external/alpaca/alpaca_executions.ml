@@ -128,7 +128,9 @@ module SymbolExecStore = struct
     let snapshot = Hashtbl.fold (fun _ o acc -> o :: acc) t.open_orders [] in
     Atomic.set t.open_orders_cache snapshot;
     Atomic.incr t.open_orders_generation;
-    Atomic.incr orders_generation
+    Atomic.incr orders_generation;
+    (* Claim edge: allocation sizes against resting buys. *)
+    Concurrency.Oracle_wakeup.notify_orders ()
   ;;
 
   (** Record an order whose state changed, for delta consumption by the strategy. [Some o]
@@ -190,7 +192,8 @@ module SymbolExecStore = struct
     publish_open_orders_cache t;
     Mutex.unlock t.mutex;
     (* Per-symbol wakeup; only this symbol's domain consumes its exec events. *)
-    Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
+    Concurrency.Exchange_wakeup.signal ~symbol:t.symbol;
+    Concurrency.Oracle_wakeup.notify_exec ()
   ;;
 
   let set_open_orders_snapshot t orders =

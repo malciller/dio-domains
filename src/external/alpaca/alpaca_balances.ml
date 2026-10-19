@@ -157,12 +157,29 @@ let update_balances () =
       acc.cash
       acc.equity
       acc.portfolio_value;
+    let prev_balances = Atomic.get balances in
+    let prev_available = Atomic.get available_balances in
     Atomic.set balances new_balances;
     Atomic.set total_balances new_total;
     Atomic.set available_balances new_available;
     Atomic.set position_marks new_marks;
     Atomic.set initial_data_received true;
     Atomic.set last_update (Unix.time ());
+    (* Alpaca has no balance push, so this poll is the acquisition edge. Notify only when
+       the published figure actually moved; the oracle re-reads the live table. *)
+    let changed
+      key
+      (before : (string, float) Hashtbl.t)
+      (after : (string, float) Hashtbl.t)
+      =
+      match Hashtbl.find_opt before key, Hashtbl.find_opt after key with
+      | Some a, Some b -> a <> b
+      | None, None -> false
+      | _ -> true
+    in
+    if changed "USD" prev_balances new_balances
+       || changed "USD" prev_available new_available
+    then Concurrency.Oracle_wakeup.notify_balance ();
     Concurrency.Exchange_wakeup.signal_all ();
     Lwt.return_unit
   | Error err ->

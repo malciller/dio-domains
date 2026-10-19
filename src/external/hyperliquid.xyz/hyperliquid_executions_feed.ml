@@ -171,7 +171,8 @@ let publish_open_orders_cache store =
     Hashtbl.fold (fun _id order acc -> order :: acc) store.open_orders [] in
   Atomic.set store.open_orders_cache snapshot;
   Atomic.incr store.open_orders_generation;
-  Atomic.incr orders_generation[@@inline ]
+  Atomic.incr orders_generation;
+  Concurrency.Oracle_wakeup.notify_orders ()[@@inline ]
 let get_orders_generation_for_symbol symbol =
   match Ds.Cow_table.find_opt stores symbol with
   | Some store -> Atomic.get store.open_orders_generation
@@ -449,6 +450,7 @@ let update_orders_internal_locked ?user_ref store (event : execution_event) =
      RingBuffer.write store.events_buffer event;
      notify_ready store;
      Concurrency.Exchange_wakeup.signal ~symbol:(event.symbol);
+     Concurrency.Oracle_wakeup.notify_exec ();
      `None)
   else
     (let index_action = ref `None in
@@ -536,6 +538,7 @@ let update_orders_internal_locked ?user_ref store (event : execution_event) =
      RingBuffer.write store.events_buffer event;
      notify_ready store;
      Concurrency.Exchange_wakeup.signal ~symbol:(event.symbol);
+     Concurrency.Oracle_wakeup.notify_exec ();
      !index_action)[@@ocaml.doc
                      " Core order-state transition handler. Updates [open_orders], writes the event to the\n    ring buffer, and signals the domain. Handles terminal removal, amendment-blacklist\n    filtering, and userref recovery.\n\n    Caller must hold [store.orders_mutex]. The full read-modify-write (plus buffer write\n    and wakeup) runs under the caller's lock, so a merged event computed from table state\n    (userFills Trade path) is atomic. Returns a deferred [order_to_symbol] action to apply\n    after unlock, avoiding nested orders_mutex -> order_index_mutex acquisition. "]
 let update_orders_internal ?user_ref store (event : execution_event) =
