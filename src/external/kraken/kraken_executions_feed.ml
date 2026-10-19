@@ -299,8 +299,6 @@ let[@inline] publish_open_orders_cache store =
   Atomic.set store.open_orders_cache snapshot;
   Atomic.incr orders_generation;
   Atomic.set orders_snapshot_at (Unix.gettimeofday ());
-  (* Claim edge: allocation sizes against resting buys, so a book change is an oracle
-     input even without a fill or terminal event. *)
   Concurrency.Oracle_wakeup.notify_orders ()
 ;;
 

@@ -209,10 +209,7 @@ let test_pending_delta_kept_when_venue_cannot_confirm () =
 ;;
 
 let test_partial_fill_delta_is_incremental () =
-  (* Venue execution events carry a CUMULATIVE filled_qty. Applying the terminal event's
-     raw figure after a partial event would count the partial twice and overstate the
-     quote the oracle believes it has. Only the delta since the previous event may move
-     the pool. *)
+  (* filled_qty is cumulative: only the delta since the previous event may move the pool. *)
   let event ~order_id ~status ~filled =
     { Dio_exchange.Exchange_intf.Types.order_id
     ; order_status = status
