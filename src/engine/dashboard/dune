@@ -15,5 +15,4 @@
   dio.supervisor
   dio.cmc)
  (modules Dashboard_server Dashboard_state)
- (preprocess
-  (pps lwt_ppx)))
+)

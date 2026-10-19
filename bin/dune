@@ -22,8 +22,7 @@
   lwt
   supervisor
   mirage-crypto-rng.unix)
- (preprocess
-  (pps lwt_ppx)))
+)
 
 (executable
  (package dio)

@@ -2,7 +2,11 @@
 
 (name dio)
 
-(generate_opam_files true)
+; dio.opam is maintained by hand: the application's OCaml dependencies now live
+; in vendor/ and are separate in-tree packages, so auto-generating opam files
+; would emit one package per vendored library. Only the native secp256k1
+; dependency remains in dio.opam.
+(generate_opam_files false)
 
 (source
  (github malciller/dio-domains))
@@ -21,31 +25,78 @@
  (depends
   ocaml
   dune
-  (yojson
-   (and
-    (>= 2.2.2)
-    (< 2.2.3)))
-  lwt
-  lwt_ppx
-  lwt_ssl
-  mirage-crypto-rng
-  (cohttp-lwt-unix
-   (< 6.0.0))
-  websocket
-  base64
-  digestif
-  uri
-  (conduit-lwt-unix
-   (< 8.0.0))
-  ipaddr
-  alcotest
-  mtime
   secp256k1
-  msgpck
-  ctypes
-  ctypes-foreign
-  notty-community)
+  (odoc :with-doc))
  (tags
   ("trading" "finance" "multicore" "ocaml" "domains")))
+
+; In-tree replacements for the OCaml libraries the engine used to take from
+; opam. The public names are kept identical so no application dune stanza or
+; source reference has to change.
+(package
+ (name lwt))
+
+(package
+ (name base64))
+
+(package
+ (name ssl))
+
+(package
+ (name lwt_ssl))
+
+(package
+ (name uri))
+
+(package
+ (name ipaddr))
+
+(package
+ (name cohttp))
+
+(package
+ (name cohttp-lwt))
+
+(package
+ (name cohttp-lwt-unix))
+
+(package
+ (name conduit-lwt-unix))
+
+(package
+ (name websocket))
+
+(package
+ (name uutf))
+
+(package
+ (name notty-community))
+
+(package
+ (name alcotest))
+
+(package
+ (name integers))
+
+(package
+ (name ctypes))
+
+(package
+ (name ctypes-foreign))
+
+(package
+ (name mtime))
+
+(package
+ (name yojson))
+
+(package
+ (name msgpck))
+
+(package
+ (name digestif))
+
+(package
+ (name mirage-crypto-rng))
 
 ; See the complete stanza docs at https://dune.readthedocs.io/en/stable/reference/dune-project/index.html

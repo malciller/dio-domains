@@ -1,5 +1,6 @@
-(** Health monitoring for supervised connections: the tick-driven monitor loop (ping/pong,
-    heartbeat, backoff reconnection) and the non-active asset subscription monitor. *)
+[@@@ocaml.text
+  " Health monitoring for supervised connections: the tick-driven monitor loop (ping/pong,\n\
+  \    heartbeat, backoff reconnection) and the non-active asset subscription monitor. "]
 
 open Lwt.Infix
 open Supervisor_types
@@ -7,14 +8,29 @@ open Supervisor_connection
 
 let section = "supervisor"
 
-(** Tick-driven health monitor. Subscribes to the tick event bus and checks all registered
-    connections at most once per second. Implements:
-    - Exponential backoff reconnection for [Failed] connections (0s..30s, up to 300s for
-      IBKR and Lighter)
-    - Stale disconnect detection (60s idle in [Disconnected] state)
-    - Stuck-connecting timeout (120s)
-    - Active ping/pong liveness for authenticated WebSockets
-    - Passive data-heartbeat timeout for market data feeds *)
+(** Case-insensitive substring test, used for rate-limit classification without pulling
+    the error-handling module into the supervisor. *)
+let contains_substring haystack needle =
+  let haystack_len = String.length haystack in
+  let needle_len = String.length needle in
+  let rec loop i =
+    i + needle_len <= haystack_len
+    && (String.sub haystack i needle_len = needle || loop (i + 1))
+  in
+  needle_len = 0 || loop 0
+;;
+
+(** Kraken enforces a 15-minute cooldown after a 429. Retrying on the normal 30-second
+    supervisor backoff keeps resetting that timer, so use a rate-limit-specific delay. *)
+let is_kraken_rate_limited name reason =
+  let is_kraken = String.length name >= 7 && String.sub name 0 7 = "kraken_" in
+  let reason = String.lowercase_ascii reason in
+  is_kraken
+  && (contains_substring reason "429"
+      || contains_substring reason "too many requests"
+      || contains_substring reason "rate limit")
+;;
+
 let monitor_loop () =
   let cycle_count = ref 0 in
   let last_market_open = ref (Ibkr.Market_hours.is_market_open ()) in
@@ -23,415 +39,389 @@ let monitor_loop () =
     if Atomic.get shutdown_requested
     then Lwt.return_unit
     else (
-      let%lwt () = Lwt_unix.sleep 1.0 in
-      if Atomic.get shutdown_requested
-      then Lwt.return_unit
-      else (
-        let current_time = Unix.time () in
-        try
-          incr cycle_count;
-          let current_open = Ibkr.Market_hours.is_market_open () in
-          let current_status = Ibkr.Market_hours.market_status_string () in
-          (* Force IBKR reconnect only on closed→open transitions; moves between closed
-             sub-states (weekend, pre-market, after-hours) must not trigger reconnect
-             spam. *)
-          if (not !last_market_open) && current_open
-          then (
+      let __ppx_lwt_0 = Lwt_unix.sleep 1.0 in
+      Lwt.backtrace_bind
+        "src/engine/supervisor/supervisor_health.ml"
+        26
+        (fun exn ->
+          try Lwt.reraise exn with
+          | exn -> exn)
+        __ppx_lwt_0
+        (fun () ->
+          if Atomic.get shutdown_requested
+          then Lwt.return_unit
+          else (
+            let current_time = Unix.time () in
             try
-              let ibkr_conn =
-                match Supervisor_types.find_connection "ibkr_gateway" with
-                | Some c -> c
-                | None -> raise Not_found
-              in
-              let ibkr_state = get_state ibkr_conn in
-              match ibkr_state with
-              | Connected ->
-                (* Live during pre-market: tear down and reconnect for fresh market-data
-                   streams. *)
-                Logging.info_f
-                  ~section
-                  "Market status transitioned: %s. Forcing IBKR gateway reconnect to \
-                   renew streams."
-                  current_status;
-                ignore (restart ibkr_conn)
-              | _ ->
-                (* connect_fn is already reconnecting (e.g. waking from market-closed
-                   sleep), or the monitor's Failed handler will pick it up. A forced
-                   restart here would spawn a duplicate connect_fn: two concurrent TCP
-                   connections racing on the same clientId cause interleaved End_of_file
-                   errors. *)
-                Logging.info_f
-                  ~section
-                  "Market status transitioned: %s. IBKR gateway is %s; existing \
-                   reconnect will handle."
-                  current_status
-                  (match ibkr_state with
-                   | Connecting -> "connecting"
-                   | Failed r -> Printf.sprintf "failed (%s)" r
-                   | Disconnected -> "disconnected"
-                   | _ -> "unknown")
-            with
-            | Not_found ->
-              Logging.info_f ~section "Market status transitioned: %s." current_status)
-          else if !last_market_status <> current_status
-          then Logging.info_f ~section "Market status changed: %s" current_status;
-          last_market_open := current_open;
-          last_market_status := current_status;
-          Mutex.lock registry_mutex;
-          let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in
-          Mutex.unlock registry_mutex;
-          List.iter
-            (fun conn ->
-              if Atomic.get shutdown_requested then () else Mutex.lock conn.mutex;
-              let state = conn.state in
-              let attempts = conn.reconnect_attempts in
-              let last_disconnected = conn.last_disconnected in
-              let last_connecting = conn.last_connecting in
-              let last_data_received = conn.last_data_received in
-              let has_connect_fn = Option.is_some conn.connect_fn in
-              Mutex.unlock conn.mutex;
-              match state, has_connect_fn with
-              | Failed reason, true ->
-                (* Re-read state under lock to prevent a TOCTOU race *)
-                Mutex.lock conn.mutex;
-                let current_state = conn.state in
-                Mutex.unlock conn.mutex;
-                if current_state <> Connecting
-                then
-                  (* IBKR market-hours gate: skip reconnection outside US equity extended
-                     hours (4 AM - 8 PM ET). The connect_fn sleeps until the next open
-                     window, so there is nothing for the monitor to do. *)
-                  if (String.equal conn.name "ibkr_gateway"
-                      && not (Ibkr.Market_hours.is_market_open ()))
-                     || ((String.equal conn.name "alpaca_data_ws"
-                          || String.equal conn.name "alpaca_trading_ws")
-                         && not (Alpaca.Market_hours.is_market_open ()))
-                  then () (* Market closed; suppress reconnection *)
-                  else (
-                    (* Exponential backoff: 0s, 2s, 4s, 8s, ... capped at 30s (300s for
-                       IBKR and Lighter) *)
-                    let max_delay =
-                      if String.equal conn.name "ibkr_gateway"
-                         || String.equal conn.name "lighter_ws"
-                      then 300.0
-                      else 30.0
-                    in
-                    let delay =
-                      if attempts <= 1
-                      then
-                        if String.equal conn.name "alpaca_data_ws"
-                           || String.equal conn.name "alpaca_trading_ws"
-                        then 2.0
-                        else 0.0
-                      else min max_delay (2.0 ** Float.of_int (attempts - 1))
-                    in
+              incr cycle_count;
+              let current_open = Ibkr.Market_hours.is_market_open () in
+              let current_status = Ibkr.Market_hours.market_status_string () in
+              if (not !last_market_open) && current_open
+              then (
+                try
+                  let ibkr_conn =
+                    match Supervisor_types.find_connection "ibkr_gateway" with
+                    | Some c -> c
+                    | None -> raise Not_found
+                  in
+                  let ibkr_state = get_state ibkr_conn in
+                  match ibkr_state with
+                  | Connected ->
+                    Logging.info_f
+                      ~section
+                      "Market status transitioned: %s. Forcing IBKR gateway reconnect to \
+                       renew streams."
+                      current_status;
+                    ignore (restart ibkr_conn)
+                  | _ ->
+                    Logging.info_f
+                      ~section
+                      "Market status transitioned: %s. IBKR gateway is %s; existing \
+                       reconnect will handle."
+                      current_status
+                      (match ibkr_state with
+                       | Connecting -> "connecting"
+                       | Failed r -> Printf.sprintf "failed (%s)" r
+                       | Disconnected -> "disconnected"
+                       | _ -> "unknown")
+                with
+                | Not_found ->
+                  Logging.info_f ~section "Market status transitioned: %s." current_status)
+              else if !last_market_status <> current_status
+              then Logging.info_f ~section "Market status changed: %s" current_status;
+              last_market_open := current_open;
+              last_market_status := current_status;
+              Mutex.lock registry_mutex;
+              let conn_list = Hashtbl.to_seq_values connections |> List.of_seq in
+              Mutex.unlock registry_mutex;
+              List.iter
+                (fun conn ->
+                  if Atomic.get shutdown_requested then () else Mutex.lock conn.mutex;
+                  let state = conn.state in
+                  let attempts = conn.reconnect_attempts in
+                  let last_disconnected = conn.last_disconnected in
+                  let last_connecting = conn.last_connecting in
+                  let last_data_received = conn.last_data_received in
+                  let has_connect_fn = Option.is_some conn.connect_fn in
+                  Mutex.unlock conn.mutex;
+                  match state, has_connect_fn with
+                  | Failed reason, true ->
+                    Mutex.lock conn.mutex;
+                    let current_state = conn.state in
+                    Mutex.unlock conn.mutex;
+                    if current_state <> Connecting
+                    then
+                      if (String.equal conn.name "ibkr_gateway"
+                          && not (Ibkr.Market_hours.is_market_open ()))
+                         || ((String.equal conn.name "alpaca_data_ws"
+                              || String.equal conn.name "alpaca_trading_ws")
+                             && not (Alpaca.Market_hours.is_market_open ()))
+                      then ()
+                      else (
+                        let rate_limited = is_kraken_rate_limited conn.name reason in
+                        let max_delay =
+                          if String.equal conn.name "ibkr_gateway"
+                             || String.equal conn.name "lighter_ws"
+                          then 300.0
+                          else 30.0
+                        in
+                        let delay =
+                          if rate_limited
+                          then 930.0 +. Random.float 30.0
+                          else if attempts <= 1
+                          then
+                            if String.equal conn.name "alpaca_data_ws"
+                               || String.equal conn.name "alpaca_trading_ws"
+                            then 2.0
+                            else 0.0
+                          else min max_delay (2.0 ** Float.of_int (attempts - 1))
+                        in
+                        let should_reconnect =
+                          match last_disconnected with
+                          | Some t -> current_time -. t >= delay
+                          | None -> true
+                        in
+                        if should_reconnect
+                        then (
+                          Logging.info_f
+                            ~section
+                            "[%s] Backup auto-reconnecting after %.1fs backoff (reason: \
+                             %s)..."
+                            conn.name
+                            delay
+                            reason;
+                          start_async conn))
+                  | Disconnected, true ->
                     let should_reconnect =
                       match last_disconnected with
-                      | Some t -> current_time -. t >= delay
-                      | None -> true
+                      | Some t -> current_time -. t >= 60.0
+                      | None -> false
                     in
                     if should_reconnect
                     then (
-                      Logging.info_f
+                      Logging.warn_f
                         ~section
-                        "[%s] Backup auto-reconnecting after %.1fs backoff (reason: \
-                         %s)..."
-                        conn.name
-                        delay
-                        reason;
-                      start_async conn))
-              | Disconnected, true ->
-                (* A failure-free disconnect may be intentional. Restart only after 60s
-                   idle so graceful shutdown and manual disconnect are not disturbed. *)
-                let should_reconnect =
-                  match last_disconnected with
-                  | Some t -> current_time -. t >= 60.0
-                  | None -> false
-                in
-                if should_reconnect
-                then (
-                  Logging.warn_f
-                    ~section
-                    "[%s] Connection disconnected for >60s, restarting..."
-                    conn.name;
-                  start_async conn)
-              | Connecting, _ ->
-                let stuck_time =
-                  match last_connecting with
-                  | Some t -> current_time -. t
-                  | None -> 0.0 (* Defensive fallback *)
-                in
-                if stuck_time > 120.0
-                then (
-                  Logging.error_f
-                    ~section
-                    "[%s] Connection stuck in 'Connecting' state for %.0fs, restarting..."
-                    conn.name
-                    stuck_time;
-                  (* Re-check under mutex before forcing restart *)
-                  Mutex.lock conn.mutex;
-                  let current_state = conn.state in
-                  Mutex.unlock conn.mutex;
-                  if current_state = Connecting
-                  then (
-                    set_state conn Disconnected;
-                    (* IBKR market-hours gate: do not restart against a closed gateway;
-                       the monitor's Failed handler defers reconnection to the next market
-                       open. *)
-                    if (String.equal conn.name "ibkr_gateway"
-                        && not (Ibkr.Market_hours.is_market_open ()))
-                       || ((String.equal conn.name "alpaca_data_ws"
-                            || String.equal conn.name "alpaca_trading_ws")
-                           && not (Alpaca.Market_hours.is_market_open ()))
-                    then (
-                      Logging.info_f
-                        ~section
-                        "[%s] Market closed, deferring reconnection"
+                        "[%s] Connection disconnected for >60s, restarting..."
                         conn.name;
-                      set_state conn (Failed "Market closed"))
-                    else start_async conn))
-              | Connected, _ ->
-                (* Liveness: data (feed frames / app heartbeats) or a successful ping
-                   within the 60s silence threshold. A feed whose ping probe is broken
-                   (e.g. Kraken's public orderbook feed not echoing pongs) but that still
-                   streams data is healthy and must not be torn down on ping failures
-                   alone; the passive data-heartbeat backstop governs. *)
-                let data_fresh =
-                  match last_data_received with
-                  | Some t -> current_time -. t <= 60.0
-                  | None -> false
-                in
-                (* Active ping/pong liveness for authenticated connections. The Kraken
-                   public orderbook feed does not answer application-level pings; its
-                   liveness is governed solely by the passive data-heartbeat backstop. *)
-                if String.equal conn.name "kraken_auth_ws"
-                   || String.equal conn.name "hyperliquid_ws"
-                   || String.equal conn.name "lighter_ws"
-                   || String.equal conn.name "alpaca_data_ws"
-                   || String.equal conn.name "alpaca_trading_ws"
-                then (
-                  let should_ping =
-                    match conn.last_ping_sent with
-                    | None -> true (* First ping *)
-                    | Some last_ping ->
-                      current_time -. last_ping
-                      >= 15.0 (* 15s interval, under 30s server timeout *)
-                  in
-                  if should_ping
-                  then (
-                    conn.last_ping_sent <- Some current_time;
-                    Lwt.async (fun () ->
-                      let req_id = next_ping_req_id () in
-                      if String.equal conn.name "kraken_auth_ws"
-                      then
-                        Lwt.catch
-                          (fun () ->
-                            Kraken.Kraken_trading_client.send_ping
-                              ~req_id
-                              ~timeout_ms:10000
-                            >>= fun response ->
-                            if response.success
-                            then (
-                              Atomic.set conn.ping_failures 0;
-                              update_data_heartbeat conn;
-                              Lwt.return_unit)
-                            else (
-                              Logging.warn_f
-                                ~section
-                                "[%s] Ping failed: %s"
-                                conn.name
-                                (match response.error with
-                                 | Some e -> e
-                                 | None -> "unknown error");
-                              Atomic.incr conn.ping_failures;
-                              Lwt.return_unit))
-                          (fun exn ->
-                            Logging.warn_f
-                              ~section
-                              "[%s] Ping exception: %s"
-                              conn.name
-                              (Printexc.to_string exn);
-                            Atomic.incr conn.ping_failures;
-                            Lwt.return_unit)
-                      else if String.equal conn.name "hyperliquid_ws"
-                      then
-                        Lwt.catch
-                          (fun () ->
-                            Hyperliquid.Ws.send_ping ~req_id ~timeout_ms:5000
-                            >>= fun success ->
-                            if success
-                            then (
-                              Atomic.set conn.ping_failures 0;
-                              update_data_heartbeat conn;
-                              Lwt.return_unit)
-                            else (
-                              Logging.warn_f
-                                ~section
-                                "[%s] Ping failed (req_id: %d)"
-                                conn.name
-                                req_id;
-                              Atomic.incr conn.ping_failures;
-                              Lwt.return_unit))
-                          (fun exn ->
-                            Logging.warn_f
-                              ~section
-                              "[%s] Ping exception: %s"
-                              conn.name
-                              (Printexc.to_string exn);
-                            Atomic.incr conn.ping_failures;
-                            Lwt.return_unit)
-                      else if String.equal conn.name "lighter_ws"
-                      then
-                        Lwt.catch
-                          (fun () ->
-                            Lighter.Ws.send_ping ~req_id ~timeout_ms:5000
-                            >>= fun success ->
-                            if success
-                            then (
-                              Atomic.set conn.ping_failures 0;
-                              update_data_heartbeat conn;
-                              Lwt.return_unit)
-                            else (
-                              Logging.warn_f
-                                ~section
-                                "[%s] Ping failed (req_id: %d)"
-                                conn.name
-                                req_id;
-                              Atomic.incr conn.ping_failures;
-                              Lwt.return_unit))
-                          (fun exn ->
-                            Logging.warn_f
-                              ~section
-                              "[%s] Ping exception: %s"
-                              conn.name
-                              (Printexc.to_string exn);
-                            Atomic.incr conn.ping_failures;
-                            Lwt.return_unit)
-                      else if String.equal conn.name "alpaca_data_ws"
-                      then
-                        Lwt.catch
-                          (fun () ->
-                            Alpaca.Orderbook.send_ping ~req_id ~timeout_ms:5000
-                            >>= fun success ->
-                            if success
-                            then (
-                              Atomic.set conn.ping_failures 0;
-                              update_data_heartbeat conn;
-                              Lwt.return_unit)
-                            else (
-                              Logging.warn_f
-                                ~section
-                                "[%s] Ping failed (req_id: %d)"
-                                conn.name
-                                req_id;
-                              Atomic.incr conn.ping_failures;
-                              Lwt.return_unit))
-                          (fun exn ->
-                            Logging.warn_f
-                              ~section
-                              "[%s] Ping exception: %s"
-                              conn.name
-                              (Printexc.to_string exn);
-                            Atomic.incr conn.ping_failures;
-                            Lwt.return_unit)
-                      else if String.equal conn.name "alpaca_trading_ws"
-                      then
-                        Lwt.catch
-                          (fun () ->
-                            Alpaca.Executions.send_ping ~req_id ~timeout_ms:5000
-                            >>= fun success ->
-                            if success
-                            then (
-                              Atomic.set conn.ping_failures 0;
-                              update_data_heartbeat conn;
-                              Lwt.return_unit)
-                            else (
-                              Logging.warn_f
-                                ~section
-                                "[%s] Ping failed (req_id: %d)"
-                                conn.name
-                                req_id;
-                              Atomic.incr conn.ping_failures;
-                              Lwt.return_unit))
-                          (fun exn ->
-                            Logging.warn_f
-                              ~section
-                              "[%s] Ping exception: %s"
-                              conn.name
-                              (Printexc.to_string exn);
-                            Atomic.incr conn.ping_failures;
-                            Lwt.return_unit)
-                      else Lwt.return_unit));
-                  (* Check ping failures outside async to avoid mutex deadlock *)
-                  let ping_failures = Atomic.get conn.ping_failures in
-                  if ping_failures >= 3
-                  then
-                    if data_fresh
+                      start_async conn)
+                  | Connecting, _ ->
+                    let stuck_time =
+                      match last_connecting with
+                      | Some t -> current_time -. t
+                      | None -> 0.0
+                    in
+                    if stuck_time > 120.0
                     then (
-                      (* Ping probe broken but data is flowing: tolerate the failed pings
-                         and keep the feed. Tearing it down would churn a healthy
-                         connection (e.g. the Kraken public orderbook feed not echoing
-                         pongs while still streaming). Reset the counter so the failure
-                         re-asserts only if the feed also goes quiet. *)
-                      Atomic.set conn.ping_failures 0;
-                      Logging.debug_f
-                        ~section
-                        "[%s] %d consecutive ping failures but data is flowing; keeping \
-                         the connection (broken ping probe tolerated)"
-                        conn.name
-                        ping_failures)
-                    else (
                       Logging.error_f
                         ~section
-                        "[%s] Ping failed %d times and no data received, marking \
-                         connection as failed"
+                        "[%s] Connection stuck in 'Connecting' state for %.0fs, \
+                         restarting..."
                         conn.name
-                        ping_failures;
-                      set_state conn (Failed "ping timeout")));
-                (* Passive data-heartbeat backstop for all connected connections: a feed
-                   that stops producing data is failed after the 60s silence threshold,
-                   regardless of ping-probe health. Successful pings keep
-                   [last_data_received] fresh; for feeds without active ping probes (e.g.
-                   Kraken public orderbook) this is the sole liveness signal. *)
-                (match last_data_received with
-                 | Some last_data when current_time -. last_data > 60.0 ->
-                   if not (String.equal conn.name "ibkr_gateway")
-                   then (
-                     Logging.warn_f
-                       ~section
-                       "[%s] No data received for %.0fs, marking connection as failed"
-                       conn.name
-                       (current_time -. last_data);
-                     set_state conn (Failed "data timeout"))
-                 | _ -> ())
-              | _ -> ())
-            conn_list;
-          (* Spawn next iteration independently to sever Forward chain. *)
-          Lwt.async loop;
-          Lwt.return_unit
-        with
-        | exn ->
-          Logging.error_f
-            ~section
-            "Exception in monitor loop: %s"
-            (Printexc.to_string exn);
-          Logging.error_f ~section "Monitor loop continuing after exception...";
-          Lwt.async loop;
-          Lwt.return_unit))
+                        stuck_time;
+                      Mutex.lock conn.mutex;
+                      let current_state = conn.state in
+                      Mutex.unlock conn.mutex;
+                      if current_state = Connecting
+                      then (
+                        set_state conn Disconnected;
+                        if (String.equal conn.name "ibkr_gateway"
+                            && not (Ibkr.Market_hours.is_market_open ()))
+                           || ((String.equal conn.name "alpaca_data_ws"
+                                || String.equal conn.name "alpaca_trading_ws")
+                               && not (Alpaca.Market_hours.is_market_open ()))
+                        then (
+                          Logging.info_f
+                            ~section
+                            "[%s] Market closed, deferring reconnection"
+                            conn.name;
+                          set_state conn (Failed "Market closed"))
+                        else start_async conn))
+                  | Connected, _ ->
+                    let data_fresh =
+                      match last_data_received with
+                      | Some t -> current_time -. t <= 60.0
+                      | None -> false
+                    in
+                    if String.equal conn.name "kraken_auth_ws"
+                       || String.equal conn.name "hyperliquid_ws"
+                       || String.equal conn.name "lighter_ws"
+                       || String.equal conn.name "alpaca_data_ws"
+                       || String.equal conn.name "alpaca_trading_ws"
+                    then (
+                      let should_ping =
+                        match conn.last_ping_sent with
+                        | None -> true
+                        | Some last_ping -> current_time -. last_ping >= 15.0
+                      in
+                      if should_ping
+                      then (
+                        conn.last_ping_sent <- Some current_time;
+                        Lwt.async (fun () ->
+                          let req_id = next_ping_req_id () in
+                          if String.equal conn.name "kraken_auth_ws"
+                          then
+                            Lwt.catch
+                              (fun () ->
+                                Kraken.Kraken_trading_client.send_ping
+                                  ~req_id
+                                  ~timeout_ms:10000
+                                >>= fun response ->
+                                if response.success
+                                then (
+                                  Atomic.set conn.ping_failures 0;
+                                  update_data_heartbeat conn;
+                                  Lwt.return_unit)
+                                else (
+                                  Logging.warn_f
+                                    ~section
+                                    "[%s] Ping failed: %s"
+                                    conn.name
+                                    (match response.error with
+                                     | Some e -> e
+                                     | None -> "unknown error");
+                                  Atomic.incr conn.ping_failures;
+                                  Lwt.return_unit))
+                              (fun exn ->
+                                Logging.warn_f
+                                  ~section
+                                  "[%s] Ping exception: %s"
+                                  conn.name
+                                  (Printexc.to_string exn);
+                                Atomic.incr conn.ping_failures;
+                                Lwt.return_unit)
+                          else if String.equal conn.name "hyperliquid_ws"
+                          then
+                            Lwt.catch
+                              (fun () ->
+                                Hyperliquid.Ws.send_ping ~req_id ~timeout_ms:5000
+                                >>= fun success ->
+                                if success
+                                then (
+                                  Atomic.set conn.ping_failures 0;
+                                  update_data_heartbeat conn;
+                                  Lwt.return_unit)
+                                else (
+                                  Logging.warn_f
+                                    ~section
+                                    "[%s] Ping failed (req_id: %d)"
+                                    conn.name
+                                    req_id;
+                                  Atomic.incr conn.ping_failures;
+                                  Lwt.return_unit))
+                              (fun exn ->
+                                Logging.warn_f
+                                  ~section
+                                  "[%s] Ping exception: %s"
+                                  conn.name
+                                  (Printexc.to_string exn);
+                                Atomic.incr conn.ping_failures;
+                                Lwt.return_unit)
+                          else if String.equal conn.name "lighter_ws"
+                          then
+                            Lwt.catch
+                              (fun () ->
+                                Lighter.Ws.send_ping ~req_id ~timeout_ms:5000
+                                >>= fun success ->
+                                if success
+                                then (
+                                  Atomic.set conn.ping_failures 0;
+                                  update_data_heartbeat conn;
+                                  Lwt.return_unit)
+                                else (
+                                  Logging.warn_f
+                                    ~section
+                                    "[%s] Ping failed (req_id: %d)"
+                                    conn.name
+                                    req_id;
+                                  Atomic.incr conn.ping_failures;
+                                  Lwt.return_unit))
+                              (fun exn ->
+                                Logging.warn_f
+                                  ~section
+                                  "[%s] Ping exception: %s"
+                                  conn.name
+                                  (Printexc.to_string exn);
+                                Atomic.incr conn.ping_failures;
+                                Lwt.return_unit)
+                          else if String.equal conn.name "alpaca_data_ws"
+                          then
+                            Lwt.catch
+                              (fun () ->
+                                Alpaca.Orderbook.send_ping ~req_id ~timeout_ms:5000
+                                >>= fun success ->
+                                if success
+                                then (
+                                  Atomic.set conn.ping_failures 0;
+                                  update_data_heartbeat conn;
+                                  Lwt.return_unit)
+                                else (
+                                  Logging.warn_f
+                                    ~section
+                                    "[%s] Ping failed (req_id: %d)"
+                                    conn.name
+                                    req_id;
+                                  Atomic.incr conn.ping_failures;
+                                  Lwt.return_unit))
+                              (fun exn ->
+                                Logging.warn_f
+                                  ~section
+                                  "[%s] Ping exception: %s"
+                                  conn.name
+                                  (Printexc.to_string exn);
+                                Atomic.incr conn.ping_failures;
+                                Lwt.return_unit)
+                          else if String.equal conn.name "alpaca_trading_ws"
+                          then
+                            Lwt.catch
+                              (fun () ->
+                                Alpaca.Executions.send_ping ~req_id ~timeout_ms:5000
+                                >>= fun success ->
+                                if success
+                                then (
+                                  Atomic.set conn.ping_failures 0;
+                                  update_data_heartbeat conn;
+                                  Lwt.return_unit)
+                                else (
+                                  Logging.warn_f
+                                    ~section
+                                    "[%s] Ping failed (req_id: %d)"
+                                    conn.name
+                                    req_id;
+                                  Atomic.incr conn.ping_failures;
+                                  Lwt.return_unit))
+                              (fun exn ->
+                                Logging.warn_f
+                                  ~section
+                                  "[%s] Ping exception: %s"
+                                  conn.name
+                                  (Printexc.to_string exn);
+                                Atomic.incr conn.ping_failures;
+                                Lwt.return_unit)
+                          else Lwt.return_unit));
+                      let ping_failures = Atomic.get conn.ping_failures in
+                      if ping_failures >= 3
+                      then
+                        if data_fresh
+                        then (
+                          Atomic.set conn.ping_failures 0;
+                          Logging.debug_f
+                            ~section
+                            "[%s] %d consecutive ping failures but data is flowing; \
+                             keeping the connection (broken ping probe tolerated)"
+                            conn.name
+                            ping_failures)
+                        else (
+                          Logging.error_f
+                            ~section
+                            "[%s] Ping failed %d times and no data received, marking \
+                             connection as failed"
+                            conn.name
+                            ping_failures;
+                          set_state conn (Failed "ping timeout")));
+                    (match last_data_received with
+                     | Some last_data when current_time -. last_data > 60.0 ->
+                       if not (String.equal conn.name "ibkr_gateway")
+                       then (
+                         Logging.warn_f
+                           ~section
+                           "[%s] No data received for %.0fs, marking connection as failed"
+                           conn.name
+                           (current_time -. last_data);
+                         set_state conn (Failed "data timeout"))
+                     | _ -> ())
+                  | _ -> ())
+                conn_list;
+              Lwt.async loop;
+              Lwt.return_unit
+            with
+            | exn ->
+              Logging.error_f
+                ~section
+                "Exception in monitor loop: %s"
+                (Printexc.to_string exn);
+              Logging.error_f ~section "Monitor loop continuing after exception...";
+              Lwt.async loop;
+              Lwt.return_unit)))
   in
   Lwt.async loop
+[@@ocaml.doc
+  " Tick-driven health monitor. Subscribes to the tick event bus and checks all registered\n\
+  \    connections at most once per second. Implements:\n\
+  \    - Exponential backoff reconnection for [Failed] connections (0s..30s, up to 300s \
+   for\n\
+  \      IBKR and Lighter)\n\
+  \    - Stale disconnect detection (60s idle in [Disconnected] state)\n\
+  \    - Stuck-connecting timeout (120s)\n\
+  \    - Active ping/pong liveness for authenticated WebSockets\n\
+  \    - Passive data-heartbeat timeout for market data feeds "]
 ;;
 
-(** Scans all exchanges every 10s for non-configured assets with a positive balance and
-    subscribes their orderbook feeds, enabling portfolio valuation for held-but-not-traded
-    assets. *)
 let monitor_non_active_assets () =
   let subscribed_symbols : (string, float) Hashtbl.t = Hashtbl.create 16 in
   let rec loop () =
     if Atomic.get shutdown_requested
     then Lwt.return_unit
     else
-      (* 10s polling interval *)
       Lwt_unix.sleep 10.0
       >>= fun () ->
       if Atomic.get shutdown_requested
@@ -517,11 +507,6 @@ let monitor_non_active_assets () =
                       if (not is_configured) && not is_quote
                       then (
                         let target_key = exch_name ^ ":" ^ symbol in
-                        (* Presence, not freshness: a thin book can go quiet for minutes,
-                           and treating staleness as "unsubscribed" re-subscribed every
-                           15s, drawing Kraken's "Already subscribed" dedup reply in a
-                           loop. Resubscribe only when no book has arrived yet, or once
-                           per reconnect. *)
                         let has_book = Ex.has_orderbook_data ~symbol in
                         let now = Unix.gettimeofday () in
                         let needs_sub =
@@ -552,9 +537,13 @@ let monitor_non_active_assets () =
                 else Lwt.return_unit))
           exchange_names
         >>= fun () ->
-        (* Sever promise chain to prevent Forward node accumulation. *)
         Lwt.async loop;
         Lwt.return_unit)
   in
   Lwt.async loop
+[@@ocaml.doc
+  " Scans all exchanges every 10s for non-configured assets with a positive balance and\n\
+  \    subscribes their orderbook feeds, enabling portfolio valuation for \
+   held-but-not-traded\n\
+  \    assets. "]
 ;;

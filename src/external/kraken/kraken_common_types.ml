@@ -88,6 +88,35 @@ let nonce () : string =
   Int64.to_string (bump ())
 ;;
 
+(** Serialises private REST requests.
+
+    A monotonic nonce is necessary but not sufficient: Kraken remembers the highest nonce
+    seen for the API key, so if two concurrent requests are sent out of order, the lower
+    nonce is rejected with [EAPI:Invalid nonce]. Holding this lock from nonce generation
+    until the response has been read guarantees the requests reach Kraken in the order
+    their nonces were generated. The critical section spans an async request and Lwt may
+    resume the fiber on a different domain, so this uses an [Atomic] spin lock rather than
+    a [Mutex]: an OS mutex must be unlocked by the same thread that locked it, which is
+    not guaranteed across an Lwt context switch. *)
+let private_requests_lock = Atomic.make false
+
+let rec acquire_private_request_lock () =
+  if Atomic.compare_and_set private_requests_lock false true
+  then Lwt.return_unit
+  else Lwt.bind (Lwt_unix.sleep 0.001) acquire_private_request_lock
+;;
+
+let release_private_request_lock () = Atomic.set private_requests_lock false
+
+let with_private_request (f : unit -> 'a Lwt.t) : 'a Lwt.t =
+  Lwt.bind (acquire_private_request_lock ()) (fun () ->
+    Lwt.finalize
+      (fun () -> Lwt_unix.with_timeout 30.0 f)
+      (fun () ->
+        release_private_request_lock ();
+        Lwt.return_unit))
+;;
+
 (** Normalizes a base64 or base64url encoded secret string. Strips whitespace, converts
     base64url characters (- and _) to standard base64 (+ and /), and appends padding as
     required. Raises [Failure] if the input is empty. *)

@@ -11,8 +11,9 @@
 # Build:
 #   docker build -f Dockerfile.base -t dio-oxcaml-base:5.2.0minus40 .
 #
-# Rebuild only when a dependency changes: dio.opam/dune-project, the patch
-# overlay in oxcaml-port/opam-overlay, or the compiler version below.
+# Rebuild only when a dependency changes: dio.opam/dune-project or the compiler
+# version below. The application's OCaml libraries are built from vendor/ by
+# the app image, not by this base image.
 # ────────────────────────────────────────────────────────────────────────────────
 FROM ocaml/opam:ubuntu-22.04-ocaml-5.2@sha256:a7c27c2aace22d97190092a4c3810b665c9c6a9bc420f202e65ac706932f034d
 ENV QEMU_CPU=host
@@ -20,17 +21,15 @@ ENV QEMU_CPU=host
 USER root
 
 # 1. System dependencies (build-time C header libraries & tools)
+#    libffi is for ctypes; libssl is for the vendored ssl bindings; the rest
+#    are for building libsecp256k1 and native OCaml stubs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     m4 \
     g++ \
     make \
     libffi-dev \
-    libgmp-dev \
-    libpcre3-dev \
     libssl-dev \
-    libpq-dev \
-    zlib1g-dev \
     autoconf \
     automake \
     libtool \
@@ -76,27 +75,18 @@ RUN eval $(opam env) \
     && opam list --installed --short | grep -qi 'oxcaml' \
     && ocamlopt -config-var version
 
-# 3c. Register the local patch overlay.
-#     dio-ox is given rank 2 and the OxCaml repo rank 1, so dio-ox outranks the
-#     default repo: a `+dioN` patch then wins over the unpatched release of the
-#     same version, while `+ox` packages from the OxCaml repo still resolve.
-COPY --chown=opam:opam oxcaml-port/opam-overlay /app/oxcaml-port/opam-overlay
-RUN eval $(opam env) \
-    && opam repo add dio-ox file:///app/oxcaml-port/opam-overlay --rank=2 \
-    && opam repo list
+# 3c. The in-tree OCaml libraries under vendor/ replaced the patched opam
+#     overlay. No local opam repository is needed; the switch's `ox` and
+#     `default` repositories are sufficient for the remaining native
+#     dependency (secp256k1).
 
 # 4. Copy project descriptors (needed for dependency resolution)
 COPY --chown=opam:opam dio.opam dune-project ./
 
-# 5. Install OCaml dependencies.
-#    lwt_ppx must be pinned for this (OxCaml) build: the repo also has
-#    5.9.1+ox, built against an older ppxlib AST (fails with "Pexp_let expects
-#    4 argument(s)"); 6.0.0+ox is matched to ppxlib 0.33.0+ox. Pinned here rather
-#    than in dio.opam because the same constraint on the classic toolchain forces
-#    ppxlib >= 0.36, which conflicts with conduit-lwt-unix < 3. The compiler
-#    version is fixed at switch creation (3a), not here, so
-#    this layer never recompiles the compiler.
+# 5. Install the remaining OCaml dependency.
+#    Every application OCaml library now lives under vendor/ and is built by
+#    dune from this source tree. secp256k1 is intentionally kept as the audited
+#    native signing library.
 RUN --mount=type=cache,target=/home/opam/.opam/download-cache,uid=1000,gid=1000 \
     eval $(opam env) \
-    && opam pin add -y --no-action lwt_ppx 6.0.0+ox \
     && opam install -y -j $(nproc) . --deps-only --with-test --no-depexts

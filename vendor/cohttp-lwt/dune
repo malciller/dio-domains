@@ -1,0 +1,6 @@
+(library
+ (name cohttp_lwt)
+ (public_name cohttp-lwt)
+ (wrapped false)
+ (modules cohttp_lwt)
+ (libraries cohttp lwt))

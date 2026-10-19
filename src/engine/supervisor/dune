@@ -23,5 +23,4 @@
   dio.lighter
   dio.alpaca
   dio.concurrency)
- (preprocess
-  (pps lwt_ppx)))
+)

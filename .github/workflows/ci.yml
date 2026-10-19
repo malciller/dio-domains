@@ -122,7 +122,6 @@ jobs:
         run: |
           fingerprint=$( {
             cat Dockerfile.base dio.opam dune-project
-            find oxcaml-port/opam-overlay -type f -print0 | sort -z | xargs -0 -r cat
           } | sha256sum | awk '{print $1}' )
           if docker image inspect "$DIO_BASE_IMAGE" \
                --format '{{ index .Config.Labels "dio.base.fingerprint" }}' 2>/dev/null \

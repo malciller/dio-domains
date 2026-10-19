@@ -59,8 +59,9 @@ let resolve_symbol ~symbols pair =
 ;;
 
 let get_open_orders ~symbols () : Kraken_executions_feed.execution_event list Lwt.t =
-  Lwt.catch
-    (fun () ->
+  Kraken_common_types.with_private_request (fun () ->
+    Lwt.catch
+      (fun () ->
       Kraken_get_fee.get_api_credentials_from_env ()
       >>= fun (api_key, api_secret) ->
       let path = "/0/private/OpenOrders" in
@@ -175,7 +176,7 @@ let get_open_orders ~symbols () : Kraken_executions_feed.execution_event list Lw
             "Retrieved %d total open orders via REST (Bypassed WS 50-order cap)"
             (List.length parsed_orders);
           Lwt.return parsed_orders))
-    (fun exn ->
-      Logging.error_f ~section "Failed to fetch OpenOrders: %s" (Printexc.to_string exn);
-      Lwt.return [])
+      (fun exn ->
+        Logging.error_f ~section "Failed to fetch OpenOrders: %s" (Printexc.to_string exn);
+        Lwt.return []))
 ;;
