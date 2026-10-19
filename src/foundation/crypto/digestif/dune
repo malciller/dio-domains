@@ -1,0 +1,16 @@
+(library
+ (name digestif)
+ (public_name dio.digestif)
+ (wrapped false)
+ (modules digestif))
+
+; The application links [digestif.c] (the accelerated implementation in the
+; upstream package). This in-tree implementation is pure OCaml, so [digestif.c]
+; is an alias that pulls in the same [Digestif] module. Keeping both names means
+; no existing dune stanza has to change.
+(library
+ (name digestif_c)
+ (public_name dio.digestif.c)
+ (wrapped false)
+ (libraries dio.digestif)
+ (modules))

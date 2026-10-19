@@ -1,6 +1,0 @@
-(library
- (name cohttp_lwt_unix)
- (public_name cohttp-lwt-unix)
- (wrapped false)
- (modules cohttp_lwt_unix)
- (libraries cohttp cohttp-lwt conduit-lwt-unix ipaddr ipaddr.unix lwt.unix uri))

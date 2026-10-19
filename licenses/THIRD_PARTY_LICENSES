@@ -1,0 +1,255 @@
+THIRD PARTY LICENSES
+====================
+
+dio-domains is distributed as source (this repository) and as a container image.
+The image bundles third-party software. This file lists what is shipped, the
+license of each component, and where the full license text can be found.
+
+The image includes this file and the referenced texts under
+/usr/share/licenses/dio/, together with a manifest of every installed
+OCaml/opam package (name, version, license) at 
+/usr/share/licenses/dio/opam-packages.txt, generated from the build switch.
+
+
+================================================================================
+1. OCaml / OxCaml runtime
+================================================================================
+
+The dio and dio-dashboard executables are compiled with, and statically link,
+the OCaml runtime (libasmrun) from OxCaml, Jane Street's fork of OCaml. The
+image is built with the 5.2.0+ox switch (ocaml-variants.5.2.0+ox,
+oxcaml-compiler.5.2.0minus40).
+
+License: the OCaml Core System (files marked "Copyright INRIA") is distributed
+under the GNU Lesser General Public License, version 2.1, with the standard
+OCaml linking exception. That exception permits linking the Core System into an
+executable and distributing the result under terms of your choice, without the
+additional requirements of LGPL clause 6. Files marked "Copyright Jane Street"
+and not "Copyright INRIA" are distributed under the MIT license.
+
+Full text: third_party/OCaml-LICENSE (the upstream OxCaml LICENSE, containing
+the linking exception and the complete LGPL-2.1 and MIT texts).
+
+Source: https://github.com/oxcaml/oxcaml
+
+
+================================================================================
+2. Bundled native libraries
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1 lighter-go (Lighter Transaction Signer)
+--------------------------------------------------------------------------------
+
+The following precompiled shared libraries are built from the lighter-go SDK
+and distributed in this repository:
+
+  - native/lighter-signer-darwin-arm64.dylib  (macOS ARM64)
+  - native/lighter-signer-linux-amd64.so      (Linux x86_64)
+
+Source:  https://github.com/elliottech/lighter-go
+License: Apache License, Version 2.0
+
+Copyright 2024 Elliot Technologies Ltd
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--------------------------------------------------------------------------------
+2.2 libsecp256k1 (Bitcoin Core)
+--------------------------------------------------------------------------------
+
+Compiled from source and distributed inside the runtime Docker image for OCaml
+fast cryptographic operations.
+
+Source:  https://github.com/bitcoin-core/secp256k1
+License: MIT License
+
+Copyright (c) 2013 Pieter Wuille
+Copyright (c) 2013-2022 The secp256k1 contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+
+================================================================================
+3. OCaml sources in this repository
+================================================================================
+
+No third-party OCaml source is vendored, copied, or derived. Every OCaml
+library listed in section 4 is an original implementation written for dio and
+is covered by this repository's LICENSE. The only third-party software in the
+build is the native set described in sections 2 and 5 and the compiler
+toolchain described in section 1.
+
+================================================================================
+4. In-tree OCaml libraries
+================================================================================
+
+These libraries are built from source in this repository (src/foundation/) and
+statically linked into dio, dio-dashboard and dio-oracle. No OCaml library is
+linked from opam; the compiler runtime is the external toolchain component.
+The remaining native dependencies are libsecp256k1, OpenSSL and the prebuilt
+Lighter Go signer, covered in section 2 and used through bindings under
+src/foundation/crypto/.
+
+The libraries are: dio.lwt, dio.lwt.unix, dio.digestif, dio.base64,
+dio.mtime, dio.msgpck, dio.yojson, dio.json_scan, dio.uutf, dio.uri,
+dio.ipaddr, dio.conduit-lwt-unix, dio.cohttp, dio.cohttp-lwt,
+dio.cohttp-lwt-unix, dio.websocket, alcotest, dio.mirage-crypto-rng,
+dio.notty, dio.ssl, dio.lwt_ssl, dio.secp256k1 and dio.lighter_ffi.
+
+The secp256k1 binding in src/foundation/crypto/secp256k1 and the Go-signer binding in
+src/foundation/crypto/lighter_ffi are original code written for dio. The native
+libsecp256k1 and the prebuilt Lighter Go signer are covered in section 2. The
+alcotest harness is test-only and is not installed.
+
+Build-, test-, and documentation-only dependencies that are not shipped:
+dune (MIT), dune-configurator (MIT), odoc (ISC).
+
+Full texts: MIT, ISC, BSD-2-Clause and BSD-3-Clause are in section 6.
+
+
+================================================================================
+5. Container base OS and runtime system libraries
+================================================================================
+
+Build base image: Ubuntu 22.04 LTS (ocaml/opam, pinned by digest).
+Runtime image: Ubuntu 24.04 LTS (pinned by digest).
+
+Runtime packages installed into the image: libssl3t64, libstdc++6, libgcc-s1,
+libjemalloc2, ca-certificates, netbase. libsecp256k1 is built from source in the
+base stage and copied into the runtime image (section 2.2). The Go Lighter
+signer is the prebuilt shared library described in section 2.1.
+
+These are unmodified Ubuntu packages. Each package's copyright and license text
+is installed by the distribution at /usr/share/doc/<package>/copyright inside
+the image. Principal licenses:
+
+  libssl3t64       Apache-2.0
+  libstdc++6       GPL-3.0-or-later with GCC runtime exception
+  libgcc-s1        GPL-3.0-or-later with GCC runtime exception
+  libjemalloc2     BSD-2-Clause
+  ca-certificates  MPL-2.0
+  netbase          GPL-2.0
+
+
+================================================================================
+6. Full license texts
+================================================================================
+
+--------------------------------------------------------------------------------
+MIT License
+--------------------------------------------------------------------------------
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+ISC License
+--------------------------------------------------------------------------------
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+
+--------------------------------------------------------------------------------
+BSD 2-Clause License
+--------------------------------------------------------------------------------
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+--------------------------------------------------------------------------------
+BSD 3-Clause License
+--------------------------------------------------------------------------------
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

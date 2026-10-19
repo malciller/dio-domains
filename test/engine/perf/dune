@@ -4,13 +4,13 @@
   dio.strategies
   dio.engine
   dio.latency_profiling
-  mtime
-  mtime.clock.os
+  dio.mtime
+  dio.mtime.clock.os
   unix))
 
 (executable
  (name gc_hammer)
- (libraries dio.latency_profiling mtime unix))
+ (libraries dio.latency_profiling dio.mtime unix))
 
 (executable
  (name sync_alloc_profile)
@@ -18,7 +18,7 @@
 
 (executable
  (name cycle_alloc_profile)
- (libraries dio.strategies dio.engine mtime mtime.clock.os unix))
+ (libraries dio.strategies dio.engine dio.mtime dio.mtime.clock.os unix))
 
 (executable
  (name intern_contention)
@@ -29,9 +29,9 @@
  (deps
   (universe)
   %{exe:bench.exe}
-  (alias ../../external/cmc/runtest)
-  (alias ../../external/hyperliquid/runtest)
-  (alias ../../external/kraken/runtest)
+  (alias ../../integrations/market_data/coinmarketcap/runtest)
+  (alias ../../integrations/venues/hyperliquid/runtest)
+  (alias ../../integrations/venues/kraken/runtest)
   (alias ../config/runtest)
   (alias ../order_executor/runtest)
   (alias ../order_executor/order_cache/runtest)

@@ -1,0 +1,5 @@
+(library
+ (name uutf)
+ (public_name dio.uutf)
+ (wrapped false)
+ (modules uutf))

@@ -1,6 +1,0 @@
-(library
- (name notty)
- (public_name notty-community)
- (wrapped false)
- (modules notty)
- (libraries uutf))

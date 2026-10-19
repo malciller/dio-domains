@@ -1,0 +1,24 @@
+(library
+ (name lighter)
+ (public_name dio.lighter)
+ (libraries
+  dio.data_structures
+  dio.yojson
+  dio.lwt
+  dio.lwt.unix
+  logging
+  dio.cohttp-lwt-unix
+  dio.uri
+  threads
+  dio.websocket
+  dio.ws_lwt
+  dio.conduit-lwt-unix
+  dio.ipaddr.unix
+  dio.lighter_ffi
+  dio.mtime
+  dio.mtime.clock.os
+  concurrency
+  dio.exchange
+  dio.error_handling
+  dio.latency_profiling)
+)

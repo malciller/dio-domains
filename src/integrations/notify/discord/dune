@@ -1,0 +1,5 @@
+(library
+ (name discord)
+ (public_name dio.discord)
+ (libraries dio.yojson dio.lwt dio.lwt.unix dio.cohttp-lwt-unix logging concurrency)
+)

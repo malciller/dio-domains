@@ -1,0 +1,6 @@
+(library
+ (name lwt_unix)
+ (public_name dio.lwt.unix)
+ (synopsis "Unix support for Lwt")
+ (wrapped false)
+ (libraries bigarray dio.lwt threads unix))

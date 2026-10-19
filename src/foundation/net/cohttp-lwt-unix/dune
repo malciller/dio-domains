@@ -1,0 +1,6 @@
+(library
+ (name cohttp_lwt_unix)
+ (public_name dio.cohttp-lwt-unix)
+ (wrapped false)
+ (modules cohttp_lwt_unix)
+ (libraries dio.cohttp dio.cohttp-lwt dio.conduit-lwt-unix dio.ipaddr dio.ipaddr.unix dio.lwt.unix dio.uri))

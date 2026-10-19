@@ -1,0 +1,22 @@
+(library
+ (name alpaca)
+ (public_name dio.alpaca)
+ (libraries
+  dio.data_structures
+  dio.yojson
+  dio.lwt
+  dio.lwt.unix
+  dio.cohttp-lwt-unix
+  dio.websocket
+  dio.ws_lwt
+  dio.mtime
+  dio.mtime.clock.os
+  logging
+  dio.uri
+  threads
+  concurrency
+  dio.exchange
+  dio.error_handling
+  dio.json_scan
+  dio.latency_profiling)
+)

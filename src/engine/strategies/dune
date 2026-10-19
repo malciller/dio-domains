@@ -17,17 +17,16 @@
  (public_name dio.strategies)
  (libraries
   dio.data_structures
-  yojson
+  dio.yojson
   logging
   flow_log
   dio.persistence
+  dio.exchange
   dio.kraken
-  dio.hyperliquid
-  dio.lighter
   dio.latency_profiling
   dio.concurrency
-  lwt
-  lwt.unix
+  dio.lwt
+  dio.lwt.unix
   unix)
  (modules
   ; core/ — legacy reference decision engine

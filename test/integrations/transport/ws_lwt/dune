@@ -1,0 +1,12 @@
+(test
+ (name test_ws_lwt)
+ (libraries
+  dio.ws_lwt
+  dio.websocket
+  dio.conduit-lwt-unix
+  dio.ipaddr
+  dio.ipaddr.unix
+  dio.lwt.unix
+  dio.uri
+  dio.digestif
+  dio.base64))

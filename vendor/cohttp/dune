@@ -1,6 +1,0 @@
-(library
- (name cohttp)
- (public_name cohttp)
- (wrapped false)
- (modules cohttp)
- (libraries uri))

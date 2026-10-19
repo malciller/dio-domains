@@ -2,10 +2,10 @@
  (name dio_dashboard)
  (public_name dio.dashboard)
  (libraries
-  yojson
+  dio.yojson
   logging
-  lwt
-  lwt.unix
+  dio.lwt
+  dio.lwt.unix
   dio.engine
   dio.oracle
   dio.strategies
@@ -13,6 +13,8 @@
   dio.concurrency
   dio.exchange
   dio.supervisor
-  dio.cmc)
+  dio.cmc
+  dio.ibkr
+  dio.alpaca)
  (modules Dashboard_server Dashboard_state)
 )

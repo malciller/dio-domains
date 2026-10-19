@@ -1,0 +1,13 @@
+(library
+ (name mtime)
+ (public_name dio.mtime)
+ (modules mtime))
+
+(library
+ (name mtime_clock)
+ (public_name dio.mtime.clock.os)
+ (modules mtime_clock)
+ (libraries dio.mtime)
+ (foreign_stubs
+  (language c)
+  (names mtime_clock_stubs)))

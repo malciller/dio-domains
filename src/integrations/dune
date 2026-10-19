@@ -1,0 +1,5 @@
+(library
+ (name dio_exchange)
+ (public_name dio.exchange)
+ (libraries dio.lwt dio.error_handling)
+ (modules Exchange_intf))

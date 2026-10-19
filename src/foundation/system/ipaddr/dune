@@ -1,0 +1,12 @@
+(library
+ (name ipaddr)
+ (public_name dio.ipaddr)
+ (wrapped false)
+ (modules ipaddr))
+
+(library
+ (name ipaddr_unix)
+ (public_name dio.ipaddr.unix)
+ (wrapped false)
+ (modules ipaddr_unix)
+ (libraries dio.ipaddr unix))

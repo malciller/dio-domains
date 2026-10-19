@@ -1,0 +1,6 @@
+(library
+ (name cmc)
+ (public_name dio.cmc)
+ (libraries dio.yojson dio.cohttp-lwt-unix dio.lwt dio.lwt.unix logging)
+
+ (modules Fear_and_greed))

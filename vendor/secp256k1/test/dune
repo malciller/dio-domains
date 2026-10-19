@@ -1,3 +1,0 @@
-(test
- (name test_secp256k1)
- (libraries secp256k1 digestif))

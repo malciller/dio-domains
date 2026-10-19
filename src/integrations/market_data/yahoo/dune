@@ -1,0 +1,13 @@
+(library
+ (name yahoo)
+ (public_name dio.yahoo)
+ (libraries
+  dio.data_structures
+  unix
+  dio.yojson
+  dio.lwt
+  dio.lwt.unix
+  dio.cohttp-lwt-unix
+  dio.uri
+  dio.logging
+  dio.exchange))

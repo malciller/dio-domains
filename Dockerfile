@@ -54,7 +54,7 @@ FROM builder AS lighter_signer
 ARG INCLUDE_LIGHTER_SIGNER=0
 RUN mkdir -p /app/signer-out \
     && if [ "$INCLUDE_LIGHTER_SIGNER" = "1" ]; then \
-         cp /app/lighter-signer-linux-amd64.so /app/signer-out/; \
+         cp /app/native/lighter-signer-linux-amd64.so /app/signer-out/; \
        fi
 
 # ==============================================================================
@@ -68,7 +68,7 @@ RUN mkdir -p /app/signer-out \
 FROM ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254 AS runtime
 
 # 3. Runtime shared libraries only. Kept to what the engine actually links:
-#    `ldd /usr/local/bin/dio` -> jemalloc, secp256k1, ffi, ssl/crypto, stdc++,
+#    `ldd /usr/local/bin/dio` -> jemalloc, secp256k1, ssl/crypto, stdc++,
 #    gcc_s, m, c. gmp/pcre/pq/zlib are NOT linked and are deliberately omitted
 #    here; libpq5 in particular drags in krb5/ldap/gnutls. libssl is named
 #    libssl3t64 on 24.04 (the 64-bit time_t rename).
@@ -116,9 +116,9 @@ COPY --from=builder /app/strategies /app/strategies
 
 # 5c. Third-party license notices. Required by the licenses of the bundled
 #     libraries; the opam manifest is generated from the exact build switch.
-COPY THIRD_PARTY_LICENSES third_party/ /usr/share/licenses/dio/
+COPY licenses/ /usr/share/licenses/dio/
 COPY --from=builder /app/opam-packages.txt /usr/share/licenses/dio/opam-packages.txt
-COPY vendor/README.md /usr/share/licenses/dio/
+COPY src/foundation/README.md /usr/share/licenses/dio/foundation-README.md
 
 # 5d. Starter kit. Lets someone with only the image create a working setup
 #     without cloning the repository.

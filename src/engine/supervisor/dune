@@ -13,7 +13,7 @@
  (libraries
   logging
   threads
-  lwt.unix
+  dio.lwt.unix
   dio.engine
   dio.oracle
   dio.strategies

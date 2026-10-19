@@ -1,0 +1,6 @@
+(library
+ (name cohttp)
+ (public_name dio.cohttp)
+ (wrapped false)
+ (modules cohttp)
+ (libraries dio.uri))

@@ -1,5 +1,0 @@
-(library
- (name yojson)
- (public_name yojson)
- (wrapped false)
- (modules yojson))

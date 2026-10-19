@@ -1,9 +1,0 @@
-(library
- (name notty_unix)
- (public_name notty-community.unix)
- (wrapped false)
- (modules notty_unix)
- (libraries notty unix)
- (foreign_stubs
-  (language c)
-  (names winsize)))

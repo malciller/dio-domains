@@ -6,9 +6,11 @@ Send a PR if you want to fix something. A few notes so it goes smoothly.
 
 - dio trades real money. If your change touches sizing, execution, or hedging,
   explain how in an issue first.
-- No new dependencies unless there's a reason. New opam packages have to build
-  clean under OxCaml (the `build-test-oxcaml` CI job). The engine is OxCaml-only;
-  there is no stock-OCaml build.
+- No new external OCaml dependencies. Runtime support code belongs in
+  `src/foundation/` as a `dio.*` library. A new native or system dependency needs a
+  written rationale plus an entry in `licenses/THIRD_PARTY_LICENSES`. The engine
+  is OxCaml-only; there is no stock-OCaml build, and CI fails on any compiler
+  `Alert`.
 - No compiler alerts. The OxCaml test run fails on any `Alert` output.
 - Never commit `.env` or credentials. CI checks for this and fails the build.
 

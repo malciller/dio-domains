@@ -1,6 +1,0 @@
-(library
- (name conduit_lwt_unix)
- (public_name conduit-lwt-unix)
- (wrapped false)
- (modules conduit_lwt_unix)
- (libraries ipaddr lwt.unix lwt_ssl ssl unix))
