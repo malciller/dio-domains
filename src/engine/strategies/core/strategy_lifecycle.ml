@@ -146,14 +146,85 @@ let log_sell_block ?(kind = "") ~state ~now ~symbol reason =
       Logging.warn_f ~section "Sell placement blocked for %s: %s" symbol key))
 ;;
 
-(** Reconciles the in-memory position ledger to the venue balance feed.
+(** Total base in the buy-credit overlay. *)
+let buy_credit_total state =
+  List.fold_left (fun acc (_, q) -> acc +. q) 0.0 state.buy_credits_since_balance
+;;
 
-    A new venue balance message is authoritative for the base it reports, so
-    [position_base] is adopted outright (replacement, never a running sum - the failure
-    mode of the removed anticipated-credit overlay, which added fills on top of the venue
-    figure and could size a sell past [reserved_base]). Any buy credit the message's
-    generation time already covers is dropped from the overlay; newer credits stay, so a
-    just-filled buy remains sellable until the feed nets it. *)
+(** Records a buy credit the venue snapshot does not include yet. The first outstanding
+    credit anchors at the adopted figure; later credits stack for FIFO settlement. *)
+let arm_buy_credit ~state ~qty ~now =
+  if qty > 1e-12
+  then (
+    if state.buy_credits_since_balance = []
+    then state.credit_anchor <- state.position_base;
+    state.buy_credits_since_balance <- state.buy_credits_since_balance @ [ now, qty ])
+;;
+
+(** Retires credits FIFO against a real base movement (a venue snapshot reflecting the
+    fill, or the base being sold). Returns the amount consumed. [credit_anchor] advances
+    by the consumed qty so the remaining credits keep the correct settlement baseline. *)
+let consume_buy_credits ~state ~qty =
+  if qty <= 1e-12 || state.buy_credits_since_balance = []
+  then 0.0
+  else (
+    let budget = ref qty in
+    let rec go acc = function
+      | [] -> List.rev acc
+      | (ts, q) :: rest when !budget <= 1e-12 -> List.rev_append acc ((ts, q) :: rest)
+      | (ts, q) :: rest ->
+        let take = Float.min !budget q in
+        budget := !budget -. take;
+        state.credit_anchor <- state.credit_anchor +. take;
+        let left = q -. take in
+        if left > 1e-12 then List.rev_append acc ((ts, left) :: rest) else go acc rest
+    in
+    let before = buy_credit_total state in
+    state.buy_credits_since_balance <- go [] state.buy_credits_since_balance;
+    before -. buy_credit_total state)
+;;
+
+(** Retires the credits a venue snapshot proves it has incorporated: a snapshot at or
+    above [credit_anchor] covers the credits up to the rise above that anchor. *)
+let settle_buy_credits ~state ~snapshot =
+  if state.buy_credits_since_balance <> []
+  then (
+    let rise = snapshot -. state.credit_anchor in
+    if rise > 1e-12 then ignore (consume_buy_credits ~state ~qty:rise))
+;;
+
+(** Reconciles the position ledger to the venue balance feed.
+
+    The venue figure is authoritative, but it is sampled and delivered independently of
+    the execution feed, so arrival order is not fill order. Increases are adopted on every
+    cycle; that recovers a lost or reordered update on the next tick. Decreases are
+    adopted only for a new message: a lower figure is real (a sell, fees, or base moved to
+    staking/earn). Buy credits are retired when a snapshot covers them
+    ([settle_buy_credits]) or when the base is sold, not by age. *)
+let adopt_venue_balance ~state ~snapshot ~allow_drop ~gross_rise =
+  let current = state.position_base in
+  if snapshot >= current
+  then (
+    let rise = snapshot -. current in
+    (* Credits are base. On hold-netted venues a same-window sell hold can flatten the
+       tradeable rise, so the gross rise is what covers them. *)
+    let credit_rise = Float.max rise (Float.max 0.0 gross_rise) in
+    let credited = consume_buy_credits ~state ~qty:credit_rise in
+    let unexplained = Float.max 0.0 (credit_rise -. credited) in
+    if unexplained > 1e-12
+    then
+      state.attributed_balance_increase
+      <- Float.max 0.0 (state.attributed_balance_increase +. unexplained);
+    state.position_base <- snapshot)
+  else if allow_drop
+  then
+    (* A lower tradeable figure is real: base sold, fees, or base moved to staking/earn.
+       The reserve overhang is then simply not sellable; forcing the ledger up to it would
+       keep phantom inventory. *)
+    state.position_base <- snapshot
+  else settle_buy_credits ~state ~snapshot
+;;
+
 let reconcile_position ~state ~now ~base_balance_age ~asset_balance ~asset_gross =
   if not (Float.is_nan asset_balance)
   then (
@@ -175,98 +246,109 @@ let reconcile_position ~state ~now ~base_balance_age ~asset_balance ~asset_gross
       (* The venue gross read (module lookup + two balance atomics) is paid only when a
          message is actually adopted, not every cycle. *)
       let asset_gross = asset_gross () in
+      let was_initialized = state.position_initialized in
       (* Track how far the adopted figure moved since the last adoption. A positive move
          can already contain buy fills whose execution events have not arrived yet
          (executions and balances are independent feeds), so buy fills draw this down
          before entering the overlay - otherwise a balance message that arrives before its
          fill event is counted twice, once in [position_base] and once in the overlay, and
          a sell can size past the holdings. Deposits that arrive before their
-         (nonexistent) fill merely under-credit, which is the safe direction. *)
+         (nonexistent) fill merely under-credit, which is the safe direction; the
+         value-based settle below re-adopts any venue figure the ledger falls behind. *)
       let delta = asset_balance -. state.position_base in
-      let was_initialized = state.position_initialized in
-      (* Gross change of this message, when the venue exposes a gross total. [None] on the
-         first gross-bearing message (nothing to diff against) and when no gross is
-         available. *)
-      let gross_delta =
-        match asset_gross with
-        | Some g when was_initialized && not (Float.is_nan state.position_gross) ->
-          Some (g -. state.position_gross)
-        | _ -> None
-      in
-      if was_initialized
+      if not was_initialized
       then (
-        match gross_delta with
-        | Some d_gross ->
-          (* Gross basis: a buy fill raises gross, so attribute against gross - a
-             same-window sell hold cannot mask it. *)
-          state.attributed_balance_increase
-          <- Float.max 0.0 (state.attributed_balance_increase +. Float.max 0.0 d_gross);
-          (* A genuine hold move is the gross/tradeable gap changing: an application (hold
-             up) or a fill (hold down) both mean the venue has accounted for the committed
-             base. Retire armed holds by that magnitude. A flat tradeable with a matching
-             gross rise (buy fill + sell hold) therefore neither leaves the buy credit
-             unabsorbed nor the sell hold netted. *)
-          let d_hold = d_gross -. delta in
-          if abs_float d_hold > 1e-12
-          then consume_sell_hold_netting ~state ~amount:(abs_float d_hold)
-        | None ->
-          state.attributed_balance_increase
-          <- Float.max 0.0 (state.attributed_balance_increase +. delta);
-          (* A tradeable DROP is the venue netting holds (or base leaving): retire the
-             oldest outstanding sell holds by that amount. Buys only raise tradeable, so
-             they never consume a hold. *)
-          if delta < 0.0 then consume_sell_hold_netting ~state ~amount:(-.delta))
-      else state.attributed_balance_increase <- 0.0;
-      (* Direction of this message, consumed by [unnetted_sell_hold]: only a flat/down
-         move can have applied an outstanding sell hold. A buy-fill increase bumps the
-         same per-asset freshness timestamp but nets no hold, so it must not retire the
-         guard. First adoption seeds 0.0. *)
-      state.last_balance_delta <- (if was_initialized then delta else 0.0);
-      state.position_base <- asset_balance;
+        (* First message: there is no prior value to settle against. Drop credits this
+           snapshot post-dates (generation time), then anchor the survivors at the seed. *)
+        state.buy_credits_since_balance
+        <- List.filter (fun (ts, _) -> ts >= venue_ts) state.buy_credits_since_balance;
+        state.position_base <- asset_balance;
+        state.credit_anchor <- state.position_base;
+        state.attributed_balance_increase <- 0.0;
+        state.last_balance_delta <- 0.0)
+      else (
+        (* Gross change of this message, when the venue exposes a gross total. [None] when
+           no gross is available. *)
+        let gross_delta =
+          match asset_gross with
+          | Some g when not (Float.is_nan state.position_gross) ->
+            Some (g -. state.position_gross)
+          | _ -> None
+        in
+        let gross_rise =
+          match gross_delta with
+          | Some d -> Float.max 0.0 d
+          | None -> 0.0
+        in
+        (match gross_delta with
+         | Some d_gross ->
+           (* A genuine hold move is the gross/tradeable gap changing: an application
+              (hold up) or a fill (hold down) both mean the venue has accounted for the
+              committed base. Retire armed holds by that magnitude. A flat tradeable with
+              a matching gross rise (buy fill + sell hold) therefore neither leaves the
+              buy credit unabsorbed nor the sell hold netted. The rise itself is
+              attributed by [adopt_venue_balance] below, which adds any increase not
+              covered by pending buy credits to [attributed_balance_increase]. *)
+           let d_hold = d_gross -. delta in
+           if abs_float d_hold > 1e-12
+           then consume_sell_hold_netting ~state ~amount:(abs_float d_hold)
+         | None ->
+           (* A tradeable DROP is the venue netting holds (or base leaving): retire the
+              oldest outstanding sell holds by that amount. Buys only raise tradeable, so
+              they never consume a hold. *)
+           if delta < 0.0 then consume_sell_hold_netting ~state ~amount:(-.delta));
+        (* Direction of this message, consumed by [unnetted_sell_hold]: only a flat/down
+           move can have applied an outstanding sell hold. A buy-fill increase bumps the
+           same per-asset freshness timestamp but nets no hold, so it must not retire the
+           guard. *)
+        state.last_balance_delta <- delta;
+        adopt_venue_balance ~state ~snapshot:asset_balance ~allow_drop:true ~gross_rise);
       state.position_initialized <- true;
       (match asset_gross with
        | Some g ->
          state.position_gross <- g;
          state.balance_uses_gross <- true
        | None -> ());
-      state.position_venue_ts <- venue_ts;
-      (* Retire overlay credits the adopted increase already covers, oldest first, then
-         drop anything older than the message generation (belt and suspenders for a dead
-         feed). *)
-      let pool = ref state.attributed_balance_increase in
-      let consumed =
-        List.filter_map
-          (fun (ts, q) ->
-            if !pool <= 0.0
-            then Some (ts, q)
-            else (
-              let take = Float.min !pool q in
-              pool := !pool -. take;
-              let left = q -. take in
-              if left > 1e-12 then Some (ts, left) else None))
-          state.buy_credits_since_balance
-      in
-      state.attributed_balance_increase <- !pool;
-      let cutoff = unreflected_cutoff ~now ~base_balance_age in
-      state.buy_credits_since_balance
-      <- List.filter (fun (ts, _) -> ts >= cutoff) consumed))
+      state.position_venue_ts <- venue_ts)
+    else (
+      (* No new timestamp: a venue figure above the whole ledger means an earlier adoption
+         was lost or arrived stale. Adopt it; this branch only raises the ledger. *)
+      let ledger = state.position_base +. buy_credit_total state in
+      if asset_balance > ledger +. 1e-9
+      then (
+        let healed = asset_balance -. ledger in
+        if now -. state.last_balance_heal_log_at >= 10.0
+        then (
+          state.last_balance_heal_log_at <- now;
+          Logging.warn_f
+            ~section
+            "Ledger corrected for %s: venue %.8f > tracked %.8f (+%.8f, credits %.8f)"
+            state.duplicate_key_buy
+            asset_balance
+            ledger
+            healed
+            (buy_credit_total state));
+        adopt_venue_balance
+          ~state
+          ~snapshot:asset_balance
+          ~allow_drop:false
+          ~gross_rise:0.0)
+      else settle_buy_credits ~state ~snapshot:asset_balance))
 ;;
 
 (* Moved to Platform_accounting (milestone 2). Thin adapter keeps the grid's state field
    as the store; behavior is unchanged. *)
-(** Sum of buy-fill credits the balance feed has not yet netted: fills at/after the newest
-    balance message (or within the grace when the feed is silent). Entries are pruned so
-    the overlay cannot grow without bound, and the sum is added to [position_base] for
-    sizing. *)
-let unreflected_buy_credit ~state ~base_balance_age ~now =
-  let credits, sum =
-    Platform_accounting.unreflected_credit
-      ~credits:state.buy_credits_since_balance
-      ~now
-      ~base_balance_age
-  in
-  state.buy_credits_since_balance <- credits;
-  sum
+(** Sum of buy-fill credits not yet reflected in the venue figure. Retired by value
+    coverage or by a sale; see [settle_buy_credits]. *)
+let unreflected_buy_credit ~state ~base_balance_age:_ ~now:_ = buy_credit_total state
+
+(** Drains the resync request set during the cycle (ghost buy or dropped user frame). *)
+let take_resync_request ~state =
+  if state.needs_resync
+  then (
+    state.needs_resync <- false;
+    true)
+  else false
 ;;
 
 (** Venue-authoritative immediately-sellable base for [asset], read straight from the
@@ -1048,7 +1130,12 @@ let sync_open_orders
         p;
       state.last_buy_order_id <- None;
       state.last_buy_order_price <- None;
-      set_asset_reserved_quote state 0.0))
+      set_asset_reserved_quote state 0.0;
+      (* The buy left the book with no terminal event. Arm the owed sell and request a
+         balance/open-orders resync; the inventory gate blocks the sell if the order was
+         only canceled. *)
+      state.just_filled_buy <- true;
+      state.needs_resync <- true))
   else if (not state.inflight_cancel_buy)
           && (not state.inflight_buy)
           && not state.inflight_amend_buy

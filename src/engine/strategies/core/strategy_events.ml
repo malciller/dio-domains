@@ -681,9 +681,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
             <- Float.max 0.0 (state.attributed_balance_increase -. already_reflected);
             let pending = credit_qty -. already_reflected in
             if pending > 1e-12
-            then
-              state.buy_credits_since_balance
-              <- state.buy_credits_since_balance @ [ now, pending ];
+            then Strategy_lifecycle.arm_buy_credit ~state ~qty:pending ~now;
             Logging.debug_f
               ~section
               "Pending base credit for %s: +%.8f (already reflected: %.8f, unreflected \
@@ -815,6 +813,11 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
                    absorbs the netting. Gross-balance venues fall by the sold qty at fill. *)
                 not state.cached_ecfg.use_accumulation_sells
              then state.position_base <- Float.max 0.0 (state.position_base -. acc_qty);
+           (* Base that just sold may have been riding the unreflected-buy bridge: retire
+              it FIFO so the overlay cannot keep offering base that has already left the
+              account. *)
+           if acc_qty > 0.0 && not state.startup_replay
+           then ignore (Strategy_lifecycle.consume_buy_credits ~state ~qty:acc_qty);
            state.last_sell_fill_qty <- Some acc_qty;
            (* Spec-aligned sell fill: profit is measured against the LAST BUY fill (single
               local buy/sell cycle pair). The prior-sell cost basis and grid-spread

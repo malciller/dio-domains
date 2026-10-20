@@ -507,11 +507,28 @@ let asset_domain_worker
        balance message newer than the placement arrives (venue hold-netting is then
        included). *)
     let base_balance_age_fn = Ex.get_balance_age_fast ~asset:base_asset in
+    (* Absolute timestamp closure for the (value, timestamp) seqlock pair. *)
+    let base_balance_updated_at_fn = Ex.get_balance_updated_at_fast ~asset:base_asset in
+    let quote_balance_updated_at_fn =
+      Ex.get_balance_updated_at_fast ~asset:quote_currency
+    in
     (* Quote-balance snapshot age: resolved once (the accessor captures the per-asset
        store and locks the global balance-store registry at construction), so the
        per-cycle read is a bare closure call instead of a fresh closure + registry lock
        every cycle. *)
     let quote_balance_age_fn = Ex.get_balance_age_fast ~asset:quote_currency in
+    (* One consistent (value, timestamp) sample. [get_balance_updated_at_fast] moves
+       exactly when the store's tradeable figure changes, so it works as a seqlock
+       version: retry if a write lands between the value and the timestamp reads. *)
+    let sample_balance ~updated_at ~balance =
+      let rec go n =
+        let t0 = updated_at () in
+        let v = balance () in
+        let t1 = updated_at () in
+        if t0 = t1 || n >= 4 then v, t1 else go (n + 1)
+      in
+      go 0
+    in
     (* Cached closures for latency-sensitive feed access in the hot loop *)
     let get_ob_pos_fn = Ex.get_orderbook_position_fast ~symbol:asset_with_fees.symbol in
     let get_tob_fn = Ex.get_top_of_book_fast ~symbol:asset_with_fees.symbol in
@@ -1499,24 +1516,36 @@ let asset_domain_worker
         let iter_orders f = Ex.iter_open_orders_fast ~symbol:asset_with_fees.symbol f in
         (* Pass the iter_orders closure down directly, avoiding intermediate
            order-tracking list allocations (2-3ms STW pause) on the event path. *)
-        (* Fast-path balance access without hashtable locks. *)
-        let asset_bal_val =
-          match base_balance_fn () with
-          | bal -> bal
-          | exception _ -> nan
+        (* Fast-path balance access without hashtable locks. Value and freshness are
+           sampled as one pair: [get_balance_updated_at] moves exactly when the tradeable
+           figure changes, so it works as a seqlock version. Reading the two atomics
+           separately let a balance write land between them, pairing the old value with
+           the new timestamp; the strategy adopted that as a fresh message and dropped the
+           buy credit that should have funded the 1:1 sell. Retry on a version change. *)
+        let asset_bal_val, base_updated_at =
+          try
+            sample_balance ~updated_at:base_balance_updated_at_fn ~balance:base_balance_fn
+          with
+          | _ -> nan, None
         in
-        let quote_bal_val =
-          match quote_balance_fn () with
-          | bal -> bal
-          | exception _ -> nan
+        let quote_bal_val, quote_updated_at =
+          try
+            sample_balance
+              ~updated_at:quote_balance_updated_at_fn
+              ~balance:quote_balance_fn
+          with
+          | _ -> nan, None
         in
         (* Balance-snapshot staleness: a fresh quote balance is authoritative, so an
            under-funded buy is skipped; a stale snapshot may be wrong, so the grid
            attempts and lets the exchange decide. Unknown age (None) is treated as stale. *)
         let quote_balance_stale =
-          match quote_balance_age_fn () with
-          | Some age -> age > stale_balance_age_seconds
-          | None -> true
+          match quote_updated_at with
+          | Some ts -> Unix.gettimeofday () -. ts > stale_balance_age_seconds
+          | None ->
+            (match quote_balance_age_fn () with
+             | Some age -> age > stale_balance_age_seconds
+             | None -> true)
         in
         (* Trigger async Fear & Greed refresh on significant price movement *)
         if not (Float.is_nan !current_price)
@@ -1640,6 +1669,13 @@ let asset_domain_worker
         (* Wall-clock timestamp computed once per cycle for strategy use, eliminating
            gettimeofday syscalls inside the strategy. *)
         let now = Unix.gettimeofday () in
+        (* Age of the same (value, timestamp) sample the strategy sees, so [cg_abal] and
+           [cg_base_age] cannot disagree. *)
+        let base_age =
+          match base_updated_at with
+          | Some ts -> Some (Float.max 0.0 (now -. ts))
+          | None -> base_balance_age_fn ()
+        in
         (* Activity tick so the dashboard reports executions/sec and last-execution time
            even with zero latency samples this window. *)
         Latency_profiler.tick_exec prof_strategy ~now;
@@ -1693,7 +1729,7 @@ let asset_domain_worker
            ctx.cg_cycle <- !cycle_count;
            ctx.cg_quote_stale <- quote_balance_stale;
            ctx.cg_oracle_halted <- oracle_halted;
-           ctx.cg_base_age <- base_balance_age_fn ();
+           ctx.cg_base_age <- base_age;
            ctx.cg_gen <- Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol;
            ctx.cg_iter <- iter_orders;
            ctx.cg_drain <- Ex.drain_open_order_changes;
@@ -1722,6 +1758,13 @@ let asset_domain_worker
               grid (an unbound asset is not [is_grid_strategy]). The reference grid entry
               point is retired (M3). *)
            ());
+        (* A dropped user frame or a ghost buy leaves no terminal event. Ask the venue for
+           a fresh balance/open-orders snapshot; the next cycle reconciles from it. *)
+        (match cached_grid_state with
+         | Some s when Dio_strategies.Strategy_api.take_resync_request ~state:s ->
+           (try Ex.resync_market_state ~symbol:asset_with_fees.symbol () with
+            | _ -> ())
+         | _ -> ());
         strat_end_ns := if latency_this_cycle then Monotonic_clock.now_ns () else 0;
         alloc_strat_end
         := if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0;
@@ -1788,7 +1831,7 @@ let asset_domain_worker
                   (Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol) )
             ; "cycle", Dio_strategies.Strategy_expr.V_int !cycle_count
             ; ( "balance_age"
-              , match base_balance_age_fn () with
+              , match base_age with
                 | Some a -> Dio_strategies.Strategy_expr.V_float a
                 | None -> Dio_strategies.Strategy_expr.V_none )
             ];

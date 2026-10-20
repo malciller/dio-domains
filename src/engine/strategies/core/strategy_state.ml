@@ -358,10 +358,12 @@ type strategy_state =
          same-window sell hold is still attributed and cannot inflate sellable inventory. *)
   ; mutable buy_credits_since_balance : (float * float) list
       (* (fill wall-clock time, credited qty) for buy fills not yet reflected in the
-         balance feed, oldest first. Mirrors [sell_holds_since_balance]: entries at/after
-         the newest balance message are summed into the sizing inventory; older entries
-         are pruned. Bounds the bridge to the feed-lag window so it cannot persist and
-         overstate like the old accumulator. *)
+         balance feed, oldest first. Mirrors [sell_holds_since_balance]. Retired by value
+         coverage (see [credit_anchor]) or when the base is sold. *)
+  ; mutable credit_anchor : float
+      (* [position_base] when the oldest outstanding buy credit was armed. A snapshot
+         at/above [credit_anchor] plus the credit total covers them; a snapshot between
+         covers part. *)
   ; mutable attributed_balance_increase : float
       (* Venue balance increase already adopted into [position_base] but not yet matched
          to a buy fill. The executions and balance feeds are independent, so a balance
@@ -381,6 +383,12 @@ type strategy_state =
          fill increase: a buy fill raises the tradeable figure and bumps the same
          per-asset freshness timestamp, so a positive delta must not be treated as proof
          an outstanding sell hold was applied. 0.0 until the first message is adopted. *)
+  ; mutable needs_resync : bool
+      (* Set when the user-event stream is known to be incomplete (a dropped frame) or a
+         tracked order vanished with no terminal event. The domain loop drains it after
+         the cycle and asks the venue for a fresh balance/open-orders snapshot. *)
+  ; mutable last_balance_heal_log_at : float
+      (* Last time the ledger-recovery WARN was emitted. *)
   ; mutable persistence_dirty : bool
       (* true when accumulation state changed; flushed by caller outside hotloop *)
   ; mutable persistence_key : string option
@@ -673,10 +681,13 @@ let rec get_strategy_state asset_symbol =
       ; position_gross = Float.nan
       ; balance_uses_gross = false
       ; buy_credits_since_balance = []
+      ; credit_anchor = 0.0
       ; attributed_balance_increase = 0.0
       ; position_venue_ts = 0.0
       ; last_seen_asset_balance = 0.0
       ; last_balance_delta = 0.0
+      ; needs_resync = false
+      ; last_balance_heal_log_at = 0.0
       ; persistence_dirty = false
       ; persistence_key = None
       ; base_accumulation_enabled = true

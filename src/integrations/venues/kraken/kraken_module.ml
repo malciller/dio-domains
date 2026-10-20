@@ -310,12 +310,23 @@ module Kraken_impl = struct
       balances-feed balance minus the holds implied by open orders, and holds come from
       the executions feed's open-orders snapshot, so the newer of the two timestamps is
       the freshness that matters: a cancel moves holds without touching the balances feed. *)
+  let resync_market_state ~symbol:_ () = ()
+
   let get_balance_updated_at ~asset =
     let store = Kraken_balances_feed.get_balance_store asset in
     let balances = Kraken_balances_feed.BalanceStore.get_last_updated store in
     let holds = Kraken_executions_feed.get_orders_snapshot_at () in
     let last = Float.max balances holds in
     if last > 0.0 then Some last else None
+  ;;
+
+  let get_balance_updated_at_fast ~asset =
+    let store = Kraken_balances_feed.get_balance_store asset in
+    fun () ->
+      let balances = Kraken_balances_feed.BalanceStore.get_last_updated store in
+      let holds = Kraken_executions_feed.get_orders_snapshot_at () in
+      let last = Float.max balances holds in
+      if last > 0.0 then Some last else None
   ;;
 
   let get_total_balance ~asset = Kraken_balances_feed.get_total_balance asset

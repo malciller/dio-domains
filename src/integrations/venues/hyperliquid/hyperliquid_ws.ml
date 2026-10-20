@@ -28,6 +28,35 @@ let signal_new_data () = Concurrency.Exchange_wakeup.signal_all ()[@@ocaml.doc
 let pushers : (Yojson.Safe.t option -> bool) list ref = ref [][@@ocaml.doc
                                                                 " Global list of subscriber push functions. Each entry accepts [Some json] to deliver a\n    message or [None] to close the stream. Returns [true] on success, [false] if the\n    message was dropped. "]
 let pushers_mutex = Mutex.create ()
+let user_pushers : (Yojson.Safe.t option -> bool) list ref = ref [][@@ocaml.doc
+                                                                      " Subscribers for user channels (balances, fills, order updates), separate from the\n    market-data firehose so an l2Book burst cannot evict a spotState/userFills frame. A\n    full buffer sets [user_resync_needed]. "]
+let user_pushers_mutex = Mutex.create ()
+let dropped_user_messages = Atomic.make 0
+let user_resync_needed = Atomic.make false
+let user_channels =
+  [ "webData2"
+  ; "spotState"
+  ; "userEvents"
+  ; "userFills"
+  ; "orderUpdates"
+  ; "userFundings"
+  ; "userNonFundingLedgerUpdates"
+  ; "userTwapSliceFills"
+  ]
+;;
+let is_user_channel json =
+  match json with
+  | `Assoc _ ->
+    (match Yojson.Safe.Util.member "channel" json with
+     | `String c -> List.mem c user_channels
+     | _ -> false)
+  | _ -> false
+;;
+
+(** Consume the user-frame-loss latch. *)
+let get_user_resync_needed () = Atomic.exchange user_resync_needed false
+let note_user_resync_needed () = Atomic.set user_resync_needed true
+let get_dropped_user_messages () = Atomic.get dropped_user_messages
 let raw_pushers : (string option -> bool) list ref = ref []
 let raw_pushers_mutex = Mutex.create ()
 module Response_table =
@@ -122,15 +151,22 @@ let close_all_subscribers () =
       then
         (Logging.debug_f ~section
            "Closing %d raw subscriber streams on disconnect" count_raw;
-         List.iter (fun push -> try ignore (push None) with | _ -> ()) r_ps)))))
+         List.iter (fun push -> try ignore (push None) with | _ -> ()) r_ps)));
+    Mutex.lock user_pushers_mutex;
+    (let u_ps = !user_pushers in
+     user_pushers := [];
+     Mutex.unlock user_pushers_mutex;
+     if u_ps <> []
+     then
+       (Logging.debug_f ~section "Closing %d user subscriber streams on disconnect"
+          (List.length u_ps);
+        List.iter (fun push -> try ignore (push None) with | _ -> ()) u_ps))))
   [@@ocaml.doc
     " Pushes [None] to every subscriber stream to signal termination, then clears the\n    pushers list. Called on disconnect to unblock consumers waiting in [Lwt_stream.iter]\n    and to release push closures. "]
-let broadcast_message json =
+let broadcast_market_message json =
   Mutex.lock pushers_mutex;
   (let ps = !pushers in
    Mutex.unlock pushers_mutex;
-   if ps = []
-   then Logging.warn ~section "No subscribers for WebSocket message!";
    (let dead = ref [] in
     let dropped_this_frame = ref 0 in
     List.iter
@@ -158,7 +194,48 @@ let broadcast_message json =
        pushers :=
          (List.filter (fun p -> not (List.memq p (!dead))) (!pushers));
        Mutex.unlock pushers_mutex)))[@@ocaml.doc
-                                      " Delivers a JSON message to all registered subscribers. Push is non-blocking: if a\n    subscriber's bounded stream is full, the message is silently dropped for that\n    subscriber to prevent unbounded memory growth from slow consumers. Dead pushers are\n    evicted. "]
+                                      " Delivers a market-data JSON message to the registered subscribers. Push is\n    non-blocking: if a subscriber's bounded stream is full, the message is dropped for\n    that subscriber (correct backpressure for quote data) and dead pushers are evicted. "]
+;;
+let broadcast_user_message json =
+  Mutex.lock user_pushers_mutex;
+  (let ps = !user_pushers in
+   Mutex.unlock user_pushers_mutex;
+   if ps = []
+   then ()
+   else
+     (let dead = ref [] in
+      List.iter
+        (fun push ->
+           let ok =
+             try push (Some json)
+             with | _ -> (dead := (push :: (!dead)); false) in
+           if not ok
+           then (
+             (* A lost user frame is not acceptable: latch a resync so balances and open
+                orders are rebuilt from the venue. *)
+             Atomic.set user_resync_needed true;
+             let n = (Atomic.fetch_and_add dropped_user_messages 1) + 1 in
+             if (n land (n - 1)) = 0
+             then
+               Logging.error_f
+                 ~section
+                 "Hyperliquid USER stream full: %d user message(s) dropped cumulative; balance/order state will be resynced from the venue"
+                 n)) ps;
+      if (!dead) <> []
+      then
+        (Mutex.lock user_pushers_mutex;
+         user_pushers :=
+           (List.filter (fun p -> not (List.memq p (!dead))) (!user_pushers));
+         Mutex.unlock user_pushers_mutex)))
+;;
+
+(** User channels use the dedicated stream; market data keeps the bounded one. *)
+let broadcast_message json =
+  if is_user_channel json
+  then broadcast_user_message json
+  else broadcast_market_message json
+;;
+
 let broadcast_raw_message msg =
   Mutex.lock raw_pushers_mutex;
   (let ps = !raw_pushers in
@@ -194,6 +271,28 @@ let subscribe_market_data () =
      Mutex.unlock pushers_mutex in
    ({ stream; close } : subscription))[@@ocaml.doc
                                         " Creates a bounded subscriber stream (capacity 16) for incoming messages. Returns a\n    [subscription] with the stream and a [close] function that removes the subscriber from\n    the global list. Messages are silently dropped when the stream buffer is full. "]
+let subscribe_user_data () =
+  (* Dedicated user-state stream, separate from market data. 4096 frames is minutes of
+     user traffic; a full buffer counts as loss and triggers a resync. *)
+  let (stream, push_source) = Lwt_stream.create_bounded 4096 in
+  let push_fn item =
+    match item with
+    | None -> (push_source#close; true)
+    | Some json ->
+        let p = push_source#push json in
+        if Lwt.is_sleeping p
+        then (Lwt.cancel p; Atomic.set user_resync_needed true; false)
+        else true in
+  Mutex.lock user_pushers_mutex;
+  user_pushers := (push_fn :: (!user_pushers));
+  Mutex.unlock user_pushers_mutex;
+  (let close () =
+     Mutex.lock user_pushers_mutex;
+     user_pushers := (List.filter (fun p -> p != push_fn) (!user_pushers));
+     Mutex.unlock user_pushers_mutex in
+   ({ stream; close } : subscription))[@@ocaml.doc
+                                        " Dedicated stream for user-state messages (balances, fills, order updates). "]
+;;
 let subscribe_raw_market_data () =
   let (stream, push_source) = Lwt_stream.create_bounded 16 in
   let push_fn item =

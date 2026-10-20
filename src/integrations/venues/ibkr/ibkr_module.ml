@@ -362,6 +362,8 @@ module Ibkr_impl = struct
      the previous attempt-anyway behavior). *)
   let get_balance_age_fast ~asset:_ () = None
   let get_balance_updated_at ~asset:_ = None
+  let get_balance_updated_at_fast ~asset:_ () = None
+  let resync_market_state ~symbol:_ () = ()
   let get_total_balance ~asset = Ibkr_balances.get_balance ~asset
   let get_staked_balance ~asset:_ = 0.0
   let get_all_balances () = Ibkr_balances.get_all_balances ()

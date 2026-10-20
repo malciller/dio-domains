@@ -502,6 +502,7 @@ let test_unnetted_sell_hold_gates_second_sizing () =
   state.position_initialized <- true;
   state.position_venue_ts <- 99.0;
   state.buy_credits_since_balance <- [ 103.0, 0.18 ];
+  state.credit_anchor <- state.position_base;
   state.attributed_balance_increase <- 0.0;
   ignore
     (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
@@ -1246,7 +1247,13 @@ let test_ghost_buy_suppressed_within_ack_grace () =
     bool
     "the stale quote reservation is released with the ghost"
     true
-    (abs_float state.reserved_quote < 1e-9)
+    (abs_float state.reserved_quote < 1e-9);
+  check bool "the ghost requests a venue resync" true state.needs_resync;
+  check
+    bool
+    "the ghost arms the owed sell (inventory gate blocks a canceled one)"
+    true
+    state.just_filled_buy
 ;;
 
 let test_position_ledger_bridges_unreflected_fill () =
@@ -1278,6 +1285,7 @@ let test_position_ledger_bridges_unreflected_fill () =
   state.position_initialized <- true;
   state.position_venue_ts <- 999.0;
   state.buy_credits_since_balance <- [ 999.5, 0.2 ];
+  state.credit_anchor <- state.position_base;
   state.sell_holds_since_balance <- [];
   let asset =
     { Dio_strategies.Strategy_api.exchange = "hyperliquid"
@@ -1341,9 +1349,8 @@ let test_position_ledger_bridges_unreflected_fill () =
 ;;
 
 let test_position_reconcile_freshness_gate () =
-  (* A new balance message is authoritative: adopt the venue figure and drop every buy
-     credit its generation time covers. A message that does not advance the feed timestamp
-     leaves the ledger and overlay untouched. *)
+  (* Credits are retired by value, not timestamp: a snapshot at or above position +
+     credit proves the venue reflected the fill; a newer snapshot below it does not. *)
   let symbol = "LEDGER2/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
   let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
@@ -1353,8 +1360,9 @@ let test_position_reconcile_freshness_gate () =
   state.position_initialized <- true;
   state.position_venue_ts <- 998.0;
   state.buy_credits_since_balance <- [ 998.5, 0.2 ];
-  (* Message generated at 999 (now 1000.5, age 1.5): adopt the figure and prune the credit
-     it covers. *)
+  state.credit_anchor <- 0.4;
+  (* A newer message (generated 999) reports a LOWER figure: adopt it, but a downward move
+     cannot prove the buy was reflected, so the credit survives. *)
   Dio_strategies.Strategy_api.reconcile_position
     ~asset_gross:(fun () -> None)
     ~state
@@ -1368,43 +1376,24 @@ let test_position_reconcile_freshness_gate () =
     (abs_float (state.position_base -. 0.2) < 1e-12);
   check
     bool
-    "credits the message already covers are pruned"
+    "a downward message does not retire a buy credit"
     true
-    (state.buy_credits_since_balance = []);
-  (* Later fill, then a message that does not advance the feed timestamp: neither the
-     adopted value nor the fresh credit changes. *)
-  state.buy_credits_since_balance <- [ 999.7, 0.15 ];
-  Dio_strategies.Strategy_api.reconcile_position
-    ~asset_gross:(fun () -> None)
-    ~state
-    ~now:1000.1
-    ~base_balance_age:(Some 1.4)
-    ~asset_balance:0.2;
-  check
-    bool
-    "a non-advancing message does not clobber the ledger"
-    true
-    (abs_float (state.position_base -. 0.2) < 1e-12);
-  check
-    bool
-    "a non-advancing message does not prune fresh credits"
-    true
-    (List.length state.buy_credits_since_balance = 1);
-  (* Feed catches up (generated 1001.5): adopt the value and prune. *)
+    (state.buy_credits_since_balance = [ 998.5, 0.2 ]);
+  (* The feed catches up to 0.6 = 0.4 + 0.2: the credit is now covered. *)
   Dio_strategies.Strategy_api.reconcile_position
     ~asset_gross:(fun () -> None)
     ~state
     ~now:1002.0
     ~base_balance_age:(Some 0.5)
-    ~asset_balance:0.39;
+    ~asset_balance:0.6;
   check
     bool
-    "fresher venue message replaces the ledger, including downward corrections"
+    "the catching-up message is adopted upward"
     true
-    (abs_float (state.position_base -. 0.39) < 1e-12);
+    (abs_float (state.position_base -. 0.6) < 1e-12);
   check
     bool
-    "credits covered by the catching-up message are pruned"
+    "credits covered by value are retired"
     true
     (state.buy_credits_since_balance = [])
 ;;
@@ -1456,6 +1445,7 @@ let test_position_seed_prunes_covered_credit () =
   state.position_base <- 0.0;
   state.position_venue_ts <- 0.0;
   state.buy_credits_since_balance <- [ 998.5, 0.2 ];
+  state.credit_anchor <- state.position_base;
   (* First message generated at 999 (after the fill at 998.5). *)
   Dio_strategies.Strategy_api.reconcile_position
     ~asset_gross:(fun () -> None)
@@ -1492,6 +1482,7 @@ let test_position_seed_keeps_newer_credit () =
   state.position_base <- 0.0;
   state.position_venue_ts <- 0.0;
   state.buy_credits_since_balance <- [ 999.5, 0.2 ];
+  state.credit_anchor <- state.position_base;
   Dio_strategies.Strategy_api.reconcile_position
     ~asset_gross:(fun () -> None)
     ~state
@@ -1535,8 +1526,8 @@ let test_position_stale_message_does_not_regress_ledger () =
 ;;
 
 let test_position_partial_credit_prune () =
-  (* Message generated between two fills covers the older but not the newer: only the
-     newer credit survives. *)
+  (* FIFO value coverage: a snapshot between the position and the expected ledger
+     consumes the oldest credits up to the rise. *)
   let symbol = "LEDGER7/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
   let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
@@ -1545,23 +1536,26 @@ let test_position_partial_credit_prune () =
   state.position_initialized <- true;
   state.position_venue_ts <- 998.0;
   state.buy_credits_since_balance <- [ 998.5, 0.1; 999.5, 0.2 ];
-  (* Message generated at 999.5; fill at 998.5 covered, fill at 999.5 not. *)
+  state.credit_anchor <- 0.2;
+  (* 0.35 covers 0.15 of the 0.3 outstanding: the 0.1 credit plus 0.05 of the 0.2. *)
   Dio_strategies.Strategy_api.reconcile_position
     ~asset_gross:(fun () -> None)
     ~state
     ~now:1000.0
     ~base_balance_age:(Some 0.5)
-    ~asset_balance:0.25;
+    ~asset_balance:0.35;
   check
     bool
     "adopts the venue figure"
     true
-    (abs_float (state.position_base -. 0.25) < 1e-12);
+    (abs_float (state.position_base -. 0.35) < 1e-12);
   check
     bool
     "only the covered credit is pruned"
     true
-    (state.buy_credits_since_balance = [ 999.5, 0.2 ])
+    (match state.buy_credits_since_balance with
+     | [ (t, q) ] -> abs_float (t -. 999.5) < 1e-9 && abs_float (q -. 0.15) < 1e-9
+     | _ -> false)
 ;;
 
 let test_position_balance_before_fill_no_double_credit () =
@@ -1702,6 +1696,39 @@ let test_position_upward_reconcile_adopts_venue () =
     (abs_float (state.position_base -. 0.5) < 1e-12)
 ;;
 
+let test_position_self_heals_without_new_timestamp () =
+  (* A lost update leaves [position_venue_ts] at the message time while [position_base]
+     stays at the old value. The next cycle must adopt the venue figure upward even though
+     the timestamp does not advance. *)
+  let symbol = "LEDGER18/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.reserved_base <- 0.19117916;
+  state.position_base <- 0.1936;
+  state.position_initialized <- true;
+  (* The lost-update state: the ledger's timestamp is already at the message time. *)
+  state.position_venue_ts <- 1000.5;
+  state.buy_credits_since_balance <- [];
+  state.credit_anchor <- 0.1936;
+  Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> None)
+    ~state
+    ~now:1001.0
+    ~base_balance_age:(Some 0.5)
+    ~asset_balance:0.3936;
+  check
+    bool
+    "a non-advancing message heals an under-reported ledger"
+    true
+    (abs_float (state.position_base -. 0.3936) < 1e-12);
+  check
+    bool
+    "the healed ledger exposes the owed lot"
+    true
+    (state.position_base -. state.reserved_base > state.cached_qty_increment)
+;;
+
 let test_position_nan_balance_does_not_seed () =
   (* Startup/feed outage: a NaN snapshot must not seed or mutate the ledger or prune
      credits. *)
@@ -1713,6 +1740,7 @@ let test_position_nan_balance_does_not_seed () =
   state.position_base <- 0.0;
   state.position_venue_ts <- 0.0;
   state.buy_credits_since_balance <- [ 999.5, 0.2 ];
+  state.credit_anchor <- state.position_base;
   Dio_strategies.Strategy_api.reconcile_position
     ~asset_gross:(fun () -> None)
     ~state
@@ -1751,6 +1779,7 @@ let test_position_buy_credit_and_sell_hold_cancel () =
   state.position_initialized <- true;
   state.position_venue_ts <- 999.0;
   state.buy_credits_since_balance <- [ 999.5, 0.2 ];
+  state.credit_anchor <- state.position_base;
   state.sell_holds_since_balance <- [ 999.5, 0.2 ];
   let asset =
     { Dio_strategies.Strategy_api.exchange = "hyperliquid"
@@ -1896,6 +1925,7 @@ let test_position_gross_reconcile_flat_message_clears_overlays () =
   state.balance_uses_gross <- true;
   state.last_seen_asset_balance <- 0.0933;
   state.buy_credits_since_balance <- [ 101.0, 0.15 ];
+  state.credit_anchor <- state.position_base;
   state.attributed_balance_increase <- 0.0;
   state.sell_holds_since_balance <- [ 100.0, 0.15 ];
   state.last_balance_delta <- 0.0;
@@ -1934,9 +1964,9 @@ let test_position_gross_reconcile_flat_message_clears_overlays () =
     (available <= 0.0933 -. 0.0922 +. 1e-9)
 ;;
 
-let test_position_dead_feed_credit_expires () =
-  (* No balance freshness beyond the grace: the credit decays so it cannot size a sale
-     against base the feed never confirmed. *)
+let test_position_dead_feed_credit_persists () =
+  (* A silent balance feed does not invalidate a real buy: the credit stays until the
+     venue covers it or the base is sold, so the owed 1:1 sell still places. *)
   let symbol = "LEDGER11/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
   let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
@@ -1957,6 +1987,7 @@ let test_position_dead_feed_credit_expires () =
   state.position_initialized <- true;
   state.position_venue_ts <- 0.0;
   state.buy_credits_since_balance <- [ 900.0, 0.2 ];
+  state.credit_anchor <- state.position_base;
   state.sell_holds_since_balance <- [];
   let asset =
     { Dio_strategies.Strategy_api.exchange = "hyperliquid"
@@ -1996,21 +2027,20 @@ let test_position_dead_feed_credit_expires () =
     ~base_balance_age:None;
   check
     bool
-    "stale credit decays after the grace"
+    "credit survives a silent feed"
     true
-    (state.buy_credits_since_balance = []);
+    (state.buy_credits_since_balance = [ 900.0, 0.2 ]);
   let pushed = Dio_strategies.Strategy_api.get_pending_orders 100 in
   check
     bool
-    "expired credit cannot size a sale"
+    "the unconfirmed fill still sizes its 1:1 sale"
     true
-    (not
-       (List.exists
-          (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
-            o.operation = Dio_strategies.Strategy_common.Place
-            && o.side = Dio_strategies.Strategy_common.Sell
-            && o.symbol = symbol)
-          pushed));
+    (List.exists
+       (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+         o.operation = Dio_strategies.Strategy_common.Place
+         && o.side = Dio_strategies.Strategy_common.Sell
+         && o.symbol = symbol)
+       pushed);
   drain ()
 ;;
 
@@ -2171,6 +2201,8 @@ let test_position_accumulation_sell_fill_keeps_ledger () =
   state.base_accumulation_enabled <- false;
   state.startup_replay <- false;
   state.last_fill_oid <- None;
+  state.buy_credits_since_balance <- [ 599.0, 0.2 ];
+  state.credit_anchor <- state.position_base;
   Dio_strategies.Strategy_api.Strategy.handle_order_filled
     ~now:600.0
     symbol
@@ -2183,7 +2215,12 @@ let test_position_accumulation_sell_fill_keeps_ledger () =
     bool
     "accumulation venue sell fill leaves the ledger untouched"
     true
-    (abs_float (state.position_base -. 0.4) < 1e-12)
+    (abs_float (state.position_base -. 0.4) < 1e-12);
+  check
+    bool
+    "selling the credited base retires the unreflected-buy bridge"
+    true
+    (state.buy_credits_since_balance = [])
 ;;
 
 let test_position_asset_low_recovery_sees_pending_credit () =
@@ -2199,6 +2236,7 @@ let test_position_asset_low_recovery_sees_pending_credit () =
   state.position_initialized <- true;
   state.position_venue_ts <- 999.0;
   state.buy_credits_since_balance <- [ 999.5, 0.2 ];
+  state.credit_anchor <- state.position_base;
   state.asset_low <- true;
   state.last_seen_asset_balance <- 0.1936;
   let asset =
@@ -2252,6 +2290,7 @@ let test_position_kraken_asset_low_recovery_sees_pending_credit () =
   state.position_venue_ts <- 999.0;
   state.last_seen_asset_balance <- 0.046;
   state.buy_credits_since_balance <- [ 1000.5, 0.04 ];
+  state.credit_anchor <- state.position_base;
   state.attributed_balance_increase <- 0.0;
   state.asset_low <- true;
   state.inflight_sell <- true;
@@ -7314,6 +7353,10 @@ let () =
             `Quick
             test_position_upward_reconcile_adopts_venue
         ; test_case
+            "a lost update self-heals without a new timestamp"
+            `Quick
+            test_position_self_heals_without_new_timestamp
+        ; test_case
             "balance message before its fill event does not double-credit"
             `Quick
             test_position_balance_before_fill_no_double_credit
@@ -7334,9 +7377,9 @@ let () =
             `Quick
             test_venue_gross_base_reads_base_asset_store
         ; test_case
-            "credit decays when the feed goes silent past the grace"
+            "credit survives a silently dead feed"
             `Quick
-            test_position_dead_feed_credit_expires
+            test_position_dead_feed_credit_persists
         ; test_case
             "reserved-exceeding ledger places nothing (no negative size)"
             `Quick

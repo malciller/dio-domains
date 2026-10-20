@@ -98,6 +98,7 @@ let snapshot_entries (st : Dio_strategies.Strategy_state.strategy_state)
   ; "s_reserved_quote", Expr.V_float st.reserved_quote
   ; "s_accumulated_profit", Expr.V_float st.accumulated_profit
   ; "s_position_base", Expr.V_float st.position_base
+  ; "s_credit_anchor", Expr.V_float st.credit_anchor
   ; "s_attributed_balance_increase", Expr.V_float st.attributed_balance_increase
   ; "s_position_initialized", Expr.V_bool st.position_initialized
   ; "s_last_buy_fill_price", optf st.last_buy_fill_price
@@ -160,6 +161,7 @@ let seed
   st.reserved_quote <- getf "s_reserved_quote" st.reserved_quote;
   st.accumulated_profit <- getf "s_accumulated_profit" st.accumulated_profit;
   st.position_base <- getf "s_position_base" st.position_base;
+  st.credit_anchor <- getf "s_credit_anchor" st.position_base;
   st.attributed_balance_increase
   <- getf "s_attributed_balance_increase" st.attributed_balance_increase;
   st.position_initialized <- getb "s_position_initialized" st.position_initialized;
