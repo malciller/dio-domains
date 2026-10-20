@@ -1100,7 +1100,7 @@ let start_periodic_tasks () =
     Lwt.async run
 let _processor_task =
   let rec run () =
-    let sub = Hyperliquid_ws.subscribe_market_data () in
+    let sub = Hyperliquid_ws.subscribe_user_data () in
     Lwt.catch
       (fun () ->
          Logging.debug_f ~section

@@ -411,8 +411,27 @@ module Hyperliquid_impl = struct
     if last > 0.0 then Some last else None
   ;;
 
+  let get_balance_updated_at_fast ~asset =
+    let store = Hyperliquid_balances.get_balance_store asset in
+    fun () ->
+      let spendable =
+        Hyperliquid_balances.BalanceStore.get_spendable_last_updated store
+      in
+      let last =
+        if spendable > 0.0
+        then spendable
+        else Hyperliquid_balances.BalanceStore.get_last_updated store
+      in
+      if last > 0.0 then Some last else None
+  ;;
+
   let get_total_balance ~asset = Hyperliquid_balances.get_total_balance asset
   let get_staked_balance ~asset = Hyperliquid_balances.get_staked_balance asset
+
+  (** Installed after the snapshot fetchers below, which live at file scope. *)
+  let resync_hook : (unit -> unit) ref = ref (fun () -> ())
+
+  let resync_market_state ~symbol:_ () = !resync_hook ()
 
   let get_all_balances () =
     let assets = Hyperliquid_balances.get_all_assets () in
@@ -1058,10 +1077,58 @@ let fetch_open_orders_ws () =
         Lwt.return_unit))
 ;;
 
+(** On-demand user-state resync, single-flight: balances first, then open orders. Failures
+    are logged and the next trigger retries. *)
+let resync_in_flight = Atomic.make false
+
+let resync_user_state () =
+  if not (Atomic.exchange resync_in_flight true)
+  then
+    Lwt.async (fun () ->
+      Lwt.finalize
+        (fun () ->
+          Lwt.catch
+            (fun () -> fetch_spot_balances_ws () >>= fun () -> fetch_open_orders_ws ())
+            (fun exn ->
+              Logging.warn_f
+                ~section:"hyperliquid_startup"
+                "User-state resync failed: %s"
+                (Printexc.to_string exn);
+              Lwt.return_unit))
+        (fun () ->
+          Atomic.set resync_in_flight false;
+          Lwt.return_unit))
+  else (
+    (* The in-flight fetch may predate this loss; keep the latch so the next pass runs
+       again. *)
+    Hyperliquid_ws.note_user_resync_needed ();
+    Logging.debug_f
+      ~section:"hyperliquid_startup"
+      "User-state resync already in flight; coalescing request")
+;;
+
+let () = Hyperliquid_impl.resync_hook := resync_user_state
+
+(** Consume the user-stream loss flag and resync. The dedicated stream should never fill;
+    this is the fallback if it does, or if the venue never sent a frame. *)
+let () =
+  let rec watch () =
+    if Hyperliquid_ws.get_user_resync_needed ()
+    then (
+      Logging.warn_f
+        ~section:"hyperliquid_startup"
+        "User-channel frame loss detected; requesting a full balance/open-orders resync";
+      resync_user_state ());
+    Lwt_unix.sleep 0.25 >>= watch
+  in
+  Lwt.async watch
+;;
+
 (* Register Hyperliquid_impl with the exchange registry at module load time *)
 let () = Exchange.Registry.register (module Hyperliquid_impl)
 
 (* Register the uniform venue decoder for the parse-domain offload route. *)
+
 let () =
   Concurrency.Parse_worker.register_venue_decoder
     ~venue:"hyperliquid"

@@ -865,6 +865,8 @@ let evaluate_excess_sweep
     is unchanged. The trigger/latch/sizing contract is documented on its sub-phases.) *)
 type sell_pre =
   { sp_is_alpaca : bool
+  ; sp_venue_balance : float
+  ; sp_base_balance_age : float option
   ; sp_ledger_balance : float
   ; sp_alpaca_available : float
   ; sp_available_base : float
@@ -1169,6 +1171,8 @@ let sell_leg_prepare
   let sell_pushed = ref false in
   let nothing_placeable = ref false in
   { sp_is_alpaca = is_alpaca
+  ; sp_venue_balance = asset_balance
+  ; sp_base_balance_age = base_balance_age
   ; sp_ledger_balance = ledger_balance
   ; sp_alpaca_available = alpaca_available
   ; sp_available_base = available_base
@@ -1222,6 +1226,7 @@ let sell_place_body
   let sell_pushed = pre.sp_sell_pushed in
   let nothing_placeable = pre.sp_nothing_placeable in
   let asset_bal = ledger_balance in
+  let venue_balance = pre.sp_venue_balance in
   let qty =
     match state.last_buy_fill_qty with
     | Some q when q > 0.0 -> q
@@ -1387,11 +1392,20 @@ let sell_place_body
             ~kind:"available below min_order_size (rounded)"
             (fun () ->
                Printf.sprintf
-                 "available %.8f (bal %.8f - reserved %.8f) rounds below min_order_size \
-                  %.8f"
+                 "available %.8f (ledger %.8f [base %.8f + credit %.8f]; venue %.8f; \
+                  reserved %.8f; hold %.8f; committed %.8f; age %s) rounds below \
+                  min_order_size %.8f"
                  available
                  asset_bal
+                 state.position_base
+                 unreflected_credit
+                 venue_balance
                  state.reserved_base
+                 unnetted_hold
+                 committed_sell
+                 (match pre.sp_base_balance_age with
+                  | Some a -> Printf.sprintf "%.2fs" a
+                  | None -> "unknown")
                  min_order_size);
           0.0, false)
       else (
@@ -1402,10 +1416,20 @@ let sell_place_body
           ~kind:"available below min_order_size"
           (fun () ->
              Printf.sprintf
-               "available %.8f (bal %.8f - reserved %.8f) is below min_order_size %.8f"
+               "available %.8f (ledger %.8f [base %.8f + credit %.8f]; venue %.8f; \
+                reserved %.8f; hold %.8f; committed %.8f; age %s) is below \
+                min_order_size %.8f"
                available
                asset_bal
+               state.position_base
+               unreflected_credit
+               venue_balance
                state.reserved_base
+               unnetted_hold
+               committed_sell
+               (match pre.sp_base_balance_age with
+                | Some a -> Printf.sprintf "%.2fs" a
+                | None -> "unknown")
                min_order_size);
         0.0, false))
     else if target_q >= min_order_size -. 1e-9 && target_q > 0.0

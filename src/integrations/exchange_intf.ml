@@ -295,6 +295,15 @@ module type HOT_READS = sig
       it is a timestamp, not an age, so the comparison needs no clock read. *)
   val get_balance_updated_at : asset:string -> float option
 
+  (** O(1) lock-free closure for {!get_balance_updated_at}. *)
+  val get_balance_updated_at_fast : asset:string -> unit -> float option
+
+  (** Fire-and-forget refresh of user-channel state for [symbol]: balance and open-orders
+      snapshots. Called when the user-event stream was incomplete or a tracked order
+      vanished with no terminal event. Must not block; venues with no on-demand snapshot
+      implement it as a no-op. *)
+  val resync_market_state : symbol:string -> unit -> unit
+
   (** O(1) atomic open-orders generation ([-1] = treat as always-changed). *)
   val get_open_orders_generation : symbol:string -> int
 

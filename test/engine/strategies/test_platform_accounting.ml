@@ -95,6 +95,7 @@ let test_consume_fifo () =
 ;;
 
 let test_unreflected_credit () =
+  (* Credits are retired by value coverage or by sale, not by age. *)
   let credits = [ 100.0, 2.0; 50.0, 3.0 ] in
   let remaining, sum =
     Platform_accounting.unreflected_credit
@@ -102,8 +103,8 @@ let test_unreflected_credit () =
       ~now:100.0
       ~base_balance_age:(Some 0.0)
   in
-  Alcotest.(check bool) "sum keeps fresh" true (approx sum 2.0);
-  Alcotest.(check bool) "drops stale" true (holds_eq remaining [ 100.0, 2.0 ])
+  Alcotest.(check bool) "sum keeps both credits" true (approx sum 5.0);
+  Alcotest.(check bool) "no age-based pruning" true (holds_eq remaining credits)
 ;;
 
 let test_committed_sell_base () =

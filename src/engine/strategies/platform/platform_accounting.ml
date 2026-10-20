@@ -12,10 +12,9 @@
     against the un-netted figure in that window lets a sell dip into reserved_base. *)
 let sell_hold_netting_grace_s = 15.0
 
-(** Freshness cutoff shared by the two feed-lag overlays (un-netted sell holds and
-    un-netted buy credits): the newest balance message's wall-clock time, but never older
-    than the grace - a dead feed must not keep an overlay alive forever. Entries at/after
-    the cutoff belong to the lag window; older entries are retired. *)
+(** Freshness cutoff for the un-netted sell-hold overlay: the newest balance message's
+    wall-clock time, but never older than the grace, so a dead feed expires holds. Buy
+    credits do not use this cutoff; they are retired by value or by a sale. *)
 let unreflected_cutoff ~now ~base_balance_age =
   match base_balance_age with
   | Some age -> Float.max (now -. age) (now -. sell_hold_netting_grace_s)
@@ -145,19 +144,14 @@ let consume_sell_hold_netting ~holds ~amount =
 let arm_sell_hold ~holds ~qty ~now = holds @ [ now, qty ]
 
 (** Un-reflected buy credits (fills not yet reflected in the balance feed), mirroring
-    {!unnetted_sell_hold} for the credit direction. [credits] is [(ts, qty)]; entries at
-    or after the freshness cutoff are summed and kept. Returns [(remaining, sum)]. *)
-let unreflected_credit ~credits ~now ~base_balance_age =
+    {!unnetted_sell_hold} for the credit direction. [credits] is [(ts, qty)]. Retired by
+    value coverage ([Strategy_lifecycle.settle_buy_credits]) or by selling the base; age
+    is ignored. The strategy state owns the ledger; this is the pure sum used by
+    replay/tests. *)
+let unreflected_credit ~credits ~now:_ ~base_balance_age:_ =
   if credits = []
   then no_unreflected_credit
-  else (
-    let cutoff = unreflected_cutoff ~now ~base_balance_age in
-    let rec go sum acc = function
-      | [] -> List.rev acc, sum
-      | (ts, q) :: rest when ts >= cutoff -> go (sum +. q) ((ts, q) :: acc) rest
-      | _ :: rest -> go sum acc rest
-    in
-    go 0.0 [] credits)
+  else credits, List.fold_left (fun acc (_, q) -> acc +. q) 0.0 credits
 ;;
 
 (** Base to subtract from the venue's reported holding:
