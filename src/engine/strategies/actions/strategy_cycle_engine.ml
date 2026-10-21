@@ -871,59 +871,68 @@ let order_place
             ~instrument
             ~reduce_only
         in
-        (* Bind the venue order id to the instrument/fee class on ack so the domain loop
-           can classify a buy fill without guessing from side/price. Sells are entries;
-           only buys close/resize/recycle and feed the actual-fill accounting. *)
-        (match side with
-         | Strategy_common.Buy ->
-           Strategy_common.register_pending_carry_order
-             ~dedup_key:duplicate_key
-             ~market:
-               (if String.equal market "perp"
-                then Strategy_common.Carry_perp
-                else Strategy_common.Carry_spot)
-             ~maker:post_only
-             ~kind:kind_key
-         | Strategy_common.Sell -> ());
-        let order =
-          Jac.create_place_order
-            ~reduce_only
-            ~time_in_force:tif
-            ~order_type
-            ~userref:Strategy_common.strategy_userref_carry
-            duplicate_key
-            instrument
-            side
-            qty
-            price
-            post_only
-            Strategy_common.Carry
-            asset.exchange
-        in
-        let describe () =
-          Printf.sprintf
-            "%s %s %.8g @ %s tif=%s reduce_only=%b key=%s"
-            (Strategy_common.string_of_order_side side)
-            instrument
-            qty
-            (match price with
-             | Some p -> Printf.sprintf "%.8g" p
-             | None -> "market")
-            tif
-            reduce_only
-            duplicate_key
-        in
-        if dry_run ()
-        then Logging.info_f ~section "Overlay DRY RUN: %s" (describe ())
+        if Strategy_common.InFlightOrders.is_in_flight duplicate_key
+        then
+          (* The previous attempt for this kind/symbol/venue is still awaiting the venue
+             ack. Retrying now can only create a duplicate; the first cycle after the ack
+             sees the resting order and amends it. Book updates burst far faster than a
+             REST round-trip, so this path is expected - keep it quiet. A key held long
+             enough to be a leak is reported by the periodic in-flight sweep instead. *)
+          Logging.debug_f ~section "Overlay order already in flight: %s" duplicate_key
         else (
-          let pushed = Jac.push_order ~now:c.cg_now ~manage_state:false order in
-          if pushed
-          then Logging.info_f ~section "Overlay order: %s" (describe ())
-          else
-            Logging.info_f
-              ~section
-              "Overlay order suppressed (in-flight duplicate or full buffer): %s"
-              duplicate_key)))
+          (* Bind the venue order id to the instrument/fee class on ack so the domain loop
+             can classify a buy fill without guessing from side/price. Sells are entries;
+             only buys close/resize/recycle and feed the actual-fill accounting. *)
+          (match side with
+           | Strategy_common.Buy ->
+             Strategy_common.register_pending_carry_order
+               ~dedup_key:duplicate_key
+               ~market:
+                 (if String.equal market "perp"
+                  then Strategy_common.Carry_perp
+                  else Strategy_common.Carry_spot)
+               ~maker:post_only
+               ~kind:kind_key
+           | Strategy_common.Sell -> ());
+          let order =
+            Jac.create_place_order
+              ~reduce_only
+              ~time_in_force:tif
+              ~order_type
+              ~userref:Strategy_common.strategy_userref_carry
+              duplicate_key
+              instrument
+              side
+              qty
+              price
+              post_only
+              Strategy_common.Carry
+              asset.exchange
+          in
+          let describe () =
+            Printf.sprintf
+              "%s %s %.8g @ %s tif=%s reduce_only=%b key=%s"
+              (Strategy_common.string_of_order_side side)
+              instrument
+              qty
+              (match price with
+               | Some p -> Printf.sprintf "%.8g" p
+               | None -> "market")
+              tif
+              reduce_only
+              duplicate_key
+          in
+          if dry_run ()
+          then Logging.info_f ~section "Overlay DRY RUN: %s" (describe ())
+          else (
+            let pushed = Jac.push_order ~now:c.cg_now ~manage_state:false order in
+            if pushed
+            then Logging.info_f ~section "Overlay order: %s" (describe ())
+            else
+              Logging.debug_f
+                ~section
+                "Overlay order suppressed (in-flight duplicate or full buffer): %s"
+                duplicate_key))))
 ;;
 
 let order_cancel c ~market ~order_id =
