@@ -393,6 +393,8 @@ module type S = sig
     -> ?qty:float
     -> ?limit_price:float
     -> ?post_only:bool
+    -> ?reduce_only:bool
+    -> ?time_in_force:Types.time_in_force
     -> ?trigger_price:float
     -> ?display_qty:float
     -> ?symbol:string
@@ -652,6 +654,11 @@ module Market_context = struct
     val get_position : coin:string -> position option
     val get_margin : unit -> margin option
     val get_margin_ratio : unit -> float option
+
+    (** Live open orders for the perpetual [coin], including reduce-only exits. This is
+        separate from the venue's spot open orders because a perp order and a spot order
+        can share an order id namespace but are not the same instrument. *)
+    val get_open_orders : coin:string -> Types.open_order list
   end
 end
 

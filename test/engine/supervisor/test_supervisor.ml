@@ -164,6 +164,69 @@ let test_post_only_rejection_reason () =
     (Supervisor_orders.is_post_only_rejection "insufficient funds")
 ;;
 
+let test_rejection_bbo () =
+  let err =
+    "HL Amendment Rejected: Error placing new order during modify: Post only order would \
+     have immediately matched, bbo was 80.892@80.893."
+  in
+  match Supervisor_orders.rejection_bbo err with
+  | None -> Alcotest.fail "rejection BBO should parse"
+  | Some (bid, ask) ->
+    Alcotest.(check (float 1e-9)) "bid" 80.892 bid;
+    Alcotest.(check (float 1e-9)) "ask" 80.893 ask;
+    Alcotest.(check (option (pair (float 1e-9) (float 1e-9))))
+      "unrelated rejection has no bbo"
+      None
+      (Supervisor_orders.rejection_bbo "insufficient funds")
+;;
+
+let test_maker_retry_price () =
+  let bbo = 80.892, 80.893 in
+  Alcotest.(check (float 1e-9))
+    "sell retries above the ask"
+    80.894
+    (Supervisor_orders.maker_retry_price
+       ~side:Dio_strategies.Strategy_common.Sell
+       ~price:80.89
+       ~bbo);
+  Alcotest.(check (float 1e-9))
+    "buy retries below the bid"
+    80.891
+    (Supervisor_orders.maker_retry_price
+       ~side:Dio_strategies.Strategy_common.Buy
+       ~price:80.89
+       ~bbo)
+;;
+
+let test_amend_request_preserves_flags () =
+  let order =
+    { Dio_strategies.Strategy_common.operation = Dio_strategies.Strategy_common.Amend
+    ; order_id = Some "oid-old"
+    ; symbol = "TEST"
+    ; side = Dio_strategies.Strategy_common.Buy
+    ; order_type = "limit"
+    ; qty = 1.0
+    ; price = Some 10.0
+    ; time_in_force = "GTC"
+    ; post_only = false
+    ; reduce_only = true
+    ; userref = None
+    ; strategy = Dio_strategies.Strategy_common.Carry
+    ; exchange = "hyperliquid"
+    ; duplicate_key = "carry:recycle:close|ro"
+    }
+  in
+  let req = Supervisor_orders.amend_request_of_order order "oid-old" in
+  Alcotest.(check (option bool))
+    "reduce only"
+    (Some true)
+    req.Dio_engine.Order_executor.reduce_only;
+  Alcotest.(check (option string))
+    "tif"
+    (Some "GTC")
+    req.Dio_engine.Order_executor.time_in_force
+;;
+
 let () =
   Alcotest.run
     "Supervisor"
@@ -197,6 +260,12 @@ let () =
             "post-only rejection detection"
             `Quick
             test_post_only_rejection_reason
+        ; Alcotest.test_case "rejection bbo parses" `Quick test_rejection_bbo
+        ; Alcotest.test_case "maker retry price" `Quick test_maker_retry_price
+        ; Alcotest.test_case
+            "amend request preserves flags"
+            `Quick
+            test_amend_request_preserves_flags
         ] )
     ]
 ;;

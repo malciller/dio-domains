@@ -152,6 +152,47 @@ let () =
 
 let order_to_symbol_startup_done = Atomic.make false
 
+(** Order id to perp coin for open orders that belong to a perpetual instrument. The venue
+    stores a perp order under the registered spot pair (or, when placed through this
+    process, under the bare coin), so the symbol key alone cannot tell a perp order from a
+    spot one. Recording the venue coin at ingest keeps that distinction available to the
+    dashboard without changing where strategies read orders from. Bounded like the other
+    order-id indexes; entries are also pruned by {!get_perp_open_orders} once the order is
+    no longer open. *)
+let perp_order_coin =
+  Concurrency.Fifo_index.create ~label:(section ^ "/perp_order_coin") ~cap:8_192 ()
+;;
+
+let () =
+  Concurrency.Fifo_index.publish_metrics
+    perp_order_coin
+    ~name:"hyperliquid.perp_order_coin"
+;;
+
+let perp_order_mutex = Mutex.create ()
+
+let note_perp_order ~order_id ~coin =
+  Mutex.lock perp_order_mutex;
+  Concurrency.Fifo_index.set perp_order_coin ~key:order_id ~value:coin;
+  Mutex.unlock perp_order_mutex
+;;
+
+let forget_perp_order order_id =
+  Mutex.lock perp_order_mutex;
+  Concurrency.Fifo_index.remove perp_order_coin order_id;
+  Mutex.unlock perp_order_mutex
+;;
+
+(** Order ids the feed has classified as perpetual. Snapshot under the same mutex that
+    guards the index, then use the list to filter the spot view. Open-order counts are
+    small, so a list lookup is cheaper than taking the mutex once per order. *)
+let perp_order_ids () =
+  Mutex.lock perp_order_mutex;
+  let ids = Concurrency.Fifo_index.fold (fun id _ acc -> id :: acc) perp_order_coin [] in
+  Mutex.unlock perp_order_mutex;
+  ids
+;;
+
 let _startup_snapshot_done : bool Atomic.t = Atomic.make false
 [@@ocaml.doc
   " Set once after [inject_open_orders]. Domains poll it each cycle;\n\
@@ -288,6 +329,15 @@ let drain_open_order_changes ~symbol =
   match Ds.Cow_table.find_opt stores symbol with
   | Some store ->
     let changes, overflow = drain_changes store in
+    let changes =
+      if String.contains symbol '/'
+      then (
+        let perp = perp_order_ids () in
+        if perp = []
+        then changes
+        else List.filter (fun (id, _) -> not (List.mem id perp)) changes)
+      else changes
+    in
     ( List.rev_map
         (fun (id, (o : open_order option)) ->
           let snap =
@@ -357,6 +407,53 @@ let get_open_orders symbol =
 [@@inline always]
 ;;
 
+(** Spot-only view of a pair's open orders. Hyperliquid's order-updates channel can key a
+    perp order under the registered spot pair, so a strategy that reads the pair directly
+    would otherwise mistake the overlay's perp take-profit for a second spot buy. *)
+let get_spot_open_orders symbol =
+  let perp = perp_order_ids () in
+  if perp = []
+  then get_open_orders symbol
+  else
+    List.filter
+      (fun (o : open_order) -> not (List.mem o.order_id perp))
+      (get_open_orders symbol)
+;;
+
+let is_live_order (o : open_order) =
+  o.remaining_qty > 0.0
+  &&
+  match o.order_status with
+  | PendingNewStatus | NewStatus | PartiallyFilledStatus | UnknownStatus _ -> true
+  | FilledStatus | CanceledStatus | ExpiredStatus | RejectedStatus -> false
+;;
+
+let get_perp_open_orders ~coin =
+  Mutex.lock perp_order_mutex;
+  let order_ids =
+    Concurrency.Fifo_index.fold
+      (fun order_id order_coin acc ->
+        if String.equal order_coin coin then order_id :: acc else acc)
+      perp_order_coin
+      []
+  in
+  Mutex.unlock perp_order_mutex;
+  List.filter_map
+    (fun order_id ->
+      match find_order_everywhere order_id with
+      | Some o when is_live_order o -> Some o
+      | Some _ -> None
+      | None ->
+        forget_perp_order order_id;
+        None)
+    order_ids
+[@@ocaml.doc
+  " Live open orders for the perpetual [coin]. Orders are found through the order index so\n\
+  \    they are returned regardless of whether the venue keyed them by the bare coin (our\n\
+  \    optimistic placement injection) or by the registered spot pair (the order-updates\n\
+  \    feed). Non-live entries are dropped from the classification map as they are seen. "]
+;;
+
 let fold_open_orders symbol ~init ~f =
   let store = get_symbol_store symbol in
   let snapshot = Atomic.get store.open_orders_cache in
@@ -365,6 +462,15 @@ let fold_open_orders symbol ~init ~f =
   " Lock-free fold over open orders from the atomic cache. Zero mutex contention on domain\n\
   \    hotpath. "]
 [@@inline always]
+;;
+
+let fold_spot_open_orders symbol ~init ~f =
+  let perp = perp_order_ids () in
+  if perp = []
+  then fold_open_orders symbol ~init ~f
+  else
+    fold_open_orders symbol ~init ~f:(fun acc (o : open_order) ->
+      if List.mem o.order_id perp then acc else f acc o)
 ;;
 
 let remove_open_order ~symbol ~order_id =
@@ -379,6 +485,7 @@ let remove_open_order ~symbol ~order_id =
   Mutex.unlock store.orders_mutex;
   if existed
   then (
+    forget_perp_order order_id;
     Mutex.lock order_index_mutex;
     retire_from_order_to_symbol order_id;
     Mutex.unlock order_index_mutex;
@@ -519,6 +626,9 @@ let clear_all_open_orders () =
   Mutex.lock order_index_mutex;
   Concurrency.Fifo_index.clear order_to_symbol;
   Mutex.unlock order_index_mutex;
+  Mutex.lock perp_order_mutex;
+  Concurrency.Fifo_index.clear perp_order_coin;
+  Mutex.unlock perp_order_mutex;
   if !total_removed > 0
   then
     Logging.info_f ~section "Cleared %d stale open orders on reconnection" !total_removed
@@ -755,6 +865,8 @@ let update_orders_internal ?user_ref store (event : execution_event) =
 ;;
 
 let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
+  if Hyperliquid_instruments_feed.is_perp_coin symbol
+  then note_perp_order ~order_id ~coin:symbol;
   let store = get_symbol_store symbol in
   let now = Unix.gettimeofday () in
   let event : execution_event =
@@ -856,6 +968,8 @@ let process_order_updates data_json =
             | `String s -> s
             | _ -> "0"
           in
+          if Hyperliquid_instruments_feed.is_perp_coin coin
+          then note_perp_order ~order_id ~coin;
           let symbol_opt =
             Mutex.lock order_index_mutex;
             let res = Concurrency.Fifo_index.find_opt order_to_symbol order_id in
@@ -1454,6 +1568,8 @@ let inject_open_orders data_json =
             | _ -> "0"
           in
           Hashtbl.replace snapshot_order_ids order_id ();
+          if Hyperliquid_instruments_feed.is_perp_coin coin
+          then note_perp_order ~order_id ~coin;
           let symbol_opt = find_registered_symbol coin in
           match symbol_opt with
           | Some symbol ->

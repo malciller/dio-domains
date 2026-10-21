@@ -80,6 +80,10 @@ let cap t = t.cap
 let find_opt t key = Hashtbl.find_opt t.map key
 let mem t key = Hashtbl.mem t.map key
 
+(** Iterate the live entries. As with {!find_opt}, callers must hold the owning feed's
+    index mutex. *)
+let fold f t init = Hashtbl.fold f t.map init
+
 type stats =
   { entries : int
   ; capacity : int (** Current cap, in [min_cap]..[default_cap]. *)

@@ -132,6 +132,21 @@ let refresh_inventory_state_on_rejection (order : strategy_order) err =
   \    report tradeable (hold-netted) balances. "]
 ;;
 
+(** Carry recovery is event-driven. A rejected amend can leave the venue order gone
+    (Hyperliquid replaces by cancel+create) while the strategy still sees it in the
+    open-order cache. Refresh the venue snapshot and wake the owning domain so the overlay
+    re-places the entry on this event instead of waiting for the next unrelated tick. *)
+let nudge_carry_recovery (order : strategy_order) =
+  (match Dio_engine.Order_executor.get_exchange order.exchange with
+   | Ok (module Ex : Dio_exchange.Exchange_intf.S) ->
+     (try Ex.resync_market_state ~symbol:order.symbol () with
+      | _ -> ())
+   | Error _ -> ());
+  Concurrency.Exchange_wakeup.signal ~symbol:order.symbol;
+  if not (String.contains order.symbol '/')
+  then Concurrency.Exchange_wakeup.signal ~symbol:(order.symbol ^ "/USDC")
+;;
+
 let grid_callbacks : strategy_callbacks =
   { on_place_ok =
       (fun order order_id ->
@@ -284,7 +299,9 @@ let hedger_callbacks : strategy_callbacks =
             ~maker:order.post_only
             ~kind:order.duplicate_key)
   ; on_amend_skipped = (fun _order _target_id -> ())
-  ; on_amend_fail = (fun _order _target_id _err -> ())
+  ; on_amend_fail =
+      (fun order _target_id _err ->
+        if order.strategy = Carry then nudge_carry_recovery order)
   ; on_cancel_ok = (fun _order _target_order_id -> ())
   ; on_cancel_fail = (fun _order _target_id -> ())
   }
@@ -326,37 +343,104 @@ let is_post_only_rejection err =
   contains_fragment lower "post only" || contains_fragment lower "post-only"
 ;;
 
+(** Parse a leading decimal number, ignoring trailing punctuation. *)
+let float_prefix s =
+  let n = String.length s in
+  let rec stop i =
+    if i >= n
+    then i
+    else (
+      match s.[i] with
+      | '0' .. '9' | '.' -> stop (i + 1)
+      | _ -> i)
+  in
+  let rec of_len len =
+    if len <= 0
+    then None
+    else (
+      match Float.of_string_opt (String.sub s 0 len) with
+      | Some f -> Some f
+      | None -> of_len (len - 1))
+  in
+  of_len (stop 0)
+;;
+
+(** BBO reported in a venue rejection, e.g. Hyperliquid's "...post only order would have
+    immediately matched, bbo was 80.892@80.893". The rejection-time BBO is fresher than
+    the local cache, so retries use it when present. *)
+let rejection_bbo err =
+  let marker = "bbo was " in
+  let marker_len = String.length marker in
+  let rec find i =
+    if i + marker_len > String.length err
+    then None
+    else if String.equal (String.sub err i marker_len) marker
+    then Some (i + marker_len)
+    else find (i + 1)
+  in
+  match find 0 with
+  | None -> None
+  | Some start ->
+    (match String.index_from_opt err start '@' with
+     | None -> None
+     | Some at ->
+       let bid = float_prefix (String.sub err start (at - start)) in
+       let ask = float_prefix (String.sub err (at + 1) (String.length err - at - 1)) in
+       (match bid, ask with
+        | Some b, Some a when b > 0.0 && a > 0.0 -> Some (b, a)
+        | _ -> None))
+;;
+
+(** Maker price one spread away from [bbo], with a small tick cushion so the retry cannot
+    land on the touch if the market moved again. *)
+let maker_retry_price ~side ~price ~bbo =
+  let bid, ask = bbo in
+  let spread = Float.max (ask -. bid) (Float.max 1e-5 (price *. 1e-5)) in
+  match side with
+  | Sell -> ask +. spread
+  | Buy -> bid -. spread
+;;
+
 (** Fresh maker price for a rejected carry post-only order.
 
     The strategy prices at the top of book it saw on the book event. By the time the REST
     placement lands the market can have moved through that price, so HL rejects the
-    post-only order. Re-read the venue book at the rejection and quote one spread away
-    from the new touch: a sell at [ask + spread] and a buy at [bid − spread] remain maker
-    orders with a small cushion for the next move. The retry is driven by the rejection
-    event, not a timer. *)
-let post_only_retry_price (order : strategy_order) =
+    post-only order. Prefer the BBO in the rejection itself (the exact book at rejection
+    time); fall back to the local cache, then quote one spread away from the new touch: a
+    sell at [ask + spread] and a buy at [bid − spread] remain maker orders with a cushion
+    for the next move. The retry is driven by the rejection event, not a timer. *)
+let post_only_retry_price ?err (order : strategy_order) =
   match order.strategy with
   | Carry when order.post_only ->
-    (match Dio_engine.Order_executor.get_exchange order.exchange with
-     | Error _ -> None
-     | Ok (module Ex) ->
-       (match Ex.get_top_of_book ~symbol:order.symbol with
-        | Some (bid, _, ask, _) when bid > 0.0 && ask > 0.0 ->
-          let spread = Float.max 0.0 (ask -. bid) in
-          let px =
-            match order.side with
-            | Sell -> ask +. spread
-            | Buy -> bid -. spread
-          in
-          if px <= 0.0
-          then None
-          else (
-            let px =
-              try Ex.round_price ~symbol:order.symbol ~price:px with
-              | _ -> px
-            in
-            Some px)
-        | _ -> None))
+    let bbo =
+      match err with
+      | Some e -> rejection_bbo e
+      | None -> None
+    in
+    let bbo =
+      match bbo with
+      | Some _ as r -> r
+      | None ->
+        (match Dio_engine.Order_executor.get_exchange order.exchange with
+         | Error _ -> None
+         | Ok (module Ex) ->
+           (match Ex.get_top_of_book ~symbol:order.symbol with
+            | Some (bid, _, ask, _) when bid > 0.0 && ask > 0.0 -> Some (bid, ask)
+            | _ -> None))
+    in
+    (match bbo with
+     | None -> None
+     | Some bbo ->
+       let price = Option.value order.price ~default:0.0 in
+       let px = maker_retry_price ~side:order.side ~price ~bbo in
+       if px <= 0.0
+       then None
+       else (
+         match Dio_engine.Order_executor.get_exchange order.exchange with
+         | Error _ -> Some px
+         | Ok (module Ex) ->
+           (try Some (Ex.round_price ~symbol:order.symbol ~price:px) with
+            | _ -> Some px)))
   | _ -> None
 ;;
 
@@ -388,6 +472,8 @@ let amend_request_of_order (order : strategy_order) target_order_id =
   ; new_limit_price = order.price
   ; limit_price_type = None
   ; post_only = Some order.post_only
+  ; reduce_only = Some order.reduce_only
+  ; time_in_force = Some order.time_in_force
   ; new_trigger_price = None
   ; trigger_price_type = None
   ; new_display_qty = None
@@ -426,7 +512,7 @@ let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
           | Error err ->
             let retry =
               if retries < 3 && is_post_only_rejection err
-              then post_only_retry_price o
+              then post_only_retry_price ~err o
               else None
             in
             (match retry with
@@ -537,7 +623,7 @@ let dispatch_amend ~auth_token ~orders_placed ~cb (order : strategy_order) targe
           | Error err ->
             let retry =
               if retries < 3 && is_post_only_rejection err
-              then post_only_retry_price o
+              then post_only_retry_price ~err o
               else None
             in
             (match retry with

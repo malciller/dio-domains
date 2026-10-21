@@ -45,6 +45,7 @@ type t =
   ; spot_seq_seen : int
   ; last_recycle_base : float
   ; last_spot : fill option
+  ; last_leverage : float
   ; updated_at : float
   }
 
@@ -78,6 +79,7 @@ let default =
   ; spot_seq_seen = 0
   ; last_recycle_base = 0.0
   ; last_spot = None
+  ; last_leverage = 0.0
   ; updated_at = 0.0
   }
 ;;
@@ -173,6 +175,7 @@ let of_json json =
       (match Yojson.Basic.Util.member "last_spot" json with
        | `Assoc _ as v -> Some (fill_of_json v)
        | _ -> None)
+  ; last_leverage = get_float json "last_leverage" 0.0
   ; updated_at = get_float json "updated_at" 0.0
   }
 ;;
@@ -211,6 +214,7 @@ let to_json (x : t) =
      ; "spot_seq", `Int x.spot_seq
      ; "spot_seq_seen", `Int x.spot_seq_seen
      ; "last_recycle_base", `Float x.last_recycle_base
+     ; "last_leverage", `Float x.last_leverage
      ; "updated_at", `Float x.updated_at
      ]
      @ fill_field "last_close" x.last_close

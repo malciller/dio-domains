@@ -21,6 +21,7 @@ type ctx =
   ; mutable cg_state : Types.strategy_state option
   ; mutable cg_carry : Dio_persistence.Carry_state_store.t option
   ; mutable cg_min_liq_reserve : float
+  ; mutable cg_last_leverage : float
   ; mutable cg_price : float
   ; mutable cg_bid : float
   ; mutable cg_ask : float
@@ -64,6 +65,7 @@ let create () =
   ; cg_state = None
   ; cg_carry = None
   ; cg_min_liq_reserve = 0.0
+  ; cg_last_leverage = 0.0
   ; cg_price = nan
   ; cg_bid = nan
   ; cg_ask = nan
@@ -561,12 +563,47 @@ let market_facts c (t : Strategy_runtime.t) =
      setf Slots.perp_qty p.qty;
      setf Slots.perp_entry p.entry;
      setf Slots.perp_margin p.margin_used;
-     setf Slots.perp_liq (Option.value p.liquidation ~default:0.0)
+     setf Slots.perp_liq (Option.value p.liquidation ~default:0.0);
+     (match p.leverage with
+      | Some l when l > 0.0 ->
+        if Float.abs (l -. c.cg_last_leverage) > 1e-9 && Option.is_some c.cg_carry
+        then
+          Logging.info_f
+            ~section
+            "carry leverage %s: %.2fx (position snapshot)"
+            c.cg_symbol
+            l;
+        c.cg_last_leverage <- l
+      | _ -> ())
    | None ->
      setf Slots.perp_qty 0.0;
      setf Slots.perp_entry 0.0;
      setf Slots.perp_margin 0.0;
      setf Slots.perp_liq 0.0);
+  setf Slots.perp_leverage c.cg_last_leverage;
+  (* A position snapshot newer than the entry fill supersedes the provisional fill facts.
+     Keep them while the snapshot still has no usable position margin, so the fill-based
+     TP can cover the gap. *)
+  (match positions_updated_at with
+   | Some ts ->
+     let fill_at =
+       match Strategy_runtime.get_platform t "carry_entry_fill_at" with
+       | Strategy_expr.V_float f -> f
+       | _ -> 0.0
+     in
+     let superseded =
+       ts > fill_at
+       &&
+       match position with
+       | None -> true
+       | Some p -> p.margin_used > 0.0
+     in
+     if superseded
+     then (
+       setf Slots.carry_entry_fill_price 0.0;
+       setf Slots.carry_entry_fill_qty 0.0;
+       setf Slots.carry_entry_fill_at 0.0)
+   | None -> ());
   (match margin with
    | Some m when fresh m.updated_at ->
      setf Slots.perp_account_value m.account_value;
@@ -585,10 +622,10 @@ let market_facts c (t : Strategy_runtime.t) =
   setf Slots.min_liq_reserve c.cg_min_liq_reserve;
   (match c.cg_carry with
    | Some cs ->
-     let close_price, close_kind, close_realized =
+     let close_price, close_kind, close_realized, close_qty =
        match cs.Dio_persistence.Carry_state_store.last_close with
-       | Some f -> f.price, f.kind, f.realized
-       | None -> 0.0, "", 0.0
+       | Some f -> f.price, f.kind, f.realized, f.qty
+       | None -> 0.0, "", 0.0, 0.0
      in
      let spot_price, spot_qty =
        match cs.Dio_persistence.Carry_state_store.last_spot with
@@ -596,6 +633,7 @@ let market_facts c (t : Strategy_runtime.t) =
        | None -> 0.0, 0.0
      in
      setf Slots.carry_close_price close_price;
+     setf Slots.carry_close_qty close_qty;
      sets Slots.carry_close_kind close_kind;
      setb
        Slots.carry_close_is_recycle
@@ -615,6 +653,7 @@ let market_facts c (t : Strategy_runtime.t) =
      seti Slots.carry_spot_seq cs.Dio_persistence.Carry_state_store.spot_seq
    | None ->
      setf Slots.carry_close_price 0.0;
+     setf Slots.carry_close_qty 0.0;
      sets Slots.carry_close_kind "";
      setb Slots.carry_close_is_recycle false;
      setf Slots.carry_close_realized 0.0;
@@ -1029,6 +1068,8 @@ let order_replace
             let order =
               Jac.create_amend_order
                 ~dup_key:kind_key
+                ~reduce_only
+                ~time_in_force:tif
                 o.order_id
                 instrument
                 order_side

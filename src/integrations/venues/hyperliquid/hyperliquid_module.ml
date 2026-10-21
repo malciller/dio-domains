@@ -211,7 +211,9 @@ module Hyperliquid_impl = struct
     ?cl_ord_id
     ?qty
     ?limit_price
-    ?post_only:_
+    ?post_only
+    ?reduce_only
+    ?time_in_force
     ?trigger_price:_
     ?display_qty:_
     ?symbol
@@ -241,6 +243,16 @@ module Hyperliquid_impl = struct
            Hyperliquid_instruments_feed.round_price_to_tick_for_symbol sym px
          in
          let sz_rounded = Hyperliquid_instruments_feed.round_qty_to_lot sym sz in
+         let hl_tif =
+           if Option.value post_only ~default:false
+           then Hyperliquid_types.Alo
+           else (
+             match time_in_force with
+             | Some Types.IOC -> Hyperliquid_types.Ioc
+             | Some Types.GTC -> Hyperliquid_types.Gtc
+             | Some Types.FOK -> Hyperliquid_types.Ioc
+             | None -> Hyperliquid_types.Gtc)
+         in
          let constructed_cl_ord_id =
            match existing.order_userref with
            | Some uref ->
@@ -257,6 +269,8 @@ module Hyperliquid_impl = struct
            ~is_buy
            ~px:px_rounded
            ~sz:sz_rounded
+           ~reduce_only:(Option.value reduce_only ~default:false)
+           ~tif:hl_tif
            ?cl_ord_id:constructed_cl_ord_id
            ~testnet:(Atomic.get is_testnet)
            ()
@@ -460,8 +474,24 @@ module Hyperliquid_impl = struct
     | None -> None
   ;;
 
+  let open_orders_for_symbol ~symbol =
+    if String.contains symbol '/'
+    then Hyperliquid_executions_feed.get_spot_open_orders symbol
+    else Hyperliquid_executions_feed.get_perp_open_orders ~coin:symbol
+  ;;
+
+  let fold_orders_for_symbol ~symbol ~init ~f =
+    if String.contains symbol '/'
+    then Hyperliquid_executions_feed.fold_spot_open_orders symbol ~init ~f
+    else
+      List.fold_left
+        (fun acc o -> f acc o)
+        init
+        (Hyperliquid_executions_feed.get_perp_open_orders ~coin:symbol)
+  ;;
+
   let get_open_orders ~symbol =
-    let orders = Hyperliquid_executions_feed.get_open_orders symbol in
+    let orders = open_orders_for_symbol ~symbol in
     List.map
       (fun (o : Hyperliquid_executions_feed.open_order) ->
         { Types.order_id = o.order_id
@@ -486,8 +516,8 @@ module Hyperliquid_impl = struct
   ;;
 
   let fold_open_orders ~symbol ~init ~f =
-    Hyperliquid_executions_feed.fold_open_orders
-      symbol
+    fold_orders_for_symbol
+      ~symbol
       ~init
       ~f:(fun acc (o : Hyperliquid_executions_feed.open_order) ->
         f
@@ -506,8 +536,8 @@ module Hyperliquid_impl = struct
   ;;
 
   let iter_open_orders_fast ~symbol f =
-    Hyperliquid_executions_feed.fold_open_orders
-      symbol
+    fold_orders_for_symbol
+      ~symbol
       ~init:()
       ~f:(fun () (o : Hyperliquid_executions_feed.open_order) ->
         let limit_price =

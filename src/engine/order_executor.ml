@@ -147,6 +147,8 @@ type amend_request =
   ; new_limit_price : float option
   ; limit_price_type : string option (** Reserved; unused by generic interface. *)
   ; post_only : bool option
+  ; reduce_only : bool option
+  ; time_in_force : string option
   ; new_trigger_price : float option
   ; trigger_price_type : string option (** Reserved; unused by generic interface. *)
   ; new_display_qty : float option
@@ -505,6 +507,8 @@ let amend_order ~token ?retry_config (request : amend_request) =
                    ?qty:request.new_quantity
                    ?limit_price:request.new_limit_price
                    ?post_only:request.post_only
+                   ?reduce_only:request.reduce_only
+                   ?time_in_force:(Option.map parse_time_in_force request.time_in_force)
                    ?trigger_price:request.new_trigger_price
                    ?display_qty:request.new_display_qty
                    ?symbol:request.symbol

@@ -154,6 +154,8 @@ module Kraken_impl = struct
     ?qty
     ?limit_price
     ?post_only
+    ?reduce_only:_
+    ?time_in_force:_
     ?trigger_price
     ?display_qty
     ?symbol

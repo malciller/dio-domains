@@ -1,13 +1,11 @@
-(** Portfolio-level liquidation reserve for the carry overlays.
+(** Per-overlay liquidation reserve for the carry overlays.
 
     In unified mode the perp liquidation is driven by the total spot USDC collateral, not
-    the per-venue initial margin. The reserve is the free USDC that must remain so that,
-    for a chosen liquidation multiple of the mark, the account equity still covers
-    maintenance if one carry position is shocked and the others stay at their current
-    marks.
-
-    The reserve is computed once per exchange and assigned to the first configured overlay
-    owner; the other overlays reserve zero for perp collateral. *)
+    the per-venue initial margin. Each trading entry with an overlay owns its own reserve
+    budget: the free USDC that must remain so that, for a chosen liquidation multiple of
+    the mark, that entry's short position still covers maintenance. The domain publishes
+    its budget as [min_liq_reserve] and its overlay reserves it; the account's total carry
+    reservation is the sum of the per-entry budgets. *)
 
 let section = "carry_reserve"
 
@@ -47,58 +45,25 @@ let pos_leg ~exchange ~coin =
     else None
 ;;
 
-(** [C_min] for a short target [i] at [L_i = mult_i * mark_i], with every other open carry
-    position held at its current mark. Returns [None] when target [i] is not a short. *)
-let c_min_for_target ~target ~others ~mult =
+(** [C_min] for one short at [L = mult * mark]. Each overlay's budget covers only its own
+    position, so the per-entry reserves add up to the account's total. Returns [None] when
+    the target is not a short. *)
+let c_min_for_target ~target ~mult =
   if target.qty >= -0.0000001
   then None
   else (
     let s = -.target.qty in
     let l = mult *. target.mark in
-    let other_pnl =
-      List.fold_left (fun acc l -> acc +. (l.qty *. (l.mark -. l.entry))) 0.0 others
-    in
-    let other_maint =
-      List.fold_left
-        (fun acc l -> acc +. (Float.abs l.qty *. l.mark *. l.maintenance))
-        0.0
-        others
-    in
-    Some
-      (Float.max
-         0.0
-         ((s *. l *. (1.0 +. target.maintenance))
-          -. (s *. target.entry)
-          -. other_pnl
-          +. other_maint)))
+    Some (Float.max 0.0 ((s *. l *. (1.0 +. target.maintenance)) -. (s *. target.entry))))
 ;;
 
-(** Portfolio reserve for [exchange]: the max single-position-shock [C_min] over the
-    configured carry overlays. Zero when no carry short is open. *)
-let compute ~exchange =
-  let entries = Config.get_overlay_entries ~exchange in
-  let legs =
-    List.filter_map
-      (fun (e : Config.overlay_entry) ->
-        let coin = base_coin_of_symbol e.oe_symbol in
-        match pos_leg ~exchange ~coin with
-        | Some leg -> Some (leg, e.oe_params.min_liq_mult)
-        | None -> None)
-      entries
-  in
-  let rec loop best = function
-    | [] -> best
-    | (target, mult) :: rest ->
-      let others =
-        List.filter_map (fun (leg, _) -> if leg == target then None else Some leg) legs
-        |> List.map (fun leg -> leg)
-      in
-      let best =
-        match c_min_for_target ~target ~others ~mult with
-        | Some c -> Float.max best c
-        | None -> best
-      in
-      loop best rest
-  in
-  loop 0.0 legs
+(** Per-entry reserve for [symbol] on [exchange]: that entry's short position at its own
+    [min_liq_mult]. Zero when no carry short is open. *)
+let compute ~exchange ~symbol =
+  let coin = base_coin_of_symbol symbol in
+  match pos_leg ~exchange ~coin with
+  | None -> 0.0
+  | Some target ->
+    let p = Config.get_overlay_params ~exchange ~symbol in
+    Option.value (c_min_for_target ~target ~mult:p.min_liq_mult) ~default:0.0
 ;;

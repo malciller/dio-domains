@@ -70,6 +70,7 @@ let perp_valid = platform "perp_valid"
 let perp_qty = platform "perp_qty"
 let perp_entry = platform "perp_entry"
 let perp_margin = platform "perp_margin"
+let perp_leverage = platform "perp_leverage"
 let perp_liq = platform "perp_liq"
 let perp_account_value = platform "perp_account_value"
 let perp_maintenance = platform "perp_maintenance"
@@ -84,6 +85,7 @@ let min_liq_reserve = platform "min_liq_reserve"
 (* Carry overlay actual-fill facts. Published from the durable carry state, never derived
    from the trigger mark. *)
 let carry_close_price = platform "carry_close_price"
+let carry_close_qty = platform "carry_close_qty"
 let carry_close_kind = platform "carry_close_kind"
 let carry_close_is_recycle = platform "carry_close_is_recycle"
 let carry_close_realized = platform "carry_close_realized"
@@ -94,6 +96,13 @@ let carry_recycle_seq = platform "carry_recycle_seq"
 let carry_spot_price = platform "carry_spot_price"
 let carry_spot_qty = platform "carry_spot_qty"
 let carry_spot_seq = platform "carry_spot_seq"
+
+(* Latest carry perp entry fill, published by the domain loop on the fill event so the
+   take-profit can be sized before the next position snapshot. [carry_entry_fill_at] is
+   the freshness gate; a perp buy (the close) clears all three. *)
+let carry_entry_fill_price = platform "carry_entry_fill_price"
+let carry_entry_fill_qty = platform "carry_entry_fill_qty"
+let carry_entry_fill_at = platform "carry_entry_fill_at"
 
 (* Engine-control flags and branch facts published by the handler. *)
 let engine_continue = platform "engine:continue"

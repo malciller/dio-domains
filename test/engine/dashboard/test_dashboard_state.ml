@@ -24,10 +24,77 @@ let make_decision () =
 
 let json () = Dio_dashboard.Dashboard_state.json_of_decision (make_decision ())
 
+(* Perp order serialization: the dashboard's asset chart reads pending exits from the perp
+   block, so the reduce-only buy that closes a short must carry its limit price. *)
+module Fake_perp_context : Dio_exchange.Exchange_intf.Market_context.S = struct
+  let name = "fakeperp"
+
+  let get_funding ~coin:_ =
+    Some
+      { Dio_exchange.Exchange_intf.Market_context.funding = 0.0
+      ; premium = 0.0
+      ; mark = 99.0
+      ; oracle = 99.0
+      ; updated_at = 0.0
+      }
+  ;;
+
+  let get_positions_updated_at () = Some 0.0
+
+  let get_position ~coin:_ =
+    Some
+      { Dio_exchange.Exchange_intf.Market_context.coin = "BTC"
+      ; qty = -0.5
+      ; entry = 100.0
+      ; position_value = 49.5
+      ; unrealized_pnl = 0.5
+      ; margin_used = 5.0
+      ; liquidation = Some 150.0
+      ; leverage = Some 10.0
+      ; updated_at = 0.0
+      }
+  ;;
+
+  let get_margin () = None
+  let get_margin_ratio () = None
+
+  let get_open_orders ~coin:_ =
+    [ { Dio_exchange.Exchange_intf.Types.order_id = "tp-close"
+      ; symbol = "BTC"
+      ; side = Dio_exchange.Exchange_intf.Types.Buy
+      ; qty = 0.5
+      ; cum_qty = 0.0
+      ; remaining_qty = 0.5
+      ; limit_price = Some 95.0
+      ; status = Dio_exchange.Exchange_intf.Types.New
+      ; user_ref = Some 3
+      ; cl_ord_id = None
+      }
+    ]
+  ;;
+end
+
+let () =
+  Dio_exchange.Exchange_intf.Registry.register_market_context (module Fake_perp_context)
+;;
+
 let field json key =
   match Yojson.Basic.Util.member key json with
   | `Null -> None
   | v -> Some v
+;;
+
+let test_perp_order_json () =
+  let j = Dio_dashboard.Dashboard_state.json_of_perp ~exchange:"fakeperp" ~coin:"BTC" in
+  (match field j "buy_orders" with
+   | Some (`List [ o ]) ->
+     (match Yojson.Basic.Util.member "price" o with
+      | `Float p -> Alcotest.(check (float 1e-9)) "close price" 95.0 p
+      | _ -> Alcotest.fail "missing close price")
+   | _ -> Alcotest.fail "expected one perp buy order");
+  match field j "sell_orders" with
+  | Some (`List []) -> ()
+  | _ -> Alcotest.fail "expected no perp sell orders"
 ;;
 
 let test_decision_fields () =
@@ -135,6 +202,7 @@ let () =
             `Quick
             test_decision_fields
         ; Alcotest.test_case "decisions keyed by symbol" `Quick test_keyed_by_symbol
+        ; Alcotest.test_case "perp orders serialized" `Quick test_perp_order_json
         ; Alcotest.test_case
             "ladder SELLS count includes the in-flight ledger"
             `Quick

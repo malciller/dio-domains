@@ -157,6 +157,38 @@ let is_strategy_file_asset (asset : trading_config) =
   Option.is_some (load_bound_strategy asset)
 ;;
 
+(** Ladder values derived from the configured ratios. The operator sets [start], [max],
+    and the ROE [add_threshold]; the engine forces [num_adds] and [add_amount] so the
+    quantity ladder lands exactly on [max] without overshooting. [num_adds] is the
+    smallest count whose step is at most the threshold, and [add_amount] is the resulting
+    equal step. *)
+type overlay_ladder =
+  { ol_start_ratio : float
+  ; ol_add_threshold : float
+  ; ol_add_amount : float
+  ; ol_num_adds : int
+  ; ol_max_ratio : float
+  }
+
+let derive_overlay_ladder (p : overlay_params) =
+  let start_ratio = p.start_ratio_pct /. 100.0 in
+  let add_threshold = p.add_threshold_pct /. 100.0 in
+  let max_ratio = p.max_ratio_pct /. 100.0 in
+  let gap = Float.max 0.0 (max_ratio -. start_ratio) in
+  let num_adds =
+    if gap <= 0.0 || add_threshold <= 0.0
+    then 0
+    else int_of_float (Float.ceil (gap /. add_threshold))
+  in
+  let add_amount = if num_adds > 0 then gap /. float_of_int num_adds else 0.0 in
+  { ol_start_ratio = start_ratio
+  ; ol_add_threshold = add_threshold
+  ; ol_add_amount = add_amount
+  ; ol_num_adds = num_adds
+  ; ol_max_ratio = max_ratio
+  }
+;;
+
 (** Core worker function executed by each OCaml domain for a trading asset. Runs the
     event-driven loop: consumes ring buffer events, executes strategy, and blocks on
     Exchange_wakeup between cycles. *)
@@ -711,28 +743,25 @@ let asset_domain_worker
                          ~exchange:asset_with_fees.exchange
                          ~symbol:asset_with_fees.symbol
                      in
-                     let start_ratio = p.start_ratio_pct /. 100.0 in
-                     let add_threshold = p.add_threshold_pct /. 100.0 in
-                     let max_ratio = p.max_ratio_pct /. 100.0 in
-                     let gap = Float.max 0.0 (max_ratio -. start_ratio) in
-                     let num_adds =
-                       if gap <= 0.0 || add_threshold <= 0.0
-                       then 0
-                       else int_of_float (Float.ceil (gap /. add_threshold))
-                     in
-                     let add_amount =
-                       if num_adds > 0 then gap /. float_of_int num_adds else 0.0
-                     in
+                     let ladder = derive_overlay_ladder p in
                      let params =
-                       [ "start_ratio", Dio_strategies.Strategy_expr.V_float start_ratio
+                       [ ( "start_ratio"
+                         , Dio_strategies.Strategy_expr.V_float ladder.ol_start_ratio )
                        ; ( "add_threshold"
-                         , Dio_strategies.Strategy_expr.V_float add_threshold )
-                       ; "add_amount", Dio_strategies.Strategy_expr.V_float add_amount
-                       ; "max_ratio", Dio_strategies.Strategy_expr.V_float max_ratio
-                       ; "num_adds", Dio_strategies.Strategy_expr.V_int num_adds
+                         , Dio_strategies.Strategy_expr.V_float ladder.ol_add_threshold )
+                       ; ( "add_amount"
+                         , Dio_strategies.Strategy_expr.V_float ladder.ol_add_amount )
+                       ; ( "max_ratio"
+                         , Dio_strategies.Strategy_expr.V_float ladder.ol_max_ratio )
+                       ; "num_adds", Dio_strategies.Strategy_expr.V_int ladder.ol_num_adds
                        ; ( "recycle_profit"
                          , Dio_strategies.Strategy_expr.V_float
                              (p.recycle_profit_pct /. 100.0) )
+                       ; ( "recycle_base_share"
+                         , Dio_strategies.Strategy_expr.V_float
+                             (p.recycle_base_share_pct /. 100.0) )
+                       ; ( "min_entry_margin_ratio"
+                         , Dio_strategies.Strategy_expr.V_float p.min_entry_margin_ratio )
                        ; ( "min_liq_mult"
                          , Dio_strategies.Strategy_expr.V_float p.min_liq_mult )
                        ]
@@ -761,29 +790,52 @@ let asset_domain_worker
       | _ -> None
     in
     (match config_grid, overlay_carry with
-     | Some (_, _, Some ort), Some st ->
+     | Some (ctx, _, Some ort), Some st ->
        Dio_strategies.Carry_runtime.seed ort !st;
+       let p =
+         Config.get_overlay_params
+           ~exchange:asset_with_fees.exchange
+           ~symbol:asset_with_fees.symbol
+       in
+       (* Seed the leverage used by the fill-time take-profit. The venue only reports a
+          position's leverage when a position exists, so a flat account has no value to
+          fetch. Prefer the explicit config; otherwise reuse the last value persisted by
+          the previous run. The first position snapshot corrects either seed. *)
+       let seeded_leverage, source =
+         if p.leverage > 0.0
+         then p.leverage, "config"
+         else if !st.last_leverage > 0.0
+         then !st.last_leverage, "carry state"
+         else 0.0, "unknown"
+       in
+       ctx.cg_last_leverage <- seeded_leverage;
+       if seeded_leverage > 0.0
+       then
+         Dio_strategies.Strategy_runtime.set_platform
+           ort
+           "perp_leverage"
+           (Dio_strategies.Strategy_expr.V_float seeded_leverage);
+       if seeded_leverage > 0.0
+       then
+         Logging.info_f
+           ~section
+           "carry leverage seed %s: %.2fx (%s)"
+           asset_with_fees.symbol
+           seeded_leverage
+           source
+       else
+         Logging.info_f
+           ~section
+           "carry leverage seed %s: unknown; the first take-profit waits for the first \
+            position snapshot (set trading[].overlay.params.leverage to seed it)"
+           asset_with_fees.symbol;
        (* An already-open position with no durable ladder state is grandfathered at its
           current ratio: the current short / accumulated base, with the add index at the
           completed band (or the max). No forced cover, even if the configured max is
           below the current ratio. *)
        if !st.anchor <= 0.0
        then (
-         let p =
-           Config.get_overlay_params
-             ~exchange:asset_with_fees.exchange
-             ~symbol:asset_with_fees.symbol
-         in
-         let start_ratio = p.start_ratio_pct /. 100.0 in
-         let add_threshold = p.add_threshold_pct /. 100.0 in
-         let max_ratio = p.max_ratio_pct /. 100.0 in
-         let gap = Float.max 0.0 (max_ratio -. start_ratio) in
-         let num_adds =
-           if gap <= 0.0 || add_threshold <= 0.0
-           then 0
-           else int_of_float (Float.ceil (gap /. add_threshold))
-         in
-         let add_amount = if num_adds > 0 then gap /. float_of_int num_adds else 0.0 in
+         let ladder = derive_overlay_ladder p in
          let reserved =
            match cached_grid_state with
            | Some s -> s.reserved_base
@@ -805,7 +857,7 @@ let asset_domain_worker
          | Some pos when pos.qty < -0.0001 && accumulated > 0.0 && pos.entry > 0.0 ->
            let short_qty = -.pos.qty in
            let ratio = short_qty /. accumulated in
-           if ratio > max_ratio +. 1e-9
+           if ratio > ladder.ol_max_ratio +. 1e-9
            then
              Logging.warn_f
                ~section
@@ -813,12 +865,12 @@ let asset_domain_worker
                 until the first profitable recycle"
                asset_with_fees.symbol
                ratio
-               max_ratio;
+               ladder.ol_max_ratio;
            Dio_strategies.Carry_runtime.init_ladder
-             ~start_ratio
-             ~add_amount
-             ~num_adds
-             ~add_threshold
+             ~start_ratio:ladder.ol_start_ratio
+             ~add_amount:ladder.ol_add_amount
+             ~num_adds:ladder.ol_num_adds
+             ~add_threshold:ladder.ol_add_threshold
              ~entry:pos.entry
              ~accumulated
              ~short_qty
@@ -827,13 +879,17 @@ let asset_domain_worker
      | _ -> ());
     (* Terminal overlay fills are the only source of the actual close/spot prices used by
        the recycle split. Record the order's cumulative fill once, on its terminal event. *)
+    let overlay_rt =
+      match config_grid with
+      | Some (_, _, ort) -> ort
+      | None -> None
+    in
     let record_overlay_fill
       ~now_exec
       (event : Dio_exchange.Exchange_intf.Types.execution_event)
       =
-      match overlay_carry with
-      | None -> ()
-      | Some r ->
+      match overlay_carry, overlay_rt with
+      | Some r, Some rt ->
         (match
            Dio_strategies.Strategy_common.lookup_carry_order ~order_id:event.order_id
          with
@@ -846,6 +902,27 @@ let asset_domain_worker
                | Types.Buy -> Dio_strategies.Strategy_common.Buy
                | Types.Sell -> Dio_strategies.Strategy_common.Sell
              in
+             (* Publish the latest perp entry fill so the overlay can place the TP from
+                the fill event, before the next webData2 position snapshot. A perp buy
+                closes the short and clears the fallback. *)
+             if meta.Dio_strategies.Strategy_common.com_market
+                = Dio_strategies.Strategy_common.Carry_perp
+             then (
+               let setf key v =
+                 Dio_strategies.Strategy_runtime.set_platform
+                   rt
+                   key
+                   (Dio_strategies.Strategy_expr.V_float v)
+               in
+               match side with
+               | Dio_strategies.Strategy_common.Sell ->
+                 setf "carry_entry_fill_price" event.avg_price;
+                 setf "carry_entry_fill_qty" event.filled_qty;
+                 setf "carry_entry_fill_at" now_exec
+               | Dio_strategies.Strategy_common.Buy ->
+                 setf "carry_entry_fill_price" 0.0;
+                 setf "carry_entry_fill_qty" 0.0;
+                 setf "carry_entry_fill_at" 0.0);
              Dio_strategies.Carry_runtime.record_fill
                ~exchange:asset_with_fees.exchange
                ~symbol:asset_with_fees.symbol
@@ -860,6 +937,7 @@ let asset_domain_worker
                ~taker_fee:(Option.value asset_with_fees.taker_fee ~default:0.0)
                r);
            Dio_strategies.Strategy_common.retire_carry_order ~order_id:event.order_id)
+      | _ -> ()
     in
     (* Overlay cycle inputs. The overlay is independent of the grid's oracle gate: it
        manages its own exposure and must run even when the primary strategy is halted. Its
@@ -1747,11 +1825,16 @@ let asset_domain_worker
          ctx.cg_gen <- 0;
          ctx.cg_profile <- false;
          ctx.cg_min_liq_reserve
-         <- (if Config.is_overlay_owner
-                  ~exchange:asset_with_fees.exchange
-                  ~symbol:asset_with_fees.symbol
-             then Carry_reserve.compute ~exchange:asset_with_fees.exchange
-             else 0.0);
+         <- (match
+               Config.get_overlay_strategy
+                 ~exchange:asset_with_fees.exchange
+                 ~symbol:asset_with_fees.symbol
+             with
+             | Some _ ->
+               Carry_reserve.compute
+                 ~exchange:asset_with_fees.exchange
+                 ~symbol:asset_with_fees.symbol
+             | None -> 0.0);
          ctx.cg_carry <- Option.map (fun r -> !r) overlay_carry;
          ort.prof_enabled <- false;
          Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->

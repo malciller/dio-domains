@@ -148,6 +148,90 @@ let test_orders_filter_nonpositive () =
   | _ -> Alcotest.fail "expected one strategy"
 ;;
 
+let test_perp_orders_parsing () =
+  let perp =
+    `Assoc
+      [ "coin", `String "BTC"
+      ; "side", `String "short"
+      ; "has_position", `Bool true
+      ; "qty", `Float (-0.5)
+      ; "abs_qty", `Float 0.5
+      ; "entry", `Float 100.0
+      ; "mark", `Float 99.0
+      ; ( "buy_orders"
+        , `List
+            [ mk_order ~id:"tp" ~price:95.0 ~qty:0.5 ()
+            ; mk_order ~id:"bad" ~price:0.0 ~qty:0.5 ()
+            ] )
+      ; "sell_orders", `List [ mk_order ~id:"add" ~price:105.0 ~qty:0.25 () ]
+      ]
+  in
+  let json =
+    snapshot_json
+      [ ( "BTC/USDC"
+        , `Assoc
+            [ "exchange", `String "hyperliquid"
+            ; "strategy", `Assoc [ "type", `String "carry_overlay" ]
+            ; "market", `Assoc [ "bid", `Float 100.0; "ask", `Float 101.0 ]
+            ; "perp", perp
+            ] )
+      ]
+      []
+  in
+  let s = Snapshot.of_json json in
+  match s.strategies with
+  | [ (_, { perp = Some p; _ }) ] ->
+    Alcotest.(check int) "buy exits parsed" 1 (List.length p.buy_orders);
+    Alcotest.(check int) "sell entries parsed" 1 (List.length p.sell_orders);
+    (match p.buy_orders with
+     | [ o ] -> Alcotest.(check (float 1e-9)) "close price" 95.0 o.price
+     | _ -> Alcotest.fail "expected one perp buy order")
+  | _ -> Alcotest.fail "expected one strategy with a perp block"
+;;
+
+let test_asset_chart_renders_perp_orders () =
+  let perp =
+    `Assoc
+      [ "coin", `String "BTC"
+      ; "side", `String "short"
+      ; "has_position", `Bool true
+      ; "qty", `Float (-0.5)
+      ; "abs_qty", `Float 0.5
+      ; "entry", `Float 100.0
+      ; "mark", `Float 99.0
+      ; "unrealized_pnl", `Float 0.5
+      ; "buy_orders", `List [ mk_order ~id:"tp" ~price:95.0 ~qty:0.5 () ]
+      ; "sell_orders", `List [ mk_order ~id:"add" ~price:105.0 ~qty:0.25 () ]
+      ]
+  in
+  let json =
+    snapshot_json
+      [ ( "BTC/USDC"
+        , `Assoc
+            [ "exchange", `String "hyperliquid"
+            ; "strategy", `Assoc [ "type", `String "carry_overlay" ]
+            ; ( "market"
+              , `Assoc
+                  [ "bid", `Float 100.0
+                  ; "ask", `Float 101.0
+                  ; "base_asset", `String "BTC"
+                  ; "base_balance", `Float 2.0
+                  ] )
+            ; "perp", perp
+            ] )
+      ]
+      []
+  in
+  let s = Snapshot.of_json json in
+  Asset_graph.record_all_prices s;
+  let img = Asset_graph.render_asset_detail 160 50 "" s in
+  Alcotest.(check int) "chart fills width" 160 (Notty.I.width img);
+  Alcotest.(check bool)
+    "chart renders at least the requested height"
+    true
+    (Notty.I.height img >= 50)
+;;
+
 let test_latency_and_oracle_parsing () =
   let metric =
     `Assoc
@@ -309,6 +393,11 @@ let () =
             "orders filter non-positive"
             `Quick
             test_orders_filter_nonpositive
+        ; Alcotest.test_case "perp orders parsing" `Quick test_perp_orders_parsing
+        ; Alcotest.test_case
+            "perp orders render on the chart"
+            `Quick
+            test_asset_chart_renders_perp_orders
         ; Alcotest.test_case
             "latency and oracle parsing"
             `Quick
