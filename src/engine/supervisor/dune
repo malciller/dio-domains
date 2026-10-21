@@ -22,5 +22,4 @@
   dio.ibkr
   dio.lighter
   dio.alpaca
-  dio.concurrency)
-)
+  dio.concurrency))

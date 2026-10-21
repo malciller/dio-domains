@@ -2,4 +2,4 @@
  (name dio_exchange)
  (public_name dio.exchange)
  (libraries dio.lwt dio.error_handling)
- (modules Exchange_intf))
+ (modules Exchange_intf Market_context Capital_reservation))

@@ -245,8 +245,8 @@ let[@inline] cyclically_between i j h =
     end marker, so a hole punched in front of a colliding entry orphans it: [find_opt]
     reports absent for a binding still in the shard, and a later [set] installs a second
     copy, double-counting [count]. Instead each following entry that depends on the hole
-    moves back into it and the hole walks forward, until it reaches an empty slot.
-    The 50% load cap guarantees one exists, so no cluster-length bound is needed. *)
+    moves back into it and the hole walks forward, until it reaches an empty slot. The 50%
+    load cap guarantees one exists, so no cluster-length bound is needed. *)
 let remove t k =
   let h = Hashtbl.hash k in
   let i = shard_index t h in

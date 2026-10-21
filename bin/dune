@@ -21,20 +21,14 @@
   dio.runtime_compat
   dio.lwt
   supervisor
-  dio.mirage-crypto-rng.unix)
-)
+  dio.mirage-crypto-rng.unix))
 
 (executable
  (package dio)
  (public_name dio-dashboard)
  (name dashboard)
  (modes exe)
- (libraries
-  dio.notty
-  dio.notty.unix
-  dio.yojson
-  unix
-  dio.dashboard_ui))
+ (libraries dio.notty dio.notty.unix dio.yojson unix dio.dashboard_ui))
 
 (executable
  (package dio)

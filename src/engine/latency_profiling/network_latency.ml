@@ -32,10 +32,7 @@ type t =
    the dashboard read it without one — latent rather than live, because every caller today
    passes one of the four hardcoded venue names that [venue_profilers] short-circuits, but
    it arms the moment anyone records a custom venue. Copy-on-write closes it for good. *)
-let profilers : (string, t) Ds.Cow_table.t =
-  Ds.Cow_table.create ~shard_count:8 ()
-;;
-
+let profilers : (string, t) Ds.Cow_table.t = Ds.Cow_table.create ~shard_count:8 ()
 let mutex = Mutex.create ()
 
 (** Coarse bucket width and upper bound for the network RTT/latency metrics. 1ms buckets
@@ -458,7 +455,10 @@ let snapshots venue =
 
 (** All venues with measured activity: (venue, label windows). *)
 let all_venue_snapshots () =
-  Ds.Cow_table.fold (fun venue _ acc -> (venue, snapshots venue) :: acc) profilers ~init:[]
+  Ds.Cow_table.fold
+    (fun venue _ acc -> (venue, snapshots venue) :: acc)
+    profilers
+    ~init:[]
 ;;
 
 (** Network window publication cadence, in seconds. Shared by the background loop and the
@@ -496,7 +496,7 @@ let publish_all ?(log_spikes = false) ?(threshold_us = 10.0) () =
         with
         | None -> ()
         | Some msg -> Logging.info_f ~section "%s" msg))
-  profilers
+    profilers
 ;;
 
 (** Background publisher: advance all venue windows every [publish_interval_seconds] so

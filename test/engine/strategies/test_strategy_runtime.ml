@@ -334,6 +334,42 @@ module Stub_engine = struct
   let expire_tif_recovery _ = ()
   let cycle_facts _ _ = ()
   let early_facts _ _ = ()
+  let market_facts _ _ = ()
+
+  let order_place
+    _
+    ~symbol:_
+    ~market:_
+    ~side:_
+    ~qty:_
+    ~price:_
+    ~tif:_
+    ~reduce_only:_
+    ~post_only:_
+    ~dedup_key:_
+    =
+    ()
+  ;;
+
+  let order_cancel _ ~market:_ ~order_id:_ = ()
+
+  let order_replace
+    _
+    ~symbol:_
+    ~market:_
+    ~side:_
+    ~qty:_
+    ~price:_
+    ~tif:_
+    ~reduce_only:_
+    ~post_only:_
+    ~dedup_key:_
+    =
+    ()
+  ;;
+
+  let quote_reserve _ ~amount:_ = ()
+  let reserve_base _ ~qty:_ = ()
   let mark_stale _ = ()
   let buy_cancel _ = ()
   let buy_place _ = ()

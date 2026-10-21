@@ -40,6 +40,27 @@ type trading_config =
 let strategy_userref_grid = 1 (* grid strategy *)
 
 let strategy_userref_mm = 2 (* market maker strategy *)
+let strategy_userref_carry = 3 (* carry overlay perp orders *)
+
+(** Decode the strategy tag embedded in a Hyperliquid-style client order id. The tag is
+    the top byte of the trailing 64 bits. Returns [None] for non-hex ids or a zero tag. *)
+let userref_of_cloid (clid : string) : int option =
+  let clean =
+    if String.starts_with ~prefix:"0x" clid
+    then String.sub clid 2 (String.length clid - 2)
+    else clid
+  in
+  if String.length clean < 16
+  then None
+  else (
+    let last = String.sub clean (String.length clean - 16) 16 in
+    try
+      let v = Int64.of_string ("0x" ^ last) in
+      let tag = Int64.shift_right_logical v 56 in
+      if Int64.compare tag 0L > 0 then Some (Int64.to_int tag) else None
+    with
+    | _ -> None)
+;;
 
 (** Returns true if [order_userref] matches the given [strategy_userref]. *)
 let is_strategy_order strategy_userref order_userref = strategy_userref = order_userref
@@ -71,11 +92,13 @@ type strategy_id =
   | Ladder
   | MM
   | Hedger
+  | Carry
 
 let string_of_strategy_id = function
   | Ladder -> "jacobs_ladder"
   | MM -> "market_maker"
   | Hedger -> "Hedger"
+  | Carry -> "carry_overlay"
 ;;
 
 (** Unified order record emitted by all strategies. *)
@@ -89,6 +112,7 @@ type strategy_order =
   ; price : float option
   ; time_in_force : string (* e.g. "GTC", "IOC", "FOK" *)
   ; post_only : bool
+  ; reduce_only : bool
   ; userref : int option (* exchange-level strategy tag *)
   ; strategy : strategy_id (* originating strategy variant *)
   ; exchange : string (* target exchange *)

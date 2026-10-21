@@ -111,19 +111,38 @@ let emit_flow_order (order : strategy_order) =
         ~fields)
 ;;
 
-let create_place_order dup_key asset_symbol side qty price post_only strategy exchange =
+let create_place_order
+  ?(reduce_only = false)
+  ?time_in_force
+  ?(order_type = "limit")
+  ?userref
+  dup_key
+  asset_symbol
+  side
+  qty
+  price
+  post_only
+  strategy
+  exchange
+  =
   let ecfg = get_exchange_config exchange in
+  let tif =
+    match time_in_force with
+    | Some t -> t
+    | None -> ecfg.time_in_force
+  in
   { operation = Place
   ; order_id = None
   ; symbol = asset_symbol
   ; exchange
   ; side
-  ; order_type = "limit"
+  ; order_type
   ; qty
   ; price
-  ; time_in_force = ecfg.time_in_force
+  ; time_in_force = tif
   ; post_only
-  ; userref = Some strategy_userref_grid
+  ; reduce_only
+  ; userref = Some (Option.value userref ~default:strategy_userref_grid)
   ; strategy
   ; duplicate_key = dup_key
   }
@@ -142,6 +161,7 @@ let create_amend_order order_id asset_symbol side qty price post_only strategy e
   ; price
   ; time_in_force = ecfg.time_in_force
   ; post_only
+  ; reduce_only = false
   ; userref = None
   ; strategy
   ; duplicate_key = ""
@@ -160,6 +180,7 @@ let create_cancel_order order_id asset_symbol strategy exchange =
   ; price = None
   ; time_in_force = "GTC"
   ; post_only = false
+  ; reduce_only = false
   ; userref = None
   ; strategy
   ; duplicate_key = ""
@@ -173,20 +194,27 @@ let create_order dup_key asset_symbol side qty price post_only exchange =
 
 (** Pushes [order] to the ringbuffer. Returns true on success, false on duplicate key or
     full buffer. *)
-let push_order ~now ?state order =
+let push_order ~now ?state ?(manage_state = true) order =
   let operation_str =
     match order.operation with
     | Place -> "place"
     | Amend -> "amend"
     | Cancel -> "cancel"
   in
+  (* Overlay orders must not enter the primary strategy's pending/sell ledger, and must
+     not create a state keyed by the perp coin (the perp order symbol is not the spot
+     pair). *)
+  let state_opt =
+    if not manage_state
+    then None
+    else
+      Some
+        (match state with
+         | Some s -> s
+         | None -> get_strategy_state order.symbol)
+  in
   match order.operation with
   | Cancel ->
-    let state =
-      match state with
-      | Some s -> s
-      | None -> get_strategy_state order.symbol
-    in
     (match order.order_id with
      | Some _ ->
        let write_result = LockFreeQueue.write order_buffer order in
@@ -194,8 +222,11 @@ let push_order ~now ?state order =
         | Some () ->
           OrderSignal.broadcast ();
           Order_actions.incr order.symbol;
-          state.last_order_time <- now;
-          if order.side = Buy then state.inflight_cancel_buy <- true;
+          (match state_opt with
+           | Some state ->
+             state.last_order_time <- now;
+             if order.side = Buy then state.inflight_cancel_buy <- true
+           | None -> ());
           record_emitted order;
           emit_flow_order order;
           true
@@ -230,61 +261,62 @@ let push_order ~now ?state order =
         Order_actions.incr order.symbol;
         record_emitted order;
         emit_flow_order order;
-        let state =
-          match state with
-          | Some s -> s
-          | None -> get_strategy_state order.symbol
-        in
-        state.last_order_time <- now;
-        (match order.operation, order.side with
-         | Place, Buy -> state.inflight_buy <- true
-         | Place, Sell -> state.inflight_sell <- true
-         | _ -> ());
-        (match order.operation with
-         | Place ->
-           let order_ecfg = get_exchange_config order.exchange in
-           let order_price = Option.value order.price ~default:0.0 in
-           let temp_order_id =
-             Printf.sprintf
-               "pending_%s_%.2f"
-               (string_of_order_side order.side)
-               order_price
-           in
-           (* Arm the in-flight sell ledger at dispatch for every venue (including
-              track_pending_sells=false): base leaves the sellable pool when the order is
-              pushed, before any ack or feed visibility, and is released only on a
-              terminal event. *)
-           (match order.side with
-            | Sell ->
-              arm_sell_commitment
-                ~state
-                ~id:temp_order_id
-                ~price:order_price
-                ~qty:order.qty
-            | Buy -> ());
-           let skip_pending = (not order_ecfg.track_pending_sells) && order.side = Sell in
-           if not skip_pending
-           then (
-             let timestamp = now in
-             state.pending_orders
-             <- (temp_order_id, order.side, order_price, timestamp)
-                :: state.pending_orders;
-             match order.side, order.price with
-             | Sell, Some price ->
-               Sell_orders.push state.open_sell_orders temp_order_id price order.qty
-             | _ -> ())
-         | Amend ->
-           let temp_order_id =
-             Printf.sprintf
-               "pending_amend_%s"
-               (Option.value order.order_id ~default:"unknown")
-           in
-           let order_price = Option.value order.price ~default:0.0 in
-           let timestamp = now in
-           state.pending_orders
-           <- (temp_order_id, order.side, order_price, timestamp) :: state.pending_orders;
-           if order.side = Buy then state.inflight_amend_buy <- true
-         | Cancel -> ());
+        (match state_opt with
+         | Some state ->
+           state.last_order_time <- now;
+           (match order.operation, order.side with
+            | Place, Buy -> state.inflight_buy <- true
+            | Place, Sell -> state.inflight_sell <- true
+            | _ -> ());
+           (match order.operation with
+            | Place ->
+              let order_ecfg = get_exchange_config order.exchange in
+              let order_price = Option.value order.price ~default:0.0 in
+              let temp_order_id =
+                Printf.sprintf
+                  "pending_%s_%.2f"
+                  (string_of_order_side order.side)
+                  order_price
+              in
+              (* Arm the in-flight sell ledger at dispatch for every venue (including
+                 track_pending_sells=false): base leaves the sellable pool when the order
+                 is pushed, before any ack or feed visibility, and is released only on a
+                 terminal event. *)
+              (match order.side with
+               | Sell ->
+                 arm_sell_commitment
+                   ~state
+                   ~id:temp_order_id
+                   ~price:order_price
+                   ~qty:order.qty
+               | Buy -> ());
+              let skip_pending =
+                (not order_ecfg.track_pending_sells) && order.side = Sell
+              in
+              if not skip_pending
+              then (
+                let timestamp = now in
+                state.pending_orders
+                <- (temp_order_id, order.side, order_price, timestamp)
+                   :: state.pending_orders;
+                match order.side, order.price with
+                | Sell, Some price ->
+                  Sell_orders.push state.open_sell_orders temp_order_id price order.qty
+                | _ -> ())
+            | Amend ->
+              let temp_order_id =
+                Printf.sprintf
+                  "pending_amend_%s"
+                  (Option.value order.order_id ~default:"unknown")
+              in
+              let order_price = Option.value order.price ~default:0.0 in
+              let timestamp = now in
+              state.pending_orders
+              <- (temp_order_id, order.side, order_price, timestamp)
+                 :: state.pending_orders;
+              if order.side = Buy then state.inflight_amend_buy <- true
+            | Cancel -> ())
+         | None -> ());
         true
       | None ->
         (match order.operation with

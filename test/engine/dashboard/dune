@@ -12,12 +12,7 @@
 
 (executable
  (name bench_dashboard)
- (libraries
-  dio.dashboard_ui
-  dio.notty
-  dio.notty.unix
-  dio.yojson
-  unix))
+ (libraries dio.dashboard_ui dio.notty dio.notty.unix dio.yojson unix))
 
 (executable
  (name preview_log_panel)

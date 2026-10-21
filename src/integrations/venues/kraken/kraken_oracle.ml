@@ -312,17 +312,17 @@ let fetch_balances ~testnet:_ : ((string * float * float) list, string) result L
         let nonce = Kraken_common_types.nonce () in
         let body = "nonce=" ^ nonce in
         post_signed ~api_key ~api_secret ~path ~body ~nonce
-      >>= fun (response, response_body) ->
-      Cohttp_lwt.Body.to_string response_body
-      >|= fun body ->
-      let status = Cohttp.Response.status response |> Cohttp.Code.code_of_status in
-      if status <> 200
-      then Error (Printf.sprintf "Kraken HTTP %d: %s" status body)
-      else (
-        try parse_balances (Yojson.Safe.from_string body) with
-        | exn ->
-          Error
-            (Printf.sprintf "Kraken response parse failed: %s" (Printexc.to_string exn))))
+        >>= fun (response, response_body) ->
+        Cohttp_lwt.Body.to_string response_body
+        >|= fun body ->
+        let status = Cohttp.Response.status response |> Cohttp.Code.code_of_status in
+        if status <> 200
+        then Error (Printf.sprintf "Kraken HTTP %d: %s" status body)
+        else (
+          try parse_balances (Yojson.Safe.from_string body) with
+          | exn ->
+            Error
+              (Printf.sprintf "Kraken response parse failed: %s" (Printexc.to_string exn))))
       (fun exn -> Lwt.return (Error (Printexc.to_string exn))))
 ;;
 

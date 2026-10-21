@@ -10,6 +10,7 @@
 ; implementations in each would leave several copies of the trickiest code in the repo.
 ;
 ; Keep this library dependency-free. It is the bottom of the graph.
+
 (library
  (name ds)
  (public_name dio.data_structures)

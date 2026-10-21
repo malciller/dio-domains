@@ -16,5 +16,4 @@
   dio.cmc
   dio.ibkr
   dio.alpaca)
- (modules Dashboard_server Dashboard_state)
-)
+ (modules Dashboard_server Dashboard_state))

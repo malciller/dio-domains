@@ -47,31 +47,31 @@ let iter_buses f = List.iter f (Atomic.get registry)
    the topics currently losing subscribers without naming them. *)
 let publish_metrics () =
   Cache_metrics.register "engine.event_bus" (fun () ->
-      let buses = Atomic.get registry in
-      let total = ref 0 in
-      let active = ref 0 in
-      let closed = ref 0 in
-      let topics_with_closed = ref 0 in
-      List.iter
-        (fun ops ->
-          let bus_total, bus_active, bus_closed = ops.stats () in
-          total := !total + bus_total;
-          active := !active + bus_active;
-          closed := !closed + bus_closed;
-          if bus_closed > 0 then incr topics_with_closed)
-        buses;
-      { Cache_metrics.name = "engine.event_bus"
-      ; metrics =
-          [ "buses", Cache_metrics.Count (List.length buses)
-          ; "subscribers", Cache_metrics.Count !total
-          ; "active", Cache_metrics.Count !active
-          ; "closed", Cache_metrics.Count !closed
-          ; "topics_with_closed", Cache_metrics.Count !topics_with_closed
-          ; ( "closed_ratio"
-            , Cache_metrics.Ratio
-                (if !total = 0 then 0.0 else float !closed /. float !total) )
-          ]
-      })
+    let buses = Atomic.get registry in
+    let total = ref 0 in
+    let active = ref 0 in
+    let closed = ref 0 in
+    let topics_with_closed = ref 0 in
+    List.iter
+      (fun ops ->
+        let bus_total, bus_active, bus_closed = ops.stats () in
+        total := !total + bus_total;
+        active := !active + bus_active;
+        closed := !closed + bus_closed;
+        if bus_closed > 0 then incr topics_with_closed)
+      buses;
+    { Cache_metrics.name = "engine.event_bus"
+    ; metrics =
+        [ "buses", Cache_metrics.Count (List.length buses)
+        ; "subscribers", Cache_metrics.Count !total
+        ; "active", Cache_metrics.Count !active
+        ; "closed", Cache_metrics.Count !closed
+        ; "topics_with_closed", Cache_metrics.Count !topics_with_closed
+        ; ( "closed_ratio"
+          , Cache_metrics.Ratio
+              (if !total = 0 then 0.0 else float !closed /. float !total) )
+        ]
+    })
 ;;
 
 module Make (Payload : PAYLOAD) = struct

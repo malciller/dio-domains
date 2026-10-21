@@ -127,6 +127,26 @@ let get_total_balance asset =
 let get_staked_balance asset =
   let store = get_balance_store asset in
   BalanceStore.get_staked_balance store
+(* Spot-only [(available, total)] for [asset], or [None] until the first spot snapshot.
+   In a unified/portfolio account the spot USDC total is the perp collateral, so the margin
+   feed reads this rather than the per-DEX perp summary. *)
+let get_spot_snapshot asset =
+  let store = get_balance_store asset in
+  Mutex.lock store.mutex;
+  (let snapshot =
+     Hashtbl.fold
+       (fun _ (w : BalanceStore.wallet_balance) acc ->
+          if String.equal w.wallet_type "spot" then Some (w.balance, w.total) else acc)
+       store.wallets None in
+   Mutex.unlock store.mutex; snapshot)
+(* Called after a spot snapshot is applied. The positions feed installs a callback so
+   unified-account margin equity is recomputed when USDC moves without a clearinghouse
+   frame (grid fills, funding, transfers). *)
+let on_spot_update : (unit -> unit) ref = ref ignore
+let notify_spot_update () =
+  try (!on_spot_update) () with
+  | exn ->
+    Logging.warn_f ~section "spot-update hook failed: %s" (Printexc.to_string exn)
 let notify_ready () =
   if not (Atomic.get is_ready)
   then
@@ -253,6 +273,7 @@ let process_market_data json =
                        "Failed to parse spotState entry: %s"
                        (Printexc.to_string exn)) balances
           with | _ -> () in
+        notify_spot_update ();
         Concurrency.Oracle_wakeup.notify_balance ();
         notify_ready ()
     | _ -> ()

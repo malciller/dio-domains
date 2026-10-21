@@ -60,9 +60,9 @@ let ready_condition = Lwt_condition.create ()
 
 (** Order id -> symbol map used to route execution messages.
 
-   Was a [Hashtbl] behind one module-wide mutex, taken on every lookup — and a lookup runs
-   per execution message, putting a process-wide lock on the fill path. The key is a
-   venue-assigned integer, so it is indexed and needs no lock (see [Ds.Id_table]). *)
+    Was a [Hashtbl] behind one module-wide mutex, taken on every lookup — and a lookup
+    runs per execution message, putting a process-wide lock on the fill path. The key is a
+    venue-assigned integer, so it is indexed and needs no lock (see [Ds.Id_table]). *)
 let order_to_symbol : string Ds.Id_table.t = Ds.Id_table.create ()
 
 let get_symbol_store symbol =
@@ -160,14 +160,14 @@ let notify_ready store =
 ;;
 
 (** Maps [order_id] to [symbol] (mutex-guarded). *)
-let register_order ~order_id ~symbol = Ds.Id_table.set order_to_symbol order_id symbol;;
+let register_order ~order_id ~symbol = Ds.Id_table.set order_to_symbol order_id symbol
 
 (** Symbol for [order_id], or [None]. *)
-let resolve_symbol order_id = Ds.Id_table.find_opt order_to_symbol order_id;;
+let resolve_symbol order_id = Ds.Id_table.find_opt order_to_symbol order_id
 
 (** Removes [order_id] from the map; call when the order reaches a terminal state so
     long-running processes do not leak entries. *)
-let unregister_order ~order_id = Ds.Id_table.remove order_to_symbol order_id;;
+let unregister_order ~order_id = Ds.Id_table.remove order_to_symbol order_id
 
 (** Applies an execution event to the tracked open-order state: removes terminal or fully
     filled orders, otherwise updates fill quantities. *)
@@ -506,7 +506,9 @@ let request_open_orders conn =
 (** Return all symbols that have initialized execution stores. *)
 let get_all_symbols () =
   Mutex.lock initialization_mutex;
-  let symbols = Ds.Cow_table.fold (fun symbol _ acc -> symbol :: acc) symbol_stores ~init:[] in
+  let symbols =
+    Ds.Cow_table.fold (fun symbol _ acc -> symbol :: acc) symbol_stores ~init:[]
+  in
   Mutex.unlock initialization_mutex;
   symbols
 ;;
@@ -564,14 +566,16 @@ let[@inline always] has_execution_data_fast symbol =
 (** Marks every initialized symbol store ready. Called on openOrderEnd after the startup
     snapshot, so waiters do not block on symbols with no executions yet. *)
 let mark_ready_all () =
-  Ds.Cow_table.iter (fun symbol store ->
+  Ds.Cow_table.iter
+    (fun symbol store ->
       if not (Atomic.get store.ready)
       then (
         Logging.debug_f
           ~section
           "Marking executions feed ready for %s (snapshot complete)"
           symbol;
-        notify_ready store)) symbol_stores
+        notify_ready store))
+    symbol_stores
 ;;
 
 (** Pre-creates stores for [symbols] and registers handlers. *)

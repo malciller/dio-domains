@@ -36,44 +36,44 @@ let get_token () : string Lwt.t =
   Kraken_common_types.with_private_request (fun () ->
     get_api_credentials_from_env ()
     >>= fun (api_key, api_secret) ->
-  let path = "/0/private/GetWebSocketsToken" in
-  let nonce = Kraken_common_types.nonce () in
-  let body_str = "nonce=" ^ nonce in
-  let signature =
-    Kraken_common_types.sign ~secret:api_secret ~path ~body:body_str ~nonce
-  in
-  let headers =
-    Cohttp.Header.of_list
-      [ "API-Key", api_key
-      ; "API-Sign", signature
-      ; "Content-Type", "application/x-www-form-urlencoded"
-      ]
-  in
-  Client.post
-    ~headers
-    ~body:(Cohttp_lwt.Body.of_string body_str)
-    (Uri.of_string (endpoint ^ path))
-  >>= fun (resp, body) ->
-  Cohttp_lwt.Body.to_string body
-  >>= fun body_str ->
-  let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-  if status <> 200
-  then (
-    error_f ~section "HTTP %d: %s" status body_str;
-    Lwt.fail_with (Printf.sprintf "Kraken API HTTP error %d" status))
-  else (
-    let json = from_string body_str in
-    let errors = Util.member "error" json in
-    match errors with
-    | `List (_ :: _ as errs) ->
-      let msg = errs |> List.map to_string |> String.concat "; " in
-      error_f ~section "API error: %s" msg;
-      Lwt.fail_with ("Kraken API error: " ^ msg)
-    | _ ->
-      let result = Util.member "result" json in
-      (match Util.member "token" result with
-       | `String token -> Lwt.return token
-       | _ ->
-         error_f ~section "Unexpected response format: %s" (Yojson.Safe.to_string json);
-         Lwt.fail_with "Invalid Kraken API response")))
+    let path = "/0/private/GetWebSocketsToken" in
+    let nonce = Kraken_common_types.nonce () in
+    let body_str = "nonce=" ^ nonce in
+    let signature =
+      Kraken_common_types.sign ~secret:api_secret ~path ~body:body_str ~nonce
+    in
+    let headers =
+      Cohttp.Header.of_list
+        [ "API-Key", api_key
+        ; "API-Sign", signature
+        ; "Content-Type", "application/x-www-form-urlencoded"
+        ]
+    in
+    Client.post
+      ~headers
+      ~body:(Cohttp_lwt.Body.of_string body_str)
+      (Uri.of_string (endpoint ^ path))
+    >>= fun (resp, body) ->
+    Cohttp_lwt.Body.to_string body
+    >>= fun body_str ->
+    let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+    if status <> 200
+    then (
+      error_f ~section "HTTP %d: %s" status body_str;
+      Lwt.fail_with (Printf.sprintf "Kraken API HTTP error %d" status))
+    else (
+      let json = from_string body_str in
+      let errors = Util.member "error" json in
+      match errors with
+      | `List (_ :: _ as errs) ->
+        let msg = errs |> List.map to_string |> String.concat "; " in
+        error_f ~section "API error: %s" msg;
+        Lwt.fail_with ("Kraken API error: " ^ msg)
+      | _ ->
+        let result = Util.member "result" json in
+        (match Util.member "token" result with
+         | `String token -> Lwt.return token
+         | _ ->
+           error_f ~section "Unexpected response format: %s" (Yojson.Safe.to_string json);
+           Lwt.fail_with "Invalid Kraken API response")))
 ;;

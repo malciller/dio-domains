@@ -286,14 +286,17 @@ let refresh_asset_history ~(offline : bool) ~(exchange : string) ~(symbol : stri
     (fun () ->
       Oracle_pipeline.history_of ~offline ~exchange ~symbol
       >|= fun series ->
-      let changed =
-        match Hashtbl.find_opt history_cache (exchange, symbol) with
-        | Some prev -> not (same_bars prev.bars series.bars)
-        | None -> true
-      in
-      Hashtbl.replace history_cache (exchange, symbol) series;
-      if changed then Hashtbl.remove references_cache (exchange, symbol);
-      changed)
+      (* Keep the previous series when the bars are unchanged. Replacing it on every
+         periodic refresh retained a fresh copy of every bar array (and its date strings)
+         per refresh even though nothing had changed - history only moves once a day. The
+         new series is left to the GC; the cached one stays stable until a bar actually
+         changes. *)
+      match Hashtbl.find_opt history_cache (exchange, symbol) with
+      | Some prev when same_bars prev.bars series.bars -> false
+      | _ ->
+        Hashtbl.replace history_cache (exchange, symbol) series;
+        Hashtbl.remove references_cache (exchange, symbol);
+        true)
     (fun exn ->
       Logging.warn_f
         ~section
@@ -402,29 +405,6 @@ let start_waker () =
 ;;
 
 let pass_requested_changed generation = Atomic.get pass_requested <> generation
-
-(** Sleeps until the deadline OR any wake (pass request, shutdown). Register-then-recheck
-    closes the lost-wakeup race: a request landing between the predicate check and the
-    waiter registration is caught by the self-broadcast, since the waiter is registered by
-    then. *)
-let rec wait_until ~(deadline : float) ~(generation : int) () =
-  if is_stopped () || pass_requested_changed generation
-  then Lwt.return_unit
-  else (
-    start_waker ();
-    let now = Unix.gettimeofday () in
-    if now >= deadline
-    then Lwt.return_unit
-    else (
-      let w = Lwt_condition.wait wake_condition in
-      if is_stopped () || pass_requested_changed generation
-      then Lwt_condition.broadcast wake_condition ();
-      Lwt.pick
-        [ (w >|= fun () -> ())
-        ; (Lwt_unix.sleep (Float.max 0.0 (deadline -. now)) >|= fun () -> ())
-        ]
-      >>= fun () -> wait_until ~deadline ~generation ()))
-;;
 
 (** Event-only wait for the control loop: blocks until a pass request or shutdown. No
     deadline, because every input transition rings the doorbell. The periodic history /
@@ -1510,6 +1490,11 @@ let refresh_once ~(offline : bool) ~(tasks : Oracle_tasks.task list) : unit Lwt.
       Lwt.return ())
     tasks
   >>= fun () ->
+  (* [Oracle_fetch.fetch_cache] is a per-pass dedup cache, but it was never cleared: the
+     first fetch's series stayed cached forever, so the venue history never picked up a
+     new daily bar after startup. Clear it now that every asset has been refreshed; the
+     durable copy still lives in [history_cache] and on disk. *)
+  Oracle_fetch.clear_cache ();
   let t_bal = Mtime_clock.now_ns () in
   let accounts = group_by_account tasks |> List.map fst in
   Lwt_list.iter_s
@@ -1534,22 +1519,44 @@ let refresh_once ~(offline : bool) ~(tasks : Oracle_tasks.task list) : unit Lwt.
   Lwt.return ()
 ;;
 
-let rec refresh_loop
+(** Periodic history/balance refresh.
+
+    This loop must NOT wait on [pass_requested]: that counter is bumped by every order,
+    fill, balance and book event, so waiting on it makes [refresh_once] run on every
+    market event instead of every [refresh_seconds]. Each run re-reads and re-parses every
+    asset's full all-time history, which is a multi-megabyte allocation burst; at event
+    frequency it both burns CPU and keeps the previous series' parse trees reachable
+    through the never-resolving bind chain.
+
+    Each iteration is spawned independently ([Lwt.async loop]) so the completed
+    iteration's promise chain can be collected rather than being retained by the recursive
+    [>>=] chain. The initial refresh is still performed once by {!run_loop} before this
+    loop starts. *)
+let refresh_loop
   ~(offline : bool)
   ~(config : runtime_config)
   ~(tasks : Oracle_tasks.task list)
   : unit Lwt.t
   =
-  if is_stopped ()
-  then Lwt.return ()
-  else
-    refresh_once ~offline ~tasks
-    >>= fun () ->
-    wait_until
-      ~deadline:(Unix.gettimeofday () +. config.refresh_seconds)
-      ~generation:(Atomic.get pass_requested)
-      ()
-    >>= fun () -> refresh_loop ~offline ~config ~tasks
+  let interval =
+    if config.refresh_seconds > 0.0 then config.refresh_seconds else 3600.0
+  in
+  let rec loop () =
+    if is_stopped ()
+    then Lwt.return ()
+    else
+      Lwt_unix.sleep interval
+      >>= fun () ->
+      if is_stopped ()
+      then Lwt.return ()
+      else
+        refresh_once ~offline ~tasks
+        >>= fun () ->
+        (* Spawn the next iteration independently to sever the Lwt.bind chain. *)
+        Lwt.async loop;
+        Lwt.return ()
+  in
+  loop ()
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -1604,6 +1611,18 @@ let run_loop
             (fun _ -> Lwt.return ())
         else Lwt.return ())
       tasks
+    >>= fun () ->
+    (* Do the first refresh now, not after [refresh_seconds]. The startup gate waits on
+       [materialized_ref]; sleeping first withheld every grid order for the full refresh
+       interval (five minutes by default). *)
+    Lwt.catch
+      (fun () -> refresh_once ~offline:false ~tasks)
+      (fun exn ->
+        Logging.error_f
+          ~section
+          "initial oracle refresh failed: %s"
+          (Printexc.to_string exn);
+        Lwt.return_unit)
     >>= fun () -> refresh_loop ~offline:false ~config ~tasks);
   (* The first pass must not run cold: refresh_once warms the account balance pool and
      sets [materialized_ref] on completion. Without this gate the very first pass can race

@@ -2,9 +2,9 @@
     parses it into the shared [Strategy_file.t] AST, dispatching on extension.
 
     Binding convention: `config.json` names a strategy (["strategy": "jacobs_ladder"]);
-    the loader tries [`strategies/<name>.strategy`] first, then [`strategies/<name>.json`]. A
-    mismatch between the filename and the declared name fails in the caller (config load)
-    via the normal name-mismatch check. *)
+    the loader tries [`strategies/<name>.strategy`] first, then
+    [`strategies/<name>.json`]. A mismatch between the filename and the declared name
+    fails in the caller (config load) via the normal name-mismatch check. *)
 
 let strateg_dir = "strategies"
 let strateg_exts = [ ".strategy"; ".json" ]

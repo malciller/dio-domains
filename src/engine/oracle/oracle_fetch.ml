@@ -8,8 +8,8 @@
 
    The pipeline owns venue-independent concerns: the disk cache policy (Oracle_cache, raw
    bars + delta fetch), clean-series normalization ([Oracle_calendar.normalize_bars],
-   applied on every read), Yahoo deep history (src/integrations/market_data/yahoo/) and the equity
-   session-calendar model. *)
+   applied on every read), Yahoo deep history (src/integrations/market_data/yahoo/) and
+   the equity session-calendar model. *)
 
 open Lwt.Infix
 
@@ -17,8 +17,8 @@ let section = "oracle_fetch"
 
 module Exchange = Dio_exchange.Exchange_intf
 
-(* The Yahoo deep-history client (src/integrations/market_data/yahoo/, [dio.yahoo]); the wrapper module
-   [Yahoo] re-exports the [Yahoo_deep_history] module. *)
+(* The Yahoo deep-history client (src/integrations/market_data/yahoo/, [dio.yahoo]); the
+   wrapper module [Yahoo] re-exports the [Yahoo_deep_history] module. *)
 module Yahoo_deep_history = Yahoo.Yahoo_deep_history
 
 let today_iso () =

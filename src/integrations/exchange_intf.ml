@@ -613,6 +613,60 @@ module type S = sig
   val decode_frame : string -> unit
 end
 
+(** Optional venue-published market context: funding/basis, perp position, and account
+    margin. Venues that do not have these concepts simply do not register the capability;
+    the engine then sees [None] and treats the data as unavailable. *)
+module Market_context = struct
+  type funding =
+    { funding : float (** hourly funding rate *)
+    ; premium : float (** perp premium vs oracle *)
+    ; mark : float
+    ; oracle : float
+    ; updated_at : float (** unix seconds *)
+    }
+
+  type position =
+    { coin : string
+    ; qty : float (** signed base quantity; negative is short *)
+    ; entry : float
+    ; position_value : float
+    ; unrealized_pnl : float
+    ; margin_used : float
+    ; liquidation : float option
+    ; leverage : float option
+    ; updated_at : float
+    }
+
+  type margin =
+    { account_value : float
+    ; margin_used : float
+    ; maintenance_margin : float
+    ; withdrawable : float
+    ; updated_at : float
+    }
+
+  module type S = sig
+    val name : string
+    val get_funding : coin:string -> funding option
+    val get_positions_updated_at : unit -> float option
+    val get_position : coin:string -> position option
+    val get_margin : unit -> margin option
+    val get_margin_ratio : unit -> float option
+  end
+end
+
+(** Optional venue-published senior quote reservation. The primary grid reads the total
+    reservation for its exchange and sizes from the remainder. *)
+module Capital_reservation = struct
+  module type S = sig
+    val name : string
+    val set : owner:string -> amount:float -> unit
+    val release : owner:string -> unit
+    val get_total : unit -> float
+    val available : quote:float -> float
+  end
+end
+
 (** Dynamic registry mapping exchange names to their [(module S)] implementations. Backed
     by a [Hashtbl] for O(1) lookup. *)
 module Registry = struct
@@ -635,6 +689,26 @@ module Registry = struct
     Hashtbl.fold (fun name _ acc -> name :: acc) _exchanges []
     |> List.sort_uniq String.compare
   ;;
+
+  (** Optional capabilities, keyed by exchange name. A venue that does not implement one
+      simply leaves it unregistered. *)
+  let _market_contexts : (string, (module Market_context.S)) Hashtbl.t = Hashtbl.create 4
+
+  let _capital_reservations : (string, (module Capital_reservation.S)) Hashtbl.t =
+    Hashtbl.create 4
+  ;;
+
+  let register_market_context (module M : Market_context.S) =
+    Hashtbl.replace _market_contexts M.name (module M)
+  ;;
+
+  let get_market_context name = Hashtbl.find_opt _market_contexts name
+
+  let register_capital_reservation (module M : Capital_reservation.S) =
+    Hashtbl.replace _capital_reservations M.name (module M)
+  ;;
+
+  let get_capital_reservation name = Hashtbl.find_opt _capital_reservations name
 end
 
 (** Oracle data-venue interface: the contract the capital oracle needs from an exchange

@@ -259,10 +259,11 @@ type store =
 type decimals = int * int
 
 let stores = Ds.Cow_table.create ~shard_count:32 ()
+
 (* Symbol -> (price_decimals, lot_decimals), learned once from /AssetPairs. Filled from a
-   concurrent [Lwt_list.iter] over the API response while the orderbook and execution paths
-   read it with no lock, so inserts raced lookups. Copy-on-write: reads stay lock-free and
-   a partially-inserted batch is never observed mid-resize. *)
+   concurrent [Lwt_list.iter] over the API response while the orderbook and execution
+   paths read it with no lock, so inserts raced lookups. Copy-on-write: reads stay
+   lock-free and a partially-inserted batch is never observed mid-resize. *)
 let decimals_tbl : (string, decimals) Ds.Cow_table.t =
   Ds.Cow_table.create ~shard_count:16 ()
 ;;
@@ -785,7 +786,8 @@ let fetch_decimals symbols =
                   | Some n -> canonicalize_kraken_name n = no_slash || n = no_slash
                   | None -> false
                 in
-                if is_ws_match || is_alt_match then Ds.Cow_table.set decimals_tbl sym (pd, ld))
+                if is_ws_match || is_alt_match
+                then Ds.Cow_table.set decimals_tbl sym (pd, ld))
               symbols)
           pairs;
         Lwt.return ()
@@ -1188,7 +1190,8 @@ let has_orderbook_data symbol =
 (** Resets all per-symbol stores: clears bid/ask maps, replaces ring buffers, and unsets
     readiness flags. Called on reconnection to ensure no stale data persists. *)
 let clear_all_stores () =
-  Ds.Cow_table.iter (fun symbol store ->
+  Ds.Cow_table.iter
+    (fun symbol store ->
       Logging.debug_f ~section "Clearing orderbook store for %s" symbol;
       Hashtbl.clear store.bids;
       Hashtbl.clear store.asks;
@@ -1196,7 +1199,8 @@ let clear_all_stores () =
       Atomic.set store.ready false;
       Atomic.set store.has_snapshot false;
       Atomic.set store.last_sequence None;
-      Atomic.set store.last_update_ns (Mtime_clock.now_ns ())) stores
+      Atomic.set store.last_update_ns (Mtime_clock.now_ns ()))
+    stores
 ;;
 
 (** Removes stores inactive for over 30 minutes and trims oversized price maps to
@@ -1209,7 +1213,8 @@ let prune_stale_data () =
   let stores_to_remove = ref [] in
   let trimmed_stores = ref [] in
   let total_stores_before = Ds.Cow_table.length stores in
-  Ds.Cow_table.iter (fun symbol store ->
+  Ds.Cow_table.iter
+    (fun symbol store ->
       let age = Int64.sub now_ns (Atomic.get store.last_update_ns) in
       if Int64.compare age stale_threshold_ns > 0
       then (
@@ -1236,7 +1241,8 @@ let prune_stale_data () =
         then (
           truncate_hashtbl store.asks false max_price_levels;
           trimmed := true);
-        if !trimmed then trimmed_stores := symbol :: !trimmed_stores)) stores;
+        if !trimmed then trimmed_stores := symbol :: !trimmed_stores))
+    stores;
   List.iter
     (fun symbol ->
       Ds.Cow_table.remove stores symbol;

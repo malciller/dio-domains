@@ -55,6 +55,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col 14 a_label "SYMBOL"
            ; col 5 a_label "STGY"
            ; col 3 a_label "ST"
+           ; col 9 a_label "PERP PNL"
            ; col_right 12 a_label "PRICE"
            ; I.string a_border " │ "
            ; col_right 11 a_label "BUY @"
@@ -72,6 +73,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col 16 a_label "SYMBOL"
            ; col 5 a_label "STGY"
            ; col 3 a_label "ST"
+           ; col 9 a_label "PERP PNL"
            ; col_right 12 a_label "PRICE"
            ; col_right 8 a_label "SPREAD"
            ; I.string a_border " │ "
@@ -250,6 +252,13 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       then "⏸", a_yellow
       else "▶", a_green
     in
+    let perp_str, perp_attr =
+      match s.perp with
+      | Some p when p.has_position ->
+        format_pnl p.unrealized_pnl, if p.unrealized_pnl >= 0.0 then a_green else a_red
+      | _ -> "--", a_dim
+    in
+    let perp_str = truncate_string 9 perp_str in
     let exch_tag = exch_tag_of exchange in
     let spread_str = format_spread_bps bid ask in
     let spread_attr =
@@ -334,6 +343,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col 14 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 8 symbol) exch_tag)
            ; col 5 a_cyan (truncate_string 4 stype)
            ; I.hcat [ I.string status_attr status_str; I.string a_text "  " ]
+           ; col 9 perp_attr perp_str
            ; price_cell
            ; I.string a_border " │ "
            ; col_right
@@ -375,6 +385,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
                (Printf.sprintf "%s(%s)" (truncate_string 10 symbol) exch_tag)
            ; col 5 a_cyan (truncate_string 4 stype)
            ; I.hcat [ I.string status_attr status_str; I.string a_text "  " ]
+           ; col 9 perp_attr perp_str
            ; price_cell
            ; col_right 8 spread_attr spread_str
            ; I.string a_border " │ "
@@ -615,6 +626,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col 14 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 8 asset) exch_tag)
            ; col 5 a_dim "--"
            ; I.hcat [ I.string status_attr status_str; I.string row_text "  " ]
+           ; col 9 a_dim "--"
            ; price_cell
            ; I.string a_border " │ "
            ; col_right 11 a_dim "--"
@@ -644,6 +656,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col 16 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag)
            ; col 5 a_dim "--"
            ; I.hcat [ I.string status_attr status_str; I.string row_text "  " ]
+           ; col 9 a_dim "--"
            ; price_cell
            ; col_right 8 spread_attr spread_str
            ; I.string a_border " │ "

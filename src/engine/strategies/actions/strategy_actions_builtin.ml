@@ -58,6 +58,43 @@ let declarations =
   ; act "expire_tif_recovery" decision []
   ; act "cycle_facts" read []
   ; act "early_facts" read []
+  ; act "market_facts" read []
+  ; act
+      "order_place"
+      effectful
+      [ se ~required:false "symbol" s
+      ; se ~required:false "market" (enum [ "spot"; "perp" ])
+      ; se "side" (enum [ "buy"; "sell" ])
+      ; se "qty" e
+      ; se ~required:false "price" e
+      ; se ~required:false "tif" (enum [ "IOC"; "GTC"; "ALO" ])
+      ; se ~required:false "reduce_only" b
+      ; se ~required:false "post_only" b
+      ; se "dedup_key" s
+      ]
+  ; act
+      "order_replace"
+      effectful
+      [ se ~required:false "symbol" s
+      ; se ~required:false "market" (enum [ "spot"; "perp" ])
+      ; se "side" (enum [ "buy"; "sell" ])
+      ; se "qty" e
+      ; se ~required:false "price" e
+      ; se ~required:false "tif" (enum [ "IOC"; "GTC"; "ALO" ])
+      ; se ~required:false "reduce_only" b
+      ; se ~required:false "post_only" b
+      ; se "dedup_key" s
+      ]
+  ; act
+      "order_cancel"
+      effectful
+      [ se "order_id" s
+      ; se ~required:false "market" (enum [ "spot"; "perp" ])
+      ; se "dedup_key" s
+      ]
+  ; act "quote_reserve" decision [ se "amount" e ]
+  ; act "quote_release" decision []
+  ; act "reserve_base" decision [ se "qty" e ]
   ; act "mark_stale_cycle" decision []
   ; act "set_gate" decision [ se "name" s; se "value" s ]
   ; act "buy_facts" decision []

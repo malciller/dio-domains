@@ -17,9 +17,9 @@
    a full listing-to-now span in one request; the loop is a fallback for longer spans.
    Pure [parse_*] functions are fixture-testable without network.
 
-   Unit: [dio.yahoo] (src/integrations/market_data/yahoo/), a leaf data client (bar/date helpers from
-   [Exchange_intf.Types]) consumed by the capital oracle's deep-history pipeline in
-   [oracle_fetch.ml]. *)
+   Unit: [dio.yahoo] (src/integrations/market_data/yahoo/), a leaf data client (bar/date
+   helpers from [Exchange_intf.Types]) consumed by the capital oracle's deep-history
+   pipeline in [oracle_fetch.ml]. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
@@ -130,12 +130,12 @@ let classify_exn (exn : exn) : [ `Missing_data | `Fatal ] =
   | _ -> `Fatal
 ;;
 
-(** Per-symbol cache of the confirmed-empty history prefix: the latest end date for which
-    Yahoo answered "no data in [requested start, end]". Fetches clamp their start past it.
-    Process-lifetime; the oracle re-fetches deep history every pass. *)
 (* Monotonic: only ever moves earlier. Copy-on-write for the same reason as
    [soft_blocked_until] — written outside [yahoo_mutex] while other symbols' passes read
    it. *)
+(** Per-symbol cache of the confirmed-empty history prefix: the latest end date for which
+    Yahoo answered "no data in [requested start, end]". Fetches clamp their start past it.
+    Process-lifetime; the oracle re-fetches deep history every pass. *)
 let no_data_before : (string, string) Ds.Cow_table.t =
   Ds.Cow_table.create ~shard_count:16 ()
 ;;

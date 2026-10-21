@@ -715,40 +715,41 @@ let poll_earn_allocations () =
           >>= fun (api_key, api_secret) ->
           let path = "/0/private/Earn/Allocations" in
           let nonce = Kraken_common_types.nonce () in
-        let encoded_body =
-          Uri.encoded_of_query [ "nonce", [ nonce ]; "hide_zero_allocations", [ "true" ] ]
-        in
-        let signature =
-          Kraken_common_types.sign ~secret:api_secret ~path ~body:encoded_body ~nonce
-        in
-        let headers =
-          Cohttp.Header.of_list
-            [ "API-Key", api_key
-            ; "API-Sign", signature
-            ; "Content-Type", "application/x-www-form-urlencoded"
-            ]
-        in
-        let rest_start = Mtime_clock.now_ns () in
-        Lwt_unix.with_timeout 10.0 (fun () ->
-          Cohttp_lwt_unix.Client.post
-            ~headers
-            ~body:(Cohttp_lwt.Body.of_string encoded_body)
-            (Uri.of_string (endpoint ^ path)))
-        >>= fun (resp, body) ->
-        Cohttp_lwt.Body.to_string body
-        >>= fun body_str ->
-        Network_latency.record_rest
-          "kraken"
-          (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
-        let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-        if status <> 200
-        then
-          Lwt.return
-            (Error (Printf.sprintf "Earn/Allocations HTTP %d: %s" status body_str))
-        else if Error_handling.string_contains body_str "EAPI:Invalid nonce"
-        then Lwt.return (Error "Earn/Allocations EAPI:Invalid nonce")
-        else Lwt.return (Ok body_str))
-      (fun exn -> Lwt.return (Error (Printexc.to_string exn))))
+          let encoded_body =
+            Uri.encoded_of_query
+              [ "nonce", [ nonce ]; "hide_zero_allocations", [ "true" ] ]
+          in
+          let signature =
+            Kraken_common_types.sign ~secret:api_secret ~path ~body:encoded_body ~nonce
+          in
+          let headers =
+            Cohttp.Header.of_list
+              [ "API-Key", api_key
+              ; "API-Sign", signature
+              ; "Content-Type", "application/x-www-form-urlencoded"
+              ]
+          in
+          let rest_start = Mtime_clock.now_ns () in
+          Lwt_unix.with_timeout 10.0 (fun () ->
+            Cohttp_lwt_unix.Client.post
+              ~headers
+              ~body:(Cohttp_lwt.Body.of_string encoded_body)
+              (Uri.of_string (endpoint ^ path)))
+          >>= fun (resp, body) ->
+          Cohttp_lwt.Body.to_string body
+          >>= fun body_str ->
+          Network_latency.record_rest
+            "kraken"
+            (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) rest_start));
+          let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+          if status <> 200
+          then
+            Lwt.return
+              (Error (Printf.sprintf "Earn/Allocations HTTP %d: %s" status body_str))
+          else if Error_handling.string_contains body_str "EAPI:Invalid nonce"
+          then Lwt.return (Error "Earn/Allocations EAPI:Invalid nonce")
+          else Lwt.return (Ok body_str))
+        (fun exn -> Lwt.return (Error (Printexc.to_string exn))))
   in
   Error_handling.retry_with_backoff
     ~section

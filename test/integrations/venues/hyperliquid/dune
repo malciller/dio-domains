@@ -1,43 +1,59 @@
 (test
  (name test_hyperliquid_actions)
+ (modules test_hyperliquid_actions)
  (libraries dio.hyperliquid alcotest))
 
 (test
  (name test_hyperliquid_types)
+ (modules test_hyperliquid_types)
  (libraries dio.hyperliquid alcotest))
 
 (test
  (name test_hyperliquid_signer)
+ (modules test_hyperliquid_signer)
  (libraries dio.hyperliquid alcotest))
 
 (test
  (name test_hyperliquid_ws)
+ (modules test_hyperliquid_ws)
  (libraries dio.hyperliquid alcotest))
 
 (test
  (name test_hyperliquid_balances)
+ (modules test_hyperliquid_balances)
  (libraries dio.hyperliquid alcotest))
 
 (test
  (name test_hyperliquid_executions_feed)
+ (modules test_hyperliquid_executions_feed)
+ (libraries dio.hyperliquid alcotest))
+
+(test
+ (name test_hyperliquid_market_context)
+ (modules test_hyperliquid_market_context)
  (libraries dio.hyperliquid alcotest))
 
 (test
  (name test_hyperliquid_instruments_feed)
+ (modules test_hyperliquid_instruments_feed)
  (libraries dio.hyperliquid alcotest))
 
 (test
  (name test_hyperliquid_orderbook_feed)
+ (modules test_hyperliquid_orderbook_feed)
  (libraries dio.hyperliquid alcotest))
 
 (test
  (name test_hyperliquid_module)
+ (modules test_hyperliquid_module)
  (libraries dio.hyperliquid alcotest))
 
 (test
  (name test_hyperliquid_get_fee)
+ (modules test_hyperliquid_get_fee)
  (libraries dio.hyperliquid alcotest))
 
 (test
  (name test_hyperliquid_oracle)
+ (modules test_hyperliquid_oracle)
  (libraries dio.hyperliquid alcotest))

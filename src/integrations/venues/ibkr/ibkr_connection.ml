@@ -57,8 +57,8 @@ let is_connected t = Atomic.get t.connected
     while our id->symbol index loses a binding.
 
     Forward only. TWS supplies the starting value via nextValidId and re-supplies it on
-    reconnect, where it can be *lower* than ids already placed in this process whose orders
-    are still working, so the floor is raised and never lowered. *)
+    reconnect, where it can be *lower* than ids already placed in this process whose
+    orders are still working, so the floor is raised and never lowered. *)
 let get_next_order_id t = Atomic.fetch_and_add t.next_order_id 1
 
 (** Adopts the server-supplied starting order id, raising the floor to [id]. Ignores a

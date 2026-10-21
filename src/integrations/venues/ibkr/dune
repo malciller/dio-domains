@@ -1,5 +1,11 @@
 (library
  (name ibkr)
  (public_name dio.ibkr)
- (libraries dio.data_structures dio.lwt dio.lwt.unix logging threads dio.concurrency dio.exchange)
-)
+ (libraries
+  dio.data_structures
+  dio.lwt
+  dio.lwt.unix
+  logging
+  threads
+  dio.concurrency
+  dio.exchange))

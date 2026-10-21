@@ -597,6 +597,114 @@ let json_of_caches () =
   |> List.sort (fun (a, _) (b, _) -> String.compare a b)
 ;;
 
+(** Perp position, margin, and funding for a spot-pair strategy asset. Uses the optional
+    exchange-level market-context capability; venues without it return null. *)
+let json_of_perp ~exchange ~coin =
+  match Dio_exchange.Exchange_intf.Registry.get_market_context exchange with
+  | None -> `Null
+  | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
+    let funding = Mc.get_funding ~coin in
+    let position = Mc.get_position ~coin in
+    let margin = Mc.get_margin () in
+    let qty =
+      match position with
+      | Some p -> p.qty
+      | None -> 0.0
+    in
+    let entry =
+      match position with
+      | Some p -> p.entry
+      | None -> 0.0
+    in
+    let mark =
+      match funding with
+      | Some f -> f.mark
+      | None -> 0.0
+    in
+    let notional =
+      match position with
+      | Some p when p.position_value > 0.0 -> abs_float p.position_value
+      | _ -> abs_float (qty *. mark)
+    in
+    let side = if qty < 0.0 then "short" else if qty > 0.0 then "long" else "flat" in
+    let fopt f =
+      match f with
+      | Some v -> `Float v
+      | None -> `Null
+    in
+    let popt f =
+      match f with
+      | Some v -> `Float v
+      | None -> `Null
+    in
+    `Assoc
+      [ "coin", `String coin
+      ; "side", `String side
+      ; "has_position", `Bool (abs_float qty > 1e-12)
+      ; "qty", `Float qty
+      ; "abs_qty", `Float (abs_float qty)
+      ; "entry", `Float entry
+      ; "notional", `Float notional
+      ; ( "unrealized_pnl"
+        , `Float
+            (match position with
+             | Some p -> p.unrealized_pnl
+             | None -> 0.0) )
+      ; ( "margin_used"
+        , `Float
+            (match position with
+             | Some p -> p.margin_used
+             | None -> 0.0) )
+      ; ( "liquidation"
+        , popt
+            (match position with
+             | Some p -> p.liquidation
+             | None -> None) )
+      ; ( "leverage"
+        , popt
+            (match position with
+             | Some p -> p.leverage
+             | None -> None) )
+      ; "mark", `Float mark
+      ; ( "oracle"
+        , `Float
+            (match funding with
+             | Some f -> f.oracle
+             | None -> 0.0) )
+      ; ( "premium"
+        , `Float
+            (match funding with
+             | Some f -> f.premium
+             | None -> 0.0) )
+      ; ( "funding_apr"
+        , `Float
+            (match funding with
+             | Some f -> f.funding *. 24.0 *. 365.0
+             | None -> 0.0) )
+      ; ( "account_value"
+        , `Float
+            (match margin with
+             | Some m -> m.account_value
+             | None -> 0.0) )
+      ; ( "maintenance_margin"
+        , `Float
+            (match margin with
+             | Some m -> m.maintenance_margin
+             | None -> 0.0) )
+      ; ( "withdrawable"
+        , `Float
+            (match margin with
+             | Some m -> m.withdrawable
+             | None -> 0.0) )
+      ; "margin_ratio", fopt (Mc.get_margin_ratio ())
+      ; ( "updated_at"
+        , `Float
+            (match position with
+             | Some p -> p.updated_at
+             | None -> 0.0) )
+      ]
+;;
+
 let build_snapshot () =
   let now = Unix.gettimeofday () in
   let uptime = now -. !engine_start_time in
@@ -639,6 +747,7 @@ let build_snapshot () =
             [ "exchange", `String tc.exchange
             ; "strategy", strategy_json
             ; "market", market_json
+            ; "perp", json_of_perp ~exchange:tc.exchange ~coin:base_asset
             ; "oracle", oracle_of tc.symbol
             ; "qty", `String tc.qty
             ; "grid_interval_lo", `Float (fst tc.grid_interval)

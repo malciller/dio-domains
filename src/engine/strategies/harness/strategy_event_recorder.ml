@@ -18,15 +18,14 @@ let record_state t entries = record t (Strategy_trace.State entries)
 let record_event t (e : Strategy_trace.event_obs) = record t (Strategy_trace.Event e)
 let record_persistence t key value = record t (Strategy_trace.Persistence (key, value))
 
+(* Registration happens from a trading Domain while other Domains are already live, and
+   [is_active] / [record_event_if_active] are consulted per emitted order and per
+   lifecycle event. Written under a mutex, read without one; a Cow_table closes that. *)
+
 (** Per-symbol active recorders for hot-path emission hooks (e.g. the shared order
     buffer). Empty when tracing is off, so the hook is a single hashtable lookup. The
     order buffer is shared across domains, so routing is by the emitted order's symbol. *)
-(* Registration happens from a trading Domain while other Domains are already live, and
-   [is_active] / [record_event_if_active] are consulted per emitted order and per lifecycle
-   event. Written under a mutex, read without one; a Cow_table closes that. *)
-let active_by_symbol : (string, t) Ds.Cow_table.t =
-  Ds.Cow_table.create ~shard_count:8 ()
-;;
+let active_by_symbol : (string, t) Ds.Cow_table.t = Ds.Cow_table.create ~shard_count:8 ()
 
 let active_mutex = Mutex.create ()
 
