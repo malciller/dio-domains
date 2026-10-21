@@ -762,6 +762,22 @@ let overlay_dry_run =
 
 let dry_run () = Lazy.force overlay_dry_run
 
+(** In-flight dedupe key for an overlay placement.
+
+    The logical kind (["carry:entry"], ["carry:recycle:close|ro"], ...) stays the value
+    the carry registry uses to match a resting order. The in-flight registry needs a key
+    that is unique per venue and instrument: a bare ["carry:entry"] is shared by every
+    symbol, so a placement that is still in flight - or whose key was never released -
+    suppresses the placement for every other symbol on every venue. *)
+let overlay_inflight_key ~dedup_key ~side ~qty ~price ~exchange ~instrument ~reduce_only =
+  let base =
+    if String.equal dedup_key ""
+    then Strategy_common.generate_duplicate_key instrument side qty price
+    else dedup_key
+  in
+  base ^ "|" ^ exchange ^ "|" ^ instrument ^ if reduce_only then "|ro" else ""
+;;
+
 (** Generic order placement for overlays. The engine knows nothing about carry policy: the
     strategy file chooses the market, side, size, price, TIF, and reduce-only flag. *)
 let order_place
@@ -840,16 +856,20 @@ let order_place
           | Some _ -> "limit"
           | None -> "market"
         in
+        (* The carry registry matches a resting order to its logical kind
+           (["carry:entry"], ["carry:recycle:close|ro"], ...), so [kind_key] stays
+           symbol-agnostic. The in-flight dedupe key must not, or one symbol's pending
+           placement suppresses every other symbol's until the 60s TTL sweep. *)
+        let kind_key = dedup_key ^ if reduce_only then "|ro" else "" in
         let duplicate_key =
-          if String.equal dedup_key ""
-          then
-            Strategy_common.generate_duplicate_key
-              instrument
-              (Strategy_common.string_of_order_side side)
-              qty
-              price
-            ^ if reduce_only then "|ro" else ""
-          else dedup_key ^ if reduce_only then "|ro" else ""
+          overlay_inflight_key
+            ~dedup_key
+            ~side:(Strategy_common.string_of_order_side side)
+            ~qty
+            ~price
+            ~exchange:asset.exchange
+            ~instrument
+            ~reduce_only
         in
         (* Bind the venue order id to the instrument/fee class on ack so the domain loop
            can classify a buy fill without guessing from side/price. Sells are entries;
@@ -863,7 +883,7 @@ let order_place
                 then Strategy_common.Carry_perp
                 else Strategy_common.Carry_spot)
              ~maker:post_only
-             ~kind:duplicate_key
+             ~kind:kind_key
          | Strategy_common.Sell -> ());
         let order =
           Jac.create_place_order
@@ -900,9 +920,9 @@ let order_place
           if pushed
           then Logging.info_f ~section "Overlay order: %s" (describe ())
           else
-            Logging.debug_f
+            Logging.info_f
               ~section
-              "Overlay order suppressed (duplicate/full buffer): %s"
+              "Overlay order suppressed (in-flight duplicate or full buffer): %s"
               duplicate_key)))
 ;;
 

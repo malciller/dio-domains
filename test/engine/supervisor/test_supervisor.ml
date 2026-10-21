@@ -227,6 +227,78 @@ let test_amend_request_preserves_flags () =
     req.Dio_engine.Order_executor.time_in_force
 ;;
 
+let carry_place_order duplicate_key =
+  { Dio_strategies.Strategy_common.operation = Dio_strategies.Strategy_common.Place
+  ; order_id = None
+  ; symbol = "BTC"
+  ; side = Dio_strategies.Strategy_common.Sell
+  ; order_type = "limit"
+  ; qty = 0.001
+  ; price = Some 84_000.0
+  ; time_in_force = "GTC"
+  ; post_only = true
+  ; reduce_only = false
+  ; userref = None
+  ; strategy = Dio_strategies.Strategy_common.Carry
+  ; exchange = "hyperliquid"
+  ; duplicate_key
+  }
+;;
+
+let test_overlay_inflight_key_is_namespaced () =
+  let key ~instrument ~exchange ~reduce_only =
+    Dio_strategies.Strategy_cycle_engine.overlay_inflight_key
+      ~dedup_key:"carry:entry"
+      ~side:"sell"
+      ~qty:0.001
+      ~price:(Some 84_000.0)
+      ~exchange
+      ~instrument
+      ~reduce_only
+  in
+  let btc = key ~instrument:"BTC" ~exchange:"hyperliquid" ~reduce_only:false in
+  Alcotest.(check bool)
+    "same kind on another instrument does not collide"
+    false
+    (String.equal btc (key ~instrument:"HYPE" ~exchange:"hyperliquid" ~reduce_only:false));
+  Alcotest.(check bool)
+    "same instrument on another venue does not collide"
+    false
+    (String.equal btc (key ~instrument:"BTC" ~exchange:"kraken" ~reduce_only:false));
+  Alcotest.(check bool)
+    "reduce-only kind does not collide with the entry kind"
+    false
+    (String.equal btc (key ~instrument:"BTC" ~exchange:"hyperliquid" ~reduce_only:true))
+;;
+
+let test_carry_place_ok_releases_inflight_key () =
+  let key = "carry:entry|hyperliquid|BTC" in
+  let order = carry_place_order key in
+  Alcotest.(check bool)
+    "key inserted"
+    true
+    (Dio_strategies.Strategy_common.InFlightOrders.add_in_flight_order key);
+  Supervisor_orders.hedger_callbacks.on_place_ok order "oid-test";
+  Alcotest.(check bool)
+    "key released on ack"
+    false
+    (Dio_strategies.Strategy_common.InFlightOrders.is_in_flight key)
+;;
+
+let test_carry_place_fail_releases_inflight_key () =
+  let key = "carry:entry|hyperliquid|BTC" in
+  let order = carry_place_order key in
+  Alcotest.(check bool)
+    "key inserted"
+    true
+    (Dio_strategies.Strategy_common.InFlightOrders.add_in_flight_order key);
+  Supervisor_orders.hedger_callbacks.on_place_fail order "post only";
+  Alcotest.(check bool)
+    "key released on terminal failure"
+    false
+    (Dio_strategies.Strategy_common.InFlightOrders.is_in_flight key)
+;;
+
 let () =
   Alcotest.run
     "Supervisor"
@@ -266,6 +338,20 @@ let () =
             "amend request preserves flags"
             `Quick
             test_amend_request_preserves_flags
+        ] )
+    ; ( "carry_inflight"
+      , [ Alcotest.test_case
+            "overlay in-flight key is namespaced"
+            `Quick
+            test_overlay_inflight_key_is_namespaced
+        ; Alcotest.test_case
+            "carry place ack releases the key"
+            `Quick
+            test_carry_place_ok_releases_inflight_key
+        ; Alcotest.test_case
+            "carry place failure releases the key"
+            `Quick
+            test_carry_place_fail_releases_inflight_key
         ] )
     ]
 ;;
