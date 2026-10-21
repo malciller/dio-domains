@@ -30,6 +30,10 @@ type ctx =
   (** Symbol of the Hyperliquid spot leg whose book the recycle buy targets. *)
   ; mutable cg_overlay_spot_symbol : string
   ; mutable cg_last_leverage : float
+  (** Venue time of the last carry entry (perp sell) fill, or 0.0. A fresh entry fill can
+      arrive before the position snapshot reflects it; [order_place] holds a new entry
+      for a short grace window so the cycle cannot re-short the full target. *)
+  ; mutable cg_last_entry_fill_at : float
   ; mutable cg_price : float
   ; mutable cg_bid : float
   ; mutable cg_ask : float
@@ -77,6 +81,7 @@ let create () =
   ; cg_overlay_has_spot_leg = false
   ; cg_overlay_spot_symbol = ""
   ; cg_last_leverage = 0.0
+  ; cg_last_entry_fill_at = 0.0
   ; cg_price = nan
   ; cg_bid = nan
   ; cg_ask = nan
@@ -830,7 +835,24 @@ let order_place
           Jac.round_qty_up qty instrument asset.exchange
         | _ -> qty)
     in
-    if (not (Float.is_finite qty)) || qty <= 0.0
+    (* A fresh carry entry fill can land before the position snapshot reflects it. The
+       strategy would then see a flat position and re-short the full target, doubling the
+       position. Hold new entry placements for a short grace window after the fill; the
+       position snapshot (or the entry-fill fact) settles within it. *)
+    let entry_grace =
+      String.equal dedup_key "carry:entry"
+      && (not reduce_only)
+      && c.cg_last_entry_fill_at > 0.0
+      && c.cg_now -. c.cg_last_entry_fill_at <= 2.0
+    in
+    if entry_grace
+    then
+      Logging.debug_f
+        ~section
+        "Overlay entry held %.2fs for the position snapshot after the entry fill (%s)"
+        (c.cg_now -. c.cg_last_entry_fill_at)
+        instrument
+    else if (not (Float.is_finite qty)) || qty <= 0.0
     then
       Logging.warn_f
         ~section
@@ -907,20 +929,18 @@ let order_place
              enough to be a leak is reported by the periodic in-flight sweep instead. *)
           Logging.debug_f ~section "Overlay order already in flight: %s" duplicate_key
         else (
-          (* Bind the venue order id to the instrument/fee class on ack so the domain loop
-             can classify a buy fill without guessing from side/price. Sells are entries;
-             only buys close/resize/recycle and feed the actual-fill accounting. *)
-          (match side with
-           | Strategy_common.Buy ->
-             Strategy_common.register_pending_carry_order
-               ~dedup_key:duplicate_key
-               ~market:
-                 (if String.equal market "perp"
-                  then Strategy_common.Carry_perp
-                  else Strategy_common.Carry_spot)
-               ~maker:post_only
-               ~kind:kind_key
-           | Strategy_common.Sell -> ());
+          (* Track every overlay placement, entry sells included. On ack the venue id is
+             bound to the kind so [order_replace] can see a tracked order while the
+             venue's open-orders scan is still catching up, exactly like the grid's
+             tracked buys/sells. *)
+          Strategy_common.register_pending_carry_order
+            ~dedup_key:duplicate_key
+            ~market:
+              (if String.equal market "perp"
+               then Strategy_common.Carry_perp
+               else Strategy_common.Carry_spot)
+            ~maker:post_only
+            ~kind:kind_key;
           let order =
             Jac.create_place_order
               ~reduce_only
@@ -1192,17 +1212,37 @@ let order_replace
             in
             ignore (Jac.push_order ~now:c.cg_now ~manage_state:false order : bool))
         | [] ->
-          order_place
-            c
-            ~symbol
-            ~market
-            ~side
-            ~qty
-            ~price:(Some px)
-            ~tif
-            ~reduce_only
-            ~post_only
-            ~dedup_key))
+          (* No open order matched the venue scan. If the order is already tracked (acked
+             but not yet visible), do not place a second one: the grid's
+             [has.tracked.buy] equivalent. The next cycle amends once the scan sees it. *)
+          let tracked_key =
+            overlay_inflight_key
+              ~dedup_key
+              ~side
+              ~qty
+              ~price:(Some px)
+              ~exchange:asset.exchange
+              ~instrument
+              ~reduce_only
+          in
+          if Strategy_common.has_tracked_carry_order ~key:tracked_key
+          then
+            Logging.debug_f
+              ~section
+              "Overlay placement held: %s already tracked"
+              tracked_key
+          else
+            order_place
+              c
+              ~symbol
+              ~market
+              ~side
+              ~qty
+              ~price:(Some px)
+              ~tif
+              ~reduce_only
+              ~post_only
+              ~dedup_key))
   | _ ->
     order_place
       c

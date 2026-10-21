@@ -957,7 +957,8 @@ let asset_domain_worker
                    ~order_id:o.order_id
                    ~market
                    ~maker
-                   ~kind)
+                   ~kind
+                   ~key:kind)
              orders
          | exception _ -> ()
        in
@@ -980,8 +981,8 @@ let asset_domain_worker
       ~now_exec
       (event : Dio_exchange.Exchange_intf.Types.execution_event)
       =
-      match overlay_carry, overlay_rt with
-      | Some r, Some rt ->
+      match overlay_carry, overlay_rt, overlay_ctx with
+      | Some r, Some rt, Some ctx ->
         (match
            Dio_strategies.Strategy_common.lookup_carry_order ~order_id:event.order_id
          with
@@ -996,7 +997,9 @@ let asset_domain_worker
              in
              (* Publish the latest perp entry fill so the overlay can place the TP from
                 the fill event, before the next webData2 position snapshot. A perp buy
-                closes the short and clears the fallback. *)
+                closes the short and clears the fallback. The overlay also stamps the
+                entry fill time so [order_place] can hold a new entry until the position
+                snapshot catches up. *)
              if meta.Dio_strategies.Strategy_common.com_market
                 = Dio_strategies.Strategy_common.Carry_perp
              then (
@@ -1008,10 +1011,13 @@ let asset_domain_worker
                in
                match side with
                | Dio_strategies.Strategy_common.Sell ->
+                 ctx.Dio_strategies.Strategy_cycle_engine.cg_last_entry_fill_at
+                 <- now_exec;
                  setf "carry_entry_fill_price" event.avg_price;
                  setf "carry_entry_fill_qty" event.filled_qty;
                  setf "carry_entry_fill_at" now_exec
                | Dio_strategies.Strategy_common.Buy ->
+                 ctx.Dio_strategies.Strategy_cycle_engine.cg_last_entry_fill_at <- 0.0;
                  setf "carry_entry_fill_price" 0.0;
                  setf "carry_entry_fill_qty" 0.0;
                  setf "carry_entry_fill_at" 0.0);

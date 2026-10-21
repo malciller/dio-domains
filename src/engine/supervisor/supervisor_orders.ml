@@ -309,12 +309,17 @@ let hedger_callbacks : strategy_callbacks =
                then Dio_strategies.Strategy_common.Carry_spot
                else Dio_strategies.Strategy_common.Carry_perp)
             ~maker:order.post_only
-            ~kind:order.duplicate_key)
+            ~kind:order.duplicate_key
+            ~key:order.duplicate_key)
   ; on_amend_skipped = (fun _order _target_id -> ())
   ; on_amend_fail =
       (fun order _target_id _err ->
         if order.strategy = Carry then nudge_carry_recovery order)
-  ; on_cancel_ok = (fun _order _target_order_id -> ())
+  ; on_cancel_ok =
+      (fun _order target_order_id ->
+        (* Retire the canceled carry order so a tracked-order check does not suppress the
+           replacement forever. The amend path re-registers the new id on its ack. *)
+        Dio_strategies.Strategy_common.retire_carry_order ~order_id:target_order_id)
   ; on_cancel_fail = (fun _order _target_id -> ())
   }
 ;;

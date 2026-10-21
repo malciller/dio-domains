@@ -76,6 +76,10 @@ type carry_order_meta =
   { com_market : carry_market
   ; com_maker : bool
   ; com_kind : string
+  ; com_key : string
+    (** The full per-instrument in-flight key ([overlay_inflight_key]). The logical
+        [com_kind] alone is shared by every symbol, so tracked-order lookups must match
+        on this key. *)
   }
 
 let carry_registry_mutex = Mutex.create ()
@@ -88,8 +92,24 @@ let register_pending_carry_order ~dedup_key ~market ~maker ~kind =
   Hashtbl.replace
     carry_pending
     dedup_key
-    { com_market = market; com_maker = maker; com_kind = kind };
+    { com_market = market; com_maker = maker; com_kind = kind; com_key = dedup_key };
   Mutex.unlock carry_registry_mutex
+;;
+
+(** True when an acked carry order for [key] is already tracked (awaiting a fill or
+    cancel). Mirrors the grid's [has.tracked.buy]: a tracked order suppresses a duplicate
+    placement while the venue's open-orders scan is still catching up. A pending placement
+    is covered by [InFlightOrders], so it is deliberately not part of this check. *)
+let has_tracked_carry_order ~key =
+  Mutex.lock carry_registry_mutex;
+  let found =
+    Hashtbl.fold
+      (fun _ meta acc -> acc || String.equal meta.com_key key)
+      carry_orders
+      false
+  in
+  Mutex.unlock carry_registry_mutex;
+  found
 ;;
 
 let trim_carry_orders_locked () =
@@ -115,12 +135,12 @@ let bind_carry_order ~dedup_key ~order_id =
 
 (** Register a replacement (amend) order id directly from the amend ack. The old id's
     mapping is retired by its cancel event; the replacement is what will fill. *)
-let register_carry_order_id ~order_id ~market ~maker ~kind =
+let register_carry_order_id ~order_id ~market ~maker ~kind ~key =
   Mutex.lock carry_registry_mutex;
   Hashtbl.replace
     carry_orders
     order_id
-    { com_market = market; com_maker = maker; com_kind = kind };
+    { com_market = market; com_maker = maker; com_kind = kind; com_key = key };
   Queue.push order_id carry_order_queue;
   trim_carry_orders_locked ();
   Mutex.unlock carry_registry_mutex
