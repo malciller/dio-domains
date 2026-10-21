@@ -124,8 +124,7 @@ let parse_pair_info json : pair_info option =
     make a transition line go missing, which costs a log line and nothing else. *)
 let update_pair_info info =
   let prev_status =
-    Ds.Cow_table.find_opt pair_cache info.symbol
-    |> Option.map (fun p -> p.status)
+    Ds.Cow_table.find_opt pair_cache info.symbol |> Option.map (fun p -> p.status)
   in
   Ds.Cow_table.set pair_cache info.symbol info;
   (match prev_status with

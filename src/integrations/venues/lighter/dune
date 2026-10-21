@@ -20,5 +20,4 @@
   concurrency
   dio.exchange
   dio.error_handling
-  dio.latency_profiling)
-)
+  dio.latency_profiling))

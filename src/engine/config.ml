@@ -147,6 +147,7 @@ let known_top_level_keys =
   ; "latency_spike_report_seconds"
   ; "latency_network_spike_threshold_us"
   ; "trading"
+  ; "overlays"
   ; "gc"
   ; "oracle"
   ; "fng_check_threshold"
@@ -573,6 +574,43 @@ let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
       }
 ;;
 
+(** Optional top-level [overlays] entries. Each is a second strategy file run in the same
+    asset domain as the primary strategy, so an overlay can read the same account/state
+    without spawning a competing domain. Keyed by [exchange|symbol].
+
+    This is deliberately generic: the engine does not know what an overlay does, only that
+    the named file is loaded and cycled after the primary strategy. *)
+let overlay_strategy_table : (string, string) Hashtbl.t = Hashtbl.create 8
+
+let overlay_key ~exchange ~symbol = exchange ^ "|" ^ symbol
+
+let get_overlay_strategy ~exchange ~symbol =
+  Hashtbl.find_opt overlay_strategy_table (overlay_key ~exchange ~symbol)
+;;
+
+let parse_overlays json =
+  Hashtbl.reset overlay_strategy_table;
+  match json |> Yojson.Basic.Util.member "overlays" with
+  | `List entries ->
+    List.iter
+      (fun entry ->
+        try
+          let open Yojson.Basic.Util in
+          let strategy = entry |> member "strategy" |> to_string in
+          let exchange = entry |> member "exchange" |> to_string in
+          let symbol = entry |> member "symbol" |> to_string in
+          if strategy <> "" && exchange <> "" && symbol <> ""
+          then
+            Hashtbl.replace
+              overlay_strategy_table
+              (overlay_key ~exchange ~symbol)
+              strategy
+        with
+        | _ -> ())
+      entries
+  | _ -> ()
+;;
+
 let read_config () : config =
   try
     (* DIO_CONFIG overrides the config path; default "config.json". Used to run the
@@ -635,6 +673,41 @@ let read_config () : config =
                  file.name;
                exit 1)))
       trading;
+    parse_overlays json;
+    Hashtbl.iter
+      (fun key strategy ->
+        match Dio_strategies.Strategy_loader.locate ~name:strategy with
+        | None ->
+          Logging.critical_f
+            ~section
+            "Overlay strategy file for %s does not exist (tried \
+             strategies/<name>.strategy and strategies/<name>.json). Refusing to start \
+             with a half-bound overlay."
+            key;
+          exit 1
+        | Some path ->
+          (match Dio_strategies.Strategy_loader.parse_file ~path with
+           | Error msg ->
+             Logging.critical_f
+               ~section
+               "Overlay strategy file '%s' for %s is invalid: %s"
+               path
+               key
+               msg;
+             exit 1
+           | Ok file ->
+             if not (String.equal file.name strategy)
+             then (
+               Logging.critical_f
+                 ~section
+                 "Overlay strategy name mismatch for %s: config.json declares '%s' but \
+                  strategy file '%s' declares '%s'"
+                 key
+                 strategy
+                 path
+                 file.name;
+               exit 1)))
+      overlay_strategy_table;
     let fng_check_threshold =
       json |> member "fng_check_threshold" |> to_float_opt |> Option.value ~default:1.5
     in

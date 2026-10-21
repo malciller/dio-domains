@@ -32,14 +32,13 @@ let stores = Ds.Cow_table.create ~shard_count:32 ()
 let ready_condition = Lwt_condition.create ()
 
 (* reqId -> symbol routing for market data responses. This had no lock at all: the
-   dispatcher wrote entries and [reset] cleared the table from the Lwt domain while trading
-   Domains read it.
+   dispatcher wrote entries and [reset] cleared the table from the Lwt domain while
+   trading Domains read it.
 
-   reqIds come from [next_req_id] below, so the key is an index rather than a string to hash
-   (see [Ds.Id_table]). The read side runs on every market-data tick, and unsubscribe is a
-   single store that cannot strand a neighbouring reqId. *)
+   reqIds come from [next_req_id] below, so the key is an index rather than a string to
+   hash (see [Ds.Id_table]). The read side runs on every market-data tick, and unsubscribe
+   is a single store that cannot strand a neighbouring reqId. *)
 let req_id_to_symbol : string Ds.Id_table.t = Ds.Id_table.create ()
-
 let next_req_id = Atomic.make 2000
 
 (** Clears reqId mappings; called before reconnecting. *)

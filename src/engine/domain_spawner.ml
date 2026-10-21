@@ -503,6 +503,18 @@ let asset_domain_worker
     (* Allocation-free cached balance closures. *)
     let base_balance_fn = Ex.get_tradeable_balance_fast ~asset:base_asset in
     let quote_balance_fn = Ex.get_tradeable_balance_fast ~asset:quote_currency in
+    (* Optional venue capability: senior quote reservations (overlays) reduce the quote
+       available to the primary grid. Venues that do not register the capability keep the
+       raw tradeable figure. *)
+    let available_quote quote =
+      match
+        Dio_exchange.Exchange_intf.Registry.get_capital_reservation
+          asset_with_fees.exchange
+      with
+      | Some (module Cr : Dio_exchange.Exchange_intf.Capital_reservation.S) ->
+        Cr.available ~quote
+      | None -> quote
+    in
     (* Base-balance snapshot age. The sell-hold guard releases placed-sell holds once a
        balance message newer than the placement arrives (venue hold-netting is then
        included). *)
@@ -658,14 +670,69 @@ let asset_domain_worker
           else (
             let ctx = Dio_strategies.Strategy_cycle_engine.create () in
             ctx.cg_symbol <- asset_with_fees.symbol;
+            let handlers = Config_grid_handlers.handler ctx in
+            let overlay_rt =
+              match
+                Config.get_overlay_strategy
+                  ~exchange:asset_with_fees.exchange
+                  ~symbol:asset_with_fees.symbol
+              with
+              | None -> None
+              | Some name ->
+                (match Dio_strategies.Strategy_loader.load ~name with
+                 | Error msg ->
+                   Logging.critical_f
+                     ~section
+                     "overlay strategy %s for %s failed to load: %s"
+                     name
+                     asset_with_fees.symbol
+                     msg;
+                   None
+                 | Ok (overlay_path, overlay_file) ->
+                   let overlay_diags =
+                     Dio_strategies.Strategy_compile.validate overlay_file
+                   in
+                   if Dio_strategies.Strategy_compile.has_errors overlay_diags
+                   then (
+                     Logging.critical_f
+                       ~section
+                       "overlay strategy file %s has errors: %s"
+                       overlay_path
+                       (Dio_strategies.Strategy_compile.format overlay_diags);
+                     None)
+                   else (
+                     Logging.info_f
+                       ~section
+                       "strategy: %s overlay %s"
+                       asset_with_fees.symbol
+                       overlay_path;
+                     Some (Dio_strategies.Strategy_runtime.create ~handlers overlay_file)))
+            in
             Logging.info_f ~section "strategy: %s running %s" asset_with_fees.symbol path;
-            Some
-              ( ctx
-              , Dio_strategies.Strategy_runtime.create
-                  ~handlers:(Config_grid_handlers.handler ctx)
-                  file )))
+            Some (ctx, Dio_strategies.Strategy_runtime.create ~handlers file, overlay_rt)))
       else None
     in
+    (* Overlay cycle inputs. The overlay is independent of the grid's oracle gate: it
+       manages its own exposure and must run even when the primary strategy is halted. Its
+       asset record only needs exchange/symbol for the generic actions; sizing lives in
+       the overlay file. *)
+    let overlay_asset : Dio_strategies.Strategy_state.trading_config =
+      { Dio_strategies.Strategy_state.exchange = asset_with_fees.exchange
+      ; symbol = asset_with_fees.symbol
+      ; qty = asset_with_fees.qty
+      ; grid_interval = fst asset_with_fees.grid_interval
+      ; sell_mult = asset_with_fees.sell_mult
+      ; strategy = asset_with_fees.strategy
+      ; maker_fee = asset_with_fees.maker_fee
+      ; taker_fee = asset_with_fees.taker_fee
+      ; accumulation_buffer = fst asset_with_fees.accumulation_buffer
+      ; base_accumulation = asset_with_fees.base_accumulation
+      ; sell_levels_persistence = asset_with_fees.sell_levels
+      }
+    in
+    let overlay_seen = ref false in
+    let overlay_last_valid = ref false in
+    let overlay_last_target = ref nan in
     (* M1 event ownership: route an execution event through the interpreter when the entry
        is file-bound, else call the reference handler directly. The reference handler
        locks state.mutex itself, so the interpreter path must run outside the book-cycle
@@ -684,7 +751,7 @@ let asset_domain_worker
       ()
       =
       match config_grid with
-      | Some (_, rt) ->
+      | Some (_, rt, _) ->
         ignore
           (Dio_strategies.Strategy_runtime.run_cycle
              rt
@@ -765,7 +832,7 @@ let asset_domain_worker
            dispatches directly. The reference handlers lock state.mutex themselves, so
            this runs OUTSIDE the interpreter's book-cycle lock. *)
         match config_grid with
-        | Some (ctx, rt) ->
+        | Some (ctx, rt, _) ->
           let now_ev = Unix.gettimeofday () in
           ctx.cg_state <- cached_grid_state;
           ctx.cg_asset <- !grid_strategy_asset_ref;
@@ -877,6 +944,14 @@ let asset_domain_worker
             (fun (event : Types.execution_event) ->
                incr event_count;
                incr cycle_events;
+               let overlay_event =
+                 match event.cl_ord_id with
+                 | Some clid ->
+                   (match Dio_strategies.Strategy_common.userref_of_cloid clid with
+                    | Some u -> u = Dio_strategies.Strategy_common.strategy_userref_carry
+                    | None -> false)
+                 | None -> false
+               in
                match event.order_status with
                | Types.Canceled | Types.Rejected | Types.Expired ->
                  should_execute_strategy := true;
@@ -886,7 +961,7 @@ let asset_domain_worker
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
                    | Types.Sell -> Dio_strategies.Strategy_common.Sell
                  in
-                 if is_grid_strategy
+                 if is_grid_strategy && not overlay_event
                  then
                    Dio_strategies.Strategy_api.Strategy.record_exec_event
                      asset_with_fees.symbol
@@ -899,7 +974,7 @@ let asset_domain_worker
                         | Dio_strategies.Strategy_common.Sell -> "sell")
                      ~cl_ord_id:event.cl_ord_id
                      ();
-                 if is_grid_strategy
+                 if is_grid_strategy && not overlay_event
                  then
                    route_exec
                      ~kind:"cancelled"
@@ -926,7 +1001,7 @@ let asset_domain_worker
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
                    | Types.Sell -> Dio_strategies.Strategy_common.Sell
                  in
-                 if is_grid_strategy
+                 if is_grid_strategy && not overlay_event
                  then
                    Dio_strategies.Strategy_api.Strategy.record_exec_event
                      asset_with_fees.symbol
@@ -941,7 +1016,7 @@ let asset_domain_worker
                      ~qty:event.filled_qty
                      ~cl_ord_id:event.cl_ord_id
                      ();
-                 if is_grid_strategy
+                 if is_grid_strategy && not overlay_event
                  then
                    route_exec
                      ~kind:"filled"
@@ -989,7 +1064,7 @@ let asset_domain_worker
                        | Types.Buy -> Dio_strategies.Strategy_common.Buy
                        | Types.Sell -> Dio_strategies.Strategy_common.Sell
                      in
-                     if is_grid_strategy
+                     if is_grid_strategy && not overlay_event
                      then
                        Dio_strategies.Strategy_api.Strategy.record_exec_event
                          asset_with_fees.symbol
@@ -1003,7 +1078,7 @@ let asset_domain_worker
                             | Dio_strategies.Strategy_common.Sell -> "sell")
                          ~price
                          ();
-                     if is_grid_strategy
+                     if is_grid_strategy && not overlay_event
                      then
                        route_exec
                          ~kind:"amended"
@@ -1491,6 +1566,90 @@ let asset_domain_worker
         && (not equity_market_closed)
         && !oracle_gate_open
       in
+      (* Overlay cycle: independent of the grid's oracle gate. Triggered by a perp
+         top-of-book change, a position/margin snapshot, a funding change, or a normal
+         grid cycle. There is no timer. *)
+      (* Overlays are event-driven by the domain loop itself: every wakeup is an exchange,
+         balance, fill, or oracle event. Run the overlay on each one; its actions are
+         idempotent (order replacement no-ops when the resting order already matches). *)
+      (match config_grid with
+       | Some (ctx, _, Some ort) ->
+         let now_ov = Unix.gettimeofday () in
+         ctx.cg_asset <- Some overlay_asset;
+         ctx.cg_state <- cached_grid_state;
+         ctx.cg_symbol <- asset_with_fees.symbol;
+         ctx.cg_price <- !current_price;
+         ctx.cg_bid <- !tob_bid;
+         ctx.cg_ask <- !tob_ask;
+         ctx.cg_abal
+         <- (try Ex.get_tradeable_balance ~asset:base_asset with
+             | _ -> nan);
+         ctx.cg_qbal
+         <- available_quote
+              (try Ex.get_tradeable_balance ~asset:quote_currency with
+               | _ -> nan);
+         ctx.cg_now <- now_ov;
+         ctx.cg_cycle <- !cycle_count;
+         ctx.cg_quote_stale <- false;
+         ctx.cg_oracle_halted <- false;
+         ctx.cg_base_age <- None;
+         ctx.cg_gen <- 0;
+         ctx.cg_profile <- false;
+         ort.prof_enabled <- false;
+         Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
+           ignore
+             (Dio_strategies.Strategy_runtime.run_cycle
+                ~collect:false
+                ort
+                ~price:!current_price
+                ~now:now_ov
+                ~event:(Dio_strategies.Strategy_runtime.make_event "book_update" [])));
+         let pbool key =
+           match Dio_strategies.Strategy_runtime.get_platform ort key with
+           | Dio_strategies.Strategy_expr.V_bool b -> b
+           | _ -> false
+         in
+         let pfloat key =
+           match Dio_strategies.Strategy_runtime.get_platform ort key with
+           | Dio_strategies.Strategy_expr.V_float f -> f
+           | _ -> nan
+         in
+         let sfloat key =
+           match Dio_strategies.Strategy_runtime.get_state ort key with
+           | Dio_strategies.Strategy_expr.V_float f -> f
+           | _ -> nan
+         in
+         let valid = pbool "funding_valid" && pbool "perp_valid" in
+         let target = sfloat "target" in
+         let target_changed =
+           valid
+           && (Float.is_nan !overlay_last_target
+               || Float.abs (target -. !overlay_last_target) > 1e-9)
+         in
+         if (not !overlay_seen) || valid <> !overlay_last_valid || target_changed
+         then (
+           overlay_seen := true;
+           overlay_last_valid := valid;
+           overlay_last_target := target;
+           Logging.info_f
+             ~section
+             "overlay %s: context_valid=%b funding_valid=%b perp_valid=%b \
+              funding_apr=%.4f premium=%.6f mark=%.4f ask=%.4f usdc_free=%.2f \
+              margin_ratio=%.3f target=%.8f short=%.8f carry_margin=%.2f"
+             asset_with_fees.symbol
+             valid
+             (pbool "funding_valid")
+             (pbool "perp_valid")
+             (pfloat "funding_apr")
+             (pfloat "premium")
+             (pfloat "mark")
+             (pfloat "ask")
+             (pfloat "usdc_free")
+             (pfloat "margin_ratio")
+             (sfloat "target")
+             (sfloat "short_qty")
+             (sfloat "carry_margin"))
+       | _ -> ());
       (* PREP/STRATEGY boundary. [t3] ends the exec phase; the block below up to the
          strategy call (oracle apply, halt/reclaim, startup gate, balance reads, F&G
          re-evaluation) is PREP. [t3_strategy] is seeded here so idle cycles still report
@@ -1713,7 +1872,7 @@ let asset_domain_worker
               @ Strategy_replay.snapshot_collections st)
          | _ -> ());
         (match config_grid with
-         | Some (ctx, rt) ->
+         | Some (ctx, rt, _) ->
            (* Config-driven grid (milestone 3): feed the engine context and run the
               strategy file's cycle. The handler calls the reference sub-functions, so
               behavior is identical by construction. The strategy-state mutex is held for
@@ -1724,7 +1883,7 @@ let asset_domain_worker
            ctx.cg_bid <- !tob_bid;
            ctx.cg_ask <- !tob_ask;
            ctx.cg_abal <- asset_bal_val;
-           ctx.cg_qbal <- quote_bal_val;
+           ctx.cg_qbal <- available_quote quote_bal_val;
            ctx.cg_now <- now;
            ctx.cg_cycle <- !cycle_count;
            ctx.cg_quote_stale <- quote_balance_stale;
@@ -1932,7 +2091,7 @@ let asset_domain_worker
                  doing strategy work. *)
               let interp =
                 match config_grid with
-                | Some (_, rt) ->
+                | Some (_, rt, _) ->
                   Printf.sprintf
                     " interp[wall=%s guard=%s args=%s cpu=%s miss=%d]"
                     (us (t4 - !t3_strategy))

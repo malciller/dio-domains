@@ -43,6 +43,22 @@ let test_parse_trading_config_optional_fields () =
   Alcotest.(check (option string)) "max_exposure" (Some "500") config.max_exposure
 ;;
 
+let test_parse_overlays () =
+  let json =
+    Yojson.Basic.from_string
+      {|{"overlays":[{"strategy":"carry_overlay","exchange":"hyperliquid","symbol":"BTC/USDC"}]}|}
+  in
+  Dio_engine.Config.parse_overlays json;
+  Alcotest.(check (option string))
+    "overlay bound"
+    (Some "carry_overlay")
+    (Dio_engine.Config.get_overlay_strategy ~exchange:"hyperliquid" ~symbol:"BTC/USDC");
+  Alcotest.(check (option string))
+    "other symbol unbound"
+    None
+    (Dio_engine.Config.get_overlay_strategy ~exchange:"hyperliquid" ~symbol:"HYPE/USDC")
+;;
+
 let test_parse_logging_config_valid () =
   let json_str =
     {|{"logging_level": "debug", "logging_sections": "engine,trading,api"}|}
@@ -290,6 +306,7 @@ let () =
             `Quick
             test_parse_logging_config_empty_sections
         ] )
+    ; "overlays", [ Alcotest.test_case "parse and bind" `Quick test_parse_overlays ]
     ; "flow_log", [ Alcotest.test_case "parse section" `Quick test_parse_flow_log_config ]
     ; ( "oracle"
       , [ Alcotest.test_case "parse full section" `Quick test_parse_oracle_config_full

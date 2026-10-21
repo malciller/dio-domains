@@ -26,7 +26,6 @@ type req_handler =
    completed request, and a linear-probe table that loses one strands the waiter, because
    the end marker is what signals its condition. *)
 let handlers : handler Ds.Id_table.t = Ds.Id_table.create ()
-
 let req_handlers : req_handler Ds.Id_table.t = Ds.Id_table.create ()
 
 (** Active connection, set by [initialize] and cleared by [reset]. Atomic because trading

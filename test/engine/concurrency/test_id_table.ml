@@ -204,8 +204,8 @@ let test_concurrent_read_write () =
 (* Domains interleaving set and remove on the *same* ids. The final state is
    nondeterministic — they interleave per operation, not per round — so there is no "last
    round" to compare against. What must hold is that an id is either absent or holds its
-   own value, never another id's, and the count matches what is present. A lost update or a
-   page published from a stale snapshot breaks both. *)
+   own value, never another id's, and the count matches what is present. A lost update or
+   a page published from a stale snapshot breaks both. *)
 let test_concurrent_set_remove_same_ids () =
   let t = Ds.Id_table.create () in
   let domains = 6 in
@@ -240,7 +240,10 @@ let test_concurrent_set_remove_same_ids () =
        (List.filter (fun i -> Ds.Id_table.find_default t i ~default:(-1) <> i) present));
   (* Quiesced, the count must be exact: the increment follows the CAS that published the
      transition, so no update can be dropped or double-counted. *)
-  Alcotest.(check int) "count exact once quiesced" (List.length present) (Ds.Id_table.length t)
+  Alcotest.(check int)
+    "count exact once quiesced"
+    (List.length present)
+    (Ds.Id_table.length t)
 ;;
 
 let () =

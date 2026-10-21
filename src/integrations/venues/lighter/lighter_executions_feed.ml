@@ -76,18 +76,22 @@ let stores = Ds.Cow_table.create ~shard_count:32 ()
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
-(** Global order_id -> symbol index. FIFO eviction once capped; writers must hold
-    [initialization_mutex]. *)
 (* Global order_id -> symbol index, bounded and FIFO-evicted. Backing store for
    [Concurrency.Fifo_index]; see that module for why this is FIFO rather than LRU and why
    queue membership is tracked explicitly. *)
+
+(** Global order_id -> symbol index. FIFO eviction once capped; writers must hold
+    [initialization_mutex]. *)
 let order_to_symbol =
-  Concurrency.Fifo_index.create ~label:(section ^ "/order_to_symbol")
-    ~cap:Concurrency.Cache_limits.order_index_startup_cap ()
+  Concurrency.Fifo_index.create
+    ~label:(section ^ "/order_to_symbol")
+    ~cap:Concurrency.Cache_limits.order_index_startup_cap
+    ()
 ;;
 
 let () =
   Concurrency.Fifo_index.publish_metrics order_to_symbol ~name:"lighter.order_to_symbol"
+;;
 
 let order_to_symbol_startup_done = Atomic.make false
 
@@ -101,7 +105,9 @@ let mark_startup_complete () =
   then (
     (* Precondition: initialization_mutex is held by the caller. *)
     let observed = Concurrency.Fifo_index.length order_to_symbol in
-    Concurrency.Fifo_index.lock_cap order_to_symbol ~observed
+    Concurrency.Fifo_index.lock_cap
+      order_to_symbol
+      ~observed
       ~floor:Concurrency.Cache_limits.order_index_min_cap)
 ;;
 
@@ -114,8 +120,10 @@ let set_startup_snapshot_done () =
     Fun.protect
       ~finally:(fun () -> Mutex.unlock initialization_mutex)
       (fun () ->
-        Ds.Cow_table.iter (fun _symbol store ->
-            if not (Atomic.get store.ready) then Atomic.set store.ready true) stores;
+        Ds.Cow_table.iter
+          (fun _symbol store ->
+            if not (Atomic.get store.ready) then Atomic.set store.ready true)
+          stores;
         mark_startup_complete ());
     Logging.debug_f
       ~section
@@ -128,11 +136,11 @@ let is_startup_snapshot_done () = Atomic.get _startup_snapshot_done
 (** Adds order_id -> symbol to the global index, evicting oldest-first past the cap.
     Caller must hold [initialization_mutex].
 
-    The old version carried a second loop that trimmed the queue when it exceeded twice the
-    cap by deleting rows from the *map*, which is backwards: a long queue is the symptom of
-    out-of-band removals leaving superseded records, and deleting live map rows destroys
-    valid mappings instead of dropping the stale records. [Fifo_index] skips superseded
-    entries on pop, so no such repair loop is needed. *)
+    The old version carried a second loop that trimmed the queue when it exceeded twice
+    the cap by deleting rows from the *map*, which is backwards: a long queue is the
+    symptom of out-of-band removals leaving superseded records, and deleting live map rows
+    destroys valid mappings instead of dropping the stale records. [Fifo_index] skips
+    superseded entries on pop, so no such repair loop is needed. *)
 let add_to_order_to_symbol order_id symbol =
   Concurrency.Fifo_index.set order_to_symbol ~key:order_id ~value:symbol
 ;;
@@ -909,7 +917,9 @@ let handle_snapshot json =
   (* Emit cancels for cached orders missing from the snapshot. *)
   let stale_orders = ref [] in
   Mutex.lock initialization_mutex;
-  let all_symbols = Ds.Cow_table.fold (fun symbol _ acc -> symbol :: acc) stores ~init:[] in
+  let all_symbols =
+    Ds.Cow_table.fold (fun symbol _ acc -> symbol :: acc) stores ~init:[]
+  in
   Mutex.unlock initialization_mutex;
   List.iter
     (fun symbol ->
@@ -961,7 +971,9 @@ let cleanup_stale_orders () =
   let now = Unix.gettimeofday () in
   let stale_threshold = 24.0 *. 3600.0 in
   Mutex.lock initialization_mutex;
-  let all_symbols = Ds.Cow_table.fold (fun symbol _ acc -> symbol :: acc) stores ~init:[] in
+  let all_symbols =
+    Ds.Cow_table.fold (fun symbol _ acc -> symbol :: acc) stores ~init:[]
+  in
   Mutex.unlock initialization_mutex;
   List.iter
     (fun symbol ->

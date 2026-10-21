@@ -23,6 +23,22 @@ let bool_arg args key =
   | _ -> false
 ;;
 
+let string_arg_opt args key =
+  match List.assoc_opt key args with
+  | Some (V_string s) -> Some s
+  | _ -> None
+;;
+
+let float_arg_opt args key =
+  match List.assoc_opt key args with
+  | Some (V_float f) -> Some f
+  | Some (V_int i) -> Some (float_of_int i)
+  | Some (V_string s) ->
+    (try Some (float_of_string s) with
+     | _ -> None)
+  | _ -> None
+;;
+
 let state_float_opt t key =
   match Strategy_runtime.get_state t key with
   | V_float f -> Some f
@@ -184,6 +200,42 @@ module type ENGINE = sig
   val expire_tif_recovery : ctx -> unit
   val cycle_facts : ctx -> Strategy_runtime.t -> unit
   val early_facts : ctx -> Strategy_runtime.t -> unit
+  val market_facts : ctx -> Strategy_runtime.t -> unit
+
+  (** Generic order placement. [market] is ["spot"] or ["perp"]; [symbol] overrides the
+      entry's instrument. [tif] is ["IOC"], ["GTC"], or ["ALO"] (post-only, sent as GTC). *)
+  val order_place
+    :  ctx
+    -> symbol:string option
+    -> market:string
+    -> side:string
+    -> qty:float
+    -> price:float option
+    -> tif:string
+    -> reduce_only:bool
+    -> post_only:bool
+    -> dedup_key:string
+    -> unit
+
+  val order_cancel : ctx -> market:string -> order_id:string -> unit
+
+  (** Place or amend a resting overlay order to the requested price/size. The engine looks
+      up the overlay's open order for the instrument; no order id is needed in the script. *)
+  val order_replace
+    :  ctx
+    -> symbol:string option
+    -> market:string
+    -> side:string
+    -> qty:float
+    -> price:float option
+    -> tif:string
+    -> reduce_only:bool
+    -> post_only:bool
+    -> dedup_key:string
+    -> unit
+
+  val quote_reserve : ctx -> amount:float -> unit
+  val reserve_base : ctx -> qty:float -> unit
   val mark_stale : ctx -> unit
   val buy_cancel : ctx -> unit
 
@@ -262,6 +314,50 @@ module Make (E : ENGINE) = struct
           | "expire_tif_recovery" -> ph Preamble (fun () -> E.expire_tif_recovery ctx)
           | "cycle_facts" -> ph Facts (fun () -> E.cycle_facts ctx t)
           | "early_facts" -> ph Facts (fun () -> E.early_facts ctx t)
+          | "market_facts" -> ph Facts (fun () -> E.market_facts ctx t)
+          | "order_place" ->
+            ph Buy (fun () ->
+              let side = Option.value (string_arg_opt args "side") ~default:"buy" in
+              let market = Option.value (string_arg_opt args "market") ~default:"spot" in
+              let tif = Option.value (string_arg_opt args "tif") ~default:"IOC" in
+              E.order_place
+                ctx
+                ~symbol:(string_arg_opt args "symbol")
+                ~market
+                ~side
+                ~qty:(float_arg args "qty")
+                ~price:(float_arg_opt args "price")
+                ~tif
+                ~reduce_only:(bool_arg args "reduce_only")
+                ~post_only:(bool_arg args "post_only")
+                ~dedup_key:(Option.value (string_arg_opt args "dedup_key") ~default:""))
+          | "order_replace" ->
+            ph Buy (fun () ->
+              let side = Option.value (string_arg_opt args "side") ~default:"buy" in
+              let market = Option.value (string_arg_opt args "market") ~default:"spot" in
+              let tif = Option.value (string_arg_opt args "tif") ~default:"ALO" in
+              E.order_replace
+                ctx
+                ~symbol:(string_arg_opt args "symbol")
+                ~market
+                ~side
+                ~qty:(float_arg args "qty")
+                ~price:(float_arg_opt args "price")
+                ~tif
+                ~reduce_only:(bool_arg args "reduce_only")
+                ~post_only:(bool_arg args "post_only")
+                ~dedup_key:(Option.value (string_arg_opt args "dedup_key") ~default:""))
+          | "order_cancel" ->
+            ph Cleanup (fun () ->
+              let market = Option.value (string_arg_opt args "market") ~default:"spot" in
+              match string_arg_opt args "order_id" with
+              | Some order_id -> E.order_cancel ctx ~market ~order_id
+              | None -> ())
+          | "quote_reserve" ->
+            ph Facts (fun () -> E.quote_reserve ctx ~amount:(float_arg args "amount"))
+          | "quote_release" -> ph Facts (fun () -> E.quote_reserve ctx ~amount:0.0)
+          | "reserve_base" ->
+            ph Facts (fun () -> E.reserve_base ctx ~qty:(float_arg args "qty"))
           | "mark_stale_cycle" -> ph Preamble (fun () -> E.mark_stale ctx)
           | "cancel_excess_buys" -> ph Buy (fun () -> E.buy_cancel ctx)
           | "buy_place" -> ph Buy (fun () -> E.buy_place ctx)

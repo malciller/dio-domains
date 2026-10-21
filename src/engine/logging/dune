@@ -2,8 +2,7 @@
  (name logging)
  (public_name dio.logging)
  (modules logging)
- (libraries dio.data_structures dio.yojson dio.lwt.unix unix dio.notty.unix)
-)
+ (libraries dio.data_structures dio.yojson dio.lwt.unix unix dio.notty.unix))
 
 ; Decision-flow telemetry layered on top of [logging]: renders the structured
 ; multi-line "what is the engine deciding" blocks and owns their throttling. Kept

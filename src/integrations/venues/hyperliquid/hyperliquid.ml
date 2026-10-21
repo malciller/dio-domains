@@ -31,6 +31,20 @@ module Module = Hyperliquid_module
 (** Shared type definitions for Hyperliquid domain objects. *)
 module Types = Hyperliquid_types
 
+(** Perp funding/premium/mark/oracle feed ([activeAssetCtx]). *)
+module Asset_ctx = Hyperliquid_asset_ctx
+
+(** Perp position and margin snapshots ([webData2]). *)
+module Positions = Hyperliquid_positions
+
+(** Account abstraction mode ([unifiedAccount] / [portfolioMargin] / standard). *)
+module Account_mode = Hyperliquid_account_mode
+
+(** Optional engine-facing market-context and quote-reservation capabilities. *)
+module Market_context = Hyperliquid_market_context
+
+module Capital_reservation = Hyperliquid_capital_reservation
+
 (** Oracle data-venue adapter (candles, fees, spot balances, instruments); implements
     [Exchange_intf.Oracle.S]. *)
 module Hyperliquid_oracle = Hyperliquid_oracle

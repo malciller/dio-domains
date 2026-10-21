@@ -102,18 +102,22 @@ let report () =
     (* Never let a diagnostic crash the trading loop. *)
     try
       let rows = Hashtbl.fold (fun k v acc -> (k, v) :: acc) live [] in
+      (* Read the previous report BEFORE overwriting [prev]. The original code reset
+         [prev] first, so every growth column was [v - 0] and printed [+0] forever - the
+         probe could show a site growing but never its rate. *)
       let prevc k =
         try Hashtbl.find prev k with
         | Not_found -> 0
       in
+      let rows = List.map (fun (k, v) -> k, v, v - prevc k) rows in
       Hashtbl.reset prev;
       Hashtbl.iter (fun k v -> Hashtbl.replace prev k v) live;
       Mutex.unlock mutex;
-      let rows = List.sort (fun (_, a) (_, b) -> compare b a) rows in
+      let rows = List.sort (fun (_, a, _) (_, b, _) -> compare b a) rows in
       Logging.info_f ~section "live survivor sites (samples; growth since last report):";
       List.iteri
-        (fun i (k, v) ->
-          if i < 12 then Logging.info_f ~section "  %6d  (+%d)  %s" v (v - prevc k) k)
+        (fun i (k, v, growth) ->
+          if i < 12 then Logging.info_f ~section "  %6d  (%+d)  %s" v growth k)
         rows
     with
     | e ->

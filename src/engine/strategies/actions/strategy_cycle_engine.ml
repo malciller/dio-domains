@@ -14,6 +14,8 @@ module Jac = Strategy_api
 module Types = Strategy_state
 module Slots = Strategy_fact_slots
 
+let section = "strategy_cycle_engine"
+
 type ctx =
   { mutable cg_asset : Types.trading_config option
   ; mutable cg_state : Types.strategy_state option
@@ -466,6 +468,504 @@ let cycle_facts c (t : Strategy_runtime.t) =
     t
     Slots.has_recent_amend_buy
     c.cg_has_recent_amend_buy
+;;
+
+(** Generic execution context for overlays. Published on demand by the [market_facts]
+    action; it deliberately has no grid-state dependency. Missing feeds publish zero (and
+    [funding_valid]/[perp_valid] false) so a consumer can gate on validity instead of
+    acting on a zero that looks real. *)
+let market_facts c (t : Strategy_runtime.t) =
+  let asset = c.cg_asset in
+  let symbol =
+    match asset with
+    | Some a -> a.symbol
+    | None -> c.cg_symbol
+  in
+  let exchange =
+    match asset with
+    | Some a -> a.exchange
+    | None -> ""
+  in
+  let base =
+    match String.split_on_char '/' symbol with
+    | b :: _ -> b
+    | [] -> symbol
+  in
+  let setf slot v = Strategy_runtime.set_platform_float t slot v in
+  let sets slot v =
+    Strategy_runtime.set_platform_slot t slot (Strategy_expr.V_string v)
+  in
+  let setb slot v = Strategy_runtime.set_platform_bool t slot v in
+  let fresh ts =
+    let age = c.cg_now -. ts in
+    age >= 0.0 && age <= 60.0
+  in
+  let mc = Dio_exchange.Exchange_intf.Registry.get_market_context exchange in
+  let funding =
+    match mc with
+    | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
+      Mc.get_funding ~coin:base
+    | None -> None
+  in
+  let positions_updated_at =
+    match mc with
+    | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
+      Mc.get_positions_updated_at ()
+    | None -> None
+  in
+  let position =
+    match mc with
+    | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
+      Mc.get_position ~coin:base
+    | None -> None
+  in
+  let margin =
+    match mc with
+    | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) -> Mc.get_margin ()
+    | None -> None
+  in
+  let reserved =
+    match Dio_exchange.Exchange_intf.Registry.get_capital_reservation exchange with
+    | Some (module Cr : Dio_exchange.Exchange_intf.Capital_reservation.S) ->
+      Cr.get_total ()
+    | None -> 0.0
+  in
+  sets Slots.symbol symbol;
+  sets Slots.base_coin base;
+  setf Slots.now c.cg_now;
+  (match funding with
+   | Some f when fresh f.updated_at ->
+     setb Slots.funding_valid true;
+     setf Slots.funding_apr (f.funding *. 24.0 *. 365.0);
+     setf Slots.premium f.premium;
+     setf Slots.mark f.mark;
+     setf Slots.oracle f.oracle
+   | _ ->
+     setb Slots.funding_valid false;
+     setf Slots.funding_apr 0.0;
+     setf Slots.premium 0.0;
+     setf Slots.mark 0.0;
+     setf Slots.oracle 0.0);
+  setb
+    Slots.perp_valid
+    (match positions_updated_at with
+     | Some ts -> fresh ts
+     | None -> false);
+  (match position with
+   | Some p ->
+     setf Slots.perp_qty p.qty;
+     setf Slots.perp_entry p.entry;
+     setf Slots.perp_margin p.margin_used;
+     setf Slots.perp_liq (Option.value p.liquidation ~default:0.0)
+   | None ->
+     setf Slots.perp_qty 0.0;
+     setf Slots.perp_entry 0.0;
+     setf Slots.perp_margin 0.0;
+     setf Slots.perp_liq 0.0);
+  (match margin with
+   | Some m when fresh m.updated_at ->
+     setf Slots.perp_account_value m.account_value;
+     setf Slots.perp_maintenance m.maintenance_margin;
+     setf
+       Slots.margin_ratio
+       (if m.maintenance_margin > 0.0
+        then m.account_value /. m.maintenance_margin
+        else 0.0)
+   | _ ->
+     setf Slots.perp_account_value 0.0;
+     setf Slots.perp_maintenance 0.0;
+     setf Slots.margin_ratio 0.0);
+  setf Slots.carry_reserved reserved;
+  match Jac.get_exchange_module exchange with
+  | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+    let staked =
+      try Ex.get_staked_balance ~asset:base with
+      | _ -> 0.0
+    in
+    let reserved =
+      match c.cg_state with
+      | Some s -> s.reserved_base
+      | None -> 0.0
+    in
+    setf Slots.accumulated_balance (reserved +. staked);
+    setf
+      Slots.spot_base_total
+      (try Ex.get_total_balance ~asset:base with
+       | _ -> 0.0);
+    setf
+      Slots.usdc_free
+      (try Ex.get_tradeable_balance ~asset:"USDC" with
+       | _ -> 0.0);
+    (match Ex.get_top_of_book ~symbol:base with
+     | Some (bid, _, ask, _) ->
+       setf Slots.bid bid;
+       setf Slots.ask ask
+     | None ->
+       setf Slots.bid 0.0;
+       setf Slots.ask 0.0);
+    (match Ex.get_top_of_book ~symbol with
+     | Some (bid, _, ask, _) ->
+       setf Slots.spot_bid bid;
+       setf Slots.spot_ask ask
+     | None ->
+       setf Slots.spot_bid 0.0;
+       setf Slots.spot_ask 0.0)
+  | None ->
+    setf Slots.accumulated_balance 0.0;
+    setf Slots.spot_base_total 0.0;
+    setf Slots.usdc_free 0.0;
+    setf Slots.bid 0.0;
+    setf Slots.ask 0.0;
+    setf Slots.spot_bid 0.0;
+    setf Slots.spot_ask 0.0
+;;
+
+(** Perp coin for a spot pair: [BTC/USDC] -> [BTC]. *)
+let perp_coin symbol =
+  match String.split_on_char '/' symbol with
+  | base :: _ -> base
+  | [] -> symbol
+;;
+
+(** Generic overlay shadow switch. Set [DIO_OVERLAY_DRY_RUN=1] to log intended overlay
+    orders/reservations without pushing or mutating state. The primary strategy is
+    unaffected. *)
+let overlay_dry_run =
+  lazy
+    (match Sys.getenv_opt "DIO_OVERLAY_DRY_RUN" with
+     | Some v ->
+       let v = String.lowercase_ascii (String.trim v) in
+       String.equal v "1" || String.equal v "true" || String.equal v "yes"
+     | None -> false)
+;;
+
+let dry_run () = Lazy.force overlay_dry_run
+
+(** Generic order placement for overlays. The engine knows nothing about carry policy: the
+    strategy file chooses the market, side, size, price, TIF, and reduce-only flag. *)
+let order_place
+  c
+  ~symbol
+  ~market
+  ~side
+  ~qty
+  ~price
+  ~tif
+  ~reduce_only
+  ~post_only
+  ~dedup_key
+  =
+  match c.cg_asset with
+  | None -> ()
+  | Some asset ->
+    let instrument =
+      match symbol with
+      | Some s -> if String.equal market "perp" then perp_coin s else s
+      | None ->
+        if String.equal market "perp" then perp_coin asset.symbol else asset.symbol
+    in
+    if (not (Float.is_finite qty)) || qty <= 0.0
+    then
+      Logging.warn_f
+        ~section
+        "Overlay order rejected: invalid qty %.8g for %s"
+        qty
+        instrument
+    else (
+      let side =
+        if String.equal (String.lowercase_ascii side) "sell"
+        then Strategy_common.Sell
+        else Strategy_common.Buy
+      in
+      let tif, post_only =
+        match String.uppercase_ascii tif with
+        | "ALO" -> "GTC", true
+        | "GTC" -> "GTC", post_only
+        | _ -> "IOC", post_only
+      in
+      let order_type =
+        match price with
+        | Some _ -> "limit"
+        | None -> "market"
+      in
+      let duplicate_key =
+        if String.equal dedup_key ""
+        then
+          Strategy_common.generate_duplicate_key
+            instrument
+            (Strategy_common.string_of_order_side side)
+            qty
+            price
+          ^ if reduce_only then "|ro" else ""
+        else dedup_key ^ if reduce_only then "|ro" else ""
+      in
+      let order =
+        Jac.create_place_order
+          ~reduce_only
+          ~time_in_force:tif
+          ~order_type
+          ~userref:Strategy_common.strategy_userref_carry
+          duplicate_key
+          instrument
+          side
+          qty
+          price
+          post_only
+          Strategy_common.Carry
+          asset.exchange
+      in
+      let describe () =
+        Printf.sprintf
+          "%s %s %.8g @ %s tif=%s reduce_only=%b key=%s"
+          (Strategy_common.string_of_order_side side)
+          instrument
+          qty
+          (match price with
+           | Some p -> Printf.sprintf "%.8g" p
+           | None -> "market")
+          tif
+          reduce_only
+          duplicate_key
+      in
+      if dry_run ()
+      then Logging.info_f ~section "Overlay DRY RUN: %s" (describe ())
+      else (
+        let pushed = Jac.push_order ~now:c.cg_now ~manage_state:false order in
+        if pushed
+        then Logging.info_f ~section "Overlay order: %s" (describe ())
+        else
+          Logging.debug_f
+            ~section
+            "Overlay order suppressed (duplicate/full buffer): %s"
+            duplicate_key))
+;;
+
+let order_cancel c ~market ~order_id =
+  match c.cg_asset with
+  | None -> ()
+  | Some asset ->
+    let instrument =
+      if String.equal market "perp" then perp_coin asset.symbol else asset.symbol
+    in
+    if dry_run ()
+    then Logging.info_f ~section "Overlay DRY RUN: cancel %s %s" instrument order_id
+    else (
+      let order =
+        Jac.create_cancel_order order_id instrument Strategy_common.Carry asset.exchange
+      in
+      ignore (Jac.push_order ~now:c.cg_now ~manage_state:false order : bool))
+;;
+
+(** Place or amend the overlay's resting order to the requested price/size. The engine
+    consults the venue's open orders, so the strategy file never has to track an order id
+    or reissue on a timer: every book event calls this, and it no-ops when the resting
+    order already matches. *)
+let order_replace
+  c
+  ~symbol
+  ~market
+  ~side
+  ~qty
+  ~price
+  ~tif
+  ~reduce_only
+  ~post_only
+  ~dedup_key
+  =
+  match c.cg_asset, price with
+  | Some asset, Some px ->
+    let instrument =
+      match symbol with
+      | Some s -> if String.equal market "perp" then perp_coin s else s
+      | None ->
+        if String.equal market "perp" then perp_coin asset.symbol else asset.symbol
+    in
+    let min_qty = Strategy_venue.get_qty_min_val instrument asset.exchange in
+    if (not (Float.is_finite qty))
+       || qty < 0.0
+       || (qty > 0.0 && min_qty > 0.0 && qty < min_qty)
+       || (not (Float.is_finite px))
+       || px <= 0.0
+    then
+      Logging.debug_f
+        ~section
+        "Overlay replace skipped: qty=%.8g (min %.8g) price=%.8g for %s"
+        qty
+        min_qty
+        px
+        instrument
+    else (
+      let order_side =
+        if String.equal (String.lowercase_ascii side) "sell"
+        then Strategy_common.Sell
+        else Strategy_common.Buy
+      in
+      let ex_side =
+        match order_side with
+        | Strategy_common.Sell -> Dio_exchange.Exchange_intf.Types.Sell
+        | Strategy_common.Buy -> Dio_exchange.Exchange_intf.Types.Buy
+      in
+      let tif, post_only =
+        match String.uppercase_ascii tif with
+        | "ALO" -> "GTC", true
+        | "GTC" -> "GTC", post_only
+        | _ -> "IOC", post_only
+      in
+      let ex = Jac.get_exchange_module asset.exchange in
+      let rounded =
+        match ex with
+        | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+          (try Ex.round_price ~symbol:instrument ~price:px with
+           | _ -> px)
+        | None -> px
+      in
+      let matching =
+        match ex with
+        | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+          (* Open orders can be keyed by the spot pair (orderUpdates maps the perp coin
+             back to the registered pair) or by the perp coin (the placement injection
+             uses the order symbol). Query both and dedupe by order id. *)
+          let spot_orders =
+            try Ex.get_open_orders ~symbol:asset.symbol with
+            | _ -> []
+          in
+          let perp_orders =
+            if String.equal instrument asset.symbol
+            then []
+            else (
+              try Ex.get_open_orders ~symbol:instrument with
+              | _ -> [])
+          in
+          let by_id = Hashtbl.create 8 in
+          List.iter
+            (fun (o : Dio_exchange.Exchange_intf.Types.open_order) ->
+              Hashtbl.replace by_id o.order_id o)
+            (spot_orders @ perp_orders);
+          Hashtbl.fold (fun _ o acc -> o :: acc) by_id []
+          |> List.filter (fun (o : Dio_exchange.Exchange_intf.Types.open_order) ->
+            o.user_ref = Some Strategy_common.strategy_userref_carry
+            && o.side = ex_side
+            && (o.status = Dio_exchange.Exchange_intf.Types.New
+                || o.status = Dio_exchange.Exchange_intf.Types.PartiallyFilled))
+        | None -> []
+      in
+      let same_price (o : Dio_exchange.Exchange_intf.Types.open_order) =
+        match o.limit_price with
+        | Some p -> Float.abs (p -. rounded) <= 1e-9 *. Float.max 1.0 (Float.abs rounded)
+        | None -> false
+      in
+      let same_qty (o : Dio_exchange.Exchange_intf.Types.open_order) =
+        Float.abs (o.remaining_qty -. qty) <= 1e-9
+      in
+      if qty <= 0.0
+      then
+        List.iter
+          (fun (o : Dio_exchange.Exchange_intf.Types.open_order) ->
+            if dry_run ()
+            then
+              Logging.info_f
+                ~section
+                "Overlay DRY RUN: cancel %s %s (target reached)"
+                instrument
+                o.order_id
+            else (
+              let order =
+                Jac.create_cancel_order
+                  o.order_id
+                  instrument
+                  Strategy_common.Carry
+                  asset.exchange
+              in
+              ignore (Jac.push_order ~now:c.cg_now ~manage_state:false order : bool)))
+          matching
+      else (
+        match matching with
+        | o :: _ when same_price o && same_qty o -> ()
+        | o :: _ ->
+          (* Amend the total size, preserving the already-filled part. The caller passes
+             the desired remaining quantity. *)
+          let total_qty = o.cum_qty +. qty in
+          if dry_run ()
+          then
+            Logging.info_f
+              ~section
+              "Overlay DRY RUN: amend %s %s to %.8g @ %.8g"
+              instrument
+              o.order_id
+              total_qty
+              rounded
+          else (
+            let order =
+              Jac.create_amend_order
+                o.order_id
+                instrument
+                order_side
+                total_qty
+                (Some px)
+                post_only
+                Strategy_common.Carry
+                asset.exchange
+            in
+            ignore (Jac.push_order ~now:c.cg_now ~manage_state:false order : bool))
+        | [] ->
+          order_place
+            c
+            ~symbol
+            ~market
+            ~side
+            ~qty
+            ~price:(Some px)
+            ~tif
+            ~reduce_only
+            ~post_only
+            ~dedup_key))
+  | _ ->
+    order_place
+      c
+      ~symbol
+      ~market
+      ~side
+      ~qty
+      ~price
+      ~tif
+      ~reduce_only
+      ~post_only
+      ~dedup_key
+;;
+
+let quote_reserve c ~amount =
+  match c.cg_asset with
+  | None -> ()
+  | Some asset ->
+    if dry_run ()
+    then
+      Logging.info_f
+        ~section
+        "Overlay DRY RUN: reserve %.4f %s quote for %s"
+        amount
+        asset.exchange
+        asset.symbol
+    else (
+      match
+        Dio_exchange.Exchange_intf.Registry.get_capital_reservation asset.exchange
+      with
+      | Some (module Cr : Dio_exchange.Exchange_intf.Capital_reservation.S) ->
+        Cr.set ~owner:("strategy:" ^ asset.symbol) ~amount
+      | None -> ())
+;;
+
+(** Moves base into the reserved ledger. The caller holds the strategy-state mutex; only
+    mark the state dirty here and let the domain's normal flush persist it. *)
+let reserve_base c ~qty =
+  match c.cg_asset, c.cg_state with
+  | Some asset, Some state when Float.is_finite qty && qty <> 0.0 ->
+    if dry_run ()
+    then
+      Logging.info_f ~section "Overlay DRY RUN: reserve %.8f base for %s" qty asset.symbol
+    else (
+      state.reserved_base <- Float.max 0.0 (state.reserved_base +. qty);
+      state.persistence_dirty <- true)
+  | _ -> ()
 ;;
 
 (** Fine path: the stale-balance side effect (record the cycle on the state). The file

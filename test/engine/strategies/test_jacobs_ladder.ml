@@ -1349,8 +1349,8 @@ let test_position_ledger_bridges_unreflected_fill () =
 ;;
 
 let test_position_reconcile_freshness_gate () =
-  (* Credits are retired by value, not timestamp: a snapshot at or above position +
-     credit proves the venue reflected the fill; a newer snapshot below it does not. *)
+  (* Credits are retired by value, not timestamp: a snapshot at or above position + credit
+     proves the venue reflected the fill; a newer snapshot below it does not. *)
   let symbol = "LEDGER2/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
   let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
@@ -1526,8 +1526,8 @@ let test_position_stale_message_does_not_regress_ledger () =
 ;;
 
 let test_position_partial_credit_prune () =
-  (* FIFO value coverage: a snapshot between the position and the expected ledger
-     consumes the oldest credits up to the rise. *)
+  (* FIFO value coverage: a snapshot between the position and the expected ledger consumes
+     the oldest credits up to the rise. *)
   let symbol = "LEDGER7/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
   let state = Dio_strategies.Strategy_api.get_strategy_state symbol in

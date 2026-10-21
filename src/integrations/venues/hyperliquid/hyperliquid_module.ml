@@ -139,14 +139,14 @@ module Hyperliquid_impl = struct
          | _ -> 0.0)
     in
     let hl_tif =
-      match time_in_force with
-      | Some Types.IOC -> Hyperliquid_types.Ioc
-      | Some Types.GTC -> Hyperliquid_types.Gtc
-      | Some Types.FOK -> Hyperliquid_types.Ioc
-      | None ->
-        if Option.value post_only ~default:false
-        then Hyperliquid_types.Alo
-        else Hyperliquid_types.Gtc
+      if Option.value post_only ~default:false
+      then Hyperliquid_types.Alo
+      else (
+        match time_in_force with
+        | Some Types.IOC -> Hyperliquid_types.Ioc
+        | Some Types.GTC -> Hyperliquid_types.Gtc
+        | Some Types.FOK -> Hyperliquid_types.Ioc
+        | None -> Hyperliquid_types.Gtc)
     in
     let px_rounded =
       Hyperliquid_instruments_feed.round_price_to_tick_for_symbol symbol px
@@ -922,6 +922,76 @@ let start_staking_balance_poller () =
   Lwt.async loop
 ;;
 
+(** Reads the account abstraction mode once. In [unifiedAccount] / [portfolioMargin] the
+    spot USDC balance is the perp collateral; the per-DEX clearinghouse summary is not
+    meaningful. A failure leaves the mode [Unknown], which falls back to the per-DEX
+    summary (correct for standard accounts). *)
+let fetch_account_mode_ws () =
+  let section = "hyperliquid_startup" in
+  let wallet =
+    match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
+    | Some w -> w
+    | None -> ""
+  in
+  if wallet = ""
+  then Lwt.return_unit
+  else (
+    let req_id = Hyperliquid_actions.next_ws_req_id () in
+    let ws_frame =
+      `Assoc
+        [ "method", `String "post"
+        ; "id", `Int req_id
+        ; ( "request"
+          , `Assoc
+              [ "type", `String "info"
+              ; ( "payload"
+                , `Assoc [ "type", `String "userAbstraction"; "user", `String wallet ] )
+              ] )
+        ]
+    in
+    Lwt.catch
+      (fun () ->
+        wait_for_ws_connected ()
+        >>= fun () ->
+        Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:5000
+        >>= fun resp_frame ->
+        let open Yojson.Safe.Util in
+        let payload =
+          try resp_frame |> member "data" |> member "response" |> member "payload" with
+          | _ -> `Null
+        in
+        let raw =
+          match payload with
+          | `String s -> Some s
+          | `Assoc _ ->
+            (try payload |> member "data" |> to_string_option with
+             | _ -> None)
+          | _ -> None
+        in
+        (match raw with
+         | Some s ->
+           let mode = Hyperliquid_account_mode.of_string s in
+           Hyperliquid_account_mode.set mode;
+           if mode = Hyperliquid_account_mode.Unknown
+           then
+             Logging.warn_f
+               ~section
+               "Unrecognised account abstraction %S; using per-DEX margin"
+               s
+         | None ->
+           Logging.warn_f
+             ~section
+             "Could not parse account abstraction response: %s"
+             (Yojson.Safe.to_string resp_frame));
+        Lwt.return_unit)
+      (fun exn ->
+        Logging.error_f
+          ~section
+          "Failed to fetch account abstraction via WS: %s"
+          (Printexc.to_string exn);
+        Lwt.return_unit))
+;;
+
 let fetch_spot_balances_ws () =
   let section = "hyperliquid_startup" in
   let wallet =
@@ -1005,6 +1075,7 @@ let fetch_spot_balances_ws () =
                   "Failed to parse spot balance entry: %s"
                   (Printexc.to_string exn))
             balances;
+          Hyperliquid_balances.notify_spot_update ();
           Hyperliquid_balances.notify_ready ();
           Lwt.return_unit))
       (fun exn ->
@@ -1088,7 +1159,10 @@ let resync_user_state () =
       Lwt.finalize
         (fun () ->
           Lwt.catch
-            (fun () -> fetch_spot_balances_ws () >>= fun () -> fetch_open_orders_ws ())
+            (fun () ->
+              fetch_account_mode_ws ()
+              >>= fun () ->
+              fetch_spot_balances_ws () >>= fun () -> fetch_open_orders_ws ())
             (fun exn ->
               Logging.warn_f
                 ~section:"hyperliquid_startup"
@@ -1138,3 +1212,22 @@ let () =
 (* Register the oracle data-venue adapter (historical candles, fees, spot balances,
    instruments for the capital oracle) at load time. *)
 let () = Exchange.Oracle.Registry.register (module Hyperliquid_oracle)
+
+(** Register the optional engine-facing capabilities when this module loads. The engine
+    references [Hyperliquid.Module], so this runs in production; the aliases in
+    [hyperliquid.ml] are convenience paths, not the registration trigger.
+
+    Also force-link the two user-stream processors. They publish funding and position
+    snapshots into the market-context capability; without a value reference from this
+    module the OCaml linker can drop them and the overlay sees no context. *)
+let () =
+  let module Registry = Dio_exchange.Exchange_intf.Registry in
+  Registry.register_market_context (module Hyperliquid_market_context.Impl);
+  Registry.register_capital_reservation (module Hyperliquid_capital_reservation.Impl);
+  ignore Hyperliquid_asset_ctx._processor_task;
+  ignore Hyperliquid_positions._processor_task;
+  Logging.info
+    ~section:"hyperliquid_module"
+    "registered market-context/capital-reservation capabilities and started \
+     asset-context/position feeds"
+;;

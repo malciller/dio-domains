@@ -401,6 +401,9 @@ let initialize_feeds ()  :
                                                   ();
                                                 Lwt.async
                                                   (fun () ->
+                                                     Hyperliquid.Module.fetch_account_mode_ws
+                                                       ()
+                                                     >>= fun () ->
                                                      Hyperliquid.Module.fetch_spot_balances_ws
                                                        ()));
                                              if has_ibkr

@@ -177,7 +177,8 @@ let test_remove_preserves_probe_chain () =
     []
     (List.sort compare missing);
   Alcotest.(check int) "length reflects removals" (n / 2) (Ds.Cow_table.length t);
-  (* Reinserting a removed key must not resurrect its probe neighbours or double the count. *)
+  (* Reinserting a removed key must not resurrect its probe neighbours or double the
+     count. *)
   Ds.Cow_table.set t (key 0) 0;
   Alcotest.(check int) "reinsert keeps count" ((n / 2) + 1) (Ds.Cow_table.length t);
   let odd_keys = List.filter (fun i -> i mod 2 = 1) (List.init n (fun i -> i)) in
@@ -193,8 +194,9 @@ let test_remove_preserves_probe_chain () =
 ;;
 
 (* Remove and reinsert repeatedly, in a table small enough that growth happens
-   mid-sequence. Growth rehashes with the same [slot_start] derivation, so a backward-shift
-   delete that mis-tracked a home slot would show up as a key lost across a resize. *)
+   mid-sequence. Growth rehashes with the same [slot_start] derivation, so a
+   backward-shift delete that mis-tracked a home slot would show up as a key lost across a
+   resize. *)
 let test_remove_across_growth () =
   let t = Ds.Cow_table.create ~shard_count:1 () in
   let key i = "g" ^ string_of_int i in

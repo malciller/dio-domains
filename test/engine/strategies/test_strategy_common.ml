@@ -33,6 +33,7 @@ let create_test_order
   ; price
   ; time_in_force
   ; post_only
+  ; reduce_only = false
   ; userref
   ; strategy
   ; duplicate_key

@@ -54,6 +54,29 @@ type oracle =
   ; exhaustion_price : float
   }
 
+type perp =
+  { coin : string
+  ; side : string
+  ; has_position : bool
+  ; qty : float
+  ; abs_qty : float
+  ; entry : float
+  ; notional : float
+  ; unrealized_pnl : float
+  ; margin_used : float
+  ; liquidation : float option
+  ; leverage : float option
+  ; mark : float
+  ; oracle : float
+  ; premium : float
+  ; funding_apr : float
+  ; account_value : float
+  ; maintenance_margin : float
+  ; withdrawable : float
+  ; margin_ratio : float option
+  ; updated_at : float
+  }
+
 type strategy =
   { symbol : string
   ; exchange : string
@@ -69,6 +92,7 @@ type strategy =
   ; last_sell_fill : float
   ; grid_interval_lo : float
   ; market : market
+  ; perp : perp option
   ; oracle : oracle option
   }
 
@@ -240,6 +264,32 @@ let parse_oracle j =
   }
 ;;
 
+let parse_perp j =
+  let f key = j |?> key |> to_float_d 0.0 in
+  let opt key = j |?> key |> to_float_opt in
+  { coin = j |?> "coin" |> to_string_d ""
+  ; side = j |?> "side" |> to_string_d "flat"
+  ; has_position = j |?> "has_position" |> to_bool_d false
+  ; qty = f "qty"
+  ; abs_qty = f "abs_qty"
+  ; entry = f "entry"
+  ; notional = f "notional"
+  ; unrealized_pnl = f "unrealized_pnl"
+  ; margin_used = f "margin_used"
+  ; liquidation = opt "liquidation"
+  ; leverage = opt "leverage"
+  ; mark = f "mark"
+  ; oracle = f "oracle"
+  ; premium = f "premium"
+  ; funding_apr = f "funding_apr"
+  ; account_value = f "account_value"
+  ; maintenance_margin = f "maintenance_margin"
+  ; withdrawable = f "withdrawable"
+  ; margin_ratio = opt "margin_ratio"
+  ; updated_at = f "updated_at"
+  }
+;;
+
 let parse_strategy symbol j =
   let strat = j |?> "strategy" in
   let sell_orders = parse_orders (strat |?> "sell_orders") in
@@ -259,6 +309,10 @@ let parse_strategy symbol j =
   ; last_sell_fill = strat |?> "last_sell_fill" |> to_float_d 0.0
   ; grid_interval_lo = j |?> "grid_interval_lo" |> to_float_d 1.0
   ; market = parse_market (j |?> "market")
+  ; perp =
+      (match j |?> "perp" with
+       | `Assoc _ as p -> Some (parse_perp p)
+       | _ -> None)
   ; oracle =
       (match j |?> "oracle" with
        | `Assoc _ as o -> Some (parse_oracle o)

@@ -1,6 +1,6 @@
 (* Demonstrates the cross-domain stall a mutex-guarded intern table causes on the strategy
-   hot path, and that the lock-free [Ds.Cow_table] used by
-   [Strategy_expr.intern_key] removes it.
+   hot path, and that the lock-free [Ds.Cow_table] used by [Strategy_expr.intern_key]
+   removes it.
 
    "Worst" alone is not a usable signal — over millions of calls a single OS scheduling
    hiccup or minor GC swamps the tail and every variant looks identical. So the run also

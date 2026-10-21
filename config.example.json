@@ -54,5 +54,6 @@
       "sell_levels": true,
       "cpu_priority": 0
     }
-  ]
+  ],
+  "overlays": []
 }

@@ -49,8 +49,10 @@ let test_order_ids_unique_across_domains () =
         done;
         for _ = 1 to per_domain do
           let id = Ibkr.Connection.get_next_order_id conn in
-          if id >= base && id < base + total then
-            if handed_out.(id - base) then Atomic.incr duplicates
+          if id >= base && id < base + total
+          then
+            if handed_out.(id - base)
+            then Atomic.incr duplicates
             else handed_out.(id - base) <- true
         done))
   in
@@ -60,13 +62,15 @@ let test_order_ids_unique_across_domains () =
   Atomic.set go true;
   List.iter Domain.join handles;
   Alcotest.(check int) "no id handed out twice" 0 (Atomic.get duplicates);
-  let missing = Array.fold_left (fun acc got -> if got then acc else acc + 1) 0 handed_out in
+  let missing =
+    Array.fold_left (fun acc got -> if got then acc else acc + 1) 0 handed_out
+  in
   Alcotest.(check int) "every id in the window was issued" 0 missing
 ;;
 
 (* nextValidId is re-sent on every reconnect and can be *lower* than ids this process has
-   already used, whose orders may still be working. Resuming from it would reuse a live id,
-   so the floor only rises. *)
+   already used, whose orders may still be working. Resuming from it would reuse a live
+   id, so the floor only rises. *)
 let test_next_valid_id_never_lowers_the_floor () =
   let conn = Ibkr.Connection.create ~host:"127.0.0.1" ~port:4002 ~client_id:4 in
   Ibkr.Connection.set_next_order_id conn 5000;
@@ -74,10 +78,16 @@ let test_next_valid_id_never_lowers_the_floor () =
   let _ = Ibkr.Connection.get_next_order_id conn in
   (* A reconnect reporting a stale lower value must not rewind the counter. *)
   Ibkr.Connection.set_next_order_id conn 100;
-  Alcotest.(check int) "counter did not rewind" 5002 (Ibkr.Connection.get_next_order_id conn);
+  Alcotest.(check int)
+    "counter did not rewind"
+    5002
+    (Ibkr.Connection.get_next_order_id conn);
   (* A higher value is still adopted. *)
   Ibkr.Connection.set_next_order_id conn 9000;
-  Alcotest.(check int) "higher server value adopted" 9000 (Ibkr.Connection.get_next_order_id conn)
+  Alcotest.(check int)
+    "higher server value adopted"
+    9000
+    (Ibkr.Connection.get_next_order_id conn)
 ;;
 
 let test_disconnect_when_not_connected () =
