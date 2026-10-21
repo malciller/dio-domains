@@ -105,7 +105,17 @@ let test_accum_qty () =
   Alcotest.(check (float 1e-9))
     "no staking, venue available"
     0.5
-    (accum_qty_of ~staked:0.0 ~pending:99.0 ~available:(Some 0.5) 3.0)
+    (accum_qty_of ~staked:0.0 ~pending:99.0 ~available:(Some 0.5) 3.0);
+  (* A venue whose available figure already includes staked must not double-count it. *)
+  Alcotest.(check (float 1e-9))
+    "staked is not double-counted"
+    10.0
+    (accum_qty_of ~staked:2.0 ~pending:0.0 ~available:(Some 10.0) 10.0);
+  (* Missing total: keep the staked balance instead of clamping the whole figure to 0. *)
+  Alcotest.(check (float 1e-9))
+    "staked survives a missing total"
+    2.0
+    (accum_qty_of ~staked:2.0 ~pending:0.0 ~available:(Some 0.0) 0.0)
 ;;
 
 let test_available_balance_parse () =
