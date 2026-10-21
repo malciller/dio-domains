@@ -271,7 +271,14 @@ let hedger_callbacks : strategy_callbacks =
           order_id;
         Dio_strategies.Strategy_common.bind_carry_order
           ~dedup_key:order.duplicate_key
-          ~order_id)
+          ~order_id;
+        (* Carry/overlay orders bypass the grid strategy state, so no ack handler releases
+           their placement dedupe key. Holding it until the TTL sweep made every later
+           overlay place with the same key disappear for 60-75s. The order is at the venue
+           now; [order.replace] dedupes by the open-orders scan from here on. *)
+        ignore
+          (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+             order.duplicate_key))
   ; on_place_fail =
       (fun order err ->
         Logging.error_f
@@ -283,7 +290,12 @@ let hedger_callbacks : strategy_callbacks =
           (price_str order)
           err;
         Dio_strategies.Strategy_common.retire_pending_carry_order
-          ~dedup_key:order.duplicate_key)
+          ~dedup_key:order.duplicate_key;
+        (* A terminal failure must free the key too, otherwise a single ALO/post-only
+           rejection blocks the next retry until the TTL sweep. *)
+        ignore
+          (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+             order.duplicate_key))
   ; on_amend_ok =
       (fun order _target_id new_id ->
         if order.strategy = Dio_strategies.Strategy_common.Carry
