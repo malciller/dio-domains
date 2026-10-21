@@ -759,6 +759,34 @@ let wait_for_ws_connected () =
   Hyperliquid_ws.wait_for_connected ()
 ;;
 
+(** Populate the instrument cache from REST when the WS payload left it empty, then signal
+    readiness. Without this an empty/malformed WS meta frame marked the feed ready and the
+    domains placed orders the signer could not resolve ("Unknown symbol"). *)
+let ensure_instruments_loaded () =
+  let section = "hyperliquid_startup" in
+  if Hyperliquid_instruments_feed.has_instruments ()
+  then Lwt.return_unit
+  else (
+    Logging.warn_f
+      ~section
+      "Hyperliquid instrument cache empty after WS meta; falling back to REST meta";
+    Lwt.catch
+      (fun () ->
+        Hyperliquid_instruments_feed.fetch_meta_from_rest
+          ~testnet:(Atomic.get Hyperliquid_impl.is_testnet)
+          ()
+        >>= fun () ->
+        Hyperliquid_instruments_feed.notify_ready ();
+        Lwt.return_unit)
+      (fun exn ->
+        Logging.error_f
+          ~section
+          "Hyperliquid REST instrument fallback failed: %s"
+          (Printexc.to_string exn);
+        Hyperliquid_instruments_feed.notify_ready ();
+        Lwt.return_unit))
+;;
+
 let initialize_instruments_ws () =
   let section = "hyperliquid_startup" in
   Lwt.catch
@@ -802,14 +830,15 @@ let initialize_instruments_ws () =
       Hyperliquid_ws.send_request ~json:ws_frame_spot ~req_id:req_id_spot ~timeout_ms:5000
       >>= fun resp_spot ->
       let payload_spot = extract_ws_payload resp_spot in
-      Hyperliquid_instruments_feed.process_meta_response payload_perp payload_spot)
+      Hyperliquid_instruments_feed.process_meta_response payload_perp payload_spot
+      >>= fun () ->
+      ensure_instruments_loaded ())
     (fun exn ->
       Logging.error_f
         ~section
         "Failed to fetch instruments via WS: %s"
         (Printexc.to_string exn);
-      Hyperliquid_instruments_feed.notify_ready ();
-      Lwt.return_unit)
+      ensure_instruments_loaded ())
 ;;
 
 let parse_json_float json =

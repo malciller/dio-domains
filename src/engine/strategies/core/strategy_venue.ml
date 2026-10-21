@@ -201,8 +201,29 @@ let floor_to_inv value inv =
     floor (scaled +. (1e-9 *. Float.max 1.0 (Float.abs scaled))) /. inv)
 ;;
 
+(** Ceil [value] up to the lot whose reciprocal step is [inv] (i.e. a step of [1/.inv]).
+    The same relative epsilon is used as [floor_to_inv], subtracted before the ceiling, so
+    binary representation error cannot bump an on-lot quantity a full step. *)
+let ceil_to_inv value inv =
+  if inv <= 0.0 || not (Float.is_finite inv)
+  then value
+  else (
+    let scaled = value *. inv in
+    ceil (scaled -. (1e-9 *. Float.max 1.0 (Float.abs scaled))) /. inv)
+;;
+
 let round_qty qty symbol exchange =
   floor_to_inv qty (1.0 /. get_qty_increment_val symbol exchange)
+;;
+
+(** Ceil [qty] up to the venue lot for [symbol]. Overlay orders use this before the
+    notional floor check: Hyperliquid rounds size down to the lot, so a quantity sized at
+    exactly the $10 floor can land below it after rounding. SOL is the sharp case (spot
+    lot 0.001, perp lot 0.01): $10 / 108 = 0.0925 SOL rounds down to 0.09 = $9.73, which
+    the venue rejects. Rounding the requested size up keeps the placed notional at or
+    above the floor. *)
+let round_qty_up qty symbol exchange =
+  ceil_to_inv qty (1.0 /. get_qty_increment_val symbol exchange)
 ;;
 
 (** Minimum accepted order QUANTITY for [symbol] in base-asset units, from the live venue
@@ -216,9 +237,9 @@ let get_qty_min_val symbol exchange =
 
 (** Default minimum order notional for [symbol] in quote terms (0.0 = unconstrained), from
     the venue's oracle adapter ([Exchange_intf.Oracle.S.min_notional]): Hyperliquid 10
-    USDC spot floor, Alpaca $1 fractional minimum, others 0.0. Unregistered venues are
-    unconstrained. Same resolution as the oracle's [Grid_adapter], so the live grid and
-    replay agree on the floor. *)
+    USDC floor for both spot and perps, Alpaca $1 fractional minimum, others 0.0.
+    Unregistered venues are unconstrained. Same resolution as the oracle's [Grid_adapter],
+    so the live grid and replay agree on the floor. *)
 let get_min_notional_val symbol exchange =
   match Exchange.Oracle.Registry.get exchange with
   | Some (module V) -> V.min_notional ~symbol

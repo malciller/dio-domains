@@ -1173,17 +1173,36 @@ let read_config () : config =
     }
 ;;
 
-(** Cached GC config, parsed once on first access. Thread-safe via Lazy. *)
-let cached_gc_config : gc_config option Lazy.t =
-  lazy
-    (let config = read_config () in
-     config.gc)
+(** Cached GC config, parsed once on first access. Every domain calls [apply_gc_config],
+    and OCaml 5's [Lazy.force] is not domain-safe: concurrent forcing of a shared lazy
+    raised [CamlinternalLazy.Undefined] and killed the domain. A mutex-guarded memo gives
+    the same parse-once behaviour without the lazy. *)
+let gc_config_mutex = Mutex.create ()
+let cached_gc_config : gc_config option ref = ref None
+let gc_config_resolved = Atomic.make false
+
+let get_gc_config () =
+  if Atomic.get gc_config_resolved
+  then !cached_gc_config
+  else (
+    Mutex.lock gc_config_mutex;
+    let v =
+      if Atomic.get gc_config_resolved
+      then !cached_gc_config
+      else (
+        let gc = (read_config ()).gc in
+        cached_gc_config := gc;
+        Atomic.set gc_config_resolved true;
+        gc)
+    in
+    Mutex.unlock gc_config_mutex;
+    v)
 ;;
 
 (** Applies GC tuning from the cached config. Must be called once per OCaml 5 domain (each
     domain has its own minor heap). No-op if [gc] is absent. *)
 let apply_gc_config () =
-  match Lazy.force cached_gc_config with
+  match get_gc_config () with
   | None -> ()
   | Some gc ->
     let ctrl = Gc.get () in

@@ -49,6 +49,17 @@ let notify_ready () =
   Lwt_condition.broadcast ready_condition ()
 ;;
 
+(** True once the metadata cache holds at least one instrument. The startup gate uses
+    this to avoid signalling readiness (and letting domains place orders) on an empty
+    cache: an empty WS payload used to call [notify_ready] and every subsequent order was
+    rejected with "Unknown symbol". *)
+let has_instruments () =
+  Mutex.lock cache_mutex;
+  let n = Hashtbl.length pair_cache in
+  Mutex.unlock cache_mutex;
+  n > 0
+;;
+
 (** Parses perpetual and spot instrument metadata from JSON payloads received via
     WebSocket. Populates [pair_cache] and signals readiness on completion. Spot
     instruments are keyed by both canonical symbol and [@N] alias. *)
@@ -132,14 +143,14 @@ let process_meta_response payload_perp payload_spot =
          spot pairs"
         (List.length universe_perp)
         (List.length universe_spot);
-      notify_ready ();
+      if has_instruments () then notify_ready ();
       Lwt.return_unit)
     (fun exn ->
       Logging.error_f
         ~section
         "Failed to process Hyperliquid instruments: %s"
         (Printexc.to_string exn);
-      notify_ready ();
+      if has_instruments () then notify_ready ();
       Lwt.return_unit)
 ;;
 

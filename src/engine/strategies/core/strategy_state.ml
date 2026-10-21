@@ -416,9 +416,9 @@ type strategy_state =
   ; mutable cached_venue_min_notional : float
       (* Venue minimum accepted order notional in quote terms (0.0 = unconstrained). Some
          venues express their minimum as an order value in the quote currency (Alpaca $1
-         fractional minimum; Hyperliquid's 10 USDC spot floor); resolved from the venue's
-         oracle adapter at strategy init. The only sell-placement floor: sells are not
-         floored at [cached_venue_min_qty] (accrual sells sell_mult x qty and residual
+         fractional minimum; Hyperliquid's 10 USDC spot/perp floor); resolved from the
+         venue's oracle adapter at strategy init. The only sell-placement floor: sells are
+         not floored at [cached_venue_min_qty] (accrual sells sell_mult x qty and residual
          inventory size below it legitimately). *)
   ; mutable exchange_reserved_atomic : float Atomic.t option
   ; processed_fills : (string, unit) Hashtbl.t

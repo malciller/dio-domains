@@ -475,6 +475,35 @@ let test_inventory_formula () =
     (q ~free:0.0 ~total:5.0 ~open_sell_base:5.0)
 ;;
 
+let test_inventory_only_hedge_venue_leg () =
+  (* A balance-only inventory leg sitting on the hedge venue shares the controller's
+     exchange/symbol. It must still be classified as inventory-only (balances section),
+     not as an active strategy: the predicate follows the leg's own [ol_has_grid]. *)
+  let json =
+    Yojson.Basic.from_string
+      {|{"trading":[
+        {"symbol":"ETH/USD","exchange":"kraken","strategy":"jacobs_ladder","overlay":{
+          "strategy":"carry_overlay","exchange":"hyperliquid",
+          "params":{"start_ratio_pct":40,"max_ratio_pct":75}}},
+        {"symbol":"ETH/USDC","exchange":"hyperliquid","overlay":{
+          "strategy":"carry_overlay","exchange":"hyperliquid",
+          "params":{"start_ratio_pct":40,"max_ratio_pct":75}}}]}|}
+  in
+  Dio_engine.Config.parse_overlays json;
+  Alcotest.(check bool)
+    "kraken grid is a strategy"
+    false
+    (Dio_engine.Config.is_inventory_only ~exchange:"kraken" ~symbol:"ETH/USD");
+  Alcotest.(check bool)
+    "hl spot leg is inventory-only"
+    true
+    (Dio_engine.Config.is_inventory_only ~exchange:"hyperliquid" ~symbol:"ETH/USDC");
+  Alcotest.(check bool)
+    "unconfigured symbol is not a leg"
+    false
+    (Dio_engine.Config.is_inventory_only ~exchange:"hyperliquid" ~symbol:"BTC/USDC")
+;;
+
 let () =
   Alcotest.run
     "Config"
@@ -517,6 +546,10 @@ let () =
             `Quick
             test_domain_assets_spawns_overlay_only
         ; Alcotest.test_case "inventory formula" `Quick test_inventory_formula
+        ; Alcotest.test_case
+            "hedge-venue inventory leg is balance-only"
+            `Quick
+            test_inventory_only_hedge_venue_leg
         ] )
     ; "flow_log", [ Alcotest.test_case "parse section" `Quick test_parse_flow_log_config ]
     ; ( "oracle"

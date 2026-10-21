@@ -769,15 +769,27 @@ let build_snapshot () =
           Some tc))
       (config.trading @ domains)
   in
-  (* An entry with no grid and no controller of its own is a pure inventory leg: it
-     belongs in the balances section, not the active/paused strategy rows. A synthetic
-     controller domain (Carry) stays in the active section. *)
+  (* Only an entry that runs a grid is an active/paused strategy row. Everything else is
+     either a real balance-only inventory leg (for example Kraken BTC/USD feeding the HL
+     BTC controller, or HL ETH/USDC) or a synthesized overlay-only controller domain with
+     no market of its own (XMR/USDC, ADA/USDC). Neither belongs in the strategy rows: the
+     balance legs render under "balances", and the synthesized controllers are the perp
+     leg of a grid that already has its own row, so their P&L is shown on that grid's row
+     via [perp] below. *)
   let is_inventory_only (tc : Dio_engine.Config.trading_config) =
     String.equal tc.strategy ""
-    && Option.is_none
-         (Dio_engine.Config.get_overlay_controller
-            ~exchange:tc.exchange
-            ~symbol:tc.symbol)
+  in
+  (* The controller a leg feeds, keyed by the leg's (venue, symbol) rather than by the
+     controller's hedge venue. [get_overlay_controller] keys on the controller's hedge
+     venue/coin, so it never matches a Kraken leg hedged on Hyperliquid. *)
+  let controller_for_leg (tc : Dio_engine.Config.trading_config) =
+    List.find_opt
+      (fun (c : Dio_engine.Config.overlay_controller) ->
+        List.exists
+          (fun (l : Dio_engine.Config.overlay_leg) ->
+            String.equal l.ol_exchange tc.exchange && String.equal l.ol_symbol tc.symbol)
+          c.oc_legs)
+      (Dio_engine.Config.get_overlay_controllers ())
   in
   let strategy_assets =
     List.filter (fun tc -> not (is_inventory_only tc)) dashboard_assets
@@ -785,15 +797,12 @@ let build_snapshot () =
   let strategies =
     List.map
       (fun (tc : Dio_engine.Config.trading_config) ->
+        let overlay = controller_for_leg tc in
         let strategy_json =
           match tc.strategy with
           | "Ladder" | "jacobs_ladder" -> json_of_grid_strategy tc.exchange tc.symbol
           | "" ->
-            (match
-               Dio_engine.Config.get_overlay_controller
-                 ~exchange:tc.exchange
-                 ~symbol:tc.symbol
-             with
+            (match overlay with
              | Some _ -> `Assoc [ "type", `String "Carry" ]
              | None -> `Assoc [ "type", `String "Inventory" ])
           | other -> `Assoc [ "type", `String other ]
@@ -802,12 +811,20 @@ let build_snapshot () =
         let market_json =
           json_of_market_data tc.exchange tc.symbol base_asset quote_currency
         in
+        (* A leg's perp book lives on the controller's hedge venue, not on the leg's own
+           venue. Without this a Kraken grid hedged on Hyperliquid reports a null perp and
+           the row shows no PERP PNL even though the controller holds the short. *)
+        let perp_exchange, perp_coin =
+          match overlay with
+          | Some c -> c.oc_hedge_exchange, c.oc_hedge_coin
+          | None -> tc.exchange, base_asset
+        in
         ( tc.symbol
         , `Assoc
             [ "exchange", `String tc.exchange
             ; "strategy", strategy_json
             ; "market", market_json
-            ; "perp", json_of_perp ~exchange:tc.exchange ~coin:base_asset
+            ; "perp", json_of_perp ~exchange:perp_exchange ~coin:perp_coin
             ; "oracle", oracle_of tc.symbol
             ; "qty", `String tc.qty
             ; "grid_interval_lo", `Float (fst tc.grid_interval)

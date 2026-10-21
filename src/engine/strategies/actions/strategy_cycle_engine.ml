@@ -705,7 +705,15 @@ let market_facts c (t : Strategy_runtime.t) =
       Slots.usdc_free
       (try Ex.get_tradeable_balance ~asset:"USDC" with
        | _ -> 0.0);
-    (match Ex.get_top_of_book ~symbol:base with
+    (* A perp l2Book can be keyed by the bare coin (the usual case) or, for a
+       cross-venue controller whose symbol has no matching spot pair, by the
+       controller's pair. Try the coin first, then the domain symbol, so an overlay
+       on a perp like XMR/ADA still sees a top of book. *)
+    (match
+       (match Ex.get_top_of_book ~symbol:base with
+        | Some _ as r -> r
+        | None -> Ex.get_top_of_book ~symbol)
+     with
      | Some (bid, _, ask, _) ->
        setf Slots.bid bid;
        setf Slots.ask ask
@@ -750,17 +758,20 @@ let perp_coin symbol =
 
 (** Generic overlay shadow switch. Set [DIO_OVERLAY_DRY_RUN=1] to log intended overlay
     orders/reservations without pushing or mutating state. The primary strategy is
-    unaffected. *)
+    unaffected.
+
+    Resolved once at module load, not in a [lazy]: every asset domain calls [dry_run] on
+    its own Domain, and OCaml 5's [Lazy.force] is not domain-safe. Concurrent forcing of
+    one shared lazy raised [CamlinternalLazy.Undefined] and crashed the overlay domains. *)
 let overlay_dry_run =
-  lazy
-    (match Sys.getenv_opt "DIO_OVERLAY_DRY_RUN" with
-     | Some v ->
-       let v = String.lowercase_ascii (String.trim v) in
-       String.equal v "1" || String.equal v "true" || String.equal v "yes"
-     | None -> false)
+  match Sys.getenv_opt "DIO_OVERLAY_DRY_RUN" with
+  | Some v ->
+    let v = String.lowercase_ascii (String.trim v) in
+    String.equal v "1" || String.equal v "true" || String.equal v "yes"
+  | None -> false
 ;;
 
-let dry_run () = Lazy.force overlay_dry_run
+let dry_run () = overlay_dry_run
 
 (** In-flight dedupe key for an overlay placement.
 
@@ -801,6 +812,24 @@ let order_place
       | None ->
         if String.equal market "perp" then perp_coin asset.symbol else asset.symbol
     in
+    let min_notional = Strategy_venue.get_min_notional_val instrument asset.exchange in
+    (* The venue rounds size DOWN to the instrument's lot, so a quantity sized at exactly
+       the floor can arrive below it (SOL perp lot 0.01 vs spot 0.001). Only when that
+       floor would fall under the venue minimum do we bump the request up to the next lot;
+       otherwise the requested size is left untouched so the venue's own rounding is what
+       the strategy asked for. A reduce-only close is left exact: Hyperliquid exempts an
+       exact close from the minimum, and bumping it could cross into the opposite side. *)
+    let qty =
+      if reduce_only
+      then qty
+      else (
+        let floor_qty = Jac.round_qty qty instrument asset.exchange in
+        match price with
+        | Some p when Float.is_finite p && p > 0.0 && min_notional > 0.0
+                      && floor_qty *. p < min_notional ->
+          Jac.round_qty_up qty instrument asset.exchange
+        | _ -> qty)
+    in
     if (not (Float.is_finite qty)) || qty <= 0.0
     then
       Logging.warn_f
@@ -814,21 +843,19 @@ let order_place
         then Strategy_common.Sell
         else Strategy_common.Buy
       in
-      (* The overlay's perp instrument is the bare coin, but Hyperliquid's 10 USDC minimum
-         applies to perps as well as spot. Query the floor with the domain's spot pair so
-         a perp top-up below it is skipped instead of sent and rejected. The strategy's
-         ledger/accounting action is a separate step and is intentionally retained when
-         the venue placement is skipped: a later, larger spot buy can realise the reserved
-         base. *)
-      let min_notional =
-        Strategy_venue.get_min_notional_val asset.symbol asset.exchange
-      in
+      (* Hyperliquid's $10 floor applies to perps as well as spot. `qty` above is the size
+         the venue will accept: untouched when its lot rounding already clears the floor,
+         bumped one lot when it would not. A reduce-only close is exempt by the venue's
+         exact-close rule. The strategy's ledger/accounting action is a separate step and
+         is intentionally retained when the venue placement is skipped: a later, larger
+         spot buy can realise the reserved base. *)
       let requested_notional =
         match price with
         | Some p when Float.is_finite p -> qty *. p
         | _ -> 0.0
       in
-      if min_notional > 0.0
+      if (not reduce_only)
+         && min_notional > 0.0
          && requested_notional > 0.0
          && requested_notional < min_notional
       then
@@ -976,11 +1003,7 @@ let order_replace
         if String.equal market "perp" then perp_coin asset.symbol else asset.symbol
     in
     let min_qty = Strategy_venue.get_qty_min_val instrument asset.exchange in
-    if (not (Float.is_finite qty))
-       || qty < 0.0
-       || (qty > 0.0 && min_qty > 0.0 && qty < min_qty)
-       || (not (Float.is_finite px))
-       || px <= 0.0
+    if (not (Float.is_finite qty)) || qty < 0.0 || (not (Float.is_finite px)) || px <= 0.0
     then
       Logging.debug_f
         ~section
@@ -1056,13 +1079,25 @@ let order_replace
         | None -> []
       in
       (* The venue floor applies to the order's total size, not the remaining size on an
-         amend. Use the spot pair for the lookup so the perp instrument (bare coin) still
-         gets Hyperliquid's 10 USDC minimum. *)
-      let min_notional =
-        Strategy_venue.get_min_notional_val asset.symbol asset.exchange
+         amend. `amend_total` bumps that total up one lot only when the venue's own
+         round-down would fall under the $10 floor; otherwise the requested total is
+         unchanged. A reduce-only close stays exact (venue exact-close exemption). *)
+      let min_notional = Strategy_venue.get_min_notional_val instrument asset.exchange in
+      let amend_total (o : Dio_exchange.Exchange_intf.Types.open_order) =
+        let total = o.cum_qty +. qty in
+        if reduce_only
+        then total
+        else (
+          let floor_total = Jac.round_qty total instrument asset.exchange in
+          if min_notional > 0.0 && floor_total *. rounded < min_notional
+          then Jac.round_qty_up total instrument asset.exchange
+          else total)
       in
       let below_min_on_amend (o : Dio_exchange.Exchange_intf.Types.open_order) =
-        min_notional > 0.0 && (o.cum_qty +. qty) *. rounded < min_notional
+        (not reduce_only) && min_notional > 0.0 && amend_total o *. rounded < min_notional
+      in
+      let below_min_qty_on_amend (o : Dio_exchange.Exchange_intf.Types.open_order) =
+        min_qty > 0.0 && amend_total o < min_qty
       in
       let same_price (o : Dio_exchange.Exchange_intf.Types.open_order) =
         match o.limit_price with
@@ -1070,7 +1105,7 @@ let order_replace
         | None -> false
       in
       let same_qty (o : Dio_exchange.Exchange_intf.Types.open_order) =
-        Float.abs (o.remaining_qty -. qty) <= 1e-9
+        Float.abs (o.remaining_qty -. Float.max 0.0 (amend_total o -. o.cum_qty)) <= 1e-9
       in
       let cancel_one
         ?(reason = "target reached")
@@ -1114,14 +1149,23 @@ let order_replace
              < %.4f; skipping venue placement (ledger/accounting update retained)"
             (Strategy_common.string_of_order_side order_side)
             instrument
-            (o.cum_qty +. qty)
+            (amend_total o)
             rounded
-            ((o.cum_qty +. qty) *. rounded)
+            (amend_total o *. rounded)
             min_notional
+        | o :: _ when below_min_qty_on_amend o ->
+          Logging.info_f
+            ~section
+            "Overlay amend below venue minimum quantity: %s %s total %.8g < %.8g; \
+             skipping venue placement (ledger/accounting update retained)"
+            (Strategy_common.string_of_order_side order_side)
+            instrument
+            (amend_total o)
+            min_qty
         | o :: _ ->
           (* Amend the total size, preserving the already-filled part. The caller passes
              the desired remaining quantity. *)
-          let total_qty = o.cum_qty +. qty in
+          let total_qty = amend_total o in
           if dry_run ()
           then
             Logging.info_f

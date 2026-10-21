@@ -158,13 +158,16 @@ let test_windows_to_series_ascending () =
 
 let test_venue_contract () =
   let open Hyperliquid.Hyperliquid_oracle in
-  (* Hyperliquid spot enforces MinTradeSpotNtl = 10 USDC; perp/venus coins (slash-less
-     symbols) are not notional-constrained. *)
+  (* Hyperliquid enforces MinTradeSpotNtl = 10 USDC on spot and MinTradeNtl = $10 on
+     perps; only an exact reduce-only close is exempt. *)
   Alcotest.(check (float 1e-9))
     "spot min_notional = 10 USDC"
     10.0
     (min_notional ~symbol:"BTC/USDC");
-  Alcotest.(check (float 1e-9)) "perp min_notional = 0" 0.0 (min_notional ~symbol:"BTC");
+  Alcotest.(check (float 1e-9))
+    "perp min_notional = $10"
+    10.0
+    (min_notional ~symbol:"BTC");
   Alcotest.(check string) "default quote USDC" "USDC" default_quote;
   (* Cold start: no spotState has landed, so there is no live snapshot and the runtime
      falls back to REST rather than sizing against a fabricated zero. *)
