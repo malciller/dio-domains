@@ -7161,7 +7161,28 @@ let test_venue_round_qty_lot_epsilon () =
   Alcotest.(check (float 1e-9))
     "venue round_qty floors a sub-lot fraction"
     0.00034
-    (Dio_strategies.Strategy_venue.round_qty 0.000349 "VQ_BTC/USDC" "hyperliquid")
+    (Dio_strategies.Strategy_venue.round_qty 0.000349 "VQ_BTC/USDC" "hyperliquid");
+  (* Opens/adds round UP to the venue lot so the placed notional clears the $10 floor.
+     This is the SOL perp case: szDecimals = 2, lot 0.01, and $10 / 108.165 = 0.09245
+     rounds up to 0.10 SOL = $10.82. Rounding down would place 0.09 = $9.73 and the venue
+     would reject it with MinTradeNtl. *)
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol:"VQ_SOL" ~sz_decimals:2;
+  Alcotest.(check (float 1e-9))
+    "venue round_qty_up keeps an on-lot quantity"
+    0.0003
+    (Dio_strategies.Strategy_venue.round_qty_up 0.0003 "VQ_BTC/USDC" "hyperliquid");
+  Alcotest.(check (float 1e-9))
+    "venue round_qty_up ceils a sub-lot fraction"
+    0.00035
+    (Dio_strategies.Strategy_venue.round_qty_up 0.000349 "VQ_BTC/USDC" "hyperliquid");
+  let sol_min =
+    Dio_strategies.Strategy_venue.round_qty_up (10.0 /. 108.165) "VQ_SOL" "hyperliquid"
+  in
+  Alcotest.(check (float 1e-9)) "SOL perp floor rounds up to its 0.01 lot" 0.1 sol_min;
+  Alcotest.(check bool)
+    "SOL perp floor is at least $10 after venue rounding"
+    true
+    (sol_min *. 108.165 >= 10.0 -. 1e-9)
 ;;
 
 let () =

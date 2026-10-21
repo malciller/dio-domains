@@ -204,7 +204,7 @@ let () = ignore Alpaca.Module.Alpaca_impl.name
 - Spot and perpetuals, with EIP-712 structured-data signing (`hyperliquid_signer.ml`).
 - Live tradeable balance comes from the WebSocket store (`webData2` / `spotState`). Perp clearinghouse USDC (`perp/account`) and delegated stake (`staking/*`) live in separate, excluded wallets, so the store's spot view matches REST `spotClearinghouseState` (spot capital only, hold-netted). The oracle serves `live_balances` from it, and `fetch_balances` (REST) remains the cold-start fallback for the brief window before the first `spotState` frame.
 - `default_fees`: for spot symbols (containing `/`) `0.0` maker / `0.001` taker; for perps `0.0002` / `0.0005`. Live fees via `/info` with `userFees`.
-- `default_quote`: `USDC`. `min_notional`: `10.0` for spot symbols containing `/`, otherwise `0.0`.
+- `default_quote`: `USDC`. `min_notional`: `10.0` for spot and perps alike (`MinTradeNtl` / `MinTradeSpotNtl`); an exact reduce-only close is exempt.
 - Oracle adapter: `/info` with `candleSnapshot` at interval `1d`, resolving spot versus perp through `spotMeta`. A `/` symbol with no matching Hyperliquid spot pair returns no bars (the asset is inactive) and is never silently substituted with perpetual data.
 - The executions feed maintains an order-id-to-symbol index (hashtable plus bounded FIFO queue) so fills can be routed when the venue omits the symbol.
 

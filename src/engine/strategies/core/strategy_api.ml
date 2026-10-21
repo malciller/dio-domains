@@ -67,6 +67,7 @@ let get_price_increment = Strategy_venue.get_price_increment
 let get_qty_increment_val = Strategy_venue.get_qty_increment_val
 let get_min_notional_val = Strategy_venue.get_min_notional_val
 let round_qty = Strategy_venue.round_qty
+let round_qty_up = Strategy_venue.round_qty_up
 let venue_lot_qty = Strategy_venue.venue_lot_qty
 let parse_config_float = Strategy_venue.parse_config_float
 let get_min_move_threshold = Strategy_venue.get_min_move_threshold

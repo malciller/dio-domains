@@ -489,10 +489,13 @@ let live_balances () : (string * float * float) list option =
 
 let default_quote = "USDC"
 
-(** Hyperliquid spot enforces a 10 USDC MinTradeSpotNtl floor on order notional; perp and
-    equity-quoted symbols are not notional-constrained in this model. [symbol] carries a
-    '/' for spot pairs (e.g. "BTC/USDC"); slash-less symbols are perp/futures. *)
-let min_notional ~symbol = if String.contains symbol '/' then 10.0 else 0.0
+(** Hyperliquid enforces a $10 minimum order value on BOTH books: [MinTradeNtl] ("Order
+    must have minimum value of $10") for perps and [MinTradeSpotNtl] ("Order must have
+    minimum value of 10 [quote_token]") for spot. The only exemption is an exact
+    reduce-only close. [symbol] is either a spot pair ("BTC/USDC") or a bare perp coin
+    ("BTC"); both resolve to the same 10-unit floor (the quote is USDC for every perp and
+    for the spot pairs this engine trades). *)
+let min_notional ~symbol:_ = 10.0
 
 (* ---- Instrument metadata ---- *)
 
