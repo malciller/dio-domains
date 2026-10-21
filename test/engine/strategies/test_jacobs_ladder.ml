@@ -2844,6 +2844,47 @@ let test_alpaca_filled_amend_failure_clears_tracking () =
   drain ()
 ;;
 
+(* Regression: "insufficient qty available for order" on Alpaca's fractional
+   cancel-and-replace path is a *replacement placement* rejection - the original order is
+   still resting and holding the shares. Classifying it as order-gone cleared tracking,
+   released the commitment and pushed a cancel, so every cooldown re-issued the same
+   doomed amend (the repeating 403/422 storm). *)
+let test_insufficient_qty_amend_failure_keeps_tracking () =
+  let symbol = "HELDQ/SMH/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.last_buy_order_id <- Some "held-1";
+  state.last_buy_order_price <- Some 639.07;
+  Hashtbl.remove state.amend_cooldowns "held-1";
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Strategy_api.Strategy.handle_order_amendment_failed
+    ~now:100.0
+    symbol
+    "held-1"
+    Dio_strategies.Strategy_common.Buy
+    {|Fallback place_order failed: HTTP 403: {"available":"0.075312","code":40310000,"existing_qty":"4.679856001","held_for_orders":"4.604544001","message":"insufficient qty available for order (requested: 2.015100004, available: 0.075312)"}|};
+  check
+    (option string)
+    "held-qty amend failure keeps the resting order tracked"
+    (Some "held-1")
+    state.last_buy_order_id;
+  (match Hashtbl.find_opt state.amend_cooldowns "held-1" with
+   | Some expiry -> check bool "non-terminal cooldown applied" true (expiry >= 101.5)
+   | None -> failwith "expected an amend cooldown");
+  check
+    bool
+    "held-qty amend failure does not push a redundant cancel"
+    true
+    (Dio_strategies.Strategy_common.LockFreeQueue.read buffer = None);
+  drain ()
+;;
+
 let test_tif_recovery_not_armed_on_insufficient_failed () =
   let symbol = "TIFREC3/HYPE/USDC" in
   let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
@@ -7519,6 +7560,10 @@ let () =
             "Alpaca filled amend failure clears tracking and evicts"
             `Quick
             test_alpaca_filled_amend_failure_clears_tracking
+        ; test_case
+            "held-qty amend failure keeps tracking"
+            `Quick
+            test_insufficient_qty_amend_failure_keeps_tracking
         ; test_case
             "insufficient-balance failure does not arm recovery"
             `Quick

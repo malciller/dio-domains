@@ -78,6 +78,22 @@ let accumulated_balance = platform "accumulated_balance"
 let spot_base_total = platform "spot_base_total"
 let usdc_free = platform "usdc_free"
 let carry_reserved = platform "carry_reserved"
+let min_notional = platform "min_notional"
+let min_liq_reserve = platform "min_liq_reserve"
+
+(* Carry overlay actual-fill facts. Published from the durable carry state, never derived
+   from the trigger mark. *)
+let carry_close_price = platform "carry_close_price"
+let carry_close_kind = platform "carry_close_kind"
+let carry_close_is_recycle = platform "carry_close_is_recycle"
+let carry_close_realized = platform "carry_close_realized"
+let carry_close_realized_total = platform "carry_close_realized_total"
+let carry_close_seq = platform "carry_close_seq"
+let carry_recycle_realized_total = platform "carry_recycle_realized_total"
+let carry_recycle_seq = platform "carry_recycle_seq"
+let carry_spot_price = platform "carry_spot_price"
+let carry_spot_qty = platform "carry_spot_qty"
+let carry_spot_seq = platform "carry_spot_seq"
 
 (* Engine-control flags and branch facts published by the handler. *)
 let engine_continue = platform "engine:continue"

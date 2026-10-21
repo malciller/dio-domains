@@ -253,7 +253,10 @@ let hedger_callbacks : strategy_callbacks =
           order.symbol
           order.qty
           (price_str order)
-          order_id)
+          order_id;
+        Dio_strategies.Strategy_common.bind_carry_order
+          ~dedup_key:order.duplicate_key
+          ~order_id)
   ; on_place_fail =
       (fun order err ->
         Logging.error_f
@@ -263,11 +266,26 @@ let hedger_callbacks : strategy_callbacks =
           order.symbol
           order.qty
           (price_str order)
-          err)
-  ; on_amend_ok = (fun _order _target_id _new_id -> ())
+          err;
+        Dio_strategies.Strategy_common.retire_pending_carry_order
+          ~dedup_key:order.duplicate_key)
+  ; on_amend_ok =
+      (fun order _target_id new_id ->
+        if order.strategy = Dio_strategies.Strategy_common.Carry
+           && order.side = Dio_strategies.Strategy_common.Buy
+           && not (String.equal order.duplicate_key "")
+        then
+          Dio_strategies.Strategy_common.register_carry_order_id
+            ~order_id:new_id
+            ~market:
+              (if String.contains order.symbol '/'
+               then Dio_strategies.Strategy_common.Carry_spot
+               else Dio_strategies.Strategy_common.Carry_perp)
+            ~maker:order.post_only
+            ~kind:order.duplicate_key)
   ; on_amend_skipped = (fun _order _target_id -> ())
   ; on_amend_fail = (fun _order _target_id _err -> ())
-  ; on_cancel_ok = (fun _order _target_id -> ())
+  ; on_cancel_ok = (fun _order _target_order_id -> ())
   ; on_cancel_fail = (fun _order _target_id -> ())
   }
 ;;
@@ -303,27 +321,83 @@ let once_only resolved f () =
   \    ([resolved] unset), setting [resolved] on the way. "]
 ;;
 
+let is_post_only_rejection err =
+  let lower = String.lowercase_ascii err in
+  contains_fragment lower "post only" || contains_fragment lower "post-only"
+;;
+
+(** Fresh maker price for a rejected carry post-only order.
+
+    The strategy prices at the top of book it saw on the book event. By the time the REST
+    placement lands the market can have moved through that price, so HL rejects the
+    post-only order. Re-read the venue book at the rejection and quote one spread away
+    from the new touch: a sell at [ask + spread] and a buy at [bid − spread] remain maker
+    orders with a small cushion for the next move. The retry is driven by the rejection
+    event, not a timer. *)
+let post_only_retry_price (order : strategy_order) =
+  match order.strategy with
+  | Carry when order.post_only ->
+    (match Dio_engine.Order_executor.get_exchange order.exchange with
+     | Error _ -> None
+     | Ok (module Ex) ->
+       (match Ex.get_top_of_book ~symbol:order.symbol with
+        | Some (bid, _, ask, _) when bid > 0.0 && ask > 0.0 ->
+          let spread = Float.max 0.0 (ask -. bid) in
+          let px =
+            match order.side with
+            | Sell -> ask +. spread
+            | Buy -> bid -. spread
+          in
+          if px <= 0.0
+          then None
+          else (
+            let px =
+              try Ex.round_price ~symbol:order.symbol ~price:px with
+              | _ -> px
+            in
+            Some px)
+        | _ -> None))
+  | _ -> None
+;;
+
+let place_request_of_order (order : strategy_order) =
+  { Dio_engine.Order_executor.order_type = order.order_type
+  ; side = side_str order
+  ; quantity = order.qty
+  ; symbol = order.symbol
+  ; limit_price = order.price
+  ; time_in_force = Some order.time_in_force
+  ; post_only = Some order.post_only
+  ; margin = None
+  ; reduce_only = Some order.reduce_only
+  ; order_userref = order.userref
+  ; cl_ord_id = None
+  ; trigger_price = None
+  ; trigger_price_type = None
+  ; display_qty = None
+  ; fee_preference = None
+  ; duplicate_key = order.duplicate_key
+  ; exchange = order.exchange
+  }
+;;
+
+let amend_request_of_order (order : strategy_order) target_order_id =
+  { Dio_engine.Order_executor.order_id = target_order_id
+  ; cl_ord_id = None
+  ; new_quantity = Some order.qty
+  ; new_limit_price = order.price
+  ; limit_price_type = None
+  ; post_only = Some order.post_only
+  ; new_trigger_price = None
+  ; trigger_price_type = None
+  ; new_display_qty = None
+  ; deadline = None
+  ; symbol = Some order.symbol
+  ; exchange = order.exchange
+  }
+;;
+
 let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
-  let order_request =
-    { Dio_engine.Order_executor.order_type = order.order_type
-    ; side = side_str order
-    ; quantity = order.qty
-    ; symbol = order.symbol
-    ; limit_price = order.price
-    ; time_in_force = Some order.time_in_force
-    ; post_only = Some order.post_only
-    ; margin = None
-    ; reduce_only = Some order.reduce_only
-    ; order_userref = order.userref
-    ; cl_ord_id = None
-    ; trigger_price = None
-    ; trigger_price_type = None
-    ; display_qty = None
-    ; fee_preference = None
-    ; duplicate_key = order.duplicate_key
-    ; exchange = order.exchange
-    }
-  in
   Lwt.async (fun () ->
     let __ppx_lwt_0 = Lwt.pause () in
     Lwt.backtrace_bind
@@ -335,29 +409,51 @@ let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
       __ppx_lwt_0
       (fun () ->
         let resolved = Atomic.make false in
+        let rec attempt retries (o : strategy_order) =
+          Dio_engine.Order_executor.place_order
+            ~token:auth_token
+            ~check_duplicate:false
+            (place_request_of_order o)
+          >>= function
+          | Ok result ->
+            once_only
+              resolved
+              (fun () ->
+                Atomic.incr orders_placed;
+                cb.on_place_ok o result.order_id;
+                Lwt.return_unit)
+              ()
+          | Error err ->
+            let retry =
+              if retries < 3 && is_post_only_rejection err
+              then post_only_retry_price o
+              else None
+            in
+            (match retry with
+             | Some px when Some px <> o.price ->
+               Logging.warn_f
+                 ~section
+                 "Carry post-only placement rejected (%s); retrying %s %s %.8f @ %.2f \
+                  (attempt %d/3)"
+                 err
+                 (side_str o)
+                 o.symbol
+                 o.qty
+                 px
+                 (retries + 1);
+               attempt (retries + 1) { o with price = Some px }
+             | _ ->
+               once_only
+                 resolved
+                 (fun () ->
+                   cb.on_place_fail o err;
+                   Lwt.return_unit)
+                 ())
+        in
         Lwt.catch
           (fun () ->
             Lwt.choose
-              [ (Dio_engine.Order_executor.place_order
-                   ~token:auth_token
-                   ~check_duplicate:false
-                   order_request
-                 >>= function
-                 | Ok result ->
-                   once_only
-                     resolved
-                     (fun () ->
-                       Atomic.incr orders_placed;
-                       cb.on_place_ok order result.order_id;
-                       Lwt.return_unit)
-                     ()
-                 | Error err ->
-                   once_only
-                     resolved
-                     (fun () ->
-                       cb.on_place_fail order err;
-                       Lwt.return_unit)
-                     ())
+              [ attempt 0 order
               ; (Lwt_unix.sleep dispatch_deadline_s
                  >>= fun () ->
                  once_only
@@ -393,21 +489,6 @@ let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
 
 let dispatch_amend ~auth_token ~orders_placed ~cb (order : strategy_order) target_order_id
   =
-  let amend_request =
-    { Dio_engine.Order_executor.order_id = target_order_id
-    ; cl_ord_id = None
-    ; new_quantity = Some order.qty
-    ; new_limit_price = order.price
-    ; limit_price_type = None
-    ; post_only = Some order.post_only
-    ; new_trigger_price = None
-    ; trigger_price_type = None
-    ; new_display_qty = None
-    ; deadline = None
-    ; symbol = Some order.symbol
-    ; exchange = order.exchange
-    }
-  in
   Lwt.async (fun () ->
     let __ppx_lwt_0 = Lwt.pause () in
     Lwt.backtrace_bind
@@ -419,48 +500,71 @@ let dispatch_amend ~auth_token ~orders_placed ~cb (order : strategy_order) targe
       __ppx_lwt_0
       (fun () ->
         let resolved = Atomic.make false in
+        let rec attempt retries (o : strategy_order) =
+          Dio_engine.Order_executor.amend_order
+            ~token:auth_token
+            (amend_request_of_order o target_order_id)
+          >>= function
+          | Ok result ->
+            if result.Dio_exchange.Exchange_intf.Types.amend_id = Some "skipped_no_change"
+            then
+              once_only
+                resolved
+                (fun () ->
+                  cb.on_amend_skipped o target_order_id;
+                  Lwt.return_unit)
+                ()
+            else
+              once_only
+                resolved
+                (fun () ->
+                  Atomic.incr orders_placed;
+                  let amend_id_str =
+                    match result.Dio_exchange.Exchange_intf.Types.amend_id with
+                    | Some id -> id
+                    | None -> "none"
+                  in
+                  Logging.debug_f
+                    ~section
+                    "\226\156\147 Order amended (Amend ID: %s)"
+                    amend_id_str;
+                  cb.on_amend_ok
+                    o
+                    target_order_id
+                    result.Dio_exchange.Exchange_intf.Types.new_order_id;
+                  Lwt.return_unit)
+                ()
+          | Error err ->
+            let retry =
+              if retries < 3 && is_post_only_rejection err
+              then post_only_retry_price o
+              else None
+            in
+            (match retry with
+             | Some px when Some px <> o.price ->
+               Logging.warn_f
+                 ~section
+                 "Carry post-only amend rejected (%s); retrying %s %s %.8f @ %.2f \
+                  (attempt %d/3)"
+                 err
+                 (side_str o)
+                 o.symbol
+                 o.qty
+                 px
+                 (retries + 1);
+               attempt (retries + 1) { o with price = Some px }
+             | _ ->
+               once_only
+                 resolved
+                 (fun () ->
+                   cb.on_amend_fail o target_order_id err;
+                   Lwt.return_unit)
+                 ())
+        in
         Lwt.catch
           (fun () ->
             Lwt.choose
-              [ (Dio_engine.Order_executor.amend_order ~token:auth_token amend_request
-                 >>= function
-                 | Ok result ->
-                   if result.Dio_exchange.Exchange_intf.Types.amend_id
-                      = Some "skipped_no_change"
-                   then
-                     once_only
-                       resolved
-                       (fun () ->
-                         cb.on_amend_skipped order target_order_id;
-                         Lwt.return_unit)
-                       ()
-                   else
-                     once_only
-                       resolved
-                       (fun () ->
-                         Atomic.incr orders_placed;
-                         let amend_id_str =
-                           match result.Dio_exchange.Exchange_intf.Types.amend_id with
-                           | Some id -> id
-                           | None -> "none"
-                         in
-                         Logging.debug_f
-                           ~section
-                           "\226\156\147 Order amended (Amend ID: %s)"
-                           amend_id_str;
-                         cb.on_amend_ok
-                           order
-                           target_order_id
-                           result.Dio_exchange.Exchange_intf.Types.new_order_id;
-                         Lwt.return_unit)
-                       ()
-                 | Error err ->
-                   once_only
-                     resolved
-                     (fun () ->
-                       cb.on_amend_fail order target_order_id err;
-                       Lwt.return_unit)
-                     ())
+              [ attempt 0 order
               ; (Lwt_unix.sleep dispatch_deadline_s
                  >>= fun () ->
                  once_only

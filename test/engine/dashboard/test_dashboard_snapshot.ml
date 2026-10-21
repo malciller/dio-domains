@@ -242,6 +242,33 @@ let test_alert_batching () =
   Alcotest.(check int) "distinct line added" 2 (List.length e)
 ;;
 
+let test_alert_modal_wraps_long_tokens () =
+  (* Compact JSON error bodies contain no spaces. Before hard-breaking, such a "word"
+     stretched the modal past the terminal width and pushed the right border off-screen
+     (and wrapped the dashboard underneath into the modal's rows). *)
+  let width = 32 in
+  let msg =
+    "Cancel order failed HTTP 422 for db72db3e: {\"code\":42210000,\"message\":\"order \
+     pending cancel\",\"related_orders\":[\"20701f00-3be1-4ef7\"]}"
+  in
+  let segs = Alerts.wrap_words ~width msg in
+  Alcotest.(check bool) "not empty" true (segs <> []);
+  List.iter
+    (fun seg ->
+      let w = Notty.I.width (Notty.I.string Notty.A.empty seg) in
+      Alcotest.(check bool)
+        (Printf.sprintf "segment %S fits (%d <= %d)" seg w width)
+        true
+        (w <= width))
+    segs;
+  (* Unbroken text must be preserved, not dropped. *)
+  let strip_spaces s =
+    String.to_seq s |> Seq.filter (fun c -> c <> ' ') |> String.of_seq
+  in
+  let joined = String.concat "" segs in
+  Alcotest.(check string) "json body preserved" (strip_spaces msg) (strip_spaces joined)
+;;
+
 let test_alert_modal_renders () =
   let entries =
     [ { Alerts.a_level = "CRITICAL"
@@ -289,6 +316,10 @@ let () =
         ; Alcotest.test_case "log parsing" `Quick test_log_parsing
         ; Alcotest.test_case "alert thresholds" `Quick test_alert_thresholds
         ; Alcotest.test_case "alert batching" `Quick test_alert_batching
+        ; Alcotest.test_case
+            "alert wraps long tokens"
+            `Quick
+            test_alert_modal_wraps_long_tokens
         ; Alcotest.test_case "alert modal renders" `Quick test_alert_modal_renders
         ] )
     ]

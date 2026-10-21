@@ -84,6 +84,24 @@ let test_retry_stops_on_rejection () =
   | Error _ -> ()
 ;;
 
+(* A repeated DELETE against an order that is already cancelling is Alpaca's
+   [{"code":42210000,"message":"order pending cancel"}]. The first cancel was accepted, so
+   the retry is an idempotent success; treating it as an error produced recurring ERROR
+   alerts on every fractional-order amendment. *)
+let test_cancel_pending_classification () =
+  let check name expected body =
+    Alcotest.(check bool) name expected (Alpaca.Rest.is_cancel_pending_response body)
+  in
+  check "pending cancel" true "{\"code\":42210000,\"message\":\"order pending cancel\"}";
+  check "pending_cancel snake case" true "order is pending_cancel";
+  check "uppercase" true "ORDER PENDING CANCEL";
+  check "genuine rejection" false "{\"code\":40310000,\"message\":\"insufficient qty\"}";
+  check
+    "already filled"
+    false
+    "{\"code\":42210000,\"message\":\"order is already filled\"}"
+;;
+
 let () =
   Alcotest.run
     "alpaca_rest"
@@ -98,6 +116,12 @@ let () =
             test_keeps_sub_penny_below_one_dollar
         ; Alcotest.test_case "on-tick pass-through" `Quick test_exact_prices_pass_through
         ; Alcotest.test_case "non-finite pass-through" `Quick test_non_finite_pass_through
+        ] )
+    ; ( "cancel"
+      , [ Alcotest.test_case
+            "pending cancel is idempotent"
+            `Quick
+            test_cancel_pending_classification
         ] )
     ; ( "retry policy"
       , [ Alcotest.test_case "classification" `Quick test_retriable_classification

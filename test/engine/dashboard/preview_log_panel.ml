@@ -85,6 +85,13 @@ let () =
       ; a_message = "fee cache miss for ETH/USD; using default maker fee"
       ; a_count = 7
       }
+    ; { Dashboard_ui.Alerts.a_level = "ERROR"
+      ; a_section = "alpaca_rest"
+      ; a_message =
+          "Cancel order failed HTTP 422 for db72db3e-74e0-4bf2-8edd-28d0d2b82e5b: \
+           {\"code\":42210000,\"message\":\"order pending cancel\"}"
+      ; a_count = 1
+      }
     ]
   in
   let mi = Dashboard_ui.Alerts.render_modal ~target_w:w ~target_h:24 alerts in

@@ -584,12 +584,94 @@ let overlay_strategy_table : (string, string) Hashtbl.t = Hashtbl.create 8
 
 let overlay_key ~exchange ~symbol = exchange ^ "|" ^ symbol
 
+(** Per-asset carry policy. Percentages are whole numbers in config.json (25, 10, 75, 1);
+    [min_liq_mult] is a multiple of the mark (2.5). *)
+type overlay_params =
+  { start_ratio_pct : float
+  ; add_threshold_pct : float
+  ; max_ratio_pct : float
+  ; recycle_profit_pct : float
+  ; min_liq_mult : float
+  }
+
+let default_overlay_params =
+  { start_ratio_pct = 25.0
+  ; add_threshold_pct = 10.0
+  ; max_ratio_pct = 75.0
+  ; recycle_profit_pct = 1.0
+  ; min_liq_mult = 2.5
+  }
+;;
+
+type overlay_entry =
+  { oe_strategy : string
+  ; oe_exchange : string
+  ; oe_symbol : string
+  ; oe_params : overlay_params
+  }
+
+(** Overlay entries in config.json order. The first entry for an exchange owns the
+    portfolio-level liquidation reserve. *)
+let overlay_entries : overlay_entry list ref = ref []
+
 let get_overlay_strategy ~exchange ~symbol =
-  Hashtbl.find_opt overlay_strategy_table (overlay_key ~exchange ~symbol)
+  match Hashtbl.find_opt overlay_strategy_table (overlay_key ~exchange ~symbol) with
+  | Some s -> Some s
+  | None ->
+    List.find_map
+      (fun (e : overlay_entry) ->
+        if String.equal e.oe_exchange exchange && String.equal e.oe_symbol symbol
+        then Some e.oe_strategy
+        else None)
+      !overlay_entries
+;;
+
+let get_overlay_entries ~exchange =
+  List.filter
+    (fun (e : overlay_entry) -> String.equal e.oe_exchange exchange)
+    !overlay_entries
+;;
+
+let get_overlay_params ~exchange ~symbol =
+  match
+    List.find_opt
+      (fun (e : overlay_entry) ->
+        String.equal e.oe_exchange exchange && String.equal e.oe_symbol symbol)
+      !overlay_entries
+  with
+  | Some e -> e.oe_params
+  | None -> default_overlay_params
+;;
+
+(** The first configured overlay for the exchange owns the account-level liquidation
+    reserve. The other overlays reserve zero for the perp collateral. *)
+let is_overlay_owner ~exchange ~symbol =
+  match get_overlay_entries ~exchange with
+  | e :: _ -> String.equal e.oe_symbol symbol
+  | [] -> true
 ;;
 
 let parse_overlays json =
   Hashtbl.reset overlay_strategy_table;
+  overlay_entries := [];
+  let params_of_entry entry =
+    let open Yojson.Basic.Util in
+    let p name default =
+      match member "params" entry with
+      | `Assoc _ as params ->
+        (match member name params with
+         | (`Int _ | `Float _) as v -> Option.value (to_float_opt v) ~default
+         | _ -> default)
+      | _ -> default
+    in
+    { start_ratio_pct = p "start_ratio_pct" default_overlay_params.start_ratio_pct
+    ; add_threshold_pct = p "add_threshold_pct" default_overlay_params.add_threshold_pct
+    ; max_ratio_pct = p "max_ratio_pct" default_overlay_params.max_ratio_pct
+    ; recycle_profit_pct =
+        p "recycle_profit_pct" default_overlay_params.recycle_profit_pct
+    ; min_liq_mult = p "min_liq_mult" default_overlay_params.min_liq_mult
+    }
+  in
   match json |> Yojson.Basic.Util.member "overlays" with
   | `List entries ->
     List.iter
@@ -600,14 +682,23 @@ let parse_overlays json =
           let exchange = entry |> member "exchange" |> to_string in
           let symbol = entry |> member "symbol" |> to_string in
           if strategy <> "" && exchange <> "" && symbol <> ""
-          then
+          then (
+            let params = params_of_entry entry in
             Hashtbl.replace
               overlay_strategy_table
               (overlay_key ~exchange ~symbol)
-              strategy
+              strategy;
+            overlay_entries
+            := { oe_strategy = strategy
+               ; oe_exchange = exchange
+               ; oe_symbol = symbol
+               ; oe_params = params
+               }
+               :: !overlay_entries)
         with
         | _ -> ())
-      entries
+      entries;
+    overlay_entries := List.rev !overlay_entries
   | _ -> ()
 ;;
 

@@ -101,6 +101,62 @@ module Alpaca_impl = struct
     | Error e -> Error e
   ;;
 
+  (** Wait for a cancel to actually settle venue-side before placing its replacement.
+
+      Alpaca's DELETE returns 200 as soon as the cancellation is *accepted*; the order
+      sits in [pending_cancel] and its shares stay in [held_for_orders] until the venue
+      finishes. Placing the replacement immediately therefore races the release and is
+      rejected with HTTP 403 ["insufficient qty available for order"]. Poll the local
+      open-order store (fed by the executions SSE stream, healed every 10s by the REST
+      resync) until the order leaves it. *)
+  let cancel_settle_timeout_s = 15.0
+
+  let cancel_settle_poll_s = 0.2
+
+  type cancel_settle =
+    | Cancel_settled
+    | Cancel_filled of float
+    | Cancel_unsettled
+
+  (** Total filled quantity recorded for [order_id] in the execution stream. Used when the
+      order has already left the open-order store: [None] there means "canceled *or*
+      filled", and a cancel-and-replace must never place the full replacement after a
+      fill. *)
+  let filled_qty_for_order ~symbol ~order_id =
+    let filled = ref 0.0 in
+    ignore
+      (Alpaca_executions.iter_execution_events
+         symbol
+         0
+         (fun (e : Alpaca_executions.execution_event_internal) ->
+            if String.equal e.order_id order_id
+            then filled := Float.max !filled e.filled_qty));
+    !filled
+  ;;
+
+  let wait_for_cancel_settle ~symbol ~order_id =
+    let deadline = Unix.gettimeofday () +. cancel_settle_timeout_s in
+    let rec loop () =
+      match Alpaca_executions.get_open_order symbol order_id with
+      | None ->
+        let filled = filled_qty_for_order ~symbol ~order_id in
+        if filled > 0.0
+        then Lwt.return (Cancel_filled filled)
+        else Lwt.return Cancel_settled
+      | Some (o : Alpaca_executions.open_order_internal) ->
+        (match o.status with
+         | Types.Filled -> Lwt.return (Cancel_filled o.cum_qty)
+         | Types.Canceled | Types.Expired | Types.Rejected ->
+           Alpaca_executions.remove_open_order symbol order_id;
+           Lwt.return Cancel_settled
+         | _ ->
+           if Unix.gettimeofday () >= deadline
+           then Lwt.return Cancel_unsettled
+           else Lwt_unix.sleep cancel_settle_poll_s >>= fun () -> loop ())
+    in
+    loop ()
+  ;;
+
   let amend_order
     ~token:_
     ~order_id
@@ -151,9 +207,7 @@ module Alpaca_impl = struct
          | Sell -> "sell")
         q
         lp;
-      Alpaca_rest.cancel_order order_id
-      >>= function
-      | Ok _ ->
+      let place_replacement () =
         remove_old_order order_id;
         Alpaca_rest.place_order
           ~symbol:sym
@@ -163,15 +217,37 @@ module Alpaca_impl = struct
           ~limit_price:lp
           ?cl_ord_id
           ()
-        >|= (function
-         | Ok res ->
-           Ok
-             { Types.original_order_id = order_id
-             ; new_order_id = res.order_id
-             ; amend_id = Some res.order_id
-             ; cl_ord_id = res.cl_ord_id
-             }
-         | Error e -> Error (Printf.sprintf "Fallback place_order failed: %s" e))
+        >|= function
+        | Ok res ->
+          Ok
+            { Types.original_order_id = order_id
+            ; new_order_id = res.order_id
+            ; amend_id = Some res.order_id
+            ; cl_ord_id = res.cl_ord_id
+            }
+        | Error e -> Error (Printf.sprintf "Fallback place_order failed: %s" e)
+      in
+      Alpaca_rest.cancel_order order_id
+      >>= function
+      | Ok _ ->
+        wait_for_cancel_settle ~symbol:sym ~order_id
+        >>= (function
+         | Cancel_settled -> place_replacement ()
+         | Cancel_filled filled ->
+           (* The old order won the race and filled. Placing the full replacement now
+              would oversell: leave it to the strategy's fill handling. *)
+           Lwt.return
+             (Error
+                (Printf.sprintf
+                   "Fallback cancel raced a fill (%.8f filled); replacement suppressed"
+                   filled))
+         | Cancel_unsettled ->
+           Lwt.return
+             (Error
+                (Printf.sprintf
+                   "Fallback cancel still pending at venue after %.0fs; replacement \
+                    deferred"
+                   cancel_settle_timeout_s)))
       | Error e ->
         Lwt.return (Error (Printf.sprintf "Fallback cancel_order failed: %s" e))
     in

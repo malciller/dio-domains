@@ -63,4 +63,5 @@
   Strategy_event_recorder
   Strategy_equivalence
   Strategy_lsp
-  Strategy_cli))
+  Strategy_cli
+  Carry_runtime))

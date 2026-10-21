@@ -5,6 +5,24 @@ open Alpaca_types
 
 let section = "alpaca_rest"
 
+(** Case-insensitive substring test, used for venue error-body classification. *)
+let contains_substring haystack needle =
+  let h = String.length haystack
+  and n = String.length needle in
+  let rec go i = i + n <= h && (String.sub haystack i n = needle || go (i + 1)) in
+  n = 0 || go 0
+;;
+
+(** Alpaca answers a repeated DELETE for an order whose cancellation is already in flight
+    with HTTP 422 code 42210000, message ["order pending cancel"]. The first cancel was
+    accepted and the venue is working on it, so this is an idempotent success - not a
+    failure. Treating it as an error made every amendment retry of a fractional order
+    raise a spurious ERROR alert. *)
+let is_cancel_pending_response body_str =
+  let body = String.lowercase_ascii body_str in
+  contains_substring body "pending cancel" || contains_substring body "pending_cancel"
+;;
+
 (** True for transport-class failures worth retrying: connection errors and
     request/deadline timeouts. HTTP 4xx venue rejections (and parse errors) are terminal. *)
 let is_retriable_http_exception e =
@@ -399,6 +417,15 @@ let cancel_order order_id =
         if status_code >= 200 && status_code < 300
         then (
           Logging.debug_f ~section "Cancelled Alpaca order %s" order_id;
+          Lwt.return (Ok [ { order_id; cl_ord_id = None } ]))
+        else if status_code = 422 && is_cancel_pending_response body_str
+        then (
+          (* Already cancelling: the venue has the request. Idempotent success. *)
+          Logging.info_f
+            ~section
+            "Cancel already pending for Alpaca order %s (HTTP 422): %s"
+            order_id
+            body_str;
           Lwt.return (Ok [ { order_id; cl_ord_id = None } ]))
         else (
           Logging.error_f
