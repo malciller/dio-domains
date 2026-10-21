@@ -106,6 +106,17 @@ let to_float_opt = function
   | _ -> None
 ;;
 
+(** Normalizes a configured venue name to the canonical lowercase identifier used by the
+    exchange registry. Built-in venue names are case-insensitive in config.json. *)
+let normalize_exchange s = String.lowercase_ascii (String.trim s)
+
+(** Base asset of a spot pair: [BTC/USD] -> [BTC]. *)
+let base_coin_of_symbol symbol =
+  match String.split_on_char '/' symbol with
+  | b :: _ -> b
+  | [] -> symbol
+;;
+
 (** Parses a [latency_spike_report] from its config string. Unknown values warn and fall
     back to internal-only. *)
 let latency_spike_report_of_string s =
@@ -333,7 +344,11 @@ let parse_config json =
   let open Yojson.Basic.Util in
   let symbol = json |> member "symbol" |> to_string in
   let exchange =
-    json |> member "exchange" |> to_string_option |> Option.value ~default:"kraken"
+    json
+    |> member "exchange"
+    |> to_string_option
+    |> Option.value ~default:"kraken"
+    |> normalize_exchange
   in
   let exch_id = Dio_exchange.Exchange_intf.Types.exchange_of_string exchange in
   (* testnet/hedge are venue-limited; accumulation_buffer is valid on every venue (Kraken
@@ -388,7 +403,11 @@ let parse_config json =
          exchange
          symbol;
        exit 1));
-  let strategy = json |> member "strategy" |> to_string in
+  (* An entry without [strategy] is an inventory-only declaration: it contributes a leg to
+     a carry overlay but runs no grid. Its grid fields are therefore optional. *)
+  let strategy =
+    json |> member "strategy" |> to_string_option |> Option.value ~default:""
+  in
   (* The strategy file convention is validated by [read_config] (not here) so the pure
      per-entry parser stays side-effect free for tests and tooling. *)
   (* grid_interval carries the hardened search bounds (gi_min, gi_max) walked by the
@@ -400,7 +419,7 @@ let parse_config json =
   let data_feed = json |> member "data_feed" |> to_string_option in
   { exchange
   ; symbol
-  ; qty = json |> member "qty" |> to_string
+  ; qty = json |> member "qty" |> to_string_option |> Option.value ~default:"0"
   ; grid_interval = parse_grid_interval json exchange symbol
   ; sell_mult =
       json |> member "sell_mult" |> to_string_option |> Option.value ~default:"1.0"
@@ -574,19 +593,27 @@ let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
       }
 ;;
 
-(** Optional [overlay] object inside a "trading" entry. Each is a second strategy file run
-    in the same asset domain as the primary strategy, so an overlay can read the same
-    account/state without spawning a competing domain. The overlay is scoped to the entry
-    that owns it: it inherits that entry's exchange and symbol, so neither has to be
-    repeated. [exchange]/[symbol] may still be written but must match the owning entry.
+let is_hyperliquid exchange = String.equal (normalize_exchange exchange) "hyperliquid"
+
+(** Optional [overlay] object inside a "trading" entry.
+
+    The trading entry is the *inventory leg*: it names the venue/symbol whose held balance
+    is hedged. The overlay names the *hedge controller*: [overlay.exchange] (default: the
+    owning entry) is the perp venue. A controller is keyed by hedge venue + perp coin, so
+    multiple inventory legs (e.g. Kraken BTC and Hyperliquid BTC) attach to one controller
+    and therefore one perp position. This is what prevents two overlays from fighting over
+    the same short.
+
+    [overlay.symbol] is optional and defaults to the owning symbol for same-venue
+    overlays, or [<base>/USDC] on Hyperliquid for cross-venue overlays.
+
+    The hedged quantity is the same whether or not a grid is active: the free spot balance
+    not in pending sell orders, plus the staked balance, excluding auto-earn balances
+    backing pending sells. The grid's [reserved_base] is part of that spot figure; it is
+    not added separately. The configured overlay ratio scales this accumulated balance.
 
     This is deliberately generic: the engine does not know what an overlay does, only that
-    the named file is loaded and cycled after the primary strategy. *)
-let overlay_strategy_table : (string, string) Hashtbl.t = Hashtbl.create 8
-
-let overlay_key ~exchange ~symbol = exchange ^ "|" ^ symbol
-
-(** Permitted keys of a trading entry's optional [overlay] object. *)
+    the named file is loaded and cycled by the controller domain. *)
 let known_overlay_keys = [ "strategy"; "exchange"; "symbol"; "params" ]
 
 (** Permitted keys of the [overlay.params] object. These are specific to the built-in
@@ -630,42 +657,111 @@ let default_overlay_params =
   }
 ;;
 
-type overlay_entry =
-  { oe_strategy : string
-  ; oe_exchange : string
-  ; oe_symbol : string
-  ; oe_params : overlay_params
+(** One inventory source feeding a hedge controller. *)
+type overlay_leg =
+  { ol_strategy : string
+  ; ol_exchange : string (** inventory venue *)
+  ; ol_symbol : string (** inventory symbol *)
+  ; ol_has_grid : bool (** true when the owning entry runs a primary strategy *)
+  ; ol_testnet : bool
   }
 
-(** Overlay entries in config.json order. *)
-let overlay_entries : overlay_entry list ref = ref []
+(** One perp position owner. [oc_legs] are all inventory sources hedged by the same perp. *)
+type overlay_controller =
+  { oc_strategy : string
+  ; oc_hedge_exchange : string
+  ; oc_hedge_symbol : string (** controller domain symbol (spot-pair form) *)
+  ; oc_hedge_coin : string (** perp coin, e.g. [BTC] *)
+  ; oc_params : overlay_params
+  ; oc_legs : overlay_leg list
+  ; oc_testnet : bool
+  ; oc_has_hl_spot_leg : bool
+  (** true when a leg is on Hyperliquid, so recycle base accumulation applies *)
+  }
+
+(** Controllers in config.json first-seen order. *)
+let overlay_controllers : overlay_controller list ref = ref []
+
+(** Legs in config.json order. *)
+let overlay_legs : overlay_leg list ref = ref []
+
+let hedge_key ~exchange ~coin =
+  normalize_exchange exchange ^ "|" ^ String.uppercase_ascii coin
+;;
+
+let controller_key (c : overlay_controller) =
+  hedge_key ~exchange:c.oc_hedge_exchange ~coin:c.oc_hedge_coin
+;;
+
+let get_overlay_controllers () = !overlay_controllers
+
+(** The controller owned by the domain at [(exchange, symbol)]. The domain symbol is the
+    hedge symbol; the key is the perp coin, so [BTC] and [BTC/USDC] resolve identically. *)
+let get_overlay_controller ~exchange ~symbol =
+  let key = hedge_key ~exchange ~coin:(base_coin_of_symbol symbol) in
+  List.find_opt (fun c -> String.equal (controller_key c) key) !overlay_controllers
+;;
+
+let get_overlay_legs ~exchange ~symbol =
+  match get_overlay_controller ~exchange ~symbol with
+  | Some c -> c.oc_legs
+  | None -> []
+;;
+
+let find_leg ~exchange ~symbol =
+  let exchange = normalize_exchange exchange in
+  List.find_opt
+    (fun l -> String.equal l.ol_exchange exchange && String.equal l.ol_symbol symbol)
+    !overlay_legs
+;;
 
 let get_overlay_strategy ~exchange ~symbol =
-  match Hashtbl.find_opt overlay_strategy_table (overlay_key ~exchange ~symbol) with
-  | Some s -> Some s
-  | None ->
-    List.find_map
-      (fun (e : overlay_entry) ->
-        if String.equal e.oe_exchange exchange && String.equal e.oe_symbol symbol
-        then Some e.oe_strategy
-        else None)
-      !overlay_entries
+  Option.map (fun l -> l.ol_strategy) (find_leg ~exchange ~symbol)
 ;;
 
 let get_overlay_params ~exchange ~symbol =
-  match
-    List.find_opt
-      (fun (e : overlay_entry) ->
-        String.equal e.oe_exchange exchange && String.equal e.oe_symbol symbol)
-      !overlay_entries
-  with
-  | Some e -> e.oe_params
-  | None -> default_overlay_params
+  match get_overlay_controller ~exchange ~symbol with
+  | Some c -> c.oc_params
+  | None ->
+    (match find_leg ~exchange ~symbol with
+     | Some l ->
+       (match
+          List.find_opt
+            (fun c ->
+              List.exists
+                (fun x ->
+                  String.equal x.ol_exchange l.ol_exchange
+                  && String.equal x.ol_symbol l.ol_symbol)
+                c.oc_legs)
+            !overlay_controllers
+        with
+        | Some c -> c.oc_params
+        | None -> default_overlay_params)
+     | None -> default_overlay_params)
+;;
+
+(** True for a [trading] entry that only feeds a carry overlay and runs no grid. *)
+let is_inventory_only ~exchange ~symbol =
+  match find_leg ~exchange ~symbol with
+  | Some l -> not l.ol_has_grid
+  | None -> false
+;;
+
+let params_equal a b =
+  let eq x y = Float.abs (x -. y) <= 1e-9 in
+  eq a.start_ratio_pct b.start_ratio_pct
+  && eq a.add_threshold_pct b.add_threshold_pct
+  && eq a.max_ratio_pct b.max_ratio_pct
+  && eq a.recycle_profit_pct b.recycle_profit_pct
+  && eq a.recycle_base_share_pct b.recycle_base_share_pct
+  && eq a.min_entry_margin_ratio b.min_entry_margin_ratio
+  && eq a.min_liq_mult b.min_liq_mult
+  && eq a.leverage b.leverage
 ;;
 
 let parse_overlays json =
-  Hashtbl.reset overlay_strategy_table;
-  overlay_entries := [];
+  overlay_controllers := [];
+  overlay_legs := [];
   let open Yojson.Basic.Util in
   let params_of_overlay overlay =
     let p name default =
@@ -689,45 +785,112 @@ let parse_overlays json =
     ; leverage = p "leverage" default_overlay_params.leverage
     }
   in
-  let register ~exchange ~symbol overlay =
+  let controllers = ref [] in
+  let find_controller ~exchange ~coin =
+    let key = hedge_key ~exchange ~coin in
+    List.find_opt (fun c -> String.equal (controller_key c) key) !controllers
+  in
+  let register_leg ~owner_exchange ~owner_symbol ~owner_strategy ~owner_testnet overlay =
     let strategy =
       overlay |> member "strategy" |> to_string_option |> Option.value ~default:""
     in
-    (* The overlay always runs in the owning entry's domain; repeating the routed
-       exchange/symbol is allowed but a mismatch would bind nothing, so reject it. *)
-    (match overlay |> member "exchange" |> to_string_option with
-     | Some declared when not (String.equal declared exchange) ->
-       Logging.critical_f
-         ~section
-         "Overlay for %s/%s declares exchange '%s'; an overlay runs on the exchange of \
-          the trading entry that owns it"
-         exchange
-         symbol
-         declared;
-       exit 1
-     | _ -> ());
-    (match overlay |> member "symbol" |> to_string_option with
-     | Some declared when not (String.equal declared symbol) ->
-       Logging.critical_f
-         ~section
-         "Overlay for %s/%s declares symbol '%s'; drop the overlay's \"symbol\" key to \
-          inherit it from the owning trading entry"
-         exchange
-         symbol
-         declared;
-       exit 1
-     | _ -> ());
     if strategy <> ""
     then (
+      let declared_hedge =
+        overlay
+        |> member "exchange"
+        |> to_string_option
+        |> Option.map normalize_exchange
+        |> Option.value ~default:owner_exchange
+      in
+      let candidate_symbol =
+        match overlay |> member "symbol" |> to_string_option with
+        | Some s -> s
+        | None ->
+          if String.equal declared_hedge owner_exchange
+          then owner_symbol
+          else if is_hyperliquid declared_hedge
+          then base_coin_of_symbol owner_symbol ^ "/USDC"
+          else owner_symbol
+      in
+      let hedge_symbol =
+        if is_hyperliquid declared_hedge && not (String.contains candidate_symbol '/')
+        then candidate_symbol ^ "/USDC"
+        else candidate_symbol
+      in
+      let hedge_coin = base_coin_of_symbol hedge_symbol in
+      let has_grid = owner_strategy <> "" in
       let params = params_of_overlay overlay in
-      Hashtbl.replace overlay_strategy_table (overlay_key ~exchange ~symbol) strategy;
-      overlay_entries
-      := { oe_strategy = strategy
-         ; oe_exchange = exchange
-         ; oe_symbol = symbol
-         ; oe_params = params
-         }
-         :: !overlay_entries)
+      let leg =
+        { ol_strategy = strategy
+        ; ol_exchange = owner_exchange
+        ; ol_symbol = owner_symbol
+        ; ol_has_grid = has_grid
+        ; ol_testnet = owner_testnet
+        }
+      in
+      (match find_leg ~exchange:owner_exchange ~symbol:owner_symbol with
+       | Some _ ->
+         Logging.critical_f
+           ~section
+           "Duplicate carry inventory leg %s/%s: each venue/asset may feed only one \
+            hedge controller"
+           owner_exchange
+           owner_symbol;
+         exit 1
+       | None -> ());
+      overlay_legs := leg :: !overlay_legs;
+      match find_controller ~exchange:declared_hedge ~coin:hedge_coin with
+      | Some c ->
+        if not (String.equal c.oc_strategy strategy)
+        then (
+          Logging.critical_f
+            ~section
+            "Carry controller %s/%s declares strategy '%s' but leg %s/%s declares '%s'; \
+             all legs of one hedge must share one overlay strategy"
+            c.oc_hedge_exchange
+            c.oc_hedge_symbol
+            c.oc_strategy
+            owner_exchange
+            owner_symbol
+            strategy;
+          exit 1);
+        if not (params_equal c.oc_params params)
+        then (
+          Logging.critical_f
+            ~section
+            "Carry controller %s/%s has conflicting params: leg %s/%s differs from the \
+             first leg. Legs of one hedge must share the same params."
+            c.oc_hedge_exchange
+            c.oc_hedge_symbol
+            owner_exchange
+            owner_symbol;
+          exit 1);
+        let updated =
+          { c with
+            oc_legs = c.oc_legs @ [ leg ]
+          ; oc_testnet = c.oc_testnet || owner_testnet
+          ; oc_has_hl_spot_leg = c.oc_has_hl_spot_leg || is_hyperliquid owner_exchange
+          }
+        in
+        controllers
+        := List.map
+             (fun x ->
+               if String.equal (controller_key x) (controller_key c) then updated else x)
+             !controllers
+      | None ->
+        controllers
+        := !controllers
+           @ [ { oc_strategy = strategy
+               ; oc_hedge_exchange = declared_hedge
+               ; oc_hedge_symbol = hedge_symbol
+               ; oc_hedge_coin = hedge_coin
+               ; oc_params = params
+               ; oc_legs = [ leg ]
+               ; oc_testnet = owner_testnet
+               ; oc_has_hl_spot_leg = is_hyperliquid owner_exchange
+               }
+             ])
   in
   let entries =
     match json |> member "trading" with
@@ -736,30 +899,84 @@ let parse_overlays json =
   in
   List.iter
     (fun entry ->
-      try
-        match entry |> member "overlay" with
-        | `Assoc _ as overlay ->
-          let exchange = entry |> member "exchange" |> to_string in
-          let symbol = entry |> member "symbol" |> to_string in
-          if validate_keys
-               ~context:(Printf.sprintf "overlay for %s/%s" exchange symbol)
-               ~allowed:known_overlay_keys
-               overlay
-          then exit 1;
-          (match overlay |> member "params" with
-           | `Assoc _ as params ->
-             if validate_keys
-                  ~context:(Printf.sprintf "overlay params for %s/%s" exchange symbol)
-                  ~allowed:known_overlay_param_keys
-                  params
-             then exit 1
-           | _ -> ());
-          register ~exchange ~symbol overlay
-        | _ -> ()
-      with
+      match entry |> member "overlay" with
+      | `Assoc _ as overlay ->
+        let owner_exchange =
+          entry
+          |> member "exchange"
+          |> to_string_option
+          |> Option.value ~default:"kraken"
+          |> normalize_exchange
+        in
+        let owner_symbol = entry |> member "symbol" |> to_string in
+        let owner_strategy =
+          entry |> member "strategy" |> to_string_option |> Option.value ~default:""
+        in
+        let owner_testnet =
+          entry |> member "testnet" |> to_bool_option |> Option.value ~default:false
+        in
+        if validate_keys
+             ~context:(Printf.sprintf "overlay for %s/%s" owner_exchange owner_symbol)
+             ~allowed:known_overlay_keys
+             overlay
+        then exit 1;
+        (match overlay |> member "params" with
+         | `Assoc _ as params ->
+           if validate_keys
+                ~context:
+                  (Printf.sprintf "overlay params for %s/%s" owner_exchange owner_symbol)
+                ~allowed:known_overlay_param_keys
+                params
+           then exit 1
+         | _ -> ());
+        register_leg ~owner_exchange ~owner_symbol ~owner_strategy ~owner_testnet overlay
       | _ -> ())
     entries;
-  overlay_entries := List.rev !overlay_entries
+  overlay_legs := List.rev !overlay_legs;
+  overlay_controllers := !controllers
+;;
+
+(** Domain assets to spawn: primary-strategy entries plus one controller asset per hedge
+    instrument. Inventory-only entries (no [strategy]) contribute a leg but no domain. A
+    controller whose hedge venue/symbol already has a primary-strategy entry attaches to
+    that existing domain instead of spawning a duplicate. *)
+let domain_assets (trading : trading_config list) : trading_config list =
+  let grid = List.filter (fun (t : trading_config) -> t.strategy <> "") trading in
+  let synthesized =
+    List.filter_map
+      (fun (c : overlay_controller) ->
+        let already =
+          List.exists
+            (fun (t : trading_config) ->
+              String.equal (normalize_exchange t.exchange) c.oc_hedge_exchange
+              && String.equal t.symbol c.oc_hedge_symbol)
+            grid
+        in
+        if already
+        then None
+        else
+          Some
+            { exchange = c.oc_hedge_exchange
+            ; symbol = c.oc_hedge_symbol
+            ; qty = "0"
+            ; grid_interval = 1.0, 1.0
+            ; sell_mult = "1.0"
+            ; min_usd_balance = None
+            ; max_exposure = None
+            ; strategy = ""
+            ; maker_fee = None
+            ; taker_fee = None
+            ; testnet = c.oc_testnet
+            ; hedge = false
+            ; accumulation_buffer = 0.01, 0.01
+            ; data_feed = None
+            ; base_accumulation = true
+            ; sell_levels = false
+            ; cpu_priority = 0
+            })
+      !overlay_controllers
+  in
+  grid @ synthesized
 ;;
 
 let read_config () : config =
@@ -771,7 +988,7 @@ let read_config () : config =
       | Some p -> p
       | None -> "config.json"
     in
-    let json = Yojson.Basic.from_file config_path in
+    let json = Jsonc.from_file config_path in
     let open Yojson.Basic.Util in
     if validate_keys ~context:"top-level" ~allowed:known_top_level_keys json then exit 1;
     let cycle_mod =
@@ -782,68 +999,85 @@ let read_config () : config =
     let gc = parse_gc_config json in
     let oracle = parse_oracle_config json in
     let trading = json |> member "trading" |> to_list |> List.map parse_config in
+    (* Overlay declarations are parsed first: a trading entry without [strategy] is valid
+       only as an inventory leg of a carry overlay. *)
+    parse_overlays json;
     (* Fail fast if any entry's strategy file is missing/invalid/name-mismatched: without
        it the domain starts but binds no strategy and trades nothing. Checked here (engine
        config load) rather than in [parse_config] so the pure parser stays side-effect
        free for tests and tooling. *)
     List.iter
       (fun (t : trading_config) ->
-        match Dio_strategies.Strategy_loader.locate ~name:t.strategy with
-        | None ->
-          Logging.critical_f
-            ~section
-            "Strategy file for %s/%s does not exist (tried strategies/<name>.strategy \
-             and strategies/<name>.json). Strategy files must be deployed alongside \
-             config.json (e.g. /app/strategies); refusing to start with no strategy \
-             bound."
-            t.exchange
-            t.symbol;
-          exit 1
-        | Some path ->
-          (match Dio_strategies.Strategy_loader.parse_file ~path with
-           | Error msg ->
-             Logging.critical_f
-               ~section
-               "Strategy file '%s' for %s/%s is invalid: %s"
-               path
-               t.exchange
-               t.symbol
-               msg;
-             exit 1
-           | Ok file ->
-             if not (String.equal file.name t.strategy)
-             then (
+        if String.equal t.strategy ""
+        then (
+          if not (is_inventory_only ~exchange:t.exchange ~symbol:t.symbol)
+          then (
+            Logging.critical_f
+              ~section
+              "Trading entry %s/%s has no strategy and no carry overlay; it would \
+               neither trade nor hedge. Add a \"strategy\" or an \"overlay\"."
+              t.exchange
+              t.symbol;
+            exit 1))
+        else (
+          match Dio_strategies.Strategy_loader.locate ~name:t.strategy with
+          | None ->
+            Logging.critical_f
+              ~section
+              "Strategy file for %s/%s does not exist (tried strategies/<name>.strategy \
+               and strategies/<name>.json). Strategy files must be deployed alongside \
+               config.json (e.g. /app/strategies); refusing to start with no strategy \
+               bound."
+              t.exchange
+              t.symbol;
+            exit 1
+          | Some path ->
+            (match Dio_strategies.Strategy_loader.parse_file ~path with
+             | Error msg ->
                Logging.critical_f
                  ~section
-                 "Strategy name mismatch for %s/%s: config.json declares '%s' but \
-                  strategy file '%s' declares '%s'"
+                 "Strategy file '%s' for %s/%s is invalid: %s"
+                 path
                  t.exchange
                  t.symbol
-                 t.strategy
-                 path
-                 file.name;
-               exit 1)))
+                 msg;
+               exit 1
+             | Ok file ->
+               if not (String.equal file.name t.strategy)
+               then (
+                 Logging.critical_f
+                   ~section
+                   "Strategy name mismatch for %s/%s: config.json declares '%s' but \
+                    strategy file '%s' declares '%s'"
+                   t.exchange
+                   t.symbol
+                   t.strategy
+                   path
+                   file.name;
+                 exit 1))))
       trading;
-    parse_overlays json;
-    Hashtbl.iter
-      (fun key strategy ->
+    List.iter
+      (fun (c : overlay_controller) ->
+        let strategy = c.oc_strategy in
         match Dio_strategies.Strategy_loader.locate ~name:strategy with
         | None ->
           Logging.critical_f
             ~section
-            "Overlay strategy file for %s does not exist (tried \
+            "Overlay strategy file for %s/%s does not exist (tried \
              strategies/<name>.strategy and strategies/<name>.json). Refusing to start \
              with a half-bound overlay."
-            key;
+            c.oc_hedge_exchange
+            c.oc_hedge_symbol;
           exit 1
         | Some path ->
           (match Dio_strategies.Strategy_loader.parse_file ~path with
            | Error msg ->
              Logging.critical_f
                ~section
-               "Overlay strategy file '%s' for %s is invalid: %s"
+               "Overlay strategy file '%s' for %s/%s is invalid: %s"
                path
-               key
+               c.oc_hedge_exchange
+               c.oc_hedge_symbol
                msg;
              exit 1
            | Ok file ->
@@ -851,14 +1085,15 @@ let read_config () : config =
              then (
                Logging.critical_f
                  ~section
-                 "Overlay strategy name mismatch for %s: config.json declares '%s' but \
-                  strategy file '%s' declares '%s'"
-                 key
+                 "Overlay strategy name mismatch for %s/%s: config.json declares '%s' \
+                  but strategy file '%s' declares '%s'"
+                 c.oc_hedge_exchange
+                 c.oc_hedge_symbol
                  strategy
                  path
                  file.name;
                exit 1)))
-      overlay_strategy_table;
+      (get_overlay_controllers ());
     let fng_check_threshold =
       json |> member "fng_check_threshold" |> to_float_opt |> Option.value ~default:1.5
     in

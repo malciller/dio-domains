@@ -426,14 +426,19 @@ let () =
      Lwt.return (Dio_oracle.Oracle_fees.load_dotenv ())
      >>= fun () ->
      let config = Dio_engine.Config.read_config () in
+     let grid_trading =
+       List.filter
+         (fun (tc : Dio_strategies.Strategy_common.trading_config) -> tc.strategy <> "")
+         config.trading
+     in
      let tcs =
        if args.symbol = ""
-       then config.trading
+       then grid_trading
        else
          List.filter
            (fun (tc : Dio_strategies.Strategy_common.trading_config) ->
              String.lowercase_ascii tc.symbol = String.lowercase_ascii args.symbol)
-           config.trading
+           grid_trading
      in
      if tcs = []
      then Lwt.fail_with (Printf.sprintf "no trading entries match '%s'" args.symbol)

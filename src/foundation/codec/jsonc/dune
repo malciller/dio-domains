@@ -1,0 +1,4 @@
+(library
+ (name jsonc)
+ (public_name dio.jsonc)
+ (libraries dio.yojson))

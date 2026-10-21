@@ -1,3 +1,11 @@
 {
-  "dioStrategy.binary": "./_build/default/bin/main.exe"
+  "dioStrategy.binary": "./_build/default/bin/main.exe",
+  // config.json is read as JSONC by the engine/dashboard. This tells VS Code's
+  // JSON language service to allow comments instead of underlining them as errors.
+  // (Trailing commas are also supported by the loader, but config.json avoids them
+  // so strict-JSON tools stay happy.)
+  "files.associations": {
+    "**/config.json": "jsonc",
+    "**/config.*.json": "jsonc"
+  }
 }

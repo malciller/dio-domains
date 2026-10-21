@@ -670,6 +670,156 @@ let asset_domain_worker
     let wakeup_sync =
       Concurrency.Exchange_wakeup.get_sync_handle asset_with_fees.symbol
     in
+    (* The carry controller owned by this domain, if any. The domain is keyed by the hedge
+       venue/symbol, so a grid domain for the hedge instrument and an overlay-only
+       controller domain resolve the same controller; inventory legs never place perp
+       orders themselves. *)
+    let overlay_controller =
+      Config.get_overlay_controller
+        ~exchange:asset_with_fees.exchange
+        ~symbol:asset_with_fees.symbol
+    in
+    (* The engine startup path is not the CLI/test path that registers the builtin action
+       inventory, so do it here before validating either runtime. Idempotent. *)
+    Dio_strategies.Strategy_actions_builtin.register_all ();
+    (* State the overlay may write accumulation into. A co-located grid reuses its state;
+       an overlay-only controller hydrates/creates its own accumulation entry. *)
+    let overlay_state =
+      match overlay_controller with
+      | None -> None
+      | Some c ->
+        (match cached_grid_state with
+         | Some s -> Some s
+         | None ->
+           let st = Dio_strategies.Strategy_api.get_strategy_state c.oc_hedge_symbol in
+           st.exchange_id <- c.oc_hedge_exchange;
+           st.cached_ecfg
+           <- Dio_strategies.Strategy_api.get_exchange_config c.oc_hedge_exchange;
+           st.cached_round_price
+           <- (fun p -> Ex.round_price ~symbol:c.oc_hedge_symbol ~price:p);
+           st.cached_price_increment
+           <- Option.value
+                (Ex.get_price_increment ~symbol:c.oc_hedge_symbol)
+                ~default:0.01;
+           st.cached_qty_increment
+           <- Option.value (Ex.get_qty_increment ~symbol:c.oc_hedge_symbol) ~default:0.01;
+           st.cached_venue_min_qty
+           <- Option.value (Ex.get_qty_min ~symbol:c.oc_hedge_symbol) ~default:0.01;
+           st.cached_venue_min_notional
+           <- Dio_strategies.Strategy_api.get_min_notional_val
+                c.oc_hedge_symbol
+                c.oc_hedge_exchange;
+           st.persistence_dirty <- false;
+           let persistence_key =
+             Dio_persistence.Base_accumulation_store.key_of
+               ~strategy:c.oc_strategy
+               ~symbol:c.oc_hedge_symbol
+               ~venue:c.oc_hedge_exchange
+           in
+           st.persistence_key <- Some persistence_key;
+           st.base_accumulation_enabled <- true;
+           st.sell_levels_enabled <- false;
+           (* An overlay-only controller has no trading entry, so the normal
+              configured-strategy hydration path does not know its accumulation key. Seed
+              the ledger explicitly so a restart resumes the recycled base. *)
+           let a = Dio_persistence.Base_accumulation_store.load ~key:persistence_key in
+           st.reserved_base <- a.Dio_persistence.Base_accumulation_store.reserved_base;
+           st.accumulated_profit
+           <- a.Dio_persistence.Base_accumulation_store.accumulated_profit;
+           st.maker_fee
+           <- (match asset_with_fees.maker_fee with
+               | Some f -> f
+               | None ->
+                 (match
+                    Dio_strategies.Fee_cache.get_maker_fee
+                      ~exchange:c.oc_hedge_exchange
+                      ~symbol:c.oc_hedge_symbol
+                  with
+                  | Some cached -> cached
+                  | None -> 0.0));
+           Some st)
+    in
+    let overlay_ctx =
+      match overlay_controller with
+      | None -> None
+      | Some _ ->
+        let ctx = Dio_strategies.Strategy_cycle_engine.create () in
+        ctx.cg_symbol <- asset_with_fees.symbol;
+        Some ctx
+    in
+    (* Overlay runtime. It runs independently of the grid, including on a domain spawned
+       only to own the hedge. Params are controller-scoped: every leg of one hedge shares
+       the ladder policy. A controller with no Hyperliquid spot leg recycles 100% quote
+       and places no spot order. *)
+    let overlay_rt =
+      match overlay_controller, overlay_ctx with
+      | Some c, Some ctx ->
+        (match Dio_strategies.Strategy_loader.load ~name:c.oc_strategy with
+         | Error msg ->
+           Logging.critical_f
+             ~section
+             "overlay strategy %s for %s/%s failed to load: %s"
+             c.oc_strategy
+             c.oc_hedge_exchange
+             c.oc_hedge_symbol
+             msg;
+           None
+         | Ok (overlay_path, overlay_file) ->
+           let overlay_diags = Dio_strategies.Strategy_compile.validate overlay_file in
+           if Dio_strategies.Strategy_compile.has_errors overlay_diags
+           then (
+             Logging.critical_f
+               ~section
+               "overlay strategy file %s has errors: %s"
+               overlay_path
+               (Dio_strategies.Strategy_compile.format overlay_diags);
+             None)
+           else (
+             let p = c.oc_params in
+             let ladder = derive_overlay_ladder p in
+             let recycle_base_share =
+               if c.oc_has_hl_spot_leg then p.recycle_base_share_pct /. 100.0 else 0.0
+             in
+             if (not c.oc_has_hl_spot_leg) && p.recycle_base_share_pct > 0.0
+             then
+               Logging.info_f
+                 ~section
+                 "carry controller %s/%s: no Hyperliquid spot leg; recycle is 100%% \
+                  quote (ignoring recycle_base_share_pct=%.1f)"
+                 c.oc_hedge_exchange
+                 c.oc_hedge_symbol
+                 p.recycle_base_share_pct;
+             let params =
+               [ "start_ratio", Dio_strategies.Strategy_expr.V_float ladder.ol_start_ratio
+               ; ( "add_threshold"
+                 , Dio_strategies.Strategy_expr.V_float ladder.ol_add_threshold )
+               ; "add_amount", Dio_strategies.Strategy_expr.V_float ladder.ol_add_amount
+               ; "max_ratio", Dio_strategies.Strategy_expr.V_float ladder.ol_max_ratio
+               ; "num_adds", Dio_strategies.Strategy_expr.V_int ladder.ol_num_adds
+               ; ( "recycle_profit"
+                 , Dio_strategies.Strategy_expr.V_float (p.recycle_profit_pct /. 100.0) )
+               ; ( "recycle_base_share"
+                 , Dio_strategies.Strategy_expr.V_float recycle_base_share )
+               ; ( "min_entry_margin_ratio"
+                 , Dio_strategies.Strategy_expr.V_float p.min_entry_margin_ratio )
+               ; "min_liq_mult", Dio_strategies.Strategy_expr.V_float p.min_liq_mult
+               ]
+             in
+             Logging.info_f
+               ~section
+               "carry controller %s/%s: overlay %s, %d leg(s), spot_accum=%b"
+               c.oc_hedge_exchange
+               c.oc_hedge_symbol
+               overlay_path
+               (List.length c.oc_legs)
+               c.oc_has_hl_spot_leg;
+             Some
+               (Dio_strategies.Strategy_runtime.create
+                  ~handlers:(Config_grid_handlers.handler ctx)
+                  ~params
+                  overlay_file)))
+      | _ -> None
+    in
     (* Config-driven grid runtime (milestone 3, coarse wrapper; default off). When a
        strategy file is bound to the entry, the loop dispatches to the interpreter whose
        handler calls the same reference execute_strategy, so behavior is identical by
@@ -678,10 +828,6 @@ let asset_domain_worker
     let config_grid =
       if is_grid_strategy
       then (
-        (* Register the builtin action inventory so the validator recognizes actions
-           (idempotent; needed because the CLI/test paths that normally register are not
-           on the engine startup path). *)
-        Dio_strategies.Strategy_actions_builtin.register_all ();
         let path =
           match strategy_file_path asset_with_fees with
           | Some p -> p
@@ -703,100 +849,26 @@ let asset_domain_worker
             let ctx = Dio_strategies.Strategy_cycle_engine.create () in
             ctx.cg_symbol <- asset_with_fees.symbol;
             let handlers = Config_grid_handlers.handler ctx in
-            let overlay_rt =
-              match
-                Config.get_overlay_strategy
-                  ~exchange:asset_with_fees.exchange
-                  ~symbol:asset_with_fees.symbol
-              with
-              | None -> None
-              | Some name ->
-                (match Dio_strategies.Strategy_loader.load ~name with
-                 | Error msg ->
-                   Logging.critical_f
-                     ~section
-                     "overlay strategy %s for %s failed to load: %s"
-                     name
-                     asset_with_fees.symbol
-                     msg;
-                   None
-                 | Ok (overlay_path, overlay_file) ->
-                   let overlay_diags =
-                     Dio_strategies.Strategy_compile.validate overlay_file
-                   in
-                   if Dio_strategies.Strategy_compile.has_errors overlay_diags
-                   then (
-                     Logging.critical_f
-                       ~section
-                       "overlay strategy file %s has errors: %s"
-                       overlay_path
-                       (Dio_strategies.Strategy_compile.format overlay_diags);
-                     None)
-                   else (
-                     Logging.info_f
-                       ~section
-                       "strategy: %s overlay %s"
-                       asset_with_fees.symbol
-                       overlay_path;
-                     let p =
-                       Config.get_overlay_params
-                         ~exchange:asset_with_fees.exchange
-                         ~symbol:asset_with_fees.symbol
-                     in
-                     let ladder = derive_overlay_ladder p in
-                     let params =
-                       [ ( "start_ratio"
-                         , Dio_strategies.Strategy_expr.V_float ladder.ol_start_ratio )
-                       ; ( "add_threshold"
-                         , Dio_strategies.Strategy_expr.V_float ladder.ol_add_threshold )
-                       ; ( "add_amount"
-                         , Dio_strategies.Strategy_expr.V_float ladder.ol_add_amount )
-                       ; ( "max_ratio"
-                         , Dio_strategies.Strategy_expr.V_float ladder.ol_max_ratio )
-                       ; "num_adds", Dio_strategies.Strategy_expr.V_int ladder.ol_num_adds
-                       ; ( "recycle_profit"
-                         , Dio_strategies.Strategy_expr.V_float
-                             (p.recycle_profit_pct /. 100.0) )
-                       ; ( "recycle_base_share"
-                         , Dio_strategies.Strategy_expr.V_float
-                             (p.recycle_base_share_pct /. 100.0) )
-                       ; ( "min_entry_margin_ratio"
-                         , Dio_strategies.Strategy_expr.V_float p.min_entry_margin_ratio )
-                       ; ( "min_liq_mult"
-                         , Dio_strategies.Strategy_expr.V_float p.min_liq_mult )
-                       ]
-                     in
-                     Some
-                       (Dio_strategies.Strategy_runtime.create
-                          ~handlers
-                          ~params
-                          overlay_file)))
-            in
             Logging.info_f ~section "strategy: %s running %s" asset_with_fees.symbol path;
-            Some (ctx, Dio_strategies.Strategy_runtime.create ~handlers file, overlay_rt)))
+            Some (ctx, Dio_strategies.Strategy_runtime.create ~handlers file)))
       else None
     in
     (* Durable carry state (trailing reference, recycle state machine, last actual fills).
-       Only present when the domain has an overlay; seeded into the runtime before the
-       first cycle. *)
+       Keyed by the controller (hedge venue/symbol), so every leg shares one state. *)
     let overlay_carry =
-      match config_grid with
-      | Some (_, _, Some _) ->
+      match overlay_rt with
+      | Some _ ->
         Some
           (ref
              (Dio_strategies.Carry_runtime.load
                 ~exchange:asset_with_fees.exchange
                 ~symbol:asset_with_fees.symbol))
-      | _ -> None
+      | None -> None
     in
-    (match config_grid, overlay_carry with
-     | Some (ctx, _, Some ort), Some st ->
+    (match overlay_rt, overlay_ctx, overlay_controller, overlay_carry with
+     | Some ort, Some ctx, Some controller, Some st ->
        Dio_strategies.Carry_runtime.seed ort !st;
-       let p =
-         Config.get_overlay_params
-           ~exchange:asset_with_fees.exchange
-           ~symbol:asset_with_fees.symbol
-       in
+       let p = controller.oc_params in
        (* Seed the leverage used by the fill-time take-profit. The venue only reports a
           position's leverage when a position exists, so a flat account has no value to
           fetch. Prefer the explicit config; otherwise reuse the last value persisted by
@@ -836,19 +908,7 @@ let asset_domain_worker
        if !st.anchor <= 0.0
        then (
          let ladder = derive_overlay_ladder p in
-         let reserved =
-           match cached_grid_state with
-           | Some s -> s.reserved_base
-           | None -> 0.0
-         in
-         let staked =
-           match Exchange.Registry.get asset_with_fees.exchange with
-           | Some (module Ex : Exchange.S) ->
-             (try Ex.get_staked_balance ~asset:base_asset with
-              | _ -> 0.0)
-           | None -> 0.0
-         in
-         let accumulated = reserved +. staked in
+         let accumulated = (Overlay_inventory.aggregate controller).total in
          match
            Dio_exchange.Market_context.get_position
              ~exchange:asset_with_fees.exchange
@@ -879,11 +939,6 @@ let asset_domain_worker
      | _ -> ());
     (* Terminal overlay fills are the only source of the actual close/spot prices used by
        the recycle split. Record the order's cumulative fill once, on its terminal event. *)
-    let overlay_rt =
-      match config_grid with
-      | Some (_, _, ort) -> ort
-      | None -> None
-    in
     let record_overlay_fill
       ~now_exec
       (event : Dio_exchange.Exchange_intf.Types.execution_event)
@@ -978,7 +1033,7 @@ let asset_domain_worker
       ()
       =
       match config_grid with
-      | Some (_, rt, _) ->
+      | Some (_, rt) ->
         ignore
           (Dio_strategies.Strategy_runtime.run_cycle
              rt
@@ -1059,7 +1114,7 @@ let asset_domain_worker
            dispatches directly. The reference handlers lock state.mutex themselves, so
            this runs OUTSIDE the interpreter's book-cycle lock. *)
         match config_grid with
-        | Some (ctx, rt, _) ->
+        | Some (ctx, rt) ->
           let now_ev = Unix.gettimeofday () in
           ctx.cg_state <- cached_grid_state;
           ctx.cg_asset <- !grid_strategy_asset_ref;
@@ -1801,11 +1856,12 @@ let asset_domain_worker
       (* Overlays are event-driven by the domain loop itself: every wakeup is an exchange,
          balance, fill, or oracle event. Run the overlay on each one; its actions are
          idempotent (order replacement no-ops when the resting order already matches). *)
-      (match config_grid with
-       | Some (ctx, _, Some ort) ->
+      (match overlay_ctx, overlay_rt, overlay_controller with
+       | Some ctx, Some ort, Some controller ->
          let now_ov = Unix.gettimeofday () in
+         let inventory = Overlay_inventory.aggregate controller in
          ctx.cg_asset <- Some overlay_asset;
-         ctx.cg_state <- cached_grid_state;
+         ctx.cg_state <- overlay_state;
          ctx.cg_symbol <- asset_with_fees.symbol;
          ctx.cg_price <- !current_price;
          ctx.cg_bid <- !tob_bid;
@@ -1824,17 +1880,13 @@ let asset_domain_worker
          ctx.cg_base_age <- None;
          ctx.cg_gen <- 0;
          ctx.cg_profile <- false;
+         ctx.cg_overlay_accumulated <- inventory.total;
+         ctx.cg_overlay_has_spot_leg <- inventory.has_spot_leg;
+         ctx.cg_overlay_spot_symbol <- inventory.spot_symbol;
          ctx.cg_min_liq_reserve
-         <- (match
-               Config.get_overlay_strategy
-                 ~exchange:asset_with_fees.exchange
-                 ~symbol:asset_with_fees.symbol
-             with
-             | Some _ ->
-               Carry_reserve.compute
-                 ~exchange:asset_with_fees.exchange
-                 ~symbol:asset_with_fees.symbol
-             | None -> 0.0);
+         <- Carry_reserve.compute
+              ~exchange:controller.oc_hedge_exchange
+              ~symbol:controller.oc_hedge_symbol;
          ctx.cg_carry <- Option.map (fun r -> !r) overlay_carry;
          ort.prof_enabled <- false;
          Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
@@ -1854,6 +1906,11 @@ let asset_domain_worker
               r
               ~now:now_ov
           | None -> ());
+         (* An overlay-only controller has no grid cycle to flush accumulation writes. *)
+         (match overlay_state with
+          | Some s when s.Dio_strategies.Strategy_state.persistence_dirty ->
+            Dio_strategies.Strategy_api.Strategy.flush_persistence asset_with_fees.symbol
+          | _ -> ());
          let pbool key =
            match Dio_strategies.Strategy_runtime.get_platform ort key with
            | Dio_strategies.Strategy_expr.V_bool b -> b
@@ -2122,7 +2179,7 @@ let asset_domain_worker
               @ Strategy_replay.snapshot_collections st)
          | _ -> ());
         (match config_grid with
-         | Some (ctx, rt, _) ->
+         | Some (ctx, rt) ->
            (* Config-driven grid (milestone 3): feed the engine context and run the
               strategy file's cycle. The handler calls the reference sub-functions, so
               behavior is identical by construction. The strategy-state mutex is held for
@@ -2341,7 +2398,7 @@ let asset_domain_worker
                  doing strategy work. *)
               let interp =
                 match config_grid with
-                | Some (_, rt, _) ->
+                | Some (_, rt) ->
                   Printf.sprintf
                     " interp[wall=%s guard=%s args=%s cpu=%s miss=%d]"
                     (us (t4 - !t3_strategy))

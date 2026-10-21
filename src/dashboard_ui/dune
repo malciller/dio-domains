@@ -5,6 +5,7 @@
   dio.notty
   dio.notty.unix
   dio.yojson
+  dio.jsonc
   unix
   dio.mtime
   dio.mtime.clock.os

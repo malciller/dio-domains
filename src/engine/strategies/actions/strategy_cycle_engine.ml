@@ -21,6 +21,14 @@ type ctx =
   ; mutable cg_state : Types.strategy_state option
   ; mutable cg_carry : Dio_persistence.Carry_state_store.t option
   ; mutable cg_min_liq_reserve : float
+  (** Aggregate hedgeable inventory across every leg of this controller. [< 0] means "not
+      an overlay controller"; [market_facts] then falls back to the local venue figure. *)
+  ; mutable cg_overlay_accumulated : float
+  (** True when the controller has a Hyperliquid spot leg, so the recycle base buy is
+      active. When false the recycle stays 100% quote. *)
+  ; mutable cg_overlay_has_spot_leg : bool
+  (** Symbol of the Hyperliquid spot leg whose book the recycle buy targets. *)
+  ; mutable cg_overlay_spot_symbol : string
   ; mutable cg_last_leverage : float
   ; mutable cg_price : float
   ; mutable cg_bid : float
@@ -65,6 +73,9 @@ let create () =
   ; cg_state = None
   ; cg_carry = None
   ; cg_min_liq_reserve = 0.0
+  ; cg_overlay_accumulated = -1.0
+  ; cg_overlay_has_spot_leg = false
+  ; cg_overlay_spot_symbol = ""
   ; cg_last_leverage = 0.0
   ; cg_price = nan
   ; cg_bid = nan
@@ -684,7 +695,11 @@ let market_facts c (t : Strategy_runtime.t) =
     let hedge_base =
       if live_base > 0.0 && live_base < ledger_base then live_base else ledger_base
     in
-    setf Slots.accumulated_balance hedge_base;
+    (* A carry controller supplies the aggregate across all inventory legs. Without a
+       controller (plain grid domain) keep the local-venue figure. *)
+    setf
+      Slots.accumulated_balance
+      (if c.cg_overlay_accumulated >= 0.0 then c.cg_overlay_accumulated else hedge_base);
     setf Slots.spot_base_total spot_total;
     setf
       Slots.usdc_free
@@ -697,13 +712,25 @@ let market_facts c (t : Strategy_runtime.t) =
      | None ->
        setf Slots.bid 0.0;
        setf Slots.ask 0.0);
-    (match Ex.get_top_of_book ~symbol with
-     | Some (bid, _, ask, _) ->
-       setf Slots.spot_bid bid;
-       setf Slots.spot_ask ask
-     | None ->
-       setf Slots.spot_bid 0.0;
-       setf Slots.spot_ask 0.0)
+    let overlay_controller = c.cg_overlay_accumulated >= 0.0 in
+    let spot_enabled = (not overlay_controller) || c.cg_overlay_has_spot_leg in
+    let spot_symbol =
+      if overlay_controller && c.cg_overlay_spot_symbol <> ""
+      then c.cg_overlay_spot_symbol
+      else symbol
+    in
+    if spot_enabled
+    then (
+      match Ex.get_top_of_book ~symbol:spot_symbol with
+      | Some (bid, _, ask, _) ->
+        setf Slots.spot_bid bid;
+        setf Slots.spot_ask ask
+      | None ->
+        setf Slots.spot_bid 0.0;
+        setf Slots.spot_ask 0.0)
+    else (
+      setf Slots.spot_bid 0.0;
+      setf Slots.spot_ask 0.0)
   | None ->
     setf Slots.accumulated_balance 0.0;
     setf Slots.spot_base_total 0.0;

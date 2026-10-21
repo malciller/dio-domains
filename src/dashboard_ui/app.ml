@@ -188,7 +188,7 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
     then Alerts.Warn
     else (
       try
-        let j = Yojson.Basic.from_file config_file in
+        let j = Jsonc.from_file config_file in
         match Yojson.Basic.Util.member "alert_level" j with
         | `String s -> Alerts.threshold_of_string s
         | _ -> Alerts.Warn
