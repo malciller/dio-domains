@@ -300,6 +300,33 @@ module InFlightOrders = struct
     exists
   ;;
 
+  (** Entries held longer than [age] seconds. A healthy placement releases its key when
+      the venue ack lands (well under a second), so a key held for seconds is stuck and is
+      silently suppressing retries. Returns [(count, oldest held)] where the oldest is
+      [(key, age_seconds)]. Used by the periodic sweep so a leaked key is reported once
+      per sweep instead of staying invisible until the 60s TTL evicts it. *)
+  let stale ?(age = 30.0) () =
+    let now = Unix.gettimeofday () in
+    let count = ref 0 in
+    let oldest = ref None in
+    for s = 0 to num_shards - 1 do
+      let mutex = shard_mutexes.(s) in
+      Mutex.lock mutex;
+      Hashtbl.iter
+        (fun key ts ->
+          let held = now -. ts in
+          if held > age
+          then (
+            incr count;
+            match !oldest with
+            | Some (_, best) when best >= held -> ()
+            | _ -> oldest := Some (key, held)))
+        registries.(s);
+      Mutex.unlock mutex
+    done;
+    !count, !oldest
+  ;;
+
   (** Return the number of entries currently tracked. *)
   let get_registry_size () =
     let total = ref 0 in

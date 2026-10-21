@@ -251,6 +251,52 @@ let test_perp_orders_classified () =
     (List.exists (fun (id, _) -> String.equal id "4242") changes)
 ;;
 
+let test_amend_replacement_visible () =
+  Hyperliquid.Executions_feed.initialize [ "AMENDX"; "AMENDX/USDC" ];
+  let ids_of orders =
+    List.map (fun (o : Hyperliquid.Executions_feed.open_order) -> o.order_id) orders
+  in
+  (* A resting take-profit as [place_order] injects it on ack. *)
+  Hyperliquid.Executions_feed.inject_order
+    ~symbol:"AMENDX"
+    ~order_id:"tp_old"
+    ~side:Hyperliquid.Executions_feed.Buy
+    ~qty:2.0
+    ~price:100.0
+    ~user_ref:3
+    ();
+  Alcotest.(check bool)
+    "old order visible before the amend"
+    true
+    (List.mem
+       "tp_old"
+       (ids_of (Hyperliquid.Executions_feed.get_perp_open_orders ~coin:"AMENDX")));
+  (* Hyperliquid's modify retires the old oid and creates a new one. [amend_order] must
+     retire the old oid and inject the replacement, otherwise [order.replace]'s
+     open-orders scan comes back empty and places a duplicate reduce-only order. *)
+  Hyperliquid.Executions_feed.remove_open_order ~symbol:"AMENDX" ~order_id:"tp_old";
+  Hyperliquid.Executions_feed.inject_order
+    ~symbol:"AMENDX"
+    ~order_id:"tp_new"
+    ~side:Hyperliquid.Executions_feed.Buy
+    ~qty:2.0
+    ~price:105.0
+    ~user_ref:3
+    ();
+  let perp = Hyperliquid.Executions_feed.get_perp_open_orders ~coin:"AMENDX" in
+  let ids = ids_of perp in
+  Alcotest.(check int) "exactly one live perp order" 1 (List.length perp);
+  Alcotest.(check bool) "replacement visible" true (List.mem "tp_new" ids);
+  Alcotest.(check bool) "retired order gone" false (List.mem "tp_old" ids);
+  match Hyperliquid.Executions_feed.get_open_order "AMENDX" "tp_new" with
+  | Some (o : Hyperliquid.Executions_feed.open_order) ->
+    Alcotest.(check (float 0.000001))
+      "replacement carries the new price"
+      105.0
+      (Option.value o.limit_price ~default:0.0)
+  | None -> Alcotest.fail "replacement order missing from the cache"
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Executions Feed"
@@ -268,6 +314,10 @@ let () =
             test_process_order_terminal_status
         ; Alcotest.test_case "find_order_everywhere" `Quick test_find_order_everywhere
         ; Alcotest.test_case "perp orders classified" `Quick test_perp_orders_classified
+        ; Alcotest.test_case
+            "amend replacement is visible"
+            `Quick
+            test_amend_replacement_visible
         ] )
     ]
 ;;

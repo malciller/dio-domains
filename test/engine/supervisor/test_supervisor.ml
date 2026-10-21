@@ -299,6 +299,74 @@ let test_carry_place_fail_releases_inflight_key () =
     (Dio_strategies.Strategy_common.InFlightOrders.is_in_flight key)
 ;;
 
+let test_overlay_place_skips_while_in_flight () =
+  Dio_strategies.Strategy_actions_builtin.register_all ();
+  ignore (Dio_strategies.Strategy_api.get_pending_orders 32 : _ list);
+  let asset : Dio_strategies.Strategy_state.trading_config =
+    { exchange = "hyperliquid"
+    ; symbol = "TEST/USDC"
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "carry_overlay"
+    ; maker_fee = None
+    ; taker_fee = None
+    ; accumulation_buffer = 0.01
+    ; base_accumulation = false
+    ; sell_levels_persistence = false
+    }
+  in
+  let ctx = Dio_strategies.Strategy_cycle_engine.create () in
+  ctx.cg_asset <- Some asset;
+  ctx.cg_symbol <- asset.symbol;
+  ctx.cg_now <- 1.0;
+  let key = "test:skip|hyperliquid|TEST" in
+  let place () =
+    Dio_strategies.Strategy_cycle_engine.order_place
+      ctx
+      ~symbol:None
+      ~market:"perp"
+      ~side:"sell"
+      ~qty:0.1
+      ~price:(Some 100.0)
+      ~tif:"IOC"
+      ~reduce_only:false
+      ~post_only:false
+      ~dedup_key:"test:skip"
+  in
+  ignore (Dio_strategies.Strategy_common.InFlightOrders.add_in_flight_order key);
+  place ();
+  Alcotest.(check int)
+    "no order pushed while the key is in flight"
+    0
+    (List.length (Dio_strategies.Strategy_api.get_pending_orders 32));
+  ignore (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order key);
+  place ();
+  Alcotest.(check int)
+    "order pushed once the key is released"
+    1
+    (List.length (Dio_strategies.Strategy_api.get_pending_orders 32));
+  ignore (Dio_strategies.Strategy_api.get_pending_orders 32 : _ list);
+  ignore (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order key)
+;;
+
+let test_inflight_stale_detection () =
+  let key = "stale:test|hyperliquid|BTC" in
+  ignore (Dio_strategies.Strategy_common.InFlightOrders.add_in_flight_order key);
+  let fresh, _ = Dio_strategies.Strategy_common.InFlightOrders.stale ~age:3600.0 () in
+  Alcotest.(check int) "fresh key is not stale" 0 fresh;
+  let count, oldest =
+    Dio_strategies.Strategy_common.InFlightOrders.stale ~age:(-1.0) ()
+  in
+  Alcotest.(check int) "inserted key is stale at a negative threshold" 1 count;
+  (match oldest with
+   | Some (k, _) -> Alcotest.(check string) "oldest key reported" key k
+   | None -> Alcotest.fail "expected an oldest held entry");
+  ignore (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order key);
+  let after, _ = Dio_strategies.Strategy_common.InFlightOrders.stale ~age:(-1.0) () in
+  Alcotest.(check int) "removed key is no longer reported" 0 after
+;;
+
 let () =
   Alcotest.run
     "Supervisor"
@@ -352,6 +420,14 @@ let () =
             "carry place failure releases the key"
             `Quick
             test_carry_place_fail_releases_inflight_key
+        ; Alcotest.test_case
+            "overlay place retries are skipped while in flight"
+            `Quick
+            test_overlay_place_skips_while_in_flight
+        ; Alcotest.test_case
+            "stale in-flight keys are detected"
+            `Quick
+            test_inflight_stale_detection
         ] )
     ]
 ;;

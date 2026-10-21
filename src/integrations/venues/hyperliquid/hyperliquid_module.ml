@@ -277,13 +277,30 @@ module Hyperliquid_impl = struct
          >|= (function
           | Ok res ->
             let new_order_id_str = Int64.to_string res.amend_id in
-            (* Do NOT inject the new OID: the old OID persists until the WS cancel
-               arrives, so adding it would show duplicate open orders and trigger spurious
-               cancel-all logic. The inflight_amend counter bridges the REST-to-WS gap.
-               Remove only the old OID on ID change, to block a late WS "open" event from
-               re-adding it. *)
+            (* Hyperliquid replaces the order with a new OID, so the old OID is retired
+               here (which blacklists a late WS "open" event for it) and the replacement
+               is injected with the new price/size. Without the injection the open-orders
+               cache has no entry for this instrument until the WS "open" event lands, and
+               [order.replace] - which matches against that cache - falls through to a
+               fresh Place. That duplicate covers the same reduce-only position, so the
+               venue cancels the amended order with "reduceOnlyCanceled" and every tick of
+               drift cancels and re-creates the take-profit. Mirror [place_order]'s
+               injection so the cache reflects the venue the moment the amend is acked. *)
             if new_order_id_str <> order_id
-            then Hyperliquid_executions_feed.remove_open_order ~symbol:sym ~order_id;
+            then (
+              Hyperliquid_executions_feed.remove_open_order ~symbol:sym ~order_id;
+              Hyperliquid_executions_feed.inject_order
+                ~symbol:sym
+                ~order_id:new_order_id_str
+                ~side:
+                  (if is_buy
+                   then Hyperliquid_executions_feed.Buy
+                   else Hyperliquid_executions_feed.Sell)
+                ~qty:sz_rounded
+                ~price:px_rounded
+                ?user_ref:existing.order_userref
+                ?cl_ord_id:constructed_cl_ord_id
+                ());
             Ok
               { Types.original_order_id = Int64.to_string res.order_id
               ; Types.new_order_id = new_order_id_str

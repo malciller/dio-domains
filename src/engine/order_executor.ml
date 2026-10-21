@@ -623,6 +623,22 @@ let start_periodic_inflight_cleanup () =
                   "Periodic in-flight cleanup: removed %d orders, %d amendments"
                   trimmed1
                   trimmed2;
+              (* A placement key should be released by its ack in well under a second.
+                 Anything held for tens of seconds is wedged and is silently suppressing
+                 every retry for that overlay kind, so surface it once per sweep. *)
+              (match InFlightOrders.stale () with
+               | 0, _ -> ()
+               | count, oldest ->
+                 let detail =
+                   match oldest with
+                   | Some (key, age) -> Printf.sprintf " (oldest %s held %.1fs)" key age
+                   | None -> ""
+                 in
+                 Logging.warn_f
+                   ~section
+                   "In-flight order keys held over 30s: %d%s"
+                   count
+                   detail);
               loop ())
             (fun exn ->
               Logging.error_f
