@@ -21,10 +21,14 @@ let free_base_of ~staked ~pending ~available base =
 ;;
 
 (** Accumulated quantity: inventory not committed to a resting sell. [staked] is part of
-    [base] but non-tradeable, so it is never reduced by a resting sell.
-    @return [staked] + {!free_base_of} *)
+    [base] but non-tradeable, so it is never reduced by a resting sell. The result is
+    clamped to [base]: [staked] is already included in the total holding, so a venue/feed
+    that reports a staking-inclusive [available] figure must not inflate the accumulated
+    quantity above what is actually held.
+    @return [min base (staked + {!free_base_of})] *)
 let accum_qty_of ~staked ~pending ~available base =
-  staked +. free_base_of ~staked ~pending ~available base
+  let qty = staked +. free_base_of ~staked ~pending ~available base in
+  if Float.is_finite base && base > 0.0 then Float.min base qty else qty
 ;;
 
 let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =

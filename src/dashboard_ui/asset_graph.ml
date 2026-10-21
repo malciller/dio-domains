@@ -396,11 +396,6 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
           ; I.string a_dim " │ "
           ; I.string a_label "Accum Qty: "
           ; I.string a_cyan (format_qty accum_qty ^ " " ^ a.asset)
-          ; I.string
-              a_dim
-              (if staked_bal > 0.0
-               then " (incl " ^ format_qty staked_bal ^ " staked)"
-               else "")
           ; I.string a_dim " ("
           ; I.string a_cyan (format_usd accum_val)
           ; I.string a_dim ")"
@@ -543,9 +538,13 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
           let close_item =
             match perp_close_order with
             | Some o ->
+              (* A reduce-only exit cannot exceed the live position. The order feed can
+                 transiently report the pre-fill size after a partial fill or amend, so
+                 cap the display at the position rather than showing a doubled close. *)
+              let close_qty = Float.min o.qty p.abs_qty in
               [ I.string a_dim " │ Close "
               ; I.string a_yellow (format_price o.price)
-              ; I.string a_dim (" x" ^ format_qty o.qty)
+              ; I.string a_dim (" x" ^ format_qty close_qty)
               ]
             | None -> []
           in
@@ -1333,9 +1332,14 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     (* Perp flags name the role of the order relative to the open position: the side that
        reduces it is the exit whose price closes the trade. *)
     let perp_flag_specs by_row is_buy =
+      let is_exit =
+        match perp_opt with
+        | Some p when p.has_position -> p.qty < 0.0 = is_buy
+        | _ -> false
+      in
       let role =
         match perp_opt with
-        | Some p when p.has_position -> if p.qty < 0.0 = is_buy then "CLOSE" else "ADD"
+        | Some p when p.has_position -> if is_exit then "CLOSE" else "ADD"
         | _ -> if is_buy then "BUY" else "SELL"
       in
       Hashtbl.fold
@@ -1344,11 +1348,21 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
           then acc
           else (
             let count = List.length orders in
-            let total_q = List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 orders in
+            let raw_q = List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 orders in
             let avg_p =
               List.fold_left (fun acc (_, p, _) -> acc +. p) 0.0 orders /. float count
             in
-            let count_str = if count > 1 then string_of_int count else "" in
+            (* A reduce-only exit cannot exceed the live position. If restart leftovers
+               have not been cancelled yet, show the position size instead of a doubled
+               close. *)
+            let total_q =
+              match perp_opt with
+              | Some p when is_exit -> Float.min raw_q p.abs_qty
+              | _ -> raw_q
+            in
+            let count_str =
+              if count > 1 && total_q >= raw_q -. 1e-9 then string_of_int count else ""
+            in
             let text = Printf.sprintf "◆P %s%s %.6g %.4g" role count_str avg_p total_q in
             (row, [ a_yellow, text ]) :: acc))
         by_row

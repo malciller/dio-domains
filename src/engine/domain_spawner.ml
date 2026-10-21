@@ -937,6 +937,43 @@ let asset_domain_worker
              ort
          | _ -> ())
      | _ -> ());
+    (* Adopt carry buy orders that survived a restart. The order-id -> kind registry is
+       in-memory, so a new process would otherwise not recognise a resting take-profit or
+       recycle order and would place a second one. The duplicate-cancel path in
+       [order_replace] then removes any extras left by an earlier restart. *)
+    (match overlay_controller with
+     | None -> ()
+     | Some c ->
+       let adopt ~symbol ~market ~kind ~maker =
+         match Ex.get_open_orders ~symbol with
+         | orders ->
+           List.iter
+             (fun (o : Types.open_order) ->
+               if o.user_ref = Some Dio_strategies.Strategy_common.strategy_userref_carry
+                  && o.side = Types.Buy
+                  && (o.status = Types.New || o.status = Types.PartiallyFilled)
+               then
+                 Dio_strategies.Strategy_common.register_carry_order_id
+                   ~order_id:o.order_id
+                   ~market
+                   ~maker
+                   ~kind)
+             orders
+         | exception _ -> ()
+       in
+       let perp_symbol = Config.base_coin_of_symbol c.oc_hedge_symbol in
+       adopt
+         ~symbol:perp_symbol
+         ~market:Dio_strategies.Strategy_common.Carry_perp
+         ~kind:"carry:recycle:close|ro"
+         ~maker:false;
+       if not (String.equal perp_symbol c.oc_hedge_symbol)
+       then
+         adopt
+           ~symbol:c.oc_hedge_symbol
+           ~market:Dio_strategies.Strategy_common.Carry_spot
+           ~kind:"carry:recycle"
+           ~maker:true);
     (* Terminal overlay fills are the only source of the actual close/spot prices used by
        the recycle split. Record the order's cumulative fill once, on its terminal event. *)
     let record_overlay_fill

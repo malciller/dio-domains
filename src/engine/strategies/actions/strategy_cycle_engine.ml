@@ -1043,27 +1043,38 @@ let order_replace
       let same_qty (o : Dio_exchange.Exchange_intf.Types.open_order) =
         Float.abs (o.remaining_qty -. qty) <= 1e-9
       in
+      let cancel_one
+        ?(reason = "target reached")
+        (o : Dio_exchange.Exchange_intf.Types.open_order)
+        =
+        if dry_run ()
+        then
+          Logging.info_f
+            ~section
+            "Overlay DRY RUN: cancel %s %s (%s)"
+            instrument
+            o.order_id
+            reason
+        else (
+          let order =
+            Jac.create_cancel_order
+              o.order_id
+              instrument
+              Strategy_common.Carry
+              asset.exchange
+          in
+          ignore (Jac.push_order ~now:c.cg_now ~manage_state:false order : bool))
+      in
+      (* One live order per overlay kind. A process restart or a cancel+replace race can
+         leave a duplicate; keep the first and cancel the rest so two take-profits cannot
+         both target the same position (the chart then shows one close, not a doubled
+         one). *)
+      (match matching with
+       | _ :: (_ :: _ as extras) when qty > 0.0 ->
+         List.iter (fun o -> cancel_one ~reason:"duplicate" o) extras
+       | _ -> ());
       if qty <= 0.0
-      then
-        List.iter
-          (fun (o : Dio_exchange.Exchange_intf.Types.open_order) ->
-            if dry_run ()
-            then
-              Logging.info_f
-                ~section
-                "Overlay DRY RUN: cancel %s %s (target reached)"
-                instrument
-                o.order_id
-            else (
-              let order =
-                Jac.create_cancel_order
-                  o.order_id
-                  instrument
-                  Strategy_common.Carry
-                  asset.exchange
-              in
-              ignore (Jac.push_order ~now:c.cg_now ~manage_state:false order : bool)))
-          matching
+      then List.iter (fun o -> cancel_one o) matching
       else (
         match matching with
         | o :: _ when same_price o && same_qty o -> ()

@@ -752,12 +752,50 @@ let build_snapshot () =
     | Some j -> j
     | None -> `Null
   in
+  (* Dashboard asset rows: every configured trading entry (including inventory-only carry
+     legs, which have no grid) plus any overlay-only controller domain that has no trading
+     entry of its own. Deduplicate by venue/symbol so a grid that is also a controller
+     appears once. *)
+  let dashboard_assets =
+    let domains = Dio_engine.Config.domain_assets config.trading in
+    let seen = Hashtbl.create 16 in
+    List.filter_map
+      (fun (tc : Dio_engine.Config.trading_config) ->
+        let key = tc.exchange ^ "|" ^ tc.symbol in
+        if Hashtbl.mem seen key
+        then None
+        else (
+          Hashtbl.replace seen key ();
+          Some tc))
+      (config.trading @ domains)
+  in
+  (* An entry with no grid and no controller of its own is a pure inventory leg: it
+     belongs in the balances section, not the active/paused strategy rows. A synthetic
+     controller domain (Carry) stays in the active section. *)
+  let is_inventory_only (tc : Dio_engine.Config.trading_config) =
+    String.equal tc.strategy ""
+    && Option.is_none
+         (Dio_engine.Config.get_overlay_controller
+            ~exchange:tc.exchange
+            ~symbol:tc.symbol)
+  in
+  let strategy_assets =
+    List.filter (fun tc -> not (is_inventory_only tc)) dashboard_assets
+  in
   let strategies =
     List.map
       (fun (tc : Dio_engine.Config.trading_config) ->
         let strategy_json =
           match tc.strategy with
           | "Ladder" | "jacobs_ladder" -> json_of_grid_strategy tc.exchange tc.symbol
+          | "" ->
+            (match
+               Dio_engine.Config.get_overlay_controller
+                 ~exchange:tc.exchange
+                 ~symbol:tc.symbol
+             with
+             | Some _ -> `Assoc [ "type", `String "Carry" ]
+             | None -> `Assoc [ "type", `String "Inventory" ])
           | other -> `Assoc [ "type", `String other ]
         in
         let base_asset, quote_currency = split_symbol tc.symbol in
@@ -778,15 +816,15 @@ let build_snapshot () =
             ; "accumulation_buffer_hi", `Float (snd tc.accumulation_buffer)
             ; "sell_mult", `String tc.sell_mult
             ] ))
-      (* Include overlay-only controller domains, which have no entry in [trading]. *)
-      (Dio_engine.Config.domain_assets config.trading)
+      strategy_assets
   in
   (* Aggregate balances from all registered exchanges, enriched with ticker data and open
-     sell orders. *)
+     sell orders. Inventory-only legs are intentionally absent from [strategy_assets], so
+     their balance rows are not filtered out and appear under "balances". *)
   let configured_symbols =
     List.map
       (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange, tc.symbol)
-      config.trading
+      strategy_assets
   in
   let exchange_names = Exchange.Registry.get_all_names () in
   let all_balances =
