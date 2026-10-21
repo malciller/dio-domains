@@ -469,7 +469,10 @@ let init_trading_engine_sync (config : Dio_engine.Config.config) =
   (try
      Supervisor.start_oracle
        ~config:(Option.value config.oracle ~default:(Oracle_runtime.default_config ()))
-       ~trading:configs_with_fees
+       ~trading:
+         (List.filter
+            (fun (t : Dio_engine.Config.trading_config) -> t.strategy <> "")
+            configs_with_fees)
        ~on_publish:(fun changed_symbols _decisions ->
          (* Signal only the domains whose asset's decision changed this pass; each domain
             blocks on its own per-symbol condition, so unrelated domains are never woken.

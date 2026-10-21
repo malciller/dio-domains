@@ -355,6 +355,126 @@ let test_parse_trading_config_overlay_key () =
   Alcotest.(check string) "strategy" "Ladder" config.strategy
 ;;
 
+let cross_venue_json =
+  {|{"trading":[
+    {"symbol":"BTC/USD","exchange":"Kraken","overlay":{
+      "strategy":"carry_overlay","exchange":"hyperliquid",
+      "params":{"start_ratio_pct":25,"add_threshold_pct":7.5,"max_ratio_pct":75,
+                "recycle_profit_pct":1.5,"recycle_base_share_pct":50,
+                "min_entry_margin_ratio":2.0,"min_liq_mult":2.5,"leverage":10}}}]}|}
+;;
+
+let test_overlay_cross_venue () =
+  let json = Yojson.Basic.from_string cross_venue_json in
+  Dio_engine.Config.parse_overlays json;
+  let c =
+    Dio_engine.Config.get_overlay_controller ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
+  in
+  (match c with
+   | None -> Alcotest.fail "expected a hyperliquid/BTC controller"
+   | Some c ->
+     Alcotest.(check string) "hedge coin" "BTC" c.oc_hedge_coin;
+     Alcotest.(check bool) "no hl spot leg" false c.oc_has_hl_spot_leg;
+     Alcotest.(check int) "one leg" 1 (List.length c.oc_legs);
+     Alcotest.(check bool)
+       "inventory-only kraken leg"
+       true
+       (List.exists
+          (fun (l : Dio_engine.Config.overlay_leg) ->
+            String.equal l.ol_exchange "kraken"
+            && String.equal l.ol_symbol "BTC/USD"
+            && not l.ol_has_grid)
+          c.oc_legs));
+  Alcotest.(check bool)
+    "the inventory leg is not a controller"
+    true
+    (Option.is_none
+       (Dio_engine.Config.get_overlay_controller ~exchange:"kraken" ~symbol:"BTC/USD"));
+  Alcotest.(check (option string))
+    "strategy resolves through the leg"
+    (Some "carry_overlay")
+    (Dio_engine.Config.get_overlay_strategy ~exchange:"kraken" ~symbol:"BTC/USD");
+  Alcotest.(check (float 1e-9))
+    "params resolve through the hedge"
+    25.0
+    (Dio_engine.Config.get_overlay_params ~exchange:"hyperliquid" ~symbol:"BTC/USDC")
+      .Dio_engine.Config.start_ratio_pct;
+  Alcotest.(check (float 1e-9))
+    "params resolve through the leg"
+    25.0
+    (Dio_engine.Config.get_overlay_params ~exchange:"kraken" ~symbol:"BTC/USD")
+      .Dio_engine.Config.start_ratio_pct
+;;
+
+let test_overlay_merges_legs () =
+  let json =
+    Yojson.Basic.from_string
+      {|{"trading":[
+        {"symbol":"BTC/USD","exchange":"kraken","overlay":{
+          "strategy":"carry_overlay","exchange":"hyperliquid",
+          "params":{"start_ratio_pct":25,"max_ratio_pct":75}}},
+        {"symbol":"BTC/USDC","exchange":"hyperliquid","strategy":"jacobs_ladder",
+         "overlay":{"strategy":"carry_overlay","exchange":"hyperliquid",
+          "params":{"start_ratio_pct":25,"max_ratio_pct":75}}}]}|}
+  in
+  Dio_engine.Config.parse_overlays json;
+  let c =
+    Dio_engine.Config.get_overlay_controller ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
+  in
+  (match c with
+   | None -> Alcotest.fail "expected one merged controller"
+   | Some c ->
+     Alcotest.(check int) "two legs" 2 (List.length c.oc_legs);
+     Alcotest.(check bool) "hl spot leg present" true c.oc_has_hl_spot_leg);
+  let entries =
+    match json |> Yojson.Basic.Util.member "trading" with
+    | `List es -> List.map Dio_engine.Config.parse_config es
+    | _ -> []
+  in
+  let assets = Dio_engine.Config.domain_assets entries in
+  Alcotest.(check int) "only the hl grid domain is spawned" 1 (List.length assets);
+  Alcotest.(check string)
+    "controller attaches to the hl grid"
+    "BTC/USDC"
+    (List.hd assets).Dio_engine.Config.symbol
+;;
+
+let test_domain_assets_spawns_overlay_only () =
+  let json = Yojson.Basic.from_string cross_venue_json in
+  Dio_engine.Config.parse_overlays json;
+  let entries =
+    match json |> Yojson.Basic.Util.member "trading" with
+    | `List es -> List.map Dio_engine.Config.parse_config es
+    | _ -> []
+  in
+  let assets = Dio_engine.Config.domain_assets entries in
+  Alcotest.(check int) "one synthetic controller domain" 1 (List.length assets);
+  let a = List.hd assets in
+  Alcotest.(check string) "controller venue" "hyperliquid" a.Dio_engine.Config.exchange;
+  Alcotest.(check string) "controller symbol" "BTC/USDC" a.Dio_engine.Config.symbol;
+  Alcotest.(check string) "controller runs no grid" "" a.Dio_engine.Config.strategy
+;;
+
+let test_inventory_formula () =
+  let q = Dio_engine.Overlay_inventory.q_of_balances in
+  Alcotest.(check (float 1e-9))
+    "no sells: free + staked"
+    10.0
+    (q ~free:8.0 ~total:10.0 ~open_sell_base:0.0);
+  Alcotest.(check (float 1e-9))
+    "staked backing a pending sell is excluded"
+    8.0
+    (q ~free:8.0 ~total:10.0 ~open_sell_base:2.0);
+  Alcotest.(check (float 1e-9))
+    "sell larger than staked excludes all staked"
+    8.0
+    (q ~free:8.0 ~total:10.0 ~open_sell_base:9.0);
+  Alcotest.(check (float 1e-9))
+    "all inventory earn-backed"
+    0.0
+    (q ~free:0.0 ~total:5.0 ~open_sell_base:5.0)
+;;
+
 let () =
   Alcotest.run
     "Config"
@@ -390,6 +510,13 @@ let () =
             "repeated owner keys accepted"
             `Quick
             test_parse_overlay_accepts_repeated_owner
+        ; Alcotest.test_case "cross-venue leg" `Quick test_overlay_cross_venue
+        ; Alcotest.test_case "legs merge per hedge" `Quick test_overlay_merges_legs
+        ; Alcotest.test_case
+            "overlay-only domain spawned"
+            `Quick
+            test_domain_assets_spawns_overlay_only
+        ; Alcotest.test_case "inventory formula" `Quick test_inventory_formula
         ] )
     ; "flow_log", [ Alcotest.test_case "parse section" `Quick test_parse_flow_log_config ]
     ; ( "oracle"

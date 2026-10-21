@@ -778,7 +778,8 @@ let build_snapshot () =
             ; "accumulation_buffer_hi", `Float (snd tc.accumulation_buffer)
             ; "sell_mult", `String tc.sell_mult
             ] ))
-      config.trading
+      (* Include overlay-only controller domains, which have no entry in [trading]. *)
+      (Dio_engine.Config.domain_assets config.trading)
   in
   (* Aggregate balances from all registered exchanges, enriched with ticker data and open
      sell orders. *)

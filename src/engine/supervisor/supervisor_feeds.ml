@@ -9,6 +9,19 @@ let initialize_feeds ()  :
   Logging.info ~section "Initializing websocket feeds...";
   (let config = Dio_engine.Config.read_config () in
    let app_configs = config.trading in
+   (* Feed symbols come from every trading entry (including inventory-only legs), while
+      domains are spawned only for grids and carry controllers. *)
+   let domain_assets = Dio_engine.Config.domain_assets app_configs in
+   let overlay_controllers = Dio_engine.Config.get_overlay_controllers () in
+   let overlay_hedge_symbols (exchange : string) =
+     overlay_controllers
+     |> List.filter (fun (c : Dio_engine.Config.overlay_controller) ->
+       String.equal c.oc_hedge_exchange exchange)
+     |> List.fold_left
+          (fun acc (c : Dio_engine.Config.overlay_controller) ->
+            c.oc_hedge_coin :: c.oc_hedge_symbol :: acc)
+          []
+   in
    Logging.info_f ~section "Loaded %d trading configuration(s)"
      (List.length app_configs);
    (let kraken_symbols =
@@ -20,22 +33,28 @@ let initialize_feeds ()  :
                  = Kraken)))
         |> (List.map (fun cfg -> cfg.Dio_engine.Config.symbol)) in
     let hyperliquid_symbols =
-      ((app_configs |>
-          (List.filter
-             (fun cfg ->
-                (Dio_exchange.Exchange_intf.Types.exchange_of_string
-                   cfg.Dio_engine.Config.exchange)
-                  = Hyperliquid)))
-         |>
-         (List.fold_left
-            (fun acc cfg ->
-               let sym = cfg.Dio_engine.Config.symbol in
-               if String.contains sym '/'
-               then
-                 let base_asset = (String.split_on_char '/' sym) |> List.hd in
-                 base_asset :: sym :: acc
-               else sym :: acc) []))
-        |> (List.sort_uniq String.compare) in
+      let from_trading =
+        ((app_configs |>
+            (List.filter
+               (fun cfg ->
+                  (Dio_exchange.Exchange_intf.Types.exchange_of_string
+                     cfg.Dio_engine.Config.exchange)
+                    = Hyperliquid)))
+           |>
+           (List.fold_left
+              (fun acc cfg ->
+                 let sym = cfg.Dio_engine.Config.symbol in
+                 if String.contains sym '/'
+                 then
+                   let base_asset = (String.split_on_char '/' sym) |> List.hd in
+                   base_asset :: sym :: acc
+                 else sym :: acc) []))
+      in
+      (* A cross-venue controller needs the hedge venue's perp/spot data even when no grid
+         trades it there. *)
+      List.sort_uniq
+        String.compare
+        (from_trading @ overlay_hedge_symbols "hyperliquid") in
     let has_hyperliquid = (List.length hyperliquid_symbols) > 0 in
     let has_kraken = (List.length kraken_symbols) > 0 in
     let hyperliquid_testnet =
@@ -47,7 +66,15 @@ let initialize_feeds ()  :
                       = Hyperliquid))
       with
       | Some cfg -> cfg.testnet
-      | None -> false in
+      | None ->
+        (match
+           List.find_opt
+             (fun (c : Dio_engine.Config.overlay_controller) ->
+               String.equal c.oc_hedge_exchange "hyperliquid")
+             overlay_controllers
+         with
+         | Some c -> c.oc_testnet
+         | None -> false) in
     let ibkr_symbols =
       (app_configs |>
          (List.filter
@@ -339,25 +366,37 @@ let initialize_feeds ()  :
                                         Logging.info ~section
                                           "Step 5: Initializing balances feed stores...";
                                         (let all_assets =
-                                           (((app_configs |>
-                                                (List.map
-                                                   (fun cfg ->
-                                                      cfg.Dio_engine.Config.symbol)))
-                                               |>
-                                               (List.map
-                                                  (fun symbol ->
-                                                     if
-                                                       String.contains symbol
-                                                         '/'
-                                                     then
-                                                       (String.split_on_char
-                                                          '/' symbol)
-                                                         |> List.hd
-                                                     else symbol)))
-                                              |>
-                                              (List.sort_uniq String.compare))
-                                             |>
-                                             (fun assets -> "USD" :: assets) in
+                                            let from_trading =
+                                              (((app_configs |>
+                                                   (List.map
+                                                      (fun cfg ->
+                                                         cfg.Dio_engine.Config.symbol)))
+                                                  |>
+                                                  (List.map
+                                                     (fun symbol ->
+                                                        if
+                                                          String.contains symbol
+                                                            '/'
+                                                        then
+                                                          (String.split_on_char
+                                                             '/' symbol)
+                                                           |> List.hd
+                                                        else symbol)))
+                                                 |>
+                                                 (List.sort_uniq String.compare))
+                                            in
+                                            let from_overlays =
+                                              List.map
+                                                (fun
+                                                  (c : Dio_engine.Config.overlay_controller)
+                                                  ->
+                                                  c.oc_hedge_coin)
+                                                overlay_controllers
+                                            in
+                                            List.sort_uniq
+                                              String.compare
+                                              ("USD"
+                                               :: (from_trading @ from_overlays)) in
                                          let all_assets =
                                            if has_hyperliquid
                                            then "USDC" :: all_assets
@@ -2133,7 +2172,7 @@ let initialize_feeds ()  :
                                                                     (Printexc.to_string
                                                                     exn);
                                                                     exit 1))
-                                                                    app_configs in
+                                                                    domain_assets in
                                                                     Lwt.backtrace_bind
                                                                     "src/engine/supervisor/supervisor_feeds.ml"
                                                                     935

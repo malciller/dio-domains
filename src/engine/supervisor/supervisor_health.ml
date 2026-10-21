@@ -428,15 +428,16 @@ let monitor_non_active_assets () =
       then Lwt.return_unit
       else (
         let config = Dio_engine.Config.read_config () in
+        let domain_assets = Dio_engine.Config.domain_assets config.trading in
         let configured_symbols =
-          List.map (fun tc -> tc.Dio_engine.Config.exchange, tc.symbol) config.trading
+          List.map (fun tc -> tc.Dio_engine.Config.exchange, tc.symbol) domain_assets
         in
         let exchange_names =
           List.sort_uniq
             String.compare
             (List.map
                (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange)
-               config.trading)
+               domain_assets)
         in
         Lwt_list.iter_s
           (fun exch_name ->

@@ -3,6 +3,7 @@
  (public_name dio.engine)
  (libraries
   dio.yojson
+  dio.jsonc
   dio.data_structures
   logging
   flow_log
@@ -19,4 +20,10 @@
   dio.error_handling
   dio.oracle
   dio.gc_config)
- (modules Config Domain_spawner Order_executor Strategy_replay Carry_reserve))
+ (modules
+  Config
+  Domain_spawner
+  Order_executor
+  Strategy_replay
+  Carry_reserve
+  Overlay_inventory))

@@ -1240,7 +1240,7 @@ let load_theme_from_config ?(config_file = "config.json") () =
       config_file
   else (
     let json =
-      try Yojson.Basic.from_file config_file with
+      try Jsonc.from_file config_file with
       | exn ->
         raise
           (Failure
