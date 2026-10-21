@@ -19,6 +19,8 @@ let section = "strategy_cycle_engine"
 type ctx =
   { mutable cg_asset : Types.trading_config option
   ; mutable cg_state : Types.strategy_state option
+  ; mutable cg_carry : Dio_persistence.Carry_state_store.t option
+  ; mutable cg_min_liq_reserve : float
   ; mutable cg_price : float
   ; mutable cg_bid : float
   ; mutable cg_ask : float
@@ -60,6 +62,8 @@ type ctx =
 let create () =
   { cg_asset = None
   ; cg_state = None
+  ; cg_carry = None
+  ; cg_min_liq_reserve = 0.0
   ; cg_price = nan
   ; cg_bid = nan
   ; cg_ask = nan
@@ -496,6 +500,7 @@ let market_facts c (t : Strategy_runtime.t) =
     Strategy_runtime.set_platform_slot t slot (Strategy_expr.V_string v)
   in
   let setb slot v = Strategy_runtime.set_platform_bool t slot v in
+  let seti slot v = Strategy_runtime.set_platform_int t slot v in
   let fresh ts =
     let age = c.cg_now -. ts in
     age >= 0.0 && age <= 60.0
@@ -576,6 +581,50 @@ let market_facts c (t : Strategy_runtime.t) =
      setf Slots.perp_maintenance 0.0;
      setf Slots.margin_ratio 0.0);
   setf Slots.carry_reserved reserved;
+  setf Slots.min_notional (Strategy_venue.get_min_notional_val symbol exchange);
+  setf Slots.min_liq_reserve c.cg_min_liq_reserve;
+  (match c.cg_carry with
+   | Some cs ->
+     let close_price, close_kind, close_realized =
+       match cs.Dio_persistence.Carry_state_store.last_close with
+       | Some f -> f.price, f.kind, f.realized
+       | None -> 0.0, "", 0.0
+     in
+     let spot_price, spot_qty =
+       match cs.Dio_persistence.Carry_state_store.last_spot with
+       | Some f -> f.price, f.qty
+       | None -> 0.0, 0.0
+     in
+     setf Slots.carry_close_price close_price;
+     sets Slots.carry_close_kind close_kind;
+     setb
+       Slots.carry_close_is_recycle
+       (String.equal close_kind "carry:recycle:close|ro"
+        || String.equal close_kind "carry:drawdown|ro");
+     setf Slots.carry_close_realized close_realized;
+     setf
+       Slots.carry_close_realized_total
+       cs.Dio_persistence.Carry_state_store.close_realized_total;
+     seti Slots.carry_close_seq cs.Dio_persistence.Carry_state_store.close_seq;
+     setf
+       Slots.carry_recycle_realized_total
+       cs.Dio_persistence.Carry_state_store.recycle_realized_total;
+     seti Slots.carry_recycle_seq cs.Dio_persistence.Carry_state_store.recycle_seq;
+     setf Slots.carry_spot_price spot_price;
+     setf Slots.carry_spot_qty spot_qty;
+     seti Slots.carry_spot_seq cs.Dio_persistence.Carry_state_store.spot_seq
+   | None ->
+     setf Slots.carry_close_price 0.0;
+     sets Slots.carry_close_kind "";
+     setb Slots.carry_close_is_recycle false;
+     setf Slots.carry_close_realized 0.0;
+     setf Slots.carry_close_realized_total 0.0;
+     seti Slots.carry_close_seq 0;
+     setf Slots.carry_recycle_realized_total 0.0;
+     seti Slots.carry_recycle_seq 0;
+     setf Slots.carry_spot_price 0.0;
+     setf Slots.carry_spot_qty 0.0;
+     seti Slots.carry_spot_seq 0);
   match Jac.get_exchange_module exchange with
   | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
     let staked =
@@ -587,11 +636,17 @@ let market_facts c (t : Strategy_runtime.t) =
       | Some s -> s.reserved_base
       | None -> 0.0
     in
-    setf Slots.accumulated_balance (reserved +. staked);
-    setf
-      Slots.spot_base_total
-      (try Ex.get_total_balance ~asset:base with
-       | _ -> 0.0);
+    let spot_total =
+      try Ex.get_total_balance ~asset:base with
+      | _ -> 0.0
+    in
+    let ledger_base = reserved +. staked in
+    let live_base = spot_total +. staked in
+    let hedge_base =
+      if live_base > 0.0 && live_base < ledger_base then live_base else ledger_base
+    in
+    setf Slots.accumulated_balance hedge_base;
+    setf Slots.spot_base_total spot_total;
     setf
       Slots.usdc_free
       (try Ex.get_tradeable_balance ~asset:"USDC" with
@@ -677,67 +732,112 @@ let order_place
         then Strategy_common.Sell
         else Strategy_common.Buy
       in
-      let tif, post_only =
-        match String.uppercase_ascii tif with
-        | "ALO" -> "GTC", true
-        | "GTC" -> "GTC", post_only
-        | _ -> "IOC", post_only
+      (* The overlay's perp instrument is the bare coin, but Hyperliquid's 10 USDC minimum
+         applies to perps as well as spot. Query the floor with the domain's spot pair so
+         a perp top-up below it is skipped instead of sent and rejected. The strategy's
+         ledger/accounting action is a separate step and is intentionally retained when
+         the venue placement is skipped: a later, larger spot buy can realise the reserved
+         base. *)
+      let min_notional =
+        Strategy_venue.get_min_notional_val asset.symbol asset.exchange
       in
-      let order_type =
+      let requested_notional =
         match price with
-        | Some _ -> "limit"
-        | None -> "market"
+        | Some p when Float.is_finite p -> qty *. p
+        | _ -> 0.0
       in
-      let duplicate_key =
-        if String.equal dedup_key ""
-        then
-          Strategy_common.generate_duplicate_key
-            instrument
-            (Strategy_common.string_of_order_side side)
-            qty
-            price
-          ^ if reduce_only then "|ro" else ""
-        else dedup_key ^ if reduce_only then "|ro" else ""
-      in
-      let order =
-        Jac.create_place_order
-          ~reduce_only
-          ~time_in_force:tif
-          ~order_type
-          ~userref:Strategy_common.strategy_userref_carry
-          duplicate_key
-          instrument
-          side
-          qty
-          price
-          post_only
-          Strategy_common.Carry
-          asset.exchange
-      in
-      let describe () =
-        Printf.sprintf
-          "%s %s %.8g @ %s tif=%s reduce_only=%b key=%s"
+      if min_notional > 0.0
+         && requested_notional > 0.0
+         && requested_notional < min_notional
+      then
+        Logging.info_f
+          ~section
+          "Overlay order below venue minimum notional: %s %s %.8g @ %.8g = %.4f < %.4f; \
+           skipping venue placement (ledger/accounting update retained)"
           (Strategy_common.string_of_order_side side)
           instrument
           qty
           (match price with
-           | Some p -> Printf.sprintf "%.8g" p
-           | None -> "market")
-          tif
-          reduce_only
-          duplicate_key
-      in
-      if dry_run ()
-      then Logging.info_f ~section "Overlay DRY RUN: %s" (describe ())
+           | Some p -> p
+           | None -> 0.0)
+          requested_notional
+          min_notional
       else (
-        let pushed = Jac.push_order ~now:c.cg_now ~manage_state:false order in
-        if pushed
-        then Logging.info_f ~section "Overlay order: %s" (describe ())
-        else
-          Logging.debug_f
-            ~section
-            "Overlay order suppressed (duplicate/full buffer): %s"
-            duplicate_key))
+        let tif, post_only =
+          match String.uppercase_ascii tif with
+          | "ALO" -> "GTC", true
+          | "GTC" -> "GTC", post_only
+          | _ -> "IOC", post_only
+        in
+        let order_type =
+          match price with
+          | Some _ -> "limit"
+          | None -> "market"
+        in
+        let duplicate_key =
+          if String.equal dedup_key ""
+          then
+            Strategy_common.generate_duplicate_key
+              instrument
+              (Strategy_common.string_of_order_side side)
+              qty
+              price
+            ^ if reduce_only then "|ro" else ""
+          else dedup_key ^ if reduce_only then "|ro" else ""
+        in
+        (* Bind the venue order id to the instrument/fee class on ack so the domain loop
+           can classify a buy fill without guessing from side/price. Sells are entries;
+           only buys close/resize/recycle and feed the actual-fill accounting. *)
+        (match side with
+         | Strategy_common.Buy ->
+           Strategy_common.register_pending_carry_order
+             ~dedup_key:duplicate_key
+             ~market:
+               (if String.equal market "perp"
+                then Strategy_common.Carry_perp
+                else Strategy_common.Carry_spot)
+             ~maker:post_only
+             ~kind:duplicate_key
+         | Strategy_common.Sell -> ());
+        let order =
+          Jac.create_place_order
+            ~reduce_only
+            ~time_in_force:tif
+            ~order_type
+            ~userref:Strategy_common.strategy_userref_carry
+            duplicate_key
+            instrument
+            side
+            qty
+            price
+            post_only
+            Strategy_common.Carry
+            asset.exchange
+        in
+        let describe () =
+          Printf.sprintf
+            "%s %s %.8g @ %s tif=%s reduce_only=%b key=%s"
+            (Strategy_common.string_of_order_side side)
+            instrument
+            qty
+            (match price with
+             | Some p -> Printf.sprintf "%.8g" p
+             | None -> "market")
+            tif
+            reduce_only
+            duplicate_key
+        in
+        if dry_run ()
+        then Logging.info_f ~section "Overlay DRY RUN: %s" (describe ())
+        else (
+          let pushed = Jac.push_order ~now:c.cg_now ~manage_state:false order in
+          if pushed
+          then Logging.info_f ~section "Overlay order: %s" (describe ())
+          else
+            Logging.debug_f
+              ~section
+              "Overlay order suppressed (duplicate/full buffer): %s"
+              duplicate_key)))
 ;;
 
 let order_cancel c ~market ~order_id =
@@ -805,6 +905,10 @@ let order_replace
         | Strategy_common.Sell -> Dio_exchange.Exchange_intf.Types.Sell
         | Strategy_common.Buy -> Dio_exchange.Exchange_intf.Types.Buy
       in
+      (* Buys share the same userref: the spot recycle buy and the perp take-profit are
+         both carry buys. Match an existing order only when its booked kind is the same;
+         otherwise a spot replace could amend/cancel the take-profit (or vice versa). *)
+      let kind_key = dedup_key ^ if reduce_only then "|ro" else "" in
       let tif, post_only =
         match String.uppercase_ascii tif with
         | "ALO" -> "GTC", true
@@ -846,8 +950,24 @@ let order_replace
             o.user_ref = Some Strategy_common.strategy_userref_carry
             && o.side = ex_side
             && (o.status = Dio_exchange.Exchange_intf.Types.New
-                || o.status = Dio_exchange.Exchange_intf.Types.PartiallyFilled))
+                || o.status = Dio_exchange.Exchange_intf.Types.PartiallyFilled)
+            &&
+            match order_side with
+            | Strategy_common.Sell -> true
+            | Strategy_common.Buy ->
+              (match Strategy_common.lookup_carry_order ~order_id:o.order_id with
+               | Some meta -> String.equal meta.com_kind kind_key
+               | None -> false))
         | None -> []
+      in
+      (* The venue floor applies to the order's total size, not the remaining size on an
+         amend. Use the spot pair for the lookup so the perp instrument (bare coin) still
+         gets Hyperliquid's 10 USDC minimum. *)
+      let min_notional =
+        Strategy_venue.get_min_notional_val asset.symbol asset.exchange
+      in
+      let below_min_on_amend (o : Dio_exchange.Exchange_intf.Types.open_order) =
+        min_notional > 0.0 && (o.cum_qty +. qty) *. rounded < min_notional
       in
       let same_price (o : Dio_exchange.Exchange_intf.Types.open_order) =
         match o.limit_price with
@@ -881,6 +1001,17 @@ let order_replace
       else (
         match matching with
         | o :: _ when same_price o && same_qty o -> ()
+        | o :: _ when below_min_on_amend o ->
+          Logging.info_f
+            ~section
+            "Overlay amend below venue minimum notional: %s %s total %.8g @ %.8g = %.4f \
+             < %.4f; skipping venue placement (ledger/accounting update retained)"
+            (Strategy_common.string_of_order_side order_side)
+            instrument
+            (o.cum_qty +. qty)
+            rounded
+            ((o.cum_qty +. qty) *. rounded)
+            min_notional
         | o :: _ ->
           (* Amend the total size, preserving the already-filled part. The caller passes
              the desired remaining quantity. *)
@@ -897,6 +1028,7 @@ let order_replace
           else (
             let order =
               Jac.create_amend_order
+                ~dup_key:kind_key
                 o.order_id
                 instrument
                 order_side

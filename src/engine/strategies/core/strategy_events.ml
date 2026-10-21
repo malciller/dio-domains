@@ -1229,10 +1229,6 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
         || contains_fragment lower_reason "already canceled"
         || contains_fragment lower_reason "already cancelled"
       in
-      let is_margin_error =
-        contains_fragment lower_reason "insufficient"
-        || contains_fragment lower_reason "margin"
-      in
       let is_rate_limit =
         contains_fragment lower_reason "too many cumulative requests"
         || contains_fragment lower_reason "rate limit"
@@ -1240,10 +1236,7 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
       let cooldown_duration =
         if is_rate_limit
         then 10.0
-        else if is_cache_miss
-                || is_cannot_modify
-                || is_margin_error
-                || is_already_terminal
+        else if is_cache_miss || is_cannot_modify || is_already_terminal
         then 0.5
         else 2.0
       in
@@ -1260,12 +1253,16 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
         || contains_fragment lower_reason "post only"
         || contains_fragment lower_reason "cross"
       in
+      (* An "insufficient qty" amendment failure deliberately does NOT mean the order is
+         gone. On the Alpaca fractional cancel-and-replace path that message comes from
+         the *replacement* placement ("insufficient qty available for order ...
+         held_for_orders ..."), which fails precisely because the original order is still
+         resting. Dropping tracking for it released the sell commitment while the venue
+         still held the shares, and the next cycle re-issued the same doomed amend - the
+         source of the repeating 403/422 storm. Keep tracking and cool down instead; the
+         order's own terminal event or the cancel path will retire it. *)
       let is_order_gone =
-        is_cache_miss
-        || is_cannot_modify
-        || is_margin_error
-        || is_tif_rejection
-        || is_already_terminal
+        is_cache_miss || is_cannot_modify || is_tif_rejection || is_already_terminal
       in
       (* A venue-terminal order can linger in the local open-order cache if the terminal
          trade-update was missed. Evict it from the open-orders scan so the adoption path

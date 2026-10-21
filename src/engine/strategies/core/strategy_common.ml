@@ -65,6 +65,88 @@ let userref_of_cloid (clid : string) : int option =
 (** Returns true if [order_userref] matches the given [strategy_userref]. *)
 let is_strategy_order strategy_userref order_userref = strategy_userref = order_userref
 
+(** Instrument class for an overlay order fill. The execution event carries only the order
+    id, so the placement side registers the class here, the supervisor binds the venue
+    order id on ack, and the domain loop looks it up on the fill. *)
+type carry_market =
+  | Carry_perp
+  | Carry_spot
+
+type carry_order_meta =
+  { com_market : carry_market
+  ; com_maker : bool
+  ; com_kind : string
+  }
+
+let carry_registry_mutex = Mutex.create ()
+let carry_pending : (string, carry_order_meta) Hashtbl.t = Hashtbl.create 16
+let carry_orders : (string, carry_order_meta) Hashtbl.t = Hashtbl.create 64
+let carry_order_queue : string Queue.t = Queue.create ()
+
+let register_pending_carry_order ~dedup_key ~market ~maker ~kind =
+  Mutex.lock carry_registry_mutex;
+  Hashtbl.replace
+    carry_pending
+    dedup_key
+    { com_market = market; com_maker = maker; com_kind = kind };
+  Mutex.unlock carry_registry_mutex
+;;
+
+let trim_carry_orders_locked () =
+  while Hashtbl.length carry_orders > 2048 && not (Queue.is_empty carry_order_queue) do
+    let oid = Queue.pop carry_order_queue in
+    Hashtbl.remove carry_orders oid
+  done
+;;
+
+let bind_carry_order ~dedup_key ~order_id =
+  if not (String.equal dedup_key "")
+  then (
+    Mutex.lock carry_registry_mutex;
+    (match Hashtbl.find_opt carry_pending dedup_key with
+     | Some meta ->
+       Hashtbl.remove carry_pending dedup_key;
+       Hashtbl.replace carry_orders order_id meta;
+       Queue.push order_id carry_order_queue;
+       trim_carry_orders_locked ()
+     | None -> ());
+    Mutex.unlock carry_registry_mutex)
+;;
+
+(** Register a replacement (amend) order id directly from the amend ack. The old id's
+    mapping is retired by its cancel event; the replacement is what will fill. *)
+let register_carry_order_id ~order_id ~market ~maker ~kind =
+  Mutex.lock carry_registry_mutex;
+  Hashtbl.replace
+    carry_orders
+    order_id
+    { com_market = market; com_maker = maker; com_kind = kind };
+  Queue.push order_id carry_order_queue;
+  trim_carry_orders_locked ();
+  Mutex.unlock carry_registry_mutex
+;;
+
+let retire_pending_carry_order ~dedup_key =
+  if not (String.equal dedup_key "")
+  then (
+    Mutex.lock carry_registry_mutex;
+    Hashtbl.remove carry_pending dedup_key;
+    Mutex.unlock carry_registry_mutex)
+;;
+
+let lookup_carry_order ~order_id =
+  Mutex.lock carry_registry_mutex;
+  let meta = Hashtbl.find_opt carry_orders order_id in
+  Mutex.unlock carry_registry_mutex;
+  meta
+;;
+
+let retire_carry_order ~order_id =
+  Mutex.lock carry_registry_mutex;
+  Hashtbl.remove carry_orders order_id;
+  Mutex.unlock carry_registry_mutex
+;;
+
 (** Order side: buy or sell. *)
 type order_side =
   | Buy

@@ -2,4 +2,8 @@
  (name dio_persistence)
  (public_name dio.persistence)
  (libraries dio.yojson logging threads dio.gc_config dio.latency_profiling)
- (modules Persistence_orchestrator Base_accumulation_store Sell_levels_store))
+ (modules
+  Persistence_orchestrator
+  Base_accumulation_store
+  Sell_levels_store
+  Carry_state_store))

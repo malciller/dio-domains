@@ -19,4 +19,4 @@
   dio.error_handling
   dio.oracle
   dio.gc_config)
- (modules Config Domain_spawner Order_executor Strategy_replay))
+ (modules Config Domain_spawner Order_executor Strategy_replay Carry_reserve))

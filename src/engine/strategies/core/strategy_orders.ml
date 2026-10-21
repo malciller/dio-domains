@@ -149,7 +149,17 @@ let create_place_order
 ;;
 
 (** Constructs an Amend strategy_order targeting [order_id]. *)
-let create_amend_order order_id asset_symbol side qty price post_only strategy exchange =
+let create_amend_order
+  ?(dup_key = "")
+  order_id
+  asset_symbol
+  side
+  qty
+  price
+  post_only
+  strategy
+  exchange
+  =
   let ecfg = get_exchange_config exchange in
   { operation = Amend
   ; order_id = Some order_id
@@ -164,7 +174,7 @@ let create_amend_order order_id asset_symbol side qty price post_only strategy e
   ; reduce_only = false
   ; userref = None
   ; strategy
-  ; duplicate_key = ""
+  ; duplicate_key = dup_key
   }
 ;;
 

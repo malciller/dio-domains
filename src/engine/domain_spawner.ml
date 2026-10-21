@@ -706,11 +706,160 @@ let asset_domain_worker
                        "strategy: %s overlay %s"
                        asset_with_fees.symbol
                        overlay_path;
-                     Some (Dio_strategies.Strategy_runtime.create ~handlers overlay_file)))
+                     let p =
+                       Config.get_overlay_params
+                         ~exchange:asset_with_fees.exchange
+                         ~symbol:asset_with_fees.symbol
+                     in
+                     let start_ratio = p.start_ratio_pct /. 100.0 in
+                     let add_threshold = p.add_threshold_pct /. 100.0 in
+                     let max_ratio = p.max_ratio_pct /. 100.0 in
+                     let gap = Float.max 0.0 (max_ratio -. start_ratio) in
+                     let num_adds =
+                       if gap <= 0.0 || add_threshold <= 0.0
+                       then 0
+                       else int_of_float (Float.ceil (gap /. add_threshold))
+                     in
+                     let add_amount =
+                       if num_adds > 0 then gap /. float_of_int num_adds else 0.0
+                     in
+                     let params =
+                       [ "start_ratio", Dio_strategies.Strategy_expr.V_float start_ratio
+                       ; ( "add_threshold"
+                         , Dio_strategies.Strategy_expr.V_float add_threshold )
+                       ; "add_amount", Dio_strategies.Strategy_expr.V_float add_amount
+                       ; "max_ratio", Dio_strategies.Strategy_expr.V_float max_ratio
+                       ; "num_adds", Dio_strategies.Strategy_expr.V_int num_adds
+                       ; ( "recycle_profit"
+                         , Dio_strategies.Strategy_expr.V_float
+                             (p.recycle_profit_pct /. 100.0) )
+                       ; ( "min_liq_mult"
+                         , Dio_strategies.Strategy_expr.V_float p.min_liq_mult )
+                       ]
+                     in
+                     Some
+                       (Dio_strategies.Strategy_runtime.create
+                          ~handlers
+                          ~params
+                          overlay_file)))
             in
             Logging.info_f ~section "strategy: %s running %s" asset_with_fees.symbol path;
             Some (ctx, Dio_strategies.Strategy_runtime.create ~handlers file, overlay_rt)))
       else None
+    in
+    (* Durable carry state (trailing reference, recycle state machine, last actual fills).
+       Only present when the domain has an overlay; seeded into the runtime before the
+       first cycle. *)
+    let overlay_carry =
+      match config_grid with
+      | Some (_, _, Some _) ->
+        Some
+          (ref
+             (Dio_strategies.Carry_runtime.load
+                ~exchange:asset_with_fees.exchange
+                ~symbol:asset_with_fees.symbol))
+      | _ -> None
+    in
+    (match config_grid, overlay_carry with
+     | Some (_, _, Some ort), Some st ->
+       Dio_strategies.Carry_runtime.seed ort !st;
+       (* An already-open position with no durable ladder state is grandfathered at its
+          current ratio: the current short / accumulated base, with the add index at the
+          completed band (or the max). No forced cover, even if the configured max is
+          below the current ratio. *)
+       if !st.anchor <= 0.0
+       then (
+         let p =
+           Config.get_overlay_params
+             ~exchange:asset_with_fees.exchange
+             ~symbol:asset_with_fees.symbol
+         in
+         let start_ratio = p.start_ratio_pct /. 100.0 in
+         let add_threshold = p.add_threshold_pct /. 100.0 in
+         let max_ratio = p.max_ratio_pct /. 100.0 in
+         let gap = Float.max 0.0 (max_ratio -. start_ratio) in
+         let num_adds =
+           if gap <= 0.0 || add_threshold <= 0.0
+           then 0
+           else int_of_float (Float.ceil (gap /. add_threshold))
+         in
+         let add_amount = if num_adds > 0 then gap /. float_of_int num_adds else 0.0 in
+         let reserved =
+           match cached_grid_state with
+           | Some s -> s.reserved_base
+           | None -> 0.0
+         in
+         let staked =
+           match Exchange.Registry.get asset_with_fees.exchange with
+           | Some (module Ex : Exchange.S) ->
+             (try Ex.get_staked_balance ~asset:base_asset with
+              | _ -> 0.0)
+           | None -> 0.0
+         in
+         let accumulated = reserved +. staked in
+         match
+           Dio_exchange.Market_context.get_position
+             ~exchange:asset_with_fees.exchange
+             ~coin:base_asset
+         with
+         | Some pos when pos.qty < -0.0001 && accumulated > 0.0 && pos.entry > 0.0 ->
+           let short_qty = -.pos.qty in
+           let ratio = short_qty /. accumulated in
+           if ratio > max_ratio +. 1e-9
+           then
+             Logging.warn_f
+               ~section
+               "carry %s: grandfathered ratio %.4f exceeds configured max %.4f; no adds \
+                until the first profitable recycle"
+               asset_with_fees.symbol
+               ratio
+               max_ratio;
+           Dio_strategies.Carry_runtime.init_ladder
+             ~start_ratio
+             ~add_amount
+             ~num_adds
+             ~add_threshold
+             ~entry:pos.entry
+             ~accumulated
+             ~short_qty
+             ort
+         | _ -> ())
+     | _ -> ());
+    (* Terminal overlay fills are the only source of the actual close/spot prices used by
+       the recycle split. Record the order's cumulative fill once, on its terminal event. *)
+    let record_overlay_fill
+      ~now_exec
+      (event : Dio_exchange.Exchange_intf.Types.execution_event)
+      =
+      match overlay_carry with
+      | None -> ()
+      | Some r ->
+        (match
+           Dio_strategies.Strategy_common.lookup_carry_order ~order_id:event.order_id
+         with
+         | None -> ()
+         | Some meta ->
+           if event.filled_qty > 0.0
+           then (
+             let side =
+               match event.side with
+               | Types.Buy -> Dio_strategies.Strategy_common.Buy
+               | Types.Sell -> Dio_strategies.Strategy_common.Sell
+             in
+             Dio_strategies.Carry_runtime.record_fill
+               ~exchange:asset_with_fees.exchange
+               ~symbol:asset_with_fees.symbol
+               ~market:meta.Dio_strategies.Strategy_common.com_market
+               ~maker:meta.Dio_strategies.Strategy_common.com_maker
+               ~kind:meta.Dio_strategies.Strategy_common.com_kind
+               ~side
+               ~price:event.avg_price
+               ~qty:event.filled_qty
+               ~now:now_exec
+               ~maker_fee:(Option.value asset_with_fees.maker_fee ~default:0.0)
+               ~taker_fee:(Option.value asset_with_fees.taker_fee ~default:0.0)
+               r);
+           Dio_strategies.Strategy_common.retire_carry_order ~order_id:event.order_id)
     in
     (* Overlay cycle inputs. The overlay is independent of the grid's oracle gate: it
        manages its own exposure and must run even when the primary strategy is halted. Its
@@ -961,6 +1110,7 @@ let asset_domain_worker
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
                    | Types.Sell -> Dio_strategies.Strategy_common.Sell
                  in
+                 if overlay_event then record_overlay_fill ~now_exec event;
                  if is_grid_strategy && not overlay_event
                  then
                    Dio_strategies.Strategy_api.Strategy.record_exec_event
@@ -1001,6 +1151,7 @@ let asset_domain_worker
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
                    | Types.Sell -> Dio_strategies.Strategy_common.Sell
                  in
+                 if overlay_event then record_overlay_fill ~now_exec event;
                  if is_grid_strategy && not overlay_event
                  then
                    Dio_strategies.Strategy_api.Strategy.record_exec_event
@@ -1595,6 +1746,13 @@ let asset_domain_worker
          ctx.cg_base_age <- None;
          ctx.cg_gen <- 0;
          ctx.cg_profile <- false;
+         ctx.cg_min_liq_reserve
+         <- (if Config.is_overlay_owner
+                  ~exchange:asset_with_fees.exchange
+                  ~symbol:asset_with_fees.symbol
+             then Carry_reserve.compute ~exchange:asset_with_fees.exchange
+             else 0.0);
+         ctx.cg_carry <- Option.map (fun r -> !r) overlay_carry;
          ort.prof_enabled <- false;
          Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
            ignore
@@ -1604,6 +1762,15 @@ let asset_domain_worker
                 ~price:!current_price
                 ~now:now_ov
                 ~event:(Dio_strategies.Strategy_runtime.make_event "book_update" [])));
+         (match overlay_carry with
+          | Some r ->
+            Dio_strategies.Carry_runtime.save_if_changed
+              ~exchange:asset_with_fees.exchange
+              ~symbol:asset_with_fees.symbol
+              ort
+              r
+              ~now:now_ov
+          | None -> ());
          let pbool key =
            match Dio_strategies.Strategy_runtime.get_platform ort key with
            | Dio_strategies.Strategy_expr.V_bool b -> b

@@ -98,29 +98,103 @@ let level_color (t : Theme.theme_palette) lvl =
   | _ -> t.c_cyan
 ;;
 
+(** Replace control characters (embedded newlines/tabs from a multi-line log message) with
+    spaces: Notty has no line-break concept inside [I.string], so a raw newline would
+    corrupt the frame. *)
+let sanitize s =
+  String.map (fun c -> if Char.code c < 0x20 || Char.code c = 0x7F then ' ' else c) s
+;;
+
+(** Split an unbreakable token into chunks of at most [width] display cells, cutting on
+    UTF-8 codepoint boundaries. Compact JSON error bodies have no spaces, so without this
+    a single "word" can be hundreds of cells wide and push the modal's right border (and
+    the dashboard behind it) off-screen. *)
+let break_token ~width s =
+  if width <= 0 || display_width s <= width
+  then [ s ]
+  else (
+    let pieces = ref [] in
+    let buf = Buffer.create width in
+    let cur_w = ref 0 in
+    let flush () =
+      if Buffer.length buf > 0
+      then (
+        pieces := Buffer.contents buf :: !pieces;
+        Buffer.clear buf;
+        cur_w := 0)
+    in
+    let i = ref 0 in
+    let len = String.length s in
+    while !i < len do
+      let c = Char.code (String.unsafe_get s !i) in
+      let clen =
+        if c < 0x80 then 1 else if c < 0xE0 then 2 else if c < 0xF0 then 3 else 4
+      in
+      let clen = min clen (len - !i) in
+      let piece = String.sub s !i clen in
+      let pw = display_width piece in
+      if !cur_w > 0 && !cur_w + pw > width then flush ();
+      Buffer.add_string buf piece;
+      cur_w := !cur_w + pw;
+      i := !i + clen
+    done;
+    flush ();
+    match List.rev !pieces with
+    | [] -> [ s ]
+    | ps -> ps)
+;;
+
+(** Greedy word-wrap to [width] display cells, hard-breaking any token that is itself
+    wider than the field. Every returned segment is guaranteed to fit, so the modal frame
+    cannot be stretched by a long error body. *)
 let wrap_words ~width s =
+  let s = sanitize s in
   if width <= 0
   then [ s ]
   else (
     let words = String.split_on_char ' ' s in
     let lines = ref [] in
     let cur = Buffer.create width in
-    List.iter
-      (fun wd ->
-        let cl = Buffer.length cur in
-        if cl = 0
-        then Buffer.add_string cur wd
-        else if cl + 1 + String.length wd <= width
-        then (
-          Buffer.add_char cur ' ';
-          Buffer.add_string cur wd)
-        else (
-          lines := Buffer.contents cur :: !lines;
-          Buffer.clear cur;
-          Buffer.add_string cur wd))
-      words;
-    lines := Buffer.contents cur :: !lines;
-    List.rev !lines)
+    let cur_w = ref 0 in
+    let flush () =
+      if Buffer.length cur > 0
+      then (
+        lines := Buffer.contents cur :: !lines;
+        Buffer.clear cur;
+        cur_w := 0)
+    in
+    let add_word wd =
+      let ww = display_width wd in
+      if !cur_w > 0 && !cur_w + 1 + ww <= width
+      then (
+        Buffer.add_char cur ' ';
+        Buffer.add_string cur wd;
+        cur_w := !cur_w + 1 + ww)
+      else if ww <= width
+      then (
+        flush ();
+        Buffer.add_string cur wd;
+        cur_w := ww)
+      else (
+        (* Over-long token: close the current line, then emit as many complete chunks as
+           the field allows and leave the remainder open for the next word. *)
+        flush ();
+        let rec emit = function
+          | [] -> ()
+          | [ last ] ->
+            Buffer.add_string cur last;
+            cur_w := display_width last
+          | piece :: rest ->
+            lines := piece :: !lines;
+            emit rest
+        in
+        emit (break_token ~width wd))
+    in
+    List.iter add_word words;
+    flush ();
+    match List.rev !lines with
+    | [] -> [ "" ]
+    | l -> l)
 ;;
 
 (** One rendered row: a wrapped message segment plus the columns to show on its first
@@ -150,6 +224,11 @@ let render_modal ~target_w ~target_h (entries : entry list) =
   (* Title bar: black on red, filled to the inner width. *)
   let title_str = Printf.sprintf " ⚠  ALERTS (%d) " n in
   let title_img = I.string A.(fg black ++ bg t.c_red ++ st bold) title_str in
+  let title_img =
+    if I.width title_img > inner_w
+    then I.hsnap ~align:`Left inner_w title_img
+    else title_img
+  in
   let title_pad = max 0 (inner_w - I.width title_img) in
   let top_row =
     I.hcat
@@ -186,6 +265,10 @@ let render_modal ~target_w ~target_h (entries : entry list) =
   in
   let overflow = List.length rows - List.length shown in
   let wrap_inner (inner : I.t) =
+    (* Defensive clip: no row may ever exceed the inner width, whatever the wrapping did. *)
+    let inner =
+      if I.width inner > inner_w then I.hsnap ~align:`Left inner_w inner else inner
+    in
     let pad = max 0 (inner_w - I.width inner) in
     I.hcat
       [ I.string a_frame "║"

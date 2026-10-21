@@ -147,6 +147,23 @@ let test_connection_metrics () =
     conn.total_connections
 ;;
 
+let test_post_only_rejection_reason () =
+  Alcotest.(check bool)
+    "HL post-only reason"
+    true
+    (Supervisor_orders.is_post_only_rejection
+       "HL Order Rejected: Post only order would have immediately matched, bbo was \
+        80.488@80.492");
+  Alcotest.(check bool)
+    "hyphenated post-only reason"
+    true
+    (Supervisor_orders.is_post_only_rejection "post-only order would cross");
+  Alcotest.(check bool)
+    "inventory rejection is not post-only"
+    false
+    (Supervisor_orders.is_post_only_rejection "insufficient funds")
+;;
+
 let () =
   Alcotest.run
     "Supervisor"
@@ -174,6 +191,12 @@ let () =
       , [ Alcotest.test_case "uptime" `Quick test_connection_uptime
         ; Alcotest.test_case "heartbeat" `Quick test_data_heartbeat
         ; Alcotest.test_case "metrics" `Quick test_connection_metrics
+        ] )
+    ; ( "order_retry"
+      , [ Alcotest.test_case
+            "post-only rejection detection"
+            `Quick
+            test_post_only_rejection_reason
         ] )
     ]
 ;;

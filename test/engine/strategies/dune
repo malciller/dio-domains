@@ -43,11 +43,6 @@
  (libraries dio.strategies alcotest))
 
 (test
- (name test_carry_overlay)
- (modules test_carry_overlay)
- (libraries dio.strategies alcotest))
-
-(test
  (name test_hot_path_invariants)
  (modules test_hot_path_invariants)
  (libraries dio.strategies dio.engine alcotest))

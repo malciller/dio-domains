@@ -903,7 +903,14 @@ let available_quote_in (a : account) (acs : account_snapshot) : float =
   let quote_updated_at = acs.acs_quote_updated_at in
   let dq, pending = pending_deltas id ~quote_updated_at in
   if pending <> [] then prune_pending id ~quote_updated_at;
-  Float.max 0.0 (Oracle_balances.available_quote acs.acs_snap ~quote:a.a_quote +. dq)
+  let raw =
+    Float.max 0.0 (Oracle_balances.available_quote acs.acs_snap ~quote:a.a_quote +. dq)
+  in
+  (* Senior overlay reservations are not available to the grid. Subtracting them here
+     keeps the capital oracle's sizing pool aligned with the execution-side
+     [Capital_reservation.available]. With no overlay the total is 0 and this is a no-op. *)
+  let reserved = Dio_exchange.Capital_reservation.get_total ~exchange:a.a_exchange in
+  Float.max 0.0 (raw -. reserved)
 ;;
 
 (** Available base for one symbol within a hoisted snapshot (same sources), minus nothing:
