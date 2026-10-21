@@ -7,6 +7,8 @@ type price_snapshot =
   ; buy_ps : float list
   ; sell_ps : float list
   ; perp_mark : float option
+  ; perp_buy_ps : float list
+  ; perp_sell_ps : float list
   }
 
 let repeat_utf8 str count =
@@ -88,6 +90,18 @@ let record_all_prices (snapshot : Snapshot.t) =
   let now = Unix.gettimeofday () in
   List.iter
     (fun (a : Snapshot.selectable_asset) ->
+      let perp_buy_ps, perp_sell_ps, perp_order_ids =
+        match a.kind with
+        | Snapshot.Strategy s ->
+          (match s.perp with
+           | Some p ->
+             ( order_prices p.buy_orders
+             , order_prices p.sell_orders
+             , List.map (fun (o : Snapshot.order) -> o.id) (p.buy_orders @ p.sell_orders)
+             )
+           | None -> [], [], [])
+        | Snapshot.Balance _ -> [], [], []
+      in
       let bid, ask, buy_ps, sell_ps =
         match a.kind with
         | Snapshot.Strategy s ->
@@ -96,7 +110,13 @@ let record_all_prices (snapshot : Snapshot.t) =
                so it is the only buy level available. *)
             if s.buy_price > 0.0 then [ s.buy_price ] else []
           in
-          s.market.bid, s.market.ask, buy_ps, order_prices s.sell_orders
+          let sell_ps =
+            s.sell_orders
+            |> List.filter (fun (o : Snapshot.order) ->
+              not (List.mem o.id perp_order_ids))
+            |> order_prices
+          in
+          s.market.bid, s.market.ask, buy_ps, sell_ps
         | Snapshot.Balance b -> b.bid, b.ask, [], order_prices b.sell_orders
       in
       let mid = if bid > 0.0 && ask > 0.0 then (bid +. ask) /. 2.0 else max bid ask in
@@ -133,10 +153,21 @@ let record_all_prices (snapshot : Snapshot.t) =
             || buy_ps <> last_snap.buy_ps
             || sell_ps <> last_snap.sell_ps
             || perp_mark <> last_snap.perp_mark
+            || perp_buy_ps <> last_snap.perp_buy_ps
+            || perp_sell_ps <> last_snap.perp_sell_ps
         in
         if should_push
         then (
-          let snap = { timestamp = now; mid_p = mid; buy_ps; sell_ps; perp_mark } in
+          let snap =
+            { timestamp = now
+            ; mid_p = mid
+            ; buy_ps
+            ; sell_ps
+            ; perp_mark
+            ; perp_buy_ps
+            ; perp_sell_ps
+            }
+          in
           Queue.push snap q;
           Hashtbl.replace last_snapshots a.key snap)))
     assets
@@ -237,6 +268,19 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       | Some s -> s.perp
       | None -> None
     in
+    (* Pending perp orders. The venue may also expose these through the spot pair's open
+       orders (order updates are keyed by the registered pair), so their ids are removed
+       from the spot lists below to avoid drawing the same target twice. *)
+    let perp_buy_orders, perp_sell_orders =
+      match perp_opt with
+      | Some p -> to_triples p.buy_orders, to_triples p.sell_orders
+      | None -> [], []
+    in
+    let perp_order_ids = Hashtbl.create 8 in
+    List.iter
+      (fun (id, _, _) -> Hashtbl.replace perp_order_ids id ())
+      (perp_buy_orders @ perp_sell_orders);
+    let not_perp_order (id, _, _) = not (Hashtbl.mem perp_order_ids id) in
     (* Sell orders: the strategy's own list, else the exchange feed. *)
     let sell_orders =
       match a.kind with
@@ -246,6 +290,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         else to_triples s.market.sell_orders
       | Snapshot.Balance b -> to_triples b.sell_orders
     in
+    let sell_orders = List.filter not_perp_order sell_orders in
     (* Accumulated holding, excluding pending sell quantity. *)
     let pending_sell_qty =
       List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 sell_orders
@@ -279,6 +324,26 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         match strat_opt with
         | Some s when s.buy_price > 0.0 -> [ s.buy_id, s.buy_price, s.buy_qty ], cap_low
         | _ -> [], false)
+    in
+    let buy_orders = List.filter not_perp_order buy_orders in
+    (* The perp-side close order: the order on the side that reduces the open position. A
+       short is closed by a buy, a long by a sell. Nearest to the mark wins when several
+       exits rest. *)
+    let perp_close_order =
+      match perp_opt with
+      | Some p when p.has_position ->
+        let exits = if p.qty < 0.0 then p.buy_orders else p.sell_orders in
+        let exits = List.filter (fun (o : Snapshot.order) -> o.price > 0.0) exits in
+        let dist (o : Snapshot.order) = abs_float (o.price -. p.mark) in
+        (match exits with
+         | [] -> None
+         | first :: rest ->
+           Some
+             (List.fold_left
+                (fun best o -> if dist o < dist best then o else best)
+                first
+                rest))
+      | _ -> None
     in
     (* Summary card: row 1 = strategy type, bid/mid/ask, holding; row 2 = last buy/sell
        fills, quote balance, accumulated quantity. *)
@@ -475,36 +540,47 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
             | Some r when Float.is_finite r -> Printf.sprintf "%.1f" r
             | _ -> "--"
           in
+          let close_item =
+            match perp_close_order with
+            | Some o ->
+              [ I.string a_dim " │ Close "
+              ; I.string a_yellow (format_price o.price)
+              ; I.string a_dim (" x" ^ format_qty o.qty)
+              ]
+            | None -> []
+          in
           [ close_row
               w
               (I.hcat
-                 [ I.string a_border " │"
-                 ; I.string a_label " Perp: "
-                 ; I.string a_magenta side
-                 ; I.string a_dim " "
-                 ; I.string a_bright qty
-                 ; I.string a_dim " @ "
-                 ; I.string a_text entry
-                 ; I.string a_dim " │ Notional "
-                 ; I.string a_text (format_usd p.notional)
-                 ; I.string a_dim " │ uPnL "
-                 ; I.string
-                     (if p.unrealized_pnl >= 0.0 then a_green else a_red)
-                     (format_pnl p.unrealized_pnl)
-                 ; I.string a_dim " │ Liq "
-                 ; I.string a_yellow liq
-                 ; I.string a_dim " │ Funding "
-                 ; I.string
-                     (if p.funding_apr >= 0.0 then a_green else a_red)
-                     (Printf.sprintf "%+.2f%%" (p.funding_apr *. 100.0))
-                 ; I.string a_dim " │ Basis "
-                 ; I.string a_text (Printf.sprintf "%+.1fbp" (p.premium *. 10000.0))
-                 ; I.string a_dim " │ Margin "
-                 ; I.string a_text (format_usd p.margin_used)
-                 ; I.string a_dim " (x"
-                 ; I.string a_text ratio
-                 ; I.string a_dim ")"
-                 ])
+                 ([ I.string a_border " │"
+                  ; I.string a_label " Perp: "
+                  ; I.string a_magenta side
+                  ; I.string a_dim " "
+                  ; I.string a_bright qty
+                  ; I.string a_dim " @ "
+                  ; I.string a_text entry
+                  ]
+                  @ close_item
+                  @ [ I.string a_dim " │ Notional "
+                    ; I.string a_text (format_usd p.notional)
+                    ; I.string a_dim " │ uPnL "
+                    ; I.string
+                        (if p.unrealized_pnl >= 0.0 then a_green else a_red)
+                        (format_pnl p.unrealized_pnl)
+                    ; I.string a_dim " │ Liq "
+                    ; I.string a_yellow liq
+                    ; I.string a_dim " │ Funding "
+                    ; I.string
+                        (if p.funding_apr >= 0.0 then a_green else a_red)
+                        (Printf.sprintf "%+.2f%%" (p.funding_apr *. 100.0))
+                    ; I.string a_dim " │ Basis "
+                    ; I.string a_text (Printf.sprintf "%+.1fbp" (p.premium *. 10000.0))
+                    ; I.string a_dim " │ Margin "
+                    ; I.string a_text (format_usd p.margin_used)
+                    ; I.string a_dim " (x"
+                    ; I.string a_text ratio
+                    ; I.string a_dim ")"
+                    ]))
           ]
       in
       let legend_row =
@@ -520,6 +596,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
              ; I.string a_magenta "── spot sells"
              ; I.string a_dim "  "
              ; I.string a_bright "── perp mark"
+             ; I.string a_dim "  "
+             ; I.string a_yellow "── perp orders"
              ])
       in
       let summary =
@@ -555,13 +633,15 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     let hist_buy_prices = List.concat_map (fun s -> s.buy_ps) hist_points in
     let hist_sell_prices = List.concat_map (fun s -> s.sell_ps) hist_points in
     let hist_perp_marks = List.filter_map (fun s -> s.perp_mark) hist_points in
+    let hist_perp_buy_prices = List.concat_map (fun s -> s.perp_buy_ps) hist_points in
+    let hist_perp_sell_prices = List.concat_map (fun s -> s.perp_sell_ps) hist_points in
     let current_perp_mark =
       match perp_opt with
       | Some p when p.mark > 0.0 -> Some p.mark
       | _ -> None
     in
-    (* Price scale covers all buy/sell orders, the fills, and the 15 minute historical mid
-       and order prices. *)
+    (* Price scale covers all buy/sell orders, the fills, the perp exits, and the 15
+       minute historical mid and order prices. *)
     let all_prices =
       (if mid > 0.0 then [ mid ] else [])
       @ (if last_buy_fill > 0.0 then [ last_buy_fill ] else [])
@@ -570,11 +650,15 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       @ hist_buy_prices
       @ hist_sell_prices
       @ hist_perp_marks
+      @ hist_perp_buy_prices
+      @ hist_perp_sell_prices
       @ (match current_perp_mark with
          | Some p -> [ p ]
          | None -> [])
       @ List.map (fun (_, p, _) -> p) buy_orders
       @ List.map (fun (_, p, _) -> p) sell_orders
+      @ List.map (fun (_, p, _) -> p) perp_buy_orders
+      @ List.map (fun (_, p, _) -> p) perp_sell_orders
     in
     let full_min_p, full_max_p =
       match all_prices with
@@ -592,7 +676,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       let buy_ps =
         List.filter_map
           (fun (_, p, _) -> if p < mid && p > 0.0 then Some p else None)
-          buy_orders
+          (buy_orders @ perp_buy_orders)
       in
       match buy_ps with
       | [] -> mid *. 0.985
@@ -602,7 +686,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       let sell_ps =
         List.filter_map
           (fun (_, p, _) -> if p > mid && p > 0.0 then Some p else None)
-          sell_orders
+          (sell_orders @ perp_sell_orders)
       in
       match sell_ps with
       | [] -> mid *. 1.015
@@ -956,6 +1040,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     let buy_grid = Array.make_matrix sub_w sub_h false in
     let sell_grid = Array.make_matrix sub_w sub_h false in
     let perp_grid = Array.make_matrix sub_w sub_h false in
+    let perp_order_grid = Array.make_matrix sub_w sub_h false in
     let mid_sub_y = Array.make sub_w (-1) in
     let perp_sub_y = Array.make sub_w (-1) in
     (* Connect pin traces across columns using one-to-one greedy matching within a small
@@ -1034,7 +1119,12 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
          (fun (_, p, _) ->
            let sy = price_to_sub_y p in
            draw_line sell_grid 0 sy (sub_w - 1) sy)
-         sell_orders
+         sell_orders;
+       List.iter
+         (fun (_, p, _) ->
+           let sy = price_to_sub_y p in
+           draw_line perp_order_grid 0 sy (sub_w - 1) sy)
+         (perp_buy_orders @ perp_sell_orders)
      | pts ->
        let t_earliest = (List.hd pts).timestamp in
        let rec mid_at_t target_t = function
@@ -1061,6 +1151,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
        in
        let buy_sub_y_list = Array.make sub_w [] in
        let sell_sub_y_list = Array.make sub_w [] in
+       let perp_buy_sub_y_list = Array.make sub_w [] in
+       let perp_sell_sub_y_list = Array.make sub_w [] in
        let rec perp_at_t target_t = function
          | [] -> current_perp_mark
          | [ s0 ] -> s0.perp_mark
@@ -1093,7 +1185,9 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
            match snap_at_t target_t pts with
            | Some snap ->
              buy_sub_y_list.(sx) <- List.map price_to_sub_y snap.buy_ps;
-             sell_sub_y_list.(sx) <- List.map price_to_sub_y snap.sell_ps
+             sell_sub_y_list.(sx) <- List.map price_to_sub_y snap.sell_ps;
+             perp_buy_sub_y_list.(sx) <- List.map price_to_sub_y snap.perp_buy_ps;
+             perp_sell_sub_y_list.(sx) <- List.map price_to_sub_y snap.perp_sell_ps
            | None -> ())
        done;
        (* Interpolate the mid price curve across consecutive columns. *)
@@ -1111,9 +1205,11 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
        then (
          let sy_last = mid_sub_y.(sub_w - 1) in
          draw_line mid_grid (sub_w - 1) sy_last (sub_w - 1) sy_last;
-         (* Interpolate the buy and sell order level pin traces across columns. *)
+         (* Interpolate the buy, sell, and perp order level pin traces across columns. *)
          connect_pin_traces buy_grid buy_sub_y_list;
-         connect_pin_traces sell_grid sell_sub_y_list);
+         connect_pin_traces sell_grid sell_sub_y_list;
+         connect_pin_traces perp_order_grid perp_buy_sub_y_list;
+         connect_pin_traces perp_order_grid perp_sell_sub_y_list);
        for sx = 0 to sub_w - 2 do
          let sy0 = perp_sub_y.(sx) in
          let sy1 = perp_sub_y.(sx + 1) in
@@ -1155,6 +1251,22 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         | _ -> None)
       else None
     in
+    (* Perp exit/entry orders grouped by canvas row. *)
+    let perp_order_rows orders =
+      let by_row = Hashtbl.create 8 in
+      List.iter
+        (fun (id, p, q) ->
+          let r = price_to_row p in
+          let existing =
+            try Hashtbl.find by_row r with
+            | Not_found -> []
+          in
+          Hashtbl.replace by_row r ((id, p, q) :: existing))
+        orders;
+      by_row
+    in
+    let perp_buy_by_row = perp_order_rows perp_buy_orders in
+    let perp_sell_by_row = perp_order_rows perp_sell_orders in
     (* Y-axis tick rows: always the mid and order rows, plus every 4th row that is not
        adjacent to a labeled row. *)
     let show_y_label = Array.make canvas_h false in
@@ -1172,6 +1284,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
      | None -> ());
     Hashtbl.iter (fun r _ -> show_y_label.(r) <- true) buy_by_row;
     Hashtbl.iter (fun r _ -> show_y_label.(r) <- true) sell_by_row;
+    Hashtbl.iter (fun r _ -> show_y_label.(r) <- true) perp_buy_by_row;
+    Hashtbl.iter (fun r _ -> show_y_label.(r) <- true) perp_sell_by_row;
     for r = 0 to canvas_h - 1 do
       if (not show_y_label.(r)) && (r = 0 || r = canvas_h - 1 || r mod 4 = 0)
       then (
@@ -1216,6 +1330,30 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         by_row
         []
     in
+    (* Perp flags name the role of the order relative to the open position: the side that
+       reduces it is the exit whose price closes the trade. *)
+    let perp_flag_specs by_row is_buy =
+      let role =
+        match perp_opt with
+        | Some p when p.has_position -> if p.qty < 0.0 = is_buy then "CLOSE" else "ADD"
+        | _ -> if is_buy then "BUY" else "SELL"
+      in
+      Hashtbl.fold
+        (fun row orders acc ->
+          if orders = []
+          then acc
+          else (
+            let count = List.length orders in
+            let total_q = List.fold_left (fun acc (_, _, q) -> acc +. q) 0.0 orders in
+            let avg_p =
+              List.fold_left (fun acc (_, p, _) -> acc +. p) 0.0 orders /. float count
+            in
+            let count_str = if count > 1 then string_of_int count else "" in
+            let text = Printf.sprintf "◆P %s%s %.6g %.4g" role count_str avg_p total_q in
+            (row, [ a_yellow, text ]) :: acc))
+        by_row
+        []
+    in
     let specs =
       [ mid_row, [ a_green, Printf.sprintf "◆ LIVE %s" (format_price mid) ] ]
       @ (match perp_row_opt with
@@ -1223,6 +1361,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
          | None -> [])
       @ order_flag_specs a_cyan "B" buy_by_row
       @ order_flag_specs a_magenta "S" sell_by_row
+      @ perp_flag_specs perp_buy_by_row true
+      @ perp_flag_specs perp_sell_by_row false
       |> List.sort (fun (a, _) (b, _) -> compare a b)
     in
     let occupied = Array.make canvas_h false in
@@ -1281,6 +1421,14 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         let is_sell_l = s_orders_l <> [] in
         let is_buy_l = Some r = buy_row_opt || b_orders_l <> [] in
         let is_perp_l = Some r = perp_row_opt in
+        let p_orders_l =
+          (try Hashtbl.find perp_buy_by_row r with
+           | Not_found -> [])
+          @
+          try Hashtbl.find perp_sell_by_row r with
+          | Not_found -> []
+        in
+        let is_perp_ord_l = p_orders_l <> [] in
         let y_label_str =
           if show_y_label.(r)
           then pad_left 11 (format_price label_prices.(r))
@@ -1296,6 +1444,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
             else A.(fg c_cyan ++ bg c_bg ++ st bold)
           else if is_sell_l
           then A.(fg c_magenta ++ bg c_bg ++ st bold)
+          else if is_perp_ord_l
+          then A.(fg c_yellow ++ bg c_bg ++ st bold)
           else if is_perp_l
           then A.(fg c_bright ++ bg c_bg ++ st bold)
           else if is_grid_line
@@ -1314,6 +1464,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
             let buy_mask = ref 0 in
             let sell_mask = ref 0 in
             let perp_mask = ref 0 in
+            let perp_ord_mask = ref 0 in
             for sub_y = 0 to 3 do
               let current_sy = cell_sy_start + sub_y in
               if current_sy >= 0 && current_sy < sub_h
@@ -1333,7 +1484,11 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
                 if perp_grid.(sx0).(current_sy)
                 then perp_mask := !perp_mask lor braille_bit 0 sub_y;
                 if perp_grid.(sx1).(current_sy)
-                then perp_mask := !perp_mask lor braille_bit 1 sub_y)
+                then perp_mask := !perp_mask lor braille_bit 1 sub_y;
+                if perp_order_grid.(sx0).(current_sy)
+                then perp_ord_mask := !perp_ord_mask lor braille_bit 0 sub_y;
+                if perp_order_grid.(sx1).(current_sy)
+                then perp_ord_mask := !perp_ord_mask lor braille_bit 1 sub_y)
             done;
             let valid_sy =
               if mid_sy0 >= 0 && mid_sy1 >= 0
@@ -1355,12 +1510,14 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
                 (min 1.0 (fill_dist *. (1.5 +. live_pulse)))
             in
             let bg_attr = if is_in_liquid then A.bg fill_rgb else A.bg c_bg in
-            let combined_mask = !mid_mask lor !buy_mask lor !sell_mask lor !perp_mask in
+            let combined_mask =
+              !mid_mask lor !buy_mask lor !sell_mask lor !perp_mask lor !perp_ord_mask
+            in
             if combined_mask <> 0
             then (
               let str = braille_to_utf8 combined_mask in
               (* Overlapping traces collapse to the theme's dominant trace color (mid
-                 wins, then buy/sell); colors are theme-derived. *)
+                 wins, then perp orders, then buy/sell); colors are theme-derived. *)
               let fg_color =
                 if !perp_mask <> 0 && !mid_mask = 0 && !buy_mask = 0 && !sell_mask = 0
                 then c_bright
@@ -1368,10 +1525,12 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
                 then c_green
                 else if !mid_mask <> 0 && !sell_mask <> 0
                 then c_green
-                else if !buy_mask <> 0 && !sell_mask <> 0
-                then c_cyan
                 else if !mid_mask <> 0
                 then c_green
+                else if !perp_ord_mask <> 0
+                then c_yellow
+                else if !buy_mask <> 0 && !sell_mask <> 0
+                then c_cyan
                 else if !buy_mask <> 0
                 then if is_synthetic_buy then c_yellow else c_cyan
                 else if !sell_mask <> 0
@@ -1476,11 +1635,15 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     in
     let num_sells = List.length sell_orders in
     let num_buys = List.length buy_orders in
+    let num_perp_orders = List.length perp_buy_orders + List.length perp_sell_orders in
     let buy_summary_str =
       if is_synthetic_buy then "1 Est Buy" else Printf.sprintf "%d Buy" num_buys
     in
+    let perp_summary_str =
+      if num_perp_orders = 0 then "" else Printf.sprintf ", %d Perp" num_perp_orders
+    in
     let orders_summary =
-      Printf.sprintf "(%d Sell, %s pending)" num_sells buy_summary_str
+      Printf.sprintf "(%d Sell, %s%s pending)" num_sells buy_summary_str perp_summary_str
     in
     let graph_title =
       section_title w ("LIVE EXCHANGE ORDERBOOK & 15M PRICE HISTORY " ^ orders_summary)

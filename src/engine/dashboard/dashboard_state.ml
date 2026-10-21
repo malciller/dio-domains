@@ -627,6 +627,26 @@ let json_of_perp ~exchange ~coin =
       | _ -> abs_float (qty *. mark)
     in
     let side = if qty < 0.0 then "short" else if qty > 0.0 then "long" else "flat" in
+    let perp_orders =
+      try Mc.get_open_orders ~coin with
+      | _ -> []
+    in
+    let order_json side_filter =
+      `List
+        (perp_orders
+         |> List.filter (fun (o : Exchange.Types.open_order) ->
+           o.side = side_filter && o.remaining_qty > 0.0)
+         |> List.filter_map (fun (o : Exchange.Types.open_order) ->
+           match o.limit_price with
+           | Some price when price > 0.0 ->
+             Some
+               (`Assoc
+                 [ "id", `String o.order_id
+                 ; "price", `Float price
+                 ; "qty", `Float o.remaining_qty
+                 ])
+           | _ -> None))
+    in
     let fopt f =
       match f with
       | Some v -> `Float v
@@ -645,6 +665,8 @@ let json_of_perp ~exchange ~coin =
       ; "abs_qty", `Float (abs_float qty)
       ; "entry", `Float entry
       ; "notional", `Float notional
+      ; "buy_orders", order_json Exchange.Types.Buy
+      ; "sell_orders", order_json Exchange.Types.Sell
       ; ( "unrealized_pnl"
         , `Float
             (match position with

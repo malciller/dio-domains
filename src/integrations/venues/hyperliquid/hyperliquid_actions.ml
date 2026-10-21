@@ -391,7 +391,18 @@ let place_order
 (** Amends an existing order by order_id on Hyperliquid via WebSocket with retry. Submits
     a "modify" action with updated price, size, and side. Returns the original and
     potentially new order ID on success. *)
-let amend_order ~symbol ~order_id ~is_buy ~px ~sz ?cl_ord_id ~testnet () =
+let amend_order
+  ~symbol
+  ~order_id
+  ~is_buy
+  ~px
+  ~sz
+  ?cl_ord_id
+  ?(reduce_only = false)
+  ?(tif = Alo)
+  ~testnet
+  ()
+  =
   let amend_order_once () =
     let asset_index =
       match Hyperliquid_instruments_feed.get_asset_index symbol with
@@ -403,8 +414,8 @@ let amend_order ~symbol ~order_id ~is_buy ~px ~sz ?cl_ord_id ~testnet () =
       ; b = is_buy
       ; p = format_number px
       ; s = format_number sz
-      ; r = false
-      ; t = Limit { tif = Alo }
+      ; r = reduce_only
+      ; t = Limit { tif }
       ; c = cl_ord_id
       }
     in
@@ -415,8 +426,8 @@ let amend_order ~symbol ~order_id ~is_buy ~px ~sz ?cl_ord_id ~testnet () =
       ; "b", `Bool is_buy
       ; "p", `String (format_number px)
       ; "s", `String (format_number sz)
-      ; "r", `Bool false
-      ; "t", `Assoc [ "limit", `Assoc [ "tif", `String "Alo" ] ]
+      ; "r", `Bool reduce_only
+      ; "t", `Assoc [ "limit", `Assoc [ "tif", `String (tif_to_string tif) ] ]
       ]
     in
     let order_json =

@@ -68,6 +68,30 @@ let test_data_accessors_empty () =
   Alcotest.(check (float 0.000001)) "no balance" 0.0 bal
 ;;
 
+let test_spot_view_excludes_perp () =
+  ExecFeed.initialize [ "MODPERP"; "MODPERP/USDC" ];
+  ExecFeed.inject_open_orders
+    (`List
+      [ `Assoc
+          [ "coin", `String "MODPERP"
+          ; "oid", `Int 777
+          ; "side", `String "B"
+          ; "limitPx", `String "90.0"
+          ; "origSz", `String "1.0"
+          ; "timestamp", `Int 1_000_000
+          ]
+      ]);
+  let spot = Hyperliquid.Module.Hyperliquid_impl.get_open_orders ~symbol:"MODPERP/USDC" in
+  Alcotest.(check int) "spot pair has no perp order" 0 (List.length spot);
+  let perp = Hyperliquid.Module.Hyperliquid_impl.get_open_orders ~symbol:"MODPERP" in
+  Alcotest.(check int) "perp view has the order" 1 (List.length perp);
+  let seen = ref [] in
+  Hyperliquid.Module.Hyperliquid_impl.iter_open_orders_fast
+    ~symbol:"MODPERP/USDC"
+    (fun id _ _ _ _ -> seen := id :: !seen);
+  Alcotest.(check bool) "spot iterator skips the perp order" false (List.mem "777" !seen)
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Module"
@@ -80,6 +104,8 @@ let () =
         ; Alcotest.test_case "side conversions" `Quick test_side_conversions
         ] )
     ; ( "data_access"
-      , [ Alcotest.test_case "empty data accessors" `Quick test_data_accessors_empty ] )
+      , [ Alcotest.test_case "empty data accessors" `Quick test_data_accessors_empty
+        ; Alcotest.test_case "spot view excludes perp" `Quick test_spot_view_excludes_perp
+        ] )
     ]
 ;;

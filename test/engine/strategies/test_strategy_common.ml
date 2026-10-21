@@ -176,6 +176,24 @@ let test_queue_batch_read_empty () =
   Alcotest.(check bool) "empty batch" true (batch = [])
 ;;
 
+let test_create_amend_order_preserves_flags () =
+  let order =
+    Dio_strategies.Strategy_api.create_amend_order
+      ~reduce_only:true
+      ~time_in_force:"IOC"
+      "oid-1"
+      "TEST/USDC"
+      Dio_strategies.Strategy_common.Buy
+      1.0
+      (Some 10.0)
+      false
+      Dio_strategies.Strategy_common.Carry
+      "kraken"
+  in
+  Alcotest.(check bool) "reduce only preserved" true order.reduce_only;
+  Alcotest.(check string) "tif preserved" "IOC" order.time_in_force
+;;
+
 let () =
   Alcotest.run
     "Strategy Common"
@@ -189,6 +207,10 @@ let () =
     ; ( "orders"
       , [ Alcotest.test_case "strategy order creation" `Quick test_strategy_order_creation
         ; Alcotest.test_case "strategy order variants" `Quick test_strategy_order_variants
+        ; Alcotest.test_case
+            "amend preserves reduce-only and tif"
+            `Quick
+            test_create_amend_order_preserves_flags
         ] )
     ; ( "lockfreequeue"
       , [ Alcotest.test_case "queue creation" `Quick test_queue_creation

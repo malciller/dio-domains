@@ -147,7 +147,6 @@ let known_top_level_keys =
   ; "latency_spike_report_seconds"
   ; "latency_network_spike_threshold_us"
   ; "trading"
-  ; "overlays"
   ; "gc"
   ; "oracle"
   ; "fng_check_threshold"
@@ -205,6 +204,7 @@ let known_trading_keys =
   ; "base_accumulation"
   ; "sell_levels"
   ; "cpu_priority"
+  ; "overlay"
   ]
 ;;
 
@@ -574,9 +574,11 @@ let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
       }
 ;;
 
-(** Optional top-level [overlays] entries. Each is a second strategy file run in the same
-    asset domain as the primary strategy, so an overlay can read the same account/state
-    without spawning a competing domain. Keyed by [exchange|symbol].
+(** Optional [overlay] object inside a "trading" entry. Each is a second strategy file run
+    in the same asset domain as the primary strategy, so an overlay can read the same
+    account/state without spawning a competing domain. The overlay is scoped to the entry
+    that owns it: it inherits that entry's exchange and symbol, so neither has to be
+    repeated. [exchange]/[symbol] may still be written but must match the owning entry.
 
     This is deliberately generic: the engine does not know what an overlay does, only that
     the named file is loaded and cycled after the primary strategy. *)
@@ -584,14 +586,36 @@ let overlay_strategy_table : (string, string) Hashtbl.t = Hashtbl.create 8
 
 let overlay_key ~exchange ~symbol = exchange ^ "|" ^ symbol
 
-(** Per-asset carry policy. Percentages are whole numbers in config.json (25, 10, 75, 1);
-    [min_liq_mult] is a multiple of the mark (2.5). *)
+(** Permitted keys of a trading entry's optional [overlay] object. *)
+let known_overlay_keys = [ "strategy"; "exchange"; "symbol"; "params" ]
+
+(** Permitted keys of the [overlay.params] object. These are specific to the built-in
+    carry overlay; custom overlays read their own [tunable:] defaults instead. *)
+let known_overlay_param_keys =
+  [ "start_ratio_pct"
+  ; "add_threshold_pct"
+  ; "max_ratio_pct"
+  ; "recycle_profit_pct"
+  ; "recycle_base_share_pct"
+  ; "min_entry_margin_ratio"
+  ; "min_liq_mult"
+  ; "leverage"
+  ]
+;;
+
+(** Per-asset carry policy. Percentages are whole numbers in config.json (25, 10, 75, 1,
+    50); [min_liq_mult] is a multiple of the mark (2.5), [min_entry_margin_ratio] is a
+    margin ratio (2.0), and [leverage] seeds the fill-time take-profit before the first
+    position snapshot (0 means unknown). *)
 type overlay_params =
   { start_ratio_pct : float
   ; add_threshold_pct : float
   ; max_ratio_pct : float
   ; recycle_profit_pct : float
+  ; recycle_base_share_pct : float
+  ; min_entry_margin_ratio : float
   ; min_liq_mult : float
+  ; leverage : float
   }
 
 let default_overlay_params =
@@ -599,7 +623,10 @@ let default_overlay_params =
   ; add_threshold_pct = 10.0
   ; max_ratio_pct = 75.0
   ; recycle_profit_pct = 1.0
+  ; recycle_base_share_pct = 50.0
+  ; min_entry_margin_ratio = 2.0
   ; min_liq_mult = 2.5
+  ; leverage = 0.0
   }
 ;;
 
@@ -610,8 +637,7 @@ type overlay_entry =
   ; oe_params : overlay_params
   }
 
-(** Overlay entries in config.json order. The first entry for an exchange owns the
-    portfolio-level liquidation reserve. *)
+(** Overlay entries in config.json order. *)
 let overlay_entries : overlay_entry list ref = ref []
 
 let get_overlay_strategy ~exchange ~symbol =
@@ -626,12 +652,6 @@ let get_overlay_strategy ~exchange ~symbol =
       !overlay_entries
 ;;
 
-let get_overlay_entries ~exchange =
-  List.filter
-    (fun (e : overlay_entry) -> String.equal e.oe_exchange exchange)
-    !overlay_entries
-;;
-
 let get_overlay_params ~exchange ~symbol =
   match
     List.find_opt
@@ -643,23 +663,15 @@ let get_overlay_params ~exchange ~symbol =
   | None -> default_overlay_params
 ;;
 
-(** The first configured overlay for the exchange owns the account-level liquidation
-    reserve. The other overlays reserve zero for the perp collateral. *)
-let is_overlay_owner ~exchange ~symbol =
-  match get_overlay_entries ~exchange with
-  | e :: _ -> String.equal e.oe_symbol symbol
-  | [] -> true
-;;
-
 let parse_overlays json =
   Hashtbl.reset overlay_strategy_table;
   overlay_entries := [];
-  let params_of_entry entry =
-    let open Yojson.Basic.Util in
+  let open Yojson.Basic.Util in
+  let params_of_overlay overlay =
     let p name default =
-      match member "params" entry with
+      match overlay |> member "params" with
       | `Assoc _ as params ->
-        (match member name params with
+        (match params |> member name with
          | (`Int _ | `Float _) as v -> Option.value (to_float_opt v) ~default
          | _ -> default)
       | _ -> default
@@ -669,37 +681,85 @@ let parse_overlays json =
     ; max_ratio_pct = p "max_ratio_pct" default_overlay_params.max_ratio_pct
     ; recycle_profit_pct =
         p "recycle_profit_pct" default_overlay_params.recycle_profit_pct
+    ; recycle_base_share_pct =
+        p "recycle_base_share_pct" default_overlay_params.recycle_base_share_pct
+    ; min_entry_margin_ratio =
+        p "min_entry_margin_ratio" default_overlay_params.min_entry_margin_ratio
     ; min_liq_mult = p "min_liq_mult" default_overlay_params.min_liq_mult
+    ; leverage = p "leverage" default_overlay_params.leverage
     }
   in
-  match json |> Yojson.Basic.Util.member "overlays" with
-  | `List entries ->
-    List.iter
-      (fun entry ->
-        try
-          let open Yojson.Basic.Util in
-          let strategy = entry |> member "strategy" |> to_string in
+  let register ~exchange ~symbol overlay =
+    let strategy =
+      overlay |> member "strategy" |> to_string_option |> Option.value ~default:""
+    in
+    (* The overlay always runs in the owning entry's domain; repeating the routed
+       exchange/symbol is allowed but a mismatch would bind nothing, so reject it. *)
+    (match overlay |> member "exchange" |> to_string_option with
+     | Some declared when not (String.equal declared exchange) ->
+       Logging.critical_f
+         ~section
+         "Overlay for %s/%s declares exchange '%s'; an overlay runs on the exchange of \
+          the trading entry that owns it"
+         exchange
+         symbol
+         declared;
+       exit 1
+     | _ -> ());
+    (match overlay |> member "symbol" |> to_string_option with
+     | Some declared when not (String.equal declared symbol) ->
+       Logging.critical_f
+         ~section
+         "Overlay for %s/%s declares symbol '%s'; drop the overlay's \"symbol\" key to \
+          inherit it from the owning trading entry"
+         exchange
+         symbol
+         declared;
+       exit 1
+     | _ -> ());
+    if strategy <> ""
+    then (
+      let params = params_of_overlay overlay in
+      Hashtbl.replace overlay_strategy_table (overlay_key ~exchange ~symbol) strategy;
+      overlay_entries
+      := { oe_strategy = strategy
+         ; oe_exchange = exchange
+         ; oe_symbol = symbol
+         ; oe_params = params
+         }
+         :: !overlay_entries)
+  in
+  let entries =
+    match json |> member "trading" with
+    | `List entries -> entries
+    | _ -> []
+  in
+  List.iter
+    (fun entry ->
+      try
+        match entry |> member "overlay" with
+        | `Assoc _ as overlay ->
           let exchange = entry |> member "exchange" |> to_string in
           let symbol = entry |> member "symbol" |> to_string in
-          if strategy <> "" && exchange <> "" && symbol <> ""
-          then (
-            let params = params_of_entry entry in
-            Hashtbl.replace
-              overlay_strategy_table
-              (overlay_key ~exchange ~symbol)
-              strategy;
-            overlay_entries
-            := { oe_strategy = strategy
-               ; oe_exchange = exchange
-               ; oe_symbol = symbol
-               ; oe_params = params
-               }
-               :: !overlay_entries)
-        with
-        | _ -> ())
-      entries;
-    overlay_entries := List.rev !overlay_entries
-  | _ -> ()
+          if validate_keys
+               ~context:(Printf.sprintf "overlay for %s/%s" exchange symbol)
+               ~allowed:known_overlay_keys
+               overlay
+          then exit 1;
+          (match overlay |> member "params" with
+           | `Assoc _ as params ->
+             if validate_keys
+                  ~context:(Printf.sprintf "overlay params for %s/%s" exchange symbol)
+                  ~allowed:known_overlay_param_keys
+                  params
+             then exit 1
+           | _ -> ());
+          register ~exchange ~symbol overlay
+        | _ -> ()
+      with
+      | _ -> ())
+    entries;
+  overlay_entries := List.rev !overlay_entries
 ;;
 
 let read_config () : config =

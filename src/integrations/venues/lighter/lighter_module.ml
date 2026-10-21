@@ -98,6 +98,8 @@ module Lighter_impl = struct
     ?qty
     ?limit_price
     ?post_only:_
+    ?reduce_only:_
+    ?time_in_force:_
     ?trigger_price:_
     ?display_qty:_
     ?symbol

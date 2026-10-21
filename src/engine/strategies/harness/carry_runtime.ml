@@ -26,6 +26,12 @@ let getf rt key default =
   | _ -> default
 ;;
 
+let getp rt key default =
+  match Rt.get_platform rt key with
+  | Expr.V_float f -> f
+  | _ -> default
+;;
+
 let getb rt key default =
   match Rt.get_state rt key with
   | Expr.V_bool b -> b
@@ -98,6 +104,7 @@ let snapshot rt (st : Store.t) ~now =
     ; recycle_realized_seen = getf rt "recycle_realized_seen" st.recycle_realized_seen
     ; spot_seq_seen = geti rt "spot_seq_seen" st.spot_seq_seen
     ; last_recycle_base = getf rt "last_recycle_base" st.last_recycle_base
+    ; last_leverage = getp rt "perp_leverage" st.last_leverage
     }
   in
   if next = st then st else { next with updated_at = now }

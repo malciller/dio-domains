@@ -75,6 +75,8 @@ type perp =
   ; withdrawable : float
   ; margin_ratio : float option
   ; updated_at : float
+  ; buy_orders : order list
+  ; sell_orders : order list
   }
 
 type strategy =
@@ -287,6 +289,8 @@ let parse_perp j =
   ; withdrawable = f "withdrawable"
   ; margin_ratio = opt "margin_ratio"
   ; updated_at = f "updated_at"
+  ; buy_orders = parse_orders (j |?> "buy_orders")
+  ; sell_orders = parse_orders (j |?> "sell_orders")
   }
 ;;
 

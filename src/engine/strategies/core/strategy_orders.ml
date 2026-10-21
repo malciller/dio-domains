@@ -151,6 +151,8 @@ let create_place_order
 (** Constructs an Amend strategy_order targeting [order_id]. *)
 let create_amend_order
   ?(dup_key = "")
+  ?(reduce_only = false)
+  ?time_in_force
   order_id
   asset_symbol
   side
@@ -169,9 +171,9 @@ let create_amend_order
   ; order_type = "limit"
   ; qty
   ; price
-  ; time_in_force = ecfg.time_in_force
+  ; time_in_force = Option.value time_in_force ~default:ecfg.time_in_force
   ; post_only
-  ; reduce_only = false
+  ; reduce_only
   ; userref = None
   ; strategy
   ; duplicate_key = dup_key

@@ -179,6 +179,18 @@ let register_test_instrument ~symbol ~sz_decimals =
   publish_cache_locked ()
 ;;
 
+(** Whether [symbol] names a perpetual instrument. Unlike {!lookup_info} this never falls
+    back to the base name, so a spot pair such as [HYPE/USDC] is not mistaken for its
+    perpetual [HYPE]. Venue payloads use the bare coin for perps and [@N] aliases for
+    spot; the fallback covers the window before instrument metadata has loaded. *)
+let is_perp_coin symbol =
+  let cache = Atomic.get published_cache in
+  match Hashtbl.find_opt cache symbol with
+  | Some info -> info.max_leverage <> None
+  | None ->
+    (not (String.contains symbol '/')) && not (String.starts_with ~prefix:"@" symbol)
+;;
+
 (** Looks up instrument info by symbol from the published snapshot (lock-free). Falls back
     to the base name (strip "/QUOTE") to resolve perpetuals. Spot pairs are keyed by full
     "BASE/QUOTE" with [asset_index >= 10000]. *)

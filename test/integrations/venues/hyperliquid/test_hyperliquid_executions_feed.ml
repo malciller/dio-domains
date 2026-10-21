@@ -169,6 +169,88 @@ let test_get_all_symbols () =
   Alcotest.(check bool) "has SYM_B" true has_b
 ;;
 
+let test_perp_orders_classified () =
+  Hyperliquid.Executions_feed.initialize [ "PERPT"; "PERPT/USDC" ];
+  (* A perp placement is injected under the bare coin. *)
+  Hyperliquid.Executions_feed.inject_order
+    ~symbol:"PERPT"
+    ~order_id:"perp_live"
+    ~side:Hyperliquid.Executions_feed.Buy
+    ~qty:1.0
+    ~price:95.0
+    ();
+  (* Spot orders on the same asset must not be reported as perp. *)
+  Hyperliquid.Executions_feed.inject_order
+    ~symbol:"PERPT/USDC"
+    ~order_id:"spot_live"
+    ~side:Hyperliquid.Executions_feed.Sell
+    ~qty:1.0
+    ~price:120.0
+    ();
+  (* The startup snapshot keys perp orders by the registered spot pair; the venue coin is
+     still what classifies them. It also sweeps orders it did not see, so the injected
+     checks run first. *)
+  let ids_of orders =
+    List.map (fun (o : Hyperliquid.Executions_feed.open_order) -> o.order_id) orders
+  in
+  let perp_before = Hyperliquid.Executions_feed.get_perp_open_orders ~coin:"PERPT" in
+  Alcotest.(check bool)
+    "injected perp order present"
+    true
+    (List.mem "perp_live" (ids_of perp_before));
+  Alcotest.(check bool)
+    "spot order excluded"
+    false
+    (List.mem "spot_live" (ids_of perp_before));
+  Hyperliquid.Executions_feed.inject_open_orders
+    (`List
+      [ `Assoc
+          [ "coin", `String "PERPT"
+          ; "oid", `Int 4242
+          ; "side", `String "B"
+          ; "limitPx", `String "90.0"
+          ; "origSz", `String "2.0"
+          ; "timestamp", `Int 1_000_000
+          ]
+      ]);
+  let perp = Hyperliquid.Executions_feed.get_perp_open_orders ~coin:"PERPT" in
+  let ids = ids_of perp in
+  Alcotest.(check int) "snapshot perp order returned" 1 (List.length perp);
+  Alcotest.(check bool) "snapshot perp order present" true (List.mem "4242" ids);
+  Alcotest.(check bool)
+    "spot order excluded after snapshot"
+    false
+    (List.mem "spot_live" ids);
+  (* The venue stores this perp order under the spot pair. The raw pair view sees it; the
+     spot-only view used by the grid must not. This is the duplicate-buy regression. *)
+  let raw_pair = ids_of (Hyperliquid.Executions_feed.get_open_orders "PERPT/USDC") in
+  Alcotest.(check bool) "raw pair sees the perp order" true (List.mem "4242" raw_pair);
+  let spot_pair =
+    ids_of (Hyperliquid.Executions_feed.get_spot_open_orders "PERPT/USDC")
+  in
+  Alcotest.(check bool)
+    "spot pair excludes the perp order"
+    false
+    (List.mem "4242" spot_pair);
+  let folded = ref [] in
+  Hyperliquid.Executions_feed.fold_spot_open_orders
+    "PERPT/USDC"
+    ~init:()
+    ~f:(fun () (o : Hyperliquid.Executions_feed.open_order) ->
+      folded := o.order_id :: !folded);
+  Alcotest.(check bool)
+    "spot fold excludes the perp order"
+    false
+    (List.mem "4242" !folded);
+  let changes, _ =
+    Hyperliquid.Executions_feed.drain_open_order_changes ~symbol:"PERPT/USDC"
+  in
+  Alcotest.(check bool)
+    "spot delta excludes the perp order"
+    false
+    (List.exists (fun (id, _) -> String.equal id "4242") changes)
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Executions Feed"
@@ -185,6 +267,7 @@ let () =
             `Quick
             test_process_order_terminal_status
         ; Alcotest.test_case "find_order_everywhere" `Quick test_find_order_everywhere
+        ; Alcotest.test_case "perp orders classified" `Quick test_perp_orders_classified
         ] )
     ]
 ;;

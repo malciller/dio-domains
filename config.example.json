@@ -38,7 +38,15 @@
       "accumulation_buffer": [
         0.1,
         0.5
-      ]
+      ],
+      "overlay": {
+        "strategy": "carry_overlay",
+        "params": {
+          "start_ratio_pct": 25,
+          "add_threshold_pct": 10,
+          "max_ratio_pct": 75
+        }
+      }
     },
     {
       "symbol": "SPY",
@@ -54,6 +62,5 @@
       "sell_levels": true,
       "cpu_priority": 0
     }
-  ],
-  "overlays": []
+  ]
 }

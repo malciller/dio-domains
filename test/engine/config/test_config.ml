@@ -46,17 +46,77 @@ let test_parse_trading_config_optional_fields () =
 let test_parse_overlays () =
   let json =
     Yojson.Basic.from_string
-      {|{"overlays":[{"strategy":"carry_overlay","exchange":"hyperliquid","symbol":"BTC/USDC"}]}|}
+      {|{"trading":[
+        {"symbol":"BTC/USDC","exchange":"hyperliquid","overlay":{
+          "strategy":"carry_overlay",
+          "params":{"start_ratio_pct":30,"add_threshold_pct":8,"max_ratio_pct":80,
+                    "recycle_profit_pct":3,"recycle_base_share_pct":60,
+                    "min_entry_margin_ratio":2.5,"min_liq_mult":3.0,
+                    "leverage":10}}},
+        {"symbol":"HYPE/USDC","exchange":"hyperliquid"}]}|}
   in
   Dio_engine.Config.parse_overlays json;
   Alcotest.(check (option string))
-    "overlay bound"
+    "overlay bound to its owning entry"
     (Some "carry_overlay")
     (Dio_engine.Config.get_overlay_strategy ~exchange:"hyperliquid" ~symbol:"BTC/USDC");
   Alcotest.(check (option string))
-    "other symbol unbound"
+    "entry without overlay unbound"
     None
-    (Dio_engine.Config.get_overlay_strategy ~exchange:"hyperliquid" ~symbol:"HYPE/USDC")
+    (Dio_engine.Config.get_overlay_strategy ~exchange:"hyperliquid" ~symbol:"HYPE/USDC");
+  let p =
+    Dio_engine.Config.get_overlay_params ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
+  in
+  Alcotest.(check (float 1e-9)) "start ratio" 30.0 p.Dio_engine.Config.start_ratio_pct;
+  Alcotest.(check (float 1e-9))
+    "recycle base share"
+    60.0
+    p.Dio_engine.Config.recycle_base_share_pct;
+  Alcotest.(check (float 1e-9))
+    "entry margin ratio"
+    2.5
+    p.Dio_engine.Config.min_entry_margin_ratio;
+  Alcotest.(check (float 1e-9)) "leverage" 10.0 p.Dio_engine.Config.leverage
+;;
+
+let test_parse_overlay_params_defaults () =
+  let json =
+    Yojson.Basic.from_string
+      {|{"trading":[{"symbol":"ETH/USDC","exchange":"hyperliquid",
+        "overlay":{"strategy":"carry_overlay"}}]}|}
+  in
+  Dio_engine.Config.parse_overlays json;
+  let p =
+    Dio_engine.Config.get_overlay_params ~exchange:"hyperliquid" ~symbol:"ETH/USDC"
+  in
+  Alcotest.(check (float 1e-9))
+    "split default"
+    50.0
+    p.Dio_engine.Config.recycle_base_share_pct;
+  Alcotest.(check (float 1e-9))
+    "entry margin default"
+    2.0
+    p.Dio_engine.Config.min_entry_margin_ratio;
+  Alcotest.(check (float 1e-9)) "leverage default" 0.0 p.Dio_engine.Config.leverage
+;;
+
+let test_parse_overlay_accepts_repeated_owner () =
+  (* Repeating the owning entry's exchange/symbol is allowed; the symbol can be omitted,
+     which is the intended shape. *)
+  let json =
+    Yojson.Basic.from_string
+      {|{"trading":[{"symbol":"SOL/USD","exchange":"hyperliquid",
+        "overlay":{"strategy":"carry_overlay","exchange":"hyperliquid","symbol":"SOL/USD"}}]}|}
+  in
+  Dio_engine.Config.parse_overlays json;
+  Alcotest.(check (option string))
+    "explicit owner matches"
+    (Some "carry_overlay")
+    (Dio_engine.Config.get_overlay_strategy ~exchange:"hyperliquid" ~symbol:"SOL/USD");
+  Alcotest.(check (option string))
+    "no binding under the overlay's absent symbol elsewhere"
+    None
+    (Dio_engine.Config.get_overlay_strategy ~exchange:"hyperliquid" ~symbol:"BTC/USDC")
 ;;
 
 let test_parse_logging_config_valid () =
@@ -282,6 +342,19 @@ let test_parse_trading_config_cpu_priority () =
   Alcotest.(check int) "explicit cpu_priority parsed" 7 explicit.cpu_priority
 ;;
 
+let test_parse_trading_config_overlay_key () =
+  (* The optional [overlay] object belongs to the trading entry and is accepted here; the
+     side-effecting binding is done by [parse_overlays]. *)
+  let config =
+    Dio_engine.Config.parse_config
+      (Yojson.Basic.from_string
+         {|{"symbol": "BTC/USDC", "exchange": "hyperliquid", "qty": "1",
+            "strategy": "Ladder", "overlay": {"strategy": "carry_overlay"}}|})
+  in
+  Alcotest.(check string) "symbol" "BTC/USDC" config.symbol;
+  Alcotest.(check string) "strategy" "Ladder" config.strategy
+;;
+
 let () =
   Alcotest.run
     "Config"
@@ -293,6 +366,10 @@ let () =
             `Quick
             test_parse_trading_config_optional_fields
         ; Alcotest.test_case "cpu priority" `Quick test_parse_trading_config_cpu_priority
+        ; Alcotest.test_case
+            "overlay key accepted"
+            `Quick
+            test_parse_trading_config_overlay_key
         ] )
     ; ( "logging_config"
       , [ Alcotest.test_case "valid logging" `Quick test_parse_logging_config_valid
@@ -306,7 +383,14 @@ let () =
             `Quick
             test_parse_logging_config_empty_sections
         ] )
-    ; "overlays", [ Alcotest.test_case "parse and bind" `Quick test_parse_overlays ]
+    ; ( "overlays"
+      , [ Alcotest.test_case "parse and bind" `Quick test_parse_overlays
+        ; Alcotest.test_case "params defaults" `Quick test_parse_overlay_params_defaults
+        ; Alcotest.test_case
+            "repeated owner keys accepted"
+            `Quick
+            test_parse_overlay_accepts_repeated_owner
+        ] )
     ; "flow_log", [ Alcotest.test_case "parse section" `Quick test_parse_flow_log_config ]
     ; ( "oracle"
       , [ Alcotest.test_case "parse full section" `Quick test_parse_oracle_config_full
