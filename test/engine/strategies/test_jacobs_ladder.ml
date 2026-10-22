@@ -1256,6 +1256,109 @@ let test_ghost_buy_suppressed_within_ack_grace () =
     state.just_filled_buy
 ;;
 
+let test_repeated_ghost_buy_is_latched () =
+  (* REGRESSION (flapping open-orders feed): capital-exhaustion pause, phantom buy on the
+     dashboard. The venue feed dropped a resting buy and then re-listed it, so the scan
+     re-adopted the same id after the purge. Every cycle therefore alternated between "a
+     buy rests" (no replacement placed, phantom row) and "it vanished", and each purge
+     requested another user-state resync - which re-listed it. The second purge of the
+     same id must evict it from the scan and the adoption path. *)
+  let symbol = "GHOST2/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "kraken";
+  Sell_orders.clear state.open_sell_orders;
+  state.pending_orders <- [];
+  Hashtbl.clear state.sell_commitments;
+  Hashtbl.clear state.amend_cooldowns;
+  Hashtbl.clear state.evicted_orders;
+  Hashtbl.clear state.processed_fills;
+  Hashtbl.clear state.feed_buy_index;
+  state.feed_index_valid <- false;
+  state.last_ghost_buy_id <- "";
+  state.inflight_buy <- false;
+  state.inflight_cancel_buy <- false;
+  state.inflight_amend_buy <- false;
+  state.last_buy_order_id <- Some "flap-buy-1";
+  state.last_buy_order_price <- Some 100.0;
+  state.last_buy_ack_ts <- 0.0;
+  state.just_filled_buy <- false;
+  state.needs_resync <- false;
+  state.reserved_quote <- 5.0;
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "kraken"
+    ; symbol
+    ; qty = "0.1"
+    ; grid_interval = 0.5
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.001
+    ; taker_fee = Some 0.002
+    ; accumulation_buffer = 0.01
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
+  let now = Unix.gettimeofday () in
+  let feed = ref [] in
+  let iter_open_orders f = List.iter (fun (a, b, c, d, e) -> f a b c d e) !feed in
+  let run_scan () =
+    ignore
+      (Dio_strategies.Strategy_api.sync_open_orders
+         ~state
+         ~now
+         ~asset
+         ~bid_price:100.0
+         ~lot_qty:0.1
+         ~iter_open_orders
+         ~get_open_orders_generation:(fun () -> -1)
+         ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
+         ~ecfg)
+  in
+  let list = [ "flap-buy-1", 100.0, 0.1, "buy", None ] in
+  (* 1. Absent past the grace: a genuine ghost, cleared (no eviction yet - one purge may
+        still be ordinary feed lag). *)
+  run_scan ();
+  check bool "first ghost clears buy tracking" true (state.last_buy_order_id = None);
+  check
+    bool
+    "a single ghost is not evicted"
+    false
+    (Hashtbl.mem state.evicted_orders "flap-buy-1");
+  check bool "first ghost requests a resync" true state.needs_resync;
+  check bool "first ghost arms the owed sell" true state.just_filled_buy;
+  (* The worker drains the resync request; the feed then re-lists the same id. *)
+  state.needs_resync <- false;
+  feed := list;
+  run_scan ();
+  check
+    bool
+    "the flapping feed re-adopts the dropped id"
+    true
+    (state.last_buy_order_id = Some "flap-buy-1");
+  (* 2. The feed drops it again: same id, second purge. *)
+  state.needs_resync <- false;
+  state.just_filled_buy <- false;
+  feed := [];
+  run_scan ();
+  check
+    bool
+    "the repeat ghost evicts the flapping id"
+    true
+    (Hashtbl.mem state.evicted_orders "flap-buy-1");
+  check bool "a repeat ghost does not request another resync" false state.needs_resync;
+  (* 3. The feed re-lists it once more: the evicted id must not be adopted. *)
+  feed := list;
+  run_scan ();
+  check bool "the evicted phantom is not re-adopted" true (state.last_buy_order_id = None);
+  check
+    bool
+    "the evicted phantom is not counted in the buy index"
+    false
+    (Hashtbl.mem state.feed_buy_index "flap-buy-1")
+;;
+
 let test_position_ledger_bridges_unreflected_fill () =
   (* Over-accumulation desync: a buy fill fires the 1:1 sell before the venue's balance
      feed nets the fill. Sizing off the raw snapshot reads bal - reserved_base = dust and
@@ -7382,6 +7485,10 @@ let () =
             "freshly acked buy is not purged as a ghost within the grace"
             `Quick
             test_ghost_buy_suppressed_within_ack_grace
+        ; test_case
+            "a flapping feed cannot re-adopt a ghost buy"
+            `Quick
+            test_repeated_ghost_buy_is_latched
         ; test_case
             "position ledger bridges an unreflected buy fill"
             `Quick
