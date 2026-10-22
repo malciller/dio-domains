@@ -1243,7 +1243,7 @@ let order_replace
               ~instrument
               ~reduce_only
           in
-          if Strategy_common.has_tracked_carry_order ~key:tracked_key
+          if Strategy_common.has_tracked_carry_order ~key:tracked_key ()
           then
             Logging.debug_f
               ~section
