@@ -52,8 +52,61 @@ The published image targets `linux/amd64` and runs under emulation on Apple
 Silicon. The engine reads `config.json` and `.env` from the working directory and
 writes state to the `dio-data` volume.
 
-Full reference: [configuration](https://diophantsolutions.com/dio/CONFIGURATION/)
-and [deployment](https://diophantsolutions.com/dio/DEPLOYMENT/).
+## Configuration
+
+`config.json` is read from the working directory. It is JSONC: `//` and
+`/* */` comments, trailing commas, and a UTF-8 BOM are accepted. The schema is
+strict; an unknown key stops startup rather than silently trading something
+else. Once a configuration has loaded, a transient read or JSON syntax failure
+reuses it; schema errors still exit.
+
+Trading is grouped by asset. `trading.defaults` holds what is shared and
+`trading.assets` declares each asset's primary strategy, overlay, and
+balance-only inventory legs:
+
+```json
+"trading": {
+  "defaults": {
+    "strategy": {
+      "hyperliquid": { "name": "jacobs_ladder", "sell_mult": "0.98" }
+    },
+    "overlay": { "name": "carry_overlay", "exchange": "hyperliquid" },
+    "oracle": { "target_survival": 0.95, "qty_cap_mult": 1.5 }
+  },
+  "assets": [
+    {
+      "asset": "BTC",
+      "oracle": { "target_survival": 0.65 },
+      "strategy": {
+        "exchange": "hyperliquid",
+        "symbol": "BTC/USDC",
+        "qty": "0.0003"
+      },
+      "overlay": {
+        "leverage": 20,
+        "inventory": [{ "exchange": "kraken", "symbol": "BTC/USD" }]
+      }
+    }
+  ]
+}
+```
+
+- `defaults.strategy.<exchange>` merges into each asset's `strategy` section for
+  that venue; `defaults.overlay` merges into every `overlay`. Objects merge key
+  by key; a list or scalar replaces the default. `defaults.oracle` sets the
+  global oracle knobs.
+- In the grouped layout the strategy file name is `strategy.name`. The legacy
+  flat `trading` array is still accepted; there the file name is `strategy`.
+- An asset needs a `strategy`, an `overlay`, or both. An `oracle` override
+  requires a `strategy`, because overrides are keyed by its symbol.
+- `overlay.inventory` adds balance-only legs to the same hedge.
+- Fees are never assumed. Recognized venues resolve them at startup; a custom
+  exchange must set both `maker_fee` and `taker_fee`.
+
+The full key reference is the
+[configuration guide](https://diophantsolutions.com/dio/CONFIGURATION/); the
+[deployment guide](https://diophantsolutions.com/dio/DEPLOYMENT/) covers the
+container walkthrough.
 
 ## Executables
 
