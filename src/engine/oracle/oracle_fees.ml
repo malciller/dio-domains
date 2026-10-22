@@ -13,11 +13,15 @@ module Exchange = Dio_exchange.Exchange_intf
 
 let section = "oracle_fees"
 
-(* Last-resort generic fee, used only when no oracle adapter is registered for the venue
-   (pure/offline/test contexts). Registered venues use their own
-   [Exchange_intf.Oracle.S.default_fees]. *)
-let fallback_maker_fee = 0.0016
-let fallback_taker_fee = 0.0026
+(* No generic fallback: a venue without an oracle adapter has no authoritative rate.
+   Inventing one corrupts net-profit accounting; fail startup instead. *)
+let no_fee_source ~(exchange : string) ~(symbol : string) =
+  Printf.sprintf
+    "No fee source registered for exchange '%s' (%s). Register an oracle adapter or set \
+     maker_fee/taker_fee explicitly."
+    exchange
+    symbol
+;;
 
 (** Per-process cache of resolved (maker, taker) fees per (exchange, symbol).
 
@@ -38,28 +42,45 @@ let cached_fees ~(exchange : string) ~(symbol : string) : (float * float) option
   Ds.Cow_table.find_opt fee_cache (exchange, symbol)
 ;;
 
-(** Venue default (maker, taker) for [exchange]/[symbol]: the registered adapter's
-    [default_fees] when available, else the generic fallback. *)
-let venue_default_fees (exchange : string) (symbol : string) : float * float =
+(** Venue default (maker, taker) for [exchange]/[symbol], when an oracle adapter is
+    registered. [None] means there is no authoritative source - callers must fail rather
+    than assume a rate. *)
+let venue_default_fees_opt (exchange : string) (symbol : string) : (float * float) option =
   match Exchange.Oracle.Registry.get (String.lowercase_ascii exchange) with
-  | Some (module V) -> V.default_fees ~symbol
-  | None -> fallback_maker_fee, fallback_taker_fee
+  | Some (module V) -> Some (V.default_fees ~symbol)
+  | None -> None
 ;;
 
-(** Fetch (maker, taker) from the real exchange for one asset, through the venue's oracle
-    adapter. *)
+(** As {!venue_default_fees_opt}, raising when no adapter is registered. *)
+let venue_default_fees (exchange : string) (symbol : string) : float * float =
+  match venue_default_fees_opt exchange symbol with
+  | Some fees -> fees
+  | None -> failwith (no_fee_source ~exchange ~symbol)
+;;
+
+(** Default fees for a symbol, preferring the registered adapter and falling back to an
+    explicitly configured pair. Raises when neither exists. *)
+let default_or_configured_fees
+  ~(exchange : string)
+  ~(symbol : string)
+  ~(configured : (float * float) option)
+  : float * float
+  =
+  match venue_default_fees_opt exchange symbol with
+  | Some fees -> fees
+  | None ->
+    (match configured with
+     | Some fees -> fees
+     | None -> failwith (no_fee_source ~exchange ~symbol))
+;;
+
+(** Fetch (maker, taker) through the venue's oracle adapter; no adapter fails the fetch. *)
 let fetch_fees ~(exchange : string) ~(symbol : string) ~(testnet : bool)
   : (float * float) Lwt.t
   =
   match Exchange.Oracle.Registry.get (String.lowercase_ascii exchange) with
   | Some (module V) -> V.fetch_fees ~testnet ~symbol
-  | None ->
-    Logging.warn_f
-      ~section
-      "no live fee endpoint for exchange '%s'; using venue default maker %.4f%%"
-      exchange
-      (fallback_maker_fee *. 100.0);
-    Lwt.return (fallback_maker_fee, fallback_taker_fee)
+  | None -> Lwt.fail (Failure (no_fee_source ~exchange ~symbol))
 ;;
 
 (** Load .env (KRAKEN/HYPERLIQUID/ALPACA credentials) into the process env if present. *)

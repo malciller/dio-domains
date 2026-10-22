@@ -1224,10 +1224,11 @@ let handle_update json on_heartbeat =
               | None -> 0.0
             in
             let fee = fill_value *. maker_fee_rate in
+            let side_str = string_of_side event.side in
             Concurrency.Fill_event_bus.publish_fill
               { venue = "kraken"
               ; symbol = event.symbol
-              ; side = string_of_side event.side
+              ; side = side_str
               ; amount = event.cum_qty
               ; fill_price = event.avg_price
               ; value = fill_value
@@ -1238,6 +1239,11 @@ let handle_update json on_heartbeat =
                   (match event.trade_id with
                    | Some tid -> Int64.to_string tid
                    | None -> "")
+              ; market = "spot"
+              ; intent = if side_str = "buy" then "buy_spot" else "sell_spot"
+              ; strategy = "grid"
+              ; realized_pnl = None
+              ; note = None
               });
           (* Update the heartbeat. *)
           on_heartbeat ()

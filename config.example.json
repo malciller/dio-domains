@@ -17,50 +17,83 @@
     "allocation_policy": 2,
     "major_heap_increment": 1048576
   },
-  "oracle": {
-    "target_survival": 0.95,
-    "min_active_dsurv": 0.0,
-    "qty_cap_mult": 1.5
-  },
-  "trading": [
-    {
-      "symbol": "BTC/USDC",
-      "exchange": "hyperliquid",
-      "qty": "0.0001",
-      "grid_interval": [
-        0.1,
-        0.5
-      ],
-      "strategy": "jacobs_ladder",
-      "testnet": true,
-      "sell_mult": "0.99",
-      "cpu_priority": 10,
-      "accumulation_buffer": [
-        0.1,
-        0.5
-      ],
-      "overlay": {
-        "strategy": "carry_overlay",
-        "params": {
-          "start_ratio_pct": 25,
-          "add_threshold_pct": 10,
-          "max_ratio_pct": 75
+  "trading": {
+    "defaults": {
+      "strategy": {
+        "hyperliquid": {
+          "name": "jacobs_ladder",
+          "sell_mult": "0.99",
+          "sell_levels": false
+        },
+        "kraken": {
+          "name": "jacobs_ladder",
+          "sell_mult": "0.99",
+          "accumulation_buffer": [0.1, 0.5],
+          "sell_levels": false
+        },
+        "alpaca": {
+          "name": "jacobs_ladder",
+          "sell_mult": "0.999",
+          "accumulation_buffer": [0.1, 0.5],
+          "testnet": true,
+          "sell_levels": true,
+          "data_feed": "iex"
         }
+      },
+      "overlay": {
+        "name": "carry_overlay",
+        "exchange": "hyperliquid",
+        "min_entry_margin_ratio": 1.0,
+        "min_liq_mult": 1.0,
+        "recycle_base_share_pct": 0
+      },
+      "oracle": {
+        "target_survival": 0.95,
+        "min_active_dsurv": 0.0,
+        "qty_cap_mult": 1.5,
+        "refresh_seconds": 300
       }
     },
-    {
-      "symbol": "SPY",
-      "exchange": "alpaca",
-      "qty": "0.01",
-      "grid_interval": [
-        0.1,
-        0.5
-      ],
-      "strategy": "jacobs_ladder",
-      "testnet": true,
-      "data_feed": "iex",
-      "sell_levels": true,
-      "cpu_priority": 0
-    }
-  ]
+    "assets": [
+      {
+        "asset": "BTC",
+        "oracle": {
+          "target_survival": 0.65,
+          "qty_cap_mult": 3.0
+        },
+        "strategy": {
+          "exchange": "hyperliquid",
+          "symbol": "BTC/USDC",
+          "qty": "0.0001",
+          "grid_interval": [0.1, 0.5],
+          "cpu_priority": 10
+        },
+        "overlay": {
+          "leverage": 20,
+          "start_ratio_pct": 25,
+          "add_threshold_pct": 10,
+          "max_ratio_pct": 75,
+          "recycle_profit_pct": 5,
+          "recycle_base_share_pct": 50,
+          "inventory": [
+            { "exchange": "kraken", "symbol": "BTC/USD" }
+          ]
+        }
+      },
+      {
+        "asset": "SPY",
+        "oracle": {
+          "target_survival": 0.7,
+          "qty_cap_mult": 2.0
+        },
+        "strategy": {
+          "exchange": "alpaca",
+          "symbol": "SPY",
+          "qty": "0.01",
+          "grid_interval": [0.1, 0.5]
+        }
+      }
+    ]
+  },
+  "strategy_trace": false
 }

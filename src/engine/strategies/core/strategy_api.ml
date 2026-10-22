@@ -14,6 +14,7 @@ type exchange_config = Strategy_state.exchange_config =
   { time_in_force : string
   ; track_pending_sells : bool
   ; use_accumulation_sells : bool
+  ; sell_uses_mult : bool
   ; sell_failure_sets_asset_low : bool
   ; use_reserved_base_guard : bool
   ; use_unnetted_sell_hold : bool

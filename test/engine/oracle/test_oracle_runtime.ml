@@ -228,6 +228,7 @@ let test_partial_fill_delta_is_incremental () =
   let symbol = "HYPE/USDC" in
   let account = "kraken|false|USDC" in
   Dio_oracle.Oracle_runtime.apply_fill_delta
+    ~fee_rate:0.0016
     ~exchange
     ~symbol
     ~testnet:false
@@ -235,8 +236,10 @@ let test_partial_fill_delta_is_incremental () =
       (event
          ~order_id:"partial-delta-test"
          ~status:Dio_exchange.Exchange_intf.Types.PartiallyFilled
-         ~filled:0.4);
+         ~filled:0.4)
+    ();
   Dio_oracle.Oracle_runtime.apply_fill_delta
+    ~fee_rate:0.0016
     ~exchange
     ~symbol
     ~testnet:false
@@ -244,7 +247,8 @@ let test_partial_fill_delta_is_incremental () =
       (event
          ~order_id:"partial-delta-test"
          ~status:Dio_exchange.Exchange_intf.Types.Filled
-         ~filled:1.0);
+         ~filled:1.0)
+    ();
   Dio_oracle.Oracle_runtime.drain_pool_events ();
   let dq, kept = Dio_oracle.Oracle_runtime.pending_deltas account ~quote_updated_at:0.0 in
   let db =

@@ -119,6 +119,160 @@ let test_parse_overlay_accepts_repeated_owner () =
     (Dio_engine.Config.get_overlay_strategy ~exchange:"hyperliquid" ~symbol:"BTC/USDC")
 ;;
 
+let grouped_json =
+  {|{"trading":{
+    "defaults":{
+      "strategy":{
+        "kraken":{"name":"jacobs_ladder","sell_mult":"0.99",
+                  "accumulation_buffer":[0.1,1.5],"sell_levels":false},
+        "hyperliquid":{"name":"jacobs_ladder","sell_mult":"0.98"},
+        "alpaca":{"name":"jacobs_ladder","sell_mult":"0.999",
+                  "accumulation_buffer":[0.05,0.4],"testnet":true,
+                  "sell_levels":true,"data_feed":"iex"}
+      },
+      "overlay":{"name":"carry_overlay","exchange":"hyperliquid",
+                 "min_entry_margin_ratio":1.0,"min_liq_mult":1.0,
+                 "recycle_base_share_pct":0},
+      "oracle":{"target_survival":0.95,"min_active_dsurv":0.0,
+                "qty_cap_mult":1.5,"refresh_seconds":300}
+    },
+    "assets":[
+      {"asset":"BTC",
+       "oracle":{"target_survival":0.65,"qty_cap_mult":3.0},
+       "strategy":{"exchange":"hyperliquid","symbol":"BTC/USDC","qty":"0.0003",
+                   "grid_interval":[0.15,0.18],
+                   "accumulation_buffer":[0.04,0.35],"cpu_priority":10},
+       "overlay":{"leverage":20,"start_ratio_pct":25,"add_threshold_pct":5,
+                  "max_ratio_pct":75,"recycle_profit_pct":5,
+                  "recycle_base_share_pct":50,
+                  "inventory":[{"exchange":"kraken","symbol":"BTC/USD"}]}},
+      {"asset":"ETH",
+       "strategy":{"exchange":"kraken","symbol":"ETH/USD","qty":"0.0045",
+                   "grid_interval":[2.5,10.0]},
+       "overlay":{"leverage":20,"start_ratio_pct":40,"add_threshold_pct":5,
+                  "max_ratio_pct":75,"recycle_profit_pct":5,
+                  "inventory":[{"exchange":"hyperliquid","symbol":"ETH/USDC"}]}},
+      {"asset":"BOTZ",
+       "oracle":{"target_survival":0.7,"qty_cap_mult":2.0},
+       "strategy":{"exchange":"alpaca","symbol":"BOTZ","qty":"0.28",
+                   "grid_interval":[0.15,0.25]}}
+    ]
+  }}|}
+;;
+
+let test_grouped_trading_flattens_and_merges () =
+  let json = Yojson.Basic.from_string grouped_json in
+  let entries =
+    match Dio_engine.Config.trading_entries_json json with
+    | `List es -> List.map Dio_engine.Config.parse_config es
+    | _ -> Alcotest.fail "expected a flattened trading list"
+  in
+  Alcotest.(check int) "strategy + inventory legs" 5 (List.length entries);
+  let btc_strategy =
+    List.find
+      (fun (t : Dio_engine.Config.trading_config) -> String.equal t.symbol "BTC/USDC")
+      entries
+  in
+  Alcotest.(check string)
+    "strategy from venue defaults"
+    "jacobs_ladder"
+    btc_strategy.strategy;
+  Alcotest.(check string) "sell_mult from venue defaults" "0.98" btc_strategy.sell_mult;
+  Alcotest.(check (pair (float 1e-9) (float 1e-9)))
+    "asset buffer overrides venue default"
+    (0.04, 0.35)
+    btc_strategy.accumulation_buffer;
+  Alcotest.(check int) "cpu priority" 10 btc_strategy.cpu_priority;
+  let inv =
+    List.find
+      (fun (t : Dio_engine.Config.trading_config) -> String.equal t.symbol "BTC/USD")
+      entries
+  in
+  Alcotest.(check string) "inventory leg has no strategy" "" inv.strategy;
+  let botz =
+    List.find
+      (fun (t : Dio_engine.Config.trading_config) -> String.equal t.symbol "BOTZ")
+      entries
+  in
+  Alcotest.(check string) "alpaca strategy default" "jacobs_ladder" botz.strategy;
+  Alcotest.(check string) "alpaca sell_mult default" "0.999" botz.sell_mult;
+  Alcotest.(check (pair (float 1e-9) (float 1e-9)))
+    "alpaca buffer default"
+    (0.05, 0.4)
+    botz.accumulation_buffer;
+  Alcotest.(check bool) "alpaca testnet default" true botz.testnet;
+  Alcotest.(check bool) "alpaca sell_levels default" true botz.sell_levels;
+  Alcotest.(check (option string)) "alpaca data feed default" (Some "iex") botz.data_feed;
+  (* Overlay params are declared once on the group and attached to every leg. *)
+  Dio_engine.Config.parse_overlays json;
+  let btc =
+    Dio_engine.Config.get_overlay_controller ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
+  in
+  (match btc with
+   | None -> Alcotest.fail "expected the BTC controller"
+   | Some c ->
+     Alcotest.(check int) "two BTC legs" 2 (List.length c.oc_legs);
+     Alcotest.(check (float 1e-9)) "leverage" 20.0 c.oc_params.leverage;
+     Alcotest.(check (float 1e-9)) "base share" 50.0 c.oc_params.recycle_base_share_pct;
+     Alcotest.(check bool) "hl spot leg" true c.oc_has_hl_spot_leg);
+  let eth =
+    Dio_engine.Config.get_overlay_controller ~exchange:"hyperliquid" ~symbol:"ETH/USDC"
+  in
+  (match eth with
+   | None -> Alcotest.fail "expected the ETH controller"
+   | Some c ->
+     Alcotest.(check int) "two ETH legs" 2 (List.length c.oc_legs);
+     Alcotest.(check bool) "hl inventory leg" true c.oc_has_hl_spot_leg);
+  Alcotest.(check (option string))
+    "cross-venue leg resolves its controller"
+    (Some "carry_overlay")
+    (Dio_engine.Config.get_overlay_strategy ~exchange:"kraken" ~symbol:"BTC/USD")
+;;
+
+let test_grouped_oracle_inline () =
+  let json = Yojson.Basic.from_string grouped_json in
+  match Dio_engine.Config.parse_oracle_config json with
+  | None -> Alcotest.fail "grouped oracle should parse"
+  | Some c ->
+    Alcotest.(check (float 1e-9)) "global target" 0.95 c.target_survival;
+    Alcotest.(check (float 1e-9)) "global qty cap" 1.5 c.qty_cap_mult;
+    Alcotest.(check (float 1e-9)) "refresh" 300.0 c.refresh_seconds;
+    Alcotest.(check int) "two asset overrides" 2 (List.length c.assets);
+    let btc = List.assoc "BTC/USDC" c.assets in
+    Alcotest.(check (option (float 1e-9))) "BTC target" (Some 0.65) btc.target_survival;
+    Alcotest.(check (option (float 1e-9))) "BTC qty cap" (Some 3.0) btc.qty_cap_mult;
+    let botz = List.assoc "BOTZ" c.assets in
+    Alcotest.(check (option (float 1e-9))) "BOTZ target" (Some 0.7) botz.target_survival;
+    Alcotest.(check (option (float 1e-9)))
+      "unset min_active_dsurv stays unset"
+      None
+      botz.min_active_dsurv
+;;
+
+let test_grouped_domain_assets () =
+  let json = Yojson.Basic.from_string grouped_json in
+  let entries =
+    match Dio_engine.Config.trading_entries_json json with
+    | `List es -> List.map Dio_engine.Config.parse_config es
+    | _ -> []
+  in
+  Dio_engine.Config.parse_overlays json;
+  let assets = Dio_engine.Config.domain_assets entries in
+  Alcotest.(check int)
+    "three grids plus the synthesized HL ETH controller"
+    4
+    (List.length assets);
+  let symbols =
+    List.map
+      (fun (t : Dio_engine.Config.trading_config) -> t.exchange ^ ":" ^ t.symbol)
+      assets
+  in
+  Alcotest.(check (list string))
+    "strategy order then synthesized controllers"
+    [ "hyperliquid:BTC/USDC"; "kraken:ETH/USD"; "alpaca:BOTZ"; "hyperliquid:ETH/USDC" ]
+    symbols
+;;
+
 let test_parse_logging_config_valid () =
   let json_str =
     {|{"logging_level": "debug", "logging_sections": "engine,trading,api"}|}
@@ -504,6 +658,39 @@ let test_inventory_only_hedge_venue_leg () =
     (Dio_engine.Config.is_inventory_only ~exchange:"hyperliquid" ~symbol:"BTC/USDC")
 ;;
 
+let test_read_config_keeps_last_good () =
+  (* A deploy that copies config.json over a live process can expose a partial file to the
+     10 s monitor re-read or to shutdown. Once a config has parsed, a transient failure
+     must return the cached one instead of raising into the caller's Lwt fiber. *)
+  let dir = Filename.temp_dir "dio-config-" "" in
+  let saved_cwd = Sys.getcwd () in
+  let restore () =
+    Sys.chdir saved_cwd;
+    (try Sys.remove (Filename.concat dir "config.json") with
+     | _ -> ());
+    try Unix.rmdir dir with
+    | _ -> ()
+  in
+  Fun.protect ~finally:restore (fun () ->
+    Sys.chdir dir;
+    let write s =
+      Out_channel.with_open_bin "config.json" (fun oc -> Out_channel.output_string oc s)
+    in
+    write {|{"trading": []}|};
+    let first = Dio_engine.Config.read_config () in
+    Alcotest.(check int) "initial read" 10000 first.cycle_mod;
+    (* Mid-copy: syntactically incomplete. *)
+    write {|{"trading": [|};
+    let during_copy = Dio_engine.Config.read_config () in
+    Alcotest.(check int)
+      "partial copy falls back to last known good"
+      10000
+      during_copy.cycle_mod;
+    write {|{"trading": [], "cycle_mod": 4242}|};
+    let recovered = Dio_engine.Config.read_config () in
+    Alcotest.(check int) "complete file replaces the fallback" 4242 recovered.cycle_mod)
+;;
+
 let () =
   Alcotest.run
     "Config"
@@ -531,6 +718,17 @@ let () =
             "empty sections"
             `Quick
             test_parse_logging_config_empty_sections
+        ] )
+    ; ( "grouped"
+      , [ Alcotest.test_case
+            "flattens and merges defaults"
+            `Quick
+            test_grouped_trading_flattens_and_merges
+        ; Alcotest.test_case
+            "oracle overrides are inline"
+            `Quick
+            test_grouped_oracle_inline
+        ; Alcotest.test_case "domain assets" `Quick test_grouped_domain_assets
         ] )
     ; ( "overlays"
       , [ Alcotest.test_case "parse and bind" `Quick test_parse_overlays
@@ -586,6 +784,11 @@ let () =
             test_to_float_opt_accepts_int
         ] )
     ; ( "file_handling"
-      , [ Alcotest.test_case "config defaults" `Quick test_read_config_defaults ] )
+      , [ Alcotest.test_case "config defaults" `Quick test_read_config_defaults
+        ; Alcotest.test_case
+            "transient partial copy keeps last known good"
+            `Quick
+            test_read_config_keeps_last_good
+        ] )
     ]
 ;;

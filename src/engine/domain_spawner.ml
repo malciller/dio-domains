@@ -441,17 +441,31 @@ let asset_domain_worker
               ~venue:asset_with_fees.exchange);
       st.base_accumulation_enabled <- asset_with_fees.base_accumulation;
       st.sell_levels_enabled <- asset_with_fees.sell_levels;
+      let default_maker, default_taker =
+        Dio_oracle.Oracle_fees.default_or_configured_fees
+          ~exchange:asset_with_fees.exchange
+          ~symbol:asset_with_fees.symbol
+          ~configured:
+            (match asset_with_fees.maker_fee, asset_with_fees.taker_fee with
+             | Some maker, Some taker -> Some (maker, taker)
+             | _ -> None)
+      in
       st.maker_fee
-      <- (match asset_with_fees.maker_fee with
-          | Some f -> f
-          | None ->
-            (match
-               Dio_strategies.Fee_cache.get_maker_fee
-                 ~exchange:asset_with_fees.exchange
-                 ~symbol:asset_with_fees.symbol
-             with
-             | Some cached -> cached
-             | None -> 0.0));
+      <- Dio_strategies.Strategy_venue.resolve_fee_rate
+           ~configured:asset_with_fees.maker_fee
+           ~cached:
+             (Dio_strategies.Fee_cache.get_maker_fee
+                ~exchange:asset_with_fees.exchange
+                ~symbol:asset_with_fees.symbol)
+           ~current:default_maker;
+      st.taker_fee
+      <- Dio_strategies.Strategy_venue.resolve_fee_rate
+           ~configured:asset_with_fees.taker_fee
+           ~cached:
+             (Dio_strategies.Fee_cache.get_taker_fee
+                ~exchange:asset_with_fees.exchange
+                ~symbol:asset_with_fees.symbol)
+           ~current:default_taker;
       ());
     (* Exec read position starts at 0 for all exchanges so snapshot events replay through
        handle_order_acknowledged, restoring last_buy_order_id and open sell tracking
@@ -740,17 +754,28 @@ let asset_domain_worker
            st.reserved_base <- a.Dio_persistence.Base_accumulation_store.reserved_base;
            st.accumulated_profit
            <- a.Dio_persistence.Base_accumulation_store.accumulated_profit;
+           let default_maker, default_taker =
+             Dio_oracle.Oracle_fees.default_or_configured_fees
+               ~exchange:c.oc_hedge_exchange
+               ~symbol:c.oc_hedge_symbol
+               ~configured:None
+           in
            st.maker_fee
-           <- (match asset_with_fees.maker_fee with
-               | Some f -> f
-               | None ->
-                 (match
-                    Dio_strategies.Fee_cache.get_maker_fee
-                      ~exchange:c.oc_hedge_exchange
-                      ~symbol:c.oc_hedge_symbol
-                  with
-                  | Some cached -> cached
-                  | None -> 0.0));
+           <- Dio_strategies.Strategy_venue.resolve_fee_rate
+                ~configured:None
+                ~cached:
+                  (Dio_strategies.Fee_cache.get_maker_fee
+                     ~exchange:c.oc_hedge_exchange
+                     ~symbol:c.oc_hedge_symbol)
+                ~current:default_maker;
+           st.taker_fee
+           <- Dio_strategies.Strategy_venue.resolve_fee_rate
+                ~configured:None
+                ~cached:
+                  (Dio_strategies.Fee_cache.get_taker_fee
+                     ~exchange:c.oc_hedge_exchange
+                     ~symbol:c.oc_hedge_symbol)
+                ~current:default_taker;
            Some st)
     in
     let overlay_ctx =
@@ -1002,69 +1027,126 @@ let asset_domain_worker
          with
          | None -> ()
          | Some meta ->
-           if event.filled_qty > 0.0
-           then (
-             let side =
-               match event.side with
-               | Types.Buy -> Dio_strategies.Strategy_common.Buy
-               | Types.Sell -> Dio_strategies.Strategy_common.Sell
-             in
-             (* Publish the latest perp entry fill so the overlay can place the TP from
-                the fill event, before the next webData2 position snapshot. A perp buy
-                closes the short and clears the fallback. The overlay also stamps the
-                entry fill time so [order_place] can hold a new entry until the position
-                snapshot catches up. *)
-             if meta.Dio_strategies.Strategy_common.com_market
-                = Dio_strategies.Strategy_common.Carry_perp
+           (* Retire the id -> kind mapping only on a terminal event. [New] and
+              [PartiallyFilled] are live; retiring on the ack makes [order_replace] unable
+              to recognize its own resting order. *)
+           let terminal =
+             Dio_strategies.Strategy_common.carry_order_terminal event.order_status
+           in
+           if terminal
+           then
+             if event.filled_qty > 0.0
              then (
-               let setf key v =
-                 Dio_strategies.Strategy_runtime.set_platform
-                   rt
-                   key
-                   (Dio_strategies.Strategy_expr.V_float v)
+               let side =
+                 match event.side with
+                 | Types.Buy -> Dio_strategies.Strategy_common.Buy
+                 | Types.Sell -> Dio_strategies.Strategy_common.Sell
                in
-               match side with
-               | Dio_strategies.Strategy_common.Sell ->
-                 ctx.Dio_strategies.Strategy_cycle_engine.cg_last_entry_fill_at
-                 <- now_exec;
-                 setf "carry_entry_fill_price" event.avg_price;
-                 setf "carry_entry_fill_qty" event.filled_qty;
-                 setf "carry_entry_fill_at" now_exec
-               | Dio_strategies.Strategy_common.Buy ->
-                 ctx.Dio_strategies.Strategy_cycle_engine.cg_last_entry_fill_at <- 0.0;
-                 setf "carry_entry_fill_price" 0.0;
-                 setf "carry_entry_fill_qty" 0.0;
-                 setf "carry_entry_fill_at" 0.0);
-             Dio_strategies.Carry_runtime.record_fill
-               ~exchange:asset_with_fees.exchange
-               ~symbol:asset_with_fees.symbol
-               ~market:meta.Dio_strategies.Strategy_common.com_market
-               ~maker:meta.Dio_strategies.Strategy_common.com_maker
-               ~kind:meta.Dio_strategies.Strategy_common.com_kind
-               ~side
-               ~price:event.avg_price
-               ~qty:event.filled_qty
-               ~now:now_exec
-               ~maker_fee:(Option.value asset_with_fees.maker_fee ~default:0.0)
-               ~taker_fee:(Option.value asset_with_fees.taker_fee ~default:0.0)
-               r;
-             (* Fill visibility: the position snapshot can lag the venue and is dropped
-                entirely during a user-stream resync, so log the booked fill itself. This
-                is the line to check when a re-hedge or take-profit appears not to have
-                executed. *)
-             Logging.info_f
-               ~section
-               "carry fill: %s %s %.8g @ %.8f (%s)"
-               (match meta.Dio_strategies.Strategy_common.com_market with
-                | Dio_strategies.Strategy_common.Carry_perp -> "perp"
-                | Dio_strategies.Strategy_common.Carry_spot -> "spot")
-               (match side with
-                | Dio_strategies.Strategy_common.Buy -> "buy"
-                | Dio_strategies.Strategy_common.Sell -> "sell")
-               event.filled_qty
-               event.avg_price
-               meta.Dio_strategies.Strategy_common.com_kind);
-           Dio_strategies.Strategy_common.retire_carry_order ~order_id:event.order_id)
+               (* Publish the latest perp entry fill so the overlay can place the TP from
+                  the fill event, before the next webData2 position snapshot. A perp buy
+                  closes the short and clears the fallback. The overlay also stamps the
+                  entry fill time so [order_place] can hold a new entry until the position
+                  snapshot catches up. *)
+               if meta.Dio_strategies.Strategy_common.com_market
+                  = Dio_strategies.Strategy_common.Carry_perp
+               then (
+                 let setf key v =
+                   Dio_strategies.Strategy_runtime.set_platform
+                     rt
+                     key
+                     (Dio_strategies.Strategy_expr.V_float v)
+                 in
+                 match side with
+                 | Dio_strategies.Strategy_common.Sell ->
+                   ctx.Dio_strategies.Strategy_cycle_engine.cg_last_entry_fill_at
+                   <- now_exec;
+                   setf "carry_entry_fill_price" event.avg_price;
+                   setf "carry_entry_fill_qty" event.filled_qty;
+                   setf "carry_entry_fill_at" now_exec
+                 | Dio_strategies.Strategy_common.Buy ->
+                   ctx.Dio_strategies.Strategy_cycle_engine.cg_last_entry_fill_at <- 0.0;
+                   setf "carry_entry_fill_price" 0.0;
+                   setf "carry_entry_fill_qty" 0.0;
+                   setf "carry_entry_fill_at" 0.0);
+               (* Perp fills use the hedge venue's schedule; spot fills use the inventory
+                  leg's. *)
+               let fee_exchange, fee_symbol, fee_configured_maker, fee_configured_taker =
+                 match meta.Dio_strategies.Strategy_common.com_market with
+                 | Dio_strategies.Strategy_common.Carry_perp ->
+                   let exchange, symbol =
+                     match overlay_controller with
+                     | Some c -> c.oc_hedge_exchange, c.oc_hedge_symbol
+                     | None -> asset_with_fees.exchange, asset_with_fees.symbol
+                   in
+                   exchange, symbol, None, None
+                 | Dio_strategies.Strategy_common.Carry_spot ->
+                   ( asset_with_fees.exchange
+                   , asset_with_fees.symbol
+                   , asset_with_fees.maker_fee
+                   , asset_with_fees.taker_fee )
+               in
+               let default_maker, default_taker =
+                 Dio_oracle.Oracle_fees.default_or_configured_fees
+                   ~exchange:fee_exchange
+                   ~symbol:fee_symbol
+                   ~configured:
+                     (match fee_configured_maker, fee_configured_taker with
+                      | Some maker, Some taker -> Some (maker, taker)
+                      | _ -> None)
+               in
+               let maker_fee =
+                 Dio_strategies.Strategy_venue.resolve_fee_rate
+                   ~configured:fee_configured_maker
+                   ~cached:
+                     (Dio_strategies.Fee_cache.get_maker_fee
+                        ~exchange:fee_exchange
+                        ~symbol:fee_symbol)
+                   ~current:default_maker
+               in
+               let taker_fee =
+                 Dio_strategies.Strategy_venue.resolve_fee_rate
+                   ~configured:fee_configured_taker
+                   ~cached:
+                     (Dio_strategies.Fee_cache.get_taker_fee
+                        ~exchange:fee_exchange
+                        ~symbol:fee_symbol)
+                   ~current:default_taker
+               in
+               Dio_strategies.Carry_runtime.record_fill
+                 ~exchange:asset_with_fees.exchange
+                 ~symbol:asset_with_fees.symbol
+                 ~market:meta.Dio_strategies.Strategy_common.com_market
+                 ~maker:meta.Dio_strategies.Strategy_common.com_maker
+                 ~kind:meta.Dio_strategies.Strategy_common.com_kind
+                 ~side
+                 ~price:event.avg_price
+                 ~qty:event.filled_qty
+                 ~now:now_exec
+                 ~maker_fee
+                 ~taker_fee
+                 r;
+               (* Fill visibility: the position snapshot can lag the venue and is dropped
+                  entirely during a user-stream resync, so log the booked fill itself.
+                  This is the line to check when a re-hedge or take-profit appears not to
+                  have executed. *)
+               Logging.info_f
+                 ~section
+                 "carry fill: %s %s %.8g @ %.8f (%s)"
+                 (match meta.Dio_strategies.Strategy_common.com_market with
+                  | Dio_strategies.Strategy_common.Carry_perp -> "perp"
+                  | Dio_strategies.Strategy_common.Carry_spot -> "spot")
+                 (match side with
+                  | Dio_strategies.Strategy_common.Buy -> "buy"
+                  | Dio_strategies.Strategy_common.Sell -> "sell")
+                 event.filled_qty
+                 event.avg_price
+                 meta.Dio_strategies.Strategy_common.com_kind);
+           Dio_strategies.Strategy_common.retire_carry_order ~order_id:event.order_id;
+           (* Terminal fill/cancel releases the placement latch, like the grid's
+              [inflight_sell]. *)
+           ignore
+             (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+                meta.Dio_strategies.Strategy_common.com_key))
       | _ -> ()
     in
     (* Overlay cycle inputs. The overlay is independent of the grid's oracle gate: it

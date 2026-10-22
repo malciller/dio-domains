@@ -583,10 +583,11 @@ let apply_trade_update json =
         | None -> 0.0
       in
       let fee = fill_value *. maker_fee_rate in
+      let side_str = if side = Buy then "buy" else "sell" in
       Concurrency.Fill_event_bus.publish_fill
         { venue = "alpaca"
         ; symbol = ord.symbol
-        ; side = (if side = Buy then "buy" else "sell")
+        ; side = side_str
         ; amount = ord.filled_qty
         ; fill_price = price
         ; value = fill_value
@@ -594,6 +595,11 @@ let apply_trade_update json =
         ; timestamp = Unix.time ()
         ; order_id = ord.id
         ; trade_id = ord.id
+        ; market = "equity"
+        ; intent = if side_str = "buy" then "buy_equity" else "sell_equity"
+        ; strategy = "grid"
+        ; realized_pnl = None
+        ; note = None
         });
     ());
   if event = "fill" || event = "partial_fill" || event = "canceled" || event = "rejected"

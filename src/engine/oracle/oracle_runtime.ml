@@ -684,11 +684,23 @@ let maker_fee_of ~exchange ~symbol =
     once the terminal fill lands. Only the delta since the previous event is a pool move. *)
 let exec_fill_cum : (string, float) Hashtbl.t = Hashtbl.create 64
 
-let apply_fill_delta ~exchange ~symbol ~testnet ~(e : Exchange.Types.execution_event) =
+let apply_fill_delta
+  ?fee_rate
+  ~exchange
+  ~symbol
+  ~testnet
+  ~(e : Exchange.Types.execution_event)
+  ()
+  =
   let prev = Option.value (Hashtbl.find_opt exec_fill_cum e.order_id) ~default:0.0 in
   let delta_qty = Float.max 0.0 (e.filled_qty -. prev) in
   if delta_qty > 0.0
-  then
+  then (
+    let fee_rate =
+      match fee_rate with
+      | Some f -> f
+      | None -> maker_fee_of ~exchange ~symbol
+    in
     apply_fill
       ~exchange
       ~symbol
@@ -696,8 +708,8 @@ let apply_fill_delta ~exchange ~symbol ~testnet ~(e : Exchange.Types.execution_e
       ~side:e.side
       ~filled_qty:delta_qty
       ~avg_price:e.avg_price
-      ~fee:(maker_fee_of ~exchange ~symbol *. delta_qty *. e.avg_price)
-      ~event_time:e.venue_time;
+      ~fee:(fee_rate *. delta_qty *. e.avg_price)
+      ~event_time:e.venue_time);
   match e.order_status with
   | Exchange.Types.Filled -> Hashtbl.remove exec_fill_cum e.order_id
   | _ -> Hashtbl.replace exec_fill_cum e.order_id e.filled_qty
@@ -725,6 +737,7 @@ let drain_execution_events (tasks : Oracle_tasks.task list) =
                    ~symbol:t.symbol
                    ~testnet:t.config.testnet
                    ~e
+                   ()
                | Exchange.Types.Canceled
                | Exchange.Types.Rejected
                | Exchange.Types.Expired ->

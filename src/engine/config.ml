@@ -1,5 +1,6 @@
-(** Per-symbol trading parameters parsed from a single entry in the "trading" array of
-    config.json. *)
+(** Per-symbol trading parameters. The [trading] section may be a flat array (legacy) or
+    the grouped [{defaults, assets}] layout; grouped entries are flattened into this type
+    by {!trading_entries_json}. *)
 type trading_config = Dio_strategies.Strategy_common.trading_config =
   { exchange : string
   ; symbol : string
@@ -188,8 +189,9 @@ let known_gc_keys =
   ]
 ;;
 
-(** Permitted keys of the optional top-level "oracle" section. All optional; absent keys
-    fall back to [Oracle_runtime.default_config]. *)
+(** Permitted keys of the optional top-level "oracle" section (legacy layout) and of
+    [trading.defaults.oracle] (grouped layout). All optional; absent keys fall back to
+    [Oracle_runtime.default_config]. *)
 let known_oracle_keys =
   [ "qty_cap_mult"; "target_survival"; "min_active_dsurv"; "refresh_seconds"; "assets" ]
 ;;
@@ -217,7 +219,79 @@ let known_trading_keys =
   ; "sell_levels"
   ; "cpu_priority"
   ; "overlay"
+  ; "oracle"
   ]
+;;
+
+(** Grouped [trading] section. Each asset group has an optional primary [strategy], an
+    optional [overlay], and balance-only [inventory] legs. Section names describe the
+    role, not an authored strategy; the strategy file is named by [name]. [defaults] is
+    shallow-merged into each declaration. *)
+let known_grouped_trading_keys = [ "defaults"; "assets" ]
+
+let known_trading_defaults_keys = [ "strategy"; "overlay"; "oracle" ]
+let known_asset_group_keys = [ "asset"; "strategy"; "overlay"; "oracle" ]
+
+(** Permitted keys inside a grouped [strategy] section. The file name moves to [name]
+    there, so the section reads [strategy.name] rather than [strategy.strategy]. *)
+let known_strategy_section_keys =
+  List.filter
+    (fun k -> not (List.mem k [ "strategy"; "overlay"; "oracle" ]))
+    known_trading_keys
+  @ [ "name" ]
+;;
+
+(** Balance-only inventory legs have no strategy of their own. *)
+let known_inventory_keys = [ "exchange"; "symbol"; "testnet" ]
+
+(** Keys of [trading.defaults.oracle]: the global oracle knobs. Per-asset overrides live
+    on the asset group, not here. *)
+let known_oracle_default_keys =
+  [ "target_survival"; "min_active_dsurv"; "qty_cap_mult"; "refresh_seconds" ]
+;;
+
+(** Shallow JSON merge for the grouped layout: objects merge key-by-key, lists and scalars
+    replace. *)
+let rec json_merge ~base ~override =
+  match base, override with
+  | `Assoc bs, `Assoc os ->
+    let keys =
+      List.fold_left
+        (fun acc (k, _) -> if List.mem_assoc k acc then acc else acc @ [ k, () ])
+        []
+        (bs @ os)
+    in
+    `Assoc
+      (List.map
+         (fun (k, ()) ->
+           match List.assoc_opt k os, List.assoc_opt k bs with
+           | Some o, Some b -> k, json_merge ~base:b ~override:o
+           | Some o, None -> k, o
+           | None, Some b -> k, b
+           | None, None -> assert false)
+         keys)
+  | _, o -> o
+;;
+
+(** Replace [key] in a JSON object, preserving key order when the key already exists. *)
+let json_set key value = function
+  | `Assoc fields ->
+    let rec go = function
+      | [] -> `Assoc ([ key, value ] @ fields)
+      | (k, _) :: _ as rest when String.equal k key -> `Assoc ((k, value) :: List.tl rest)
+      | field :: rest ->
+        (match go rest with
+         | `Assoc out -> `Assoc (field :: out)
+         | _ -> assert false)
+    in
+    go fields
+  | other -> other
+;;
+
+(** Remove [key] from a JSON object. *)
+let json_remove key = function
+  | `Assoc fields -> `Assoc (List.filter (fun (k, _) -> not (String.equal k key)) fields)
+  | other -> other
 ;;
 
 (** Logs CRITICAL for each key of [json] not in [allowed]; returns [true] if any unknown
@@ -338,8 +412,8 @@ let parse_accumulation_buffer json exchange symbol =
   | _ -> default
 ;;
 
-(** Parses one entry of the JSON "trading" array into a [trading_config]. Validates keys
-    and venue restrictions; [exit 1] on schema violation. *)
+(** Parses one flattened entry of the trading section into a [trading_config]. Validates
+    keys and venue restrictions; [exit 1] on schema violation. *)
 let parse_config json =
   if validate_keys ~context:"trading entry" ~allowed:known_trading_keys json then exit 1;
   let open Yojson.Basic.Util in
@@ -554,49 +628,11 @@ let parse_gc_config json : gc_config option =
       }
 ;;
 
-(** Parses the optional top-level "oracle" object. [None] when absent (engine uses
-    [Oracle_runtime.default_config]). Exits on unknown sub-keys. All values optional;
-    "assets" entries, keyed by symbol, override per field. *)
-let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
-  let open Yojson.Basic.Util in
-  match json |> member "oracle" with
-  | `Null -> None
-  | oracle_json ->
-    if validate_keys ~context:"oracle" ~allowed:known_oracle_keys oracle_json then exit 1;
-    let defaults = Dio_oracle.Oracle_runtime.default_config () in
-    let opt_float key default =
-      oracle_json |> member key |> to_float_opt |> Option.value ~default
-    in
-    Some
-      { target_survival = opt_float "target_survival" defaults.target_survival
-      ; min_active_dsurv = opt_float "min_active_dsurv" defaults.min_active_dsurv
-      ; qty_cap_mult = opt_float "qty_cap_mult" defaults.qty_cap_mult
-      ; refresh_seconds = opt_float "refresh_seconds" defaults.refresh_seconds
-      ; assets =
-          (match oracle_json |> member "assets" with
-           | `Null -> defaults.assets
-           | assets_json ->
-             assets_json
-             |> to_assoc
-             |> List.map (fun (symbol, entry) ->
-               if validate_keys
-                    ~context:("oracle asset '" ^ symbol ^ "'")
-                    ~allowed:known_oracle_asset_keys
-                    entry
-               then exit 1;
-               let okey key = entry |> member key |> to_float_opt in
-               ( symbol
-               , ({ target_survival = okey "target_survival"
-                  ; min_active_dsurv = okey "min_active_dsurv"
-                  ; qty_cap_mult = okey "qty_cap_mult"
-                  }
-                  : Dio_oracle.Oracle_runtime.asset_overrides) )))
-      }
-;;
-
 let is_hyperliquid exchange = String.equal (normalize_exchange exchange) "hyperliquid"
 
-(** Optional [overlay] object inside a "trading" entry.
+(** Optional [overlay] object inside a **flat** "trading" entry (legacy layout). The
+    grouped layout uses an [overlay] section named by [name] instead; this shape is the
+    internal form [flatten_grouped_trading] emits.
 
     The trading entry is the *inventory leg*: it names the venue/symbol whose held balance
     is hedged. The overlay names the *hedge controller*: [overlay.exchange] (default: the
@@ -629,6 +665,12 @@ let known_overlay_param_keys =
   ; "min_liq_mult"
   ; "leverage"
   ]
+;;
+
+(** Permitted keys inside a grouped [overlay] section. The file is named by [name]
+    (default [carry_overlay]); params sit directly under [overlay]. *)
+let known_overlay_section_keys =
+  [ "name"; "exchange"; "symbol"; "inventory" ] @ known_overlay_param_keys
 ;;
 
 (** Per-asset carry policy. Percentages are whole numbers in config.json (25, 10, 75, 1,
@@ -760,7 +802,264 @@ let params_equal a b =
   && eq a.leverage b.leverage
 ;;
 
-let parse_overlays json =
+let config_error context fmt =
+  Printf.ksprintf
+    (fun msg ->
+      Logging.critical_f ~section "%s: %s" context msg;
+      exit 1)
+    fmt
+;;
+
+let require_object ~context = function
+  | `Assoc _ as j -> j
+  | _ -> config_error context "expected an object"
+;;
+
+let require_string ~context json key =
+  match json |> Yojson.Basic.Util.member key |> Yojson.Basic.Util.to_string_option with
+  | Some s when String.trim s <> "" -> s
+  | _ -> config_error context "missing required string '%s'" key
+;;
+
+(** Flatten the grouped [trading] section into the flat entry list the engine consumes.
+
+    One group = one asset. [strategy] is the primary section; [overlay] is the single
+    controller fed by every primary/inventory leg. [inventory] legs are balance-only. The
+    group's [oracle] rides on the primary entry for {!parse_oracle_config}. A legacy flat
+    [trading] array is returned unchanged. *)
+let flatten_grouped_trading json =
+  let open Yojson.Basic.Util in
+  let section = json |> member "trading" in
+  match section with
+  | `List _ -> section
+  | `Assoc _ ->
+    if validate_keys ~context:"trading" ~allowed:known_grouped_trading_keys section
+    then exit 1;
+    let defaults =
+      match section |> member "defaults" with
+      | `Assoc _ as d ->
+        if validate_keys
+             ~context:"trading.defaults"
+             ~allowed:known_trading_defaults_keys
+             d
+        then exit 1;
+        d
+      | _ -> `Assoc []
+    in
+    let strategy_defaults =
+      match defaults |> member "strategy" with
+      | `Assoc _ as g ->
+        List.iter
+          (fun (venue, d) ->
+            if validate_keys
+                 ~context:(Printf.sprintf "trading.defaults.strategy.%s" venue)
+                 ~allowed:known_strategy_section_keys
+                 d
+            then exit 1)
+          (to_assoc g);
+        g
+      | _ -> `Assoc []
+    in
+    let overlay_defaults =
+      match defaults |> member "overlay" with
+      | `Assoc _ as c ->
+        if validate_keys
+             ~context:"trading.defaults.overlay"
+             ~allowed:known_overlay_section_keys
+             c
+        then exit 1;
+        c
+      | _ -> `Assoc []
+    in
+    (match defaults |> member "oracle" with
+     | `Assoc _ as o ->
+       if validate_keys
+            ~context:"trading.defaults.oracle"
+            ~allowed:known_oracle_default_keys
+            o
+       then exit 1
+     | _ -> ());
+    let groups =
+      match section |> member "assets" with
+      | `List gs -> gs
+      | `Null -> []
+      | _ -> config_error "trading.assets" "expected an array"
+    in
+    let out = ref [] in
+    List.iter
+      (fun group ->
+        let group = require_object ~context:"trading.assets[]" group in
+        if validate_keys
+             ~context:"trading asset group"
+             ~allowed:known_asset_group_keys
+             group
+        then exit 1;
+        let asset = require_string ~context:"trading asset group" group "asset" in
+        let group_oracle =
+          match group |> member "oracle" with
+          | `Assoc _ as o ->
+            if validate_keys
+                 ~context:(Printf.sprintf "oracle for asset '%s'" asset)
+                 ~allowed:known_oracle_asset_keys
+                 o
+            then exit 1;
+            o
+          | `Null -> `Null
+          | _ -> config_error "trading asset group" "'oracle' must be an object"
+        in
+        let overlay_section =
+          match group |> member "overlay" with
+          | `Assoc _ as c ->
+            let c = json_merge ~base:overlay_defaults ~override:c in
+            if validate_keys
+                 ~context:(Printf.sprintf "overlay for asset '%s'" asset)
+                 ~allowed:known_overlay_section_keys
+                 c
+            then exit 1;
+            c
+          | `Null -> `Null
+          | _ -> config_error "trading asset group" "'overlay' must be an object"
+        in
+        let overlay_json =
+          match overlay_section with
+          | `Null -> None
+          | `Assoc _ ->
+            let hedge =
+              require_string
+                ~context:("overlay for asset '" ^ asset ^ "'")
+                overlay_section
+                "exchange"
+            in
+            let name =
+              overlay_section
+              |> member "name"
+              |> to_string_option
+              |> Option.value ~default:"carry_overlay"
+            in
+            let symbol = overlay_section |> member "symbol" |> to_string_option in
+            let params =
+              `Assoc
+                (List.filter
+                   (fun (k, _) -> List.mem k known_overlay_param_keys)
+                   (to_assoc overlay_section))
+            in
+            Some
+              (`Assoc
+                ([ "strategy", `String name; "exchange", `String hedge ]
+                 @ (match symbol with
+                    | Some s -> [ "symbol", `String s ]
+                    | None -> [])
+                 @ [ "params", params ]))
+          | _ -> assert false
+        in
+        let has_strategy =
+          match group |> member "strategy" with
+          | `Assoc _ -> true
+          | `Null -> false
+          | _ -> config_error "trading asset group" "'strategy' must be an object"
+        in
+        if (not has_strategy)
+           &&
+           match overlay_section with
+           | `Null -> true
+           | _ -> false
+        then
+          config_error
+            ("trading asset '" ^ asset ^ "'")
+            "needs a 'strategy', an 'overlay', or both";
+        if (match group_oracle with
+            | `Null -> false
+            | _ -> true)
+           && not has_strategy
+        then
+          config_error
+            ("trading asset '" ^ asset ^ "'")
+            "'oracle' requires a 'strategy' section (oracle sizing is per \
+             primary              strategy symbol)";
+        (match group |> member "strategy" with
+         | `Assoc _ as g ->
+           let exchange =
+             require_string ~context:("strategy for asset '" ^ asset ^ "'") g "exchange"
+           in
+           let base =
+             match strategy_defaults |> member exchange with
+             | `Assoc _ as d -> d
+             | _ -> `Assoc []
+           in
+           let g = json_merge ~base ~override:g in
+           ignore
+             (require_string ~context:("strategy for asset '" ^ asset ^ "'") g "symbol");
+           let name =
+             require_string ~context:("strategy for asset '" ^ asset ^ "'") g "name"
+           in
+           let g = json_set "strategy" (`String name) (json_remove "name" g) in
+           let g =
+             match group_oracle with
+             | `Assoc _ as o ->
+               let existing =
+                 match g |> member "oracle" with
+                 | `Assoc _ as e -> e
+                 | _ -> `Assoc []
+               in
+               json_set "oracle" (json_merge ~base:existing ~override:o) g
+             | _ -> g
+           in
+           let g =
+             match overlay_json with
+             | Some o -> json_set "overlay" o g
+             | None -> g
+           in
+           out := g :: !out
+         | _ -> ());
+        match overlay_section with
+        | `Assoc _ ->
+          let overlay_json =
+            match overlay_json with
+            | Some o -> o
+            | None -> assert false
+          in
+          let inventory =
+            match overlay_section |> member "inventory" with
+            | `List is -> is
+            | `Null -> []
+            | _ -> config_error "overlay" "'inventory' must be an array"
+          in
+          if (not has_strategy) && inventory = []
+          then
+            config_error
+              ("overlay for asset '" ^ asset ^ "'")
+              "has no legs: add a strategy or an inventory entry";
+          List.iter
+            (fun inv ->
+              let inv = require_object ~context:"overlay.inventory[]" inv in
+              if validate_keys
+                   ~context:("inventory leg for asset '" ^ asset ^ "'")
+                   ~allowed:known_inventory_keys
+                   inv
+              then exit 1;
+              ignore
+                (require_string
+                   ~context:("inventory leg for asset '" ^ asset ^ "'")
+                   inv
+                   "exchange");
+              ignore
+                (require_string
+                   ~context:("inventory leg for asset '" ^ asset ^ "'")
+                   inv
+                   "symbol");
+              out := json_set "overlay" overlay_json inv :: !out)
+            inventory
+        | _ -> ())
+      groups;
+    `List (List.rev !out)
+  | _ -> `List []
+;;
+
+(** The flat trading entry list for either layout. Grouped sections are flattened; legacy
+    arrays pass through. *)
+let trading_entries_json json = flatten_grouped_trading json
+
+let parse_overlays_from_trading trading_json =
   overlay_controllers := [];
   overlay_legs := [];
   let open Yojson.Basic.Util in
@@ -894,7 +1193,7 @@ let parse_overlays json =
              ])
   in
   let entries =
-    match json |> member "trading" with
+    match trading_json with
     | `List entries -> entries
     | _ -> []
   in
@@ -935,6 +1234,106 @@ let parse_overlays json =
     entries;
   overlay_legs := List.rev !overlay_legs;
   overlay_controllers := !controllers
+;;
+
+(** Parses overlay declarations from either layout. Grouped sections are flattened first. *)
+let parse_overlays json = parse_overlays_from_trading (trading_entries_json json)
+
+let asset_overrides_of_json ~context entry =
+  let open Yojson.Basic.Util in
+  if validate_keys ~context ~allowed:known_oracle_asset_keys entry then exit 1;
+  let okey key = entry |> member key |> to_float_opt in
+  ({ target_survival = okey "target_survival"
+   ; min_active_dsurv = okey "min_active_dsurv"
+   ; qty_cap_mult = okey "qty_cap_mult"
+   }
+   : Dio_oracle.Oracle_runtime.asset_overrides)
+;;
+
+(** Parses the oracle configuration from either layout.
+
+    Grouped layout: global defaults live in [trading.defaults.oracle]; per-asset overrides
+    live on the asset group and ride the flattened strategy entry, so an override is never
+    separated from the asset it sizes.
+
+    Legacy layout: top-level ["oracle"] with ["assets"] remains accepted. *)
+let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
+  let open Yojson.Basic.Util in
+  let grouped =
+    match json |> member "trading" with
+    | `Assoc _ -> true
+    | _ -> false
+  in
+  (match grouped, json |> member "oracle" with
+   | true, `Assoc _ ->
+     Logging.critical_f
+       ~section
+       "Top-level 'oracle' is not used with grouped trading: put global defaults in \
+        trading.defaults.oracle and per-asset overrides on the asset group";
+     exit 1
+   | _ -> ());
+  let defaults_json =
+    match json |> member "trading" with
+    | `Assoc _ ->
+      (match json |> member "trading" |> member "defaults" |> member "oracle" with
+       | `Assoc _ as o -> o
+       | _ -> `Assoc [])
+    | _ ->
+      (match json |> member "oracle" with
+       | `Assoc _ as o -> o
+       | _ -> `Assoc [])
+  in
+  if validate_keys ~context:"oracle defaults" ~allowed:known_oracle_keys defaults_json
+  then exit 1;
+  let legacy_assets =
+    match json |> member "oracle" with
+    | `Assoc fields ->
+      (match List.assoc_opt "assets" fields with
+       | Some (`Assoc a) -> a
+       | _ -> [])
+    | _ -> []
+  in
+  let inline_assets =
+    trading_entries_json json
+    |> to_list
+    |> List.filter_map (fun entry ->
+      match entry |> member "oracle", entry |> member "symbol" with
+      | (`Assoc _ as o), `String symbol -> Some (symbol, o)
+      | _ -> None)
+  in
+  let assets =
+    List.map
+      (fun (symbol, entry) ->
+        symbol, asset_overrides_of_json ~context:("oracle asset '" ^ symbol ^ "'") entry)
+      (legacy_assets @ inline_assets)
+  in
+  let seen = Hashtbl.create 8 in
+  List.iter
+    (fun (symbol, _) ->
+      if Hashtbl.mem seen symbol
+      then (
+        Logging.critical_f
+          ~section
+          "Duplicate oracle override for symbol '%s': declare it once, inline on the \
+           asset group"
+          symbol;
+        exit 1)
+      else Hashtbl.add seen symbol ())
+    assets;
+  if assets = [] && defaults_json = `Assoc []
+  then None
+  else (
+    let defaults = Dio_oracle.Oracle_runtime.default_config () in
+    let opt_float key default =
+      defaults_json |> member key |> to_float_opt |> Option.value ~default
+    in
+    Some
+      { target_survival = opt_float "target_survival" defaults.target_survival
+      ; min_active_dsurv = opt_float "min_active_dsurv" defaults.min_active_dsurv
+      ; qty_cap_mult = opt_float "qty_cap_mult" defaults.qty_cap_mult
+      ; refresh_seconds = opt_float "refresh_seconds" defaults.refresh_seconds
+      ; assets
+      })
 ;;
 
 (** Domain assets to spawn: primary-strategy entries plus one controller asset per hedge
@@ -980,6 +1379,27 @@ let domain_assets (trading : trading_config list) : trading_config list =
   grid @ synthesized
 ;;
 
+(** Last config that parsed successfully. [read_config] is re-run every 10 s and during
+    shutdown; a deploy that copies over a live config.json must not kill the caller, so a
+    transient parse failure reuses this. Startup has no cached value and still fails fast. *)
+let last_good_config : config option ref = ref None
+
+(** Last transient load error, so a persistently unreadable file logs once rather than
+    every poll. *)
+let last_config_error = ref ""
+
+let note_config_error exn =
+  let msg = Printexc.to_string exn in
+  if not (String.equal msg !last_config_error)
+  then (
+    last_config_error := msg;
+    Logging.warn_f
+      ~section
+      "config.json is temporarily unreadable (%s); keeping the last known good \
+       configuration"
+      msg)
+;;
+
 let read_config () : config =
   try
     (* DIO_CONFIG overrides the config path; default "config.json". Used to run the
@@ -999,10 +1419,11 @@ let read_config () : config =
     let flow_log = parse_flow_log_config json in
     let gc = parse_gc_config json in
     let oracle = parse_oracle_config json in
-    let trading = json |> member "trading" |> to_list |> List.map parse_config in
+    let trading_json = trading_entries_json json in
+    let trading = trading_json |> to_list |> List.map parse_config in
     (* Overlay declarations are parsed first: a trading entry without [strategy] is valid
        only as an inventory leg of a carry overlay. *)
-    parse_overlays json;
+    parse_overlays_from_trading trading_json;
     (* Fail fast if any entry's strategy file is missing/invalid/name-mismatched: without
        it the domain starts but binds no strategy and trades nothing. Checked here (engine
        config load) rather than in [parse_config] so the pure parser stays side-effect
@@ -1130,48 +1551,69 @@ let read_config () : config =
     let strategy_trace =
       json |> member "strategy_trace" |> to_bool_option |> Option.value ~default:false
     in
-    { cycle_mod
-    ; logging
-    ; flow_log
-    ; gc
-    ; oracle
-    ; trading
-    ; fng_check_threshold
-    ; latency_window_seconds
-    ; latency_spike_threshold_us
-    ; latency_spike_report
-    ; latency_spike_report_seconds
-    ; latency_network_spike_threshold_us
-    ; theme
-    ; strategy_trace
-    }
+    let config =
+      { cycle_mod
+      ; logging
+      ; flow_log
+      ; gc
+      ; oracle
+      ; trading
+      ; fng_check_threshold
+      ; latency_window_seconds
+      ; latency_spike_threshold_us
+      ; latency_spike_report
+      ; latency_spike_report_seconds
+      ; latency_network_spike_threshold_us
+      ; theme
+      ; strategy_trace
+      }
+    in
+    last_good_config := Some config;
+    last_config_error := "";
+    config
   with
   | Yojson.Json_error msg ->
-    Logging.critical_f ~section "Failed to parse config.json: %s" msg;
-    exit 1
+    (match !last_good_config with
+     | Some config ->
+       note_config_error (Yojson.Json_error msg);
+       config
+     | None ->
+       Logging.critical_f ~section "Failed to parse config.json: %s" msg;
+       exit 1)
   | Sys_error msg ->
-    Logging.warn_f ~section "Cannot read config.json: %s, using defaults" msg;
-    { cycle_mod = 10000
-    ; logging = { level = Logging.INFO; sections = []; width = None }
-    ; flow_log =
-        { enabled = flow_log_env_enabled ()
-        ; min_interval_seconds = 0.2
-        ; heartbeat_seconds = 5.0
-        ; pulse_seconds = 5.0
-        ; price_ticks = true
-        }
-    ; gc = None
-    ; oracle = None
-    ; trading = []
-    ; fng_check_threshold = 1.5
-    ; latency_window_seconds = 5.0
-    ; latency_spike_threshold_us = 10.0
-    ; latency_spike_report = Spike_report_internal
-    ; latency_spike_report_seconds = 30.0
-    ; latency_network_spike_threshold_us = 20_000.0
-    ; theme = None
-    ; strategy_trace = false
-    }
+    (match !last_good_config with
+     | Some config ->
+       note_config_error (Sys_error msg);
+       config
+     | None ->
+       Logging.warn_f ~section "Cannot read config.json: %s, using defaults" msg;
+       { cycle_mod = 10000
+       ; logging = { level = Logging.INFO; sections = []; width = None }
+       ; flow_log =
+           { enabled = flow_log_env_enabled ()
+           ; min_interval_seconds = 0.2
+           ; heartbeat_seconds = 5.0
+           ; pulse_seconds = 5.0
+           ; price_ticks = true
+           }
+       ; gc = None
+       ; oracle = None
+       ; trading = []
+       ; fng_check_threshold = 1.5
+       ; latency_window_seconds = 5.0
+       ; latency_spike_threshold_us = 10.0
+       ; latency_spike_report = Spike_report_internal
+       ; latency_spike_report_seconds = 30.0
+       ; latency_network_spike_threshold_us = 20_000.0
+       ; theme = None
+       ; strategy_trace = false
+       })
+  | exn ->
+    (match !last_good_config with
+     | Some config ->
+       note_config_error exn;
+       config
+     | None -> raise exn)
 ;;
 
 (** Cached GC config, parsed once on first access. Every domain calls [apply_gc_config],

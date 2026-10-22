@@ -359,6 +359,8 @@ let test_carry_place_ok_releases_inflight_key () =
     true
     (Dio_strategies.Strategy_common.InFlightOrders.add_in_flight_order key);
   Supervisor_orders.hedger_callbacks.on_place_ok order "oid-test";
+  (* Ack releases the placement key; the id -> kind registry remains the duplicate guard
+     until the terminal event. *)
   Alcotest.(check bool)
     "key released on ack"
     false
