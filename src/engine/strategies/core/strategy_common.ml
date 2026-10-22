@@ -80,6 +80,10 @@ type carry_order_meta =
     (** The full per-instrument in-flight key ([overlay_inflight_key]). The logical
         [com_kind] alone is shared by every symbol, so tracked-order lookups must match
         on this key. *)
+  ; com_at : float
+    (** Wall-clock registration time. A venue amend replaces the order id; if the old
+        id's fill/cancel event is lost, its entry would otherwise suppress every later
+        replace for this kind forever. Tracking is bounded by age for that reason. *)
   }
 
 let carry_registry_mutex = Mutex.create ()
@@ -92,19 +96,33 @@ let register_pending_carry_order ~dedup_key ~market ~maker ~kind =
   Hashtbl.replace
     carry_pending
     dedup_key
-    { com_market = market; com_maker = maker; com_kind = kind; com_key = dedup_key };
+    { com_market = market
+    ; com_maker = maker
+    ; com_kind = kind
+    ; com_key = dedup_key
+    ; com_at = Unix.gettimeofday ()
+    };
   Mutex.unlock carry_registry_mutex
 ;;
 
-(** True when an acked carry order for [key] is already tracked (awaiting a fill or
-    cancel). Mirrors the grid's [has.tracked.buy]: a tracked order suppresses a duplicate
+(** True when a recently acked carry order for [key] is already tracked (awaiting a fill
+    or cancel). Mirrors the grid's [has.tracked.buy]: a tracked order suppresses a duplicate
     placement while the venue's open-orders scan is still catching up. A pending placement
-    is covered by [InFlightOrders], so it is deliberately not part of this check. *)
-let has_tracked_carry_order ~key =
+    is covered by [InFlightOrders], so it is deliberately not part of this check.
+
+    Bounded by [max_age]: the check exists only to cover the ack -> open-orders scan
+    window. An order that is amended gets a new venue id, and if the old id's terminal
+    event never arrives its mapping would otherwise suppress every later replace for this
+    kind forever (the overlay then looks completely stalled: no entry, no take-profit).
+    Once the order is visible in the venue scan the caller amends it; the age bound only
+    decides whether a *missing* order may be re-placed. *)
+let has_tracked_carry_order ?(max_age = 5.0) ~key () =
+  let now = Unix.gettimeofday () in
   Mutex.lock carry_registry_mutex;
   let found =
     Hashtbl.fold
-      (fun _ meta acc -> acc || String.equal meta.com_key key)
+      (fun _ meta acc ->
+        acc || (String.equal meta.com_key key && now -. meta.com_at <= max_age))
       carry_orders
       false
   in
@@ -133,14 +151,20 @@ let bind_carry_order ~dedup_key ~order_id =
     Mutex.unlock carry_registry_mutex)
 ;;
 
-(** Register a replacement (amend) order id directly from the amend ack. The old id's
-    mapping is retired by its cancel event; the replacement is what will fill. *)
+(** Register a replacement (amend) order id directly from the amend ack. The old id is
+    retired by the caller: a venue amend produces a new id, and unless the old mapping is
+    removed it keeps suppressing replacements for the same kind. *)
 let register_carry_order_id ~order_id ~market ~maker ~kind ~key =
   Mutex.lock carry_registry_mutex;
   Hashtbl.replace
     carry_orders
     order_id
-    { com_market = market; com_maker = maker; com_kind = kind; com_key = key };
+    { com_market = market
+    ; com_maker = maker
+    ; com_kind = kind
+    ; com_key = key
+    ; com_at = Unix.gettimeofday ()
+    };
   Queue.push order_id carry_order_queue;
   trim_carry_orders_locked ();
   Mutex.unlock carry_registry_mutex

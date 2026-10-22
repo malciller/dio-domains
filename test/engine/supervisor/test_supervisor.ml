@@ -245,6 +245,86 @@ let carry_place_order duplicate_key =
   }
 ;;
 
+let carry_amend_order ~symbol ~side ~reduce_only ~duplicate_key =
+  { Dio_strategies.Strategy_common.operation = Dio_strategies.Strategy_common.Amend
+  ; order_id = Some "old-id"
+  ; symbol
+  ; side
+  ; order_type = "limit"
+  ; qty = 0.001
+  ; price = Some 84_000.0
+  ; time_in_force = "GTC"
+  ; post_only = false
+  ; reduce_only
+  ; userref = Some Dio_strategies.Strategy_common.strategy_userref_carry
+  ; strategy = Dio_strategies.Strategy_common.Carry
+  ; exchange = "hyperliquid"
+  ; duplicate_key
+  }
+;;
+
+let test_carry_amend_retires_old_and_tracks_new () =
+  (* Venue amend = new order id. The old mapping must be retired (or it suppresses every
+     later replace for the kind) and the new id must inherit the correct kind/market so
+     its fill is booked. *)
+  (* entry (sell, not reduce-only) *)
+  let key = "carry:entry|hyperliquid|BTC" in
+  Dio_strategies.Strategy_common.register_pending_carry_order
+    ~dedup_key:key
+    ~market:Dio_strategies.Strategy_common.Carry_perp
+    ~maker:false
+    ~kind:"carry:entry";
+  Dio_strategies.Strategy_common.bind_carry_order ~dedup_key:key ~order_id:"btc-entry-old";
+  let entry =
+    carry_amend_order
+      ~symbol:"BTC"
+      ~side:Dio_strategies.Strategy_common.Sell
+      ~reduce_only:false
+      ~duplicate_key:"carry:entry"
+  in
+  Supervisor_orders.hedger_callbacks.on_amend_ok entry "btc-entry-old" "btc-entry-new";
+  (match Dio_strategies.Strategy_common.lookup_carry_order ~order_id:"btc-entry-new" with
+   | Some meta ->
+     Alcotest.(check string) "new entry kind" "carry:entry" meta.com_kind;
+     Alcotest.(check string) "new entry tracked key" key meta.com_key;
+     Alcotest.(check bool)
+       "new entry market"
+       true
+       (meta.com_market = Dio_strategies.Strategy_common.Carry_perp)
+   | None -> Alcotest.fail "amended entry id is not tracked");
+  Alcotest.(check bool)
+    "old entry id retired"
+    true
+    (Dio_strategies.Strategy_common.lookup_carry_order ~order_id:"btc-entry-old" = None);
+  (* take-profit (buy, reduce-only): the full key keeps the |ro suffix *)
+  let ro = "carry:recycle:close|hyperliquid|BTC|ro" in
+  Dio_strategies.Strategy_common.register_pending_carry_order
+    ~dedup_key:ro
+    ~market:Dio_strategies.Strategy_common.Carry_perp
+    ~maker:false
+    ~kind:"carry:recycle:close|ro";
+  Dio_strategies.Strategy_common.bind_carry_order ~dedup_key:ro ~order_id:"tp-old";
+  let tp =
+    carry_amend_order
+      ~symbol:"BTC"
+      ~side:Dio_strategies.Strategy_common.Buy
+      ~reduce_only:true
+      ~duplicate_key:"carry:recycle:close|ro"
+  in
+  Supervisor_orders.hedger_callbacks.on_amend_ok tp "tp-old" "tp-new";
+  (match Dio_strategies.Strategy_common.lookup_carry_order ~order_id:"tp-new" with
+   | Some meta ->
+     Alcotest.(check string) "new tp kind" "carry:recycle:close|ro" meta.com_kind;
+     Alcotest.(check string) "new tp tracked key" ro meta.com_key
+   | None -> Alcotest.fail "amended take-profit id is not tracked");
+  Alcotest.(check bool)
+    "old tp id retired"
+    true
+    (Dio_strategies.Strategy_common.lookup_carry_order ~order_id:"tp-old" = None);
+  Dio_strategies.Strategy_common.retire_carry_order ~order_id:"btc-entry-new";
+  Dio_strategies.Strategy_common.retire_carry_order ~order_id:"tp-new"
+;;
+
 let test_overlay_inflight_key_is_namespaced () =
   let key ~instrument ~exchange ~reduce_only =
     Dio_strategies.Strategy_cycle_engine.overlay_inflight_key
@@ -424,6 +504,10 @@ let () =
             "overlay place retries are skipped while in flight"
             `Quick
             test_overlay_place_skips_while_in_flight
+        ; Alcotest.test_case
+            "carry amend retires old id and tracks new"
+            `Quick
+            test_carry_amend_retires_old_and_tracks_new
         ; Alcotest.test_case
             "stale in-flight keys are detected"
             `Quick

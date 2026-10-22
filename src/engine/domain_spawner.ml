@@ -1285,13 +1285,26 @@ let asset_domain_worker
             (fun (event : Types.execution_event) ->
                incr event_count;
                incr cycle_events;
+               (* Identify carry executions by the order registry first, the cloid
+                  second. A venue amend lands as a new order id and need not carry a
+                  cloid, so a cloid-only test drops the fill entirely: the close/entry
+                  fill is never booked, its registry mapping is never retired, and every
+                  later replace for that kind is silently suppressed. The registry is
+                  populated on the place/amend ack, which always precedes the fill. *)
                let overlay_event =
-                 match event.cl_ord_id with
-                 | Some clid ->
-                   (match Dio_strategies.Strategy_common.userref_of_cloid clid with
-                    | Some u -> u = Dio_strategies.Strategy_common.strategy_userref_carry
-                    | None -> false)
-                 | None -> false
+                 (match
+                    Dio_strategies.Strategy_common.lookup_carry_order
+                      ~order_id:event.order_id
+                  with
+                  | Some _ -> true
+                  | None ->
+                    (match event.cl_ord_id with
+                     | Some clid ->
+                       (match Dio_strategies.Strategy_common.userref_of_cloid clid with
+                        | Some u ->
+                          u = Dio_strategies.Strategy_common.strategy_userref_carry
+                        | None -> false)
+                     | None -> false))
                in
                match event.order_status with
                | Types.Canceled | Types.Rejected | Types.Expired ->

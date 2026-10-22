@@ -258,6 +258,22 @@ let grid_callbacks : strategy_callbacks =
   }
 ;;
 
+(** Rebuild the full per-instrument in-flight key a carry amend belongs to. The amend
+    request carries the logical kind (["carry:entry"], ["carry:recycle:close|ro"]), while the
+    registry keys tracked orders by [kind|exchange|instrument(|ro)]. Without this the new id
+    would not suppress a duplicate while the venue's open-orders scan catches up. *)
+let carry_amend_inflight_key (order : strategy_order) =
+  let kind = order.duplicate_key in
+  let root =
+    let n = String.length kind in
+    if n > 3 && String.equal (String.sub kind (n - 3) 3) "|ro"
+    then String.sub kind 0 (n - 3)
+    else kind
+  in
+  root ^ "|" ^ order.exchange ^ "|" ^ order.symbol
+  ^ if order.reduce_only then "|ro" else ""
+;;
+
 let hedger_callbacks : strategy_callbacks =
   { on_place_ok =
       (fun order order_id ->
@@ -297,11 +313,14 @@ let hedger_callbacks : strategy_callbacks =
           (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
              order.duplicate_key))
   ; on_amend_ok =
-      (fun order _target_id new_id ->
+      (fun order target_id new_id ->
         if order.strategy = Dio_strategies.Strategy_common.Carry
-           && order.side = Dio_strategies.Strategy_common.Buy
            && not (String.equal order.duplicate_key "")
-        then
+        then (
+          (* A venue amend lands as a new order id. Retire the old mapping first: if the
+             old id's terminal event is lost, its full-key mapping would suppress every
+             later replace for this kind forever (no entry, no take-profit). *)
+          Dio_strategies.Strategy_common.retire_carry_order ~order_id:target_id;
           Dio_strategies.Strategy_common.register_carry_order_id
             ~order_id:new_id
             ~market:
@@ -310,7 +329,7 @@ let hedger_callbacks : strategy_callbacks =
                else Dio_strategies.Strategy_common.Carry_perp)
             ~maker:order.post_only
             ~kind:order.duplicate_key
-            ~key:order.duplicate_key)
+            ~key:(carry_amend_inflight_key order)))
   ; on_amend_skipped = (fun _order _target_id -> ())
   ; on_amend_fail =
       (fun order _target_id _err ->
