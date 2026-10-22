@@ -3112,6 +3112,50 @@ let test_order_cancellation_matches_client_order_id () =
   check (option (float 0.)) "buy price cleared" None state.last_buy_order_price
 ;;
 
+let test_cancel_mid_amend_keeps_pending_marker () =
+  (* A cancel for the old id during a cancel+replace amendment is the amendment's side
+     effect. Dropping its [pending_amend_] marker there made the rung look un-amended for
+     the rest of the replace window, so the persisted-ladder reconcile restored it and the
+     venue rejected the duplicate with "insufficient qty available" (SMH 403 storm). The
+     amendment's own terminal event retires the marker. *)
+  let symbol = "MID_AMEND_CANCEL/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  let module IA = Dio_strategies.Strategy_common.InFlightAmendments in
+  ignore (IA.remove_in_flight_amendment "old-1");
+  state.pending_orders
+  <- [ "pending_amend_old-1", Dio_strategies.Strategy_common.Sell, 101.0, 0.0 ];
+  ignore (IA.add_in_flight_amendment "old-1");
+  Dio_strategies.Strategy_api.Strategy.handle_order_cancelled
+    ~now:0.0
+    symbol
+    "old-1"
+    Dio_strategies.Strategy_common.Sell
+    None;
+  check
+    bool
+    "pending amend marker survives the amendment's cancel event"
+    true
+    (List.exists
+       (fun (id, _, _, _) -> String.equal id "pending_amend_old-1")
+       state.pending_orders);
+  Dio_strategies.Strategy_api.Strategy.handle_order_amended
+    ~now:0.0
+    symbol
+    "old-1"
+    "new-1"
+    Dio_strategies.Strategy_common.Sell
+    101.0;
+  check
+    bool
+    "amendment completion retires the marker"
+    true
+    (not
+       (List.exists
+          (fun (id, _, _, _) -> String.equal id "pending_amend_old-1")
+          state.pending_orders));
+  ignore (IA.remove_in_flight_amendment "old-1")
+;;
+
 let test_order_rejection () =
   let state = Dio_strategies.Strategy_api.get_strategy_state "TEST3/USD" in
   state.pending_orders
@@ -5216,20 +5260,25 @@ let test_alpaca_excess_amends_open_top_rung () =
     check (float 1e-6) "excess amend grows the top rung by the excess" 2.0 o.qty;
     check
       bool
-      "excess amend covers the rung for the cancel+replace window"
+      "excess amend stays pending (covers the rung until the venue answers)"
       true
       (List.exists
-         (fun (_id, p, _ts) -> abs_float (p -. 101.0) < 1e-6)
-         state.recently_injected_sells)
+         (fun (id, side, p, _ts) ->
+           String.starts_with ~prefix:"pending_amend_" id
+           && side = Dio_strategies.Strategy_common.Sell
+           && abs_float (p -. 101.0) < 1e-6)
+         state.pending_orders)
   | _ -> failwith "expected exactly one sell amend on the top rung"
 ;;
 
 let test_alpaca_inflight_amend_rung_not_restored () =
   (* Regression: an Alpaca fractional amend is cancel+replace. The old order leaves the
      feed before the replacement lists; restoring the "missing" rung races the replacement
-     and is rejected with HTTP 403 "insufficient qty available" (seen on SMH). *)
+     and is rejected with HTTP 403 "insufficient qty available" (seen on SMH). The cover
+     is the pending-amend marker, so it closes on the venue's terminal event, not a timer. *)
   let symbol = "ALPACA_INFLIGHT_AMEND/USD" in
   let state = reset_alpaca_excess_state symbol in
+  state.pending_orders <- [];
   state.persisted_sell_levels <- [ 101.0, 1.0 ];
   let asset = alpaca_excess_asset ~symbol in
   let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
@@ -5269,25 +5318,28 @@ let test_alpaca_inflight_amend_rung_not_restored () =
       ~base_balance_age:None
       ~oracle_halted:false
   in
-  (* Amend dispatched; the replacement is not listed yet. *)
-  state.recently_injected_sells <- [ "top-oid", 101.0, Unix.gettimeofday () ];
+  (* Amend dispatched; its cancel has landed but the replacement is not listed yet. *)
+  state.pending_orders
+  <- [ "pending_amend_top-oid", Dio_strategies.Strategy_common.Sell, 101.0, 100.0 ];
   evaluate ~now:100.0 (sync ());
   check
     bool
     "no restore while the amended rung's replacement is in flight"
     true
     (pushed_sell_for symbol = None);
-  state.recently_injected_sells <- [ "top-oid", 101.0, 0.0 ];
+  (* The venue answered (amend failed, or the old order was genuinely cancelled): the
+     pending marker is retired, so the missing rung is restored on this same cycle. *)
+  state.pending_orders <- [];
   evaluate ~now:100.0 (sync ());
   match pushed_sell_for symbol with
   | Some o ->
-    check (float 1e-6) "expired coverage restores the dropped rung" 1.0 o.qty;
+    check (float 1e-6) "amend resolution restores the dropped rung immediately" 1.0 o.qty;
     check
       (float 0.005)
       "restored rung keeps its recorded price"
       101.0
       (Option.value o.price ~default:0.0)
-  | None -> failwith "expected the dropped rung to be restored after the cover window"
+  | None -> failwith "expected the dropped rung to be restored once the amend resolved"
 ;;
 
 let test_alpaca_excess_excludes_reserved_base () =
@@ -8359,6 +8411,10 @@ let () =
             "order cancellation matches client order id"
             `Quick
             test_order_cancellation_matches_client_order_id
+        ; test_case
+            "cancel mid-amend keeps the pending marker"
+            `Quick
+            test_cancel_mid_amend_keeps_pending_marker
         ; test_case "order rejection" `Quick test_order_rejection
         ; test_case
             "amendment TIF reject arms recovery"

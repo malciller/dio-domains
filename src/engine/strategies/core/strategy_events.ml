@@ -1040,8 +1040,15 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
                 asset_symbol);
             filter_keep_if_needed
               (fun (pending_id, s, _, _) ->
+                (* A cancel for the old id during a cancel+replace amendment is the
+                   amendment's side effect, not a real cancellation. Keep its
+                   [pending_amend_] marker so the rung stays covered until the amendment's
+                   own terminal event (ack/skip/failure) retires it; the persisted-rung
+                   reconcile uses that marker to avoid restoring a rung the venue's
+                   replacement still holds. *)
                 let matches =
-                  pending_id = order_id || pending_amend_for pending_id order_id
+                  pending_id = order_id
+                  || (pending_amend_for pending_id order_id && not is_being_amended)
                 in
                 let is_ghost_placement =
                   (not is_known_order)

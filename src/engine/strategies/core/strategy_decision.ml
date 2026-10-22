@@ -835,17 +835,6 @@ let evaluate_excess_sweep
               asset.exchange
           in
           let pushed = push_order ~now ~state order in
-          (* Register at dispatch, before the cancel event: the old id leaves the feed
-             before the replacement lists, and [sync_open_orders] would restore the
-             "missing" rung. The venue rejects that duplicate with "insufficient qty
-             available". *)
-          if pushed
-          then
-            state.recently_injected_sells
-            <- take
-                 20
-                 ((oid, top_open_price, Unix.gettimeofday ())
-                  :: state.recently_injected_sells);
           if pushed && ecfg.use_unnetted_sell_hold && delta > 0.0
           then arm_sell_hold ~state ~qty:delta ~now;
           (* A real qty increase is a meaningful execution event; a rounding-dust sweep
