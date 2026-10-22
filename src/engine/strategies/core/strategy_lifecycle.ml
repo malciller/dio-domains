@@ -73,36 +73,34 @@ let persisted_rebuild_needed ~(feed : Sell_orders.t) persisted =
   (not (ordered false 0.0 persisted)) || any_qty_changed persisted || any_adopted 0
 ;;
 
-(** Seconds a placed or amended sell keeps its rung covered. On a cancel+replace venue the
-    old order leaves the feed before the replacement is listed; restoring the "missing"
-    rung races the replacement and the venue rejects it with HTTP 403
-    ["insufficient qty available"]. *)
-let sell_injected_cover_s = 10.0
-
-(** True when an order at [price] was injected (placed or amended) within the
-    cancel+replace recognition window. *)
-let rung_covered_by_recent_injection ~state ~now price =
+(** True when a sell amendment for the rung at [price] is still in flight. A
+    cancel+replace venue removes the old order from the feed while its replacement is not
+    listed yet; restoring the rung in that window races the replacement and the venue
+    rejects the duplicate (HTTP 403 ["insufficient qty available"]). [pending_amend_*] is
+    added at dispatch and retired by exactly one terminal event (ack, skip, or failure),
+    so the cover closes with the amendment, not on a timer. Once acked, the replacement is
+    pushed into [open_sell_orders] directly (see [handle_order_amended]). *)
+let sell_amend_pending_at ~state price =
   List.exists
-    (fun (_id, injected_price, ts) ->
-      now -. ts < sell_injected_cover_s
-      && price_within_tolerance ~reference:price injected_price)
-    state.recently_injected_sells
+    (fun (id, side, amend_price, _ts) ->
+      side = Sell
+      && String.starts_with ~prefix:"pending_amend_" id
+      && price_within_tolerance ~reference:price amend_price)
+    state.pending_orders
 ;;
 
 (** Reconciles the persisted-sell grid (Alpaca offline fill recovery). Computed once per
-    execution and reused by the three persisted-sell branches. A rung mid-amend counts as
-    open: its absence is the amend's cancel, not a dropped level. *)
+    execution and reused by the three persisted-sell branches. A rung whose amendment is
+    in flight is treated as open: its absence from the feed is the amend's transient
+    cancel, not a dropped level. *)
 let reconcile_persisted_sell_levels ~state =
-  let now = Unix.gettimeofday () in
   let open_levels, missing_levels =
     partition_persisted_sell_levels
       state.persisted_sell_levels
       (Sell_orders.to_list state.open_sell_orders)
   in
   let covered, missing_levels =
-    List.partition
-      (fun (p, _) -> rung_covered_by_recent_injection ~state ~now p)
-      missing_levels
+    List.partition (fun (p, _) -> sell_amend_pending_at ~state p) missing_levels
   in
   open_levels @ covered, missing_levels
 ;;
@@ -1215,7 +1213,7 @@ let sync_open_orders
         in
         (* An amending rung is transiently absent from the feed. Treat it as open so the
            restore path does not race the replacement (venue 403). *)
-        go 0 || rung_covered_by_recent_injection ~state ~now:now_time p
+        go 0 || sell_amend_pending_at ~state p
       in
       let missing_acc = ref [] in
       List.iter
