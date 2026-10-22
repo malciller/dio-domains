@@ -31,8 +31,8 @@ type ctx =
   ; mutable cg_overlay_spot_symbol : string
   ; mutable cg_last_leverage : float
   (** Venue time of the last carry entry (perp sell) fill, or 0.0. A fresh entry fill can
-      arrive before the position snapshot reflects it; [order_place] holds a new entry
-      for a short grace window so the cycle cannot re-short the full target. *)
+      arrive before the position snapshot reflects it; [order_place] holds a new entry for
+      a short grace window so the cycle cannot re-short the full target. *)
   ; mutable cg_last_entry_fill_at : float
   ; mutable cg_price : float
   ; mutable cg_bid : float
@@ -509,14 +509,14 @@ let market_facts c (t : Strategy_runtime.t) =
     | None -> ""
   in
   let base =
-    match String.split_on_char '/' symbol with
-    | b :: _ -> b
-    | [] -> symbol
+    (* One [String.sub]; the overlay cycle calls this on every tick and
+       [String.split_on_char] builds a list plus a substring per call. *)
+    match String.index_opt symbol '/' with
+    | Some i -> String.sub symbol 0 i
+    | None -> symbol
   in
   let setf slot v = Strategy_runtime.set_platform_float t slot v in
-  let sets slot v =
-    Strategy_runtime.set_platform_slot t slot (Strategy_expr.V_string v)
-  in
+  let setstr slot v = Strategy_runtime.set_platform_string t slot v in
   let setb slot v = Strategy_runtime.set_platform_bool t slot v in
   let seti slot v = Strategy_runtime.set_platform_int t slot v in
   let fresh ts =
@@ -553,8 +553,8 @@ let market_facts c (t : Strategy_runtime.t) =
       Cr.get_total ()
     | None -> 0.0
   in
-  sets Slots.symbol symbol;
-  sets Slots.base_coin base;
+  setstr Slots.symbol symbol;
+  setstr Slots.base_coin base;
   setf Slots.now c.cg_now;
   (match funding with
    | Some f when fresh f.updated_at ->
@@ -650,7 +650,7 @@ let market_facts c (t : Strategy_runtime.t) =
      in
      setf Slots.carry_close_price close_price;
      setf Slots.carry_close_qty close_qty;
-     sets Slots.carry_close_kind close_kind;
+     setstr Slots.carry_close_kind close_kind;
      setb
        Slots.carry_close_is_recycle
        (String.equal close_kind "carry:recycle:close|ro"
@@ -670,7 +670,7 @@ let market_facts c (t : Strategy_runtime.t) =
    | None ->
      setf Slots.carry_close_price 0.0;
      setf Slots.carry_close_qty 0.0;
-     sets Slots.carry_close_kind "";
+     setstr Slots.carry_close_kind "";
      setb Slots.carry_close_is_recycle false;
      setf Slots.carry_close_realized 0.0;
      setf Slots.carry_close_realized_total 0.0;
@@ -710,16 +710,16 @@ let market_facts c (t : Strategy_runtime.t) =
       Slots.usdc_free
       (try Ex.get_tradeable_balance ~asset:"USDC" with
        | _ -> 0.0);
-    (* A perp l2Book can be keyed by the bare coin (the usual case) or, for a
-       cross-venue controller whose symbol has no matching spot pair, by the controller's
-       pair: on Hyperliquid the l2Book subscription for an ADA/XMR domain is the bare
-       coin, but the frame is filed under the domain pair, so the coin store stays empty.
-       Try the coin, then the domain symbol. For an overlay the domain symbol is
-       frequently a *spot* pair (ETH/USDC, SOL/USDC, HYPE/USDC), where the spot book is
-       the wrong side of the perp touch by the spot-perp premium; those already resolve
-       on the coin store, so the pair fallback only fires for the pair-keyed perp books.
-       If neither exists, quote the perp mark so the hedge is still priced off the perp
-       rather than left with no quote. *)
+    (* A perp l2Book can be keyed by the bare coin (the usual case) or, for a cross-venue
+       controller whose symbol has no matching spot pair, by the controller's pair: on
+       Hyperliquid the l2Book subscription for an ADA/XMR domain is the bare coin, but the
+       frame is filed under the domain pair, so the coin store stays empty. Try the coin,
+       then the domain symbol. For an overlay the domain symbol is frequently a *spot*
+       pair (ETH/USDC, SOL/USDC, HYPE/USDC), where the spot book is the wrong side of the
+       perp touch by the spot-perp premium; those already resolve on the coin store, so
+       the pair fallback only fires for the pair-keyed perp books. If neither exists,
+       quote the perp mark so the hedge is still priced off the perp rather than left with
+       no quote. *)
     let overlay_controller = c.cg_overlay_accumulated >= 0.0 in
     let fallback_mark =
       match funding with
@@ -731,9 +731,8 @@ let market_facts c (t : Strategy_runtime.t) =
        setf Slots.bid bid;
        setf Slots.ask ask
      | None when overlay_controller && fallback_mark > 0.0 ->
-       (* The perp book store is not keyed by the coin for this domain: use the perp
-          mark. It is a genuine perp quote, unlike the pair store which can be a spot
-          book. *)
+       (* The perp book store is not keyed by the coin for this domain: use the perp mark.
+          It is a genuine perp quote, unlike the pair store which can be a spot book. *)
        setf Slots.bid fallback_mark;
        setf Slots.ask fallback_mark
      | None ->
@@ -774,9 +773,9 @@ let market_facts c (t : Strategy_runtime.t) =
 
 (** Perp coin for a spot pair: [BTC/USDC] -> [BTC]. *)
 let perp_coin symbol =
-  match String.split_on_char '/' symbol with
-  | base :: _ -> base
-  | [] -> symbol
+  match String.index_opt symbol '/' with
+  | Some i -> String.sub symbol 0 i
+  | None -> symbol
 ;;
 
 (** Generic overlay shadow switch. Set [DIO_OVERLAY_DRY_RUN=1] to log intended overlay
@@ -848,8 +847,11 @@ let order_place
       else (
         let floor_qty = Jac.round_qty qty instrument asset.exchange in
         match price with
-        | Some p when Float.is_finite p && p > 0.0 && min_notional > 0.0
-                      && floor_qty *. p < min_notional ->
+        | Some p
+          when Float.is_finite p
+               && p > 0.0
+               && min_notional > 0.0
+               && floor_qty *. p < min_notional ->
           Jac.round_qty_up qty instrument asset.exchange
         | _ -> qty)
     in
@@ -1056,11 +1058,6 @@ let order_replace
         then Strategy_common.Sell
         else Strategy_common.Buy
       in
-      let ex_side =
-        match order_side with
-        | Strategy_common.Sell -> Dio_exchange.Exchange_intf.Types.Sell
-        | Strategy_common.Buy -> Dio_exchange.Exchange_intf.Types.Buy
-      in
       (* Buys share the same userref: the spot recycle buy and the perp take-profit are
          both carry buys. Match an existing order only when its booked kind is the same;
          otherwise a spot replace could amend/cancel the take-profit (or vice versa). *)
@@ -1084,36 +1081,50 @@ let order_replace
         | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
           (* Open orders can be keyed by the spot pair (orderUpdates maps the perp coin
              back to the registered pair) or by the perp coin (the placement injection
-             uses the order symbol). Query both and dedupe by order id. *)
-          let spot_orders =
-            try Ex.get_open_orders ~symbol:asset.symbol with
-            | _ -> []
-          in
-          let perp_orders =
-            if String.equal instrument asset.symbol
-            then []
-            else (
-              try Ex.get_open_orders ~symbol:instrument with
-              | _ -> [])
-          in
-          let by_id = Hashtbl.create 8 in
-          List.iter
-            (fun (o : Dio_exchange.Exchange_intf.Types.open_order) ->
-              Hashtbl.replace by_id o.order_id o)
-            (spot_orders @ perp_orders);
-          Hashtbl.fold (fun _ o acc -> o :: acc) by_id []
-          |> List.filter (fun (o : Dio_exchange.Exchange_intf.Types.open_order) ->
-            o.user_ref = Some Strategy_common.strategy_userref_carry
-            && o.side = ex_side
-            && (o.status = Dio_exchange.Exchange_intf.Types.New
-                || o.status = Dio_exchange.Exchange_intf.Types.PartiallyFilled)
-            &&
+             uses the order symbol). Query both.
+
+             Two-phase scan: the fast iterator yields primitives, so only an order that
+             matches this carry kind is materialized (usually one, often zero). Building
+             the full [Types.open_order] list for every resting order on every book tick
+             was the overlay's dominant allocation (100+ orders per pair, several replaces
+             per cycle). *)
+          let seen = Hashtbl.create 4 in
+          let out = ref [] in
+          let want_side =
             match order_side with
-            | Strategy_common.Sell -> true
-            | Strategy_common.Buy ->
-              (match Strategy_common.lookup_carry_order ~order_id:o.order_id with
-               | Some meta -> String.equal meta.com_kind kind_key
-               | None -> false))
+            | Strategy_common.Sell -> "sell"
+            | Strategy_common.Buy -> "buy"
+          in
+          let consider symbol =
+            try
+              Ex.iter_open_orders_fast
+                ~symbol
+                (fun oid _price _remaining side_str userref ->
+                   if userref = Some Strategy_common.strategy_userref_carry
+                      && String.equal side_str want_side
+                      && (not (Hashtbl.mem seen oid))
+                      &&
+                      match order_side with
+                      | Strategy_common.Sell -> true
+                      | Strategy_common.Buy ->
+                        (match Strategy_common.lookup_carry_order ~order_id:oid with
+                         | Some meta -> String.equal meta.com_kind kind_key
+                         | None -> false)
+                   then (
+                     match Ex.get_open_order ~symbol ~order_id:oid with
+                     | Some (o : Dio_exchange.Exchange_intf.Types.open_order)
+                       when o.status = Dio_exchange.Exchange_intf.Types.New
+                            || o.status = Dio_exchange.Exchange_intf.Types.PartiallyFilled
+                       ->
+                       Hashtbl.replace seen oid ();
+                       out := o :: !out
+                     | _ -> ()))
+            with
+            | _ -> ()
+          in
+          consider asset.symbol;
+          if not (String.equal instrument asset.symbol) then consider instrument;
+          !out
         | None -> []
       in
       (* The venue floor applies to the order's total size, not the remaining size on an
@@ -1231,8 +1242,8 @@ let order_replace
             ignore (Jac.push_order ~now:c.cg_now ~manage_state:false order : bool))
         | [] ->
           (* No open order matched the venue scan. If the order is already tracked (acked
-             but not yet visible), do not place a second one: the grid's
-             [has.tracked.buy] equivalent. The next cycle amends once the scan sees it. *)
+             but not yet visible), do not place a second one: the grid's [has.tracked.buy]
+             equivalent. The next cycle amends once the scan sees it. *)
           let tracked_key =
             overlay_inflight_key
               ~dedup_key

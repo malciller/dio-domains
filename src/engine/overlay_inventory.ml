@@ -13,8 +13,9 @@
     inventory.
 
     Reading balances and open orders is an in-memory store access on the overlay cycle,
-    not the grid hot path. The open-order scan is skipped entirely when there are no
-    sells. *)
+    not the grid hot path. The open-order walk uses the venue's allocation-free iterator
+    (primitive values, no [Types.open_order] list), so a pair with a large resting ladder
+    does not allocate a record per order on every cycle. *)
 
 let section = "overlay_inventory"
 
@@ -36,21 +37,42 @@ let get_module exchange =
     None
 ;;
 
-(** Quantity of open sell orders for [symbol]. Returns 0 on any accessor failure. *)
+(** Quantity of open sell orders for [symbol]. Returns 0 on any accessor failure.
+    Allocation-free: [iter_open_orders_fast] yields primitives, so the overlay cycle no
+    longer materializes one [Types.open_order] record per resting order. *)
 let open_sell_base (module Ex : Exchange.S) ~symbol =
-  try
-    List.fold_left
-      (fun acc (o : Exchange.Types.open_order) ->
-        match o.side with
-        | Exchange.Types.Sell ->
-          if o.status = Exchange.Types.New || o.status = Exchange.Types.PartiallyFilled
-          then acc +. Float.max 0.0 o.remaining_qty
-          else acc
-        | Exchange.Types.Buy -> acc)
-      0.0
-      (Ex.get_open_orders ~symbol)
-  with
-  | _ -> 0.0
+  let total = ref 0.0 in
+  (try
+     Ex.iter_open_orders_fast ~symbol (fun _oid _price qty side_str _userref ->
+       if qty > 0.0 && String.equal side_str "sell" then total := !total +. qty)
+   with
+   | _ -> ());
+  !total
+;;
+
+(** Per-leg cache for {!open_sell_base}. The venue's open-orders generation moves only
+    when the book changes, so a quiet pair reuses the last sum instead of walking its
+    resting ladder on every overlay cycle (the hot-read contract reserves O(open-orders)
+    work for reconcile paths). *)
+type open_sell_cache =
+  { mutable gen : int
+  ; mutable value : float
+  }
+
+let create_open_sell_cache () = { gen = -2; value = 0.0 }
+
+let open_sell_base_cached (module Ex : Exchange.S) ~symbol ~(cache : open_sell_cache) =
+  let gen =
+    try Ex.get_open_orders_generation ~symbol with
+    | _ -> -1
+  in
+  if gen >= 0 && gen = cache.gen
+  then cache.value
+  else (
+    let value = open_sell_base (module Ex) ~symbol in
+    cache.gen <- gen;
+    cache.value <- value;
+    value)
 ;;
 
 (** Hedgeable base for one leg. [free] is the tradeable (hold-netted) figure; [total]
@@ -67,7 +89,7 @@ let q_of_balances ~free ~total ~open_sell_base =
 
 let sanitize v = if Float.is_finite v && v > 0.0 then v else 0.0
 
-let leg_q (leg : Config.overlay_leg) =
+let leg_q ?cache (leg : Config.overlay_leg) =
   match get_module leg.ol_exchange with
   | None -> 0.0
   | Some (module Ex : Exchange.S) ->
@@ -80,8 +102,17 @@ let leg_q (leg : Config.overlay_leg) =
       try sanitize (Ex.get_total_balance ~asset:base) with
       | _ -> 0.0
     in
-    let open_sell = open_sell_base (module Ex) ~symbol:leg.ol_symbol in
+    let open_sell =
+      match cache with
+      | Some c -> open_sell_base_cached (module Ex) ~symbol:leg.ol_symbol ~cache:c
+      | None -> open_sell_base (module Ex) ~symbol:leg.ol_symbol
+    in
     q_of_balances ~free ~total ~open_sell_base:open_sell
+;;
+
+(** Per-leg caches aligned with [controller.oc_legs]. *)
+let create_caches (controller : Config.overlay_controller) =
+  Array.init (List.length controller.oc_legs) (fun _ -> create_open_sell_cache ())
 ;;
 
 (** Sum the legs of [controller]. [spot_symbol] is the controller's Hyperliquid spot pair
@@ -101,4 +132,35 @@ let aggregate (controller : Config.overlay_controller) =
        | Some l -> l.ol_symbol
        | None -> controller.oc_hedge_symbol)
   }
+;;
+
+(** {!aggregate} with per-leg open-sell caches. Falls back to [aggregate] when [caches] is
+    not aligned with the controller's legs (a config reload / test fixture). *)
+let aggregate_cached (controller : Config.overlay_controller) ~caches =
+  let legs = controller.oc_legs in
+  if Array.length caches <> List.length legs
+  then aggregate controller
+  else (
+    let i = ref 0 in
+    let total =
+      List.fold_left
+        (fun acc leg ->
+          let cache = Array.unsafe_get caches !i in
+          incr i;
+          acc +. leg_q ~cache leg)
+        0.0
+        legs
+    in
+    let hl_leg =
+      List.find_opt
+        (fun (l : Config.overlay_leg) -> Config.is_hyperliquid l.ol_exchange)
+        legs
+    in
+    { total
+    ; has_spot_leg = Option.is_some hl_leg
+    ; spot_symbol =
+        (match hl_leg with
+         | Some l -> l.ol_symbol
+         | None -> controller.oc_hedge_symbol)
+    })
 ;;

@@ -8,20 +8,23 @@
     reservation is the sum of the per-entry budgets. *)
 
 let section = "carry_reserve"
+let base_coin_of_symbol symbol = Config.base_coin_of_symbol symbol
 
-let base_coin_of_symbol symbol =
-  match String.split_on_char '/' symbol with
-  | b :: _ -> b
-  | [] -> symbol
+(** Case-insensitive equality without allocating an uppercased copy. *)
+let ci_equal a b =
+  let n = String.length a in
+  n = String.length b
+  &&
+  let rec go i =
+    i >= n || (Char.uppercase_ascii a.[i] = Char.uppercase_ascii b.[i] && go (i + 1))
+  in
+  go 0
 ;;
 
 (** Hyperliquid base-tier maintenance rates for the carry assets. Unknown coins use the
     conservative HYPE rate. *)
 let maintenance_rate ~coin =
-  match String.uppercase_ascii coin with
-  | "BTC" -> 0.0125
-  | "HYPE" -> 0.05
-  | _ -> 0.05
+  if ci_equal coin "BTC" then 0.0125 else if ci_equal coin "HYPE" then 0.05 else 0.05
 ;;
 
 type leg =
@@ -66,4 +69,13 @@ let compute ~exchange ~symbol =
   | Some target ->
     let p = Config.get_overlay_params ~exchange ~symbol in
     Option.value (c_min_for_target ~target ~mult:p.min_liq_mult) ~default:0.0
+;;
+
+(** As {!compute}, but with the controller's already-resolved coin and liquidation
+    multiple. The domain loop knows both for the life of the controller, so the per-cycle
+    reserve does no config lookup, string normalization, or symbol split. *)
+let compute_with ~exchange ~coin ~min_liq_mult =
+  match pos_leg ~exchange ~coin with
+  | None -> 0.0
+  | Some target -> Option.value (c_min_for_target ~target ~mult:min_liq_mult) ~default:0.0
 ;;

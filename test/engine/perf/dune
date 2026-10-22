@@ -3,6 +3,7 @@
  (libraries
   dio.strategies
   dio.engine
+  dio.hyperliquid
   dio.latency_profiling
   dio.mtime
   dio.mtime.clock.os

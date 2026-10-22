@@ -171,26 +171,61 @@ let () =
 
 let perp_order_mutex = Mutex.create ()
 
+(** Immutable membership snapshot of [perp_order_coin], republished (never mutated) under
+    [perp_order_mutex] whenever the classification index changes.
+
+    The spot view used to rebuild an id list on every read and then [List.mem] it once per
+    open order: O(n^2) string comparisons plus a fresh list per call. The overlay asks for
+    the spot book every cycle, so on a 100-order pair that alone was tens of microseconds
+    and thousands of allocated words per cycle (the PREP tail in the latency report).
+    Readers now do one [Atomic.get] and O(1) [Hashtbl.mem], allocating nothing. Writers
+    are order events, not the cycle path, so copying the (small, bounded) id set on change
+    is cheap by comparison. *)
+let perp_ids : (string, unit) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
+
+(** Bumped whenever [perp_ids] changes. Folded into the per-symbol open-orders generation
+    so a consumer caching anything derived from the spot view (the overlay's open-sell
+    base) invalidates when an order is reclassified, even though the raw open-orders
+    snapshot itself did not change. Both counters are monotonic, so the sum changes on
+    either bump. *)
+let perp_ids_generation : int Atomic.t = Atomic.make 0
+
+(* Caller holds [perp_order_mutex]. *)
+let publish_perp_ids_locked () =
+  let snapshot =
+    Hashtbl.create (max 16 (Concurrency.Fifo_index.length perp_order_coin))
+  in
+  Concurrency.Fifo_index.fold
+    (fun id _ () -> Hashtbl.replace snapshot id ())
+    perp_order_coin
+    ();
+  Atomic.set perp_ids snapshot;
+  Atomic.incr perp_ids_generation
+;;
+
+(** Lock-free, allocation-free perp-id membership snapshot. Treat as read-only. *)
+let perp_ids_snapshot () = Atomic.get perp_ids [@@inline]
+
 let note_perp_order ~order_id ~coin =
   Mutex.lock perp_order_mutex;
+  (* A repeat update for an order already classified as perp cannot change membership, so
+     skip the snapshot rebuild (the O(1) lookup is much cheaper than republishing). The
+     eviction queue only changes on a new admission; still republish if the bounded index
+     actually shrank, so a cap eviction cannot leave a stale id in the reader snapshot. *)
+  let already = Concurrency.Fifo_index.mem perp_order_coin order_id in
+  let before = Concurrency.Fifo_index.length perp_order_coin in
   Concurrency.Fifo_index.set perp_order_coin ~key:order_id ~value:coin;
+  if (not already) || Concurrency.Fifo_index.length perp_order_coin <> before
+  then publish_perp_ids_locked ();
   Mutex.unlock perp_order_mutex
 ;;
 
 let forget_perp_order order_id =
   Mutex.lock perp_order_mutex;
+  let present = Concurrency.Fifo_index.mem perp_order_coin order_id in
   Concurrency.Fifo_index.remove perp_order_coin order_id;
+  if present then publish_perp_ids_locked ();
   Mutex.unlock perp_order_mutex
-;;
-
-(** Order ids the feed has classified as perpetual. Snapshot under the same mutex that
-    guards the index, then use the list to filter the spot view. Open-order counts are
-    small, so a list lookup is cheaper than taking the mutex once per order. *)
-let perp_order_ids () =
-  Mutex.lock perp_order_mutex;
-  let ids = Concurrency.Fifo_index.fold (fun id _ acc -> id :: acc) perp_order_coin [] in
-  Mutex.unlock perp_order_mutex;
-  ids
 ;;
 
 let _startup_snapshot_done : bool Atomic.t = Atomic.make false
@@ -277,7 +312,10 @@ let orders_generation : int Atomic.t = Atomic.make 0
   \    when unchanged. Mirrors [Kraken_executions_feed.orders_generation]. "]
 ;;
 
-let get_orders_generation () = Atomic.get orders_generation [@@inline]
+let get_orders_generation () =
+  Atomic.get orders_generation + Atomic.get perp_ids_generation
+[@@inline]
+;;
 
 [@@@ocaml.text
   " Publishes an immutable snapshot of open_orders to the atomic cache. Must be called by\n\
@@ -317,7 +355,7 @@ let publish_open_orders_cache store =
 
 let get_orders_generation_for_symbol symbol =
   match Ds.Cow_table.find_opt stores symbol with
-  | Some store -> Atomic.get store.open_orders_generation
+  | Some store -> Atomic.get store.open_orders_generation + Atomic.get perp_ids_generation
   | None -> -1
 [@@ocaml.doc
   " Per-symbol generation for [symbol]. [-1] when the store does not exist yet, so the\n\
@@ -330,13 +368,15 @@ let drain_open_order_changes ~symbol =
   | Some store ->
     let changes, overflow = drain_changes store in
     let changes =
-      if String.contains symbol '/'
-      then (
-        let perp = perp_order_ids () in
-        if perp = []
+      (* The drain returns [] on the common cycle; do not rebuild the perp view just to
+         filter an empty list. *)
+      if changes = [] || not (String.contains symbol '/')
+      then changes
+      else (
+        let perp = perp_ids_snapshot () in
+        if Hashtbl.length perp = 0
         then changes
-        else List.filter (fun (id, _) -> not (List.mem id perp)) changes)
-      else changes
+        else List.filter (fun (id, _) -> not (Hashtbl.mem perp id)) changes)
     in
     ( List.rev_map
         (fun (id, (o : open_order option)) ->
@@ -411,12 +451,12 @@ let get_open_orders symbol =
     perp order under the registered spot pair, so a strategy that reads the pair directly
     would otherwise mistake the overlay's perp take-profit for a second spot buy. *)
 let get_spot_open_orders symbol =
-  let perp = perp_order_ids () in
-  if perp = []
+  let perp = perp_ids_snapshot () in
+  if Hashtbl.length perp = 0
   then get_open_orders symbol
   else
     List.filter
-      (fun (o : open_order) -> not (List.mem o.order_id perp))
+      (fun (o : open_order) -> not (Hashtbl.mem perp o.order_id))
       (get_open_orders symbol)
 ;;
 
@@ -465,12 +505,12 @@ let fold_open_orders symbol ~init ~f =
 ;;
 
 let fold_spot_open_orders symbol ~init ~f =
-  let perp = perp_order_ids () in
-  if perp = []
+  let perp = perp_ids_snapshot () in
+  if Hashtbl.length perp = 0
   then fold_open_orders symbol ~init ~f
   else
     fold_open_orders symbol ~init ~f:(fun acc (o : open_order) ->
-      if List.mem o.order_id perp then acc else f acc o)
+      if Hashtbl.mem perp o.order_id then acc else f acc o)
 ;;
 
 let remove_open_order ~symbol ~order_id =
@@ -628,6 +668,7 @@ let clear_all_open_orders () =
   Mutex.unlock order_index_mutex;
   Mutex.lock perp_order_mutex;
   Concurrency.Fifo_index.clear perp_order_coin;
+  publish_perp_ids_locked ();
   Mutex.unlock perp_order_mutex;
   if !total_removed > 0
   then

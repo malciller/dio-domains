@@ -251,6 +251,36 @@ let test_perp_orders_classified () =
     (List.exists (fun (id, _) -> String.equal id "4242") changes)
 ;;
 
+(* The spot view reads a published membership snapshot, not the classification index
+   itself. Make sure a reclassification (forget) is reflected: a stale snapshot would keep
+   hiding a real spot order after the perp position retired it. *)
+let test_perp_classification_snapshot_updates () =
+  Hyperliquid.Executions_feed.initialize [ "SNAPX"; "SNAPX/USDC" ];
+  Hyperliquid.Executions_feed.inject_order
+    ~symbol:"SNAPX/USDC"
+    ~order_id:"snap-1"
+    ~side:Hyperliquid.Executions_feed.Sell
+    ~qty:1.0
+    ~price:100.0
+    ();
+  let spot_ids () =
+    List.map
+      (fun (o : Hyperliquid.Executions_feed.open_order) -> o.order_id)
+      (Hyperliquid.Executions_feed.get_spot_open_orders "SNAPX/USDC")
+  in
+  Alcotest.(check bool) "initially a spot order" true (List.mem "snap-1" (spot_ids ()));
+  Hyperliquid.Executions_feed.note_perp_order ~order_id:"snap-1" ~coin:"SNAPX";
+  Alcotest.(check bool)
+    "classified perp is hidden from spot"
+    false
+    (List.mem "snap-1" (spot_ids ()));
+  Hyperliquid.Executions_feed.forget_perp_order "snap-1";
+  Alcotest.(check bool)
+    "retired classification restores spot view"
+    true
+    (List.mem "snap-1" (spot_ids ()))
+;;
+
 let test_amend_replacement_visible () =
   Hyperliquid.Executions_feed.initialize [ "AMENDX"; "AMENDX/USDC" ];
   let ids_of orders =
@@ -314,6 +344,10 @@ let () =
             test_process_order_terminal_status
         ; Alcotest.test_case "find_order_everywhere" `Quick test_find_order_everywhere
         ; Alcotest.test_case "perp orders classified" `Quick test_perp_orders_classified
+        ; Alcotest.test_case
+            "perp classification snapshot updates"
+            `Quick
+            test_perp_classification_snapshot_updates
         ; Alcotest.test_case
             "amend replacement is visible"
             `Quick

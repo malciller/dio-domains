@@ -358,6 +358,46 @@ let bench_sell_prepare () =
   name, n, LP.percentile p 0.50, LP.percentile p 0.90, LP.percentile p 0.99, total_ms
 ;;
 
+(* Hyperliquid spot-order view with a realistic ladder. The venue can key perp orders
+   under the registered spot pair, so the spot view must exclude them. This used to build
+   an id list and [List.mem] it once per open order on every overlay cycle: O(n^2) string
+   comparisons plus a record list per call. The benchmark pins the allocation-free, O(n)
+   shape (and reports words/call so a regression to list materialization is visible). *)
+let bench_spot_order_filter () =
+  let name = "hyperliquid_spot_filter_100_orders" in
+  let module E = Hyperliquid.Executions_feed in
+  E.initialize [ "BENCHP"; "BENCHP/USDC" ];
+  let orders = 100 in
+  for i = 1 to orders do
+    let id = string_of_int i in
+    E.inject_order
+      ~symbol:"BENCHP/USDC"
+      ~order_id:id
+      ~side:E.Sell
+      ~qty:1.0
+      ~price:100.0
+      ~user_ref:3
+      ~cl_ord_id:id
+      ()
+  done;
+  (* Half the resting orders are perp take-profits keyed under the spot pair. *)
+  for i = 1 to orders / 2 do
+    E.note_perp_order ~order_id:(string_of_int i) ~coin:"BENCHP"
+  done;
+  let n = 200_000 in
+  let p = LP.create ~max_latency_us:100_000 name in
+  let seen = ref 0 in
+  let w0 = Gc.minor_words () in
+  let total_ms =
+    wall_ms (fun () ->
+      run_bench p n (fun () ->
+        E.fold_spot_open_orders "BENCHP/USDC" ~init:() ~f:(fun () _ -> incr seen)))
+  in
+  let words = (Gc.minor_words () -. w0) /. float n in
+  Printf.printf "  %s: %.1f words/call (seen=%d)\n%!" name words !seen;
+  name, n, LP.percentile p 0.50, LP.percentile p 0.90, LP.percentile p 0.99, total_ms
+;;
+
 (* ── entry point ──────────────────────────────────────────────────────────── *)
 
 let () =
@@ -381,6 +421,7 @@ let () =
     ; bench_state_warmup ()
     ; bench_duplicate_key_gen ()
     ; bench_strategy_cycle ()
+    ; bench_spot_order_filter ()
     ; bench_sync_scan ()
     ; bench_sell_prepare ()
     ]

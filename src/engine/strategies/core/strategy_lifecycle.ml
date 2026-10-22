@@ -387,9 +387,9 @@ let venue_gross_base ~(hold_netted : bool) ~(asset : trading_config) ~spendable 
          i.e. every Hyperliquid spot strategy, the venue this path exists for. Take the
          base asset before the lookup. Slash-less symbols ("SMH") pass through unchanged. *)
       let base_asset =
-        match String.split_on_char '/' asset.symbol with
-        | base :: _ -> base
-        | [] -> asset.symbol
+        match String.index_opt asset.symbol '/' with
+        | Some i -> String.sub asset.symbol 0 i
+        | None -> asset.symbol
       in
       let total =
         try Ex.get_total_balance ~asset:base_asset with
