@@ -126,6 +126,16 @@ type strategy_state =
          is suppressed only within [buy_ack_ghost_grace_s] of this stamp, so a buy that
          genuinely leaves the book later is still recovered promptly. Stays 0.0 for buys
          adopted from the feed (never acked locally). *)
+  ; mutable last_ghost_buy_id : string
+      (* Order id most recently purged as a ghost buy ("" = none). A venue feed that
+         re-lists an order it just dropped makes the adoption path re-track the same id,
+         so the next scan purges it again: the grid alternates between "a buy rests" (no
+         replacement placed, phantom row in the dashboard) and "it vanished", while every
+         purge requests another user-state resync - the resync is what re-lists it. The
+         same id ghosted twice is the signature of that flap: the id is then evicted (see
+         [evicted_orders]) so both the scan and the adoption path ignore it, and no
+         further resync is requested. A genuine one-off feed lag (an adopted buy has no
+         ack grace) is still recovered on the first purge and can be re-adopted normally. *)
   ; mutable inflight_cancel_buy : bool
       (* true while buy cancel is pending confirmation via order channel *)
   ; mutable inflight_amend_buy : bool
@@ -582,6 +592,7 @@ let rec get_strategy_state asset_symbol =
       ; last_cycle = 0
       ; last_order_time = 0.0
       ; last_buy_ack_ts = 0.0
+      ; last_ghost_buy_id = ""
       ; inflight_cancel_buy = false
       ; inflight_amend_buy = false
       ; amend_cooldowns = Hashtbl.create 16

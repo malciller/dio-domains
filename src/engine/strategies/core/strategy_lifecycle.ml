@@ -87,6 +87,7 @@ let reconcile_persisted_sell_levels ~state =
 let sell_hold_netting_grace_s = Platform_accounting.sell_hold_netting_grace_s
 let unreflected_cutoff = Platform_accounting.unreflected_cutoff
 let sweep_max_balance_age_s = Platform_accounting.sweep_max_balance_age_s
+let ghost_buy_evict_ttl_s = Platform_accounting.ghost_buy_evict_ttl_s
 
 (* Moved to Platform_accounting (milestone 2). Thin adapter keeps the grid's state field
    as the store; behavior is unchanged. *)
@@ -1121,6 +1122,16 @@ let sync_open_orders
     then (
       let oid = Option.value state.last_buy_order_id ~default:"none" in
       let p = Option.value state.last_buy_order_price ~default:0.0 in
+      (* A feed that re-lists an order it just dropped re-adopts the same id on the next
+         cycle, so this purge repeats: the strategy believes a buy rests (places no
+         replacement; the dashboard row is a phantom) while every purge requests another
+         user-state resync - and the resync is what re-lists the order. The same id
+         ghosted twice is the signature of that flap. Evict it, which removes it from both
+         the scan and the adoption path, and stop requesting resyncs that only bring it
+         back. *)
+      let repeat =
+        (not (String.equal oid "none")) && String.equal oid state.last_ghost_buy_id
+      in
       Logging.warn_f
         ~section
         "GHOST_BUY_DETECTED [%s] order %s @ %.2f in memory, but not in open orders feed. \
@@ -1128,14 +1139,20 @@ let sync_open_orders
         asset.symbol
         oid
         p;
+      state.last_ghost_buy_id <- oid;
       state.last_buy_order_id <- None;
       state.last_buy_order_price <- None;
       set_asset_reserved_quote state 0.0;
-      (* The buy left the book with no terminal event. Arm the owed sell and request a
-         balance/open-orders resync; the inventory gate blocks the sell if the order was
-         only canceled. *)
-      state.just_filled_buy <- true;
-      state.needs_resync <- true))
+      if repeat
+      then
+        Hashtbl.replace state.evicted_orders oid (now_time +. ghost_buy_evict_ttl_s, Buy)
+      else (
+        (* The buy left the book with no terminal event. Arm the owed sell and request a
+           balance/open-orders resync; the inventory gate blocks the sell if the order was
+           only canceled. On a repeat the first purge already armed both, and the resync
+           it requested is the one that re-listed the phantom. *)
+        state.just_filled_buy <- true;
+        state.needs_resync <- true)))
   else if (not state.inflight_cancel_buy)
           && (not state.inflight_buy)
           && not state.inflight_amend_buy

@@ -29,6 +29,14 @@ let unreflected_cutoff ~now ~base_balance_age =
     it. *)
 let buy_ack_ghost_grace_s = 15.0
 
+(** Seconds a ghost buy's order id stays evicted after the *second* purge of the same id.
+    A feed that re-lists a dropped order re-adopts it, so the purge repeats; evicting the
+    id removes it from the open-orders scan and the adoption path. The window only has to
+    outlive the venue feed's own stale-entry cleanup (24h), after which the entry is gone
+    from the feed as well. A single ghost is never evicted: an adopted buy has no ack
+    grace, so the first purge may still be ordinary feed lag. *)
+let ghost_buy_evict_ttl_s = 86_400.0
+
 (** Tolerance for [last_balance_delta] direction tests. Balances are base quantities
     accumulated by repeated float addition, so an unchanged venue figure can land a few
     ULPs above or below the adopted value; without this a spurious tiny positive delta
