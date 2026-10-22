@@ -711,21 +711,39 @@ let market_facts c (t : Strategy_runtime.t) =
       (try Ex.get_tradeable_balance ~asset:"USDC" with
        | _ -> 0.0);
     (* A perp l2Book can be keyed by the bare coin (the usual case) or, for a
-       cross-venue controller whose symbol has no matching spot pair, by the
-       controller's pair. Try the coin first, then the domain symbol, so an overlay
-       on a perp like XMR/ADA still sees a top of book. *)
-    (match
-       (match Ex.get_top_of_book ~symbol:base with
-        | Some _ as r -> r
-        | None -> Ex.get_top_of_book ~symbol)
-     with
+       cross-venue controller whose symbol has no matching spot pair, by the controller's
+       pair: on Hyperliquid the l2Book subscription for an ADA/XMR domain is the bare
+       coin, but the frame is filed under the domain pair, so the coin store stays empty.
+       Try the coin, then the domain symbol. For an overlay the domain symbol is
+       frequently a *spot* pair (ETH/USDC, SOL/USDC, HYPE/USDC), where the spot book is
+       the wrong side of the perp touch by the spot-perp premium; those already resolve
+       on the coin store, so the pair fallback only fires for the pair-keyed perp books.
+       If neither exists, quote the perp mark so the hedge is still priced off the perp
+       rather than left with no quote. *)
+    let overlay_controller = c.cg_overlay_accumulated >= 0.0 in
+    let fallback_mark =
+      match funding with
+      | Some f when fresh f.updated_at -> f.mark
+      | _ -> 0.0
+    in
+    (match Ex.get_top_of_book ~symbol:base with
      | Some (bid, _, ask, _) ->
        setf Slots.bid bid;
        setf Slots.ask ask
+     | None when overlay_controller && fallback_mark > 0.0 ->
+       (* The perp book store is not keyed by the coin for this domain: use the perp
+          mark. It is a genuine perp quote, unlike the pair store which can be a spot
+          book. *)
+       setf Slots.bid fallback_mark;
+       setf Slots.ask fallback_mark
      | None ->
-       setf Slots.bid 0.0;
-       setf Slots.ask 0.0);
-    let overlay_controller = c.cg_overlay_accumulated >= 0.0 in
+       (match Ex.get_top_of_book ~symbol with
+        | Some (bid, _, ask, _) ->
+          setf Slots.bid bid;
+          setf Slots.ask ask
+        | None ->
+          setf Slots.bid 0.0;
+          setf Slots.ask 0.0));
     let spot_enabled = (not overlay_controller) || c.cg_overlay_has_spot_leg in
     let spot_symbol =
       if overlay_controller && c.cg_overlay_spot_symbol <> ""

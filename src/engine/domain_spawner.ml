@@ -1033,7 +1033,23 @@ let asset_domain_worker
                ~now:now_exec
                ~maker_fee:(Option.value asset_with_fees.maker_fee ~default:0.0)
                ~taker_fee:(Option.value asset_with_fees.taker_fee ~default:0.0)
-               r);
+               r;
+             (* Fill visibility: the position snapshot can lag the venue and is dropped
+                entirely during a user-stream resync, so log the booked fill itself. This
+                is the line to check when a re-hedge or take-profit appears not to have
+                executed. *)
+             Logging.info_f
+               ~section
+               "carry fill: %s %s %.8g @ %.8f (%s)"
+               (match meta.Dio_strategies.Strategy_common.com_market with
+                | Dio_strategies.Strategy_common.Carry_perp -> "perp"
+                | Dio_strategies.Strategy_common.Carry_spot -> "spot")
+               (match side with
+                | Dio_strategies.Strategy_common.Buy -> "buy"
+                | Dio_strategies.Strategy_common.Sell -> "sell")
+               event.filled_qty
+               event.avg_price
+               meta.Dio_strategies.Strategy_common.com_kind);
            Dio_strategies.Strategy_common.retire_carry_order ~order_id:event.order_id)
       | _ -> ()
     in
@@ -1327,7 +1343,67 @@ let asset_domain_worker
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
                    | Types.Sell -> Dio_strategies.Strategy_common.Sell
                  in
-                 if overlay_event then record_overlay_fill ~now_exec event;
+                 if overlay_event
+                 then (
+                   let fill_market, fill_perp =
+                     match
+                       Dio_strategies.Strategy_common.lookup_carry_order
+                         ~order_id:event.order_id
+                     with
+                     | Some meta ->
+                       (match meta.Dio_strategies.Strategy_common.com_market with
+                        | Dio_strategies.Strategy_common.Carry_perp -> "perp", true
+                        | Dio_strategies.Strategy_common.Carry_spot -> "spot", false)
+                     | None -> "", false
+                   in
+                   record_overlay_fill ~now_exec event;
+                   (* Carry overlays are event-bound like the grid: dispatch the fill
+                      through the overlay interpreter in this event. A take-profit close
+                      then re-places the replacement short immediately instead of waiting
+                      for the next book tick or position snapshot. *)
+                   match overlay_rt, overlay_ctx with
+                   | Some ort, Some octx ->
+                     octx.cg_asset <- Some overlay_asset;
+                     octx.cg_state <- overlay_state;
+                     octx.cg_now <- now_exec;
+                     octx.cg_carry <- Option.map (fun r -> !r) overlay_carry;
+                     Dio_strategies.Strategy_cycle_engine.with_lock octx (fun () ->
+                       ignore
+                         (Dio_strategies.Strategy_runtime.run_cycle
+                            ~collect:false
+                            ort
+                            ~price:event.avg_price
+                            ~now:now_exec
+                            ~event:
+                              (Dio_strategies.Strategy_runtime.make_event
+                                 "filled"
+                                 [ "now", Dio_strategies.Strategy_expr.V_float now_exec
+                                 ; ( "order_id"
+                                   , Dio_strategies.Strategy_expr.V_string event.order_id
+                                   )
+                                 ; ( "side"
+                                   , Dio_strategies.Strategy_expr.V_string
+                                       (match event.side with
+                                        | Types.Buy -> "buy"
+                                        | Types.Sell -> "sell") )
+                                 ; ( "market"
+                                   , Dio_strategies.Strategy_expr.V_string fill_market )
+                                 ; ( "is_perp"
+                                   , Dio_strategies.Strategy_expr.V_float
+                                       (if fill_perp then 1.0 else 0.0) )
+                                 ; ( "is_buy"
+                                   , Dio_strategies.Strategy_expr.V_float
+                                       (match event.side with
+                                        | Types.Buy -> 1.0
+                                        | Types.Sell -> 0.0) )
+                                 ; ( "price"
+                                   , Dio_strategies.Strategy_expr.V_float event.avg_price
+                                   )
+                                 ; ( "qty"
+                                   , Dio_strategies.Strategy_expr.V_float event.filled_qty
+                                   )
+                                 ])))
+                   | _ -> ());
                  if is_grid_strategy && not overlay_event
                  then
                    Dio_strategies.Strategy_api.Strategy.record_exec_event
@@ -1984,7 +2060,7 @@ let asset_domain_worker
            Logging.info_f
              ~section
              "overlay %s: context_valid=%b funding_valid=%b perp_valid=%b \
-              funding_apr=%.4f premium=%.6f mark=%.4f ask=%.4f usdc_free=%.2f \
+              funding_apr=%.4f premium=%.6f mark=%.4f bid=%.4f ask=%.4f usdc_free=%.2f \
               margin_ratio=%.3f target=%.8f short=%.8f carry_margin=%.2f"
              asset_with_fees.symbol
              valid
@@ -1993,6 +2069,7 @@ let asset_domain_worker
              (pfloat "funding_apr")
              (pfloat "premium")
              (pfloat "mark")
+             (pfloat "bid")
              (pfloat "ask")
              (pfloat "usdc_free")
              (pfloat "margin_ratio")
