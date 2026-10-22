@@ -51,10 +51,18 @@ let classify (err : string) : error_kind =
      || string_contains e "network"
      || string_contains e "reset"
      || string_contains e "broken pipe"
+     || string_contains e "epipe"
+     || string_contains e "econnrefused"
+     || string_contains e "econnaborted"
+     || string_contains e "ehostunreach"
+     || string_contains e "enetunreach"
+     || string_contains e "enetdown"
      || string_contains e "websocket"
      || string_contains e "socket"
   then Connection
   else if string_contains e "timeout"
+          || string_contains e "timed out"
+          || string_contains e "etimedout"
   then Timeout
   else if string_contains e "rate limit"
           || string_contains e "too many requests"

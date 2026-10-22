@@ -5213,8 +5213,81 @@ let test_alpaca_excess_amends_open_top_rung () =
       "excess amend keeps the top rung price"
       101.0
       (Option.value o.price ~default:0.0);
-    check (float 1e-6) "excess amend grows the top rung by the excess" 2.0 o.qty
+    check (float 1e-6) "excess amend grows the top rung by the excess" 2.0 o.qty;
+    check
+      bool
+      "excess amend covers the rung for the cancel+replace window"
+      true
+      (List.exists
+         (fun (_id, p, _ts) -> abs_float (p -. 101.0) < 1e-6)
+         state.recently_injected_sells)
   | _ -> failwith "expected exactly one sell amend on the top rung"
+;;
+
+let test_alpaca_inflight_amend_rung_not_restored () =
+  (* Regression: an Alpaca fractional amend is cancel+replace. The old order leaves the
+     feed before the replacement lists; restoring the "missing" rung races the replacement
+     and is rejected with HTTP 403 "insufficient qty available" (seen on SMH). *)
+  let symbol = "ALPACA_INFLIGHT_AMEND/USD" in
+  let state = reset_alpaca_excess_state symbol in
+  state.persisted_sell_levels <- [ 101.0, 1.0 ];
+  let asset = alpaca_excess_asset ~symbol in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  let feed = ref [] in
+  let iter f = List.iter (fun (a, b, c, d, e) -> f a b c d e) !feed in
+  let sync () =
+    let open_p, missing_p =
+      match
+        Dio_strategies.Strategy_api.sync_open_orders
+          ~state
+          ~now:100.0
+          ~asset
+          ~bid_price:100.0
+          ~lot_qty:1.0
+          ~iter_open_orders:iter
+          ~get_open_orders_generation:(fun () -> -1)
+          ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
+          ~ecfg
+      with
+      | _, _, _, _, _, open_p, missing_p -> open_p, missing_p
+    in
+    open_p, missing_p
+  in
+  let evaluate ~now (open_p, missing_p) =
+    drain_order_buffer ();
+    Dio_strategies.Strategy_api.evaluate_sell_leg
+      ~persisted_reconcile:(open_p, missing_p)
+      ~state
+      ~now
+      ~asset
+      ~bid_price:100.0
+      ~ask_price:100.1
+      ~asset_balance:3.0
+      ~buy_attempted:false
+      ~ecfg
+      ~locked_in_sells:0.0
+      ~base_balance_age:None
+      ~oracle_halted:false
+  in
+  (* Amend dispatched; the replacement is not listed yet. *)
+  state.recently_injected_sells <- [ "top-oid", 101.0, Unix.gettimeofday () ];
+  evaluate ~now:100.0 (sync ());
+  check
+    bool
+    "no restore while the amended rung's replacement is in flight"
+    true
+    (pushed_sell_for symbol = None);
+  state.recently_injected_sells <- [ "top-oid", 101.0, 0.0 ];
+  evaluate ~now:100.0 (sync ());
+  match pushed_sell_for symbol with
+  | Some o ->
+    check (float 1e-6) "expired coverage restores the dropped rung" 1.0 o.qty;
+    check
+      (float 0.005)
+      "restored rung keeps its recorded price"
+      101.0
+      (Option.value o.price ~default:0.0)
+  | None -> failwith "expected the dropped rung to be restored after the cover window"
 ;;
 
 let test_alpaca_excess_excludes_reserved_base () =
@@ -6296,6 +6369,96 @@ let test_sync_open_orders_skip_readopts_best_buy () =
     state.last_buy_order_id
 ;;
 
+let test_sync_open_orders_ignores_carry_orders () =
+  (* Regression: carry recycle buys and perp take-profits share the pair book. Only
+     grid-tagged orders may be counted, locked, or adopted as the resting buy/sell. *)
+  let open Dio_strategies.Strategy_api in
+  let module C = Dio_strategies.Strategy_common in
+  let symbol = "CARRY_OWNERSHIP/USDC" in
+  let state = get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.cached_ecfg <- get_exchange_config "hyperliquid";
+  Hashtbl.clear state.sell_commitments;
+  Hashtbl.reset state.amend_cooldowns;
+  Hashtbl.reset state.feed_buy_index;
+  Hashtbl.reset state.feed_sell_index;
+  Sell_orders.clear state.open_sell_orders;
+  Sell_orders.clear state.cached_feed_sell_orders;
+  state.sell_commitments_clean <- true;
+  state.feed_index_valid <- false;
+  state.open_orders_scan_valid <- false;
+  state.inflight_buy <- false;
+  state.inflight_amend_buy <- false;
+  state.inflight_cancel_buy <- false;
+  state.last_buy_order_id <- None;
+  state.last_buy_order_price <- None;
+  state.last_buy_ack_ts <- 0.0;
+  let asset =
+    { exchange = "hyperliquid"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = false
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = get_exchange_config "hyperliquid" in
+  let feed = ref [] in
+  let iter f = List.iter (fun (a, b, c, d, e) -> f a b c d e) !feed in
+  let sync () =
+    sync_open_orders
+      ~state
+      ~now:100.0
+      ~asset
+      ~bid_price:100.0
+      ~lot_qty:1.0
+      ~iter_open_orders:iter
+      ~get_open_orders_generation:(fun () -> -1)
+      ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
+      ~ecfg
+  in
+  feed
+  := [ "carry-buy", 101.0, 2.0, "buy", Some C.strategy_userref_carry
+     ; "carry-sell", 102.0, 3.0, "sell", Some C.strategy_userref_carry
+     ];
+  let open_buys, _, locked_in_buys, locked_in_sells, _, _, _ = sync () in
+  check int "carry buy is not counted as a grid buy" 0 open_buys;
+  check (float 1e-9) "carry buy does not lock quote" 0.0 locked_in_buys;
+  check (float 1e-9) "carry sell does not lock base" 0.0 locked_in_sells;
+  check (option string) "carry buy is not adopted" None state.last_buy_order_id;
+  check
+    (option (float 0.))
+    "carry buy price is not adopted"
+    None
+    state.last_buy_order_price;
+  check
+    int
+    "carry sell is not adopted"
+    0
+    (Dio_strategies.Strategy_sell_orders.length state.open_sell_orders);
+  feed
+  := [ ( "grid-buy"
+       , 99.0
+       , 1.0
+       , "buy"
+       , Some Dio_strategies.Strategy_common.strategy_userref_grid )
+     ];
+  let open_buys, _, locked_in_buys, _, _, _, _ = sync () in
+  check int "grid buy still counts" 1 open_buys;
+  check (float 1e-9) "grid buy still locks quote" 99.0 locked_in_buys;
+  check (option string) "grid buy is adopted" (Some "grid-buy") state.last_buy_order_id;
+  check
+    (option (float 0.))
+    "grid buy price is adopted"
+    (Some 99.0)
+    state.last_buy_order_price
+;;
+
 let test_terminal_buy_not_readopted_on_skip () =
   (* REGRESSION (BOTZ wedge): a buy the strategy already knows is terminal (filled) can
      still be listed by the venue's open-order feed - the REST snapshot and the trade
@@ -6558,6 +6721,67 @@ let test_buy_cancel_excess_spares_amend_replacement () =
     "buy tracking cleared after the cancels"
     None
     state.last_buy_order_id
+;;
+
+let test_buy_cancel_excess_ignores_carry () =
+  (* Regression: the single-buy policy only counts and cancels grid orders. A carry buy on
+     the same pair is not an "excess" ladder buy. *)
+  let open Dio_strategies.Strategy_api in
+  let module C = Dio_strategies.Strategy_common in
+  let symbol = "EXCESS_CARRY/USDC" in
+  let state = get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.pending_orders <- [];
+  state.last_buy_order_id <- Some "grid-buy";
+  state.last_buy_order_price <- Some 98.0;
+  state.inflight_buy <- false;
+  state.inflight_amend_buy <- false;
+  state.inflight_cancel_buy <- false;
+  let asset =
+    { exchange = "hyperliquid"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = false
+    ; sell_levels_persistence = false
+    }
+  in
+  let buffer = get_order_buffer () in
+  let rec drain () =
+    match C.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  let feed =
+    [ "grid-buy", 98.0, 1.0, "buy", Some C.strategy_userref_grid
+    ; "carry-buy", 99.0, 1.0, "buy", Some C.strategy_userref_carry
+    ]
+  in
+  let iter f = List.iter (fun (o, p, q, s, u) -> f o p q s u) feed in
+  drain ();
+  Dio_strategies.Strategy_decision.buy_cancel_excess
+    ~state
+    ~now:100.0
+    ~asset
+    ~iter_open_orders:iter
+    ~cycle:1
+    ~effective_buy_count:2;
+  let pushed = get_pending_orders 100 in
+  check int "only the grid buy is cancelled" 1 (List.length pushed);
+  (match pushed with
+   | [ (o : C.strategy_order) ] ->
+     check
+       (option string)
+       "the cancelled order is the grid buy"
+       (Some "grid-buy")
+       o.order_id
+   | _ -> Alcotest.fail "expected exactly one cancel");
+  check (option string) "grid buy tracking cleared" None state.last_buy_order_id
 ;;
 
 let test_tracked_buy_fill_clears_pending_place_token () =
@@ -7787,6 +8011,10 @@ let () =
             `Quick
             test_sync_open_orders_skip_readopts_best_buy
         ; test_case
+            "sync ignores carry-tagged orders"
+            `Quick
+            test_sync_open_orders_ignores_carry_orders
+        ; test_case
             "terminal buy is purged and not re-adopted on a skip"
             `Quick
             test_terminal_buy_not_readopted_on_skip
@@ -7802,6 +8030,10 @@ let () =
             "buy excess-cancel spares an amend replacement"
             `Quick
             test_buy_cancel_excess_spares_amend_replacement
+        ; test_case
+            "buy excess-cancel ignores carry orders"
+            `Quick
+            test_buy_cancel_excess_ignores_carry
         ; test_case
             "tracked buy fill clears a stale placement token"
             `Quick
@@ -8061,6 +8293,10 @@ let () =
             "alpaca excess amends an open top rung"
             `Quick
             test_alpaca_excess_amends_open_top_rung
+        ; test_case
+            "alpaca in-flight amend rung is not restored"
+            `Quick
+            test_alpaca_inflight_amend_rung_not_restored
         ; test_case
             "alpaca excess excludes reserved_base"
             `Quick

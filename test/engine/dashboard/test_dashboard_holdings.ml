@@ -3,7 +3,18 @@
    capital-low flag - an asset the oracle says cannot fund its first buy is paused even
    when the grid state is quiet. *)
 
-let strategy_json ?(oracle = `Null) ?(capital_low = false) ?(market_closed = false) () =
+let order_json ?(owner = "grid") id price qty =
+  `Assoc
+    [ "id", `String id; "price", `Float price; "qty", `Float qty; "owner", `String owner ]
+;;
+
+let strategy_json
+  ?(oracle = `Null)
+  ?(capital_low = false)
+  ?(market_closed = false)
+  ?(buy_orders = [])
+  ()
+  =
   `Assoc
     [ "exchange", `String "hyperliquid"
     ; ( "strategy"
@@ -12,6 +23,7 @@ let strategy_json ?(oracle = `Null) ?(capital_low = false) ?(market_closed = fal
           ; "capital_low", `Bool capital_low
           ; "market_is_closed", `Bool market_closed
           ] )
+    ; "market", `Assoc [ "buy_orders", `List buy_orders ]
     ; "oracle", oracle
     ]
 ;;
@@ -66,6 +78,26 @@ let test_strategy_paused () =
     "oracle-ACTIVE grid -> running"
     (Dashboard_ui.Holdings.strategy_paused
        (strategy_of_json (strategy_json ~oracle:(oracle_json true) ())))
+    false;
+  (* Only a grid-tagged buy is a resting ladder buy; a carry buy must not mask
+     capital-low. *)
+  Alcotest.(check bool)
+    "a carry-owned buy does not mask capital-low"
+    (Dashboard_ui.Holdings.strategy_paused
+       (strategy_of_json
+          (strategy_json
+             ~capital_low:true
+             ~buy_orders:[ order_json ~owner:"carry" "tp" 99.0 1.0 ]
+             ())))
+    true;
+  Alcotest.(check bool)
+    "a grid-owned resting buy overrides capital-low"
+    (Dashboard_ui.Holdings.strategy_paused
+       (strategy_of_json
+          (strategy_json
+             ~capital_low:true
+             ~buy_orders:[ order_json ~owner:"grid" "buy" 99.0 1.0 ]
+             ())))
     false
 ;;
 

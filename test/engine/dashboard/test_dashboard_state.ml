@@ -90,7 +90,10 @@ let test_perp_order_json () =
    | Some (`List [ o ]) ->
      (match Yojson.Basic.Util.member "price" o with
       | `Float p -> Alcotest.(check (float 1e-9)) "close price" 95.0 p
-      | _ -> Alcotest.fail "missing close price")
+      | _ -> Alcotest.fail "missing close price");
+     (match Yojson.Basic.Util.member "owner" o with
+      | `String s -> Alcotest.(check string) "carry-owned take-profit" "carry" s
+      | _ -> Alcotest.fail "missing owner")
    | _ -> Alcotest.fail "expected one perp buy order");
   match field j "sell_orders" with
   | Some (`List []) -> ()

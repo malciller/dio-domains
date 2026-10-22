@@ -65,6 +65,24 @@ let userref_of_cloid (clid : string) : int option =
 (** Returns true if [order_userref] matches the given [strategy_userref]. *)
 let is_strategy_order strategy_userref order_userref = strategy_userref = order_userref
 
+(** True for grid-owned userrefs. Untagged and zero-tag orders count as grid: Alpaca and
+    IBKR omit the userref, and an amend can drop it. Carry and MM orders are tagged, so
+    excluding them keeps the books separate. *)
+let is_grid_order = function
+  | Some r -> r = strategy_userref_grid || r = 0
+  | None -> true
+;;
+
+(** Ownership label for serialized orders. Unknown non-zero tags map to ["other"] rather
+    than being silently treated as grid. *)
+let order_owner = function
+  | Some r when r = strategy_userref_grid || r = 0 -> "grid"
+  | Some r when r = strategy_userref_carry -> "carry"
+  | Some r when r = strategy_userref_mm -> "mm"
+  | Some _ -> "other"
+  | None -> "grid"
+;;
+
 (** Instrument class for an overlay order fill. The execution event carries only the order
     id, so the placement side registers the class here, the supervisor binds the venue
     order id on ack, and the domain loop looks it up on the fill. *)
@@ -77,13 +95,13 @@ type carry_order_meta =
   ; com_maker : bool
   ; com_kind : string
   ; com_key : string
-    (** The full per-instrument in-flight key ([overlay_inflight_key]). The logical
-        [com_kind] alone is shared by every symbol, so tracked-order lookups must match
-        on this key. *)
+  (** The full per-instrument in-flight key ([overlay_inflight_key]). The logical
+      [com_kind] alone is shared by every symbol, so tracked-order lookups must match on
+      this key. *)
   ; com_at : float
-    (** Wall-clock registration time. A venue amend replaces the order id; if the old
-        id's fill/cancel event is lost, its entry would otherwise suppress every later
-        replace for this kind forever. Tracking is bounded by age for that reason. *)
+  (** Wall-clock registration time. A venue amend replaces the order id; if the old id's
+      fill/cancel event is lost, its entry would otherwise suppress every later replace
+      for this kind forever. Tracking is bounded by age for that reason. *)
   }
 
 let carry_registry_mutex = Mutex.create ()
@@ -94,9 +112,7 @@ let carry_order_queue : string Queue.t = Queue.create ()
 (** True only for the execution statuses that end an order's life. [New] and
     [PartiallyFilled] are live: the id -> kind mapping must survive so [order_replace]
     recognizes its own resting order instead of placing a duplicate every tick. *)
-let carry_order_terminal
-  (status : Dio_exchange.Exchange_intf.Types.order_status)
-  =
+let carry_order_terminal (status : Dio_exchange.Exchange_intf.Types.order_status) =
   let open Dio_exchange.Exchange_intf.Types in
   match status with
   | Filled | Canceled | Rejected | Expired -> true
@@ -117,9 +133,9 @@ let register_pending_carry_order ~dedup_key ~market ~maker ~kind =
   Mutex.unlock carry_registry_mutex
 ;;
 
-(** True when an acked carry order for [key] is tracked (awaiting fill or cancel).
-    Mirrors the grid's [has.tracked.buy]: suppresses duplicates while the venue's
-    open-orders scan catches up.
+(** True when an acked carry order for [key] is tracked (awaiting fill or cancel). Mirrors
+    the grid's [has.tracked.buy]: suppresses duplicates while the venue's open-orders scan
+    catches up.
 
     No age bound: the mapping is created on ack and retired only by a terminal event (or
     an amend's old-id retirement). A resting take-profit can sit for minutes. A lost
