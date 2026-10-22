@@ -402,7 +402,7 @@ let test_unnetted_sell_hold_gates_second_sizing () =
   state.cached_venue_min_qty <- 0.0;
   state.cached_venue_min_notional <- 10.0;
   state.reserved_base <- 0.0224;
-  state.accumulated_profit <- 24.0;
+  state.accumulated_profit <- 0.0;
   Sell_orders.clear state.open_sell_orders;
   state.inflight_sell <- false;
   state.asset_low <- false;
@@ -529,6 +529,115 @@ let test_unnetted_sell_hold_gates_second_sizing () =
     "after netting is observed, the fresh fill's sell is placeable again"
     true
     (sell3_qty >= 0.17 && sell3_qty <= 0.18 +. 1e-6);
+  drain ()
+;;
+
+let test_hl_capital_low_sells_residual_above_resting_hold () =
+  (* Hyperliquid reports a hold-netted balance: the resting sell's 0.0003 is already
+     removed from [position_base]. Sizing must therefore subtract only the un-netted
+     overlay, not the full commitment again. The residual above reserved_base is a whole
+     lot and must still be offered while capital_low is latched. *)
+  let symbol = "HL_CAPLOW_RESERVE/USD" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:5;
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.0003;
+  state.maker_fee <- 0.0;
+  state.cached_sell_mult <- 1.0;
+  state.cached_qty_increment <- 0.00001;
+  state.cached_price_increment <- 0.01;
+  state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 0.0;
+  state.reserved_base <- 0.00106332;
+  state.position_base <- 0.00137277;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 99.0;
+  state.last_seen_asset_balance <- 0.00137277;
+  state.sell_holds_since_balance <- [];
+  state.buy_credits_since_balance <- [];
+  state.attributed_balance_increase <- 0.0;
+  state.open_sell_orders <- Sell_orders.of_list [ "resting-sell", 81545.0, 0.0003 ];
+  set_sell_commitments
+    state.sell_commitments
+    [ "resting-sell", 81545.0, 0.0003, true, true, 0.0 ];
+  state.feed_locked_sell_base <- 0.0003;
+  state.just_filled_buy <- false;
+  state.last_buy_fill_price <- Some 81545.0;
+  state.last_buy_fill_qty <- Some 0.0003;
+  state.capital_low <- true;
+  state.asset_low <- false;
+  state.inflight_sell <- false;
+  state.persisted_sell_levels <- [];
+  ignore
+    (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+       state.duplicate_key_sell);
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.0003"
+    ; grid_interval = 0.18
+    ; sell_mult = "1.0"
+    ; strategy = "jacobs_ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.25
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Strategy_api.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:81545.0
+    ~ask_price:81546.0
+    ~asset_balance:0.00137277
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:(Dio_strategies.Strategy_api.committed_sell_base state)
+    ~base_balance_age:(Some 1.0);
+  let pending = Dio_strategies.Strategy_api.get_pending_orders 100 in
+  let second_sell =
+    List.find_opt
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+        o.operation = Dio_strategies.Strategy_common.Place
+        && o.side = Dio_strategies.Strategy_common.Sell
+        && o.symbol = symbol)
+      pending
+  in
+  check
+    bool
+    "capital-low still offers the free residual above the resting sell's hold"
+    true
+    (Option.is_some second_sell);
+  (match second_sell with
+   | Some o ->
+     check (float 1e-9) "residual sell is the owed lot" 0.0003 o.qty;
+     let price = Option.value o.price ~default:0.0 in
+     check
+       bool
+       "residual sell is a fresh rung, not the resting order"
+       true
+       (price > 81545.0)
+   | None -> ());
+  check
+    bool
+    "reserved_base is untouched by the residual sell"
+    true
+    (abs_float (state.reserved_base -. 0.00106332) < 1e-12);
+  state.capital_low <- false;
   drain ()
 ;;
 
@@ -2378,6 +2487,176 @@ let test_position_asset_low_recovery_sees_pending_credit () =
     state.resuming_after_balance_flag
 ;;
 
+let test_asset_low_sells_non_reserved_residual () =
+  (* A rejected sell latches [asset_low], but that latch must not suppress selling base
+     that is genuinely free. The leg offers [available_base] - ledger minus
+     [reserved_base] and committed sells - even when the owed 1:1 lot is larger, and
+     clamps the order to that residual instead of holding the whole fill. *)
+  let symbol = "ASSETLOW_RESIDUAL/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.18;
+  state.cached_sell_mult <- 1.0;
+  state.cached_qty_increment <- 0.01;
+  state.cached_venue_min_qty <- 0.01;
+  state.cached_venue_min_notional <- 0.0;
+  state.reserved_base <- 0.16;
+  state.position_base <- 0.2;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 99.0;
+  state.last_seen_asset_balance <- 0.2;
+  state.sell_holds_since_balance <- [];
+  state.buy_credits_since_balance <- [];
+  state.attributed_balance_increase <- 0.0;
+  Sell_orders.clear state.open_sell_orders;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 88.0;
+  state.last_buy_fill_qty <- Some 0.18;
+  state.asset_low <- true;
+  state.inflight_sell <- false;
+  state.persisted_sell_levels <- [];
+  ignore
+    (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+       state.duplicate_key_sell);
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.18"
+    ; grid_interval = 0.36
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.25
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Strategy_api.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:88.0
+    ~ask_price:88.1
+    ~asset_balance:0.2
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:(Some 0.1);
+  let placed =
+    List.fold_left
+      (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+        match o.operation, o.side with
+        | Place, Sell when o.symbol = symbol -> acc +. o.qty
+        | _ -> acc)
+      0.0
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
+  in
+  check
+    (float 1e-9)
+    "asset_low sells the non-reserved residual, not the whole owed lot"
+    0.04
+    placed;
+  check
+    (float 1e-12)
+    "the residual sell never crosses reserved_base"
+    0.16
+    state.reserved_base;
+  check bool "a successful residual sell clears asset_low" false state.asset_low;
+  drain ()
+;;
+
+let test_asset_low_residual_below_floor_stays_blocked () =
+  (* The residual escape hatch is bounded by the venue floor: dust that cannot be placed
+     keeps the latch (and the bracket) intact instead of issuing a doomed sell. *)
+  let symbol = "ASSETLOW_DUST/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.18;
+  state.cached_sell_mult <- 1.0;
+  state.cached_qty_increment <- 0.01;
+  state.cached_venue_min_qty <- 0.01;
+  state.cached_venue_min_notional <- 0.0;
+  state.reserved_base <- 0.16;
+  state.position_base <- 0.163;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 99.0;
+  state.last_seen_asset_balance <- 0.163;
+  state.sell_holds_since_balance <- [];
+  state.buy_credits_since_balance <- [];
+  state.attributed_balance_increase <- 0.0;
+  Sell_orders.clear state.open_sell_orders;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 88.0;
+  state.last_buy_fill_qty <- Some 0.18;
+  state.asset_low <- true;
+  state.inflight_sell <- false;
+  state.persisted_sell_levels <- [];
+  ignore
+    (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+       state.duplicate_key_sell);
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.18"
+    ; grid_interval = 0.36
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.25
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Strategy_api.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:88.0
+    ~ask_price:88.1
+    ~asset_balance:0.163
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:(Some 0.1);
+  let sells =
+    List.filter
+      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
+        o.operation = Dio_strategies.Strategy_common.Place
+        && o.side = Dio_strategies.Strategy_common.Sell
+        && o.symbol = symbol)
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
+  in
+  check bool "sub-floor residual does not issue a sell" true (sells = []);
+  check bool "sub-floor residual keeps asset_low latched" true state.asset_low;
+  drain ()
+;;
+
 let test_position_kraken_asset_low_recovery_sees_pending_credit () =
   (* Kraken gates recovery on a balance increase. That increase must be read off the
      fill-aware ledger: a just-filled buy raises [position_base + unreflected] before the
@@ -4202,6 +4481,159 @@ let test_accumulation_sells_non_accrued_inventory () =
     "just_filled_buy cleared after the sell is placed"
     false
     state.just_filled_buy
+;;
+
+let test_venue_retention_and_skim () =
+  (* Kraken retains the [(1 - sell_mult)] slice inside the order: the sell is
+     [qty * sell_mult]. Hyperliquid cannot (the slice is below one lot), so it sells 1:1
+     and, when accumulated quote profit covers a whole lot, skims that lot into
+     [reserved_base] before sizing. Neither order can cross the reserve. *)
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  let placed_sell_qty symbol =
+    List.fold_left
+      (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+        match o.operation, o.side with
+        | Place, Sell when o.symbol = symbol -> acc +. o.qty
+        | _ -> acc)
+      0.0
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
+  in
+  let run ~symbol:_ ~asset ~state ~ecfg ~now ~asset_balance ~age ~price =
+    Dio_strategies.Strategy_api.evaluate_sell_leg
+      ~persisted_reconcile:
+        (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
+      ~state
+      ~now
+      ~asset
+      ~bid_price:price
+      ~ask_price:(price *. 1.0001)
+      ~asset_balance
+      ~buy_attempted:false
+      ~oracle_halted:false
+      ~ecfg
+      ~locked_in_sells:0.0
+      ~base_balance_age:(Some age)
+  in
+  let make_state symbol exchange grid_qty sell_mult lot reserved profit buy_price =
+    let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+    state.exchange_id <- exchange;
+    state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config exchange;
+    state.grid_qty <- grid_qty;
+    state.cached_sell_mult <- sell_mult;
+    state.cached_qty_increment <- lot;
+    state.cached_venue_min_qty <- 0.0;
+    state.cached_venue_min_notional <- 0.0;
+    state.reserved_base <- reserved;
+    state.accumulated_profit <- profit;
+    state.accumulation_buffer <- 0.1;
+    state.position_base <- reserved +. grid_qty +. 0.001;
+    state.position_initialized <- true;
+    state.position_venue_ts <- 0.0;
+    state.buy_credits_since_balance <- [];
+    state.sell_holds_since_balance <- [ 100.0, 0.001 ];
+    Sell_orders.clear state.open_sell_orders;
+    state.inflight_sell <- false;
+    state.just_filled_buy <- true;
+    state.last_buy_fill_price <- Some buy_price;
+    state.last_buy_fill_qty <- Some grid_qty;
+    state
+  in
+  let symbol = "RETENTION_KR/XMR/USD" in
+  let state = make_state symbol "kraken" 1.0 0.9 0.01 0.0 0.0 100.0 in
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "kraken"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "0.9"
+    ; strategy = "jacobs_ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.1
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
+  drain ();
+  run ~symbol ~asset ~state ~ecfg ~now:100.0 ~asset_balance:1.001 ~age:0.1 ~price:100.0;
+  check (float 1e-9) "kraken sells qty * sell_mult" 0.9 (placed_sell_qty symbol);
+  drain ();
+  (* Hyperliquid sells 1:1: the 0.1 slice is one lot, retained by the skim rather than by
+     shrinking each order. *)
+  let symbol = "RETENTION_HL/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = make_state symbol "hyperliquid" 1.0 0.9 0.01 0.0 0.0 50.0 in
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "0.9"
+    ; strategy = "jacobs_ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.1
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  drain ();
+  run ~symbol ~asset ~state ~ecfg ~now:100.0 ~asset_balance:1.001 ~age:0.1 ~price:50.0;
+  check (float 1e-9) "hyperliquid sells 1:1" 1.0 (placed_sell_qty symbol);
+  check (float 1e-9) "no skim without a profit window" 0.0 state.reserved_base;
+  drain ();
+  let symbol = "SKIM_HL/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = make_state symbol "hyperliquid" 0.1 0.9 0.01 0.05 5.0 200.0 in
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "hyperliquid";
+  state.position_base <- 0.051;
+  state.just_filled_buy <- false;
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.1"
+    ; grid_interval = 1.0
+    ; sell_mult = "0.9"
+    ; strategy = "jacobs_ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.1
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  drain ();
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done symbol;
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
+    ~now:99.0
+    symbol
+    "skim_buy"
+    Dio_strategies.Strategy_common.Buy
+    ~fill_price:200.0
+    ~fill_qty:0.1
+    None;
+  check (float 1e-9) "skimmed lot is moved into reserved_base" 0.06 state.reserved_base;
+  check
+    (option (float 1e-9))
+    "sellable reference is the lot less the skim"
+    (Some 0.09)
+    state.last_buy_fill_qty;
+  run ~symbol ~asset ~state ~ecfg ~now:100.0 ~asset_balance:0.151 ~age:0.1 ~price:200.0;
+  check (float 1e-9) "sell is the 1:1 remainder" 0.09 (placed_sell_qty symbol);
+  check
+    bool
+    "sell leaves the reserve untouched"
+    true
+    (placed_sell_qty symbol <= 0.151 -. state.reserved_base +. 1e-9);
+  drain ()
 ;;
 
 let test_nothing_placeable_clears_latch () =
@@ -7402,6 +7834,10 @@ let () =
             `Quick
             test_capital_low_still_places_bottom_rung_sell
         ; test_case
+            "capital-low sells the residual above a resting sell's hold"
+            `Quick
+            test_hl_capital_low_sells_residual_above_resting_hold
+        ; test_case
             "burst on a tracked accumulation venue never dips into reserved_base"
             `Quick
             test_burst_tracked_venue_no_reserved_dip
@@ -7429,6 +7865,10 @@ let () =
             "accumulation sells non-accrued inventory (no locked double-count)"
             `Quick
             test_accumulation_sells_non_accrued_inventory
+        ; test_case
+            "venue retention: Kraken sell_mult, HL 1:1 + profit-gated skim"
+            `Quick
+            test_venue_retention_and_skim
         ; test_case
             "nothing placeable clears the latch"
             `Quick
@@ -7573,6 +8013,14 @@ let () =
             "kraken asset_low recovery sees the pending buy credit"
             `Quick
             test_position_kraken_asset_low_recovery_sees_pending_credit
+        ; test_case
+            "asset_low still sells a non-reserved residual"
+            `Quick
+            test_asset_low_sells_non_reserved_residual
+        ; test_case
+            "sub-floor residual stays blocked behind asset_low"
+            `Quick
+            test_asset_low_residual_below_floor_stays_blocked
         ; test_case
             "sell hold netting retires the oldest hold FIFO, buys never do"
             `Quick

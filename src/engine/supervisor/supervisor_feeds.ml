@@ -2136,32 +2136,41 @@ let initialize_feeds ()  :
                                                                     taker)
                                                                     })
                                                                     |
-                                                                    Custom _
+                                                                    Custom exchange
                                                                     ->
-                                                                    (Logging.warn_f
+                                                                    (match
+                                                                    asset.Dio_engine.Config.maker_fee,
+                                                                    asset.Dio_engine.Config.taker_fee
+                                                                    with
+                                                                    |
+                                                                    Some maker,
+                                                                    Some taker
+                                                                    ->
+                                                                    (Logging.info_f
                                                                     ~section
-                                                                    "Fee fetching not implemented for exchange: %s, using defaults"
-                                                                    asset.Dio_engine.Config.exchange;
+                                                                    "Custom exchange %s/%s: using explicitly configured maker=%.6f taker=%.6f"
+                                                                    exchange
+                                                                    asset.Dio_engine.Config.symbol
+                                                                    maker
+                                                                    taker;
                                                                     Dio_strategies.Fee_cache.store_fees
-                                                                    ~exchange:(
-                                                                    asset.Dio_engine.Config.exchange)
+                                                                    ~exchange
                                                                     ~symbol:(
                                                                     asset.Dio_engine.Config.symbol)
-                                                                    ~maker_fee:0.0016
-                                                                    ~taker_fee:0.0026
-                                                                    ~ttl_seconds:600.0;
+                                                                    ~maker_fee:maker
+                                                                    ~taker_fee:taker
+                                                                    ~ttl_seconds:86400.0;
                                                                     Lwt.return
-                                                                    {
-                                                                    asset with
-                                                                    Dio_engine.Config.maker_fee
-                                                                    =
-                                                                    (Some
-                                                                    0.0016);
-                                                                    Dio_engine.Config.taker_fee
-                                                                    =
-                                                                    (Some
-                                                                    0.0026)
-                                                                    })
+                                                                    asset)
+                                                                    |
+                                                                    _ ->
+                                                                    (Logging.error_f
+                                                                    ~section
+                                                                    "No fee source for custom exchange %s (%s): register an oracle adapter or set maker_fee and taker_fee explicitly. Refusing to start with an assumed fee."
+                                                                    exchange
+                                                                    asset.Dio_engine.Config.symbol;
+                                                                    exit
+                                                                    1))
                                                                     with
                                                                     |
                                                                     exn ->

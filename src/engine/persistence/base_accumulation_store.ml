@@ -111,13 +111,27 @@ let apply_buy_fill t ~price ~qty ~oid =
   { t with last_buy_fill_price = Some price; last_buy_fill_qty = Some qty }
 ;;
 
-(** Sell fill: compare against the last buy fill for profitability. profit = (sell_price -
-    last_buy_price) * paired_qty - [fees] (fees are all-inclusive, both legs); when net
-    profit > 0 it is added to accumulated_profit. When accumulated_profit covers the
-    acquisition cost of the reserved base plus [buffer] (realtime, fear-and-greed driven):
-    reserved_base += oracle_qty * (1 - sell_mult) and accumulated_profit -= base_cost,
-    preserving the buffer and surplus profit in the quote ledger. [fees] defaults to 0.0. *)
-let apply_sell_fill t ~price ~qty ~oid ~buffer ~sell_mult ~oracle_qty ?(fees = 0.0) () =
+(** Sell fill: profit = (sell_price - last_buy_price) * paired_qty - [fees] (all-in, both
+    legs); positive net profit accrues to [accumulated_profit].
+
+    [sell_uses_mult] venues (Kraken) withheld the [(1 - sell_mult)] slice inside the
+    order, so [oracle_qty * (1 - sell_mult)] may move into [reserved_base] once profit
+    covers its cost. On 1:1 venues (Hyperliquid/Alpaca) the base was sold, not withheld;
+    accruing it would reserve base that does not exist. Those keep profit in quote and
+    skim a whole lot separately (see [Strategy_events]). [fees] is required: the real
+    all-in fee. *)
+let apply_sell_fill
+  t
+  ~price
+  ~qty
+  ~oid
+  ~buffer
+  ~sell_mult
+  ~oracle_qty
+  ~fees
+  ?(sell_uses_mult = true)
+  ()
+  =
   let t =
     { t with
       last_sell_fill_price = Some price
@@ -136,15 +150,18 @@ let apply_sell_fill t ~price ~qty ~oid ~buffer ~sell_mult ~oracle_qty ?(fees = 0
     if net_profit > 0.0
     then (
       let accumulated_profit = t.accumulated_profit +. net_profit in
-      let accrued_base = Float.max 0.0 (oracle_qty *. (1.0 -. sell_mult)) in
-      let base_cost = accrued_base *. buy_price in
-      if accrued_base > 0.0 && accumulated_profit >= base_cost +. buffer
-      then
-        { t with
-          reserved_base = t.reserved_base +. accrued_base
-        ; accumulated_profit = accumulated_profit -. base_cost
-        }
-      else { t with accumulated_profit })
+      if not sell_uses_mult
+      then { t with accumulated_profit }
+      else (
+        let accrued_base = Float.max 0.0 (oracle_qty *. (1.0 -. sell_mult)) in
+        let base_cost = accrued_base *. buy_price in
+        if accrued_base > 0.0 && accumulated_profit >= base_cost +. buffer
+        then
+          { t with
+            reserved_base = t.reserved_base +. accrued_base
+          ; accumulated_profit = accumulated_profit -. base_cost
+          }
+        else { t with accumulated_profit }))
     else t
   | _ -> t
 ;;

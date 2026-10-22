@@ -349,14 +349,15 @@ let refresh_fee c =
   match c.cg_state, c.cg_asset with
   | Some state, Some asset ->
     state.maker_fee
-    <- (match asset.maker_fee with
-        | Some f -> f
-        | None ->
-          (match
-             Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol
-           with
-           | Some cached -> cached
-           | None -> 0.0))
+    <- Strategy_venue.resolve_fee_rate
+         ~configured:asset.maker_fee
+         ~cached:(Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol)
+         ~current:state.maker_fee;
+    state.taker_fee
+    <- Strategy_venue.resolve_fee_rate
+         ~configured:asset.taker_fee
+         ~cached:(Fee_cache.get_taker_fee ~exchange:asset.exchange ~symbol:asset.symbol)
+         ~current:state.taker_fee
   | _ -> ()
 ;;
 
@@ -611,7 +612,12 @@ let market_facts c (t : Strategy_runtime.t) =
        ts > fill_at
        &&
        match position with
-       | None -> true
+       | None ->
+         (* A flat snapshot received shortly after the entry fill can predate the fill's
+            effect (the feed timestamps arrival, not venue state). Keep the provisional
+            fill facts until the next snapshot interval has passed; otherwise the overlay
+            sees a flat position again and re-shorts the target. *)
+         fill_at <= 0.0 || ts -. fill_at > 5.0
        | Some p -> p.margin_used > 0.0
      in
      if superseded
@@ -855,15 +861,14 @@ let order_place
           Jac.round_qty_up qty instrument asset.exchange
         | _ -> qty)
     in
-    (* A fresh carry entry fill can land before the position snapshot reflects it. The
-       strategy would then see a flat position and re-short the full target, doubling the
-       position. Hold new entry placements for a short grace window after the fill; the
-       position snapshot (or the entry-fill fact) settles within it. *)
+    (* A fresh entry fill can precede the position snapshot; without a grace window the
+       overlay sees flat and re-shorts the full target. Hold new entries until the next
+       webData2 snapshot (~5s). The fill is already booked. *)
     let entry_grace =
       String.equal dedup_key "carry:entry"
       && (not reduce_only)
       && c.cg_last_entry_fill_at > 0.0
-      && c.cg_now -. c.cg_last_entry_fill_at <= 2.0
+      && c.cg_now -. c.cg_last_entry_fill_at <= 6.0
     in
     if entry_grace
     then
@@ -1090,40 +1095,81 @@ let order_replace
              per cycle). *)
           let seen = Hashtbl.create 4 in
           let out = ref [] in
+          let want_perp = String.equal market "perp" in
           let want_side =
             match order_side with
             | Strategy_common.Sell -> "sell"
             | Strategy_common.Buy -> "buy"
           in
-          let consider symbol =
+          let consider ~is_perp symbol =
             try
               Ex.iter_open_orders_fast
                 ~symbol
                 (fun oid _price _remaining side_str userref ->
                    if userref = Some Strategy_common.strategy_userref_carry
                       && String.equal side_str want_side
-                      && (not (Hashtbl.mem seen oid))
-                      &&
-                      match order_side with
-                      | Strategy_common.Sell -> true
-                      | Strategy_common.Buy ->
-                        (match Strategy_common.lookup_carry_order ~order_id:oid with
-                         | Some meta -> String.equal meta.com_kind kind_key
-                         | None -> false)
+                      && not (Hashtbl.mem seen oid)
                    then (
-                     match Ex.get_open_order ~symbol ~order_id:oid with
-                     | Some (o : Dio_exchange.Exchange_intf.Types.open_order)
-                       when o.status = Dio_exchange.Exchange_intf.Types.New
-                            || o.status = Dio_exchange.Exchange_intf.Types.PartiallyFilled
-                       ->
-                       Hashtbl.replace seen oid ();
-                       out := o :: !out
-                     | _ -> ()))
+                     (* Both books share one userref. Match instrument class and logical
+                        kind so a spot recycle is never amended as a perp take-profit.
+                        The registry check covers a view that lists an unclassified
+                        order. *)
+                     let meta = Strategy_common.lookup_carry_order ~order_id:oid in
+                     let market_ok =
+                       match meta with
+                       | Some m ->
+                         m.Strategy_common.com_market
+                         = Strategy_common.Carry_perp
+                         = want_perp
+                       | None -> is_perp = want_perp
+                     in
+                     let kind_ok =
+                       match order_side, meta with
+                       | Strategy_common.Buy, Some m ->
+                         String.equal m.Strategy_common.com_kind kind_key
+                       | Strategy_common.Buy, None -> false
+                       | Strategy_common.Sell, Some m ->
+                         String.equal m.Strategy_common.com_kind kind_key
+                       | Strategy_common.Sell, None -> true
+                     in
+                     if market_ok && kind_ok
+                     then (
+                       (* The id index may point at the spot pair even when the scan was
+                          keyed by the bare coin. Try the scanned store, then the other
+                          store; querying only the scanned key duplicates every resting
+                          perp order. *)
+                       let materialize store_symbol =
+                         match Ex.get_open_order ~symbol:store_symbol ~order_id:oid with
+                         | Some _ as o -> o
+                         | None -> None
+                       in
+                       let other = if is_perp then asset.symbol else instrument in
+                       let order =
+                         match materialize symbol with
+                         | Some _ as o -> o
+                         | None when not (String.equal other symbol) -> materialize other
+                         | None -> None
+                       in
+                       match order with
+                       | Some (o : Dio_exchange.Exchange_intf.Types.open_order)
+                         when o.status = Dio_exchange.Exchange_intf.Types.New
+                              || o.status
+                                 = Dio_exchange.Exchange_intf.Types.PartiallyFilled ->
+                         Hashtbl.replace seen oid ();
+                         out := o :: !out
+                       | _ -> ())))
             with
             | _ -> ()
           in
-          consider asset.symbol;
-          if not (String.equal instrument asset.symbol) then consider instrument;
+          if want_perp
+          then
+            (* The perp view resolves orders stored under either the bare coin or the
+               registered spot pair through the order index, so one scan covers both. *)
+            consider ~is_perp:true instrument
+          else (
+            consider ~is_perp:false asset.symbol;
+            if not (String.equal instrument asset.symbol)
+            then consider ~is_perp:false instrument);
           !out
         | None -> []
       in
@@ -1169,14 +1215,24 @@ let order_replace
             o.order_id
             reason
         else (
-          let order =
-            Jac.create_cancel_order
-              o.order_id
-              instrument
-              Strategy_common.Carry
-              asset.exchange
-          in
-          ignore (Jac.push_order ~now:c.cg_now ~manage_state:false order : bool))
+          (* One cancel request per order. [order_replace] runs every book tick and a
+             canceled order can linger in the open-orders cache. The supervisor clears
+             the key on the cancel ack/failure. *)
+          let cancel_key = "overlay:cancel|" ^ o.order_id in
+          if Strategy_common.InFlightOrders.is_in_flight cancel_key
+          then ()
+          else (
+            ignore (Strategy_common.InFlightOrders.add_in_flight_order cancel_key);
+            let order =
+              Jac.create_cancel_order
+                o.order_id
+                instrument
+                Strategy_common.Carry
+                asset.exchange
+            in
+            let pushed = Jac.push_order ~now:c.cg_now ~manage_state:false order in
+            if not pushed
+            then ignore (Strategy_common.InFlightOrders.remove_in_flight_order cancel_key)))
       in
       (* One live order per overlay kind. A process restart or a cancel+replace race can
          leave a duplicate; keep the first and cancel the rest so two take-profits cannot

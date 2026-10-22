@@ -288,10 +288,9 @@ let hedger_callbacks : strategy_callbacks =
         Dio_strategies.Strategy_common.bind_carry_order
           ~dedup_key:order.duplicate_key
           ~order_id;
-        (* Carry/overlay orders bypass the grid strategy state, so no ack handler releases
-           their placement dedupe key. Holding it until the TTL sweep made every later
-           overlay place with the same key disappear for 60-75s. The order is at the venue
-           now; [order.replace] dedupes by the open-orders scan from here on. *)
+        (* Release the placement key on ack, like the grid. The durable duplicate guard
+           is the acked id -> kind mapping in [carry_orders] ([has_tracked_carry_order],
+           no age bound), not this short-lived latch. *)
         ignore
           (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
              order.duplicate_key))
@@ -337,9 +336,24 @@ let hedger_callbacks : strategy_callbacks =
   ; on_cancel_ok =
       (fun _order target_order_id ->
         (* Retire the canceled carry order so a tracked-order check does not suppress the
-           replacement forever. The amend path re-registers the new id on its ack. *)
-        Dio_strategies.Strategy_common.retire_carry_order ~order_id:target_order_id)
-  ; on_cancel_fail = (fun _order _target_id -> ())
+           replacement forever, and release its placement latch. The amend path
+           re-registers the new id on its ack. *)
+        (match
+           Dio_strategies.Strategy_common.retire_carry_order_key
+             ~order_id:target_order_id
+         with
+         | Some key ->
+           ignore
+             (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order key)
+         | None -> ());
+        ignore
+          (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+             ("overlay:cancel|" ^ target_order_id)))
+  ; on_cancel_fail =
+      (fun _order target_order_id ->
+        ignore
+          (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+             ("overlay:cancel|" ^ target_order_id)))
   }
 ;;
 

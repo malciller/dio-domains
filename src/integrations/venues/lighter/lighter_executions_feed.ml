@@ -804,6 +804,11 @@ let process_account_orders_update json =
                    ; timestamp = Unix.gettimeofday ()
                    ; order_id
                    ; trade_id = order_id (* no separate trade id available *)
+                   ; market = "perp"
+                   ; intent = if is_ask then "open_short" else "close_short"
+                   ; strategy = "carry"
+                   ; realized_pnl = None
+                   ; note = None
                    };
                  (* Trigger a REST balance refresh after fills. The WS balance channel
                     often lags, especially for unified account USDC collateral. Without

@@ -288,7 +288,9 @@ module Hyperliquid_impl = struct
                injection so the cache reflects the venue the moment the amend is acked. *)
             if new_order_id_str <> order_id
             then (
-              Hyperliquid_executions_feed.remove_open_order ~symbol:sym ~order_id;
+              Hyperliquid_executions_feed.remove_open_order
+                ~symbol:(Hyperliquid_executions_feed.store_symbol_for_order sym)
+                ~order_id;
               Hyperliquid_executions_feed.inject_order
                 ~symbol:sym
                 ~order_id:new_order_id_str
@@ -354,7 +356,9 @@ module Hyperliquid_impl = struct
                entries if the orderUpdates WS message is delayed or lost. *)
             List.iter
               (fun id ->
-                Hyperliquid_executions_feed.remove_open_order ~symbol ~order_id:id)
+                Hyperliquid_executions_feed.remove_open_order
+                  ~symbol:(Hyperliquid_executions_feed.store_symbol_for_order symbol)
+                  ~order_id:id)
               ids_for_symbol;
             let new_results =
               List.map
@@ -1121,6 +1125,8 @@ let fetch_spot_balances_ws () =
           Lwt.return_unit)
         else (
           let balances = balances_node |> to_list in
+          let entries = ref [] in
+          let parse_failed = ref false in
           List.iter
             (fun item ->
               try
@@ -1131,13 +1137,7 @@ let fetch_spot_balances_ws () =
                    can only spend total - hold. *)
                 let hold = parse_json_float (member "hold" item) in
                 let available = max 0.0 (total -. hold) in
-                let store = Hyperliquid_balances.get_balance_store coin in
-                Hyperliquid_balances.BalanceStore.update_wallet
-                  store
-                  ~available
-                  ~total
-                  "spot"
-                  "account";
+                entries := (coin, available, total) :: !entries;
                 Logging.debug_f
                   ~section
                   "Initial Spot %s balance: %.6f avail / %.6f total"
@@ -1146,11 +1146,18 @@ let fetch_spot_balances_ws () =
                   total
               with
               | exn ->
+                parse_failed := true;
                 Logging.warn_f
                   ~section
                   "Failed to parse spot balance entry: %s"
                   (Printexc.to_string exn))
             balances;
+          (* [spotClearinghouseState] is the authoritative full set. Apply it as such so
+             tokens that have gone to zero are cleared from the store; a partial parse
+             falls back to a merge rather than risking a false zero. *)
+          Hyperliquid_balances.apply_spot_snapshot
+            ~full:(not !parse_failed)
+            (List.rev !entries);
           Hyperliquid_balances.notify_spot_update ();
           Hyperliquid_balances.notify_ready ();
           Lwt.return_unit))

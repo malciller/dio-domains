@@ -72,6 +72,7 @@ let test_apply_sell_fill_profit_and_reserve () =
       ~buffer:2.0
       ~sell_mult:0.8
       ~oracle_qty:0.1
+      ~fees:0.0
       ()
   in
   Alcotest.(check (float 1e-12)) "reserved_base accrued" 0.02 t.A.reserved_base;
@@ -98,6 +99,7 @@ let test_apply_sell_fill_below_buffer () =
       ~buffer:2.0
       ~sell_mult:0.8
       ~oracle_qty:0.1
+      ~fees:0.0
       ()
   in
   Alcotest.(check (float 1e-12)) "no reservation under buffer" 0.0 t.A.reserved_base;
@@ -115,10 +117,55 @@ let test_apply_sell_fill_unprofitable () =
       ~buffer:2.0
       ~sell_mult:2.0
       ~oracle_qty:1.0
+      ~fees:0.0
       ()
   in
   Alcotest.(check (float 1e-12)) "loss not accumulated" 0.0 t.A.accumulated_profit;
   Alcotest.(check (float 1e-12)) "no reservation on loss" 0.0 t.A.reserved_base
+;;
+
+let test_apply_sell_fill_one_to_one_no_reserve () =
+  (* A 1:1 venue (Hyperliquid/Alpaca) did not withhold the sell_mult slice in the order,
+     so a sell fill must never accrue reserved_base: the base was sold. The profit stays
+     in quote for the separate, profit-gated lot skim. *)
+  let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"o1" in
+  let t =
+    A.apply_sell_fill
+      t
+      ~price:110.0
+      ~qty:0.5
+      ~oid:"o2"
+      ~buffer:0.0
+      ~sell_mult:0.8
+      ~oracle_qty:0.1
+      ~sell_uses_mult:false
+      ~fees:0.0
+      ()
+  in
+  Alcotest.(check (float 1e-12)) "1:1 sell accrues no base" 0.0 t.A.reserved_base;
+  Alcotest.(check (float 1e-12)) "profit kept in quote" 5.0 t.A.accumulated_profit
+;;
+
+let test_apply_sell_fill_fees_reduce_profit () =
+  (* 0.5 all-in fees reduce profit to 4.5; the reserve accrual then takes 2.0. *)
+  let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"o1" in
+  let t =
+    A.apply_sell_fill
+      t
+      ~price:110.0
+      ~qty:0.5
+      ~oid:"o2"
+      ~buffer:2.0
+      ~sell_mult:0.8
+      ~oracle_qty:0.1
+      ~fees:0.5
+      ()
+  in
+  Alcotest.(check (float 1e-12))
+    "fees reduce accumulated profit"
+    2.5
+    t.A.accumulated_profit;
+  Alcotest.(check (float 1e-12)) "reserve still accrues after fees" 0.02 t.A.reserved_base
 ;;
 
 (* -- Round-trip serialization + persistence ---------------------------- *)
@@ -358,6 +405,12 @@ let () =
           , test_apply_sell_fill_profit_and_reserve )
         ; "apply_sell_fill below buffer", `Quick, test_apply_sell_fill_below_buffer
         ; "apply_sell_fill unprofitable", `Quick, test_apply_sell_fill_unprofitable
+        ; ( "apply_sell_fill 1:1 accrues no base"
+          , `Quick
+          , test_apply_sell_fill_one_to_one_no_reserve )
+        ; ( "apply_sell_fill fees reduce profit"
+          , `Quick
+          , test_apply_sell_fill_fees_reduce_profit )
         ] )
     ; ( "round_trip"
       , [ "accumulation", `Quick, test_accumulation_round_trip

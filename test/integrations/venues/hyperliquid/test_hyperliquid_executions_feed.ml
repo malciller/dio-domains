@@ -282,11 +282,13 @@ let test_perp_classification_snapshot_updates () =
 ;;
 
 let test_amend_replacement_visible () =
-  Hyperliquid.Executions_feed.initialize [ "AMENDX"; "AMENDX/USDC" ];
+  Hyperliquid.Executions_feed.initialize [ "AMENDX/USDC" ];
   let ids_of orders =
     List.map (fun (o : Hyperliquid.Executions_feed.open_order) -> o.order_id) orders
   in
-  (* A resting take-profit as [place_order] injects it on ack. *)
+  (* A resting take-profit is injected with its perp coin, as [place_order] does on ack.
+     It must be filed under the registered spot pair, the store the owning domain reads.
+     Filing it under the bare coin hides every fill from the overlay. *)
   Hyperliquid.Executions_feed.inject_order
     ~symbol:"AMENDX"
     ~order_id:"tp_old"
@@ -295,6 +297,10 @@ let test_amend_replacement_visible () =
     ~price:100.0
     ~user_ref:3
     ();
+  Alcotest.(check (option string))
+    "perp order is filed under the registered pair"
+    (Some "AMENDX/USDC")
+    (Hyperliquid.Executions_feed.order_store_symbol ~order_id:"tp_old");
   Alcotest.(check bool)
     "old order visible before the amend"
     true
@@ -304,7 +310,7 @@ let test_amend_replacement_visible () =
   (* Hyperliquid's modify retires the old oid and creates a new one. [amend_order] must
      retire the old oid and inject the replacement, otherwise [order.replace]'s
      open-orders scan comes back empty and places a duplicate reduce-only order. *)
-  Hyperliquid.Executions_feed.remove_open_order ~symbol:"AMENDX" ~order_id:"tp_old";
+  Hyperliquid.Executions_feed.remove_open_order ~symbol:"AMENDX/USDC" ~order_id:"tp_old";
   Hyperliquid.Executions_feed.inject_order
     ~symbol:"AMENDX"
     ~order_id:"tp_new"
@@ -318,13 +324,59 @@ let test_amend_replacement_visible () =
   Alcotest.(check int) "exactly one live perp order" 1 (List.length perp);
   Alcotest.(check bool) "replacement visible" true (List.mem "tp_new" ids);
   Alcotest.(check bool) "retired order gone" false (List.mem "tp_old" ids);
-  match Hyperliquid.Executions_feed.get_open_order "AMENDX" "tp_new" with
+  match Hyperliquid.Executions_feed.get_open_order "AMENDX/USDC" "tp_new" with
   | Some (o : Hyperliquid.Executions_feed.open_order) ->
     Alcotest.(check (float 0.000001))
       "replacement carries the new price"
       105.0
       (Option.value o.limit_price ~default:0.0)
-  | None -> Alcotest.fail "replacement order missing from the cache"
+  | None -> Alcotest.fail "replacement order missing from the pair store"
+;;
+
+let test_fill_intent_close_short () =
+  Hyperliquid.Executions_feed.initialize [ "HYPE/USDC" ];
+  let tid = 987_654_321 in
+  let now_ms = int_of_float (Unix.gettimeofday () *. 1000.0) in
+  let json =
+    `Assoc
+      [ "channel", `String "userFills"
+      ; ( "data"
+        , `Assoc
+            [ ( "fills"
+              , `List
+                  [ `Assoc
+                      [ "coin", `String "HYPE"
+                      ; "oid", `Int 999_001
+                      ; "px", `String "77.83"
+                      ; "sz", `String "0.52"
+                      ; "side", `String "B"
+                      ; "time", `Int now_ms
+                      ; "dir", `String "Close Short"
+                      ; "closedPnl", `String "0.42"
+                      ; "fee", `String "0.01"
+                      ; "tid", `Int tid
+                      ] ] )
+            ] )
+      ]
+  in
+  Hyperliquid.Executions_feed.process_market_data json;
+  let fills = Concurrency.Fill_event_bus.get_recent_fills () in
+  match
+    List.find_opt
+      (fun (f : Concurrency.Fill_event_bus.fill_event) -> f.order_id = "999001")
+      fills
+  with
+  | None -> Alcotest.fail "fill event not published"
+  | Some f ->
+    Alcotest.(check string) "market is perp" "perp" f.market;
+    Alcotest.(check string) "intent is close_short" "close_short" f.intent;
+    Alcotest.(check string) "strategy is carry" "carry" f.strategy;
+    (match f.realized_pnl with
+     | Some p -> Alcotest.(check (float 0.000001)) "closed PnL" 0.42 p
+     | None -> Alcotest.fail "expected realized PnL");
+    (match f.note with
+     | Some n -> Alcotest.(check string) "direction note" "Close Short" n
+     | None -> Alcotest.fail "expected direction note")
 ;;
 
 let () =
@@ -352,6 +404,10 @@ let () =
             "amend replacement is visible"
             `Quick
             test_amend_replacement_visible
+        ; Alcotest.test_case
+            "fill intent: close short"
+            `Quick
+            test_fill_intent_close_short
         ] )
     ]
 ;;

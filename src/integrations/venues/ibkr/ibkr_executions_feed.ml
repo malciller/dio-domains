@@ -279,10 +279,11 @@ let handle_order_status fields =
         | None -> 0.0
       in
       let fee = fill_value *. maker_fee_rate in
+      let side_str = if side = "BUY" then "buy" else "sell" in
       Concurrency.Fill_event_bus.publish_fill
         { venue = "ibkr"
         ; symbol
-        ; side = (if side = "BUY" then "buy" else "sell")
+        ; side = side_str
         ; amount = filled
         ; fill_price = avg_fill_price
         ; value = fill_value
@@ -292,6 +293,11 @@ let handle_order_status fields =
         ; trade_id =
             string_of_int order_id
             (* No per-trade id in the API; the order id stands in. *)
+        ; market = "equity"
+        ; intent = if side_str = "buy" then "buy_equity" else "sell_equity"
+        ; strategy = "grid"
+        ; realized_pnl = None
+        ; note = None
         })
   | None ->
     Logging.debug_f

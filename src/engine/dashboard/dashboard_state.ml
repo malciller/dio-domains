@@ -156,6 +156,7 @@ let json_of_grid_strategy exchange symbol =
     ; "pending_count", `Int (List.length state.pending_orders)
     ; "grid_qty", `Float state.grid_qty
     ; "maker_fee", `Float state.maker_fee
+    ; "taker_fee", `Float state.taker_fee
     ]
 ;;
 
@@ -549,6 +550,9 @@ let json_of_recent_fills () =
            [ "venue", `String f.venue
            ; "symbol", `String f.symbol
            ; "side", `String f.side
+           ; "market", `String f.market
+           ; "intent", `String f.intent
+           ; "strategy", `String f.strategy
            ; "amount", `Float f.amount
            ; "fill_price", `Float f.fill_price
            ; "value", `Float f.value

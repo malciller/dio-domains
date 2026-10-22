@@ -91,6 +91,18 @@ let carry_pending : (string, carry_order_meta) Hashtbl.t = Hashtbl.create 16
 let carry_orders : (string, carry_order_meta) Hashtbl.t = Hashtbl.create 64
 let carry_order_queue : string Queue.t = Queue.create ()
 
+(** True only for the execution statuses that end an order's life. [New] and
+    [PartiallyFilled] are live: the id -> kind mapping must survive so [order_replace]
+    recognizes its own resting order instead of placing a duplicate every tick. *)
+let carry_order_terminal
+  (status : Dio_exchange.Exchange_intf.Types.order_status)
+  =
+  let open Dio_exchange.Exchange_intf.Types in
+  match status with
+  | Filled | Canceled | Rejected | Expired -> true
+  | Pending | New | PartiallyFilled | Unknown _ -> false
+;;
+
 let register_pending_carry_order ~dedup_key ~market ~maker ~kind =
   Mutex.lock carry_registry_mutex;
   Hashtbl.replace
@@ -105,24 +117,18 @@ let register_pending_carry_order ~dedup_key ~market ~maker ~kind =
   Mutex.unlock carry_registry_mutex
 ;;
 
-(** True when a recently acked carry order for [key] is already tracked (awaiting a fill
-    or cancel). Mirrors the grid's [has.tracked.buy]: a tracked order suppresses a duplicate
-    placement while the venue's open-orders scan is still catching up. A pending placement
-    is covered by [InFlightOrders], so it is deliberately not part of this check.
+(** True when an acked carry order for [key] is tracked (awaiting fill or cancel).
+    Mirrors the grid's [has.tracked.buy]: suppresses duplicates while the venue's
+    open-orders scan catches up.
 
-    Bounded by [max_age]: the check exists only to cover the ack -> open-orders scan
-    window. An order that is amended gets a new venue id, and if the old id's terminal
-    event never arrives its mapping would otherwise suppress every later replace for this
-    kind forever (the overlay then looks completely stalled: no entry, no take-profit).
-    Once the order is visible in the venue scan the caller amends it; the age bound only
-    decides whether a *missing* order may be re-placed. *)
-let has_tracked_carry_order ?(max_age = 5.0) ~key () =
-  let now = Unix.gettimeofday () in
+    No age bound: the mapping is created on ack and retired only by a terminal event (or
+    an amend's old-id retirement). A resting take-profit can sit for minutes. A lost
+    terminal event is surfaced by the in-flight stale sweep, not by re-placing. *)
+let has_tracked_carry_order ~key () =
   Mutex.lock carry_registry_mutex;
   let found =
     Hashtbl.fold
-      (fun _ meta acc ->
-        acc || (String.equal meta.com_key key && now -. meta.com_at <= max_age))
+      (fun _ meta acc -> acc || String.equal meta.com_key key)
       carry_orders
       false
   in
@@ -189,6 +195,19 @@ let retire_carry_order ~order_id =
   Mutex.lock carry_registry_mutex;
   Hashtbl.remove carry_orders order_id;
   Mutex.unlock carry_registry_mutex
+;;
+
+(** Retire a carry order and return its in-flight key when tracked. The cancel ack
+    releases the placement latch: the terminal event can race the ack or be dropped.
+    [None] when the id was untracked. *)
+let retire_carry_order_key ~order_id =
+  Mutex.lock carry_registry_mutex;
+  let meta = Hashtbl.find_opt carry_orders order_id in
+  Hashtbl.remove carry_orders order_id;
+  Mutex.unlock carry_registry_mutex;
+  match meta with
+  | Some m -> Some m.com_key
+  | None -> None
 ;;
 
 (** Order side: buy or sell. *)

@@ -437,11 +437,11 @@ let evaluate_asset_low_recovery
     let committed_sell =
       if ecfg.use_reserved_base_guard
       then
-        effective_committed_sell_base
-          ~ecfg
-          ~ledger_total:(committed_sell_base state)
-          ~feed_total:state.feed_locked_sell_base
-          ~unnetted_hold
+        (* [asset_bal] is the gross ledger on non-Alpaca venues; the feed-collapsed
+           commitment would make resting sells look free. *)
+        Float.max
+          (committed_sell_base state)
+          (Sell_orders.sum_qty state.open_sell_orders)
       else 0.0
     in
     let available_asset =

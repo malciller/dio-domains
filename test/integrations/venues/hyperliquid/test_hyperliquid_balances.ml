@@ -247,6 +247,62 @@ let test_spot_balances_is_spot_only_and_hold_netted () =
     (find perp_only = None)
 ;;
 
+let spot_state_json coins =
+  `Assoc
+    [ "channel", `String "spotState"
+    ; ( "data"
+      , `Assoc
+          [ ( "spotState"
+            , `Assoc
+                [ ( "balances"
+                  , `List
+                      (List.map
+                         (fun (coin, total, hold) ->
+                            `Assoc
+                              [ "coin", `String coin
+                              ; "total", `String total
+                              ; "hold", `String hold
+                              ])
+                         coins) )
+                ] )
+          ] )
+    ]
+;;
+
+let test_spot_state_full_vs_delta () =
+  (* The first spotState frame after subscribe is the full set; later frames are deltas.
+     A balance that reaches zero is omitted from the full frame, so the store must clear
+     it or the grid offers phantom base. *)
+  Hyperliquid.Balances.expect_full_spot_snapshot ();
+  Hyperliquid.Balances.process_market_data
+    (spot_state_json [ "ZEROED/USDC", "2.5", "0.5"; "USDC", "100", "0" ]);
+  Alcotest.(check (float 0.000001))
+    "setup: candidate balance is present"
+    2.0
+    (Hyperliquid.Balances.get_balance "ZEROED/USDC");
+  (* A delta that omits the coin means unchanged, not zero. *)
+  Hyperliquid.Balances.process_market_data (spot_state_json [ "USDC", "99", "0" ]);
+  Alcotest.(check (float 0.000001))
+    "delta does not zero an untouched asset"
+    2.0
+    (Hyperliquid.Balances.get_balance "ZEROED/USDC");
+  (* The next full snapshot (post-resubscribe or authoritative resync) omits it: zero. *)
+  Hyperliquid.Balances.expect_full_spot_snapshot ();
+  Hyperliquid.Balances.process_market_data (spot_state_json [ "USDC", "90", "0" ]);
+  Alcotest.(check (float 0.000001))
+    "full snapshot zeros the absent asset"
+    0.0
+    (Hyperliquid.Balances.get_balance "ZEROED/USDC");
+  Alcotest.(check (float 0.000001))
+    "full snapshot zeros the absent asset total"
+    0.0
+    (Hyperliquid.Balances.get_total_balance "ZEROED/USDC");
+  Alcotest.(check (float 0.000001))
+    "present asset is untouched"
+    90.0
+    (Hyperliquid.Balances.get_balance "USDC")
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Balances"
@@ -276,6 +332,10 @@ let () =
             "spot_balances is spot-only and hold-netted"
             `Quick
             test_spot_balances_is_spot_only_and_hold_netted
+        ; Alcotest.test_case
+            "spotState full snapshot vs delta"
+            `Quick
+            test_spot_state_full_vs_delta
         ] )
     ]
 ;;

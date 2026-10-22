@@ -28,6 +28,11 @@ type exchange_config =
   { time_in_force : string (** TIF value for limit orders ("Alo" or "GTC") *)
   ; track_pending_sells : bool (** Add sell orders to pending_orders tracking *)
   ; use_accumulation_sells : bool (** Enable profit-gated accumulation sell path *)
+  ; sell_uses_mult : bool
+  (** Size each sell at [qty * sell_mult], retaining the [(1 - sell_mult)] slice in the
+      order itself. Only for venues whose lot size and grid interval make the retained
+      slice a tradeable quantity (Kraken). Venues with tighter lots (Hyperliquid) sell 1:1
+      and retain a whole lot from accumulated quote profit instead. *)
   ; sell_failure_sets_asset_low : bool
   (** Set asset_low on sell insufficient-balance rejection *)
   ; use_reserved_base_guard : bool
@@ -235,6 +240,8 @@ type strategy_state =
       (* cached exchange_config; avoids string comparison per cycle *)
   ; mutable maker_fee : float
       (* cached maker fee rate; used by fill handler for profit calc *)
+  ; mutable taker_fee : float
+      (* cached taker fee rate; selected when a fill crossed (non-post-only) *)
   ; mutable exchange_id : string (* cached exchange name; used for persistence routing *)
   ; mutable startup_replay : bool
       (* true during startup fill replay; suppresses profit calculation *)
@@ -451,6 +458,7 @@ let default_kraken_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
   ; use_accumulation_sells = true
+  ; sell_uses_mult = true
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; use_unnetted_sell_hold = true
@@ -624,6 +632,7 @@ let rec get_strategy_state asset_symbol =
       ; cached_sell_mult = 1.0
       ; cached_ecfg = default_kraken_config
       ; maker_fee = 0.0
+      ; taker_fee = 0.0
       ; exchange_id = ""
       ; startup_replay = true
       ; matched_persisted_indices = Hashtbl.create 16

@@ -8,6 +8,7 @@ let kraken_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
   ; use_accumulation_sells = true
+  ; sell_uses_mult = true
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; use_unnetted_sell_hold = true
@@ -24,6 +25,7 @@ let hyperliquid_config =
   { time_in_force = "Alo"
   ; track_pending_sells = false
   ; use_accumulation_sells = true
+  ; sell_uses_mult = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; use_unnetted_sell_hold = true
@@ -40,6 +42,7 @@ let ibkr_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
   ; use_accumulation_sells = true
+  ; sell_uses_mult = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; use_unnetted_sell_hold = true
@@ -56,6 +59,7 @@ let lighter_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
   ; use_accumulation_sells = true
+  ; sell_uses_mult = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; use_unnetted_sell_hold = true
@@ -72,6 +76,7 @@ let alpaca_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
   ; use_accumulation_sells = false
+  ; sell_uses_mult = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; use_unnetted_sell_hold = true
@@ -107,8 +112,21 @@ let ibkr_commission ~qty ~price =
   Float.max min_fee (Float.min raw max_fee)
 ;;
 
+(** Fee-rate resolution: an explicit config value wins, then the live [Fee_cache] entry
+    (populated by the supervisor's venue fetch), then the caller's last known value. It
+    never substitutes a literal 0.0, so a transient cache miss cannot silently make fills
+    free. *)
+let resolve_fee_rate ~configured ~cached ~current =
+  match configured with
+  | Some f when Float.is_finite f -> f
+  | _ ->
+    (match cached with
+     | Some f when Float.is_finite f -> f
+     | _ -> current)
+;;
+
 (* Venue dispatch memo tables. Both were plain Hashtbls read and written with no lock from
-   every trading Domain — [get_exchange_module] alone is called twice per strategy cycle
+   every trading Domain - [get_exchange_module] alone is called twice per strategy cycle
    (venue_available_base and venue_gross_base), so a resize racing a lookup was reachable
    on the hot path. Now Cow_tables: lock-free reads, and a miss copies one shard rather
    than the whole map. Keyspace is the four registered venues, so the bounds are fixed. *)

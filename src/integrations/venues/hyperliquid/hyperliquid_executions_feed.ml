@@ -429,11 +429,15 @@ let get_open_order symbol order_id =
 [@@inline always]
 ;;
 
-let find_order_everywhere order_id =
+let order_store_symbol ~order_id =
   Mutex.lock order_index_mutex;
-  let symbol_opt = Concurrency.Fifo_index.find_opt order_to_symbol order_id in
+  let result = Concurrency.Fifo_index.find_opt order_to_symbol order_id in
   Mutex.unlock order_index_mutex;
-  match symbol_opt with
+  result
+;;
+
+let find_order_everywhere order_id =
+  match order_store_symbol ~order_id with
   | Some symbol -> get_open_order symbol order_id
   | None -> None
 ;;
@@ -905,9 +909,51 @@ let update_orders_internal ?user_ref store (event : execution_event) =
   apply_index_action index_action
 ;;
 
+(** The registered spot pair for a venue coin, when one exists. Kept separate from
+    {!find_registered_symbol} so the injection path, defined earlier, can resolve it. *)
+let registered_pair_for coin =
+  let pair = ref None in
+  Mutex.lock initialization_mutex;
+  Ds.Cow_table.iter
+    (fun registered_symbol _ ->
+      if String.starts_with ~prefix:(coin ^ "/") registered_symbol
+      then pair := Some registered_symbol)
+    stores;
+  Mutex.unlock initialization_mutex;
+  !pair
+;;
+
+(** The registered bare-coin store, if any (test harnesses and non-pair venues). *)
+let registered_exact_symbol coin =
+  match Ds.Cow_table.find_opt stores coin with
+  | Some _ -> Some coin
+  | None -> None
+;;
+
+(** Store key for an injected order. A perp order is placed with its bare coin
+    (["HYPE"]) but the owning domain is registered under the spot pair (["HYPE/USDC"])
+    and reads fills from that store. Filing it under the bare coin hides the fill, so
+    [carry_recycle_seq] never advances and the replacement short is never placed. *)
+let store_symbol_for_order symbol =
+  if String.contains symbol '/'
+  then symbol
+  else (
+    match registered_pair_for symbol with
+    | Some pair -> pair
+    | None -> symbol)
+;;
+
 let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
-  if Hyperliquid_instruments_feed.is_perp_coin symbol
-  then note_perp_order ~order_id ~coin:symbol;
+  (* A slashless, non-[@N] symbol is a perp coin. Do not depend on the instrument cache
+     having published it: an ack can arrive during warm-up, and a misclassified order is
+     filed under a store the owning domain never reads. *)
+  let is_perp =
+    Hyperliquid_instruments_feed.is_perp_coin symbol
+    || (not (String.contains symbol '/')
+        && not (String.starts_with ~prefix:"@" symbol))
+  in
+  if is_perp then note_perp_order ~order_id ~coin:symbol;
+  let symbol = store_symbol_for_order symbol in
   let store = get_symbol_store symbol in
   let now = Unix.gettimeofday () in
   let event : execution_event =
@@ -963,21 +1009,10 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
 ;;
 
 let find_registered_symbol coin =
-  let result = ref None in
-  let exact = ref None in
-  Mutex.lock initialization_mutex;
-  Ds.Cow_table.iter
-    (fun registered_symbol _ ->
-      if String.starts_with ~prefix:(coin ^ "/") registered_symbol
-      then result := Some registered_symbol
-      else if registered_symbol = coin
-      then exact := Some registered_symbol)
-    stores;
-  Mutex.unlock initialization_mutex;
-  match !result with
+  match registered_pair_for coin with
   | Some symbol -> Some symbol
   | None ->
-    (match !exact with
+    (match registered_exact_symbol coin with
      | Some symbol -> Some symbol
      | None -> Hyperliquid_instruments_feed.resolve_symbol coin)
 ;;
@@ -1235,6 +1270,10 @@ let process_user_events data_json =
           | `String s -> s
           | _ -> "0"
         in
+        (* Classify before resolving the store. The order index can be empty after a
+           restart or eviction; an unmarked perp fill leaks into the grid's spot view. *)
+        if Hyperliquid_instruments_feed.is_perp_coin coin
+        then note_perp_order ~order_id ~coin;
         let symbol_opt =
           Mutex.lock order_index_mutex;
           let res = Concurrency.Fifo_index.find_opt order_to_symbol order_id in
@@ -1248,6 +1287,24 @@ let process_user_events data_json =
           let price = member "px" fill |> to_string |> float_of_string in
           let size = member "sz" fill |> to_string |> float_of_string in
           let side = if member "side" fill |> to_string = "B" then Buy else Sell in
+          let side_str = if side = Buy then "buy" else "sell" in
+          let dir =
+            match member "dir" fill with
+            | `String s -> s
+            | _ -> ""
+          in
+          let liquidation =
+            match member "liquidation" fill with
+            | `Null -> None
+            | j -> Some j
+          in
+          let closed_pnl =
+            match member "closedPnl" fill with
+            | `String s -> (try Some (float_of_string s) with | _ -> None)
+            | `Float f -> Some f
+            | `Int i -> Some (float_of_int i)
+            | _ -> None
+          in
           let tid =
             match member "tid" fill with
             | `Int i -> Int64.of_int i
@@ -1387,10 +1444,57 @@ let process_user_events data_json =
                 | None -> 0.0
               in
               let estimated_fee = fill_value *. maker_fee_rate in
+              let market =
+                if Hyperliquid_instruments_feed.is_perp_coin coin
+                then "perp"
+                else "spot"
+              in
+              let contains hay needle =
+                let n = String.length needle in
+                let rec go i =
+                  i + n <= String.length hay
+                  && (String.equal (String.sub hay i n) needle || go (i + 1))
+                in
+                n = 0 || go 0
+              in
+              let d = String.lowercase_ascii dir in
+              let intent =
+                if liquidation <> None
+                then "liquidation"
+                else if contains d "open short"
+                then "open_short"
+                else if contains d "close short"
+                then "close_short"
+                else if contains d "open long"
+                then "open_long"
+                else if contains d "close long"
+                then "close_long"
+                else if String.equal market "perp"
+                then if String.equal side_str "sell" then "open_short" else "close_short"
+                else if String.equal side_str "buy"
+                then "buy_spot"
+                else "sell_spot"
+              in
+              let note =
+                match liquidation with
+                | Some j ->
+                  let method_ =
+                    match member "method" j with
+                    | `String s -> s
+                    | _ -> "?"
+                  in
+                  let mark =
+                    match member "markPx" j with
+                    | `String s -> s
+                    | _ -> "?"
+                  in
+                  Some (Printf.sprintf "%s @ %s" method_ mark)
+                | None -> if String.equal dir "" then None else Some dir
+              in
               Concurrency.Fill_event_bus.publish_fill
                 { venue = "hyperliquid"
                 ; symbol
-                ; side = (if side = Buy then "buy" else "sell")
+                ; side = side_str
                 ; amount = !filled_out
                 ; fill_price = !avg_out
                 ; value = fill_value
@@ -1398,6 +1502,11 @@ let process_user_events data_json =
                 ; timestamp = action_time
                 ; order_id
                 ; trade_id = Int64.to_string tid
+                ; market
+                ; intent
+                ; strategy = (if String.equal market "perp" then "carry" else "grid")
+                ; realized_pnl = closed_pnl
+                ; note
                 })
             else if is_startup_snapshot_done ()
             then
@@ -1484,7 +1593,49 @@ let process_user_events data_json =
            Logging.info_f ~section "Order NON-USER CANCEL: %s [%s]" order_id symbol
          | None -> ())
       | None -> ())
-    non_user_cancels
+    non_user_cancels;
+  (* Account-level liquidation. The liquidating fill is published above with
+     [liquidation] metadata; this carries the account-level notional/value. *)
+  (match member "liquidation" data_json with
+   | `Null -> ()
+   | liq ->
+     let fld name =
+       match member name liq with
+       | `String s -> (try float_of_string s with | _ -> 0.0)
+       | `Float f -> f
+       | `Int i -> float_of_int i
+       | _ -> 0.0
+     in
+     let lid =
+       match member "lid" liq with
+       | `Int i -> string_of_int i
+       | `String s -> s
+       | _ -> "0"
+     in
+     let ntl_pos = fld "liquidated_ntl_pos" in
+     let account_value = fld "liquidated_account_value" in
+     let liquidator =
+       match member "liquidator" liq with
+       | `String s -> s
+       | _ -> "?"
+     in
+     Concurrency.Fill_event_bus.publish_fill
+       { venue = "hyperliquid"
+       ; symbol = "ACCOUNT"
+       ; side = ""
+       ; amount = 0.0
+       ; fill_price = 0.0
+       ; value = ntl_pos
+       ; fee = 0.0
+       ; timestamp = Unix.gettimeofday ()
+       ; order_id = "liq:" ^ lid
+       ; trade_id = "liq:" ^ lid
+       ; market = "perp"
+       ; intent = "liquidation"
+       ; strategy = "account"
+       ; realized_pnl = None
+       ; note = Some (Printf.sprintf "account_value=$%.2f liquidator=%s" account_value liquidator)
+       })
 ;;
 
 let process_market_data json =

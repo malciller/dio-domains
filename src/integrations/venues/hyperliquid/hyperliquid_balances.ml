@@ -209,6 +209,70 @@ let canonicalize_coin =
   | "USOL" -> "SOL"
   | other -> other[@@ocaml.doc
                     " Maps wrapped spot token identifiers to canonical symbols. The spot API returns\n    prefixed names (e.g. \"UBTC\" for BTC). This mapping must stay consistent with\n    [hyperliquid_instruments_feed.ml]. "]
+
+(** True until the next [spotState] frame is consumed. Hyperliquid sends the full spot
+    set on the first frame after a subscription, then deltas containing only changed
+    coins; there is no [isSnapshot] flag. Only a full frame may zero absent assets; in a
+    delta, absence means unchanged. *)
+let spot_snapshot_expected = Atomic.make true
+
+(** Mark the next [spotState] frame as the post-subscribe full snapshot; driven by the
+    reconnect event, not a timer. *)
+let expect_full_spot_snapshot () = Atomic.set spot_snapshot_expected true
+
+(** Apply one spot snapshot to the per-asset stores.
+
+    [full = true] is the authoritative full set ([spotState]'s first frame or the
+    [spotClearinghouseState] resync): absent assets are zeroed, or the grid offers phantom
+    base. [full = false] merges a delta: present coins update, absent coins are untouched. *)
+let apply_spot_snapshot ~full entries =
+  let present =
+    if full then Some (Hashtbl.create (max 8 (List.length entries))) else None
+  in
+  List.iter
+    (fun (coin, available, total) ->
+       (match present with
+        | Some t -> Hashtbl.replace t coin ()
+        | None -> ());
+       let store = get_balance_store coin in
+       BalanceStore.update_wallet store ~available ~total "spot" "account")
+    entries;
+  match present with
+  | None -> ()
+  | Some present ->
+    (* Full snapshot: zero every spot wallet not represented in it. Perp/staking wallets
+       are left alone; only a ["spot/account"] wallet is authoritative here. *)
+    List.iter
+      (fun coin ->
+         if not (Hashtbl.mem present coin)
+         then (
+           let store = get_balance_store coin in
+           let has_spot =
+             Mutex.lock store.mutex;
+             let found =
+               Hashtbl.fold
+                 (fun _ (w : BalanceStore.wallet_balance) acc ->
+                    acc || String.equal w.wallet_type "spot")
+                 store.wallets
+                 false
+             in
+             Mutex.unlock store.mutex;
+             found
+           in
+           if has_spot
+           then (
+             BalanceStore.update_wallet
+               store
+               ~available:0.0
+               ~total:0.0
+               "spot"
+               "account";
+             Logging.info_f
+               ~section
+               "%s absent from the full spot snapshot - zeroing stale spot balance"
+               coin)))
+      (get_all_assets ())
+
 let process_market_data json =
   let open Yojson.Safe.Util in
     let channel = (member "channel" json) |> to_string_option in
@@ -247,10 +311,16 @@ let process_market_data json =
         notify_ready ()
     | Some "spotState" ->
         let data = member "data" json in
+        (* The first frame after (re)subscribe is the full set; everything later is a
+           delta. Consume the flag before parsing so a malformed full frame cannot cause
+           a following delta to be treated as authoritative. *)
+        let full = Atomic.exchange spot_snapshot_expected false in
         let () =
           try
             let balances =
               ((member "spotState" data) |> (member "balances")) |> to_list in
+            let entries = ref [] in
+            let parse_failed = ref false in
             List.iter
               (fun item ->
                  try
@@ -259,9 +329,7 @@ let process_market_data json =
                    let total = parse_json_float (member "total" item) in
                    let hold = parse_json_float (member "hold" item) in
                    let available = max 0.0 (total -. hold) in
-                   let store = get_balance_store coin in
-                   BalanceStore.update_wallet store ~available ~total "spot"
-                     "account";
+                   entries := (coin, available, total) :: !entries;
                    if coin = "USDC"
                    then
                      Logging.debug_f ~section
@@ -269,9 +337,19 @@ let process_market_data json =
                        available total hold
                  with
                  | exn ->
+                     parse_failed := true;
                      Logging.warn_f ~section
                        "Failed to parse spotState entry: %s"
-                       (Printexc.to_string exn)) balances
+                       (Printexc.to_string exn)) balances;
+            if !parse_failed && full
+            then
+              Logging.warn_f
+                ~section
+                "spotState full snapshot had parse errors; merging without the \
+                 absent-asset zeroing pass (a later full resync will correct it)";
+            apply_spot_snapshot
+              ~full:(full && not !parse_failed)
+              (List.rev !entries)
           with | _ -> () in
         notify_spot_update ();
         Concurrency.Oracle_wakeup.notify_balance ();
@@ -280,6 +358,7 @@ let process_market_data json =
 let _processor_task =
   let rec run () =
     let sub = Hyperliquid_ws.subscribe_user_data () in
+    expect_full_spot_snapshot ();
     Lwt.catch
       (fun () ->
          Logging.debug_f ~section

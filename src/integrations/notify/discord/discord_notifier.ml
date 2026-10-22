@@ -70,25 +70,124 @@ let acquire_token () =
 
 (* Message formatting. *)
 
-(** Format a fill event as a Discord embed field. *)
+(** Market and strategy labels. *)
+let market_label = function
+  | "perp" -> "Perp"
+  | "spot" -> "Spot"
+  | "equity" -> "Equity"
+  | m -> m
+;;
+
+let strategy_label = function
+  | "grid" -> "Grid"
+  | "carry" -> "Carry"
+  | "hedge" -> "Hedge"
+  | "account" -> "Account"
+  | s -> s
+;;
+
+(** Venue intent -> emoji + label: a perp sell reads "Opened short", not "SELL". *)
+let intent_view (fill : Concurrency.Fill_event_bus.fill_event) =
+  match fill.intent with
+  | "open_short" -> "🔴", "Opened short"
+  | "close_short" -> "🟢", "Closed short"
+  | "open_long" -> "🟢", "Opened long"
+  | "close_long" -> "🔴", "Closed long"
+  | "buy_spot" -> "🟢", "Bought spot"
+  | "sell_spot" -> "🔴", "Sold spot"
+  | "buy_equity" -> "🟢", "Bought equity"
+  | "sell_equity" -> "🔴", "Sold equity"
+  | "liquidation" -> "🚨", "LIQUIDATED"
+  | _ -> if fill.side = "buy" then "🟢", "Buy fill" else "🔴", "Sell fill"
+;;
+
+let intent_color (fill : Concurrency.Fill_event_bus.fill_event) =
+  match fill.intent with
+  | "liquidation" -> 0x8B0000
+  | "close_short" | "close_long" ->
+    (match fill.realized_pnl with
+     | Some p when p < 0.0 -> 0xE67E22 (* orange: closed at a loss *)
+     | Some _ -> 0x2ECC71 (* green: closed at a profit *)
+     | None -> 0x3498DB (* neutral: venue did not report PnL *))
+  | "open_short" | "sell_spot" | "sell_equity" -> 0xE74C3C
+  | "open_long" | "buy_spot" | "buy_equity" -> 0x2ECC71
+  | _ -> if fill.side = "buy" then 0x2ECC71 else 0xE74C3C
+;;
+
+let pnl_str p =
+  Printf.sprintf "%s$%.4f" (if p >= 0.0 then "+" else "-") (Float.abs p)
+;;
+
+let field name value inline =
+  `Assoc [ "name", `String name; "value", `String value; "inline", `Bool inline ]
+;;
+
+(** Compact per-fill field block for batched embeds. *)
 let format_fill_field (fill : Concurrency.Fill_event_bus.fill_event) =
-  let side_emoji = if fill.side = "buy" then "🟢" else "🔴" in
-  let side_label = String.uppercase_ascii fill.side in
-  let name = Printf.sprintf "%s %s %s" side_emoji side_label fill.symbol in
-  let value =
-    Printf.sprintf
-      "**Exchange:** `%s`\n\
-       **Amount:** `%.8g`\n\
-       **Price:** `$%.4f`\n\
-       **Value:** `$%.2f`\n\
-       **Fee:** `$%.4f`"
-      fill.venue
-      fill.amount
-      fill.fill_price
-      fill.value
-      fill.fee
+  let emoji, label = intent_view fill in
+  let name = Printf.sprintf "%s %s %s" emoji label fill.symbol in
+  let detail =
+    if fill.symbol = "ACCOUNT"
+    then
+      Printf.sprintf "**Venue:** `%s`\n**Liquidated notional:** `$%.2f`" fill.venue fill.value
+    else
+      Printf.sprintf
+        "**Venue:** `%s` · **%s** · **%s**\n**Amount:** `%.8g`\n**Price:** `$%.4f`\n\
+         **Value:** `$%.2f`\n**Fee:** `$%.4f`"
+        fill.venue
+        (market_label fill.market)
+        (strategy_label fill.strategy)
+        fill.amount
+        fill.fill_price
+        fill.value
+        fill.fee
   in
-  `Assoc [ "name", `String name; "value", `String value; "inline", `Bool true ]
+  let detail =
+    match fill.realized_pnl with
+    | Some p -> detail ^ Printf.sprintf "\n**Realized PnL:** `%s`" (pnl_str p)
+    | None -> detail
+  in
+  let detail =
+    match fill.note with
+    | Some s when s <> "" -> detail ^ Printf.sprintf "\n**Note:** `%s`" s
+    | _ -> detail
+  in
+  field name detail true
+;;
+
+(** Full field list for the single-fill focused embed. *)
+let fill_fields (fill : Concurrency.Fill_event_bus.fill_event) =
+  let base =
+    [ field "Venue" (Printf.sprintf "`%s`" fill.venue) true
+    ; field "Market" (Printf.sprintf "`%s`" (market_label fill.market)) true
+    ; field "Strategy" (Printf.sprintf "`%s`" (strategy_label fill.strategy)) true
+    ]
+  in
+  let size =
+    if fill.symbol = "ACCOUNT"
+    then [ field "Liquidated notional" (Printf.sprintf "`$%.2f`" fill.value) true ]
+    else
+      [ field "Amount" (Printf.sprintf "`%.8g`" fill.amount) true
+      ; field "Fill price" (Printf.sprintf "`$%.4f`" fill.fill_price) true
+      ; field "Value" (Printf.sprintf "`$%.2f`" fill.value) true
+      ]
+  in
+  let fees =
+    if fill.fee > 0.0
+    then [ field "Fee" (Printf.sprintf "`$%.4f`" fill.fee) true ]
+    else []
+  in
+  let pnl =
+    match fill.realized_pnl with
+    | Some p -> [ field "Realized PnL" (Printf.sprintf "`%s`" (pnl_str p)) true ]
+    | None -> []
+  in
+  let note =
+    match fill.note with
+    | Some s when s <> "" -> [ field "Note" (Printf.sprintf "`%s`" s) false ]
+    | _ -> []
+  in
+  base @ size @ fees @ pnl @ note
 ;;
 
 (** Build a Discord webhook JSON payload for a batch of fills. *)
@@ -96,48 +195,20 @@ let build_webhook_payload (fills : Concurrency.Fill_event_bus.fill_event list) =
   match fills with
   | [] -> None
   | [ fill ] ->
-    (* Single fill: use a focused embed *)
-    let side_label = String.uppercase_ascii fill.side in
-    let color = if fill.side = "buy" then 0x2ECC71 else 0xE74C3C in
+    let emoji, label = intent_view fill in
+    let color = intent_color fill in
+    let title =
+      if fill.symbol = "ACCOUNT" && String.equal fill.intent "liquidation"
+      then "🚨 LIQUIDATION — ACCOUNT"
+      else if fill.fill_price > 0.0
+      then Printf.sprintf "%s %s — %s @ $%.4f" emoji label fill.symbol fill.fill_price
+      else Printf.sprintf "%s %s — %s" emoji label fill.symbol
+    in
     let embed =
       `Assoc
-        [ ( "title"
-          , `String
-              (Printf.sprintf "%s - %s @ $%.4f" fill.symbol side_label fill.fill_price) )
+        [ "title", `String title
         ; "color", `Int color
-        ; ( "fields"
-          , `List
-              [ `Assoc
-                  [ "name", `String "Exchange"
-                  ; "value", `String (Printf.sprintf "`%s`" fill.venue)
-                  ; "inline", `Bool true
-                  ]
-              ; `Assoc
-                  [ "name", `String "Pair"
-                  ; "value", `String (Printf.sprintf "`%s`" fill.symbol)
-                  ; "inline", `Bool true
-                  ]
-              ; `Assoc
-                  [ "name", `String "Side"
-                  ; "value", `String side_label
-                  ; "inline", `Bool true
-                  ]
-              ; `Assoc
-                  [ "name", `String "Amount"
-                  ; "value", `String (Printf.sprintf "`%.8g`" fill.amount)
-                  ; "inline", `Bool true
-                  ]
-              ; `Assoc
-                  [ "name", `String "Fill Price"
-                  ; "value", `String (Printf.sprintf "`$%.4f`" fill.fill_price)
-                  ; "inline", `Bool true
-                  ]
-              ; `Assoc
-                  [ "name", `String "Value"
-                  ; "value", `String (Printf.sprintf "`$%.2f`" fill.value)
-                  ; "inline", `Bool true
-                  ]
-              ] )
+        ; "fields", `List (fill_fields fill)
         ; ( "timestamp"
           , `String
               (let t = Unix.gmtime fill.timestamp in
@@ -155,8 +226,13 @@ let build_webhook_payload (fills : Concurrency.Fill_event_bus.fill_event list) =
   | fills ->
     (* Multiple fills: batch into a single embed with per-fill fields *)
     let n = List.length fills in
-    let color = 0x3498DB in
-    (* Blue for batched *)
+    let has_liquidation =
+      List.exists
+        (fun (f : Concurrency.Fill_event_bus.fill_event) ->
+           String.equal f.intent "liquidation")
+        fills
+    in
+    let color = if has_liquidation then 0x8B0000 else 0x3498DB in
     let venues =
       List.sort_uniq
         String.compare
@@ -164,9 +240,14 @@ let build_webhook_payload (fills : Concurrency.Fill_event_bus.fill_event list) =
     in
     let venue_str = String.concat ", " venues in
     let fields = List.map format_fill_field fills in
+    let title =
+      if has_liquidation
+      then Printf.sprintf "%d executions (LIQUIDATION) — %s" n venue_str
+      else Printf.sprintf "%d executions — %s" n venue_str
+    in
     let embed =
       `Assoc
-        [ "title", `String (Printf.sprintf "%d Order Fills — %s" n venue_str)
+        [ "title", `String title
         ; "color", `Int color
         ; "fields", `List fields
         ; ( "timestamp"

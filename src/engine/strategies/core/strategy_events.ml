@@ -361,6 +361,14 @@ let handle_order_failed ~now asset_symbol side reason =
              asset_symbol)
        | Sell when is_insufficient_balance ->
          let ecfg = get_exchange_config state.exchange_id in
+         (* Local ledger has the base but the venue does not: stale/missed balance
+            snapshot, not sizing. Request an authoritative spot snapshot; [asset_low]
+            latches below until the refreshed balance is adopted. *)
+         (match get_exchange_module state.exchange_id with
+          | Some (module Ex) ->
+            (try Ex.resync_market_state ~symbol:asset_symbol () with
+             | _ -> ())
+          | None -> ());
          if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> []
          then (
            match failed_sell_price_opt with
@@ -651,6 +659,45 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
           <- updated.Dio_persistence.Base_accumulation_store.last_buy_fill_price;
           state.last_buy_fill_qty
           <- updated.Dio_persistence.Base_accumulation_store.last_buy_fill_qty;
+          (* Profit-gated lot skim for 1:1 venues. The order cannot withhold the
+             [(1 - sell_mult)] slice (below one lot), so split the buy fill's own base:
+             once quote profit covers a lot plus the buffer, move that lot into
+             [reserved_base] and reduce the sellable reference. The reserve is backed by
+             this buy. Runs once per buy, never on the sell path. *)
+          if (not state.startup_replay)
+             && state.base_accumulation_enabled
+             && state.cached_ecfg.use_accumulation_sells
+             && (not state.cached_ecfg.sell_uses_mult)
+             && fill_price > 0.0
+             && acc_qty > 0.0
+          then (
+            let sell_mult = Float.min 1.0 (Float.max 0.0 state.cached_sell_mult) in
+            let lot =
+              if state.cached_qty_increment > 0.0
+              then state.cached_qty_increment
+              else 1e-8
+            in
+            let retained = acc_qty *. (1.0 -. sell_mult) in
+            let skim =
+              round_qty_up (Float.max retained lot) asset_symbol state.exchange_id
+            in
+            let cost = skim *. fill_price in
+            if skim > 0.0
+               && acc_qty -. skim >= lot -. 1e-9
+               && state.accumulated_profit >= cost +. state.accumulation_buffer
+            then (
+              state.reserved_base <- state.reserved_base +. skim;
+              state.accumulated_profit <- Float.max 0.0 (state.accumulated_profit -. cost);
+              state.last_buy_fill_qty <- Some (acc_qty -. skim);
+              state.persistence_dirty <- true;
+              Logging.info_f
+                ~section
+                "Skimmed base for %s: +%.8f into reserved_base (cost $%.4f, sellable lot \
+                 %.8f)"
+                asset_symbol
+                skim
+                cost
+                (acc_qty -. skim)));
           (* Persistence dirty-marking follows the per-strategy config opt-in
              (base_accumulation), not a hardcoded venue list. *)
           if state.base_accumulation_enabled then state.persistence_dirty <- true;
@@ -866,6 +913,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
                ~buffer:state.accumulation_buffer
                ~sell_mult:state.cached_sell_mult
                ~oracle_qty:state.grid_qty
+               ~sell_uses_mult:state.cached_ecfg.sell_uses_mult
                ~fees
                ()
            in

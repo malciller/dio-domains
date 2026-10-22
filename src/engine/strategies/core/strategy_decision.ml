@@ -871,6 +871,7 @@ type sell_pre =
   ; sp_alpaca_available : float
   ; sp_available_base : float
   ; sp_committed_sell : float
+  ; sp_committed_total : float
   ; sp_unnetted_hold : float
   ; sp_unreflected_credit : float
   ; sp_reserve_headroom : float
@@ -880,6 +881,7 @@ type sell_pre =
   ; sp_base_ref_price : float
   ; sp_capital_exhausted : bool
   ; sp_halt_inventory_check : bool
+  ; sp_asset_low_residual_ok : bool
   ; sp_should_trigger_sell : bool
   ; sp_is_sell_on_cooldown : bool
   ; sp_missing_after_reconcile : (float * float) list ref
@@ -910,9 +912,19 @@ let sell_leg_prepare
      base as free, and sizing against it is the reserved_base leak under volatility. *)
   let _sp_ov = Strategy_state.sub_start state in
   let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age in
-  (* The base to subtract from the venue's reported holding: the ledger total on
-     gross-balance venues, and the ledger's excess over the venue feed (never below the
-     unnetted overlay) on net-balance venues. See [effective_committed_sell_base]. *)
+  (* Sizing basis must match the venue's balance semantics. The position ledger holds the
+     venue's reported figure on hold-netted venues (Hyperliquid), where that figure is
+     already net of resting-order holds, so subtracting the full commitment again would
+     double-count the hold and hide the free residual above [reserved_base]. On venues
+     that report a gross balance, the whole commitment is subtracted.
+     [effective_committed_sell_base] owns that venue split; [committed_total] is kept for
+     the reserve headroom and placement telemetry, which need the full outstanding
+     commitment regardless of how the venue reports it. *)
+  let committed_total =
+    Float.max
+      (Float.max locked_in_sells (Sell_orders.sum_qty state.open_sell_orders))
+      unnetted_hold
+  in
   let committed_sell =
     effective_committed_sell_base
       ~ecfg
@@ -952,18 +964,9 @@ let sell_leg_prepare
       ~committed_sell
       ~unnetted_hold
   in
-  (* Total base committed to sells, taking the larger of the in-flight ledger and the live
-     open-order list. The ledger is authoritative in the running system (the scan rebuilds
-     it each execution); the open-order sum keeps the reserve headroom honest for direct
-     callers that populate only [open_sell_orders], and when the ledger transiently
-     undercounts a dropped order. Taking the max avoids double-counting the overlap. *)
-  let committed_total =
-    let open_sum = Sell_orders.sum_qty state.open_sell_orders in
-    Float.max (committed_sell_base state) open_sum
-  in
-  (* Reserve-bounded headroom from the local ledger: base we hold that is not already
-     committed to a resting/in-flight sell. Independent of the venue snapshot, so a stale
-     [qty_available] cannot authorize committing [reserved_base]. *)
+  (* Reserve-bounded headroom from the local ledger. Always uses the full commitment, even
+     when the venue-reported sizing basis collapses it, so a stale [qty_available] cannot
+     authorize committing [reserved_base]. *)
   let reserve_headroom =
     Float.max 0.0 (ledger_balance -. state.reserved_base -. committed_total)
   in
@@ -1092,6 +1095,27 @@ let sell_leg_prepare
     then 1.0
     else 0.0
   in
+  (* [asset_low] is latched by a rejected sell for the full owed lot, but a free residual
+     can still exist. [available_base] is net of [reserved_base] and every committed sell,
+     so it is exactly what can still be offered; gate on the rounded residual clearing the
+     venue floor, and the sell body clamps the owed qty to it. Below the floor the latch
+     blocks as before. *)
+  let asset_low_residual_ok =
+    if not state.asset_low
+    then false
+    else (
+      let min_order_size =
+        if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
+      in
+      let min_qty = Float.max min_order_size state.cached_venue_min_qty in
+      let residual =
+        if Float.is_nan available_base
+        then 0.0
+        else Float.max 0.0 (round_qty available_base asset.symbol asset.exchange)
+      in
+      residual >= min_qty -. 1e-9
+      && (min_notional <= 0.0 || residual *. base_ref_price >= min_notional -. 1e-9))
+  in
   let inventory_ok =
     inventory_basis > 0.0
     &&
@@ -1156,8 +1180,8 @@ let sell_leg_prepare
       then Some "asset balance snapshot unavailable (NaN) - inventory not evaluable"
       else if has_active_sell state
       then Some "a sell placement is in flight (has_active_sell)"
-      else if state.asset_low
-      then Some "asset_low flag latched"
+      else if state.asset_low && not asset_low_residual_ok
+      then Some "asset_low flag latched (no non-reserved residual above the venue floor)"
       else if is_sell_on_cooldown
       then Some "sell placement cooldown active"
       else None
@@ -1177,6 +1201,7 @@ let sell_leg_prepare
   ; sp_alpaca_available = alpaca_available
   ; sp_available_base = available_base
   ; sp_committed_sell = committed_sell
+  ; sp_committed_total = committed_total
   ; sp_unnetted_hold = unnetted_hold
   ; sp_unreflected_credit = unreflected_credit
   ; sp_reserve_headroom = reserve_headroom
@@ -1186,6 +1211,7 @@ let sell_leg_prepare
   ; sp_base_ref_price = base_ref_price
   ; sp_capital_exhausted = capital_exhausted
   ; sp_halt_inventory_check = halt_inventory_check
+  ; sp_asset_low_residual_ok = asset_low_residual_ok
   ; sp_should_trigger_sell = should_trigger_sell
   ; sp_is_sell_on_cooldown = is_sell_on_cooldown
   ; sp_missing_after_reconcile = missing_after_reconcile
@@ -1194,12 +1220,14 @@ let sell_leg_prepare
   }
 ;;
 
-(** True when a fresh sell is placeable this cycle. *)
+(** True when a fresh sell is placeable this cycle. [asset_low] blocks the leg only while
+    no non-reserved residual clears the venue floor; a placeable residual is sold (clamped
+    to [available_base] in the body) instead of being held behind the latch. *)
 let sell_place_should ~state ~asset_balance ~pre =
   pre.sp_should_trigger_sell
   && (not (Float.is_nan asset_balance))
   && (not (has_active_sell state))
-  && (not state.asset_low)
+  && ((not state.asset_low) || pre.sp_asset_low_residual_ok)
   && not pre.sp_is_sell_on_cooldown
 ;;
 
@@ -1218,6 +1246,7 @@ let sell_place_body
   let alpaca_available = pre.sp_alpaca_available in
   let ledger_balance = pre.sp_ledger_balance in
   let committed_sell = pre.sp_committed_sell in
+  let committed_total = pre.sp_committed_total in
   let unnetted_hold = pre.sp_unnetted_hold in
   let unreflected_credit = pre.sp_unreflected_credit in
   let capital_exhausted = pre.sp_capital_exhausted in
@@ -1279,29 +1308,32 @@ let sell_place_body
          keeps the recovery rung at fill + gi. *)
       owed_sell_price ~state ~asset ~ecfg ~bid_price ~ask_price ~capital_exhausted
   in
-  (* Sell quantity: every filled buy owes exactly one 1:1 sell of what it bought (the
-     persisted replacement level restores its own qty). All sizing beyond this is
-     inventory clamping below - no profit gating, no sell_mult sizing. *)
+  let min_order_size =
+    if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
+  in
+  let is_accumulation = ecfg.use_accumulation_sells in
+  let sell_mult = Float.min 1.0 (Float.max 0.0 state.cached_sell_mult) in
+  (* Sell sizing. Kraken's lot size and grid interval are large enough to withhold the
+     [(1 - sell_mult)] slice inside the order itself, so the sell is [qty * sell_mult].
+     Hyperliquid cannot: that slice is below one lot, so it sells 1:1 and its buy-fill
+     handler skims a whole lot into [reserved_base] from accumulated quote profit (see
+     [strategy_events]); [qty] there is already the sellable remainder. *)
   let sell_qty =
     match target_sell_qty_override with
     | Some tq -> tq
-    | None -> qty
+    | None -> if ecfg.sell_uses_mult then qty *. sell_mult else qty
   in
   (* Non-accrued, uncommitted sellable inventory. Base committed to a resting or in-flight
      sell is subtracted on EVERY venue via [locked_in_sells] (the in-flight sell ledger),
      so it can never be offered again - not even when the venue reports a gross figure or
      its open-order feed momentarily drops a live order. Alpaca uses the venue's own
      [qty_available], which is already free of resting holds. *)
-  let is_accumulation = ecfg.use_accumulation_sells in
   let available =
     if is_accumulation
     then Float.max 0.0 (asset_bal -. state.reserved_base -. committed_sell)
     else if is_alpaca
     then alpaca_available
     else Float.max 0.0 (asset_bal -. state.reserved_base -. committed_sell)
-  in
-  let min_order_size =
-    if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
   in
   let target_q = round_qty sell_qty asset.symbol asset.exchange in
   let effective_sell_qty, balance_ok =
@@ -1316,9 +1348,13 @@ let sell_place_body
          ledger on accumulation venues), so sweeping the full available can offer base
          that already left - dipping into reserved_base. The sweep therefore runs only
          while both feed-lag overlays are clear; with an un-netted sell hold or buy credit
-         outstanding the owed 1:1 lot is placed and the hold guard re-armed. *)
+         outstanding the owed 1:1 lot is placed and the hold guard re-armed. It also
+         cannot run where the order withholds the retention slice ([sell_uses_mult]):
+         selling the whole float would sell that slice back and leave the accrual
+         unbacked. *)
       let sweep_eligible =
         (not is_alpaca)
+        && (not ecfg.sell_uses_mult)
         && target_sell_qty_override = None
         && not ecfg.remaintain_expired_sells
       in
@@ -1539,7 +1575,7 @@ let sell_place_body
           unreflected_credit
           state.reserved_base
           available
-          committed_sell
+          committed_total
           unnetted_hold
           open_sell_base
           quote_reserved)
