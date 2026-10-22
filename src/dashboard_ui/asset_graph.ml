@@ -1300,7 +1300,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
        across the chart. *)
     let clip_pin s =
       let max_len = max 0 (pin_col_w - 3) in
-      if String.length s <= max_len then s else String.sub s 0 max_len
+      if utf8_len s <= max_len then s else truncate_string max_len s
     in
     let perp_pin_lines =
       match perp_opt with
@@ -1314,11 +1314,11 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     (* Percentage distance from the live reference price to the order's execution price:
        the move still required for the target to fill. Spot targets measure from the spot
        mid; perp targets from the perp mark, falling back to the spot mid when the venue
-       has not published a mark. *)
+       has not published a mark. No brackets: the flag column is narrow and the sign
+       already distinguishes a target above the reference from one below. *)
     let distance_suffix reference price =
       if reference > 0.0 && price > 0.0
-      then
-        Printf.sprintf " [%s]" (format_pct ((price -. reference) /. reference *. 100.0))
+      then Printf.sprintf " %s" (format_pct ((price -. reference) /. reference *. 100.0))
       else ""
     in
     let perp_reference =
@@ -1354,7 +1354,9 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         []
     in
     (* Perp flags name the role of the order relative to the open position: the side that
-       reduces it is the exit whose price closes the trade. *)
+       reduces it is the exit whose price closes the trade. Roles are one letter (C/A for
+       close/add, B/S when flat) because the flag column is narrow and price, quantity and
+       distance already fill most of it. *)
     let perp_flag_specs by_row is_buy =
       let is_exit =
         match perp_opt with
@@ -1363,8 +1365,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       in
       let role =
         match perp_opt with
-        | Some p when p.has_position -> if is_exit then "CLOSE" else "ADD"
-        | _ -> if is_buy then "BUY" else "SELL"
+        | Some p when p.has_position -> if is_exit then "C" else "A"
+        | _ -> if is_buy then "B" else "S"
       in
       Hashtbl.fold
         (fun row orders acc ->
@@ -1385,11 +1387,13 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
               | _ -> raw_q
             in
             let count_str =
-              if count > 1 && total_q >= raw_q -. 1e-9 then string_of_int count else ""
+              if count > 1 && total_q >= raw_q -. 1e-9
+              then "x" ^ string_of_int count
+              else ""
             in
             let text =
               Printf.sprintf
-                "◆P %s%s %.6g %.4g%s"
+                "◆P%s%s %.6g %.4g%s"
                 role
                 count_str
                 avg_p
