@@ -17,7 +17,7 @@ open Lwt.Infix
 let section = "discord_notifier"
 
 (** Maximum fill events per embed. Discord supports up to 25 fields; 10 keeps messages
-    readable (each fill uses ~5-6 fields). *)
+    readable (one full-width field per fill). *)
 let max_fills_per_message = 10
 
 (* Token bucket rate limiter. *)
@@ -86,108 +86,250 @@ let strategy_label = function
   | s -> s
 ;;
 
-(** Venue intent -> emoji + label: a perp sell reads "Opened short", not "SELL". *)
-let intent_view (fill : Concurrency.Fill_event_bus.fill_event) =
+let venue_label = function
+  | "kraken" -> "Kraken"
+  | "hyperliquid" -> "Hyperliquid"
+  | "lighter" -> "Lighter"
+  | "ibkr" -> "IBKR"
+  | "alpaca" -> "Alpaca"
+  | v -> String.capitalize_ascii v
+;;
+
+(* Embed colors. Spot uses green/red for buys/sells; perps use blue/grey for opens/closes
+   so the color bar identifies the market at a glance. *)
+let color_buy = 0x2ECC71
+let color_sell = 0xE74C3C
+let color_perp_open = 0x3498DB
+let color_perp_close = 0x95A5A6
+let color_liquidation = 0x8B0000
+let color_batch = 0x5865F2
+
+(** Venue intent -> action label. The action leads so it is the first thing read. *)
+let intent_label (fill : Concurrency.Fill_event_bus.fill_event) =
   match fill.intent with
-  | "open_short" -> "🔴", "Opened short"
-  | "close_short" -> "🟢", "Closed short"
-  | "open_long" -> "🟢", "Opened long"
-  | "close_long" -> "🔴", "Closed long"
-  | "buy_spot" -> "🟢", "Bought spot"
-  | "sell_spot" -> "🔴", "Sold spot"
-  | "buy_equity" -> "🟢", "Bought equity"
-  | "sell_equity" -> "🔴", "Sold equity"
-  | "liquidation" -> "🚨", "LIQUIDATED"
-  | _ -> if fill.side = "buy" then "🟢", "Buy fill" else "🔴", "Sell fill"
+  | "open_short" -> "OPEN SHORT"
+  | "close_short" -> "CLOSE SHORT"
+  | "open_long" -> "OPEN LONG"
+  | "close_long" -> "CLOSE LONG"
+  | "buy_spot" -> "BUY SPOT"
+  | "sell_spot" -> "SELL SPOT"
+  | "buy_equity" -> "BUY EQUITY"
+  | "sell_equity" -> "SELL EQUITY"
+  | "liquidation" -> "LIQUIDATION"
+  | _ -> if fill.side = "buy" then "BUY" else "SELL"
 ;;
 
 let intent_color (fill : Concurrency.Fill_event_bus.fill_event) =
   match fill.intent with
-  | "liquidation" -> 0x8B0000
-  | "close_short" | "close_long" ->
-    (match fill.realized_pnl with
-     | Some p when p < 0.0 -> 0xE67E22 (* orange: closed at a loss *)
-     | Some _ -> 0x2ECC71 (* green: closed at a profit *)
-     | None -> 0x3498DB (* neutral: venue did not report PnL *))
-  | "open_short" | "sell_spot" | "sell_equity" -> 0xE74C3C
-  | "open_long" | "buy_spot" | "buy_equity" -> 0x2ECC71
-  | _ -> if fill.side = "buy" then 0x2ECC71 else 0xE74C3C
+  | "liquidation" -> color_liquidation
+  | "open_short" | "open_long" -> color_perp_open
+  | "close_short" | "close_long" -> color_perp_close
+  | "sell_spot" | "sell_equity" -> color_sell
+  | "buy_spot" | "buy_equity" -> color_buy
+  | _ -> if fill.side = "buy" then color_buy else color_sell
+;;
+
+(** A batch keeps a single fill's color when every fill agrees, otherwise it falls back to
+    a neutral color so the bar never implies a specific action. *)
+let batch_color (fills : Concurrency.Fill_event_bus.fill_event list) =
+  match List.map intent_color fills with
+  | [] -> color_batch
+  | c :: rest when List.for_all (fun x -> x = c) rest -> c
+  | _ -> color_batch
+;;
+
+(** Insert thousands separators into a plain decimal string. *)
+let group_thousands s =
+  let int_part, fraction =
+    match String.index_opt s '.' with
+    | Some i -> String.sub s 0 i, String.sub s i (String.length s - i)
+    | None -> s, ""
+  in
+  let n = String.length int_part in
+  let buf = Buffer.create (n + (n / 3)) in
+  String.iteri
+    (fun i c ->
+      if i > 0 && (n - i) mod 3 = 0 then Buffer.add_char buf ',';
+      Buffer.add_char buf c)
+    int_part;
+  Buffer.contents buf ^ fraction
+;;
+
+(** Trim trailing zeros while keeping two decimal places. *)
+let trim_zeros s =
+  match String.index_opt s '.' with
+  | None -> s
+  | Some dot ->
+    let min_len = dot + 3 in
+    let rec find i =
+      if i <= min_len
+      then min_len
+      else if String.get s (i - 1) = '0'
+      then find (i - 1)
+      else i
+    in
+    String.sub s 0 (find (String.length s))
+;;
+
+(** Currency with useful precision: cents for large amounts, more digits for sub-dollar
+    prices, and no noisy trailing zeros. *)
+let format_currency v =
+  let magnitude = Float.abs v in
+  let decimals =
+    if magnitude >= 1000.0
+    then 2
+    else if magnitude >= 1.0
+    then 4
+    else if magnitude >= 0.01
+    then 6
+    else if magnitude >= 0.0001
+    then 8
+    else 10
+  in
+  let magnitude_str = Printf.sprintf "%.*f" decimals magnitude |> trim_zeros in
+  Printf.sprintf "%s$%s" (if v < 0.0 then "-" else "") (group_thousands magnitude_str)
 ;;
 
 let pnl_str p =
-  Printf.sprintf "%s$%.4f" (if p >= 0.0 then "+" else "-") (Float.abs p)
+  let sign = if p >= 0.0 then "+" else "-" in
+  sign ^ format_currency (Float.abs p)
 ;;
 
 let field name value inline =
   `Assoc [ "name", `String name; "value", `String value; "inline", `Bool inline ]
 ;;
 
+(** One-line summary: action, instrument, and fill price. Used as message content so push
+    notifications carry the same information as the channel. *)
+let fill_summary (fill : Concurrency.Fill_event_bus.fill_event) =
+  let action = intent_label fill in
+  if fill.symbol = "ACCOUNT" && String.equal fill.intent "liquidation"
+  then "LIQUIDATION — ACCOUNT"
+  else if fill.fill_price > 0.0
+  then Printf.sprintf "%s — %s @ %s" action fill.symbol (format_currency fill.fill_price)
+  else Printf.sprintf "%s — %s" action fill.symbol
+;;
+
 (** Compact per-fill field block for batched embeds. *)
 let format_fill_field (fill : Concurrency.Fill_event_bus.fill_event) =
-  let emoji, label = intent_view fill in
-  let name = Printf.sprintf "%s %s %s" emoji label fill.symbol in
+  let name =
+    if fill.symbol = "ACCOUNT"
+    then Printf.sprintf "%s — ACCOUNT" (intent_label fill)
+    else if fill.fill_price > 0.0
+    then
+      Printf.sprintf
+        "%s — %s @ %s"
+        (intent_label fill)
+        fill.symbol
+        (format_currency fill.fill_price)
+    else Printf.sprintf "%s — %s" (intent_label fill) fill.symbol
+  in
   let detail =
     if fill.symbol = "ACCOUNT"
     then
-      Printf.sprintf "**Venue:** `%s`\n**Liquidated notional:** `$%.2f`" fill.venue fill.value
+      Printf.sprintf
+        "Venue: %s\nLiquidated notional: %s"
+        (venue_label fill.venue)
+        (format_currency fill.value)
     else
       Printf.sprintf
-        "**Venue:** `%s` · **%s** · **%s**\n**Amount:** `%.8g`\n**Price:** `$%.4f`\n\
-         **Value:** `$%.2f`\n**Fee:** `$%.4f`"
-        fill.venue
+        "Venue: %s · %s · %s\nAmount: %.8g\nValue: %s\nFee: %s"
+        (venue_label fill.venue)
         (market_label fill.market)
         (strategy_label fill.strategy)
         fill.amount
-        fill.fill_price
-        fill.value
-        fill.fee
+        (format_currency fill.value)
+        (format_currency fill.fee)
   in
   let detail =
     match fill.realized_pnl with
-    | Some p -> detail ^ Printf.sprintf "\n**Realized PnL:** `%s`" (pnl_str p)
+    | Some p -> detail ^ Printf.sprintf "\nRealized PnL: %s" (pnl_str p)
     | None -> detail
   in
   let detail =
     match fill.note with
-    | Some s when s <> "" -> detail ^ Printf.sprintf "\n**Note:** `%s`" s
+    | Some s when s <> "" -> detail ^ Printf.sprintf "\nNote: %s" s
     | _ -> detail
   in
-  field name detail true
+  field name detail false
 ;;
 
 (** Full field list for the single-fill focused embed. *)
 let fill_fields (fill : Concurrency.Fill_event_bus.fill_event) =
   let base =
-    [ field "Venue" (Printf.sprintf "`%s`" fill.venue) true
-    ; field "Market" (Printf.sprintf "`%s`" (market_label fill.market)) true
-    ; field "Strategy" (Printf.sprintf "`%s`" (strategy_label fill.strategy)) true
+    [ field "Venue" (venue_label fill.venue) true
+    ; field "Market" (market_label fill.market) true
+    ; field "Strategy" (strategy_label fill.strategy) true
     ]
   in
   let size =
     if fill.symbol = "ACCOUNT"
-    then [ field "Liquidated notional" (Printf.sprintf "`$%.2f`" fill.value) true ]
+    then [ field "Liquidated notional" (format_currency fill.value) true ]
     else
-      [ field "Amount" (Printf.sprintf "`%.8g`" fill.amount) true
-      ; field "Fill price" (Printf.sprintf "`$%.4f`" fill.fill_price) true
-      ; field "Value" (Printf.sprintf "`$%.2f`" fill.value) true
+      [ field "Amount" (Printf.sprintf "%.8g" fill.amount) true
+      ; field
+          "Price"
+          (if fill.fill_price > 0.0 then format_currency fill.fill_price else "n/a")
+          true
+      ; field "Value" (format_currency fill.value) true
       ]
   in
   let fees =
-    if fill.fee > 0.0
-    then [ field "Fee" (Printf.sprintf "`$%.4f`" fill.fee) true ]
-    else []
+    if fill.fee > 0.0 then [ field "Fee" (format_currency fill.fee) true ] else []
   in
   let pnl =
     match fill.realized_pnl with
-    | Some p -> [ field "Realized PnL" (Printf.sprintf "`%s`" (pnl_str p)) true ]
+    | Some p -> [ field "Realized PnL" (pnl_str p) true ]
     | None -> []
   in
   let note =
     match fill.note with
-    | Some s when s <> "" -> [ field "Note" (Printf.sprintf "`%s`" s) false ]
+    | Some s when s <> "" -> [ field "Note" s false ]
     | _ -> []
   in
   base @ size @ fees @ pnl @ note
+;;
+
+let iso8601 timestamp =
+  let t = Unix.gmtime timestamp in
+  Printf.sprintf
+    "%04d-%02d-%02dT%02d:%02d:%02dZ"
+    (t.tm_year + 1900)
+    (t.tm_mon + 1)
+    t.tm_mday
+    t.tm_hour
+    t.tm_min
+    t.tm_sec
+;;
+
+let embed_json ~color ~fields ~timestamp =
+  `Assoc
+    [ "color", `Int color
+    ; "fields", `List fields
+    ; "timestamp", `String (iso8601 timestamp)
+    ]
+;;
+
+(** Batch summary: count and action when uniform, the asset when uniform, and venues. *)
+let batch_summary (fills : Concurrency.Fill_event_bus.fill_event list) =
+  let unique f = List.sort_uniq String.compare (List.map f fills) in
+  let actions = unique intent_label in
+  let symbols = unique (fun (f : Concurrency.Fill_event_bus.fill_event) -> f.symbol) in
+  let venues =
+    unique (fun (f : Concurrency.Fill_event_bus.fill_event) -> venue_label f.venue)
+  in
+  let n = List.length fills in
+  let action =
+    match actions with
+    | [ action ] -> Printf.sprintf "%d× %s" n action
+    | _ -> Printf.sprintf "%d FILLS" n
+  in
+  let subject =
+    match symbols with
+    | [ symbol ] -> symbol
+    | _ -> "MULTIPLE ASSETS"
+  in
+  Printf.sprintf "%s — %s · %s" action subject (String.concat ", " venues)
 ;;
 
 (** Build a Discord webhook JSON payload for a batch of fills. *)
@@ -195,75 +337,43 @@ let build_webhook_payload (fills : Concurrency.Fill_event_bus.fill_event list) =
   match fills with
   | [] -> None
   | [ fill ] ->
-    let emoji, label = intent_view fill in
-    let color = intent_color fill in
-    let title =
-      if fill.symbol = "ACCOUNT" && String.equal fill.intent "liquidation"
-      then "🚨 LIQUIDATION — ACCOUNT"
-      else if fill.fill_price > 0.0
-      then Printf.sprintf "%s %s — %s @ $%.4f" emoji label fill.symbol fill.fill_price
-      else Printf.sprintf "%s %s — %s" emoji label fill.symbol
-    in
     let embed =
-      `Assoc
-        [ "title", `String title
-        ; "color", `Int color
-        ; "fields", `List (fill_fields fill)
-        ; ( "timestamp"
-          , `String
-              (let t = Unix.gmtime fill.timestamp in
-               Printf.sprintf
-                 "%04d-%02d-%02dT%02d:%02d:%02dZ"
-                 (t.tm_year + 1900)
-                 (t.tm_mon + 1)
-                 t.tm_mday
-                 t.tm_hour
-                 t.tm_min
-                 t.tm_sec) )
-        ]
+      embed_json
+        ~color:(intent_color fill)
+        ~fields:(fill_fields fill)
+        ~timestamp:fill.timestamp
     in
-    Some (`Assoc [ "embeds", `List [ embed ] ])
+    Some (`Assoc [ "content", `String (fill_summary fill); "embeds", `List [ embed ] ])
   | fills ->
-    (* Multiple fills: batch into a single embed with per-fill fields *)
+    (* Multiple fills: one embed with a full-width field per fill. *)
     let n = List.length fills in
     let has_liquidation =
       List.exists
         (fun (f : Concurrency.Fill_event_bus.fill_event) ->
-           String.equal f.intent "liquidation")
+          String.equal f.intent "liquidation")
         fills
     in
-    let color = if has_liquidation then 0x8B0000 else 0x3498DB in
+    let color = if has_liquidation then color_liquidation else batch_color fills in
     let venues =
       List.sort_uniq
         String.compare
-        (List.map (fun (f : Concurrency.Fill_event_bus.fill_event) -> f.venue) fills)
+        (List.map
+           (fun (f : Concurrency.Fill_event_bus.fill_event) -> venue_label f.venue)
+           fills)
     in
     let venue_str = String.concat ", " venues in
-    let fields = List.map format_fill_field fills in
-    let title =
+    let summary =
       if has_liquidation
-      then Printf.sprintf "%d executions (LIQUIDATION) — %s" n venue_str
-      else Printf.sprintf "%d executions — %s" n venue_str
+      then Printf.sprintf "%d FILLS (LIQUIDATION) — %s" n venue_str
+      else batch_summary fills
     in
     let embed =
-      `Assoc
-        [ "title", `String title
-        ; "color", `Int color
-        ; "fields", `List fields
-        ; ( "timestamp"
-          , `String
-              (let t = Unix.gmtime (Unix.gettimeofday ()) in
-               Printf.sprintf
-                 "%04d-%02d-%02dT%02d:%02d:%02dZ"
-                 (t.tm_year + 1900)
-                 (t.tm_mon + 1)
-                 t.tm_mday
-                 t.tm_hour
-                 t.tm_min
-                 t.tm_sec) )
-        ]
+      embed_json
+        ~color
+        ~fields:(List.map format_fill_field fills)
+        ~timestamp:(Unix.gettimeofday ())
     in
-    Some (`Assoc [ "embeds", `List [ embed ] ])
+    Some (`Assoc [ "content", `String summary; "embeds", `List [ embed ] ])
 ;;
 
 (* Webhook HTTP client. *)
