@@ -679,6 +679,20 @@ let asset_domain_worker
         ~exchange:asset_with_fees.exchange
         ~symbol:asset_with_fees.symbol
     in
+    (* Controller-scoped values the overlay cycle needs every tick. Resolve them once here
+       instead of re-normalizing the exchange and splitting the symbol in the loop. *)
+    let overlay_coin, overlay_min_liq_mult =
+      match overlay_controller with
+      | Some c -> Config.base_coin_of_symbol c.oc_hedge_symbol, c.oc_params.min_liq_mult
+      | None -> "", 0.0
+    in
+    (* Open-sell sums per inventory leg, invalidated by the venue's open-orders
+       generation. Without this the overlay walks every resting sell on every tick. *)
+    let overlay_inventory_caches =
+      match overlay_controller with
+      | Some c -> Some (Overlay_inventory.create_caches c)
+      | None -> None
+    in
     (* The engine startup path is not the CLI/test path that registers the builtin action
        inventory, so do it here before validating either runtime. Idempotent. *)
     Dio_strategies.Strategy_actions_builtin.register_all ();
@@ -1285,26 +1299,26 @@ let asset_domain_worker
             (fun (event : Types.execution_event) ->
                incr event_count;
                incr cycle_events;
-               (* Identify carry executions by the order registry first, the cloid
-                  second. A venue amend lands as a new order id and need not carry a
-                  cloid, so a cloid-only test drops the fill entirely: the close/entry
-                  fill is never booked, its registry mapping is never retired, and every
-                  later replace for that kind is silently suppressed. The registry is
-                  populated on the place/amend ack, which always precedes the fill. *)
+               (* Identify carry executions by the order registry first, the cloid second.
+                  A venue amend lands as a new order id and need not carry a cloid, so a
+                  cloid-only test drops the fill entirely: the close/entry fill is never
+                  booked, its registry mapping is never retired, and every later replace
+                  for that kind is silently suppressed. The registry is populated on the
+                  place/amend ack, which always precedes the fill. *)
                let overlay_event =
-                 (match
-                    Dio_strategies.Strategy_common.lookup_carry_order
-                      ~order_id:event.order_id
-                  with
-                  | Some _ -> true
-                  | None ->
-                    (match event.cl_ord_id with
-                     | Some clid ->
-                       (match Dio_strategies.Strategy_common.userref_of_cloid clid with
-                        | Some u ->
-                          u = Dio_strategies.Strategy_common.strategy_userref_carry
-                        | None -> false)
-                     | None -> false))
+                 match
+                   Dio_strategies.Strategy_common.lookup_carry_order
+                     ~order_id:event.order_id
+                 with
+                 | Some _ -> true
+                 | None ->
+                   (match event.cl_ord_id with
+                    | Some clid ->
+                      (match Dio_strategies.Strategy_common.userref_of_cloid clid with
+                       | Some u ->
+                         u = Dio_strategies.Strategy_common.strategy_userref_carry
+                       | None -> false)
+                    | None -> false)
                in
                match event.order_status with
                | Types.Canceled | Types.Rejected | Types.Expired ->
@@ -1797,16 +1811,36 @@ let asset_domain_worker
             st.capital_low_logged <- false;
             st.capital_low_at_balance <- 0.0)
         | Some d ->
+          (* Why the grid's buy pool emptied is otherwise invisible: the venue can still
+             show quote while the senior overlay reservations have claimed all of it
+             (unified collateral). Record both sides on the transition. *)
+          let venue_quote =
+            try Ex.get_tradeable_balance ~asset:quote_currency with
+            | _ -> nan
+          in
+          let quote_reserved =
+            match
+              Dio_exchange.Exchange_intf.Registry.get_capital_reservation
+                asset_with_fees.exchange
+            with
+            | Some (module Cr : Dio_exchange.Exchange_intf.Capital_reservation.S) ->
+              (try Cr.get_total () with
+               | _ -> 0.0)
+            | None -> 0.0
+          in
           Logging.warn_f
             ~section
-            "[%s/%s] Capital oracle INACTIVE: %s (D_surv %.1f%%, qty %.8g, gi %.4f%%); \
-             new orders suspended, fills still tracked"
+            "[%s/%s] Capital oracle INACTIVE: %s (D_surv %.1f%%, qty %.8g, gi %.4f%%; \
+             venue quote %.2f, reserved by overlays %.2f); new orders suspended, fills \
+             still tracked"
             asset_with_fees.exchange
             asset_with_fees.symbol
             (if d.reason = "" then "capital reallocated" else d.reason)
             (d.d_surv *. 100.0)
             d.buy_qty
             d.grid_interval
+            venue_quote
+            quote_reserved
         | None ->
           Logging.info_f
             ~section
@@ -1991,7 +2025,11 @@ let asset_domain_worker
       (match overlay_ctx, overlay_rt, overlay_controller with
        | Some ctx, Some ort, Some controller ->
          let now_ov = Unix.gettimeofday () in
-         let inventory = Overlay_inventory.aggregate controller in
+         let inventory =
+           match overlay_inventory_caches with
+           | Some caches -> Overlay_inventory.aggregate_cached controller ~caches
+           | None -> Overlay_inventory.aggregate controller
+         in
          ctx.cg_asset <- Some overlay_asset;
          ctx.cg_state <- overlay_state;
          ctx.cg_symbol <- asset_with_fees.symbol;
@@ -2016,9 +2054,10 @@ let asset_domain_worker
          ctx.cg_overlay_has_spot_leg <- inventory.has_spot_leg;
          ctx.cg_overlay_spot_symbol <- inventory.spot_symbol;
          ctx.cg_min_liq_reserve
-         <- Carry_reserve.compute
-              ~exchange:controller.oc_hedge_exchange
-              ~symbol:controller.oc_hedge_symbol;
+         <- Carry_reserve.compute_with
+              ~coin:overlay_coin
+              ~min_liq_mult:overlay_min_liq_mult
+              ~exchange:controller.oc_hedge_exchange;
          ctx.cg_carry <- Option.map (fun r -> !r) overlay_carry;
          ort.prof_enabled <- false;
          Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
@@ -2070,11 +2109,25 @@ let asset_domain_worker
            overlay_seen := true;
            overlay_last_valid := valid;
            overlay_last_target := target;
+           (* Exchange-wide senior claim across every overlay on this venue. When it
+              approaches usdc_free, the venue's grids are starved of buy quote even though
+              the venue reports cash free - the D_surv 0 / halt condition. *)
+           let quote_reserved =
+             match
+               Dio_exchange.Exchange_intf.Registry.get_capital_reservation
+                 asset_with_fees.exchange
+             with
+             | Some (module Cr : Dio_exchange.Exchange_intf.Capital_reservation.S) ->
+               (try Cr.get_total () with
+                | _ -> 0.0)
+             | None -> 0.0
+           in
            Logging.info_f
              ~section
              "overlay %s: context_valid=%b funding_valid=%b perp_valid=%b \
               funding_apr=%.4f premium=%.6f mark=%.4f bid=%.4f ask=%.4f usdc_free=%.2f \
-              margin_ratio=%.3f target=%.8f short=%.8f carry_margin=%.2f"
+              quote_reserved=%.2f margin_ratio=%.3f target=%.8f short=%.8f \
+              carry_margin=%.2f"
              asset_with_fees.symbol
              valid
              (pbool "funding_valid")
@@ -2085,6 +2138,7 @@ let asset_domain_worker
              (pfloat "bid")
              (pfloat "ask")
              (pfloat "usdc_free")
+             quote_reserved
              (pfloat "margin_ratio")
              (sfloat "target")
              (sfloat "short_qty")

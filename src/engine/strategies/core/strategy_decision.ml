@@ -1510,7 +1510,39 @@ let sell_place_body
             "Placed sell order for %s: %.8f @ %.4f"
             asset.symbol
             effective_sell_qty
-            sell_price)
+            sell_price;
+        (* Placement-basis telemetry (placement-only, so the per-cycle cost is unchanged).
+           Records the exact accounting the reserved-base guard just ran on plus the
+           venue's senior quote reservation. Without it a later reserved dip can only be
+           reconstructed from three independent feeds (balance store, open-order feed,
+           accumulation store); with it the basis at the decision is on the record. *)
+        let open_sell_base = Sell_orders.sum_qty state.open_sell_orders in
+        let quote_reserved =
+          match
+            Dio_exchange.Exchange_intf.Registry.get_capital_reservation asset.exchange
+          with
+          | Some (module Cr : Dio_exchange.Exchange_intf.Capital_reservation.S) ->
+            (try Cr.get_total () with
+             | _ -> 0.0)
+          | None -> 0.0
+        in
+        Logging.info_f
+          ~section
+          "Sell basis for %s: qty %.8f @ %.4f ledger %.8f position %.8f credit %.8f \
+           reserved %.8f available %.8f committed %.8f unnetted %.8f open_sell_base %.8f \
+           quote_reserved %.8f"
+          asset.symbol
+          effective_sell_qty
+          sell_price
+          asset_bal
+          state.position_base
+          unreflected_credit
+          state.reserved_base
+          available
+          committed_sell
+          unnetted_hold
+          open_sell_base
+          quote_reserved)
       else
         log_sell_block ~state ~now ~symbol:asset.symbol (fun () ->
           "order dispatch rejected (duplicate in-flight placement key)"))

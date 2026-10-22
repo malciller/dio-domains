@@ -442,6 +442,16 @@ let[@inline] set_platform_int t slot (i : int) =
     t.platform <- set_arr t.platform slot (V_int i)
 ;;
 
+(* Raw-payload string setter: compare before allocating the [V_string] block. The symbol
+   and base-coin facts are republished every overlay tick but almost never change. *)
+let[@inline] set_platform_string t slot (s : string) =
+  match platform_slot_get t slot with
+  | V_string s0 when String.equal s0 s -> ()
+  | _ ->
+    bump_gen t;
+    t.platform <- set_arr t.platform slot (V_string s)
+;;
+
 let set_signal_slot t slot v =
   if not (slot_unchanged t.signals slot v)
   then (

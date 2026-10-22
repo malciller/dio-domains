@@ -110,11 +110,12 @@ let to_float_opt = function
     exchange registry. Built-in venue names are case-insensitive in config.json. *)
 let normalize_exchange s = String.lowercase_ascii (String.trim s)
 
-(** Base asset of a spot pair: [BTC/USD] -> [BTC]. *)
+(** Base asset of a spot pair: [BTC/USD] -> [BTC]. Single [String.sub], no list. Called
+    from per-cycle overlay paths, so it must not build the [String.split_on_char] list. *)
 let base_coin_of_symbol symbol =
-  match String.split_on_char '/' symbol with
-  | b :: _ -> b
-  | [] -> symbol
+  match String.index_opt symbol '/' with
+  | Some i -> String.sub symbol 0 i
+  | None -> symbol
 ;;
 
 (** Parses a [latency_spike_report] from its config string. Unknown values warn and fall
@@ -1178,6 +1179,7 @@ let read_config () : config =
     raised [CamlinternalLazy.Undefined] and killed the domain. A mutex-guarded memo gives
     the same parse-once behaviour without the lazy. *)
 let gc_config_mutex = Mutex.create ()
+
 let cached_gc_config : gc_config option ref = ref None
 let gc_config_resolved = Atomic.make false
 
