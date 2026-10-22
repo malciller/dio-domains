@@ -100,11 +100,7 @@ let buy_cancel_excess
      for orders that really left the book. *)
   let cancelled = ref [] in
   iter_open_orders (fun order_id _ _ side_str userref_opt ->
-    let is_our_strategy =
-      match userref_opt with
-      | Some ref_val -> ref_val <> strategy_userref_mm
-      | None -> true
-    in
+    let is_our_strategy = is_grid_order userref_opt in
     if is_our_strategy && side_str = "buy"
     then (
       let is_mid_amend =
@@ -839,6 +835,17 @@ let evaluate_excess_sweep
               asset.exchange
           in
           let pushed = push_order ~now ~state order in
+          (* Register at dispatch, before the cancel event: the old id leaves the feed
+             before the replacement lists, and [sync_open_orders] would restore the
+             "missing" rung. The venue rejects that duplicate with "insufficient qty
+             available". *)
+          if pushed
+          then
+            state.recently_injected_sells
+            <- take
+                 20
+                 ((oid, top_open_price, Unix.gettimeofday ())
+                  :: state.recently_injected_sells);
           if pushed && ecfg.use_unnetted_sell_hold && delta > 0.0
           then arm_sell_hold ~state ~qty:delta ~now;
           (* A real qty increase is a meaningful execution event; a rounding-dust sweep

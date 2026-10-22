@@ -112,13 +112,15 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       if s.buy_price > 0.0
       then s.buy_price
       else (
-        match s.market.buy_orders with
+        match List.filter Snapshot.is_grid_order s.market.buy_orders with
         | [] -> 0.0
         | o :: rest ->
           List.fold_left (fun acc (o : Snapshot.order) -> min acc o.price) o.price rest)
     in
     let sell_orders =
-      if s.sell_orders <> [] then s.sell_orders else s.market.sell_orders
+      if s.sell_orders <> []
+      then s.sell_orders
+      else List.filter Snapshot.is_grid_order s.market.sell_orders
     in
     let sell_count = s.sell_count in
     let unrealized_profit, pending_sell_qty =
@@ -771,7 +773,9 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         let base_bal = s.market.base_balance in
         let staked_bal = s.market.staked_balance in
         let sell_orders =
-          if s.sell_orders <> [] then s.sell_orders else s.market.sell_orders
+          if s.sell_orders <> []
+          then s.sell_orders
+          else List.filter Snapshot.is_grid_order s.market.sell_orders
         in
         let strat_up, pending_sell_qty =
           List.fold_left

@@ -293,6 +293,7 @@ let json_of_market_data exchange symbol base_asset quote_currency =
                [ "id", `String o.order_id
                ; "price", `Float (Option.value o.limit_price ~default:0.0)
                ; "qty", `Float o.remaining_qty
+               ; "owner", `String (Dio_strategies.Strategy_common.order_owner o.user_ref)
                ])
            exch_buy_orders)
     in
@@ -304,6 +305,7 @@ let json_of_market_data exchange symbol base_asset quote_currency =
                [ "id", `String o.order_id
                ; "price", `Float (Option.value o.limit_price ~default:0.0)
                ; "qty", `Float o.remaining_qty
+               ; "owner", `String (Dio_strategies.Strategy_common.order_owner o.user_ref)
                ])
            exch_sell_orders)
     in
@@ -648,6 +650,8 @@ let json_of_perp ~exchange ~coin =
                  [ "id", `String o.order_id
                  ; "price", `Float price
                  ; "qty", `Float o.remaining_qty
+                 ; ( "owner"
+                   , `String (Dio_strategies.Strategy_common.order_owner o.user_ref) )
                  ])
            | _ -> None))
     in
@@ -967,6 +971,9 @@ let build_snapshot () =
                            [ "id", `String o.order_id
                            ; "price", `Float (Option.value o.limit_price ~default:0.0)
                            ; "qty", `Float o.remaining_qty
+                           ; ( "owner"
+                             , `String
+                                 (Dio_strategies.Strategy_common.order_owner o.user_ref) )
                            ])
                        sell_orders)
                 in

@@ -287,7 +287,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       | Snapshot.Strategy s ->
         if s.sell_orders <> []
         then to_triples s.sell_orders
-        else to_triples s.market.sell_orders
+        else to_triples (List.filter Snapshot.is_grid_order s.market.sell_orders)
       | Snapshot.Balance b -> to_triples b.sell_orders
     in
     let sell_orders = List.filter not_perp_order sell_orders in
@@ -314,7 +314,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     in
     let buy_orders_parsed =
       match a.kind with
-      | Snapshot.Strategy s -> to_triples s.market.buy_orders
+      | Snapshot.Strategy s ->
+        to_triples (List.filter Snapshot.is_grid_order s.market.buy_orders)
       | Snapshot.Balance _ -> []
     in
     let buy_orders, is_synthetic_buy =

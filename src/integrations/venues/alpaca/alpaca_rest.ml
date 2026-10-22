@@ -46,6 +46,17 @@ let retry_http_exceptions ~f =
     ()
 ;;
 
+(** Logs non-transport request exceptions. Connection and timeout failures are the retry
+    layer's WARN; logging them here as ERROR raised an alert per self-healed attempt. *)
+let request_exception_error ~op exn =
+  let exn_str = Printexc.to_string exn in
+  let err = Printf.sprintf "%s HTTP exception: %s" op exn_str in
+  (match Error_handling.classify exn_str with
+   | Error_handling.Connection | Error_handling.Timeout -> ()
+   | _ -> Logging.error_f ~section "%s" err);
+  err
+;;
+
 let make_headers () =
   let key = Config.api_key () in
   let secret = Config.api_secret () in
@@ -301,7 +312,9 @@ let place_order
             Logging.error_f ~section "%s (body: %s)" err body_str;
             Lwt.return (Error err))
         else (
-          Logging.error_f ~section "Place order failed HTTP %d: %s" status_code body_str;
+          (* The caller logs the rejection at ERROR; logging it here too doubled the
+             alert. *)
+          Logging.debug_f ~section "Place order failed HTTP %d: %s" status_code body_str;
           Lwt.return (Error (Printf.sprintf "HTTP %d: %s" status_code body_str))))
       (fun exn ->
         (* Return the failure as [Error] so [retry_http_exceptions] can classify and retry
@@ -510,10 +523,7 @@ let get_open_orders_once () =
   Lwt.catch
     (fun () -> fetch_all [] None)
     (fun exn ->
-      let err =
-        Printf.sprintf "Get open orders HTTP exception: %s" (Printexc.to_string exn)
-      in
-      Logging.error_f ~section "%s" err;
+      let err = request_exception_error ~op:"Get open orders" exn in
       Lwt.return (Error err))
 ;;
 
@@ -565,10 +575,7 @@ let get_account_once () =
         Lwt.return
           (Error (Printf.sprintf "HTTP %d getting account: %s" status_code body_str))))
     (fun exn ->
-      let err =
-        Printf.sprintf "Get account HTTP exception: %s" (Printexc.to_string exn)
-      in
-      Logging.error_f ~section "%s" err;
+      let err = request_exception_error ~op:"Get account" exn in
       Lwt.return (Error err))
 ;;
 
@@ -637,10 +644,7 @@ let get_positions_once () =
         Lwt.return
           (Error (Printf.sprintf "HTTP %d getting positions: %s" status_code body_str))))
     (fun exn ->
-      let err =
-        Printf.sprintf "Get positions HTTP exception: %s" (Printexc.to_string exn)
-      in
-      Logging.error_f ~section "%s" err;
+      let err = request_exception_error ~op:"Get positions" exn in
       Lwt.return (Error err))
 ;;
 

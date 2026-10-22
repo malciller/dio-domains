@@ -46,6 +46,18 @@ let test_retriable_classification () =
     "connection retriable"
     true
     "Get open orders HTTP exception: Unix.Unix_error(ECONNRESET, \"read\", \"\")";
+  check
+    "connect refused retriable"
+    true
+    "Get account HTTP exception: Unix.Unix_error(Unix.ECONNREFUSED, \"connect\", \"\")";
+  check
+    "os connect timeout retriable"
+    true
+    "Get account HTTP exception: Unix.Unix_error(Unix.ETIMEDOUT, \"connect\", \"\")";
+  check
+    "host unreachable retriable"
+    true
+    "Get account HTTP exception: Unix.Unix_error(Unix.EHOSTUNREACH, \"connect\", \"\")";
   check "422 terminal" false "HTTP 422 getting positions: sub-penny";
   check "parse terminal" false "Failed to parse positions response: bad json"
 ;;

@@ -73,12 +73,38 @@ let persisted_rebuild_needed ~(feed : Sell_orders.t) persisted =
   (not (ordered false 0.0 persisted)) || any_qty_changed persisted || any_adopted 0
 ;;
 
+(** Seconds a placed or amended sell keeps its rung covered. On a cancel+replace venue the
+    old order leaves the feed before the replacement is listed; restoring the "missing"
+    rung races the replacement and the venue rejects it with HTTP 403
+    ["insufficient qty available"]. *)
+let sell_injected_cover_s = 10.0
+
+(** True when an order at [price] was injected (placed or amended) within the
+    cancel+replace recognition window. *)
+let rung_covered_by_recent_injection ~state ~now price =
+  List.exists
+    (fun (_id, injected_price, ts) ->
+      now -. ts < sell_injected_cover_s
+      && price_within_tolerance ~reference:price injected_price)
+    state.recently_injected_sells
+;;
+
 (** Reconciles the persisted-sell grid (Alpaca offline fill recovery). Computed once per
-    execution and reused by the three persisted-sell branches. *)
+    execution and reused by the three persisted-sell branches. A rung mid-amend counts as
+    open: its absence is the amend's cancel, not a dropped level. *)
 let reconcile_persisted_sell_levels ~state =
-  partition_persisted_sell_levels
-    state.persisted_sell_levels
-    (Sell_orders.to_list state.open_sell_orders)
+  let now = Unix.gettimeofday () in
+  let open_levels, missing_levels =
+    partition_persisted_sell_levels
+      state.persisted_sell_levels
+      (Sell_orders.to_list state.open_sell_orders)
+  in
+  let covered, missing_levels =
+    List.partition
+      (fun (p, _) -> rung_covered_by_recent_injection ~state ~now p)
+      missing_levels
+  in
+  open_levels @ covered, missing_levels
 ;;
 
 (* Pure overlay constants and the freshness cutoff moved to Platform_accounting (milestone
@@ -439,9 +465,7 @@ let evaluate_asset_low_recovery
       then
         (* [asset_bal] is the gross ledger on non-Alpaca venues; the feed-collapsed
            commitment would make resting sells look free. *)
-        Float.max
-          (committed_sell_base state)
-          (Sell_orders.sum_qty state.open_sell_orders)
+        Float.max (committed_sell_base state) (Sell_orders.sum_qty state.open_sell_orders)
       else 0.0
     in
     let available_asset =
@@ -699,10 +723,7 @@ let apply_open_order_delta ~state ~now_time ~ecfg ~changes =
        | None -> ());
       let is_our =
         match snap with
-        | Some (_, _, _, userref) ->
-          (match userref with
-           | Some r -> r <> strategy_userref_mm
-           | None -> true)
+        | Some (_, _, _, userref) -> is_grid_order userref
         | None -> true
       in
       let keep =
@@ -929,11 +950,7 @@ let sync_open_orders
     let t_scan_start = Monotonic_clock.now_ns () in
     iter_open_orders (fun oid price qty side_str userref_opt ->
       state.sync_orders_seen <- state.sync_orders_seen + 1;
-      let is_our_strategy =
-        match userref_opt with
-        | Some ref_val -> ref_val <> strategy_userref_mm
-        | None -> true
-      in
+      let is_our_strategy = is_grid_order userref_opt in
       if qty > 0.0
          && is_our_strategy
          && (evicted_empty || not (Hashtbl.mem state.evicted_orders oid))
@@ -1196,7 +1213,9 @@ let sync_open_orders
           then true
           else go (j + 1)
         in
-        go 0
+        (* An amending rung is transiently absent from the feed. Treat it as open so the
+           restore path does not race the replacement (venue 403). *)
+        go 0 || rung_covered_by_recent_injection ~state ~now:now_time p
       in
       let missing_acc = ref [] in
       List.iter

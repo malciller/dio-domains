@@ -1620,7 +1620,7 @@ let asset_domain_worker
                        | Types.Buy -> Dio_strategies.Strategy_common.Buy
                        | Types.Sell -> Dio_strategies.Strategy_common.Sell
                      in
-                     if is_grid_strategy
+                     if is_grid_strategy && not overlay_event
                      then
                        Dio_strategies.Strategy_api.Strategy.record_exec_event
                          asset_with_fees.symbol
@@ -1633,7 +1633,7 @@ let asset_domain_worker
                             | Dio_strategies.Strategy_common.Sell -> "sell")
                          ~price
                          ();
-                     if is_grid_strategy
+                     if is_grid_strategy && not overlay_event
                      then
                        route_exec
                          ~kind:"acknowledged"
@@ -1704,13 +1704,14 @@ let asset_domain_worker
           let now_inject = Unix.gettimeofday () in
           Ex.iter_open_orders_fast
             ~symbol:asset_with_fees.symbol
-            (fun oid price _qty side_str _userref_opt ->
+            (fun oid price _qty side_str userref_opt ->
                let order_side =
                  if side_str = "buy"
                  then Dio_strategies.Strategy_common.Buy
                  else Dio_strategies.Strategy_common.Sell
                in
                if is_grid_strategy
+                  && Dio_strategies.Strategy_common.is_grid_order userref_opt
                then
                  route_exec
                    ~kind:"acknowledged"
@@ -1790,8 +1791,11 @@ let asset_domain_worker
           let has_open_buy = ref false in
           Ex.iter_open_orders_fast
             ~symbol:asset_with_fees.symbol
-            (fun _oid _price qty side_str _userref ->
-               if qty > 0.0 && side_str = "buy" then has_open_buy := true);
+            (fun _oid _price qty side_str userref ->
+               if qty > 0.0
+                  && side_str = "buy"
+                  && Dio_strategies.Strategy_common.is_grid_order userref
+               then has_open_buy := true);
           not !has_open_buy
         | _ -> false
       in
@@ -1960,8 +1964,10 @@ let asset_domain_worker
              (* Allocation-free: primitives only, no [Types.open_order] record. *)
              Ex.iter_open_orders_fast
                ~symbol:asset_with_fees.symbol
-               (fun oid _price qty side_str _userref ->
-                  if qty > 0.0 && side_str = "buy"
+               (fun oid _price qty side_str userref ->
+                  if qty > 0.0
+                     && side_str = "buy"
+                     && Dio_strategies.Strategy_common.is_grid_order userref
                   then (
                     any_buy := true;
                     if not
@@ -1988,9 +1994,10 @@ let asset_domain_worker
                let n = ref 0 in
                Ex.iter_open_orders_fast
                  ~symbol:asset_with_fees.symbol
-                 (fun oid _price qty side_str _userref ->
+                 (fun oid _price qty side_str userref ->
                     if qty > 0.0
                        && side_str = "buy"
+                       && Dio_strategies.Strategy_common.is_grid_order userref
                        && not
                             (Dio_strategies.Strategy_common.InFlightAmendments
                              .is_in_flight

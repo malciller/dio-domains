@@ -214,6 +214,36 @@ let test_carry_order_terminal () =
   check "Unknown keeps the mapping" false (Unknown "resting")
 ;;
 
+let test_grid_order_ownership () =
+  let module C = Dio_strategies.Strategy_common in
+  Alcotest.(check bool) "grid tag" true (C.is_grid_order (Some C.strategy_userref_grid));
+  Alcotest.(check bool)
+    "carry tag is not a grid order"
+    false
+    (C.is_grid_order (Some C.strategy_userref_carry));
+  Alcotest.(check bool)
+    "mm tag is not a grid order"
+    false
+    (C.is_grid_order (Some C.strategy_userref_mm));
+  Alcotest.(check bool) "untagged order counts as grid" true (C.is_grid_order None);
+  Alcotest.(check bool)
+    "userref 0 counts as untagged grid"
+    true
+    (C.is_grid_order (Some 0));
+  Alcotest.(check string)
+    "owner: grid"
+    "grid"
+    (C.order_owner (Some C.strategy_userref_grid));
+  Alcotest.(check string)
+    "owner: carry"
+    "carry"
+    (C.order_owner (Some C.strategy_userref_carry));
+  Alcotest.(check string) "owner: mm" "mm" (C.order_owner (Some C.strategy_userref_mm));
+  Alcotest.(check string) "owner: untagged" "grid" (C.order_owner None);
+  Alcotest.(check string) "owner: userref 0" "grid" (C.order_owner (Some 0));
+  Alcotest.(check string) "owner: unknown tag" "other" (C.order_owner (Some 99))
+;;
+
 let test_tracked_carry_order_has_no_age_bound () =
   let module C = Dio_strategies.Strategy_common in
   let key = "test:tracked|hyperliquid|TEST" in
@@ -294,6 +324,10 @@ let () =
             "tracked carry order guard has no age bound"
             `Quick
             test_tracked_carry_order_has_no_age_bound
+        ; Alcotest.test_case
+            "only grid-tagged orders are grid-owned"
+            `Quick
+            test_grid_order_ownership
         ] )
     ; ( "fees"
       , [ Alcotest.test_case

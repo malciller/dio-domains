@@ -10,6 +10,9 @@ type order =
   { id : string
   ; price : float
   ; qty : float
+  ; owner : string
+  (** Which strategy placed the order: ["grid"], ["carry"], ["mm"], or ["other"]. Missing
+      owner defaults to ["grid"] (pre-ownership frames and the grid's own sell ledger). *)
   }
 
 type level =
@@ -205,11 +208,21 @@ let parse_order j =
   let price = j |?> "price" |> to_float_d 0.0 in
   let qty = j |?> "qty" |> to_float_d 0.0 in
   if price > 0.0 && qty > 0.0
-  then Some { id = j |?> "id" |> to_string_d "?"; price; qty }
+  then
+    Some
+      { id = j |?> "id" |> to_string_d "?"
+      ; price
+      ; qty
+      ; owner = j |?> "owner" |> to_string_d "grid"
+      }
   else None
 ;;
 
 let parse_orders j = j |> to_list_d |> List.filter_map parse_order
+
+(** True for grid-owned orders. Carry orders share the pair book and must not drive the
+    row's BUY @ cell or mask its capital/oracle pause. *)
+let is_grid_order (o : order) = String.equal o.owner "grid"
 
 let parse_level j =
   let price = j |?> "price" |> to_float_d 0.0 in
@@ -431,7 +444,9 @@ let oracle_inactive (s : strategy) =
     resting buy overrides the capital/oracle gates (already placed and funded), leaving
     only [market_is_closed] to pause it. *)
 let strategy_paused (s : strategy) =
-  let has_resting_buy = s.buy_price > 0.0 || s.market.buy_orders <> [] in
+  let has_resting_buy =
+    s.buy_price > 0.0 || List.exists is_grid_order s.market.buy_orders
+  in
   if has_resting_buy
   then s.market_is_closed
   else oracle_inactive s || s.capital_low || s.market_is_closed
