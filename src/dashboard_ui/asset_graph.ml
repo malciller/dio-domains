@@ -1311,6 +1311,21 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
           , Printf.sprintf "uPnL %s" (format_pnl p.unrealized_pnl) )
         ]
     in
+    (* Percentage distance from the live reference price to the order's execution price:
+       the move still required for the target to fill. Spot targets measure from the spot
+       mid; perp targets from the perp mark, falling back to the spot mid when the venue
+       has not published a mark. *)
+    let distance_suffix reference price =
+      if reference > 0.0 && price > 0.0
+      then
+        Printf.sprintf " [%s]" (format_pct ((price -. reference) /. reference *. 100.0))
+      else ""
+    in
+    let perp_reference =
+      match current_perp_mark with
+      | Some mark -> mark
+      | None -> mid
+    in
     (* One flag per visible order row, not one aggregate flag for the whole side. Each
        flag carries the row's price and total quantity; same-row orders are merged. *)
     let order_flag_specs color prefix by_row =
@@ -1325,7 +1340,15 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
               List.fold_left (fun acc (_, p, _) -> acc +. p) 0.0 orders /. float count
             in
             let count_str = if count > 1 then string_of_int count else "" in
-            let text = Printf.sprintf "◆%s%s %.6g %.4g" prefix count_str avg_p total_q in
+            let text =
+              Printf.sprintf
+                "◆%s%s %.6g %.4g%s"
+                prefix
+                count_str
+                avg_p
+                total_q
+                (distance_suffix mid avg_p)
+            in
             (row, [ color, text ]) :: acc))
         by_row
         []
@@ -1364,7 +1387,15 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
             let count_str =
               if count > 1 && total_q >= raw_q -. 1e-9 then string_of_int count else ""
             in
-            let text = Printf.sprintf "◆P %s%s %.6g %.4g" role count_str avg_p total_q in
+            let text =
+              Printf.sprintf
+                "◆P %s%s %.6g %.4g%s"
+                role
+                count_str
+                avg_p
+                total_q
+                (distance_suffix perp_reference avg_p)
+            in
             (row, [ a_yellow, text ]) :: acc))
         by_row
         []
