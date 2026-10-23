@@ -51,6 +51,20 @@ module Types = struct
     | Buy
     | Sell
 
+  (** Instrument class. Venues classify this at ingest, where the venue coin is known, so
+      downstream code never has to infer spot vs perp from a symbol or an order-id
+      registry. A perp order can be stored under a spot pair (Hyperliquid keys some perp
+      orders by the registered pair), and a spot order can be bare-coin aliased; the
+      symbol alone is not authoritative. *)
+  type market =
+    | Spot
+    | Perp
+
+  let string_of_market = function
+    | Spot -> "spot"
+    | Perp -> "perp"
+  ;;
+
   (** Time-in-force policy governing order lifetime.
       - [GTC]: Good-til-canceled.
       - [IOC]: Immediate-or-cancel; unfilled portion is canceled.
@@ -84,6 +98,9 @@ module Types = struct
   type open_order =
     { order_id : string (** Exchange-assigned order identifier. *)
     ; symbol : string (** Trading pair symbol. *)
+    ; market : market
+    (** Instrument class of this order. Authoritative for spot/perp separation even when
+        [symbol] is a pair for a perp order (Hyperliquid) or a bare coin for a spot alias. *)
     ; side : order_side (** Buy or sell. *)
     ; qty : float (** Original order quantity. *)
     ; cum_qty : float (** Cumulative filled quantity. *)
@@ -118,6 +135,10 @@ module Types = struct
   (** Execution report describing a state change on an order. *)
   type execution_event =
     { order_id : string (** Exchange-assigned order identifier. *)
+    ; market : market
+    (** Instrument class of the order this execution belongs to, classified by the venue
+        adapter where the venue coin is known. Never infer it from [order_id] or a symbol:
+        both spot and perp orders can share a store key. *)
     ; order_status : order_status (** Updated order status. *)
     ; limit_price : float option (** Limit price, if applicable. *)
     ; side : order_side (** Buy or sell. *)

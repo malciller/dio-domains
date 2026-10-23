@@ -212,6 +212,7 @@ let test_partial_fill_delta_is_incremental () =
   (* filled_qty is cumulative: only the delta since the previous event may move the pool. *)
   let event ~order_id ~status ~filled =
     { Dio_exchange.Exchange_intf.Types.order_id
+    ; market = Dio_exchange.Exchange_intf.Types.Spot
     ; order_status = status
     ; limit_price = Some 100.0
     ; side = Dio_exchange.Exchange_intf.Types.Buy

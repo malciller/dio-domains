@@ -17,6 +17,7 @@ type exchange_config = Strategy_state.exchange_config =
   ; sell_uses_mult : bool
   ; sell_failure_sets_asset_low : bool
   ; use_reserved_base_guard : bool
+  ; enforce_venue_min_qty : bool
   ; use_unnetted_sell_hold : bool
   ; balance_nets_open_order_holds : bool
   ; hold_netted_from_venue_state : bool

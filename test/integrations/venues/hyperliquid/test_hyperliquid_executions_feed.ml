@@ -198,6 +198,49 @@ let test_perp_orders_classified () =
     "injected perp order present"
     true
     (List.mem "perp_live" (ids_of perp_before));
+  (match
+     List.find_opt
+       (fun (o : Hyperliquid.Executions_feed.open_order) -> o.order_id = "perp_live")
+       (Hyperliquid.Executions_feed.get_open_orders "PERPT/USDC")
+   with
+   | Some o ->
+     Alcotest.(check bool)
+       "perp order labelled perp"
+       true
+       (o.market = Dio_exchange.Exchange_intf.Types.Perp)
+   | None -> Alcotest.fail "expected the injected perp order");
+  (match
+     List.find_opt
+       (fun (o : Hyperliquid.Executions_feed.open_order) -> o.order_id = "spot_live")
+       (Hyperliquid.Executions_feed.get_open_orders "PERPT/USDC")
+   with
+   | Some o ->
+     Alcotest.(check bool)
+       "spot order labelled spot"
+       true
+       (o.market = Dio_exchange.Exchange_intf.Types.Spot)
+   | None -> Alcotest.fail "expected the injected spot order");
+  (* The execution events carry the same label, so a domain can route by market even when
+     the id -> carry registry is empty. *)
+  let events = Hyperliquid.Executions_feed.read_execution_events "PERPT/USDC" 0 in
+  let market_of id =
+    List.find_map
+      (fun (e : Hyperliquid.Executions_feed.execution_event) ->
+        if String.equal e.order_id id then Some e.market else None)
+      events
+  in
+  Alcotest.(check (option bool))
+    "perp execution event labelled perp"
+    (Some true)
+    (Option.map
+       (fun m -> m = Dio_exchange.Exchange_intf.Types.Perp)
+       (market_of "perp_live"));
+  Alcotest.(check (option bool))
+    "spot execution event labelled spot"
+    (Some true)
+    (Option.map
+       (fun m -> m = Dio_exchange.Exchange_intf.Types.Spot)
+       (market_of "spot_live"));
   Alcotest.(check bool)
     "spot order excluded"
     false
@@ -355,7 +398,8 @@ let test_fill_intent_close_short () =
                       ; "closedPnl", `String "0.42"
                       ; "fee", `String "0.01"
                       ; "tid", `Int tid
-                      ] ] )
+                      ]
+                  ] )
             ] )
       ]
   in

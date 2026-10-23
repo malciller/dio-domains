@@ -105,6 +105,7 @@ let snapshot rt (st : Store.t) ~now =
     ; spot_seq_seen = geti rt "spot_seq_seen" st.spot_seq_seen
     ; last_recycle_base = getf rt "last_recycle_base" st.last_recycle_base
     ; last_leverage = getp rt "perp_leverage" st.last_leverage
+    ; full_balance_ref = st.full_balance_ref
     }
   in
   if next = st then st else { next with updated_at = now }
@@ -161,16 +162,27 @@ let record_fill
     Store.save_async ~exchange ~base_coin:(base_coin_of_symbol symbol) next)
 ;;
 
-(** Initialize the ladder state for an already-open position when the durable state is
-    empty. The engine calls this after seeding; the strategy has a conservative fallback
-    for the no-state case. The grandfathered ratio is the current short / accumulated
-    base; the index is the completed band, or the max when the position is at/above the
-    cap. *)
+(** Reset the ladder to the configured start. Used when the basis mode changes so the old
+    ratio is never applied to the new basis before the position snapshot arrives. *)
+let reset_ladder ~start_ratio rt =
+  setf rt "anchor" 0.0;
+  setf rt "ladder_ratio" start_ratio;
+  seti rt "add_index" 0;
+  setf rt "next_add" 0.0;
+  setb rt "add_armed" false
+;;
+
+(** Initialize the ladder for an already-open position when the durable state is empty or
+    the basis mode changed. The ratio is the current short / the new basis, clamped to
+    [max_ratio]; the index is the completed band, or the max at/above the cap. The
+    [next_add] seed is ROE-based like the live ladder. *)
 let init_ladder
   ~start_ratio
+  ~max_ratio
   ~add_amount
   ~num_adds
   ~add_threshold
+  ~leverage
   ~entry
   ~accumulated
   ~short_qty
@@ -178,9 +190,12 @@ let init_ladder
   =
   if short_qty > 0.0001 && accumulated > 0.0 && entry > 0.0
   then (
-    let ratio = short_qty /. accumulated in
+    let raw_ratio = short_qty /. accumulated in
+    let ratio = Float.min max_ratio (Float.max start_ratio raw_ratio) in
     let index =
-      if ratio >= start_ratio +. (float_of_int num_adds *. add_amount) -. 1e-9
+      if add_amount <= 0.0
+      then num_adds
+      else if ratio >= start_ratio +. (float_of_int num_adds *. add_amount) -. 1e-9
       then num_adds
       else
         max
@@ -190,12 +205,13 @@ let init_ladder
              (int_of_float (Float.floor ((ratio -. start_ratio) /. add_amount))))
     in
     let next_add =
-      if index < num_adds
-      then entry *. (1.0 +. (float_of_int (index + 1) *. add_threshold))
+      if index < num_adds && leverage > 0.0
+      then entry *. (1.0 +. (float_of_int (index + 1) *. add_threshold /. leverage))
       else 0.0
     in
     setf rt "anchor" entry;
-    setf rt "ladder_ratio" (Float.max start_ratio ratio);
+    setf rt "ladder_ratio" ratio;
     seti rt "add_index" index;
-    setf rt "next_add" next_add)
+    setf rt "next_add" next_add;
+    setb rt "add_armed" false)
 ;;

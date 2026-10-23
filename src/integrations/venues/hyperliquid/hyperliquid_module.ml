@@ -483,6 +483,7 @@ module Hyperliquid_impl = struct
       Some
         { Types.order_id = o.order_id
         ; symbol = o.symbol
+        ; market = o.market
         ; side = side_of_hyperliquid_side o.side
         ; qty = o.order_qty
         ; cum_qty = o.cum_qty
@@ -517,6 +518,7 @@ module Hyperliquid_impl = struct
       (fun (o : Hyperliquid_executions_feed.open_order) ->
         { Types.order_id = o.order_id
         ; symbol = o.symbol
+        ; market = o.market
         ; side = side_of_hyperliquid_side o.side
         ; qty = o.order_qty
         ; cum_qty = o.cum_qty
@@ -545,6 +547,7 @@ module Hyperliquid_impl = struct
           acc
           { Types.order_id = o.order_id
           ; symbol = o.symbol
+          ; market = o.market
           ; side = side_of_hyperliquid_side o.side
           ; qty = o.order_qty
           ; cum_qty = o.cum_qty
@@ -607,6 +610,7 @@ module Hyperliquid_impl = struct
         | _ ->
           Some
             { Types.order_id = e.order_id
+            ; market = e.market
             ; order_status = status_of_hyperliquid_status e.order_status
             ; limit_price = e.limit_price
             ; side = side_of_hyperliquid_side e.side
@@ -632,6 +636,7 @@ module Hyperliquid_impl = struct
          | _ ->
            f
              { Types.order_id = e.order_id
+             ; market = e.market
              ; order_status = status_of_hyperliquid_status e.order_status
              ; limit_price = e.limit_price
              ; side = side_of_hyperliquid_side e.side
@@ -835,8 +840,7 @@ let initialize_instruments_ws () =
       >>= fun resp_spot ->
       let payload_spot = extract_ws_payload resp_spot in
       Hyperliquid_instruments_feed.process_meta_response payload_perp payload_spot
-      >>= fun () ->
-      ensure_instruments_loaded ())
+      >>= fun () -> ensure_instruments_loaded ())
     (fun exn ->
       Logging.error_f
         ~section

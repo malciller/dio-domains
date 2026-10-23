@@ -231,6 +231,7 @@ module Lighter_impl = struct
       Some
         { Types.order_id = o.order_id
         ; symbol = o.symbol
+        ; market = Types.Perp
         ; side = side_of_lighter_side o.side
         ; qty = o.order_qty
         ; cum_qty = o.cum_qty
@@ -249,6 +250,7 @@ module Lighter_impl = struct
       (fun (o : Lighter_executions_feed.open_order) ->
         { Types.order_id = o.order_id
         ; symbol = o.symbol
+        ; market = Types.Perp
         ; side = side_of_lighter_side o.side
         ; qty = o.order_qty
         ; cum_qty = o.cum_qty
@@ -277,6 +279,7 @@ module Lighter_impl = struct
           acc
           { Types.order_id = o.order_id
           ; symbol = o.symbol
+          ; market = Types.Perp
           ; side = side_of_lighter_side o.side
           ; qty = o.order_qty
           ; cum_qty = o.cum_qty
@@ -333,6 +336,7 @@ module Lighter_impl = struct
     List.map
       (fun (e : Lighter_executions_feed.execution_event) ->
         { Types.order_id = e.order_id
+        ; market = Types.Perp
         ; order_status = status_of_lighter_status e.order_status
         ; limit_price = e.limit_price
         ; side = side_of_lighter_side e.side
@@ -354,6 +358,7 @@ module Lighter_impl = struct
       (fun (e : Lighter_executions_feed.execution_event) ->
          f
            { Types.order_id = e.order_id
+           ; market = Types.Perp
            ; order_status = status_of_lighter_status e.order_status
            ; limit_price = e.limit_price
            ; side = side_of_lighter_side e.side

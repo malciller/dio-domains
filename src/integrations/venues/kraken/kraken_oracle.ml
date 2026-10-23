@@ -351,7 +351,12 @@ let live_balances () : (string * float * float) list option =
 ;;
 
 let default_quote = "USD"
-let min_notional ~symbol:_ = 0.0
+
+(** The venue's own per-pair minimum order cost. Returning 0.0 before the instrument
+    metadata loads preserves the old unconstrained behaviour; once loaded, the grid and
+    the overlay both reject sub-minimum orders locally instead of letting the venue reject
+    them (e.g. a clamped 0.0004 XMR residual). *)
+let min_notional ~symbol = Kraken_instruments_feed.get_cost_min symbol
 
 (* ---- Instrument metadata ---- *)
 

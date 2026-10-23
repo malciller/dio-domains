@@ -4814,6 +4814,76 @@ let test_kraken_partial_sell_clamp () =
   | None -> failwith "expected the clamped sell to be pushed"
 ;;
 
+let test_kraken_dust_clamp_blocked_by_notional () =
+  (* REGRESSION: after a 0.0198 XMR sell is placed, Kraken nets its hold and the next tick
+     sees only a 0.0004 residual above reserved_base. The clamp branch used to offer that
+     residual, which the venue rejected with "volume minimum not met". The venue's
+     cost_min is the floor; a clamped residual worth less than it must not be dispatched,
+     and the latch must clear so the leg stops retrying. *)
+  let symbol = "KRAKEN_DUST/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.grid_qty <- 0.02;
+  state.cached_sell_mult <- 0.99;
+  state.cached_qty_increment <- 0.0001;
+  state.cached_venue_min_qty <- 0.001;
+  state.cached_venue_min_notional <- 1.0;
+  state.reserved_base <- 0.0176;
+  state.position_base <- 0.018;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 99.0;
+  state.attributed_balance_increase <- 0.0;
+  state.buy_credits_since_balance <- [];
+  Sell_orders.clear state.open_sell_orders;
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 590.0;
+  state.last_buy_fill_qty <- Some 0.02;
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "kraken"
+    ; symbol
+    ; qty = "0.02"
+    ; grid_interval = 2.0
+    ; sell_mult = "0.99"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0016
+    ; taker_fee = None
+    ; accumulation_buffer = 0.1
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
+    }
+  in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Strategy_api.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:590.0
+    ~ask_price:590.1
+    ~asset_balance:0.018
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:0.0
+    ~base_balance_age:(Some 0.1)
+    ~oracle_halted:false;
+  check
+    bool
+    "sub-cost_min clamped residual is not dispatched"
+    true
+    (Dio_strategies.Strategy_api.get_pending_orders 100 = []);
+  check bool "latch cleared after the dust sell was refused" false state.just_filled_buy
+;;
+
 let test_alpaca_dollar_floor_gate () =
   (* Alpaca's venue floor is a dollar notional: a sell is attempted only when the
      non-accrued inventory is worth at least $1. Below the floor the leg withholds the
@@ -8161,6 +8231,10 @@ let () =
             "kraken partial inventory sells the clamp"
             `Quick
             test_kraken_partial_sell_clamp
+        ; test_case
+            "kraken dust clamp blocked by venue cost minimum"
+            `Quick
+            test_kraken_dust_clamp_blocked_by_notional
         ; test_case
             "alpaca dollar notional floor gate"
             `Quick

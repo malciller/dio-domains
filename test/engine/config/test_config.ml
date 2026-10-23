@@ -52,7 +52,7 @@ let test_parse_overlays () =
           "params":{"start_ratio_pct":30,"add_threshold_pct":8,"max_ratio_pct":80,
                     "recycle_profit_pct":3,"recycle_base_share_pct":60,
                     "min_entry_margin_ratio":2.5,"min_liq_mult":3.0,
-                    "leverage":10}}},
+                    "leverage":10,"full_balance_ref":true}}},
         {"symbol":"HYPE/USDC","exchange":"hyperliquid"}]}|}
   in
   Dio_engine.Config.parse_overlays json;
@@ -76,7 +76,8 @@ let test_parse_overlays () =
     "entry margin ratio"
     2.5
     p.Dio_engine.Config.min_entry_margin_ratio;
-  Alcotest.(check (float 1e-9)) "leverage" 10.0 p.Dio_engine.Config.leverage
+  Alcotest.(check (float 1e-9)) "leverage" 10.0 p.Dio_engine.Config.leverage;
+  Alcotest.(check bool) "full balance ref" true p.Dio_engine.Config.full_balance_ref
 ;;
 
 let test_parse_overlay_params_defaults () =
@@ -97,7 +98,11 @@ let test_parse_overlay_params_defaults () =
     "entry margin default"
     2.0
     p.Dio_engine.Config.min_entry_margin_ratio;
-  Alcotest.(check (float 1e-9)) "leverage default" 0.0 p.Dio_engine.Config.leverage
+  Alcotest.(check (float 1e-9)) "leverage default" 0.0 p.Dio_engine.Config.leverage;
+  Alcotest.(check bool)
+    "full balance ref default"
+    false
+    p.Dio_engine.Config.full_balance_ref
 ;;
 
 let test_parse_overlay_accepts_repeated_owner () =
@@ -614,19 +619,23 @@ let test_inventory_formula () =
   Alcotest.(check (float 1e-9))
     "no sells: free + staked"
     10.0
-    (q ~free:8.0 ~total:10.0 ~open_sell_base:0.0);
+    (q ~full_balance_ref:false ~free:8.0 ~total:10.0 ~open_sell_base:0.0);
   Alcotest.(check (float 1e-9))
     "staked backing a pending sell is excluded"
     8.0
-    (q ~free:8.0 ~total:10.0 ~open_sell_base:2.0);
+    (q ~full_balance_ref:false ~free:8.0 ~total:10.0 ~open_sell_base:2.0);
   Alcotest.(check (float 1e-9))
     "sell larger than staked excludes all staked"
     8.0
-    (q ~free:8.0 ~total:10.0 ~open_sell_base:9.0);
+    (q ~full_balance_ref:false ~free:8.0 ~total:10.0 ~open_sell_base:9.0);
   Alcotest.(check (float 1e-9))
     "all inventory earn-backed"
     0.0
-    (q ~free:0.0 ~total:5.0 ~open_sell_base:5.0)
+    (q ~full_balance_ref:false ~free:0.0 ~total:5.0 ~open_sell_base:5.0);
+  Alcotest.(check (float 1e-9))
+    "full balance ref uses total holdings"
+    10.0
+    (q ~full_balance_ref:true ~free:8.0 ~total:10.0 ~open_sell_base:2.0)
 ;;
 
 let test_inventory_only_hedge_venue_leg () =

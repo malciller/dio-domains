@@ -801,21 +801,9 @@ let overlay_dry_run =
 
 let dry_run () = overlay_dry_run
 
-(** In-flight dedupe key for an overlay placement.
-
-    The logical kind (["carry:entry"], ["carry:recycle:close|ro"], ...) stays the value
-    the carry registry uses to match a resting order. The in-flight registry needs a key
-    that is unique per venue and instrument: a bare ["carry:entry"] is shared by every
-    symbol, so a placement that is still in flight - or whose key was never released -
-    suppresses the placement for every other symbol on every venue. *)
-let overlay_inflight_key ~dedup_key ~side ~qty ~price ~exchange ~instrument ~reduce_only =
-  let base =
-    if String.equal dedup_key ""
-    then Strategy_common.generate_duplicate_key instrument side qty price
-    else dedup_key
-  in
-  base ^ "|" ^ exchange ^ "|" ^ instrument ^ if reduce_only then "|ro" else ""
-;;
+(** In-flight dedupe key shared with restart adoption (see
+    {!Strategy_common.overlay_inflight_key}). *)
+let overlay_inflight_key = Strategy_common.overlay_inflight_key
 
 (** Generic order placement for overlays. The engine knows nothing about carry policy: the
     strategy file chooses the market, side, size, price, TIF, and reduce-only flag. *)
@@ -834,11 +822,12 @@ let order_place
   match c.cg_asset with
   | None -> ()
   | Some asset ->
+    let is_perp = String.equal market "perp" in
+    let market_class = if is_perp then Strategy_common.Perp else Strategy_common.Spot in
     let instrument =
       match symbol with
-      | Some s -> if String.equal market "perp" then perp_coin s else s
-      | None ->
-        if String.equal market "perp" then perp_coin asset.symbol else asset.symbol
+      | Some s -> if is_perp then perp_coin s else s
+      | None -> if is_perp then perp_coin asset.symbol else asset.symbol
     in
     let min_notional = Strategy_venue.get_min_notional_val instrument asset.exchange in
     (* The venue rounds size DOWN to the instrument's lot, so a quantity sized at exactly
@@ -961,9 +950,7 @@ let order_place
           Strategy_common.register_pending_carry_order
             ~dedup_key:duplicate_key
             ~market:
-              (if String.equal market "perp"
-               then Strategy_common.Carry_perp
-               else Strategy_common.Carry_spot)
+              (if is_perp then Strategy_common.Carry_perp else Strategy_common.Carry_spot)
             ~maker:post_only
             ~kind:kind_key;
           let order =
@@ -972,6 +959,7 @@ let order_place
               ~time_in_force:tif
               ~order_type
               ~userref:Strategy_common.strategy_userref_carry
+              ~market:market_class
               duplicate_key
               instrument
               side
@@ -983,8 +971,9 @@ let order_place
           in
           let describe () =
             Printf.sprintf
-              "%s %s %.8g @ %s tif=%s reduce_only=%b key=%s"
+              "%s [%s] %s %.8g @ %s tif=%s reduce_only=%b key=%s"
               (Strategy_common.string_of_order_side side)
+              (Strategy_common.string_of_market market_class)
               instrument
               qty
               (match price with
@@ -1011,14 +1000,25 @@ let order_cancel c ~market ~order_id =
   match c.cg_asset with
   | None -> ()
   | Some asset ->
-    let instrument =
-      if String.equal market "perp" then perp_coin asset.symbol else asset.symbol
-    in
+    let is_perp = String.equal market "perp" in
+    let market_class = if is_perp then Strategy_common.Perp else Strategy_common.Spot in
+    let instrument = if is_perp then perp_coin asset.symbol else asset.symbol in
     if dry_run ()
-    then Logging.info_f ~section "Overlay DRY RUN: cancel %s %s" instrument order_id
+    then
+      Logging.info_f
+        ~section
+        "Overlay DRY RUN: cancel [%s] %s %s"
+        (Strategy_common.string_of_market market_class)
+        instrument
+        order_id
     else (
       let order =
-        Jac.create_cancel_order order_id instrument Strategy_common.Carry asset.exchange
+        Jac.create_cancel_order
+          ~market:market_class
+          order_id
+          instrument
+          Strategy_common.Carry
+          asset.exchange
       in
       ignore (Jac.push_order ~now:c.cg_now ~manage_state:false order : bool))
 ;;
@@ -1041,11 +1041,12 @@ let order_replace
   =
   match c.cg_asset, price with
   | Some asset, Some px ->
+    let is_perp = String.equal market "perp" in
+    let want_market = if is_perp then Strategy_common.Perp else Strategy_common.Spot in
     let instrument =
       match symbol with
-      | Some s -> if String.equal market "perp" then perp_coin s else s
-      | None ->
-        if String.equal market "perp" then perp_coin asset.symbol else asset.symbol
+      | Some s -> if is_perp then perp_coin s else s
+      | None -> if is_perp then perp_coin asset.symbol else asset.symbol
     in
     let min_qty = Strategy_venue.get_qty_min_val instrument asset.exchange in
     if (not (Float.is_finite qty)) || qty < 0.0 || (not (Float.is_finite px)) || px <= 0.0
@@ -1095,7 +1096,7 @@ let order_replace
              per cycle). *)
           let seen = Hashtbl.create 4 in
           let out = ref [] in
-          let want_perp = String.equal market "perp" in
+          let want_perp = is_perp in
           let want_side =
             match order_side with
             | Strategy_common.Sell -> "sell"
@@ -1111,9 +1112,8 @@ let order_replace
                       && not (Hashtbl.mem seen oid)
                    then (
                      (* Both books share one userref. Match instrument class and logical
-                        kind so a spot recycle is never amended as a perp take-profit.
-                        The registry check covers a view that lists an unclassified
-                        order. *)
+                        kind so a spot recycle is never amended as a perp take-profit. The
+                        registry check covers a view that lists an unclassified order. *)
                      let meta = Strategy_common.lookup_carry_order ~order_id:oid in
                      let market_ok =
                        match meta with
@@ -1121,7 +1121,10 @@ let order_replace
                          m.Strategy_common.com_market
                          = Strategy_common.Carry_perp
                          = want_perp
-                       | None -> is_perp = want_perp
+                       | None ->
+                         (* No registry entry: the materialized order's own market label
+                            decides, not the store key. *)
+                         true
                      in
                      let kind_ok =
                        match order_side, meta with
@@ -1152,7 +1155,8 @@ let order_replace
                        in
                        match order with
                        | Some (o : Dio_exchange.Exchange_intf.Types.open_order)
-                         when o.status = Dio_exchange.Exchange_intf.Types.New
+                         when (o.market = want_market
+                               && o.status = Dio_exchange.Exchange_intf.Types.New)
                               || o.status
                                  = Dio_exchange.Exchange_intf.Types.PartiallyFilled ->
                          Hashtbl.replace seen oid ();
@@ -1216,8 +1220,8 @@ let order_replace
             reason
         else (
           (* One cancel request per order. [order_replace] runs every book tick and a
-             canceled order can linger in the open-orders cache. The supervisor clears
-             the key on the cancel ack/failure. *)
+             canceled order can linger in the open-orders cache. The supervisor clears the
+             key on the cancel ack/failure. *)
           let cancel_key = "overlay:cancel|" ^ o.order_id in
           if Strategy_common.InFlightOrders.is_in_flight cancel_key
           then ()
@@ -1286,6 +1290,7 @@ let order_replace
                 ~dup_key:kind_key
                 ~reduce_only
                 ~time_in_force:tif
+                ~market:want_market
                 o.order_id
                 instrument
                 order_side

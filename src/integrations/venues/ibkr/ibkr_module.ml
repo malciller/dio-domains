@@ -376,6 +376,7 @@ module Ibkr_impl = struct
       Some
         { Types.order_id = oo.Ibkr_executions_feed.oo_order_id
         ; symbol = oo.oo_symbol
+        ; market = Types.Spot
         ; side = side_of_string oo.oo_side
         ; qty = oo.oo_qty
         ; cum_qty = oo.oo_filled_qty
@@ -393,6 +394,7 @@ module Ibkr_impl = struct
       (fun (oo : Ibkr_executions_feed.open_order) ->
         { Types.order_id = oo.oo_order_id
         ; symbol = oo.oo_symbol
+        ; market = Types.Spot
         ; side = side_of_string oo.oo_side
         ; qty = oo.oo_qty
         ; cum_qty = oo.oo_filled_qty
@@ -481,6 +483,7 @@ module Ibkr_impl = struct
     List.map
       (fun (e : Ibkr_executions_feed.execution_event) ->
         { Types.order_id = e.order_id
+        ; market = Types.Spot
         ; order_status = Ibkr_types.to_exchange_order_status e.status
         ; limit_price = None
         ; side = side_of_string e.side
@@ -502,6 +505,7 @@ module Ibkr_impl = struct
       (fun (e : Ibkr_executions_feed.execution_event) ->
          f
            { Types.order_id = e.order_id
+           ; market = Types.Spot
            ; order_status = Ibkr_types.to_exchange_order_status e.status
            ; limit_price = None
            ; side = side_of_string e.side
@@ -524,6 +528,7 @@ module Ibkr_impl = struct
           acc
           { Types.order_id = oo.oo_order_id
           ; symbol = oo.oo_symbol
+          ; market = Types.Spot
           ; side = side_of_string oo.oo_side
           ; qty = oo.oo_qty
           ; cum_qty = oo.oo_filled_qty

@@ -43,6 +43,8 @@
       "overlay": {
         "name": "carry_overlay",
         "exchange": "hyperliquid",
+        // true: full spot holdings (open-sell base included); false: accumulated basis.
+        "full_balance_ref": false,
         "min_entry_margin_ratio": 1.0,
         "min_liq_mult": 1.0,
         "recycle_base_share_pct": 0

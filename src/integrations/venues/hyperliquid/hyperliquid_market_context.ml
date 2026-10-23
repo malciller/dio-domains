@@ -27,6 +27,7 @@ let status_of (s : Feed.order_status) =
 let order_of_feed (o : Feed.open_order) : Exchange.Types.open_order =
   { order_id = o.order_id
   ; symbol = o.symbol
+  ; market = o.market
   ; side = side_of o.side
   ; qty = o.order_qty
   ; cum_qty = o.cum_qty

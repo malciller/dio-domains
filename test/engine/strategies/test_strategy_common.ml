@@ -27,6 +27,7 @@ let create_test_order
   { Dio_strategies.Strategy_common.operation
   ; order_id
   ; symbol
+  ; market = Dio_strategies.Strategy_common.Spot
   ; side
   ; order_type
   ; qty
@@ -194,6 +195,32 @@ let test_create_amend_order_preserves_flags () =
   Alcotest.(check string) "tif preserved" "IOC" order.time_in_force
 ;;
 
+let test_overlay_inflight_key () =
+  let module C = Dio_strategies.Strategy_common in
+  Alcotest.(check string)
+    "entry key is venue + instrument scoped"
+    "carry:entry|hyperliquid|XMR"
+    (C.overlay_inflight_key
+       ~dedup_key:"carry:entry"
+       ~side:"sell"
+       ~qty:0.0
+       ~price:None
+       ~exchange:"hyperliquid"
+       ~instrument:"XMR"
+       ~reduce_only:false);
+  Alcotest.(check string)
+    "reduce-only key keeps the suffix at the end"
+    "carry:recycle:close|hyperliquid|XMR|ro"
+    (C.overlay_inflight_key
+       ~dedup_key:"carry:recycle:close"
+       ~side:"buy"
+       ~qty:0.0
+       ~price:None
+       ~exchange:"hyperliquid"
+       ~instrument:"XMR"
+       ~reduce_only:true)
+;;
+
 let test_carry_order_terminal () =
   let open Dio_exchange.Exchange_intf.Types in
   let check label expected status =
@@ -316,6 +343,10 @@ let () =
             "amend preserves reduce-only and tif"
             `Quick
             test_create_amend_order_preserves_flags
+        ; Alcotest.test_case
+            "overlay in-flight key is venue and instrument scoped"
+            `Quick
+            test_overlay_inflight_key
         ; Alcotest.test_case
             "carry mapping retires only on terminal status"
             `Quick

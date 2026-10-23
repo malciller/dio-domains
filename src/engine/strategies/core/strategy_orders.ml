@@ -116,6 +116,7 @@ let create_place_order
   ?time_in_force
   ?(order_type = "limit")
   ?userref
+  ?(market = Spot)
   dup_key
   asset_symbol
   side
@@ -134,6 +135,7 @@ let create_place_order
   { operation = Place
   ; order_id = None
   ; symbol = asset_symbol
+  ; market
   ; exchange
   ; side
   ; order_type
@@ -153,6 +155,7 @@ let create_amend_order
   ?(dup_key = "")
   ?(reduce_only = false)
   ?time_in_force
+  ?(market = Spot)
   order_id
   asset_symbol
   side
@@ -166,6 +169,7 @@ let create_amend_order
   { operation = Amend
   ; order_id = Some order_id
   ; symbol = asset_symbol
+  ; market
   ; exchange
   ; side
   ; order_type = "limit"
@@ -181,10 +185,11 @@ let create_amend_order
 ;;
 
 (** Constructs a Cancel strategy_order targeting [order_id]. *)
-let create_cancel_order order_id asset_symbol strategy exchange =
+let create_cancel_order ?(market = Spot) order_id asset_symbol strategy exchange =
   { operation = Cancel
   ; order_id = Some order_id
   ; symbol = asset_symbol
+  ; market
   ; exchange
   ; side = Buy
   ; order_type = "limit"

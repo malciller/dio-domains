@@ -12,6 +12,9 @@
     balance is treated as committed to a sale and must not be counted as hedgeable
     inventory.
 
+    A controller with [full_balance_ref] uses [total] instead, so the base locked in open
+    sell orders is part of the hedgeable inventory.
+
     Reading balances and open orders is an in-memory store access on the overlay cycle,
     not the grid hot path. The open-order walk uses the venue's allocation-free iterator
     (primitive values, no [Types.open_order] list), so a pair with a large resting ladder
@@ -75,39 +78,46 @@ let open_sell_base_cached (module Ex : Exchange.S) ~symbol ~(cache : open_sell_c
     value)
 ;;
 
-(** Hedgeable base for one leg. [free] is the tradeable (hold-netted) figure; [total]
-    includes earn/staked balances. Pending sell orders can be backed by auto-earn; those
-    staked units are committed to a sale and are excluded. With no sells there is nothing
-    to exclude, so the subtraction is skipped entirely. *)
-let q_of_balances ~free ~total ~open_sell_base =
-  let staked = Float.max 0.0 (total -. free) in
-  let staked =
-    if open_sell_base <= 0.0 then staked else Float.max 0.0 (staked -. open_sell_base)
-  in
-  free +. staked
-;;
-
 let sanitize v = if Float.is_finite v && v > 0.0 then v else 0.0
 
-let leg_q ?cache (leg : Config.overlay_leg) =
+(** Hedgeable base for one leg. [free] is the tradeable (hold-netted) figure; [total]
+    includes earn/staked balances and the base locked in resting sell orders. Pending sell
+    orders can be backed by auto-earn; those staked units are committed to a sale and are
+    excluded from the accumulated basis. With no sells there is nothing to exclude, so the
+    subtraction is skipped entirely. *)
+let q_of_balances ~full_balance_ref ~free ~total ~open_sell_base =
+  if full_balance_ref
+  then sanitize total
+  else (
+    let staked = Float.max 0.0 (total -. free) in
+    let staked =
+      if open_sell_base <= 0.0 then staked else Float.max 0.0 (staked -. open_sell_base)
+    in
+    free +. staked)
+;;
+
+let leg_q ?cache ?(full_balance_ref = false) (leg : Config.overlay_leg) =
   match get_module leg.ol_exchange with
   | None -> 0.0
   | Some (module Ex : Exchange.S) ->
     let base = base_coin_of_symbol leg.ol_symbol in
-    let free =
-      try sanitize (Ex.get_tradeable_balance ~asset:base) with
-      | _ -> 0.0
-    in
     let total =
       try sanitize (Ex.get_total_balance ~asset:base) with
       | _ -> 0.0
     in
-    let open_sell =
-      match cache with
-      | Some c -> open_sell_base_cached (module Ex) ~symbol:leg.ol_symbol ~cache:c
-      | None -> open_sell_base (module Ex) ~symbol:leg.ol_symbol
-    in
-    q_of_balances ~free ~total ~open_sell_base:open_sell
+    if full_balance_ref
+    then total
+    else (
+      let free =
+        try sanitize (Ex.get_tradeable_balance ~asset:base) with
+        | _ -> 0.0
+      in
+      let open_sell =
+        match cache with
+        | Some c -> open_sell_base_cached (module Ex) ~symbol:leg.ol_symbol ~cache:c
+        | None -> open_sell_base (module Ex) ~symbol:leg.ol_symbol
+      in
+      q_of_balances ~full_balance_ref ~free ~total ~open_sell_base:open_sell)
 ;;
 
 (** Per-leg caches aligned with [controller.oc_legs]. *)
@@ -119,7 +129,13 @@ let create_caches (controller : Config.overlay_controller) =
     when it has an HL leg, else empty. The recycle base-accumulation path is only enabled
     when an HL spot leg exists. *)
 let aggregate (controller : Config.overlay_controller) =
-  let total = List.fold_left (fun acc leg -> acc +. leg_q leg) 0.0 controller.oc_legs in
+  let full_balance_ref = controller.oc_params.full_balance_ref in
+  let total =
+    List.fold_left
+      (fun acc leg -> acc +. leg_q ~full_balance_ref leg)
+      0.0
+      controller.oc_legs
+  in
   let hl_leg =
     List.find_opt
       (fun (l : Config.overlay_leg) -> Config.is_hyperliquid l.ol_exchange)
@@ -137,6 +153,7 @@ let aggregate (controller : Config.overlay_controller) =
 (** {!aggregate} with per-leg open-sell caches. Falls back to [aggregate] when [caches] is
     not aligned with the controller's legs (a config reload / test fixture). *)
 let aggregate_cached (controller : Config.overlay_controller) ~caches =
+  let full_balance_ref = controller.oc_params.full_balance_ref in
   let legs = controller.oc_legs in
   if Array.length caches <> List.length legs
   then aggregate controller
@@ -147,7 +164,7 @@ let aggregate_cached (controller : Config.overlay_controller) ~caches =
         (fun acc leg ->
           let cache = Array.unsafe_get caches !i in
           incr i;
-          acc +. leg_q ~cache leg)
+          acc +. leg_q ~cache ~full_balance_ref leg)
         0.0
         legs
     in

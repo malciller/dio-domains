@@ -4,6 +4,7 @@
   \    eviction; per-resource mutexes and atomic flags. "]
 
 open Lwt.Infix
+module Types = Dio_exchange.Exchange_intf.Types
 
 let section = "hyperliquid_executions_feed"
 
@@ -37,6 +38,7 @@ type order_status =
 type open_order =
   { order_id : string
   ; symbol : string
+  ; market : Types.market
   ; side : side
   ; order_qty : float
   ; cum_qty : float
@@ -53,6 +55,7 @@ type open_order =
 type execution_event =
   { order_id : string
   ; symbol : string
+  ; market : Types.market
   ; exec_type : exec_type
   ; order_status : order_status
   ; limit_price : float option
@@ -851,6 +854,7 @@ let update_orders_internal_locked ?user_ref store (event : execution_event) =
       let order : open_order =
         { order_id = event.order_id
         ; symbol = event.symbol
+        ; market = event.market
         ; side = event.side
         ; order_qty = event.order_qty
         ; cum_qty = event.cum_qty
@@ -930,9 +934,9 @@ let registered_exact_symbol coin =
   | None -> None
 ;;
 
-(** Store key for an injected order. A perp order is placed with its bare coin
-    (["HYPE"]) but the owning domain is registered under the spot pair (["HYPE/USDC"])
-    and reads fills from that store. Filing it under the bare coin hides the fill, so
+(** Store key for an injected order. A perp order is placed with its bare coin (["HYPE"])
+    but the owning domain is registered under the spot pair (["HYPE/USDC"]) and reads
+    fills from that store. Filing it under the bare coin hides the fill, so
     [carry_recycle_seq] never advances and the replacement short is never placed. *)
 let store_symbol_for_order symbol =
   if String.contains symbol '/'
@@ -949,8 +953,7 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
      filed under a store the owning domain never reads. *)
   let is_perp =
     Hyperliquid_instruments_feed.is_perp_coin symbol
-    || (not (String.contains symbol '/')
-        && not (String.starts_with ~prefix:"@" symbol))
+    || ((not (String.contains symbol '/')) && not (String.starts_with ~prefix:"@" symbol))
   in
   if is_perp then note_perp_order ~order_id ~coin:symbol;
   let symbol = store_symbol_for_order symbol in
@@ -959,6 +962,7 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?user_ref ?cl_ord_id () =
   let event : execution_event =
     { order_id
     ; symbol
+    ; market = (if is_perp then Types.Perp else Types.Spot)
     ; exec_type = New
     ; order_status = NewStatus
     ; limit_price = Some price
@@ -1168,6 +1172,10 @@ let process_order_updates data_json =
             let event : execution_event =
               { order_id
               ; symbol
+              ; market =
+                  (if Hyperliquid_instruments_feed.is_perp_coin coin
+                   then Types.Perp
+                   else Types.Spot)
               ; exec_type
               ; order_status
               ; limit_price = Some price
@@ -1300,7 +1308,9 @@ let process_user_events data_json =
           in
           let closed_pnl =
             match member "closedPnl" fill with
-            | `String s -> (try Some (float_of_string s) with | _ -> None)
+            | `String s ->
+              (try Some (float_of_string s) with
+               | _ -> None)
             | `Float f -> Some f
             | `Int i -> Some (float_of_int i)
             | _ -> None
@@ -1387,6 +1397,10 @@ let process_user_events data_json =
                   let event : execution_event =
                     { order_id
                     ; symbol
+                    ; market =
+                        (if Hyperliquid_instruments_feed.is_perp_coin coin
+                         then Types.Perp
+                         else Types.Spot)
                     ; exec_type = Trade
                     ; order_status = status
                     ; limit_price
@@ -1445,9 +1459,7 @@ let process_user_events data_json =
               in
               let estimated_fee = fill_value *. maker_fee_rate in
               let market =
-                if Hyperliquid_instruments_feed.is_perp_coin coin
-                then "perp"
-                else "spot"
+                if Hyperliquid_instruments_feed.is_perp_coin coin then "perp" else "spot"
               in
               let contains hay needle =
                 let n = String.length needle in
@@ -1572,6 +1584,7 @@ let process_user_events data_json =
            let event : execution_event =
              { order_id
              ; symbol
+             ; market = current_order.market
              ; exec_type = Canceled
              ; order_status = CanceledStatus
              ; limit_price = current_order.limit_price
@@ -1594,48 +1607,52 @@ let process_user_events data_json =
          | None -> ())
       | None -> ())
     non_user_cancels;
-  (* Account-level liquidation. The liquidating fill is published above with
-     [liquidation] metadata; this carries the account-level notional/value. *)
-  (match member "liquidation" data_json with
-   | `Null -> ()
-   | liq ->
-     let fld name =
-       match member name liq with
-       | `String s -> (try float_of_string s with | _ -> 0.0)
-       | `Float f -> f
-       | `Int i -> float_of_int i
-       | _ -> 0.0
-     in
-     let lid =
-       match member "lid" liq with
-       | `Int i -> string_of_int i
-       | `String s -> s
-       | _ -> "0"
-     in
-     let ntl_pos = fld "liquidated_ntl_pos" in
-     let account_value = fld "liquidated_account_value" in
-     let liquidator =
-       match member "liquidator" liq with
-       | `String s -> s
-       | _ -> "?"
-     in
-     Concurrency.Fill_event_bus.publish_fill
-       { venue = "hyperliquid"
-       ; symbol = "ACCOUNT"
-       ; side = ""
-       ; amount = 0.0
-       ; fill_price = 0.0
-       ; value = ntl_pos
-       ; fee = 0.0
-       ; timestamp = Unix.gettimeofday ()
-       ; order_id = "liq:" ^ lid
-       ; trade_id = "liq:" ^ lid
-       ; market = "perp"
-       ; intent = "liquidation"
-       ; strategy = "account"
-       ; realized_pnl = None
-       ; note = Some (Printf.sprintf "account_value=$%.2f liquidator=%s" account_value liquidator)
-       })
+  (* Account-level liquidation. The liquidating fill is published above with [liquidation]
+     metadata; this carries the account-level notional/value. *)
+  match member "liquidation" data_json with
+  | `Null -> ()
+  | liq ->
+    let fld name =
+      match member name liq with
+      | `String s ->
+        (try float_of_string s with
+         | _ -> 0.0)
+      | `Float f -> f
+      | `Int i -> float_of_int i
+      | _ -> 0.0
+    in
+    let lid =
+      match member "lid" liq with
+      | `Int i -> string_of_int i
+      | `String s -> s
+      | _ -> "0"
+    in
+    let ntl_pos = fld "liquidated_ntl_pos" in
+    let account_value = fld "liquidated_account_value" in
+    let liquidator =
+      match member "liquidator" liq with
+      | `String s -> s
+      | _ -> "?"
+    in
+    Concurrency.Fill_event_bus.publish_fill
+      { venue = "hyperliquid"
+      ; symbol = "ACCOUNT"
+      ; side = ""
+      ; amount = 0.0
+      ; fill_price = 0.0
+      ; value = ntl_pos
+      ; fee = 0.0
+      ; timestamp = Unix.gettimeofday ()
+      ; order_id = "liq:" ^ lid
+      ; trade_id = "liq:" ^ lid
+      ; market = "perp"
+      ; intent = "liquidation"
+      ; strategy = "account"
+      ; realized_pnl = None
+      ; note =
+          Some
+            (Printf.sprintf "account_value=$%.2f liquidator=%s" account_value liquidator)
+      }
 ;;
 
 let process_market_data json =
@@ -1797,6 +1814,10 @@ let inject_open_orders data_json =
             let event : execution_event =
               { order_id
               ; symbol
+              ; market =
+                  (if Hyperliquid_instruments_feed.is_perp_coin coin
+                   then Types.Perp
+                   else Types.Spot)
               ; exec_type = New
               ; order_status = NewStatus
               ; limit_price = Some price
@@ -1857,6 +1878,7 @@ let inject_open_orders data_json =
         let event : execution_event =
           { order_id = cached_order.order_id
           ; symbol
+          ; market = cached_order.market
           ; exec_type = Canceled
           ; order_status = CanceledStatus
           ; limit_price = cached_order.limit_price

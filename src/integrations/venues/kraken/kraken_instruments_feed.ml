@@ -427,6 +427,14 @@ let get_qty_min symbol : float option =
   | None -> None
 ;;
 
+(** Returns the minimum order cost (quote notional) for [symbol], or 0.0 when the pair
+    metadata is not cached yet. *)
+let get_cost_min symbol : float =
+  match Ds.Cow_table.find_opt pair_cache symbol with
+  | Some info -> info.cost_min
+  | None -> 0.0
+;;
+
 (** Returns the minimum quantity step size for [symbol], or [None]. *)
 let get_qty_increment symbol : float option =
   match Ds.Cow_table.find_opt pair_cache symbol with
