@@ -475,6 +475,29 @@ let is_live_order (o : open_order) =
   | FilledStatus | CanceledStatus | ExpiredStatus | RejectedStatus -> false
 ;;
 
+(** Find a live order by its client order id across every symbol store. A Hyperliquid
+    modify is a cancel+replace: the acknowledgement may not carry the replacement oid, but
+    both legs are linked by the cloid. Scans the atomic snapshots, so no store mutex is
+    taken on the amend path. *)
+let find_order_by_cloid cloid =
+  let same a = String.equal (String.lowercase_ascii a) (String.lowercase_ascii cloid) in
+  let found = ref None in
+  Ds.Cow_table.iter
+    (fun _symbol store ->
+      if !found = None
+      then
+        List.iter
+          (fun (o : open_order) ->
+            if !found = None
+            then (
+              match o.cl_ord_id with
+              | Some c when is_live_order o && same c -> found := Some o
+              | _ -> ()))
+          (Atomic.get store.open_orders_cache))
+    stores;
+  !found
+;;
+
 let get_perp_open_orders ~coin =
   Mutex.lock perp_order_mutex;
   let order_ids =

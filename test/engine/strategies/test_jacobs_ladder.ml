@@ -3156,6 +3156,47 @@ let test_cancel_mid_amend_keeps_pending_marker () =
   ignore (IA.remove_in_flight_amendment "old-1")
 ;;
 
+let test_same_id_amend_arms_replacement_pending () =
+  (* A Hyperliquid modify ack without a replacement oid comes back as a same-id "amend".
+     Arm the symbol-level replacement-pending window so the excess sweep cannot mistake
+     the old/replacement pair for duplicate buys while the feed binds the real new id. *)
+  let symbol = "SAME_ID_AMEND/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.pending_orders <- [];
+  state.last_buy_order_id <- Some "old";
+  state.last_buy_order_price <- Some 100.0;
+  Hashtbl.reset state.amend_cooldowns;
+  Dio_strategies.Strategy_api.Strategy.handle_order_amended
+    ~now:100.0
+    symbol
+    "old"
+    "old"
+    Dio_strategies.Strategy_common.Buy
+    101.0;
+  check
+    bool
+    "replacement-pending marker armed for a same-id Hyperliquid ack"
+    true
+    (match Hashtbl.find_opt state.amend_cooldowns "replacement_pending" with
+     | Some expiry -> expiry > 100.0
+     | None -> false);
+  Dio_strategies.Strategy_api.Strategy.handle_order_amended
+    ~now:101.0
+    symbol
+    "old"
+    "new"
+    Dio_strategies.Strategy_common.Buy
+    102.0;
+  check
+    bool
+    "resolved amend clears the replacement-pending marker"
+    true
+    (match Hashtbl.find_opt state.amend_cooldowns "replacement_pending" with
+     | None -> true
+     | Some expiry -> expiry <= 101.0)
+;;
+
 let test_order_rejection () =
   let state = Dio_strategies.Strategy_api.get_strategy_state "TEST3/USD" in
   state.pending_orders
@@ -6845,6 +6886,122 @@ let test_buy_cancel_excess_spares_amend_replacement () =
     state.last_buy_order_id
 ;;
 
+let test_buy_cancel_excess_respects_tracked_amend_cooldown () =
+  (* Regression for the Hyperliquid modify-ack race: the amend cooldown is keyed to the
+     tracked (old) id, while the feed may already list the replacement. The
+     registry/replacement guards can be momentarily empty, but a tracked buy inside its
+     amend cooldown must still suppress the excess sweep. *)
+  let open Dio_strategies.Strategy_api in
+  let module C = Dio_strategies.Strategy_common in
+  let symbol = "EXCESS_COOLDOWN/USDC" in
+  let state = get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.pending_orders <- [];
+  state.last_buy_order_id <- Some "buy-old";
+  state.last_buy_order_price <- Some 99.0;
+  state.inflight_buy <- false;
+  state.inflight_amend_buy <- false;
+  state.inflight_cancel_buy <- false;
+  Hashtbl.reset state.amend_cooldowns;
+  Hashtbl.replace state.amend_cooldowns "buy-old" 200.0;
+  let asset =
+    { exchange = "hyperliquid"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = false
+    ; sell_levels_persistence = false
+    }
+  in
+  let buffer = get_order_buffer () in
+  let rec drain () =
+    match C.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  let feed = [ "buy-old", 99.0, 1.0, "buy", None; "buy-new", 99.0, 1.0, "buy", None ] in
+  let iter f = List.iter (fun (o, p, q, s, u) -> f o p q s u) feed in
+  drain ();
+  Dio_strategies.Strategy_decision.buy_cancel_excess
+    ~state
+    ~now:100.0
+    ~asset
+    ~iter_open_orders:iter
+    ~cycle:1
+    ~effective_buy_count:2;
+  check
+    int
+    "no cancels while the tracked buy is inside its amend cooldown"
+    0
+    (List.length (get_pending_orders 100));
+  (* Control: with the cooldown expired, a genuine duplicate pair is still cancelled. *)
+  Hashtbl.replace state.amend_cooldowns "buy-old" 50.0;
+  drain ();
+  Dio_strategies.Strategy_decision.buy_cancel_excess
+    ~state
+    ~now:100.0
+    ~asset
+    ~iter_open_orders:iter
+    ~cycle:2
+    ~effective_buy_count:2;
+  check
+    int
+    "duplicates cancelled after the cooldown"
+    2
+    (List.length (get_pending_orders 100))
+;;
+
+let test_amend_failure_adopts_live_replacement () =
+  (* If the amend ack lost the replacement id and the next amend targets the dead old id,
+     adopt the live grid buy already visible in the feed instead of clearing tracking and
+     placing a duplicate. *)
+  let open Dio_strategies.Strategy_api in
+  let module C = Dio_strategies.Strategy_common in
+  let symbol = "AMEND_ADOPT/USDC" in
+  let state = get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.pending_orders <- [];
+  state.last_buy_order_id <- Some "gone";
+  state.last_buy_order_price <- Some 99.0;
+  state.cached_best_buy_id <- "replacement";
+  state.cached_best_buy_price <- 98.5;
+  state.inflight_buy <- false;
+  state.inflight_amend_buy <- false;
+  state.inflight_cancel_buy <- false;
+  Hashtbl.reset state.evicted_orders;
+  Hashtbl.remove state.processed_fills "replacement";
+  let buffer = get_order_buffer () in
+  let rec drain () =
+    match C.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Strategy_api.Strategy.handle_order_amendment_failed
+    ~now:100.0
+    symbol
+    "gone"
+    C.Buy
+    "Order not found for amendment: gone";
+  check
+    (option string)
+    "live replacement adopted"
+    (Some "replacement")
+    state.last_buy_order_id;
+  check
+    (option (float 0.000001))
+    "replacement price adopted"
+    (Some 98.5)
+    state.last_buy_order_price;
+  check bool "dead id evicted" true (Hashtbl.mem state.evicted_orders "gone");
+  drain ()
+;;
+
 let test_buy_cancel_excess_ignores_carry () =
   (* Regression: the single-buy policy only counts and cancels grid orders. A carry buy on
      the same pair is not an "excess" ladder buy. *)
@@ -8153,6 +8310,14 @@ let () =
             `Quick
             test_buy_cancel_excess_spares_amend_replacement
         ; test_case
+            "buy excess-cancel respects a tracked amend cooldown"
+            `Quick
+            test_buy_cancel_excess_respects_tracked_amend_cooldown
+        ; test_case
+            "amend failure adopts a live replacement"
+            `Quick
+            test_amend_failure_adopts_live_replacement
+        ; test_case
             "buy excess-cancel ignores carry orders"
             `Quick
             test_buy_cancel_excess_ignores_carry
@@ -8489,6 +8654,10 @@ let () =
             "cancel mid-amend keeps the pending marker"
             `Quick
             test_cancel_mid_amend_keeps_pending_marker
+        ; test_case
+            "same-id amend arms replacement pending"
+            `Quick
+            test_same_id_amend_arms_replacement_pending
         ; test_case "order rejection" `Quick test_order_rejection
         ; test_case
             "amendment TIF reject arms recovery"

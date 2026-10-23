@@ -1061,7 +1061,17 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
       if not is_being_amended
       then (
         Hashtbl.remove state.amend_cooldowns order_id;
-        Hashtbl.remove state.evicted_orders order_id;
+        (* A cancelled buy is terminal. Evict it so a stale open-order snapshot cannot
+           re-adopt it as the resting buy and issue a doomed amend against a dead id.
+           Sells are not evicted: an evicted sell arms the wash-trade crossing guard and
+           would block fresh buys for the eviction TTL. *)
+        (match side with
+         | Buy ->
+           Hashtbl.replace
+             state.evicted_orders
+             order_id
+             (Unix.gettimeofday () +. 900.0, Buy)
+         | Sell -> Hashtbl.remove state.evicted_orders order_id);
         ignore (InFlightAmendments.remove_in_flight_amendment order_id);
         let cancelled_side = side in
         let was_tracked_buy =
@@ -1219,6 +1229,19 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
       let cooldown = if old_order_id = new_order_id then 2.0 else 10.0 in
       Hashtbl.replace state.amend_cooldowns old_order_id (now +. cooldown);
       Hashtbl.replace state.amend_cooldowns new_order_id (now +. cooldown);
+      (* On a cancel+replace venue, a same-id ack means the exchange did not name the
+         replacement. The ordinary cooldown is keyed to the old id, so it cannot cover the
+         replacement id until the feed binds it. Suppress the excess-buy sweep for the
+         symbol during that window; [sync_open_orders] folds this marker into
+         [has_recent_amend_buy], and [buy_cancel_excess] checks it as a backstop. *)
+      (match side with
+       | Buy ->
+         if old_order_id = new_order_id
+         then (
+           if String.equal state.exchange_id "hyperliquid"
+           then Hashtbl.replace state.amend_cooldowns "replacement_pending" (now +. 30.0))
+         else Hashtbl.remove state.amend_cooldowns "replacement_pending"
+       | Sell -> ());
       if side = Buy then state.inflight_amend_buy <- false;
       ())
 ;;
@@ -1323,8 +1346,11 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
          trade-update was missed. Evict it from the open-orders scan so the adoption path
          cannot re-adopt the stale entry as the resting buy and re-issue the same failed
          cancel+replace. The TTL mirrors the cleanup window used by [sync_open_orders];
-         the entry is harmless once the order also leaves the venue cache. *)
-      if is_already_terminal
+         the entry is harmless once the order also leaves the venue cache. Apply this to
+         every "order is gone" verdict, not just the explicit terminal statuses: a
+         cache-miss amend is just as dead, and re-adopting it from a stale feed snapshot
+         reproduces the same doomed-amend loop. *)
+      if is_order_gone
       then Hashtbl.replace state.evicted_orders order_id (now +. 900.0, side);
       if is_order_gone
       then (
@@ -1351,14 +1377,44 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
         | Buy ->
           (match state.last_buy_order_id with
            | Some target_id when target_id = order_id ->
-             state.last_buy_order_id <- None;
-             state.last_buy_order_price <- None;
              Hashtbl.remove state.amend_cooldowns "place_Buy";
-             Logging.info_f
-               ~section
-               "Amendment failed for buy order %s: %s. Order is gone, cleared tracking."
-               order_id
-               reason
+             (* The amend target is dead. If the venue already listed the replacement (or
+                another live grid buy), re-track it instead of clearing tracking and
+                placing a duplicate. This is the recovery path when the amend ack did not
+                carry the replacement oid. *)
+             let replacement =
+               let best_id = state.cached_best_buy_id in
+               let best_price = state.cached_best_buy_price in
+               if best_id <> ""
+                  && best_id <> order_id
+                  && best_price > 0.0
+                  && (not (Hashtbl.mem state.evicted_orders best_id))
+                  && not (Hashtbl.mem state.processed_fills best_id)
+               then Some (best_id, best_price)
+               else None
+             in
+             (match replacement with
+              | Some (replacement_id, replacement_price) ->
+                add_tracked_order_id state replacement_id;
+                state.last_buy_order_id <- Some replacement_id;
+                state.last_buy_order_price <- Some replacement_price;
+                Logging.info_f
+                  ~section
+                  "Amendment failed for buy order %s: %s. Adopted live replacement %s @ \
+                   %.4f instead of replacing."
+                  order_id
+                  reason
+                  replacement_id
+                  replacement_price
+              | None ->
+                state.last_buy_order_id <- None;
+                state.last_buy_order_price <- None;
+                Logging.info_f
+                  ~section
+                  "Amendment failed for buy order %s: %s. Order is gone, cleared \
+                   tracking."
+                  order_id
+                  reason)
            | _ ->
              Hashtbl.remove state.amend_cooldowns "place_Buy";
              ())

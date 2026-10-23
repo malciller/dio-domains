@@ -96,6 +96,10 @@ type place_order_result = { order_id : int64 }
 type amend_order_result =
   { amend_id : int64
   ; order_id : int64
+  ; replacement_known : bool
+  (** [false] when the acknowledgement carried no replacement oid (the common Hyperliquid
+      modify shape). The caller must then resolve the new leg by cloid from the
+      order-updates feed before treating [amend_id] as authoritative. *)
   }
 
 (** Credentials from the environment, resolved once on first use. Env vars are static for
@@ -388,6 +392,68 @@ let place_order
     ()
 ;;
 
+(** Parse a modify acknowledgement.
+
+    Hyperliquid implements modify as cancel+replace. The common acknowledgement is
+    [{ status: "ok"; response: { type: "default" } }] with no replacement oid: the new leg
+    arrives later on the order-updates channel. Returning [order_id] in that case is only
+    a placeholder; the caller must resolve the replacement by cloid. Some response
+    variants do carry [data.statuses[].resting.oid], so parse it when present. *)
+let parse_amend_response ~order_id (res : Yojson.Safe.t)
+  : (amend_order_result, string) result
+  =
+  let open Yojson.Safe.Util in
+  try
+    let status = member "status" res |> to_string_option in
+    match status with
+    | Some "err" ->
+      let err_msg =
+        match member "response" res with
+        | `String s -> s
+        | other -> Yojson.Safe.to_string other
+      in
+      Error (Printf.sprintf "HL Amendment Rejected: %s" err_msg)
+    | _ ->
+      let response = member "response" res in
+      let statuses =
+        match member "data" response with
+        | `Assoc _ as data ->
+          (match member "statuses" data with
+           | `List l -> Some l
+           | _ -> None)
+        | _ -> None
+      in
+      (match statuses with
+       | None -> Ok { amend_id = order_id; order_id; replacement_known = false }
+       | Some [] -> Error "Empty status list in response"
+       | Some (s :: _) ->
+         let resting = member "resting" s in
+         if resting <> `Null
+         then (
+           match resting |> member "oid" |> to_int64_opt with
+           | Some new_oid -> Ok { amend_id = new_oid; order_id; replacement_known = true }
+           | None ->
+             Error
+               (Printf.sprintf
+                  "Failed to find new oid in resting status: %s"
+                  (Yojson.Safe.to_string s)))
+         else (
+           match member "error" s |> to_string_option with
+           | Some err -> Error (Printf.sprintf "HL Amendment Rejected: %s" err)
+           | None ->
+             Error
+               (Printf.sprintf
+                  "Failed to find oid or error in HL amend response: %s"
+                  (Yojson.Safe.to_string res))))
+  with
+  | exn ->
+    Error
+      (Printf.sprintf
+         "Failed to parse HL response: %s (Raw: %s)"
+         (Printexc.to_string exn)
+         (Yojson.Safe.to_string res))
+;;
+
 (** Amends an existing order by order_id on Hyperliquid via WebSocket with retry. Submits
     a "modify" action with updated price, size, and side. Returns the original and
     potentially new order ID on success. *)
@@ -445,58 +511,7 @@ let amend_order
     let is_mainnet = not testnet in
     post_exchange_ws ~testnet ~action_json ~action_msgpack ~is_mainnet
     >>= function
-    | Ok res ->
-      let open Yojson.Safe.Util in
-      (try
-         let status = member "status" res |> to_string_option in
-         match status with
-         | Some "err" ->
-           let err_msg =
-             match member "response" res with
-             | `String s -> s
-             | other -> Yojson.Safe.to_string other
-           in
-           Lwt.return (Error (Printf.sprintf "HL Amendment Rejected: %s" err_msg))
-         | _ ->
-           let response = member "response" res in
-           let response_type = member "type" response |> to_string_option in
-           (match response_type with
-            | Some "default" -> Lwt.return (Ok { amend_id = order_id; order_id })
-            | _ ->
-              let data = member "data" response in
-              let statuses = member "statuses" data |> to_list in
-              (match statuses with
-               | s :: _ ->
-                 let resting = member "resting" s in
-                 if resting <> `Null
-                 then (
-                   match resting |> member "oid" |> to_int64_opt with
-                   | Some new_oid -> Lwt.return (Ok { amend_id = new_oid; order_id })
-                   | None ->
-                     Lwt.return
-                       (Error
-                          (Printf.sprintf
-                             "Failed to find new oid in resting status: %s"
-                             (Yojson.Safe.to_string s))))
-                 else (
-                   match member "error" s |> to_string_option with
-                   | Some err ->
-                     Lwt.return (Error (Printf.sprintf "HL Amendment Rejected: %s" err))
-                   | None ->
-                     Lwt.return
-                       (Error
-                          (Printf.sprintf
-                             "Failed to find oid or error in HL amend response: %s"
-                             (Yojson.Safe.to_string res))))
-               | [] -> Lwt.return (Error "Empty status list in response")))
-       with
-       | exn ->
-         Lwt.return
-           (Error
-              (Printf.sprintf
-                 "Failed to parse HL response: %s (Raw: %s)"
-                 (Printexc.to_string exn)
-                 (Yojson.Safe.to_string res))))
+    | Ok res -> Lwt.return (parse_amend_response ~order_id res)
     | Error e -> Lwt.return (Error e)
   in
   Error_handling.retry_with_backoff

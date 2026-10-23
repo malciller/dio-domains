@@ -98,68 +98,92 @@ let buy_cancel_excess
      racing the amend (the amend then fails "order not found") and leaving buy tracking
      pointed at a dead order. Track what we actually cancelled so tracking is only cleared
      for orders that really left the book. *)
-  let cancelled = ref [] in
-  iter_open_orders (fun order_id _ _ side_str userref_opt ->
-    let is_our_strategy = is_grid_order userref_opt in
-    if is_our_strategy && side_str = "buy"
-    then (
-      let is_mid_amend =
-        InFlightAmendments.is_amend_lifecycle_active order_id
-        || InFlightAmendments.is_replacement_target order_id
-        || List.exists
-             (fun (id, _, _, _) ->
-               String.starts_with ~prefix:"pending_amend_" id
-               && String.length id > 14
-               && String.sub id 14 (String.length id - 14) = order_id)
-             state.pending_orders
-      in
-      if is_mid_amend
-      then
-        Logging.debug_f
-          ~section
-          "Skipping cancel of mid-amendment buy order %s for %s (amend will replace it)"
-          order_id
-          asset.symbol
-      else (
-        let cancel_order =
-          create_cancel_order order_id asset.symbol Ladder asset.exchange
-        in
-        ignore (push_order ~now ~state cancel_order);
-        cancelled := order_id :: !cancelled;
-        (* [push_order] emits the CANCEL block when the flow layer is on. *)
-        if not (Flow_log.enabled ())
-        then
-          Logging.info_f
-            ~section
-            "Cancelling excess buy order: %s for %s"
-            order_id
-            asset.symbol)));
-  if !cancelled <> []
+  (* Backstop for the same race: keep the old/replacement pair out of the excess sweep
+     while the tracked buy is inside its amend cooldown, even if the registry mapping
+     lags. *)
+  let tracked_recently_amended =
+    match state.last_buy_order_id with
+    | Some tracked ->
+      (match Hashtbl.find_opt state.amend_cooldowns tracked with
+       | Some expiry -> now < expiry
+       | None -> false)
+    | None -> false
+  in
+  let replacement_pending =
+    match Hashtbl.find_opt state.amend_cooldowns "replacement_pending" with
+    | Some expiry -> now < expiry
+    | None -> false
+  in
+  if replacement_pending || tracked_recently_amended
   then (
-    if not (Flow_log.enabled ())
-    then
-      Logging.info_f
-        ~section
-        "Found %d buy orders for %s, cancelled all cancellable buy orders to maintain \
-         single buy order policy"
-        effective_buy_count
-        asset.symbol)
-  else
     Logging.debug_f
       ~section
-      "Found %d buy orders for %s, all mid-amendment - no cancellable excess"
-      effective_buy_count
+      "Skipping excess-buy cancel for %s: amend/replacement window is still active"
       asset.symbol;
-  (* Only clear tracking when the tracked order itself was cancelled. If every candidate
-     was mid-amendment (or the tracked id was the protected one), the resting buy (or its
-     in-flight amend) is still live; clearing here would orphan it until the next feed
-     scan adopts the best buy. *)
-  (match state.last_buy_order_id with
-   | Some tracked when List.exists (String.equal tracked) !cancelled ->
-     state.last_buy_order_id <- None;
-     state.last_buy_order_price <- None
-   | _ -> ());
-  state.last_cycle <- cycle
+    state.last_cycle <- cycle)
+  else (
+    let cancelled = ref [] in
+    iter_open_orders (fun order_id _ _ side_str userref_opt ->
+      let is_our_strategy = is_grid_order userref_opt in
+      if is_our_strategy && side_str = "buy"
+      then (
+        let is_mid_amend =
+          InFlightAmendments.is_amend_lifecycle_active order_id
+          || InFlightAmendments.is_replacement_target order_id
+          || List.exists
+               (fun (id, _, _, _) ->
+                 String.starts_with ~prefix:"pending_amend_" id
+                 && String.length id > 14
+                 && String.sub id 14 (String.length id - 14) = order_id)
+               state.pending_orders
+        in
+        if is_mid_amend
+        then
+          Logging.debug_f
+            ~section
+            "Skipping cancel of mid-amendment buy order %s for %s (amend will replace it)"
+            order_id
+            asset.symbol
+        else (
+          let cancel_order =
+            create_cancel_order order_id asset.symbol Ladder asset.exchange
+          in
+          ignore (push_order ~now ~state cancel_order);
+          cancelled := order_id :: !cancelled;
+          (* [push_order] emits the CANCEL block when the flow layer is on. *)
+          if not (Flow_log.enabled ())
+          then
+            Logging.info_f
+              ~section
+              "Cancelling excess buy order: %s for %s"
+              order_id
+              asset.symbol)));
+    if !cancelled <> []
+    then (
+      if not (Flow_log.enabled ())
+      then
+        Logging.info_f
+          ~section
+          "Found %d buy orders for %s, cancelled all cancellable buy orders to maintain \
+           single buy order policy"
+          effective_buy_count
+          asset.symbol)
+    else
+      Logging.debug_f
+        ~section
+        "Found %d buy orders for %s, all mid-amendment - no cancellable excess"
+        effective_buy_count
+        asset.symbol;
+    (* Only clear tracking when the tracked order itself was cancelled. If every candidate
+       was mid-amendment (or the tracked id was the protected one), the resting buy (or
+       its in-flight amend) is still live; clearing here would orphan it until the next
+       feed scan adopts the best buy. *)
+    (match state.last_buy_order_id with
+     | Some tracked when List.exists (String.equal tracked) !cancelled ->
+       state.last_buy_order_id <- None;
+       state.last_buy_order_price <- None
+     | _ -> ());
+    state.last_cycle <- cycle)
 ;;
 
 (** The buy-placement plan: the sizing and price computed for a fresh buy, plus the branch

@@ -99,6 +99,27 @@ let test_spot_view_excludes_perp () =
   Alcotest.(check bool) "spot iterator skips the perp order" false (List.mem "777" !seen)
 ;;
 
+let test_resolve_amend_replacement_from_feed () =
+  (* The modify ack has no replacement oid; the order-updates feed links the new leg by
+     cloid. Resolution must find it without waiting for a round trip. *)
+  ExecFeed.initialize [ "AMEND_RESOLVE/USDC" ];
+  ExecFeed.inject_order
+    ~symbol:"AMEND_RESOLVE/USDC"
+    ~order_id:"new-oid"
+    ~side:ExecFeed.Buy
+    ~qty:1.0
+    ~price:100.0
+    ~cl_ord_id:"0xRESOLVE"
+    ();
+  let resolved =
+    Lwt_main.run
+      (Hyperliquid.Module.Hyperliquid_impl.resolve_amend_replacement
+         ~cloid:"0xresolve"
+         ~old_order_id:"old-oid")
+  in
+  Alcotest.(check (option string)) "replacement found by cloid" (Some "new-oid") resolved
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Module"
@@ -109,6 +130,12 @@ let () =
     ; ( "conversions"
       , [ Alcotest.test_case "status conversions" `Quick test_status_conversions
         ; Alcotest.test_case "side conversions" `Quick test_side_conversions
+        ] )
+    ; ( "amend"
+      , [ Alcotest.test_case
+            "resolve replacement from feed"
+            `Quick
+            test_resolve_amend_replacement_from_feed
         ] )
     ; ( "data_access"
       , [ Alcotest.test_case "empty data accessors" `Quick test_data_accessors_empty
