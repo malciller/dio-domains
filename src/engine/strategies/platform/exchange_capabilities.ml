@@ -16,6 +16,10 @@ type t =
   ; use_accumulation_sells : bool
   ; sell_failure_sets_asset_low : bool
   ; use_reserved_base_guard : bool
+  ; enforce_venue_min_qty : bool
+  (** True when the venue rejects an order below its advertised base-quantity minimum
+      (Kraken). Hyperliquid/Alpaca gate on the quote-notional floor instead, so applying
+      their lot-sized [qty_min] to a sell would block legitimate notional-clearing orders. *)
   ; use_unnetted_sell_hold : bool
   ; balance_nets_open_order_holds : bool
   ; hold_netted_from_venue_state : bool
@@ -32,6 +36,7 @@ let kraken =
   ; use_accumulation_sells = true
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
+  ; enforce_venue_min_qty = true
   ; use_unnetted_sell_hold = true
   ; balance_nets_open_order_holds = true
   ; hold_netted_from_venue_state = false
@@ -49,6 +54,7 @@ let hyperliquid =
   ; use_accumulation_sells = true
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
+  ; enforce_venue_min_qty = false
   ; use_unnetted_sell_hold = true
   ; balance_nets_open_order_holds = true
   ; hold_netted_from_venue_state = true
@@ -66,6 +72,7 @@ let ibkr =
   ; use_accumulation_sells = true
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
+  ; enforce_venue_min_qty = true
   ; use_unnetted_sell_hold = true
   ; balance_nets_open_order_holds = false
   ; hold_netted_from_venue_state = false
@@ -83,6 +90,7 @@ let lighter =
   ; use_accumulation_sells = true
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
+  ; enforce_venue_min_qty = true
   ; use_unnetted_sell_hold = true
   ; balance_nets_open_order_holds = false
   ; hold_netted_from_venue_state = false
@@ -100,6 +108,7 @@ let alpaca =
   ; use_accumulation_sells = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
+  ; enforce_venue_min_qty = false
   ; use_unnetted_sell_hold = true
   ; balance_nets_open_order_holds = true
   ; hold_netted_from_venue_state = true

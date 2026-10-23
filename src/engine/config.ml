@@ -644,10 +644,12 @@ let is_hyperliquid exchange = String.equal (normalize_exchange exchange) "hyperl
     [overlay.symbol] is optional and defaults to the owning symbol for same-venue
     overlays, or [<base>/USDC] on Hyperliquid for cross-venue overlays.
 
-    The hedged quantity is the same whether or not a grid is active: the free spot balance
-    not in pending sell orders, plus the staked balance, excluding auto-earn balances
-    backing pending sells. The grid's [reserved_base] is part of that spot figure; it is
-    not added separately. The configured overlay ratio scales this accumulated balance.
+    The hedged quantity is the same whether or not a grid is active. By default it is the
+    free spot balance not in pending sell orders, plus the staked balance, excluding
+    auto-earn balances backing pending sells; [full_balance_ref] uses the full spot
+    holding instead, including the base locked in sell orders. The grid's [reserved_base]
+    is part of that spot figure; it is not added separately. The configured overlay ratio
+    scales the selected basis.
 
     This is deliberately generic: the engine does not know what an overlay does, only that
     the named file is loaded and cycled by the controller domain. *)
@@ -664,6 +666,7 @@ let known_overlay_param_keys =
   ; "min_entry_margin_ratio"
   ; "min_liq_mult"
   ; "leverage"
+  ; "full_balance_ref"
   ]
 ;;
 
@@ -686,6 +689,8 @@ type overlay_params =
   ; min_entry_margin_ratio : float
   ; min_liq_mult : float
   ; leverage : float
+  ; full_balance_ref : bool
+  (** Reference total spot holdings instead of the accumulated basis. *)
   }
 
 let default_overlay_params =
@@ -697,6 +702,7 @@ let default_overlay_params =
   ; min_entry_margin_ratio = 2.0
   ; min_liq_mult = 2.5
   ; leverage = 0.0
+  ; full_balance_ref = false
   }
 ;;
 
@@ -800,6 +806,7 @@ let params_equal a b =
   && eq a.min_entry_margin_ratio b.min_entry_margin_ratio
   && eq a.min_liq_mult b.min_liq_mult
   && eq a.leverage b.leverage
+  && Bool.equal a.full_balance_ref b.full_balance_ref
 ;;
 
 let config_error context fmt =
@@ -1072,6 +1079,14 @@ let parse_overlays_from_trading trading_json =
          | _ -> default)
       | _ -> default
     in
+    let b name default =
+      match overlay |> member "params" with
+      | `Assoc _ as params ->
+        (match params |> member name with
+         | `Bool v -> v
+         | _ -> default)
+      | _ -> default
+    in
     { start_ratio_pct = p "start_ratio_pct" default_overlay_params.start_ratio_pct
     ; add_threshold_pct = p "add_threshold_pct" default_overlay_params.add_threshold_pct
     ; max_ratio_pct = p "max_ratio_pct" default_overlay_params.max_ratio_pct
@@ -1083,6 +1098,7 @@ let parse_overlays_from_trading trading_json =
         p "min_entry_margin_ratio" default_overlay_params.min_entry_margin_ratio
     ; min_liq_mult = p "min_liq_mult" default_overlay_params.min_liq_mult
     ; leverage = p "leverage" default_overlay_params.leverage
+    ; full_balance_ref = b "full_balance_ref" default_overlay_params.full_balance_ref
     }
   in
   let controllers = ref [] in

@@ -11,6 +11,7 @@ type fill =
   ; qty : float
   ; realized : float
   ; fee : float
+  ; market : string (** ["perp"] or ["spot"]. *)
   ; kind : string
   ; ts : float
   }
@@ -46,6 +47,7 @@ type t =
   ; last_recycle_base : float
   ; last_spot : fill option
   ; last_leverage : float
+  ; full_balance_ref : bool
   ; updated_at : float
   }
 
@@ -80,6 +82,7 @@ let default =
   ; last_recycle_base = 0.0
   ; last_spot = None
   ; last_leverage = 0.0
+  ; full_balance_ref = false
   ; updated_at = 0.0
   }
 ;;
@@ -114,6 +117,7 @@ let fill_of_json json =
   ; qty = f "qty" 0.0
   ; realized = f "realized" 0.0
   ; fee = f "fee" 0.0
+  ; market = get_string json "market" ""
   ; kind = get_string json "kind" ""
   ; ts = f "ts" 0.0
   }
@@ -125,6 +129,7 @@ let fill_to_json (x : fill) =
     ; "qty", `Float x.qty
     ; "realized", `Float x.realized
     ; "fee", `Float x.fee
+    ; "market", `String x.market
     ; "kind", `String x.kind
     ; "ts", `Float x.ts
     ]
@@ -176,6 +181,7 @@ let of_json json =
        | `Assoc _ as v -> Some (fill_of_json v)
        | _ -> None)
   ; last_leverage = get_float json "last_leverage" 0.0
+  ; full_balance_ref = get_bool json "full_balance_ref" false
   ; updated_at = get_float json "updated_at" 0.0
   }
 ;;
@@ -215,6 +221,7 @@ let to_json (x : t) =
      ; "spot_seq_seen", `Int x.spot_seq_seen
      ; "last_recycle_base", `Float x.last_recycle_base
      ; "last_leverage", `Float x.last_leverage
+     ; "full_balance_ref", `Bool x.full_balance_ref
      ; "updated_at", `Float x.updated_at
      ]
      @ fill_field "last_close" x.last_close
@@ -263,7 +270,7 @@ let record_close_fill t ~price ~qty ~realized ~fee ~kind ~ts =
   ; recycle_seq = (t.recycle_seq + if is_recycle then 1 else 0)
   ; recycle_realized_total =
       (t.recycle_realized_total +. if is_recycle then realized else 0.0)
-  ; last_close = Some { price; qty; realized; fee; kind; ts }
+  ; last_close = Some { price; qty; realized; fee; market = "perp"; kind; ts }
   ; updated_at = ts
   }
 ;;
@@ -272,7 +279,7 @@ let record_close_fill t ~price ~qty ~realized ~fee ~kind ~ts =
 let record_spot_fill t ~price ~qty ~realized ~fee ~kind ~ts =
   { t with
     spot_seq = t.spot_seq + 1
-  ; last_spot = Some { price; qty; realized; fee; kind; ts }
+  ; last_spot = Some { price; qty; realized; fee; market = "spot"; kind; ts }
   ; updated_at = ts
   }
 ;;

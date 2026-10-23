@@ -352,6 +352,7 @@ module Kraken_impl = struct
       Some
         { Types.order_id = o.order_id
         ; symbol = o.symbol
+        ; market = Types.Spot
         ; side = side_of_kraken_side o.side
         ; qty = o.order_qty
         ; cum_qty = o.cum_qty
@@ -372,6 +373,7 @@ module Kraken_impl = struct
       (fun (o : Kraken_executions_feed.open_order) ->
         { Types.order_id = o.order_id
         ; symbol = o.symbol
+        ; market = Types.Spot
         ; side = side_of_kraken_side o.side
         ; qty = o.order_qty
         ; cum_qty = o.cum_qty
@@ -422,6 +424,7 @@ module Kraken_impl = struct
           else status_of_kraken_status e.order_status
         in
         { Types.order_id = e.order_id
+        ; market = Types.Spot
         ; order_status = effective_status
         ; limit_price = e.limit_price
         ; side = side_of_kraken_side e.side
@@ -452,6 +455,7 @@ module Kraken_impl = struct
          in
          f
            { Types.order_id = e.order_id
+           ; market = Types.Spot
            ; order_status = effective_status
            ; limit_price = e.limit_price
            ; side = side_of_kraken_side e.side
@@ -535,6 +539,7 @@ module Kraken_impl = struct
           acc
           { Types.order_id = o.order_id
           ; symbol = o.symbol
+          ; market = Types.Spot
           ; side = side_of_kraken_side o.side
           ; qty = o.order_qty
           ; cum_qty = o.cum_qty

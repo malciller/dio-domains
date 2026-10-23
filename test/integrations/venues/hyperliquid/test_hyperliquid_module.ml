@@ -85,6 +85,13 @@ let test_spot_view_excludes_perp () =
   Alcotest.(check int) "spot pair has no perp order" 0 (List.length spot);
   let perp = Hyperliquid.Module.Hyperliquid_impl.get_open_orders ~symbol:"MODPERP" in
   Alcotest.(check int) "perp view has the order" 1 (List.length perp);
+  (match perp with
+   | [ o ] ->
+     Alcotest.(check bool)
+       "perp order is labelled perp"
+       true
+       (o.Dio_exchange.Exchange_intf.Types.market = Dio_exchange.Exchange_intf.Types.Perp)
+   | _ -> Alcotest.fail "expected exactly one perp order");
   let seen = ref [] in
   Hyperliquid.Module.Hyperliquid_impl.iter_open_orders_fast
     ~symbol:"MODPERP/USDC"

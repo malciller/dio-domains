@@ -236,6 +236,17 @@ let string_of_order_side = function
   | Sell -> "sell"
 ;;
 
+(** Instrument class carried by every order from construction to fill. Aliased to the
+    exchange layer's type so there is exactly one definition in the process. *)
+type market = Dio_exchange.Exchange_intf.Types.market =
+  | Spot
+  | Perp
+
+let string_of_market = function
+  | Spot -> "spot"
+  | Perp -> "perp"
+;;
+
 (** Operation type for a strategy order. *)
 type operation_type =
   | Place (* submit a new order *)
@@ -267,6 +278,7 @@ type strategy_order =
   { operation : operation_type (* place, amend, or cancel *)
   ; order_id : string option (* target order ID for amend/cancel; None for place *)
   ; symbol : string
+  ; market : market
   ; side : order_side
   ; order_type : string (* e.g. "limit", "market" *)
   ; qty : float
@@ -287,6 +299,25 @@ let generate_duplicate_key symbol side quantity limit_price =
   match limit_price with
   | Some p -> symbol ^ "|" ^ side ^ "|" ^ q_str ^ "|" ^ string_of_float p
   | None -> symbol ^ "|" ^ side ^ "|" ^ q_str ^ "|market"
+;;
+
+(** In-flight dedupe key for an overlay placement.
+
+    The logical kind (["carry:entry"], ["carry:recycle:close|ro"], ...) stays the value
+    the carry registry uses to match a resting order. The in-flight registry needs a key
+    that is unique per venue and instrument: a bare ["carry:entry"] is shared by every
+    symbol, so a placement that is still in flight - or whose key was never released -
+    suppresses the placement for every other symbol on every venue.
+
+    Shared by placement, replacement, and restart adoption so all three derive the exact
+    same key. *)
+let overlay_inflight_key ~dedup_key ~side ~qty ~price ~exchange ~instrument ~reduce_only =
+  let base =
+    if String.equal dedup_key ""
+    then generate_duplicate_key instrument side qty price
+    else dedup_key
+  in
+  base ^ "|" ^ exchange ^ "|" ^ instrument ^ if reduce_only then "|ro" else ""
 ;;
 
 (** Per-symbol strategy order-action counters.

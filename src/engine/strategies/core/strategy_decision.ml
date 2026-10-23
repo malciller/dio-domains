@@ -1239,6 +1239,9 @@ let sell_place_body
   ~pre
   =
   let is_alpaca = pre.sp_is_alpaca in
+  (* The grid's own instrument class, printed on every placement so a spot rung can never
+     be mistaken for a carry perp order in the log. *)
+  let market_label = if String.equal asset.exchange "lighter" then "perp" else "spot" in
   let alpaca_available = pre.sp_alpaca_available in
   let ledger_balance = pre.sp_ledger_balance in
   let committed_sell = pre.sp_committed_sell in
@@ -1306,6 +1309,14 @@ let sell_place_body
   in
   let min_order_size =
     if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
+  in
+  (* Venues that enforce a base-quantity minimum (Kraken) reject a clamped residual below
+     it even when the residual clears the lot step. Notional-floor venues
+     (Hyperliquid/Alpaca) keep the historical qty-floor exemption. *)
+  let venue_min_qty =
+    if ecfg.enforce_venue_min_qty
+    then Float.max min_order_size state.cached_venue_min_qty
+    else min_order_size
   in
   let is_accumulation = ecfg.use_accumulation_sells in
   let sell_mult = Float.min 1.0 (Float.max 0.0 state.cached_sell_mult) in
@@ -1400,9 +1411,9 @@ let sell_place_body
                  target_q
                  min_order_size);
           0.0, false)
-      else if available >= min_order_size -. 1e-9
+      else if available >= venue_min_qty -. 1e-9
       then
-        if rounded_avail >= min_order_size -. 1e-9 && rounded_avail > 0.0
+        if rounded_avail >= venue_min_qty -. 1e-9 && rounded_avail > 0.0
         then (
           Logging.debug_f
             ~section
@@ -1492,7 +1503,7 @@ let sell_place_body
     in
     let venue_min_ok q =
       q > 0.0
-      && q >= min_order_size -. 1e-9
+      && q >= venue_min_qty -. 1e-9
       && (min_notional <= 0.0 || q *. sell_price >= min_notional -. 1e-9)
     in
     if venue_min_ok effective_sell_qty
@@ -1539,7 +1550,8 @@ let sell_place_body
         then
           Logging.info_f
             ~section
-            "Placed sell order for %s: %.8f @ %.4f"
+            "Placed [%s] sell order for %s: %.8f @ %.4f"
+            market_label
             asset.symbol
             effective_sell_qty
             sell_price;
@@ -1560,9 +1572,10 @@ let sell_place_body
         in
         Logging.info_f
           ~section
-          "Sell basis for %s: qty %.8f @ %.4f ledger %.8f position %.8f credit %.8f \
+          "Sell basis [%s] for %s: qty %.8f @ %.4f ledger %.8f position %.8f credit %.8f \
            reserved %.8f available %.8f committed %.8f unnetted %.8f open_sell_base %.8f \
            quote_reserved %.8f"
+          market_label
           asset.symbol
           effective_sell_qty
           sell_price
@@ -1610,11 +1623,12 @@ let sell_place_body
            ~state
            ~now
            ~symbol:asset.symbol
-           ~kind:"sellable inventory below the quote-notional minimum"
+           ~kind:"sellable inventory below the venue minimum"
            (fun () ->
               Printf.sprintf
-                "sellable inventory below the quote-notional minimum (venue min $%.2f, \
-                 sell_price %.4f, sell qty %.8f)"
+                "sellable inventory below the venue minimum (min qty %.8f, min notional \
+                 $%.2f, sell_price %.4f, sell qty %.8f)"
+                venue_min_qty
                 min_notional
                 sell_price
                 effective_sell_qty));

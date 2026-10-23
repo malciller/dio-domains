@@ -203,6 +203,7 @@ let test_amend_request_preserves_flags () =
     { Dio_strategies.Strategy_common.operation = Dio_strategies.Strategy_common.Amend
     ; order_id = Some "oid-old"
     ; symbol = "TEST"
+    ; market = Dio_strategies.Strategy_common.Perp
     ; side = Dio_strategies.Strategy_common.Buy
     ; order_type = "limit"
     ; qty = 1.0
@@ -231,6 +232,7 @@ let carry_place_order duplicate_key =
   { Dio_strategies.Strategy_common.operation = Dio_strategies.Strategy_common.Place
   ; order_id = None
   ; symbol = "BTC"
+  ; market = Dio_strategies.Strategy_common.Perp
   ; side = Dio_strategies.Strategy_common.Sell
   ; order_type = "limit"
   ; qty = 0.001
@@ -249,6 +251,7 @@ let carry_amend_order ~symbol ~side ~reduce_only ~duplicate_key =
   { Dio_strategies.Strategy_common.operation = Dio_strategies.Strategy_common.Amend
   ; order_id = Some "old-id"
   ; symbol
+  ; market = Dio_strategies.Strategy_common.Perp
   ; side
   ; order_type = "limit"
   ; qty = 0.001

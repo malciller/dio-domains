@@ -152,8 +152,9 @@ let grid_callbacks : strategy_callbacks =
       (fun order order_id ->
         Logging.info_f
           ~section
-          "\226\156\147 Order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
+          "\226\156\147 Order placed successfully: %s [%s] %s %.8f @ %s (Order ID: %s)"
           (side_str order)
+          (Dio_strategies.Strategy_common.string_of_market order.market)
           order.symbol
           order.qty
           (price_str order)
@@ -168,8 +169,9 @@ let grid_callbacks : strategy_callbacks =
       (fun order err ->
         Logging.error_f
           ~section
-          "\226\156\151 Order placement failed: %s %s %.8f @ %s - %s"
+          "\226\156\151 Order placement failed: %s [%s] %s %.8f @ %s - %s"
           (side_str order)
+          (Dio_strategies.Strategy_common.string_of_market order.market)
           order.symbol
           order.qty
           (price_str order)
@@ -188,8 +190,9 @@ let grid_callbacks : strategy_callbacks =
       (fun order target_order_id new_order_id ->
         Logging.info_f
           ~section
-          "\226\156\147 Order amended successfully: %s %s %.8f @ %s New Order ID: %s"
+          "\226\156\147 Order amended successfully: %s [%s] %s %.8f @ %s New Order ID: %s"
           (side_str order)
+          (Dio_strategies.Strategy_common.string_of_market order.market)
           order.symbol
           order.qty
           (price_str order)
@@ -259,9 +262,9 @@ let grid_callbacks : strategy_callbacks =
 ;;
 
 (** Rebuild the full per-instrument in-flight key a carry amend belongs to. The amend
-    request carries the logical kind (["carry:entry"], ["carry:recycle:close|ro"]), while the
-    registry keys tracked orders by [kind|exchange|instrument(|ro)]. Without this the new id
-    would not suppress a duplicate while the venue's open-orders scan catches up. *)
+    request carries the logical kind (["carry:entry"], ["carry:recycle:close|ro"]), while
+    the registry keys tracked orders by [kind|exchange|instrument(|ro)]. Without this the
+    new id would not suppress a duplicate while the venue's open-orders scan catches up. *)
 let carry_amend_inflight_key (order : strategy_order) =
   let kind = order.duplicate_key in
   let root =
@@ -270,7 +273,11 @@ let carry_amend_inflight_key (order : strategy_order) =
     then String.sub kind 0 (n - 3)
     else kind
   in
-  root ^ "|" ^ order.exchange ^ "|" ^ order.symbol
+  root
+  ^ "|"
+  ^ order.exchange
+  ^ "|"
+  ^ order.symbol
   ^ if order.reduce_only then "|ro" else ""
 ;;
 
@@ -279,8 +286,10 @@ let hedger_callbacks : strategy_callbacks =
       (fun order order_id ->
         Logging.info_f
           ~section
-          "\226\156\147 Hedger order placed successfully: %s %s %.8f @ %s (Order ID: %s)"
+          "\226\156\147 Hedger order placed successfully: %s [%s] %s %.8f @ %s (Order \
+           ID: %s)"
           (side_str order)
+          (Dio_strategies.Strategy_common.string_of_market order.market)
           order.symbol
           order.qty
           (price_str order)
@@ -288,9 +297,9 @@ let hedger_callbacks : strategy_callbacks =
         Dio_strategies.Strategy_common.bind_carry_order
           ~dedup_key:order.duplicate_key
           ~order_id;
-        (* Release the placement key on ack, like the grid. The durable duplicate guard
-           is the acked id -> kind mapping in [carry_orders] ([has_tracked_carry_order],
-           no age bound), not this short-lived latch. *)
+        (* Release the placement key on ack, like the grid. The durable duplicate guard is
+           the acked id -> kind mapping in [carry_orders] ([has_tracked_carry_order], no
+           age bound), not this short-lived latch. *)
         ignore
           (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
              order.duplicate_key))
@@ -298,8 +307,9 @@ let hedger_callbacks : strategy_callbacks =
       (fun order err ->
         Logging.error_f
           ~section
-          "\226\156\151 Hedger order placement failed: %s %s %.8f @ %s - %s"
+          "\226\156\151 Hedger order placement failed: %s [%s] %s %.8f @ %s - %s"
           (side_str order)
+          (Dio_strategies.Strategy_common.string_of_market order.market)
           order.symbol
           order.qty
           (price_str order)
@@ -323,9 +333,11 @@ let hedger_callbacks : strategy_callbacks =
           Dio_strategies.Strategy_common.register_carry_order_id
             ~order_id:new_id
             ~market:
-              (if String.contains order.symbol '/'
-               then Dio_strategies.Strategy_common.Carry_spot
-               else Dio_strategies.Strategy_common.Carry_perp)
+              (match order.market with
+               | Dio_strategies.Strategy_common.Spot ->
+                 Dio_strategies.Strategy_common.Carry_spot
+               | Dio_strategies.Strategy_common.Perp ->
+                 Dio_strategies.Strategy_common.Carry_perp)
             ~maker:order.post_only
             ~kind:order.duplicate_key
             ~key:(carry_amend_inflight_key order)))
@@ -339,8 +351,7 @@ let hedger_callbacks : strategy_callbacks =
            replacement forever, and release its placement latch. The amend path
            re-registers the new id on its ack. *)
         (match
-           Dio_strategies.Strategy_common.retire_carry_order_key
-             ~order_id:target_order_id
+           Dio_strategies.Strategy_common.retire_carry_order_key ~order_id:target_order_id
          with
          | Some key ->
            ignore

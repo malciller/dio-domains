@@ -348,6 +348,7 @@ module Alpaca_impl = struct
       Some
         { Types.order_id = o.order_id
         ; symbol = o.symbol
+        ; market = Types.Spot
         ; side = o.side
         ; qty = o.qty
         ; cum_qty = o.cum_qty
@@ -366,6 +367,7 @@ module Alpaca_impl = struct
       (fun (o : Alpaca_executions.open_order_internal) ->
         { Types.order_id = o.order_id
         ; symbol = o.symbol
+        ; market = Types.Spot
         ; side = o.side
         ; qty = o.qty
         ; cum_qty = o.cum_qty
@@ -423,6 +425,7 @@ module Alpaca_impl = struct
     List.map
       (fun (e : Alpaca_executions.execution_event_internal) ->
         { Types.order_id = e.order_id
+        ; market = Types.Spot
         ; order_status = e.order_status
         ; limit_price = e.limit_price
         ; side = e.side
@@ -444,6 +447,7 @@ module Alpaca_impl = struct
       (fun (e : Alpaca_executions.execution_event_internal) ->
          f
            { Types.order_id = e.order_id
+           ; market = Types.Spot
            ; order_status = e.order_status
            ; limit_price = e.limit_price
            ; side = e.side
@@ -466,6 +470,7 @@ module Alpaca_impl = struct
           acc
           { Types.order_id = o.order_id
           ; symbol = o.symbol
+          ; market = Types.Spot
           ; side = o.side
           ; qty = o.qty
           ; cum_qty = o.cum_qty

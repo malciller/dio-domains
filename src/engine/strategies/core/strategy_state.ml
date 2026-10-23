@@ -37,6 +37,9 @@ type exchange_config =
   (** Set asset_low on sell insufficient-balance rejection *)
   ; use_reserved_base_guard : bool
   (** Check reserved_base + locked_in_sells before selling *)
+  ; enforce_venue_min_qty : bool
+  (** True when the venue rejects an order below its advertised base-quantity minimum
+      (Kraken). Notional-floor venues (Hyperliquid/Alpaca) keep their quote floor only. *)
   ; use_unnetted_sell_hold : bool
   (** Arm/consume the placed-sell hold overlay so a sell never sizes against base
       committed to a resting sell whose venue hold the balance feed has not netted.
@@ -461,6 +464,7 @@ let default_kraken_config =
   ; sell_uses_mult = true
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
+  ; enforce_venue_min_qty = true
   ; use_unnetted_sell_hold = true
   ; balance_nets_open_order_holds = true
   ; hold_netted_from_venue_state = false

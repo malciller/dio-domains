@@ -387,6 +387,15 @@ let asset_domain_worker
        [Exchange_wakeup.wait_since]. [oracle_gate_deadline] bounds when the warning may
        fire; it is checked on wakeups, never polled. *)
     let is_grid_strategy = is_file_bound_strategy in
+    (* The primary strategy's instrument class. The grid consumes only executions for its
+       own market: a spot grid must never consume a perp fill that lost its carry mapping,
+       and a perp grid (Lighter) must still consume its own fills. *)
+    let grid_market =
+      match asset_with_fees.exchange with
+      | "kraken" | "alpaca" | "ibkr" -> Types.Spot
+      | "lighter" -> Types.Perp
+      | _ -> if String.contains asset_with_fees.symbol '/' then Types.Spot else Types.Perp
+    in
     let oracle_tracks_asset =
       Oracle_runtime.tracks_asset
         ~exchange:asset_with_fees.exchange
@@ -704,6 +713,7 @@ let asset_domain_worker
        generation. Without this the overlay walks every resting sell on every tick. *)
     let overlay_inventory_caches =
       match overlay_controller with
+      | Some c when c.oc_params.full_balance_ref -> None
       | Some c -> Some (Overlay_inventory.create_caches c)
       | None -> None
     in
@@ -846,12 +856,14 @@ let asset_domain_worker
              in
              Logging.info_f
                ~section
-               "carry controller %s/%s: overlay %s, %d leg(s), spot_accum=%b"
+               "carry controller %s/%s: overlay %s, %d leg(s), spot_accum=%b, \
+                full_balance_ref=%b"
                c.oc_hedge_exchange
                c.oc_hedge_symbol
                overlay_path
                (List.length c.oc_legs)
-               c.oc_has_hl_spot_leg;
+               c.oc_has_hl_spot_leg
+               c.oc_params.full_balance_ref;
              Some
                (Dio_strategies.Strategy_runtime.create
                   ~handlers:(Config_grid_handlers.handler ctx)
@@ -940,93 +952,223 @@ let asset_domain_worker
            "carry leverage seed %s: unknown; the first take-profit waits for the first \
             position snapshot (set trading[].overlay.params.leverage to seed it)"
            asset_with_fees.symbol;
-       (* An already-open position with no durable ladder state is grandfathered at its
-          current ratio: the current short / accumulated base, with the add index at the
-          completed band (or the max). No forced cover, even if the configured max is
-          below the current ratio. *)
-       if !st.anchor <= 0.0
+       (* A basis-mode change resets the ladder to the new start first: a stale ratio
+          must never be applied to the new basis if the position snapshot is missing or
+          the balances are cold. If the position is known, grandfather its current short
+          against the new basis. *)
+       if !st.anchor <= 0.0 || !st.full_balance_ref <> p.full_balance_ref
        then (
          let ladder = derive_overlay_ladder p in
-         let accumulated = (Overlay_inventory.aggregate controller).total in
-         match
-           Dio_exchange.Market_context.get_position
-             ~exchange:asset_with_fees.exchange
-             ~coin:base_asset
-         with
-         | Some pos when pos.qty < -0.0001 && accumulated > 0.0 && pos.entry > 0.0 ->
-           let short_qty = -.pos.qty in
-           let ratio = short_qty /. accumulated in
-           if ratio > ladder.ol_max_ratio +. 1e-9
-           then
-             Logging.warn_f
-               ~section
-               "carry %s: grandfathered ratio %.4f exceeds configured max %.4f; no adds \
-                until the first profitable recycle"
-               asset_with_fees.symbol
-               ratio
-               ladder.ol_max_ratio;
-           Dio_strategies.Carry_runtime.init_ladder
+         let mode_changed = !st.full_balance_ref <> p.full_balance_ref in
+         if mode_changed
+         then
+           Dio_strategies.Carry_runtime.reset_ladder
              ~start_ratio:ladder.ol_start_ratio
-             ~add_amount:ladder.ol_add_amount
-             ~num_adds:ladder.ol_num_adds
-             ~add_threshold:ladder.ol_add_threshold
-             ~entry:pos.entry
-             ~accumulated
-             ~short_qty
-             ort
-         | _ -> ())
+             ort;
+         let accumulated = (Overlay_inventory.aggregate controller).total in
+         (match
+            Dio_exchange.Market_context.get_position
+              ~exchange:asset_with_fees.exchange
+              ~coin:base_asset
+          with
+          | Some pos when pos.qty < -0.0001 && accumulated > 0.0 && pos.entry > 0.0 ->
+            let short_qty = -.pos.qty in
+            let ratio = short_qty /. accumulated in
+            if ratio > ladder.ol_max_ratio +. 1e-9
+            then
+              Logging.warn_f
+                ~section
+                "carry %s: grandfathered ratio %.4f exceeds configured max %.4f; no adds \
+                 until the first profitable recycle"
+                asset_with_fees.symbol
+                ratio
+                ladder.ol_max_ratio;
+            Dio_strategies.Carry_runtime.init_ladder
+              ~start_ratio:ladder.ol_start_ratio
+              ~max_ratio:ladder.ol_max_ratio
+              ~add_amount:ladder.ol_add_amount
+              ~num_adds:ladder.ol_num_adds
+              ~add_threshold:ladder.ol_add_threshold
+              ~leverage:p.leverage
+              ~entry:pos.entry
+              ~accumulated
+              ~short_qty
+              ort
+          | _ -> ());
+         if mode_changed
+         then st := { !st with full_balance_ref = p.full_balance_ref })
      | _ -> ());
-    (* Adopt carry buy orders that survived a restart. The order-id -> kind registry is
-       in-memory, so a new process would otherwise not recognise a resting take-profit or
-       recycle order and would place a second one. The duplicate-cancel path in
-       [order_replace] then removes any extras left by an earlier restart. *)
+    (* Adopt carry orders that survived a restart. The order-id -> kind registry is
+       in-memory, so a new process would otherwise not recognise a resting take-profit,
+       recycle buy, or entry sell and would place a second one. The duplicate-cancel path
+       in [order_replace] then removes any extras left by an earlier restart. *)
     (match overlay_controller with
      | None -> ()
      | Some c ->
-       let adopt ~symbol ~market ~kind ~maker =
+       let adopt
+         ~symbol
+         ~instrument
+         ~(market : Types.market)
+         ~side
+         ~kind
+         ~maker
+         ~reduce_only
+         =
          match Ex.get_open_orders ~symbol with
          | orders ->
+           let carry_market =
+             match market with
+             | Types.Perp -> Dio_strategies.Strategy_common.Carry_perp
+             | Types.Spot -> Dio_strategies.Strategy_common.Carry_spot
+           in
            List.iter
              (fun (o : Types.open_order) ->
                if o.user_ref = Some Dio_strategies.Strategy_common.strategy_userref_carry
-                  && o.side = Types.Buy
+                  && o.market = market
+                  && o.side = side
                   && (o.status = Types.New || o.status = Types.PartiallyFilled)
-               then
+               then (
+                 (* [kind] is the registered logical kind (the TP carries the [|ro]
+                    suffix). The in-flight key is rebuilt from the unsuffixed root, the
+                    same way [overlay_inflight_key] builds it at placement. *)
+                 let key_kind =
+                   let n = String.length kind in
+                   if n > 3 && String.equal (String.sub kind (n - 3) 3) "|ro"
+                   then String.sub kind 0 (n - 3)
+                   else kind
+                 in
+                 let key =
+                   Dio_strategies.Strategy_common.overlay_inflight_key
+                     ~dedup_key:key_kind
+                     ~side:
+                       (match side with
+                        | Types.Buy -> "buy"
+                        | Types.Sell -> "sell")
+                     ~qty:0.0
+                     ~price:None
+                     ~exchange:c.oc_hedge_exchange
+                     ~instrument
+                     ~reduce_only
+                 in
                  Dio_strategies.Strategy_common.register_carry_order_id
                    ~order_id:o.order_id
-                   ~market
+                   ~market:carry_market
                    ~maker
                    ~kind
-                   ~key:kind)
+                   ~key))
              orders
          | exception _ -> ()
        in
        let perp_symbol = Config.base_coin_of_symbol c.oc_hedge_symbol in
+       (* Perp sells are entries; perp buys are reduce-only closes. *)
        adopt
          ~symbol:perp_symbol
-         ~market:Dio_strategies.Strategy_common.Carry_perp
+         ~instrument:perp_symbol
+         ~market:Types.Perp
+         ~side:Types.Buy
          ~kind:"carry:recycle:close|ro"
-         ~maker:false;
+         ~maker:false
+         ~reduce_only:true;
+       adopt
+         ~symbol:perp_symbol
+         ~instrument:perp_symbol
+         ~market:Types.Perp
+         ~side:Types.Sell
+         ~kind:"carry:entry"
+         ~maker:false
+         ~reduce_only:false;
        if not (String.equal perp_symbol c.oc_hedge_symbol)
        then
          adopt
            ~symbol:c.oc_hedge_symbol
-           ~market:Dio_strategies.Strategy_common.Carry_spot
+           ~instrument:c.oc_hedge_symbol
+           ~market:Types.Spot
+           ~side:Types.Buy
            ~kind:"carry:recycle"
-           ~maker:true);
+           ~maker:true
+           ~reduce_only:false);
     (* Terminal overlay fills are the only source of the actual close/spot prices used by
        the recycle split. Record the order's cumulative fill once, on its terminal event. *)
     let record_overlay_fill
       ~now_exec
+      ~(market : Types.market)
       (event : Dio_exchange.Exchange_intf.Types.execution_event)
       =
       match overlay_carry, overlay_rt, overlay_ctx with
       | Some r, Some rt, Some ctx ->
-        (match
-           Dio_strategies.Strategy_common.lookup_carry_order ~order_id:event.order_id
-         with
+        let meta_opt =
+          match
+            Dio_strategies.Strategy_common.lookup_carry_order ~order_id:event.order_id
+          with
+          | Some m -> Some (m, false)
+          | None when event.order_status = Types.Filled && event.filled_qty > 0.0 ->
+            (* A carry order can lose its id mapping across a restart/amend/resync while
+               still carrying the carry cloid. Infer the logical kind from the venue's
+               market label and the side so the fill is still booked on the correct leg
+               instead of being dropped (or, worse, routed to the grid). *)
+            (match market, event.side with
+             | Types.Perp, Types.Buy ->
+               Some
+                 ( { Dio_strategies.Strategy_common.com_market =
+                       Dio_strategies.Strategy_common.Carry_perp
+                   ; com_maker = false
+                   ; com_kind = "carry:close:unmapped"
+                   ; com_key = ""
+                   ; com_at = now_exec
+                   }
+                 , true )
+             | Types.Perp, Types.Sell ->
+               Some
+                 ( { Dio_strategies.Strategy_common.com_market =
+                       Dio_strategies.Strategy_common.Carry_perp
+                   ; com_maker = false
+                   ; com_kind = "carry:entry:unmapped"
+                   ; com_key = ""
+                   ; com_at = now_exec
+                   }
+                 , true )
+             | Types.Spot, Types.Buy ->
+               Some
+                 ( { Dio_strategies.Strategy_common.com_market =
+                       Dio_strategies.Strategy_common.Carry_spot
+                   ; com_maker = true
+                   ; com_kind = "carry:recycle:unmapped"
+                   ; com_key = ""
+                   ; com_at = now_exec
+                   }
+                 , true )
+             | Types.Spot, Types.Sell -> None)
+          | None -> None
+        in
+        (match meta_opt with
          | None -> ()
-         | Some meta ->
+         | Some (meta, synthetic) ->
+           if synthetic
+           then
+             Logging.warn_f
+               ~section
+               "carry order %s was not in the id registry; booked the %s %s fill as %s \
+                from the venue classification"
+               event.order_id
+               (Types.string_of_market market)
+               (match event.side with
+                | Types.Buy -> "buy"
+                | Types.Sell -> "sell")
+               meta.Dio_strategies.Strategy_common.com_kind;
+           let registry_market =
+             match meta.Dio_strategies.Strategy_common.com_market with
+             | Dio_strategies.Strategy_common.Carry_perp -> Types.Perp
+             | Dio_strategies.Strategy_common.Carry_spot -> Types.Spot
+           in
+           if registry_market <> market
+           then
+             Logging.warn_f
+               ~section
+               "carry order %s books as %s from the venue but was registered as %s; \
+                using the venue classification"
+               event.order_id
+               (Types.string_of_market market)
+               (Types.string_of_market registry_market);
            (* Retire the id -> kind mapping only on a terminal event. [New] and
               [PartiallyFilled] are live; retiring on the ack makes [order_replace] unable
               to recognize its own resting order. *)
@@ -1047,8 +1189,7 @@ let asset_domain_worker
                   closes the short and clears the fallback. The overlay also stamps the
                   entry fill time so [order_place] can hold a new entry until the position
                   snapshot catches up. *)
-               if meta.Dio_strategies.Strategy_common.com_market
-                  = Dio_strategies.Strategy_common.Carry_perp
+               if market = Types.Perp
                then (
                  let setf key v =
                    Dio_strategies.Strategy_runtime.set_platform
@@ -1071,15 +1212,15 @@ let asset_domain_worker
                (* Perp fills use the hedge venue's schedule; spot fills use the inventory
                   leg's. *)
                let fee_exchange, fee_symbol, fee_configured_maker, fee_configured_taker =
-                 match meta.Dio_strategies.Strategy_common.com_market with
-                 | Dio_strategies.Strategy_common.Carry_perp ->
+                 match market with
+                 | Types.Perp ->
                    let exchange, symbol =
                      match overlay_controller with
                      | Some c -> c.oc_hedge_exchange, c.oc_hedge_symbol
                      | None -> asset_with_fees.exchange, asset_with_fees.symbol
                    in
                    exchange, symbol, None, None
-                 | Dio_strategies.Strategy_common.Carry_spot ->
+                 | Types.Spot ->
                    ( asset_with_fees.exchange
                    , asset_with_fees.symbol
                    , asset_with_fees.maker_fee
@@ -1115,7 +1256,10 @@ let asset_domain_worker
                Dio_strategies.Carry_runtime.record_fill
                  ~exchange:asset_with_fees.exchange
                  ~symbol:asset_with_fees.symbol
-                 ~market:meta.Dio_strategies.Strategy_common.com_market
+                 ~market:
+                   (if market = Types.Perp
+                    then Dio_strategies.Strategy_common.Carry_perp
+                    else Dio_strategies.Strategy_common.Carry_spot)
                  ~maker:meta.Dio_strategies.Strategy_common.com_maker
                  ~kind:meta.Dio_strategies.Strategy_common.com_kind
                  ~side
@@ -1132,21 +1276,23 @@ let asset_domain_worker
                Logging.info_f
                  ~section
                  "carry fill: %s %s %.8g @ %.8f (%s)"
-                 (match meta.Dio_strategies.Strategy_common.com_market with
-                  | Dio_strategies.Strategy_common.Carry_perp -> "perp"
-                  | Dio_strategies.Strategy_common.Carry_spot -> "spot")
+                 (Types.string_of_market market)
                  (match side with
                   | Dio_strategies.Strategy_common.Buy -> "buy"
                   | Dio_strategies.Strategy_common.Sell -> "sell")
                  event.filled_qty
                  event.avg_price
                  meta.Dio_strategies.Strategy_common.com_kind);
-           Dio_strategies.Strategy_common.retire_carry_order ~order_id:event.order_id;
-           (* Terminal fill/cancel releases the placement latch, like the grid's
-              [inflight_sell]. *)
-           ignore
-             (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
-                meta.Dio_strategies.Strategy_common.com_key))
+           if not synthetic
+           then (
+             Dio_strategies.Strategy_common.retire_carry_order ~order_id:event.order_id;
+             (* Terminal fill/cancel releases the placement latch, like the grid's
+                [inflight_sell]. *)
+             if not (String.equal meta.Dio_strategies.Strategy_common.com_key "")
+             then
+               ignore
+                 (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+                    meta.Dio_strategies.Strategy_common.com_key)))
       | _ -> ()
     in
     (* Overlay cycle inputs. The overlay is independent of the grid's oracle gate: it
@@ -1402,6 +1548,27 @@ let asset_domain_worker
                        | None -> false)
                     | None -> false)
                in
+               (* The grid is a SPOT strategy. A perp execution must never reach its
+                  fill/cancel handlers, even when the id -> carry mapping was lost (a
+                  restart, an amend, a resync): the venue labelled the instrument, so use
+                  that label rather than trusting the registry alone. *)
+               let grid_event =
+                 is_grid_strategy && (not overlay_event) && event.market = grid_market
+               in
+               if is_grid_strategy && (not overlay_event) && event.market <> grid_market
+               then
+                 Logging.warn_f
+                   ~section
+                   "ignoring %s %s execution for %s order %s: no carry mapping; refusing \
+                    to route it to the %s grid"
+                   (match event.order_status with
+                    | Types.Filled -> "filled"
+                    | Types.Canceled | Types.Rejected | Types.Expired -> "terminal"
+                    | _ -> "open")
+                   (Types.string_of_market event.market)
+                   asset_with_fees.symbol
+                   event.order_id
+                   (Types.string_of_market grid_market);
                match event.order_status with
                | Types.Canceled | Types.Rejected | Types.Expired ->
                  should_execute_strategy := true;
@@ -1411,8 +1578,9 @@ let asset_domain_worker
                    | Types.Buy -> Dio_strategies.Strategy_common.Buy
                    | Types.Sell -> Dio_strategies.Strategy_common.Sell
                  in
-                 if overlay_event then record_overlay_fill ~now_exec event;
-                 if is_grid_strategy && not overlay_event
+                 if overlay_event
+                 then record_overlay_fill ~now_exec ~market:event.market event;
+                 if grid_event
                  then
                    Dio_strategies.Strategy_api.Strategy.record_exec_event
                      asset_with_fees.symbol
@@ -1425,7 +1593,7 @@ let asset_domain_worker
                         | Dio_strategies.Strategy_common.Sell -> "sell")
                      ~cl_ord_id:event.cl_ord_id
                      ();
-                 if is_grid_strategy && not overlay_event
+                 if grid_event
                  then
                    route_exec
                      ~kind:"cancelled"
@@ -1454,18 +1622,12 @@ let asset_domain_worker
                  in
                  if overlay_event
                  then (
-                   let fill_market, fill_perp =
-                     match
-                       Dio_strategies.Strategy_common.lookup_carry_order
-                         ~order_id:event.order_id
-                     with
-                     | Some meta ->
-                       (match meta.Dio_strategies.Strategy_common.com_market with
-                        | Dio_strategies.Strategy_common.Carry_perp -> "perp", true
-                        | Dio_strategies.Strategy_common.Carry_spot -> "spot", false)
-                     | None -> "", false
-                   in
-                   record_overlay_fill ~now_exec event;
+                   (* The venue's own market label is authoritative for the fill event.
+                      The registry supplies the logical carry kind; it must not decide
+                      spot vs perp, or a lost/mis-bound id books a perp fill as spot. *)
+                   let fill_market = Types.string_of_market event.market in
+                   let fill_perp = event.market = Types.Perp in
+                   record_overlay_fill ~now_exec ~market:event.market event;
                    (* Carry overlays are event-bound like the grid: dispatch the fill
                       through the overlay interpreter in this event. A take-profit close
                       then re-places the replacement short immediately instead of waiting
@@ -1513,7 +1675,7 @@ let asset_domain_worker
                                    )
                                  ])))
                    | _ -> ());
-                 if is_grid_strategy && not overlay_event
+                 if grid_event
                  then
                    Dio_strategies.Strategy_api.Strategy.record_exec_event
                      asset_with_fees.symbol
@@ -1528,7 +1690,7 @@ let asset_domain_worker
                      ~qty:event.filled_qty
                      ~cl_ord_id:event.cl_ord_id
                      ();
-                 if is_grid_strategy && not overlay_event
+                 if grid_event
                  then
                    route_exec
                      ~kind:"filled"
@@ -1576,7 +1738,7 @@ let asset_domain_worker
                        | Types.Buy -> Dio_strategies.Strategy_common.Buy
                        | Types.Sell -> Dio_strategies.Strategy_common.Sell
                      in
-                     if is_grid_strategy && not overlay_event
+                     if grid_event
                      then
                        Dio_strategies.Strategy_api.Strategy.record_exec_event
                          asset_with_fees.symbol
@@ -1590,7 +1752,7 @@ let asset_domain_worker
                             | Dio_strategies.Strategy_common.Sell -> "sell")
                          ~price
                          ();
-                     if is_grid_strategy && not overlay_event
+                     if grid_event
                      then
                        route_exec
                          ~kind:"amended"
@@ -1620,7 +1782,7 @@ let asset_domain_worker
                        | Types.Buy -> Dio_strategies.Strategy_common.Buy
                        | Types.Sell -> Dio_strategies.Strategy_common.Sell
                      in
-                     if is_grid_strategy && not overlay_event
+                     if grid_event
                      then
                        Dio_strategies.Strategy_api.Strategy.record_exec_event
                          asset_with_fees.symbol
@@ -1633,7 +1795,7 @@ let asset_domain_worker
                             | Dio_strategies.Strategy_common.Sell -> "sell")
                          ~price
                          ();
-                     if is_grid_strategy && not overlay_event
+                     if grid_event
                      then
                        route_exec
                          ~kind:"acknowledged"
