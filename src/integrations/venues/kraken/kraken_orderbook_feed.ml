@@ -13,6 +13,12 @@ type state_t =
   }
 
 let state = { active_conn = None; mutex = Lwt_mutex.create () }
+
+(** Monotone incarnation counter for the orderbook socket. A read loop from an earlier
+    incarnation must stop feeding frames: two live subscriptions interleave snapshots and
+    deltas from different sequence spaces into the same store. *)
+let conn_generation = ref 0
+
 let get_conduit_ctx = Kraken_common_types.get_conduit_ctx
 let orderbook_depth = Kraken_common_types.default_orderbook_depth
 let ring_buffer_size = Kraken_common_types.default_ring_buffer_size_orderbook
@@ -1534,7 +1540,7 @@ let wait_for_orderbook_data = wait_for_orderbook_data_lwt
 (** Subscribe to orderbook channels and enter the asynchronous read loop. Invokes
     [on_failure] on connection loss; resolves the returned promise when the loop
     terminates. *)
-let start_message_handler conn symbols on_failure on_heartbeat =
+let start_message_handler ~my_gen conn symbols on_failure on_heartbeat =
   let subscribe_msg =
     `Assoc
       [ "method", `String "subscribe"
@@ -1572,8 +1578,13 @@ let start_message_handler conn symbols on_failure on_heartbeat =
         then state.active_conn <- None;
         Lwt.return_unit)
       >>= fun () ->
-      on_failure reason;
-      Lwt.return_unit)
+      (* A superseded socket was closed by [connect_and_subscribe]; reporting it as a
+         failure would make the supervisor reconnect on top of the replacement. *)
+      if my_gen <> !conn_generation
+      then Lwt.return_unit
+      else (
+        on_failure reason;
+        Lwt.return_unit))
     else Lwt.return_unit
   in
   let process_frame = function
@@ -1581,10 +1592,15 @@ let start_message_handler conn symbols on_failure on_heartbeat =
       Logging.warn ~section "Orderbook WebSocket closed by server";
       notify_failure "Connection closed by server"
     | frame ->
-      (* parse+dispatch run on the Parse_worker domain; this returns immediately (no
-         awaiting), keeping the WS read loop tight. *)
-      let () = handle_message_async frame.Websocket.Frame.content on_heartbeat in
-      Lwt.return_unit
+      (* A superseded incarnation must not feed the parse queue: its frames belong to an
+         older sequence space and would race the new connection's snapshot. *)
+      if my_gen <> !conn_generation
+      then Lwt.return_unit
+      else (
+        (* parse+dispatch run on the Parse_worker domain; this returns immediately (no
+           awaiting), keeping the WS read loop tight. *)
+        let () = handle_message_async frame.Websocket.Frame.content on_heartbeat in
+        Lwt.return_unit)
   in
   Lwt_mutex.with_lock state.mutex (fun () ->
     state.active_conn <- Some conn;
@@ -1722,6 +1738,16 @@ and resubscribe_symbol symbol =
     in
     let msg_str = Yojson.Safe.to_string unsub_msg in
     Logging.info_f ~section "Unsubscribing %s before re-subscribing" symbol;
+    (* The venue's snapshot only touches the levels it sends, so a resubscribe that starts
+       from a partially populated book fails its first checksum and loops. *)
+    (match store_opt symbol with
+     | Some store ->
+       Hashtbl.clear store.bids;
+       Hashtbl.clear store.asks;
+       RingBuffer.clear store.buffer;
+       Atomic.set store.has_snapshot false;
+       Atomic.set store.last_sequence None
+     | None -> ());
     Ws_lwt.write conn (Websocket.Frame.create ~content:msg_str ())
     >>= fun () -> Lwt_unix.sleep 0.25 >>= fun () -> subscribe_symbols [ symbol ]
   | None ->
@@ -1778,6 +1804,32 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   let all_syms = add_subscribed_symbols symbols in
   let uri = Uri.of_string "wss://ws.kraken.com/v2" in
   Logging.debug_f ~section "Connecting to Kraken orderbook WebSocket...";
+  (* Tear down the previous incarnation first: on a data timeout the supervisor reconnects
+     while the old read loop is still parked in [Ws_lwt.read] on a dead-but-open socket,
+     which keeps the old subscription alive server-side. Bump and steal under
+     [state.mutex] so two callers cannot each supersede and then close the other's socket. *)
+  Lwt_mutex.with_lock state.mutex (fun () ->
+    let my_gen = !conn_generation + 1 in
+    conn_generation := my_gen;
+    let old = state.active_conn in
+    state.active_conn <- None;
+    Lwt.return (my_gen, old))
+  >>= fun (my_gen, old) ->
+  (match old with
+   | None -> Lwt.return_unit
+   | Some old ->
+     Lwt.catch
+       (fun () -> Lwt_unix.with_timeout 2.0 (fun () -> Ws_lwt.close_transport old))
+       (fun exn ->
+         Logging.debug_f
+           ~section
+           "Closing previous orderbook socket failed: %s"
+           (Printexc.to_string exn);
+         Lwt.return_unit))
+  >>= fun () ->
+  (* Clear after the old socket is gone so no straggler delta can land in a book the new
+     snapshot is about to initialise. The supervisor also calls this; idempotent. *)
+  clear_all_stores ();
   Lwt_unix.getaddrinfo "ws.kraken.com" "443" [ Unix.AI_FAMILY Unix.PF_INET ]
   >>= fun addresses ->
   let ip =
@@ -1789,16 +1841,26 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   let ctx = get_conduit_ctx () in
   Lwt_unix.with_timeout ws_connect_timeout_s (fun () -> Ws_lwt.connect ~ctx client uri)
   >>= fun conn ->
-  Lwt_mutex.with_lock state.mutex (fun () ->
-    state.active_conn <- Some conn;
-    Lwt.return_unit)
-  >>= fun () ->
-  Logging.debug_f ~section "Orderbook WebSocket established, subscribing...";
-  on_connected ();
-  start_message_handler conn all_syms on_failure on_heartbeat
-  >>= fun () ->
-  Logging.debug_f ~section "Orderbook WebSocket connection closed";
-  Lwt.return_unit
+  if my_gen <> !conn_generation
+  then (
+    (* Superseded while the handshake was in flight. Publish nothing, and close the socket
+       so it cannot keep a second subscription alive on the venue. *)
+    Logging.debug_f
+      ~section
+      "Orderbook handshake superseded (gen %d); closing the new socket"
+      my_gen;
+    Lwt.catch (fun () -> Ws_lwt.close_transport conn) (fun _exn -> Lwt.return_unit))
+  else
+    Lwt_mutex.with_lock state.mutex (fun () ->
+      state.active_conn <- Some conn;
+      Lwt.return_unit)
+    >>= fun () ->
+    Logging.debug_f ~section "Orderbook WebSocket established, subscribing...";
+    on_connected ();
+    start_message_handler ~my_gen conn all_syms on_failure on_heartbeat
+    >>= fun () ->
+    Logging.debug_f ~section "Orderbook WebSocket connection closed";
+    Lwt.return_unit
 ;;
 
 let initialize symbols =

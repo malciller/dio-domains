@@ -27,9 +27,14 @@ open Lwt.Infix
 (* Capital-oracle runtime; explicit alias avoids opening the whole Dio_oracle namespace. *)
 module Oracle_runtime = Dio_oracle.Oracle_runtime
 
-(** Enable backtraces only when DIO_BACKTRACE is set; avoids allocation overhead in
-    production. *)
-let () = Printexc.record_backtrace (Sys.getenv_opt "DIO_BACKTRACE" |> Option.is_some)
+(** Backtraces default on: an unhandled async exception is reported once, and without a
+    stack the line names no call site. [DIO_BACKTRACE=0] disables the per-raise cost. *)
+let () =
+  Printexc.record_backtrace
+    (match Sys.getenv_opt "DIO_BACKTRACE" with
+     | Some ("0" | "false" | "off" | "no") -> false
+     | _ -> true)
+;;
 
 module Fear_and_greed = Cmc.Fear_and_greed
 
@@ -175,9 +180,12 @@ let setup_lwt_exception_handler () =
        let backtrace = Printexc.get_backtrace () in
        Logging.critical_f
          ~section:"main"
-         "Unhandled exception in Lwt.async: %s\nBacktrace:\n%s"
+         "Unhandled exception in Lwt.async: %s\nBacktrace:\n%s%s"
          (Printexc.to_string exn)
-         backtrace;
+         backtrace
+         (if backtrace = ""
+          then "(empty - the exception carried no recorded stack)"
+          else "");
        (* Swallow the exception; re-raising here would terminate the process. *)
        ()
 ;;

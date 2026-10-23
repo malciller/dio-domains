@@ -159,12 +159,17 @@ let grid_callbacks : strategy_callbacks =
           order.qty
           (price_str order)
           order_id;
-        match order.price with
-        | Some price ->
-          Dio_strategies.Strategy_api.Strategy.enqueue_event
-            order.symbol
-            (Ack { now = Unix.gettimeofday (); order_id; side = order.side; price })
-        | None -> ())
+        (match order.price with
+         | Some price ->
+           Dio_strategies.Strategy_api.Strategy.enqueue_event
+             order.symbol
+             (Ack { now = Unix.gettimeofday (); order_id; side = order.side; price })
+         | None -> ());
+        (* Only the 60s TTL sweep freed this before, so every place for the rung was
+           dropped as a duplicate until then. *)
+        ignore
+          (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+             order.duplicate_key))
   ; on_place_fail =
       (fun order err ->
         Logging.error_f
@@ -180,12 +185,16 @@ let grid_callbacks : strategy_callbacks =
         Dio_strategies.Strategy_api.Strategy.enqueue_event
           order.symbol
           (Failed { now = Unix.gettimeofday (); side = order.side; reason = err });
-        match order.price with
-        | Some price ->
-          Dio_strategies.Strategy_api.Strategy.enqueue_event
-            order.symbol
-            (Rejected { now = Unix.gettimeofday (); side = order.side; price })
-        | None -> ())
+        (match order.price with
+         | Some price ->
+           Dio_strategies.Strategy_api.Strategy.enqueue_event
+             order.symbol
+             (Rejected { now = Unix.gettimeofday (); side = order.side; price })
+         | None -> ());
+        (* Free the latch even if the domain thread that consumes [Failed] is stalled. *)
+        ignore
+          (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+             order.duplicate_key))
   ; on_amend_ok =
       (fun order target_order_id new_order_id ->
         Logging.info_f

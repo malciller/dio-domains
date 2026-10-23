@@ -183,28 +183,31 @@ let background_cpus () =
     List.filter (fun c -> not (List.mem c trading)) (online_cpus ())
 ;;
 
-(** Round-robin allocator over the background CPU list. *)
+(** Round-robin allocator over the background CPU list. Cursor is atomic: overflow trading
+    domains allocate from it concurrently while they are spawned. *)
 let make_background_allocator () =
   let cpus = Array.of_list (background_cpus ()) in
   let n = Array.length cpus in
-  let i = ref 0 in
+  let i = Atomic.make 0 in
   fun () ->
     if n = 0
     then -1
     else (
-      let c = cpus.(!i mod n) in
-      incr i;
-      c)
+      let k = Atomic.fetch_and_add i 1 in
+      cpus.(k mod n))
 ;;
 
 (** Shared background allocator so distinct background domains/threads land on distinct
-    (E-)cores instead of all piling onto the first one. *)
-let background_alloc = lazy (make_background_allocator ())
+    (E-)cores instead of all piling onto the first one.
+
+    Eager, not [lazy]: spawning domains force it concurrently, and OCaml 5 raises
+    [CamlinternalLazy.Undefined] in all but the winner. *)
+let background_alloc = make_background_allocator ()
 
 (** Pin the calling thread to a background CPU (best-effort): keeps feed parsing,
     persistence and the supervisor off the trading P-cores so they cannot preempt a
     trading cycle. *)
-let pin_self_background () = pin_self (Lazy.force background_alloc ())
+let pin_self_background () = pin_self (background_alloc ())
 
 (** Pin the calling domain to a fixed background range [lo, hi] (best-effort). Used to
     keep the busy-spin canary and other polling work off the trading cores. *)

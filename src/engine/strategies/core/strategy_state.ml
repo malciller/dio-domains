@@ -482,8 +482,15 @@ let default_kraken_config =
 let strategy_states = Atomic.make Strategy_common.StringMap.empty
 
 (** Symbol -> resolved state key, invalidated when the configured-strategy registry
-    changes. Keeps the hot-path lookup off the O(entries) registry scan. *)
-let state_key_cache : (string, string * int) Hashtbl.t = Hashtbl.create 32
+    changes. Keeps the hot-path lookup off the O(entries) registry scan.
+
+    Copy-on-write in an atomic cell: this is read from [get_strategy_state] on trading
+    cycles, where a process-wide mutex blocks the domain thread (and its Lwt engine)
+    behind whichever domain holds it. The table is tiny and changes once per config
+    version, so a map copy on miss is cheaper than a lock on every hit. *)
+let state_key_cache : (string * int) Strategy_common.StringMap.t Atomic.t =
+  Atomic.make Strategy_common.StringMap.empty
+;;
 
 let state_key_mutex = Mutex.create ()
 
@@ -491,24 +498,34 @@ let state_key_of_symbol asset_symbol =
   let version =
     Dio_persistence.Persistence_orchestrator.current_configured_strategies_version ()
   in
-  Mutex.lock state_key_mutex;
-  let key =
-    match Hashtbl.find_opt state_key_cache asset_symbol with
-    | Some (k, v) when v = version -> k
-    | _ ->
-      let k =
-        match
-          Dio_persistence.Persistence_orchestrator.unique_configured_strategy_for_symbol
-            asset_symbol
-        with
-        | Some (strategy, venue) -> strategy ^ ":" ^ asset_symbol ^ ":" ^ venue
-        | None -> asset_symbol
-      in
-      Hashtbl.replace state_key_cache asset_symbol (k, version);
-      k
-  in
-  Mutex.unlock state_key_mutex;
-  key
+  match Strategy_common.StringMap.find_opt asset_symbol (Atomic.get state_key_cache) with
+  | Some (k, v) when v = version -> k
+  | _ ->
+    Mutex.lock state_key_mutex;
+    let key =
+      match
+        Strategy_common.StringMap.find_opt asset_symbol (Atomic.get state_key_cache)
+      with
+      | Some (k, v) when v = version -> k
+      | _ ->
+        let k =
+          match
+            Dio_persistence.Persistence_orchestrator.unique_configured_strategy_for_symbol
+              asset_symbol
+          with
+          | Some (strategy, venue) -> strategy ^ ":" ^ asset_symbol ^ ":" ^ venue
+          | None -> asset_symbol
+        in
+        Atomic.set
+          state_key_cache
+          (Strategy_common.StringMap.add
+             asset_symbol
+             (k, version)
+             (Atomic.get state_key_cache));
+        k
+    in
+    Mutex.unlock state_key_mutex;
+    key
 ;;
 
 (** Retrieves or lazily initializes the strategy state for [asset_symbol]. *)

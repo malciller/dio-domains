@@ -10,8 +10,8 @@
     "price_ticks": true
   },
   "gc": {
-    "minor_heap_size": 524288,
-    "space_overhead": 200,
+    "minor_heap_size": 1048576,
+    "space_overhead": 120,
     "max_overhead": 1000000,
     "window_size": 10,
     "allocation_policy": 2,

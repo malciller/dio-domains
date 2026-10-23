@@ -2801,10 +2801,13 @@ let asset_domain_worker
           let stall_us = stall_ns / 1000 in
           let sched_str =
             let stw =
-              Printf.sprintf
-                " stw=%s"
-                (Latency_profiler.format_us
-                   (float (Canary.last_window_max_ns ()) /. 1000.0))
+              if Canary.is_running ()
+              then
+                Printf.sprintf
+                  " stw=%s"
+                  (Latency_profiler.format_us
+                     (float (Canary.last_window_max_ns ()) /. 1000.0))
+              else " stw=n/a"
             in
             (if stall_us <= 0
              then Printf.sprintf " cpu=%dus stall=0us" cpu_us
@@ -3107,7 +3110,12 @@ let start_domain config state fee_fetcher =
              exceeds the core count; those overflow domains stay unpinned and share the
              remaining cores. *)
           let cpu = state.pinned_cpu in
-          Thread_affinity.pin_self cpu;
+          (* An overflow domain must stay off the cores the pinned ones own: fully
+             unpinned, CFS can place it on a trading P-core and preempt a whole timeslice.
+             Share the background set instead. *)
+          if cpu >= 0
+          then Thread_affinity.pin_self cpu
+          else Thread_affinity.pin_self_background ();
           (* Opt-in real-time priority: DIO_TRADING_RT_PRIO (e.g. 50) runs the domain
              SCHED_FIFO so no CFS thread can preempt it. Needs CAP_SYS_NICE (see
              Thread_affinity.set_self_rt). Only rung on for a domain that owns a core: an
@@ -3116,12 +3124,20 @@ let start_domain config state fee_fetcher =
           (match Thread_affinity.configured_rt_prio () with
            | Some prio when cpu >= 0 -> Thread_affinity.set_self_rt prio
            | Some _ | None -> ());
-          Logging.info_f
-            ~section
-            "domain %s/%s pinned to cpu %d"
-            asset.exchange
-            asset.symbol
-            cpu;
+          if cpu >= 0
+          then
+            Logging.info_f
+              ~section
+              "domain %s/%s pinned to cpu %d"
+              asset.exchange
+              asset.symbol
+              cpu
+          else
+            Logging.info_f
+              ~section
+              "domain %s/%s pinned to the background CPU set (no trading core left)"
+              asset.exchange
+              asset.symbol;
           let clk_per_call, busy_wall_ns, busy_cpu_ns =
             Monotonic_clock.calibration_summary ()
           in
@@ -3306,8 +3322,8 @@ let spawn_supervised_domains_for_assets
     Logging.warn_f
       ~section
       "affinity: %d trading domains but only %d trading CPUs (%s); the %d highest \
-       cpu_priority get a dedicated core and the remaining %d run unpinned (shared \
-       cores)"
+       cpu_priority get a dedicated core and the remaining %d are pinned to the \
+       background CPU set (shared, but off the trading cores)"
       domain_count
       cpu_count
       (String.concat "," (List.map string_of_int (Thread_affinity.trading_cpus ())))
