@@ -39,3 +39,10 @@ VS Code API.
   ```
 - After changing the extension files you can reload the VS Code window
   (Cmd+Shift+P → *Developer: Reload Window*).
+
+## Zed
+
+Zed cannot consume TextMate grammars, so it has its own extension at
+[`editors/zed-strategy`](../zed-strategy/README.md). It provides the same
+highlighting and `dio strategy lsp` diagnostics using the tree-sitter grammar in
+[`editors/tree-sitter-strategy`](../tree-sitter-strategy).

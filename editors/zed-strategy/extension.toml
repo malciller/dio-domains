@@ -1,0 +1,19 @@
+id = "dio-strategy"
+name = "Dio Strategy"
+version = "0.1.0"
+schema_version = 1
+authors = ["Dio"]
+description = "Syntax highlighting and live validation for Dio `.strategy` scripts."
+repository = "https://github.com/malciller/dio-domains"
+
+[grammars.strategy]
+repository = "https://github.com/malciller/dio-domains"
+# `dev-install.sh` rewrites this to a local commit in the generated dev copy.
+# For a published extension, set this to the commit that contains
+# `editors/tree-sitter-strategy`.
+rev = "REPLACE_WITH_COMMIT"
+path = "editors/tree-sitter-strategy"
+
+[language_servers.dio-strategy]
+name = "Dio Strategy"
+languages = ["Strategy"]
