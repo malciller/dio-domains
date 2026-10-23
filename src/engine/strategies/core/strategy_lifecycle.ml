@@ -1161,13 +1161,9 @@ let sync_open_orders
       if repeat
       then
         Hashtbl.replace state.evicted_orders oid (now_time +. ghost_buy_evict_ttl_s, Buy)
-      else (
-        (* The buy left the book with no terminal event. Arm the owed sell and request a
-           balance/open-orders resync; the inventory gate blocks the sell if the order was
-           only canceled. On a repeat the first purge already armed both, and the resync
-           it requested is the one that re-listed the phantom. *)
-        state.just_filled_buy <- true;
-        state.needs_resync <- true)))
+      else
+        (* A ghost is an absence, not a fill: resync, and let the outcome arm the sell. *)
+        state.needs_resync <- true))
   else if (not state.inflight_cancel_buy)
           && (not state.inflight_buy)
           && not state.inflight_amend_buy

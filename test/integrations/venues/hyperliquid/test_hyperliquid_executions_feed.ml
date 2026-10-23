@@ -444,6 +444,38 @@ let test_fill_intent_close_short () =
      | None -> Alcotest.fail "expected direction note")
 ;;
 
+let test_open_orders_snapshot_does_not_cancel_newer_local_order () =
+  (* A resync snapshot can predate a placement; absence must not cancel an order injected
+     after the request. *)
+  let symbol = "RACESNAP/USDC" in
+  Hyperliquid.Executions_feed.initialize [ symbol ];
+  Hyperliquid.Executions_feed.inject_order
+    ~symbol
+    ~order_id:"raced-1"
+    ~side:Hyperliquid.Executions_feed.Buy
+    ~qty:1.0
+    ~price:100.0
+    ();
+  let injected_at =
+    match Hyperliquid.Executions_feed.get_open_order symbol "raced-1" with
+    | Some o -> o.last_updated
+    | None -> Alcotest.fail "order not injected"
+  in
+  Hyperliquid.Executions_feed.inject_open_orders
+    ~requested_at:(injected_at -. 1.0)
+    (`List []);
+  Alcotest.(check bool)
+    "an order placed after the snapshot request survives the reconcile"
+    true
+    (Option.is_some (Hyperliquid.Executions_feed.get_open_order symbol "raced-1"));
+  let later = injected_at +. 1.0 in
+  Hyperliquid.Executions_feed.inject_open_orders ~requested_at:later (`List []);
+  Alcotest.(check bool)
+    "a later snapshot retires the order"
+    false
+    (Option.is_some (Hyperliquid.Executions_feed.get_open_order symbol "raced-1"))
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Executions Feed"
@@ -470,6 +502,10 @@ let () =
             "amend replacement is visible"
             `Quick
             test_amend_replacement_visible
+        ; Alcotest.test_case
+            "snapshot does not cancel a newer local order"
+            `Quick
+            test_open_orders_snapshot_does_not_cancel_newer_local_order
         ; Alcotest.test_case
             "fill intent: close short"
             `Quick

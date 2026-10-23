@@ -206,6 +206,8 @@ let handle_order_acknowledged ~now asset_symbol order_id side price =
       (match side with
        | Buy ->
          add_tracked_order_id state order_id;
+         (* A venue ack outranks a feed absence: un-evict a ghosted id. *)
+         Hashtbl.remove state.evicted_orders order_id;
          state.last_buy_order_id <- Some order_id;
          state.last_buy_order_price <- Some price;
          state.inflight_buy <- false;
@@ -287,12 +289,16 @@ let handle_order_failed ~now asset_symbol side reason =
       <- filter_keep_if_needed (fun (_, s, _, _) -> s <> side) state.pending_orders;
       (match side with
        | Buy ->
-         state.last_buy_order_id <- None;
-         state.last_buy_order_price <- None;
-         state.inflight_buy <- false
+         state.inflight_buy <- false;
+         (* A placement failure can only concern an order that never acked, so it must not
+            retire a tracked buy; [Rejected] retires by price. *)
+         if state.last_buy_order_id = None
+         then (
+           state.last_buy_order_price <- None;
+           set_asset_reserved_quote state 0.0)
        | Sell -> state.inflight_sell <- false);
       (match side with
-       | Buy -> set_asset_reserved_quote state 0.0
+       | Buy -> ()
        | Sell ->
          remove_pending_sell_commitments ~state;
          Sell_orders.remove_prefix state.open_sell_orders "pending_sell_");
@@ -460,9 +466,19 @@ let handle_order_rejected ~now:_ asset_symbol side price =
            state.pending_orders;
       (match side with
        | Buy ->
-         state.last_buy_order_id <- None;
-         state.last_buy_order_price <- None;
-         state.inflight_buy <- false
+         state.inflight_buy <- false;
+         (* Match by price: a rejected duplicate must not detach the acked buy. *)
+         let retires_tracked_buy =
+           match state.last_buy_order_id, state.last_buy_order_price with
+           | None, _ -> true
+           | Some _, Some tracked -> abs_float (tracked -. price) < 0.01
+           | Some _, None -> false
+         in
+         if retires_tracked_buy
+         then (
+           state.last_buy_order_id <- None;
+           state.last_buy_order_price <- None;
+           set_asset_reserved_quote state 0.0)
        | Sell ->
          state.inflight_sell <- false;
          remove_pending_sell_commitments ~state;
@@ -1162,14 +1178,18 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
                 asset_symbol;
             state.inflight_amend_buy <- false
           | _ ->
-            state.last_buy_order_id <- Some new_order_id;
-            state.last_buy_order_price <- Some price;
-            Logging.debug_f
-              ~section
-              "External buy order amendment in tracking: %s @ %.4f for %s"
-              new_order_id
-              price
-              asset_symbol;
+            (* An unresolved HL amend ack returns the superseded id; don't let it displace
+               a live tracked buy. *)
+            if state.last_buy_order_id = None
+            then (
+              state.last_buy_order_id <- Some new_order_id;
+              state.last_buy_order_price <- Some price;
+              Logging.debug_f
+                ~section
+                "External buy order amendment in tracking: %s @ %.4f for %s"
+                new_order_id
+                price
+                asset_symbol);
             state.inflight_amend_buy <- false)
        | Sell ->
          add_tracked_order_id state new_order_id;
