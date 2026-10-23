@@ -295,7 +295,8 @@ let buy_place_send ~state ~now ~(asset : trading_config) ~qty ~buy_price =
   in
   if push_order ~now ~state order
   then (
-    state.last_buy_order_price <- Some buy_price;
+    (* Don't overwrite a tracked buy's price: the rejection handlers match on it. *)
+    if state.last_buy_order_id = None then state.last_buy_order_price <- Some buy_price;
     state.tif_recovery_pending <- false;
     state.force_buy_reanchor <- false;
     (* When the decision-flow layer is on, [push_order] already emitted a SEND block for
@@ -345,7 +346,7 @@ let buy_place_send_insufficient
   in
   if push_order ~now ~state order
   then (
-    state.last_buy_order_price <- Some buy_price;
+    if state.last_buy_order_id = None then state.last_buy_order_price <- Some buy_price;
     true)
   else false
 ;;

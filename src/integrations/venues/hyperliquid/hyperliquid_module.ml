@@ -1311,6 +1311,8 @@ let fetch_open_orders_ws () =
   then Lwt.return_unit
   else (
     let req_id = Hyperliquid_actions.next_ws_req_id () in
+    (* Snapshot cutoff: request time, not receipt. *)
+    let requested_at = Unix.gettimeofday () in
     let ws_frame =
       `Assoc
         [ "method", `String "post"
@@ -1348,7 +1350,7 @@ let fetch_open_orders_ws () =
           | _ -> `Null
         in
         let orders_json = if data_node <> `Null then data_node else payload in
-        Hyperliquid_executions_feed.inject_open_orders orders_json;
+        Hyperliquid_executions_feed.inject_open_orders ~requested_at orders_json;
         (* Signal that the open-order snapshot has been fully injected. Domain workers
            block on this event instead of a fixed wall-clock delay. *)
         Hyperliquid_executions_feed.set_startup_snapshot_done ();

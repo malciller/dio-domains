@@ -1783,7 +1783,7 @@ let initialize symbols =
     symbols
 ;;
 
-let inject_open_orders data_json =
+let inject_open_orders ?requested_at data_json =
   let open Yojson.Safe.Util in
   try
     let orders = to_list data_json in
@@ -1892,7 +1892,14 @@ let inject_open_orders data_json =
           (fun () ->
             Hashtbl.iter
               (fun order_id (cached_order : open_order) ->
-                if not (Hashtbl.mem snapshot_order_ids order_id)
+                (* Only orders injected before the request may be judged absent: a
+                   snapshot requested before a placement cannot list it. *)
+                let raced_snapshot =
+                  match requested_at with
+                  | Some t -> cached_order.last_updated > t
+                  | None -> false
+                in
+                if (not raced_snapshot) && not (Hashtbl.mem snapshot_order_ids order_id)
                 then stale_orders := (symbol, store, cached_order) :: !stale_orders)
               store.open_orders))
       all_symbols;

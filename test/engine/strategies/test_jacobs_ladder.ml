@@ -1360,8 +1360,8 @@ let test_ghost_buy_suppressed_within_ack_grace () =
   check bool "the ghost requests a venue resync" true state.needs_resync;
   check
     bool
-    "the ghost arms the owed sell (inventory gate blocks a canceled one)"
-    true
+    "a ghost is not evidence of a fill: it must not arm the owed sell"
+    false
     state.just_filled_buy
 ;;
 
@@ -1436,7 +1436,11 @@ let test_repeated_ghost_buy_is_latched () =
     false
     (Hashtbl.mem state.evicted_orders "flap-buy-1");
   check bool "first ghost requests a resync" true state.needs_resync;
-  check bool "first ghost arms the owed sell" true state.just_filled_buy;
+  check
+    bool
+    "first ghost does not arm the owed sell (an absence is not a fill)"
+    false
+    state.just_filled_buy;
   (* The worker drains the resync request; the feed then re-lists the same id. *)
   state.needs_resync <- false;
   feed := list;
@@ -1466,6 +1470,56 @@ let test_repeated_ghost_buy_is_latched () =
     "the evicted phantom is not counted in the buy index"
     false
     (Hashtbl.mem state.feed_buy_index "flap-buy-1")
+;;
+
+let test_duplicate_buy_rejection_keeps_tracked_buy () =
+  (* REGRESSION: a duplicate buy rejected after the first buy acked cleared the live buy's
+     tracking and quote reservation, leaving it resting untracked at the venue. *)
+  let symbol = "DUPREJ/BTC/USDC" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "hyperliquid";
+  state.last_buy_order_id <- Some "acked-live-buy";
+  state.last_buy_order_price <- Some 80_462.0;
+  state.reserved_quote <- 24.0;
+  state.inflight_buy <- true;
+  Dio_strategies.Strategy_api.Strategy.handle_order_failed
+    ~now:100.0
+    symbol
+    Dio_strategies.Strategy_common.Buy
+    "HL Order Rejected: Insufficient spot balance";
+  check
+    (option string)
+    "a duplicate placement failure keeps the acked buy tracked"
+    (Some "acked-live-buy")
+    state.last_buy_order_id;
+  check
+    (option (float 0.01))
+    "and keeps its resting price"
+    (Some 80_462.0)
+    state.last_buy_order_price;
+  check (float 0.01) "and keeps its quote reservation" 24.0 state.reserved_quote;
+  Dio_strategies.Strategy_api.Strategy.handle_order_rejected
+    ~now:100.0
+    symbol
+    Dio_strategies.Strategy_common.Buy
+    80_419.0;
+  check
+    (option string)
+    "the duplicate's rejection (different price) does not clear the live buy"
+    (Some "acked-live-buy")
+    state.last_buy_order_id;
+  Dio_strategies.Strategy_api.Strategy.handle_order_rejected
+    ~now:100.0
+    symbol
+    Dio_strategies.Strategy_common.Buy
+    80_462.0;
+  check
+    (option string)
+    "the tracked buy's own rejection retires it"
+    None
+    state.last_buy_order_id;
+  check (float 0.01) "and releases its reservation" 0.0 state.reserved_quote
 ;;
 
 let test_position_ledger_bridges_unreflected_fill () =
@@ -3071,13 +3125,23 @@ let test_order_acknowledgment () =
   state.pending_orders
   <- ("test123", Dio_strategies.Strategy_common.Buy, 50000.0, Unix.time ())
      :: state.pending_orders;
+  (* A venue ack must clear a ghost eviction. *)
+  Hashtbl.replace
+    state.evicted_orders
+    "order456"
+    (Unix.gettimeofday () +. 900.0, Dio_strategies.Strategy_common.Buy);
   Dio_strategies.Strategy_api.Strategy.handle_order_acknowledged
     ~now:0.0
     "TEST/USD"
     "order456"
     Dio_strategies.Strategy_common.Buy
     50000.0;
-  check (option string) "buy order id updated" (Some "order456") state.last_buy_order_id
+  check (option string) "buy order id updated" (Some "order456") state.last_buy_order_id;
+  check
+    bool
+    "a venue ack clears a ghost eviction"
+    false
+    (Hashtbl.mem state.evicted_orders "order456")
 ;;
 
 let test_order_cancellation () =
@@ -8452,6 +8516,10 @@ let () =
             "a flapping feed cannot re-adopt a ghost buy"
             `Quick
             test_repeated_ghost_buy_is_latched
+        ; test_case
+            "a duplicate buy rejection keeps the tracked live buy"
+            `Quick
+            test_duplicate_buy_rejection_keeps_tracked_buy
         ; test_case
             "position ledger bridges an unreflected buy fill"
             `Quick
