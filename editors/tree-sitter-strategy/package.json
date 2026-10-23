@@ -1,0 +1,22 @@
+{
+  "name": "tree-sitter-strategy",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for Dio strategy scripts",
+  "main": "bindings/node",
+  "keywords": ["tree-sitter", "strategy", "dio"],
+  "license": "MIT",
+  "dependencies": {
+    "node-addon-api": "^8.0.0",
+    "node-gyp-build": "^4.8.0"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "^0.27.0"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.strategy",
+      "file-types": ["strategy"],
+      "highlights": "queries/highlights.scm"
+    }
+  ]
+}

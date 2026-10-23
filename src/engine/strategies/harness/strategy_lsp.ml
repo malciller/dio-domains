@@ -95,12 +95,18 @@ let diagnostic ~range ~severity ~message =
     ]
 ;;
 
-let publish (uri : string) (diags : Yojson.Safe.t list) : unit =
+let publish ?version (uri : string) (diags : Yojson.Safe.t list) : unit =
+  let version_fields =
+    match version with
+    | Some v -> [ "version", `Int v ]
+    | None -> []
+  in
   write_msg
     (`Assoc
       [ "jsonrpc", `String "2.0"
       ; "method", `String "textDocument/publishDiagnostics"
-      ; "params", `Assoc [ "uri", `String uri; "diagnostics", `List diags ]
+      ; ( "params"
+        , `Assoc ([ "uri", `String uri; "diagnostics", `List diags ] @ version_fields) )
       ])
 ;;
 
@@ -213,10 +219,78 @@ let locate (where : string) (text : string) : int * int * int * int =
   else 0, 0, 0, 0
 ;;
 
+(* ───────────────────── UTF-16 position mapping ───────────────────── *)
+
+(** LSP positions are UTF-16 code units; the engine reports UTF-8 byte offsets, so a
+    diagnostic after a non-ASCII character on the same line would land short. *)
+let utf16_length (s : string) : int =
+  let n = String.length s in
+  let rec go i acc =
+    if i >= n
+    then acc
+    else (
+      let b = Char.code s.[i] in
+      if b < 0x80
+      then go (i + 1) (acc + 1)
+      else if b < 0xE0
+      then go (min n (i + 2)) (acc + 1)
+      else if b < 0xF0
+      then go (min n (i + 3)) (acc + 1)
+      else go (min n (i + 4)) (acc + 2))
+  in
+  go 0 0
+;;
+
+let line_starts (text : string) : int array =
+  let starts = ref [ 0 ] in
+  String.iteri (fun i c -> if c = '\n' then starts := (i + 1) :: !starts) text;
+  Array.of_list (List.rev !starts)
+;;
+
+let line_bounds (text : string) (starts : int array) (line : int) : int * int =
+  if line < 0 || line >= Array.length starts
+  then 0, 0
+  else (
+    let start = starts.(line) in
+    let stop =
+      match String.index_from_opt text start '\n' with
+      | Some i -> i
+      | None -> String.length text
+    in
+    start, stop)
+;;
+
+let byte_offset_of_utf16 (line : string) (units : int) : int =
+  let n = String.length line in
+  let rec go i u =
+    if i >= n || u <= 0
+    then i
+    else (
+      let b = Char.code line.[i] in
+      let bytes =
+        if b < 0x80 then 1 else if b < 0xE0 then 2 else if b < 0xF0 then 3 else 4
+      in
+      let width = if bytes = 4 then 2 else 1 in
+      if u < width then i else go (min n (i + bytes)) (u - width))
+  in
+  go 0 (max 0 units)
+;;
+
+let utf16_col (text : string) (starts : int array) (line : int) (byte_col : int) : int =
+  let start, stop = line_bounds text starts line in
+  if start = 0 && stop = 0
+  then 0
+  else (
+    let line_text = String.sub text start (stop - start) in
+    let byte_col = max 0 (min byte_col (String.length line_text)) in
+    utf16_length (String.sub line_text 0 byte_col))
+;;
+
 (* ───────────────────────── validation ───────────────────────── *)
 
 (** Validate [text] and publish diagnostics for [uri]. *)
-let validate_text (uri : string) (text : string) : unit =
+let validate_text ?version (uri : string) (text : string) : unit =
+  let starts = line_starts text in
   match Strategy_script.parse_string text with
   | Error msg ->
     let line, col, m =
@@ -226,7 +300,9 @@ let validate_text (uri : string) (text : string) : unit =
          | _ -> 0, 0, msg)
       | _ -> 0, 0, msg
     in
+    let col = utf16_col text starts line col in
     publish
+      ?version
       uri
       [ diagnostic ~range:(range_obj line col line (col + 1)) ~severity:1 ~message:m ]
   | Ok f ->
@@ -236,54 +312,153 @@ let validate_text (uri : string) (text : string) : unit =
       List.rev_map
         (fun (d : Strategy_compile.diagnostic) ->
           let sl, sc, el, ec = locate d.where text in
+          let sc = utf16_col text starts sl sc in
+          let ec = utf16_col text starts el ec in
           diagnostic
             ~range:(range_obj sl sc el ec)
             ~severity:(sev_to_severity d.sev)
             ~message:(d.where ^ ": " ^ d.msg))
         diags
     in
-    publish uri lsp_diags
+    publish ?version uri lsp_diags
 ;;
 
 (* ───────────────────────── message handling ───────────────────────── *)
 
-let docs : (string, string) Hashtbl.t = Hashtbl.create 16
+type doc =
+  { mutable text : string
+  ; mutable version : int option
+  }
+
+let docs : (string, doc) Hashtbl.t = Hashtbl.create 16
 let exit_requested = ref false
 
-let text_document_uri (params : Yojson.Safe.t) : string =
-  let open Util in
-  params |> member "textDocument" |> member "uri" |> to_string
+let assoc_member key json =
+  match json with
+  | `Assoc fields -> List.assoc_opt key fields
+  | _ -> None
 ;;
 
+let text_document (params : Yojson.Safe.t) : Yojson.Safe.t =
+  match assoc_member "textDocument" params with
+  | Some td -> td
+  | None -> `Null
+;;
+
+let text_document_uri (params : Yojson.Safe.t) : string =
+  match assoc_member "uri" (text_document params) with
+  | Some (`String uri) -> uri
+  | _ -> ""
+;;
+
+let text_document_version (params : Yojson.Safe.t) : int option =
+  match assoc_member "version" (text_document params) with
+  | Some (`Int version) -> Some version
+  | _ -> None
+;;
+
+let position_of_json (json : Yojson.Safe.t) : int * int =
+  match assoc_member "line" json, assoc_member "character" json with
+  | Some (`Int line), Some (`Int character) -> line, character
+  | _ -> 0, 0
+;;
+
+let byte_offset_of_position (text : string) (starts : int array) (line, character) : int =
+  let start, stop = line_bounds text starts line in
+  if start = 0 && stop = 0
+  then 0
+  else (
+    let line_text = String.sub text start (stop - start) in
+    start + byte_offset_of_utf16 line_text character)
+;;
+
+(** Apply one LSP [TextDocumentContentChangeEvent]. Range-delimited changes are accepted
+    even though the server advertises full sync, so clients that send them still work. *)
+let apply_change (text : string) (change : Yojson.Safe.t) : string =
+  let replacement =
+    match assoc_member "text" change with
+    | Some (`String text) -> text
+    | _ -> ""
+  in
+  match assoc_member "range" change with
+  | None | Some `Null -> replacement
+  | Some range ->
+    let bound key =
+      match assoc_member key range with
+      | Some position -> position_of_json position
+      | None -> 0, 0
+    in
+    let starts = line_starts text in
+    let start = byte_offset_of_position text starts (bound "start") in
+    let stop = byte_offset_of_position text starts (bound "end") in
+    let len = String.length text in
+    let start = max 0 (min start len) in
+    let stop = max start (min stop len) in
+    String.sub text 0 start ^ replacement ^ String.sub text stop (len - stop)
+;;
+
+let store_doc uri text version = Hashtbl.replace docs uri { text; version }
+
 let handle_notification (method_ : string) (params : Yojson.Safe.t) : unit =
-  let open Util in
   match method_ with
   | "textDocument/didOpen" ->
     let uri = text_document_uri params in
-    let text = params |> member "textDocument" |> member "text" |> to_string in
-    Hashtbl.replace docs uri text;
-    validate_text uri text
+    let text =
+      match assoc_member "text" (text_document params) with
+      | Some (`String text) -> text
+      | _ -> ""
+    in
+    let version = text_document_version params in
+    store_doc uri text version;
+    validate_text ?version uri text
   | "textDocument/didChange" ->
     let uri = text_document_uri params in
-    (match params |> member "contentChanges" |> to_list |> List.rev with
-     | c :: _ ->
-       let text = member "text" c |> to_string in
-       Hashtbl.replace docs uri text;
-       validate_text uri text
-     | [] -> ())
+    let current =
+      match Hashtbl.find_opt docs uri with
+      | Some doc -> doc.text
+      | None -> ""
+    in
+    let changes =
+      match assoc_member "contentChanges" params with
+      | Some (`List changes) -> changes
+      | _ -> []
+    in
+    let text = List.fold_left apply_change current changes in
+    let version = text_document_version params in
+    store_doc uri text version;
+    validate_text ?version uri text
   | "textDocument/didSave" ->
     let uri = text_document_uri params in
     let text =
-      match Hashtbl.find_opt docs uri with
-      | Some t -> t
-      | None -> ""
+      match assoc_member "text" params with
+      | Some (`String text) -> Some text
+      | _ ->
+        (match Hashtbl.find_opt docs uri with
+         | Some doc -> Some doc.text
+         | None -> None)
     in
-    if String.length text > 0 then validate_text uri text
+    let version =
+      match Hashtbl.find_opt docs uri with
+      | Some doc -> doc.version
+      | None -> text_document_version params
+    in
+    (match text with
+     | Some text when String.length text > 0 -> validate_text ?version uri text
+     | _ -> ())
   | "textDocument/didClose" ->
     let uri = text_document_uri params in
+    let version =
+      match Hashtbl.find_opt docs uri with
+      | Some doc -> doc.version
+      | None -> None
+    in
     Hashtbl.remove docs uri;
-    publish uri []
-  | "exit" -> Stdlib.exit 0
+    publish ?version uri []
+  | "exit" -> exit_requested := true
+  | "initialized"
+  | "$/cancelRequest"
+  | "workspace/didChangeConfiguration"
+  | "workspace/didChangeWatchedFiles" -> ()
   | _ -> ()
 ;;
 
@@ -306,15 +481,27 @@ let handle_request (id : Yojson.Safe.t) (method_ : string) (_params : Yojson.Saf
                           ; "change", `Int 1
                           ; "save", `Assoc [ "includeText", `Bool true ]
                           ] )
+                    ; "positionEncoding", `String "utf-16"
                     ] )
               ; ( "serverInfo"
-                , `Assoc [ "name", `String "dio-strategy"; "version", `String "0.1.0" ] )
+                , `Assoc [ "name", `String "dio-strategy"; "version", `String "0.2.0" ] )
               ] )
         ])
   | "shutdown" ->
-    exit_requested := true;
+    (* Respond first; the client then sends `exit` or closes the pipe. Closing the stream
+       here races its pending write. *)
     write_msg (`Assoc [ "jsonrpc", `String "2.0"; "id", id; "result", `Null ])
-  | _ -> write_msg (`Assoc [ "jsonrpc", `String "2.0"; "id", id; "result", `Null ])
+  | _ ->
+    write_msg
+      (`Assoc
+        [ "jsonrpc", `String "2.0"
+        ; "id", id
+        ; ( "error"
+          , `Assoc
+              [ "code", `Int (-32601)
+              ; "message", `String ("method not found: " ^ method_)
+              ] )
+        ])
 ;;
 
 let handle_frame (json : Yojson.Safe.t) : unit =

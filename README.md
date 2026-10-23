@@ -130,7 +130,7 @@ container walkthrough.
 | `test/` | Test suites mirroring `src/`. |
 | `strategies/` | Strategy scripts loaded by name from `config.json`. |
 | `proxy/` | Optional Cloudflare relay for Lighter traffic. |
-| `editors/` | VS Code extension for the strategy language. |
+| `editors/` | Editor support for the strategy language: VS Code (`vscode-strategy`), Zed (`zed-strategy`), and the shared tree-sitter grammar. |
 
 ## Performance
 

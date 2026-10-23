@@ -1,0 +1,14 @@
+{
+  // The engine accepts JSONC in config*.json, same as .vscode/settings.json
+  // tells VS Code to do.
+  "file_types": {
+    "JSONC": [
+      "**/.zed/*.json",
+      "**/.vscode/**/*.json",
+      "**/{zed,Zed}/{settings,keymap,tasks,debug}.json",
+      "tsconfig*.json",
+      "**/config.json",
+      "**/config.*.json"
+    ]
+  }
+}
