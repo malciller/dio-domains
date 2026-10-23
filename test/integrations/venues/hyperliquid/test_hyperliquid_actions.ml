@@ -173,6 +173,46 @@ let test_to_int64_opt () =
     (Hyperliquid.Actions.to_int64_opt (`Float 1.5))
 ;;
 
+let test_parse_amend_response () =
+  let order_id = 100L in
+  let parse json =
+    Hyperliquid.Actions.parse_amend_response ~order_id (Yojson.Safe.from_string json)
+  in
+  (match parse {|{"status":"ok","response":{"type":"default"}}|} with
+   | Ok r ->
+     Alcotest.(check int64)
+       "default ack keeps the old id only as a placeholder"
+       order_id
+       r.amend_id;
+     Alcotest.(check bool)
+       "default ack reports the replacement as unknown"
+       false
+       r.replacement_known;
+     Alcotest.(check int64) "original id preserved" order_id r.order_id
+   | Error e -> Alcotest.fail e);
+  (match
+     parse
+       {|{"status":"ok","response":{"type":"modify","data":{"statuses":[{"resting":{"oid":456}}]}}}|}
+   with
+   | Ok r ->
+     Alcotest.(check int64) "resting oid is the replacement" 456L r.amend_id;
+     Alcotest.(check bool) "replacement is known" true r.replacement_known
+   | Error e -> Alcotest.fail e);
+  (* Some response variants wrap the statuses under a default response. Parse them instead
+     of discarding the replacement id. *)
+  (match
+     parse
+       {|{"status":"ok","response":{"type":"default","data":{"statuses":[{"resting":{"oid":789}}]}}}|}
+   with
+   | Ok r ->
+     Alcotest.(check int64) "default with statuses resolves" 789L r.amend_id;
+     Alcotest.(check bool) "replacement is known" true r.replacement_known
+   | Error e -> Alcotest.fail e);
+  match parse {|{"status":"err","response":"bad signature"}|} with
+  | Error e -> Alcotest.(check bool) "error surfaces" true (String.length e > 0)
+  | Ok _ -> Alcotest.fail "expected an amendment error"
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Actions"
@@ -181,6 +221,8 @@ let () =
         ; Alcotest.test_case "format_number" `Quick test_format_number
         ; Alcotest.test_case "to_hl_order_wire" `Quick test_to_hl_order_wire
         ] )
+    ; ( "amend"
+      , [ Alcotest.test_case "parse_amend_response" `Quick test_parse_amend_response ] )
     ; ( "utils"
       , [ Alcotest.test_case "string_contains" `Quick test_string_contains
         ; Alcotest.test_case "is_retriable_error" `Quick test_is_retriable_error

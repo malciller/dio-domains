@@ -202,6 +202,106 @@ module Hyperliquid_impl = struct
     | Error e -> Error e
   ;;
 
+  (** Resolve the replacement order id for a modify whose acknowledgement carries no oid.
+
+      Hyperliquid implements modify as cancel+replace, but the acknowledgement normally
+      only confirms success ([response.type = "default"]). The old and replacement legs
+      are linked by the cloid we supply, and the replacement arrives on the order-updates
+      channel. Prefer the local feed (the update usually beats the ack); fall back to an
+      authoritative [orderStatus] lookup by cloid when the WS update was dropped. *)
+  let query_order_status_by_cloid_ws cloid =
+    match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
+    | None | Some "" -> Lwt.return_none
+    | Some wallet ->
+      if not (Hyperliquid_ws.is_connected ())
+      then Lwt.return_none
+      else (
+        let req_id = Hyperliquid_actions.next_ws_req_id () in
+        let ws_frame =
+          `Assoc
+            [ "method", `String "post"
+            ; "id", `Int req_id
+            ; ( "request"
+              , `Assoc
+                  [ "type", `String "info"
+                  ; ( "payload"
+                    , `Assoc
+                        [ "type", `String "orderStatus"
+                        ; "user", `String wallet
+                        ; "oid", `String cloid
+                        ] )
+                  ] )
+            ]
+        in
+        Lwt.catch
+          (fun () ->
+            Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:3000
+            >>= fun resp_frame ->
+            let open Yojson.Safe.Util in
+            let payload =
+              try
+                resp_frame |> member "data" |> member "response" |> member "payload"
+              with
+              | _ -> `Null
+            in
+            match payload |> member "status" |> to_string_option with
+            | Some "order" ->
+              let order = payload |> member "order" in
+              (match order |> member "status" |> to_string_option with
+               | Some "open" ->
+                 let oid =
+                   match
+                     order
+                     |> member "order"
+                     |> member "oid"
+                     |> Hyperliquid_actions.to_int64_opt
+                   with
+                   | Some id -> Some (Int64.to_string id)
+                   | None ->
+                     (match order |> member "oid" |> Hyperliquid_actions.to_int64_opt with
+                      | Some id -> Some (Int64.to_string id)
+                      | None -> None)
+                 in
+                 Lwt.return oid
+               | _ -> Lwt.return_none)
+            | _ -> Lwt.return_none)
+          (fun exn ->
+            Logging.debug_f
+              ~section
+              "orderStatus lookup by cloid %s failed: %s"
+              cloid
+              (Printexc.to_string exn);
+            Lwt.return_none))
+  ;;
+
+  let resolve_amend_replacement ~cloid ~old_order_id =
+    let find () =
+      match Hyperliquid_executions_feed.find_order_by_cloid cloid with
+      | Some o when String.equal o.order_id old_order_id -> None
+      | Some o -> Some o.order_id
+      | None -> None
+    in
+    let rec wait remaining =
+      match find () with
+      | Some oid -> Lwt.return (Some oid)
+      | None when remaining > 0 -> Lwt_unix.sleep 0.025 >>= fun () -> wait (remaining - 1)
+      | None -> Lwt.return_none
+    in
+    match find () with
+    | Some oid -> Lwt.return (Some oid)
+    | None ->
+      (* Give the order-updates push a brief head start before spending a round trip on
+         the authoritative lookup. *)
+      wait 8
+      >>= (function
+       | Some oid -> Lwt.return (Some oid)
+       | None ->
+         query_order_status_by_cloid_ws cloid
+         >>= (function
+          | Some oid when not (String.equal oid old_order_id) -> Lwt.return (Some oid)
+          | _ -> wait 20))
+  ;;
+
   (** Amend an existing order (cancel-replace on Hyperliquid). Looks up the current order
       state from the executions feed to fill in any parameters not explicitly provided by
       the caller. *)
@@ -274,9 +374,35 @@ module Hyperliquid_impl = struct
            ?cl_ord_id:constructed_cl_ord_id
            ~testnet:(Atomic.get is_testnet)
            ()
-         >|= (function
+         >>= fun result ->
+         (match result with
+          | Error e -> Lwt.return (Error e)
           | Ok res ->
-            let new_order_id_str = Int64.to_string res.amend_id in
+            let ack_id_str = Int64.to_string res.amend_id in
+            let resolved =
+              if res.replacement_known
+              then Lwt.return (Some ack_id_str)
+              else (
+                (* The ack carries no replacement oid. Hyperliquid's modify is a
+                   cancel+replace, so the old id is dead; find the replacement by the
+                   cloid we submitted instead of pretending the amend stayed in place. *)
+                match constructed_cl_ord_id with
+                | Some cloid -> resolve_amend_replacement ~cloid ~old_order_id:order_id
+                | None -> Lwt.return_none)
+            in
+            resolved
+            >>= fun resolved ->
+            let new_order_id_str =
+              match resolved with
+              | Some id -> id
+              | None ->
+                Logging.warn_f
+                  ~section
+                  "Amend ack for %s carried no replacement oid and none could be \
+                   resolved; tracking still points at the superseded id"
+                  order_id;
+                ack_id_str
+            in
             (* Hyperliquid replaces the order with a new OID, so the old OID is retired
                here (which blacklists a late WS "open" event for it) and the replacement
                is injected with the new price/size. Without the injection the open-orders
@@ -303,13 +429,13 @@ module Hyperliquid_impl = struct
                 ?user_ref:existing.order_userref
                 ?cl_ord_id:constructed_cl_ord_id
                 ());
-            Ok
-              { Types.original_order_id = Int64.to_string res.order_id
-              ; Types.new_order_id = new_order_id_str
-              ; Types.amend_id = None
-              ; Types.cl_ord_id = constructed_cl_ord_id
-              }
-          | Error e -> Error e))
+            Lwt.return
+              (Ok
+                 { Types.original_order_id = Int64.to_string res.order_id
+                 ; Types.new_order_id = new_order_id_str
+                 ; Types.amend_id = None
+                 ; Types.cl_ord_id = constructed_cl_ord_id
+                 })))
   ;;
 
   (** Cancel one or more orders by order ID. Orders are grouped by symbol for

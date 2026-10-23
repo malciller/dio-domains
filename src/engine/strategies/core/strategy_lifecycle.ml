@@ -1233,8 +1233,13 @@ let sync_open_orders
         List.rev !open_acc, List.rev !missing_acc))
     else [], []
   in
+  let replacement_pending =
+    match Hashtbl.find_opt state.amend_cooldowns "replacement_pending" with
+    | Some expiry -> now_time < expiry
+    | None -> false
+  in
   ( !open_buy_count_from_scan
-  , !has_recent_amend_buy
+  , !has_recent_amend_buy || replacement_pending
   , !locked_in_buys
   , !locked_in_sells
   , (if !closest_sell_id = "" then None else Some (!closest_sell_id, !closest_sell_price))

@@ -31,6 +31,27 @@ let test_inject_order () =
   | None -> Alcotest.fail "Order not injected"
 ;;
 
+let test_find_order_by_cloid () =
+  Hyperliquid.Executions_feed.initialize [ "CLOIDX" ];
+  Hyperliquid.Executions_feed.inject_order
+    ~symbol:"CLOIDX"
+    ~order_id:"cloid-order"
+    ~side:Hyperliquid.Executions_feed.Buy
+    ~qty:1.0
+    ~price:100.0
+    ~cl_ord_id:"0xABC"
+    ();
+  (match Hyperliquid.Executions_feed.find_order_by_cloid "0xabc" with
+   | Some o -> Alcotest.(check string) "order id" "cloid-order" o.order_id
+   | None -> Alcotest.fail "order not found by cloid");
+  Alcotest.(check (option string))
+    "unknown cloid"
+    None
+    (Option.map
+       (fun (o : Hyperliquid.Executions_feed.open_order) -> o.order_id)
+       (Hyperliquid.Executions_feed.find_order_by_cloid "0xdef"))
+;;
+
 let test_process_order_updates () =
   Hyperliquid.Executions_feed.initialize [ "HYPE" ];
   let json =
@@ -432,6 +453,7 @@ let () =
         ] )
     ; ( "orders"
       , [ Alcotest.test_case "inject_order" `Quick test_inject_order
+        ; Alcotest.test_case "find_order_by_cloid" `Quick test_find_order_by_cloid
         ; Alcotest.test_case "process_order_updates" `Quick test_process_order_updates
         ; Alcotest.test_case "get_open_orders" `Quick test_get_open_orders
         ; Alcotest.test_case

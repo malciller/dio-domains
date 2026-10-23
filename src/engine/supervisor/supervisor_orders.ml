@@ -249,7 +249,9 @@ let grid_callbacks : strategy_callbacks =
              }))
   ; on_cancel_ok =
       (fun order target_order_id ->
-        Logging.info_f ~section "\226\156\147 Cancelled order: %s" target_order_id;
+        (* The dispatch already logged the venue result; this is only the state-cleanup
+           acknowledgement. *)
+        Logging.debug_f ~section "Cancel cleanup enqueued for %s" target_order_id;
         Dio_strategies.Strategy_api.Strategy.enqueue_event
           order.symbol
           (Cancel_cleanup { order_id = target_order_id }))
@@ -778,11 +780,22 @@ let dispatch_cancel
             | Ok results ->
               let count = List.length results in
               Atomic.set orders_placed (Atomic.get orders_placed + count);
-              Logging.info_f
-                ~section
-                "\226\156\147 Cancelled %d order(s) successfully: %s"
-                count
-                target_order_id;
+              (* An empty result means the venue/local cache no longer held the id. That
+                 is a successful reconciliation for cleanup purposes, but it is not a
+                 venue-confirmed cancellation - say so instead of claiming "Cancelled 0
+                 order(s) successfully". *)
+              if count = 0
+              then
+                Logging.info_f
+                  ~section
+                  "\226\156\147 Cancel reconciled for %s (order already absent)"
+                  target_order_id
+              else
+                Logging.info_f
+                  ~section
+                  "\226\156\147 Cancelled %d order(s) successfully: %s"
+                  count
+                  target_order_id;
               cb.on_cancel_ok order target_order_id;
               Lwt.return_unit
             | Error err ->
