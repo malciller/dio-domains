@@ -173,26 +173,40 @@ let engine_profs =
 ;;
 
 let span_from t = Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) t)
-let asset_profiler_cache : (string, Latency_profiler.t) Hashtbl.t = Hashtbl.create 16
+
+(** Per-asset profiler cache, copy-on-write in an atomic cell. The hit path is a lock-free
+    read: [record_asset_latency] runs on the oracle pass for every asset, and a
+    process-wide mutex there serializes unrelated domains behind whichever one holds it. *)
+module Profiler_map = Map.Make (String)
+
+let asset_profiler_cache : Latency_profiler.t Profiler_map.t Atomic.t =
+  Atomic.make Profiler_map.empty
+;;
+
 let asset_profiler_mutex = Mutex.create ()
 
 let asset_profiler_of symbol =
-  Mutex.lock asset_profiler_mutex;
-  let prof =
-    match Hashtbl.find_opt asset_profiler_cache symbol with
-    | Some p -> p
-    | None ->
-      let p =
-        Latency_profiler.create
-          ~bucket_us:1
-          ~max_latency_us:10_000
-          ("oracle:asset:" ^ symbol)
-      in
-      Hashtbl.replace asset_profiler_cache symbol p;
-      p
-  in
-  Mutex.unlock asset_profiler_mutex;
-  prof
+  match Profiler_map.find_opt symbol (Atomic.get asset_profiler_cache) with
+  | Some p -> p
+  | None ->
+    Mutex.lock asset_profiler_mutex;
+    let prof =
+      match Profiler_map.find_opt symbol (Atomic.get asset_profiler_cache) with
+      | Some p -> p
+      | None ->
+        let p =
+          Latency_profiler.create
+            ~bucket_us:1
+            ~max_latency_us:10_000
+            ("oracle:asset:" ^ symbol)
+        in
+        Atomic.set
+          asset_profiler_cache
+          (Profiler_map.add symbol p (Atomic.get asset_profiler_cache));
+        p
+    in
+    Mutex.unlock asset_profiler_mutex;
+    prof
 ;;
 
 let record_asset_latency symbol span cause =
@@ -214,15 +228,10 @@ let profiler_snapshots () =
 
 (** Per-asset oracle latency snapshots for the dashboard's per-domain rows. *)
 let asset_profiler_snapshots () =
-  Mutex.lock asset_profiler_mutex;
-  let snaps =
-    Hashtbl.fold
-      (fun symbol prof acc -> (symbol, Latency_profiler.published_snapshot prof) :: acc)
-      asset_profiler_cache
-      []
-  in
-  Mutex.unlock asset_profiler_mutex;
-  snaps
+  Profiler_map.fold
+    (fun symbol prof acc -> (symbol, Latency_profiler.published_snapshot prof) :: acc)
+    (Atomic.get asset_profiler_cache)
+    []
 ;;
 
 (* ------------------------------------------------------------------ *)

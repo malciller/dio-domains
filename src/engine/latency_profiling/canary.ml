@@ -45,6 +45,11 @@ let env_float name default =
     global stop-the-world pause from a single thread being descheduled. *)
 let last_max_cell = Atomic.make 0
 
+(** Set by {!start} once the detector domain exists. Without it "no pause this window" and
+    "canary switched off" are the same value, and both printed [stw=0ns]. *)
+let running = Atomic.make false
+
+let is_running () = Atomic.get running
 let last_window_max_ns () = Atomic.get last_max_cell
 
 (** [run ~threshold_us ~window_seconds] never returns. Records the gap between consecutive
@@ -89,6 +94,7 @@ let start () =
   then (
     let threshold_us = env_float "DIO_CANARY_THRESHOLD_US" 10.0 in
     let window_seconds = env_float "DIO_CANARY_WINDOW_S" 5.0 in
+    Atomic.set running true;
     Logging.info_f
       ~section
       "Stop-the-world canary started (threshold %s, window %.0fs)"
@@ -103,4 +109,9 @@ let start () =
          Thread_affinity.pin_self_background ();
          Thread_affinity.set_self_idle ();
          run ~threshold_us ~window_seconds)))
+  else
+    Logging.info_f
+      ~section
+      "Stop-the-world canary disabled (DIO_CANARY=0): per-domain reports show stw=n/a, \
+       so a cross-domain GC pause will not be attributable"
 ;;

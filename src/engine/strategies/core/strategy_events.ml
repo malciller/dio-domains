@@ -1115,10 +1115,10 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
         ignore (Sell_orders.remove_by_id state.open_sell_orders order_id);
         remove_sell_commitment ~state ~id:order_id)
       else
-        Logging.info_f
+        Logging.debug_f
           ~section
-          "Order cancellation for %s (%s) ignored for tracking reset because order \
-           amendment is in progress"
+          "Order cancellation for %s (%s) is the cancel half of a cancel/replace \
+           amendment; keeping the rung's tracking until the amendment's terminal event"
           asset_symbol
           order_id)
 ;;

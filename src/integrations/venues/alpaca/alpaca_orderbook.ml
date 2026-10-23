@@ -507,142 +507,192 @@ let conn_generation = ref 0
     quote until the other feed streams fresh "q" messages. *)
 let session_watch_seconds = 5.0
 
+(** Serialises "supersede and steal the current socket". Without it two overlapping
+    callers can bump the generation and the loser closes the winner's new socket. *)
+let conn_admin = Lwt_mutex.create ()
+
+(** Close a socket without blocking the reconnect path: a wedged TLS channel can leave
+    [Lwt_io.close] waiting on a flush.
+
+    Alpaca allows one market-data connection per account. A connection the supervisor has
+    declared dead is still open (its read loop is parked in [Ws_lwt.read]), so connecting
+    the replacement first makes every handshake fail with 406 and leaks another socket.
+    Close releases the server-side slot. *)
+let close_conn conn =
+  Lwt.catch
+    (fun () -> Lwt_unix.with_timeout 2.0 (fun () -> Ws_lwt.close_transport conn))
+    (fun exn ->
+      Logging.debug_f ~section "Alpaca data WS close failed: %s" (Printexc.to_string exn);
+      Lwt.return_unit)
+;;
+
 let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
   let url_str = session_data_ws_url () in
   let is_overnight_feed = Alpaca_market_hours.is_overnight_hours () in
-  let my_gen = !conn_generation + 1 in
-  conn_generation := my_gen;
-  let uri = Uri.of_string url_str in
-  let host = Uri.host uri |> Option.value ~default:"stream.data.alpaca.markets" in
-  let port = Uri.port uri |> Option.value ~default:443 in
-  (* Set by the session watcher on a feed change; the catch handler then reconnects
-     internally instead of reporting failure. *)
-  let session_switch = ref false in
-  Lwt.catch
-    (fun () ->
-      Lwt_unix.getaddrinfo host (string_of_int port) [ Unix.AI_FAMILY Unix.PF_INET ]
-      >>= fun addresses ->
-      let ip =
-        match addresses with
-        | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ ->
-          Ipaddr_unix.of_inet_addr addr
-        | _ -> failwith ("Failed to resolve host " ^ host)
-      in
-      let client = `TLS (`Hostname host, `IP ip, `Port port) in
-      let ctx = Ws_lwt.resolve_ctx () in
-      (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP connection would
-         otherwise block the reconnect (main Lwt loop) indefinitely. *)
-      Lwt_unix.with_timeout 20.0 (fun () -> Ws_lwt.connect ~ctx client uri)
-      >>= fun conn ->
-      active_conn := Some conn;
-      Logging.info_f
-        ~section
-        "Connected to Alpaca Market Data WS at %s (%s feed)"
-        url_str
-        (if is_overnight_feed then "overnight" else "regular");
-      let auth_msg =
-        `Assoc
-          [ "action", `String "auth"
-          ; "key", `String (Alpaca_types.Config.api_key ())
-          ; "secret", `String (Alpaca_types.Config.api_secret ())
-          ]
-        |> Yojson.Safe.to_string
-      in
-      Logging.debug ~section "Sending Alpaca Market Data WS authentication...";
-      Ws_lwt.write conn (Websocket.Frame.create ~content:auth_msg ())
-      >>= fun () ->
-      let authenticated = ref false in
-      let auth_failure_reason = ref None in
-      let on_auth_success () =
-        if not !authenticated
+  Lwt_mutex.with_lock conn_admin (fun () ->
+    let my_gen = !conn_generation + 1 in
+    conn_generation := my_gen;
+    let previous = !active_conn in
+    active_conn := None;
+    Lwt.return (my_gen, previous))
+  >>= fun (my_gen, previous) ->
+  (match previous with
+   | None -> Lwt.return_unit
+   | Some conn -> close_conn conn)
+  >>= fun () ->
+  if my_gen <> !conn_generation
+  then Lwt.return_unit
+  else (
+    let uri = Uri.of_string url_str in
+    let host = Uri.host uri |> Option.value ~default:"stream.data.alpaca.markets" in
+    let port = Uri.port uri |> Option.value ~default:443 in
+    (* Set by the session watcher on a feed change; the catch handler then reconnects
+       internally instead of reporting failure. *)
+    let session_switch = ref false in
+    Lwt.catch
+      (fun () ->
+        Lwt_unix.getaddrinfo host (string_of_int port) [ Unix.AI_FAMILY Unix.PF_INET ]
+        >>= fun addresses ->
+        let ip =
+          match addresses with
+          | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ ->
+            Ipaddr_unix.of_inet_addr addr
+          | _ -> failwith ("Failed to resolve host " ^ host)
+        in
+        let client = `TLS (`Hostname host, `IP ip, `Port port) in
+        let ctx = Ws_lwt.resolve_ctx () in
+        (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP connection would
+           otherwise block the reconnect (main Lwt loop) indefinitely. *)
+        Lwt_unix.with_timeout 20.0 (fun () -> Ws_lwt.connect ~ctx client uri)
+        >>= fun conn ->
+        if my_gen <> !conn_generation
         then (
-          authenticated := true;
-          on_connected ();
-          Lwt.async (fun () -> send_subscription !active_subscriptions))
-      in
-      let on_auth_error code msg =
-        let reason = Printf.sprintf "Alpaca Market Data WS error (%d): %s" code msg in
-        auth_failure_reason := Some reason;
-        Lwt.async (fun () ->
-          Lwt.catch (fun () -> Ws_lwt.close_transport conn) (fun _exn -> Lwt.return_unit))
-      in
-      let rec read_loop () =
-        Ws_lwt.read conn
-        >>= fun frame ->
-        on_heartbeat ();
-        (match !auth_failure_reason with
-         | Some reason -> Lwt.fail (Failure reason)
-         | None ->
-           (match frame.Websocket.Frame.opcode with
-            | Websocket.Frame.Opcode.Ping ->
-              let pong_frame =
-                Websocket.Frame.create
-                  ~opcode:Websocket.Frame.Opcode.Pong
-                  ~content:frame.Websocket.Frame.content
-                  ()
-              in
-              Ws_lwt.write conn pong_frame
-            | Websocket.Frame.Opcode.Pong ->
-              (* Reply to [send_ping]; resolves any pending waiter. *)
-              last_pong_time := Unix.gettimeofday ();
-              Lwt_condition.broadcast pong_condition ();
-              Lwt.return_unit
-            | Websocket.Frame.Opcode.Close ->
-              Lwt.fail (Failure "Alpaca Market Data WS received Close frame from server")
-            | _ ->
-              let content = String.trim frame.Websocket.Frame.content in
-              if content <> ""
-              then handle_message_str ~on_auth_success ~on_auth_error content;
-              (match !auth_failure_reason with
-               | Some reason -> Lwt.fail (Failure reason)
-               | None -> Lwt.return_unit)))
-        >>= fun () -> read_loop ()
-      in
-      (* Session switching: while this incarnation is current, watch the session boundary.
-         On a feed change (regular/pre/after-hours <-> overnight) close the socket; the
-         catch handler reconnects on the other feed, holding the last real quote during
-         the gap. *)
-      let rec session_watcher () =
-        Lwt_unix.sleep session_watch_seconds
-        >>= fun () ->
-        if !conn_generation <> my_gen
-        then Lwt.return_unit
+          (* A newer incarnation started while this handshake was in flight: publish
+             nothing and close the socket, or it starves every later attempt of Alpaca's
+             one-slot limit. *)
+          Logging.debug_f
+            ~section
+            "Alpaca data WS handshake superseded (gen %d); closing the new socket"
+            my_gen;
+          close_conn conn >>= fun () -> Lwt.fail Exit)
         else (
-          match !active_conn with
-          | Some c when c == conn ->
-            let want_overnight = Alpaca_market_hours.is_overnight_hours () in
-            if want_overnight <> is_overnight_feed
+          active_conn := Some conn;
+          Logging.info_f
+            ~section
+            "Connected to Alpaca Market Data WS at %s (%s feed)"
+            url_str
+            (if is_overnight_feed then "overnight" else "regular");
+          let auth_msg =
+            `Assoc
+              [ "action", `String "auth"
+              ; "key", `String (Alpaca_types.Config.api_key ())
+              ; "secret", `String (Alpaca_types.Config.api_secret ())
+              ]
+            |> Yojson.Safe.to_string
+          in
+          Logging.debug ~section "Sending Alpaca Market Data WS authentication...";
+          Ws_lwt.write conn (Websocket.Frame.create ~content:auth_msg ())
+          >>= fun () ->
+          let authenticated = ref false in
+          let auth_failure_reason = ref None in
+          let on_auth_success () =
+            if not !authenticated
             then (
-              session_switch := true;
-              Logging.info_f
-                ~section
-                "Alpaca market session changed: switching to the %s feed"
-                (if want_overnight
-                 then "overnight (v1beta1/overnight)"
-                 else "regular (v2/" ^ !Alpaca_types.Config.data_feed ^ ")");
+              authenticated := true;
+              on_connected ();
+              Lwt.async (fun () -> send_subscription !active_subscriptions))
+          in
+          let on_auth_error code msg =
+            let reason = Printf.sprintf "Alpaca Market Data WS error (%d): %s" code msg in
+            auth_failure_reason := Some reason;
+            Lwt.async (fun () ->
               Lwt.catch
                 (fun () -> Ws_lwt.close_transport conn)
                 (fun _exn -> Lwt.return_unit))
-            else session_watcher ()
-          | _ -> Lwt.return_unit)
-      in
-      Lwt.async session_watcher;
-      read_loop ())
-    (fun exn ->
-      active_conn := None;
-      if !session_switch
-      then (
-        (* Controlled switch: reconnect immediately on the other feed. *)
-        Logging.info_f
-          ~section
-          "Alpaca data WS reconnecting to the %s feed"
-          (if Alpaca_market_hours.is_overnight_hours () then "overnight" else "regular");
-        connect_and_monitor ~on_failure ~on_connected ~on_heartbeat)
-      else (
-        let err = Printexc.to_string exn in
-        Logging.error_f ~section "Alpaca data WS disconnected: %s" err;
-        on_failure err;
-        Lwt.return_unit))
+          in
+          let rec read_loop () =
+            Ws_lwt.read conn
+            >>= fun frame ->
+            on_heartbeat ();
+            (match !auth_failure_reason with
+             | Some reason -> Lwt.fail (Failure reason)
+             | None ->
+               (match frame.Websocket.Frame.opcode with
+                | Websocket.Frame.Opcode.Ping ->
+                  let pong_frame =
+                    Websocket.Frame.create
+                      ~opcode:Websocket.Frame.Opcode.Pong
+                      ~content:frame.Websocket.Frame.content
+                      ()
+                  in
+                  Ws_lwt.write conn pong_frame
+                | Websocket.Frame.Opcode.Pong ->
+                  (* Reply to [send_ping]; resolves any pending waiter. *)
+                  last_pong_time := Unix.gettimeofday ();
+                  Lwt_condition.broadcast pong_condition ();
+                  Lwt.return_unit
+                | Websocket.Frame.Opcode.Close ->
+                  Lwt.fail
+                    (Failure "Alpaca Market Data WS received Close frame from server")
+                | _ ->
+                  let content = String.trim frame.Websocket.Frame.content in
+                  if content <> ""
+                  then handle_message_str ~on_auth_success ~on_auth_error content;
+                  (match !auth_failure_reason with
+                   | Some reason -> Lwt.fail (Failure reason)
+                   | None -> Lwt.return_unit)))
+            >>= fun () -> read_loop ()
+          in
+          (* Session switching: while this incarnation is current, watch the session
+             boundary. On a feed change (regular/pre/after-hours <-> overnight) close the
+             socket; the catch handler reconnects on the other feed, holding the last real
+             quote during the gap. *)
+          let rec session_watcher () =
+            Lwt_unix.sleep session_watch_seconds
+            >>= fun () ->
+            if !conn_generation <> my_gen
+            then Lwt.return_unit
+            else (
+              match !active_conn with
+              | Some c when c == conn ->
+                let want_overnight = Alpaca_market_hours.is_overnight_hours () in
+                if want_overnight <> is_overnight_feed
+                then (
+                  session_switch := true;
+                  Logging.info_f
+                    ~section
+                    "Alpaca market session changed: switching to the %s feed"
+                    (if want_overnight
+                     then "overnight (v1beta1/overnight)"
+                     else "regular (v2/" ^ !Alpaca_types.Config.data_feed ^ ")");
+                  Lwt.catch
+                    (fun () -> Ws_lwt.close_transport conn)
+                    (fun _exn -> Lwt.return_unit))
+                else session_watcher ()
+              | _ -> Lwt.return_unit)
+          in
+          Lwt.async session_watcher;
+          read_loop ()))
+      (fun exn ->
+        (* A superseded socket was closed on purpose; reporting it would make the
+           supervisor reconnect on top of the replacement. *)
+        let superseded = my_gen <> !conn_generation in
+        if not superseded then active_conn := None;
+        if superseded
+        then Lwt.return_unit
+        else if !session_switch
+        then (
+          (* Controlled switch: reconnect immediately on the other feed. *)
+          Logging.info_f
+            ~section
+            "Alpaca data WS reconnecting to the %s feed"
+            (if Alpaca_market_hours.is_overnight_hours () then "overnight" else "regular");
+          connect_and_monitor ~on_failure ~on_connected ~on_heartbeat)
+        else (
+          let err = Printexc.to_string exn in
+          Logging.error_f ~section "Alpaca data WS disconnected: %s" err;
+          on_failure err;
+          Lwt.return_unit)))
 ;;
 
 (** Sends a WebSocket Ping frame and waits for the matching Pong within [timeout_ms].
