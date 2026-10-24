@@ -168,21 +168,22 @@ let reset_ladder ~start_ratio rt =
   setf rt "anchor" 0.0;
   setf rt "ladder_ratio" start_ratio;
   seti rt "add_index" 0;
+  seti rt "ladder_rungs" 0;
   setf rt "next_add" 0.0;
   setb rt "add_armed" false
 ;;
 
-(** Initialize the ladder for an already-open position when the durable state is empty or
-    the basis mode changed. The ratio is the current short / the new basis, clamped to
-    [max_ratio]; the index is the completed band, or the max at/above the cap. The
-    [next_add] seed is ROE-based like the live ladder. *)
+(** Seed the ladder from the live short: the current size is the ladder start, so the
+    caller derives the remaining rungs from it. The mark anchors the bands, not the
+    historical entry. *)
 let init_ladder
-  ~start_ratio
   ~max_ratio
-  ~add_amount
-  ~num_adds
+  ~add_first
+  ~add_growth
+  ~num_rungs
   ~add_threshold
   ~leverage
+  ~mark
   ~entry
   ~accumulated
   ~short_qty
@@ -190,28 +191,20 @@ let init_ladder
   =
   if short_qty > 0.0001 && accumulated > 0.0 && entry > 0.0
   then (
-    let raw_ratio = short_qty /. accumulated in
-    let ratio = Float.min max_ratio (Float.max start_ratio raw_ratio) in
-    let index =
-      if add_amount <= 0.0
-      then num_adds
-      else if ratio >= start_ratio +. (float_of_int num_adds *. add_amount) -. 1e-9
-      then num_adds
-      else
-        max
-          0
-          (min
-             num_adds
-             (int_of_float (Float.floor ((ratio -. start_ratio) /. add_amount))))
-    in
+    let ratio = Float.min max_ratio (Float.max 0.0 (short_qty /. accumulated)) in
+    let anchor = if mark > 0.0 then mark else entry in
     let next_add =
-      if index < num_adds && leverage > 0.0
-      then entry *. (1.0 +. (float_of_int (index + 1) *. add_threshold /. leverage))
+      if num_rungs > 0 && leverage > 0.0
+      then anchor *. (1.0 +. add_threshold /. leverage)
       else 0.0
     in
-    setf rt "anchor" entry;
+    setf rt "anchor" anchor;
     setf rt "ladder_ratio" ratio;
-    seti rt "add_index" index;
+    setf rt "ladder_start" ratio;
+    setf rt "ladder_first" add_first;
+    setf rt "ladder_growth" add_growth;
+    seti rt "ladder_rungs" num_rungs;
+    seti rt "add_index" 0;
     setf rt "next_add" next_add;
     setb rt "add_armed" false)
 ;;

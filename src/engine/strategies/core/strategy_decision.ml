@@ -589,7 +589,7 @@ let buy_amend_with_sell
            ())
          else if not (Float.is_nan quote_balance)
          then
-           Logging.warn_f
+           Logging.debug_f
              ~section
              "Insufficient quote balance for %s trailing: need %.2f, have %.2f (incl. \
               committed %.2f)"
@@ -682,7 +682,7 @@ let buy_amend_no_sell
            ())
          else if not (Float.is_nan quote_balance)
          then
-           Logging.warn_f
+           Logging.debug_f
              ~section
              "Insufficient quote balance to trail buy: need %.2f, have %.2f (incl. \
               committed %.2f)"

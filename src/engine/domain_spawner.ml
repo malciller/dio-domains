@@ -157,35 +157,66 @@ let is_strategy_file_asset (asset : trading_config) =
   Option.is_some (load_bound_strategy asset)
 ;;
 
-(** Ladder values derived from the configured ratios. The operator sets [start], [max],
-    and the ROE [add_threshold]; the engine forces [num_adds] and [add_amount] so the
-    quantity ladder lands exactly on [max] without overshooting. [num_adds] is the
-    smallest count whose step is at most the threshold, and [add_amount] is the resulting
-    equal step. *)
+(** Derived ladder shape. Rung count, add sizes, and trail are all outputs of [start],
+    [max], and the ROE [add_threshold]; none are configured.
+
+    Bands are spaced from the ladder anchor. An entry-anchored band recedes as adds lift
+    the average, so a fixed ROE step would buy a widening price gap. *)
 type overlay_ladder =
   { ol_start_ratio : float
   ; ol_add_threshold : float
-  ; ol_add_amount : float
-  ; ol_num_adds : int
+  ; ol_add_first : float
+  ; ol_add_growth : float
   ; ol_max_ratio : float
+  ; ol_num_rungs : int
+  ; ol_max_trail_pct : float
   }
 
-let derive_overlay_ladder (p : overlay_params) =
-  let start_ratio = p.start_ratio_pct /. 100.0 in
+let derive_overlay_ladder ?start_ratio ~leverage (p : overlay_params) =
+  let start_ratio =
+    match start_ratio with
+    | Some s -> s
+    | None -> p.start_ratio_pct /. 100.0
+  in
+  let start_ratio = Float.max 0.0 start_ratio in
   let add_threshold = p.add_threshold_pct /. 100.0 in
   let max_ratio = p.max_ratio_pct /. 100.0 in
+  let start_ratio = Float.min max_ratio start_ratio in
   let gap = Float.max 0.0 (max_ratio -. start_ratio) in
-  let num_adds =
-    if gap <= 0.0 || add_threshold <= 0.0
+  let num_rungs =
+    if add_threshold <= 0.0 || gap <= 0.0
     then 0
     else int_of_float (Float.ceil (gap /. add_threshold))
   in
-  let add_amount = if num_adds > 0 then gap /. float_of_int num_adds else 0.0 in
+  let add_first, add_growth =
+    if num_rungs = 0
+    then 0.0, 1.0
+    else if num_rungs = 1
+    then gap, 1.0
+    else (
+      let first = Float.min gap (start_ratio *. add_threshold) in
+      let f r = (first *. ((r ** float_of_int num_rungs) -. 1.0) /. (r -. 1.0)) -. gap in
+      let lo = ref 1.000000001
+      and hi = ref 8.0 in
+      for _ = 1 to 200 do
+        let mid = 0.5 *. (!lo +. !hi) in
+        if f mid < 0.0 then lo := mid else hi := mid
+      done;
+      let growth = 0.5 *. (!lo +. !hi) in
+      if Float.is_finite growth then first, growth else gap, 1.0)
+  in
+  let max_trail_pct =
+    if leverage <= 0.0
+    then 0.0
+    else float_of_int num_rungs *. add_threshold /. leverage *. 100.0
+  in
   { ol_start_ratio = start_ratio
   ; ol_add_threshold = add_threshold
-  ; ol_add_amount = add_amount
-  ; ol_num_adds = num_adds
+  ; ol_add_first = add_first
+  ; ol_add_growth = add_growth
   ; ol_max_ratio = max_ratio
+  ; ol_num_rungs = num_rungs
+  ; ol_max_trail_pct = max_trail_pct
   }
 ;;
 
@@ -825,7 +856,7 @@ let asset_domain_worker
              None)
            else (
              let p = c.oc_params in
-             let ladder = derive_overlay_ladder p in
+             let ladder = derive_overlay_ladder ~leverage:p.leverage p in
              let recycle_base_share =
                if c.oc_has_hl_spot_leg then p.recycle_base_share_pct /. 100.0 else 0.0
              in
@@ -842,9 +873,10 @@ let asset_domain_worker
                [ "start_ratio", Dio_strategies.Strategy_expr.V_float ladder.ol_start_ratio
                ; ( "add_threshold"
                  , Dio_strategies.Strategy_expr.V_float ladder.ol_add_threshold )
-               ; "add_amount", Dio_strategies.Strategy_expr.V_float ladder.ol_add_amount
+               ; "add_first", Dio_strategies.Strategy_expr.V_float ladder.ol_add_first
+               ; "add_growth", Dio_strategies.Strategy_expr.V_float ladder.ol_add_growth
                ; "max_ratio", Dio_strategies.Strategy_expr.V_float ladder.ol_max_ratio
-               ; "num_adds", Dio_strategies.Strategy_expr.V_int ladder.ol_num_adds
+               ; "num_adds", Dio_strategies.Strategy_expr.V_int ladder.ol_num_rungs
                ; ( "recycle_profit"
                  , Dio_strategies.Strategy_expr.V_float (p.recycle_profit_pct /. 100.0) )
                ; ( "recycle_base_share"
@@ -857,13 +889,15 @@ let asset_domain_worker
              Logging.info_f
                ~section
                "carry controller %s/%s: overlay %s, %d leg(s), spot_accum=%b, \
-                full_balance_ref=%b"
+                full_balance_ref=%b, ladder=%d rung(s) to max, max trail +%.3f%%"
                c.oc_hedge_exchange
                c.oc_hedge_symbol
                overlay_path
                (List.length c.oc_legs)
                c.oc_has_hl_spot_leg
-               c.oc_params.full_balance_ref;
+               c.oc_params.full_balance_ref
+               ladder.ol_num_rungs
+               ladder.ol_max_trail_pct;
              Some
                (Dio_strategies.Strategy_runtime.create
                   ~handlers:(Config_grid_handlers.handler ctx)
@@ -952,51 +986,64 @@ let asset_domain_worker
            "carry leverage seed %s: unknown; the first take-profit waits for the first \
             position snapshot (set trading[].overlay.params.leverage to seed it)"
            asset_with_fees.symbol;
-       (* A basis-mode change resets the ladder to the new start first: a stale ratio
-          must never be applied to the new basis if the position snapshot is missing or
-          the balances are cold. If the position is known, grandfather its current short
-          against the new basis. *)
-       if !st.anchor <= 0.0 || !st.full_balance_ref <> p.full_balance_ref
-       then (
-         let ladder = derive_overlay_ladder p in
-         let mode_changed = !st.full_balance_ref <> p.full_balance_ref in
-         if mode_changed
-         then
-           Dio_strategies.Carry_runtime.reset_ladder
-             ~start_ratio:ladder.ol_start_ratio
-             ort;
-         let accumulated = (Overlay_inventory.aggregate controller).total in
-         (match
-            Dio_exchange.Market_context.get_position
-              ~exchange:asset_with_fees.exchange
-              ~coin:base_asset
-          with
-          | Some pos when pos.qty < -0.0001 && accumulated > 0.0 && pos.entry > 0.0 ->
-            let short_qty = -.pos.qty in
-            let ratio = short_qty /. accumulated in
-            if ratio > ladder.ol_max_ratio +. 1e-9
-            then
-              Logging.warn_f
-                ~section
-                "carry %s: grandfathered ratio %.4f exceeds configured max %.4f; no adds \
-                 until the first profitable recycle"
-                asset_with_fees.symbol
-                ratio
-                ladder.ol_max_ratio;
-            Dio_strategies.Carry_runtime.init_ladder
-              ~start_ratio:ladder.ol_start_ratio
-              ~max_ratio:ladder.ol_max_ratio
-              ~add_amount:ladder.ol_add_amount
-              ~num_adds:ladder.ol_num_adds
-              ~add_threshold:ladder.ol_add_threshold
+       (* Startup re-derives the ladder from the LIVE short, which may be mid-ladder or
+          over max. The current size is the ladder start, so the rungs and trail are the
+          distance left to [max_ratio], not a historical schedule. Flat keeps the
+          persisted state. *)
+       let ladder = derive_overlay_ladder ~leverage:p.leverage p in
+       let mode_changed = !st.full_balance_ref <> p.full_balance_ref in
+       let accumulated = (Overlay_inventory.aggregate controller).total in
+       (match
+          Dio_exchange.Market_context.get_position
+            ~exchange:asset_with_fees.exchange
+            ~coin:base_asset
+        with
+        | Some pos when pos.qty < -0.0001 && accumulated > 0.0 && pos.entry > 0.0 ->
+          let short_qty = -.pos.qty in
+          let ratio = short_qty /. accumulated in
+          if ratio > ladder.ol_max_ratio +. 1e-9
+          then
+            Logging.warn_f
+              ~section
+              "carry %s: grandfathered ratio %.4f exceeds configured max %.4f; no adds \
+               until the first profitable recycle"
+              asset_with_fees.symbol
+              ratio
+              ladder.ol_max_ratio;
+          let live =
+            derive_overlay_ladder
+              ~start_ratio:(Float.min ladder.ol_max_ratio ratio)
               ~leverage:p.leverage
-              ~entry:pos.entry
-              ~accumulated
-              ~short_qty
-              ort
-          | _ -> ());
-         if mode_changed
-         then st := { !st with full_balance_ref = p.full_balance_ref })
+              p
+          in
+          let mark =
+            match
+              Dio_exchange.Market_context.get_funding
+                ~exchange:asset_with_fees.exchange
+                ~coin:base_asset
+            with
+            | Some f when f.mark > 0.0 -> f.mark
+            | _ -> 0.0
+          in
+          Dio_strategies.Carry_runtime.init_ladder
+            ~max_ratio:live.ol_max_ratio
+            ~add_first:live.ol_add_first
+            ~add_growth:live.ol_add_growth
+            ~num_rungs:live.ol_num_rungs
+            ~add_threshold:live.ol_add_threshold
+            ~leverage:p.leverage
+            ~mark
+            ~entry:pos.entry
+            ~accumulated
+            ~short_qty
+            ort
+        | _ ->
+          if mode_changed
+          then
+            Dio_strategies.Carry_runtime.reset_ladder
+              ~start_ratio:ladder.ol_start_ratio
+              ort);
+       if mode_changed then st := { !st with full_balance_ref = p.full_balance_ref }
      | _ -> ());
     (* Adopt carry orders that survived a restart. The order-id -> kind registry is
        in-memory, so a new process would otherwise not recognise a resting take-profit,
