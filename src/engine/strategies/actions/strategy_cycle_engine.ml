@@ -41,6 +41,9 @@ type ctx =
   ; mutable cg_qbal : float
   ; mutable cg_now : float
   ; mutable cg_cycle : int
+  (** Controller key ("venue|symbol") whose [accumulated_profit] this domain drains. Empty
+      when the domain is not the grid leg of a carry controller. *)
+  ; mutable cg_credit_key : string
   ; mutable cg_quote_stale : bool
   ; mutable cg_oracle_halted : bool
   ; mutable cg_base_age : float option
@@ -89,6 +92,7 @@ let create () =
   ; cg_qbal = nan
   ; cg_now = 0.0
   ; cg_cycle = 0
+  ; cg_credit_key = ""
   ; cg_quote_stale = false
   ; cg_oracle_halted = false
   ; cg_base_age = None
@@ -498,6 +502,14 @@ let cycle_facts c (t : Strategy_runtime.t) =
     [funding_valid]/[perp_valid] false) so a consumer can gate on validity instead of
     acting on a zero that looks real. *)
 let market_facts c (t : Strategy_runtime.t) =
+  (match c.cg_state with
+   | Some s when c.cg_credit_key <> "" ->
+     let credit = Accum_credit.drain ~key:c.cg_credit_key in
+     if credit > 0.0
+     then (
+       s.accumulated_profit <- s.accumulated_profit +. credit;
+       s.persistence_dirty <- true)
+   | _ -> ());
   let asset = c.cg_asset in
   let symbol =
     match asset with
@@ -694,7 +706,9 @@ let market_facts c (t : Strategy_runtime.t) =
     in
     let reserved =
       match c.cg_state with
-      | Some s -> s.reserved_base
+      | Some s ->
+        s.staked_base <- Float.max 0.0 staked;
+        s.reserved_base
       | None -> 0.0
     in
     let spot_total =
@@ -1411,6 +1425,19 @@ let reserve_base c ~qty =
       state.reserved_base <- Float.max 0.0 (state.reserved_base +. qty);
       state.persistence_dirty <- true)
   | _ -> ()
+;;
+
+(** Credit realized carry profit to the parent grid's [accumulated_profit]. The grid
+    domain drains it on its next cycle and spends it skimming base on a buy fill. *)
+let credit_profit c ~qty =
+  if Float.is_finite qty && qty > 0.0
+  then (
+    match c.cg_asset with
+    | Some asset ->
+      Accum_credit.add
+        ~key:(Accum_credit.key ~exchange:asset.exchange ~symbol:asset.symbol)
+        qty
+    | None -> ())
 ;;
 
 (** Fine path: the stale-balance side effect (record the cycle on the state). The file

@@ -2,13 +2,13 @@
 
 open Strategy_state
 
-(* Kraken matches HL/Lighter/IBKR: 1:1 sells and persistence-layer reserved_base accrual
-   on profitable sell fills (Base_accumulation_store). *)
+(* Kraken matches HL: 1:1 sells, retention skimmed into reserved_base on the buy fill. *)
 let kraken_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
   ; use_accumulation_sells = true
-  ; sell_uses_mult = true
+  ; sell_uses_mult = false
+  ; staked_backs_reserve = true
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; enforce_venue_min_qty = true
@@ -27,6 +27,7 @@ let hyperliquid_config =
   ; track_pending_sells = false
   ; use_accumulation_sells = true
   ; sell_uses_mult = false
+  ; staked_backs_reserve = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; enforce_venue_min_qty = false
@@ -45,6 +46,7 @@ let ibkr_config =
   ; track_pending_sells = true
   ; use_accumulation_sells = true
   ; sell_uses_mult = false
+  ; staked_backs_reserve = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; enforce_venue_min_qty = true
@@ -63,6 +65,7 @@ let lighter_config =
   ; track_pending_sells = true
   ; use_accumulation_sells = true
   ; sell_uses_mult = false
+  ; staked_backs_reserve = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; enforce_venue_min_qty = true
@@ -81,6 +84,7 @@ let alpaca_config =
   ; track_pending_sells = true
   ; use_accumulation_sells = false
   ; sell_uses_mult = false
+  ; staked_backs_reserve = false
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; enforce_venue_min_qty = false

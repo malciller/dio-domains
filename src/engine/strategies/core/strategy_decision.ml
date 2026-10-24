@@ -963,6 +963,12 @@ let sell_leg_prepare
     (if state.position_initialized then state.position_base else asset_balance)
     +. unreflected_credit
   in
+  (* Staked/earn base cannot be sold, so it backs the reservation first: only the
+     reserved amount above the staked balance reduces the tradeable float. *)
+  let staked =
+    if state.cached_ecfg.staked_backs_reserve then Float.max 0.0 state.staked_base else 0.0
+  in
+  let reserved_tradeable = Float.max 0.0 (state.reserved_base -. staked) in
   (* Alpaca's sellable base: venue [qty_available] (free of resting holds) plus un-polled
      buy credits, minus the reserve. Moved to Platform_accounting (milestone 2). *)
   let alpaca_available =
@@ -970,7 +976,7 @@ let sell_leg_prepare
       ~venue_available:asset_available
       ~ledger_balance
       ~unreflected_credit
-      ~reserved_base:state.reserved_base
+      ~reserved_base:reserved_tradeable
       ~committed_sell
       ~unnetted_hold
   in
@@ -981,7 +987,7 @@ let sell_leg_prepare
       ~venue_available:asset_available
       ~ledger_balance
       ~unreflected_credit
-      ~reserved_base:state.reserved_base
+      ~reserved_base:reserved_tradeable
       ~committed_sell
       ~unnetted_hold
   in
@@ -989,7 +995,7 @@ let sell_leg_prepare
      when the venue-reported sizing basis collapses it, so a stale [qty_available] cannot
      authorize committing [reserved_base]. *)
   let reserve_headroom =
-    Float.max 0.0 (ledger_balance -. state.reserved_base -. committed_total)
+    Float.max 0.0 (ledger_balance -. reserved_tradeable -. committed_total)
   in
   Strategy_state.sub_stop state Strategy_state.Splan_overlays _sp_ov;
   (* The persisted-sell grid is reconciled once per execution and the result is reused by
@@ -1090,7 +1096,7 @@ let sell_leg_prepare
     if Float.is_nan asset_balance
     then 0.0
     else if is_accumulation_basis
-    then ledger_balance -. state.reserved_base -. committed_sell
+    then ledger_balance -. reserved_tradeable -. committed_sell
     else available_base
   in
   (* Inventory gate for sell placement: available non-accrued inventory must cover the
@@ -1279,6 +1285,10 @@ let sell_place_body
   let sell_pushed = pre.sp_sell_pushed in
   let nothing_placeable = pre.sp_nothing_placeable in
   let asset_bal = ledger_balance in
+  let staked =
+    if state.cached_ecfg.staked_backs_reserve then Float.max 0.0 state.staked_base else 0.0
+  in
+  let reserved_tradeable = Float.max 0.0 (state.reserved_base -. staked) in
   let venue_balance = pre.sp_venue_balance in
   let qty =
     match state.last_buy_fill_qty with
@@ -1362,10 +1372,10 @@ let sell_place_body
      [qty_available], which is already free of resting holds. *)
   let available =
     if is_accumulation
-    then Float.max 0.0 (asset_bal -. state.reserved_base -. committed_sell)
+    then Float.max 0.0 (asset_bal -. reserved_tradeable -. committed_sell)
     else if is_alpaca
     then alpaca_available
-    else Float.max 0.0 (asset_bal -. state.reserved_base -. committed_sell)
+    else Float.max 0.0 (asset_bal -. reserved_tradeable -. committed_sell)
   in
   let target_q = round_qty sell_qty asset.symbol asset.exchange in
   let effective_sell_qty, balance_ok =

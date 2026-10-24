@@ -42,6 +42,7 @@
   Strategy_api
   ; platform/ — central accounting
   Platform_accounting
+  Accum_credit
   Exchange_capabilities
   Fee_cache
   ; actions/ — registry + grid bridge
