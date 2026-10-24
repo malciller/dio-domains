@@ -15,7 +15,6 @@ type exchange_config = Strategy_state.exchange_config =
   ; track_pending_sells : bool
   ; use_accumulation_sells : bool
   ; sell_uses_mult : bool
-  ; staked_backs_reserve : bool
   ; sell_failure_sets_asset_low : bool
   ; use_reserved_base_guard : bool
   ; enforce_venue_min_qty : bool

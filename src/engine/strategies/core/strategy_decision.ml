@@ -965,9 +965,7 @@ let sell_leg_prepare
   in
   (* Staked/earn base cannot be sold, so it backs the reservation first: only the
      reserved amount above the staked balance reduces the tradeable float. *)
-  let staked =
-    if state.cached_ecfg.staked_backs_reserve then Float.max 0.0 state.staked_base else 0.0
-  in
+  let staked = Float.max 0.0 state.staked_base in
   let reserved_tradeable = Float.max 0.0 (state.reserved_base -. staked) in
   (* Alpaca's sellable base: venue [qty_available] (free of resting holds) plus un-polled
      buy credits, minus the reserve. Moved to Platform_accounting (milestone 2). *)
@@ -1285,9 +1283,7 @@ let sell_place_body
   let sell_pushed = pre.sp_sell_pushed in
   let nothing_placeable = pre.sp_nothing_placeable in
   let asset_bal = ledger_balance in
-  let staked =
-    if state.cached_ecfg.staked_backs_reserve then Float.max 0.0 state.staked_base else 0.0
-  in
+  let staked = Float.max 0.0 state.staked_base in
   let reserved_tradeable = Float.max 0.0 (state.reserved_base -. staked) in
   let venue_balance = pre.sp_venue_balance in
   let qty =

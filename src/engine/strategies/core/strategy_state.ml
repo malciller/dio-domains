@@ -33,10 +33,6 @@ type exchange_config =
       order itself. Kept for venues whose lot size and grid interval make the retained
       slice a tradeable quantity. *)
 
-  ; staked_backs_reserve : bool
-  (** Earn/staked base sits outside the tradeable float, so it backs [reserved_base]
-      before the float is reduced. Only venues whose balance figure excludes staked base
-      and whose reservation is a total-holdings claim (Kraken). *)
   ; sell_failure_sets_asset_low : bool
   (** Set asset_low on sell insufficient-balance rejection *)
   ; use_reserved_base_guard : bool
@@ -468,7 +464,6 @@ let default_kraken_config =
   ; track_pending_sells = true
   ; use_accumulation_sells = true
   ; sell_uses_mult = true
-  ; staked_backs_reserve = true
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; enforce_venue_min_qty = true
