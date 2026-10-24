@@ -459,6 +459,58 @@ let test_latency_persistence () =
   Latencies.set_page 0
 ;;
 
+let perp_json ?(qty = -1.0) ?(mark = 100.0) ?(buys = []) ?(sells = []) () =
+  `Assoc
+    [ "coin", `String "TEST"
+    ; "side", `String (if qty < 0.0 then "short" else "long")
+    ; "has_position", `Bool (Float.abs qty > 1e-12)
+    ; "qty", `Float qty
+    ; "abs_qty", `Float (Float.abs qty)
+    ; "entry", `Float 100.0
+    ; "mark", `Float mark
+    ; "buy_orders", `List buys
+    ; "sell_orders", `List sells
+    ]
+;;
+
+let test_perp_close_distance () =
+  let parse = Dashboard_ui.Snapshot.parse_perp in
+  let dist p = Dashboard_ui.Holdings.perp_close_dist_pct p in
+  let short =
+    parse
+      (perp_json
+         ~buys:[ order_json "b1" 98.0 1.0; order_json "b2" 99.5 1.0 ]
+         ~sells:[ order_json "s1" 101.0 1.0 ]
+         ())
+  in
+  (match dist short with
+   | Some v -> Alcotest.(check (float 1e-9)) "short exits on the nearest buy" (-0.5) v
+   | None -> Alcotest.fail "expected a short close distance");
+  let long =
+    parse
+      (perp_json
+         ~qty:1.0
+         ~buys:[ order_json "b1" 98.0 1.0 ]
+         ~sells:[ order_json "s1" 101.0 1.0 ]
+         ())
+  in
+  (match dist long with
+   | Some v -> Alcotest.(check (float 1e-9)) "long exits on the nearest sell" 1.0 v
+   | None -> Alcotest.fail "expected a long close distance");
+  Alcotest.(check bool)
+    "flat has no close distance"
+    true
+    (dist (parse (perp_json ~qty:0.0 ())) = None);
+  Alcotest.(check bool)
+    "no exit order has no close distance"
+    true
+    (dist (parse (perp_json ())) = None);
+  Alcotest.(check bool)
+    "stale mark has no close distance"
+    true
+    (dist (parse (perp_json ~mark:0.0 ~buys:[ order_json "b1" 99.0 1.0 ] ())) = None)
+;;
+
 let () =
   Alcotest.run
     "dashboard_holdings"
@@ -483,6 +535,12 @@ let () =
             "available_balance distinguishes zero from unknown"
             `Quick
             test_available_balance_parse
+        ] )
+    ; ( "perp close"
+      , [ Alcotest.test_case
+            "nearest exit distance uses the reducing side"
+            `Quick
+            test_perp_close_distance
         ] )
     ; ( "latency formatting"
       , [ Alcotest.test_case

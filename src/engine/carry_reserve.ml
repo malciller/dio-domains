@@ -2,10 +2,13 @@
 
     In unified mode the perp liquidation is driven by the total spot USDC collateral, not
     the per-venue initial margin. Each trading entry with an overlay owns its own reserve
-    budget: the free USDC that must remain so that, for a chosen liquidation multiple of
-    the mark, that entry's short position still covers maintenance. The domain publishes
-    its budget as [min_liq_reserve] and its overlay reserves it; the account's total carry
-    reservation is the sum of the per-entry budgets. *)
+    budget: the free USDC that must remain so that, at a chosen liquidation multiple of
+    the mark, that entry's *configured max-size short* still covers maintenance. Sizing
+    the budget for the top of the ladder (rather than the live position) keeps the funding
+    for the whole add ladder out of the grid's reach, and stops the reservation from
+    growing cycle by cycle as the short adds. The domain publishes its budget as
+    [min_liq_reserve] and its overlay reserves it; the account's total carry reservation
+    is the sum of the per-entry budgets. *)
 
 let section = "carry_reserve"
 let base_coin_of_symbol symbol = Config.base_coin_of_symbol symbol
@@ -60,22 +63,40 @@ let c_min_for_target ~target ~mult =
     Some (Float.max 0.0 ((s *. l *. (1.0 +. target.maintenance)) -. (s *. target.entry))))
 ;;
 
-(** Per-entry reserve for [symbol] on [exchange]: that entry's short position at its own
-    [min_liq_mult]. Zero when no carry short is open. *)
+(** Per-entry reserve sized to the entry's [max_qty] ladder target, with the controller's
+    already-resolved coin and liquidation multiple. The domain loop knows both for the
+    life of the controller, so the per-cycle reserve does no config lookup, string
+    normalization, or symbol split.
+
+    The formula is linear in size, so the target reserve is the per-unit requirement at
+    the live average entry times [max_qty]. Returns zero while the controller is flat:
+    there is no ladder to fund until the first short fills. *)
+let compute_with ~exchange ~coin ~min_liq_mult ~max_qty =
+  match pos_leg ~exchange ~coin with
+  | None -> 0.0
+  | Some target when target.qty >= -0.0000001 -> 0.0
+  | Some target ->
+    let target_qty =
+      if Float.is_finite max_qty && max_qty > 0.0 then max_qty else Float.abs target.qty
+    in
+    let qty = Float.max target_qty (Float.abs target.qty) in
+    Option.value
+      (c_min_for_target ~target:{ target with qty = -.qty } ~mult:min_liq_mult)
+      ~default:0.0
+;;
+
+(** Per-entry reserve for [symbol] on [exchange] at the live short's own size, resolving
+    the per-asset [min_liq_mult] from config. The domain loop uses {!compute_with}
+    directly with the controller's configured target. *)
 let compute ~exchange ~symbol =
   let coin = base_coin_of_symbol symbol in
   match pos_leg ~exchange ~coin with
   | None -> 0.0
   | Some target ->
     let p = Config.get_overlay_params ~exchange ~symbol in
-    Option.value (c_min_for_target ~target ~mult:p.min_liq_mult) ~default:0.0
-;;
-
-(** As {!compute}, but with the controller's already-resolved coin and liquidation
-    multiple. The domain loop knows both for the life of the controller, so the per-cycle
-    reserve does no config lookup, string normalization, or symbol split. *)
-let compute_with ~exchange ~coin ~min_liq_mult =
-  match pos_leg ~exchange ~coin with
-  | None -> 0.0
-  | Some target -> Option.value (c_min_for_target ~target ~mult:min_liq_mult) ~default:0.0
+    compute_with
+      ~exchange
+      ~coin
+      ~min_liq_mult:p.min_liq_mult
+      ~max_qty:(Float.abs target.qty)
 ;;

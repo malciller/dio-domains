@@ -485,6 +485,63 @@ module InFlightOrders = struct
   ;;
 end
 
+(** Venue-failure backoff for overlay placements. [order_replace] runs on every book tick,
+    so a rejection (429, insufficient margin, unresolved amend id) would otherwise
+    re-issue on the next tick and amplify the failure. Keyed by the full in-flight key so
+    a failing kind/symbol backs off independently. *)
+module Placement_backoff = struct
+  let table : (string, float) Hashtbl.t = Hashtbl.create 32
+  let mutex = Mutex.create ()
+  let default_s = 5.0
+  let rate_limited_s = 15.0
+  let unresolved_amend_s = 3.0
+
+  let contains s sub =
+    let n = String.length s
+    and m = String.length sub in
+    let rec go i = i + m <= n && (String.equal (String.sub s i m) sub || go (i + 1)) in
+    m = 0 || go 0
+  ;;
+
+  let is_rate_limited err = contains err "429" || contains err "Too Many Requests"
+
+  let note ?(hold = default_s) ~key () =
+    Mutex.lock mutex;
+    Hashtbl.replace table key (Unix.gettimeofday () +. hold);
+    Mutex.unlock mutex
+  ;;
+
+  let note_failure ?(err = "") ~key () =
+    note ~hold:(if is_rate_limited err then rate_limited_s else default_s) ~key ()
+  ;;
+
+  (** A Hyperliquid amend ack did not resolve the replacement id: the venue order is live
+      under an id the open-orders cache may not know yet. Hold the key briefly instead of
+      placing a duplicate beside it. *)
+  let note_unresolved_amend ~key () = note ~hold:unresolved_amend_s ~key ()
+
+  let clear ~key =
+    Mutex.lock mutex;
+    Hashtbl.remove table key;
+    Mutex.unlock mutex
+  ;;
+
+  let remaining ~key () =
+    let now = Unix.gettimeofday () in
+    Mutex.lock mutex;
+    let left =
+      match Hashtbl.find_opt table key with
+      | Some until when until > now -> until -. now
+      | Some _ ->
+        Hashtbl.remove table key;
+        0.0
+      | None -> 0.0
+    in
+    Mutex.unlock mutex;
+    left
+  ;;
+end
+
 (** In-flight amendment lifecycle registry: deduplication of pending amend requests plus
     the exchange's mid-amend order-replacement events.
 

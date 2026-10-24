@@ -316,6 +316,36 @@ let test_tracked_carry_order_is_ack_age_bounded () =
     (C.has_tracked_carry_order ~key ())
 ;;
 
+let test_placement_backoff_is_bounded () =
+  let module C = Dio_strategies.Strategy_common in
+  let key = "test:backoff|hyperliquid|TEST" in
+  C.Placement_backoff.note_failure ~err:"Insufficient margin" ~key ();
+  Alcotest.(check bool)
+    "rejection holds the key"
+    true
+    (C.Placement_backoff.remaining ~key () > 0.0);
+  C.Placement_backoff.clear ~key;
+  Alcotest.(check bool)
+    "success releases the key"
+    true
+    (C.Placement_backoff.remaining ~key () = 0.0);
+  C.Placement_backoff.note_failure
+    ~err:"Failed to parse HL response (Raw: \"429 Too Many Requests\")"
+    ~key
+    ();
+  Alcotest.(check bool)
+    "rate limit backs off longer than a plain rejection"
+    true
+    (C.Placement_backoff.remaining ~key () > C.Placement_backoff.default_s);
+  C.Placement_backoff.clear ~key;
+  C.Placement_backoff.note_unresolved_amend ~key ();
+  Alcotest.(check bool)
+    "unresolved amend holds briefly"
+    true
+    (C.Placement_backoff.remaining ~key () > 0.0);
+  C.Placement_backoff.clear ~key
+;;
+
 let test_resolve_fee_rate () =
   (* Fee resolution never invents a literal rate: explicit config, then the live cache,
      then the caller's last known value (which the domain seeded from the venue default). *)
@@ -367,6 +397,10 @@ let () =
             "tracked carry order guard is bounded by the ack window"
             `Quick
             test_tracked_carry_order_is_ack_age_bounded
+        ; Alcotest.test_case
+            "placement backoff is bounded"
+            `Quick
+            test_placement_backoff_is_bounded
         ; Alcotest.test_case
             "only grid-tagged orders are grid-owned"
             `Quick

@@ -2308,6 +2308,7 @@ let asset_domain_worker
          <- Carry_reserve.compute_with
               ~coin:overlay_coin
               ~min_liq_mult:overlay_min_liq_mult
+              ~max_qty:(controller.oc_params.max_ratio_pct /. 100.0 *. inventory.total)
               ~exchange:controller.oc_hedge_exchange;
          ctx.cg_carry <- Option.map (fun r -> !r) overlay_carry;
          ort.prof_enabled <- false;

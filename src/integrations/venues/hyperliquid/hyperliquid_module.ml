@@ -1363,8 +1363,71 @@ let fetch_open_orders_ws () =
         Lwt.return_unit))
 ;;
 
-(** On-demand user-state resync, single-flight: balances first, then open orders. Failures
-    are logged and the next trigger retries. *)
+(** Fetch the perp clearinghouse state. The user stream is the primary source, but a lost
+    frame leaves the position map stale until the next webData2; the resync must repair it
+    or the overlay keeps seeing a closed/flat position and never places the exit for a
+    short that is actually open. *)
+let fetch_positions_ws () =
+  let section = "hyperliquid_startup" in
+  let wallet =
+    match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
+    | Some w -> w
+    | None -> ""
+  in
+  if wallet = ""
+  then Lwt.return_unit
+  else (
+    let req_id = Hyperliquid_actions.next_ws_req_id () in
+    let ws_frame =
+      `Assoc
+        [ "method", `String "post"
+        ; "id", `Int req_id
+        ; ( "request"
+          , `Assoc
+              [ "type", `String "info"
+              ; ( "payload"
+                , `Assoc [ "type", `String "clearinghouseState"; "user", `String wallet ]
+                )
+              ] )
+        ]
+    in
+    Lwt.catch
+      (fun () ->
+        wait_for_ws_connected ()
+        >>= fun () ->
+        Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:5000
+        >>= fun resp_frame ->
+        let open Yojson.Safe.Util in
+        let response_node =
+          try resp_frame |> member "data" |> member "response" with
+          | _ -> `Null
+        in
+        let payload =
+          try response_node |> member "payload" with
+          | _ -> `Null
+        in
+        let data_node =
+          try payload |> member "data" with
+          | _ -> `Null
+        in
+        let state = if data_node <> `Null then data_node else payload in
+        if state <> `Null
+        then
+          ignore
+            (Hyperliquid_positions.apply_clearinghouse_state
+               ~now:(Unix.gettimeofday ())
+               state);
+        Lwt.return_unit)
+      (fun exn ->
+        Logging.error_f
+          ~section
+          "Failed to fetch positions via WS: %s"
+          (Printexc.to_string exn);
+        Lwt.return_unit))
+;;
+
+(** On-demand user-state resync, single-flight: balances, positions, then open orders.
+    Failures are logged and the next trigger retries. *)
 let resync_in_flight = Atomic.make false
 
 let resync_user_state () =
@@ -1377,7 +1440,8 @@ let resync_user_state () =
             (fun () ->
               fetch_account_mode_ws ()
               >>= fun () ->
-              fetch_spot_balances_ws () >>= fun () -> fetch_open_orders_ws ())
+              fetch_spot_balances_ws ()
+              >>= fun () -> fetch_positions_ws () >>= fun () -> fetch_open_orders_ws ())
             (fun exn ->
               Logging.warn_f
                 ~section:"hyperliquid_startup"
@@ -1399,15 +1463,24 @@ let resync_user_state () =
 let () = Hyperliquid_impl.resync_hook := resync_user_state
 
 (** Consume the user-stream loss flag and resync. The dedicated stream should never fill;
-    this is the fallback if it does, or if the venue never sent a frame. *)
+    this is the fallback if it does, or if the venue never sent a frame. Debounced: a
+    burst of dropped frames must not turn into a REST request storm that trips the venue's
+    rate limit (which then keeps the resync from repairing anything). *)
 let () =
+  let last_resync = ref 0.0 in
   let rec watch () =
     if Hyperliquid_ws.get_user_resync_needed ()
     then (
-      Logging.warn_f
-        ~section:"hyperliquid_startup"
-        "User-channel frame loss detected; requesting a full balance/open-orders resync";
-      resync_user_state ());
+      let now = Unix.gettimeofday () in
+      if now -. !last_resync >= 2.0
+      then (
+        last_resync := now;
+        Logging.warn_f
+          ~section:"hyperliquid_startup"
+          "User-channel frame loss detected; requesting a full \
+           balance/positions/open-orders resync";
+        resync_user_state ())
+      else Hyperliquid_ws.note_user_resync_needed ());
     Lwt_unix.sleep 0.25 >>= watch
   in
   Lwt.async watch
