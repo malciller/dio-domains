@@ -17,7 +17,6 @@ socket, with latency and log views and an alert popup for warnings and errors.
 [![release](https://img.shields.io/github/v/release/malciller/dio-domains)](https://github.com/malciller/dio-domains/releases)
 [![stars](https://img.shields.io/github/stars/malciller/dio-domains?style=social&label=Star)](https://github.com/malciller/dio-domains/stargazers)
 [![docker pulls](https://img.shields.io/docker/pulls/malciller/dio-domains)](https://hub.docker.com/r/malciller/dio-domains)
-[![OCaml](https://img.shields.io/github/languages/top/malciller/dio-domains)](https://ocaml.org)
 [![license](https://img.shields.io/github/license/malciller/dio-domains)](LICENSE)
 
 > dio trades real money and ships without warranty. Test on a testnet before
