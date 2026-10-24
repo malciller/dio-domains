@@ -82,6 +82,13 @@ type perp =
   ; sell_orders : order list
   }
 
+type ladder =
+  { rungs : int
+  ; trail_pct : float
+  ; start_ratio_pct : float
+  ; max_ratio_pct : float
+  }
+
 type strategy =
   { symbol : string
   ; exchange : string
@@ -97,6 +104,7 @@ type strategy =
   ; last_sell_fill : float
   ; grid_interval_lo : float
   ; market : market
+  ; ladder : ladder option
   ; perp : perp option
   ; oracle : oracle option
   }
@@ -326,6 +334,16 @@ let parse_strategy symbol j =
   ; last_sell_fill = strat |?> "last_sell_fill" |> to_float_d 0.0
   ; grid_interval_lo = j |?> "grid_interval_lo" |> to_float_d 1.0
   ; market = parse_market (j |?> "market")
+  ; ladder =
+      (match strat |?> "ladder" with
+       | `Assoc _ as l ->
+         Some
+           { rungs = l |?> "rungs" |> to_int_d 0
+           ; trail_pct = l |?> "trail_pct" |> to_float_d 0.0
+           ; start_ratio_pct = l |?> "start_ratio_pct" |> to_float_d 0.0
+           ; max_ratio_pct = l |?> "max_ratio_pct" |> to_float_d 0.0
+           }
+       | _ -> None)
   ; perp =
       (match j |?> "perp" with
        | `Assoc _ as p -> Some (parse_perp p)

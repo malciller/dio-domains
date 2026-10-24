@@ -815,6 +815,42 @@ let build_snapshot () =
              | None -> `Assoc [ "type", `String "Inventory" ])
           | other -> `Assoc [ "type", `String other ]
         in
+        (* Derived from the live short when one is open: the runtime re-derives the ladder
+           at startup, so these are the rungs and trail LEFT to max_ratio. *)
+        let strategy_json =
+          match overlay, strategy_json with
+          | Some c, `Assoc fields ->
+            let p = c.oc_params in
+            let config_ladder =
+              Dio_engine.Domain_spawner.derive_overlay_ladder ~leverage:p.leverage p
+            in
+            let live =
+              let acc = (Dio_engine.Overlay_inventory.aggregate c).total in
+              match
+                Dio_exchange.Market_context.get_position
+                  ~exchange:c.oc_hedge_exchange
+                  ~coin:c.oc_hedge_coin
+              with
+              | Some pos when acc > 0.0 && pos.qty < -0.0001 ->
+                let ratio = Float.min (p.max_ratio_pct /. 100.0) (Float.abs pos.qty /. acc) in
+                Dio_engine.Domain_spawner.derive_overlay_ladder
+                  ~start_ratio:ratio
+                  ~leverage:p.leverage
+                  p
+              | _ -> config_ladder
+            in
+            `Assoc
+              (fields
+               @ [ ( "ladder"
+                   , `Assoc
+                       [ "rungs", `Int live.ol_num_rungs
+                       ; "trail_pct", `Float live.ol_max_trail_pct
+                       ; "start_ratio_pct", `Float (live.ol_start_ratio *. 100.0)
+                       ; "max_ratio_pct", `Float (live.ol_max_ratio *. 100.0)
+                       ] )
+                 ])
+          | _ -> strategy_json
+        in
         let base_asset, quote_currency = split_symbol tc.symbol in
         let market_json =
           json_of_market_data tc.exchange tc.symbol base_asset quote_currency

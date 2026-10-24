@@ -461,6 +461,26 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         ; item "signer" "SIGN"
         ]
     in
+    (* Carry ladder: remaining rungs and price range left to max_ratio. On its own row:
+       row 2 already runs to the panel edge and close_row crops the overflow. *)
+    let ladder_line =
+      match strat_opt with
+      | Some { ladder = Some l; _ } when l.rungs > 0 ->
+        Some
+          (I.hcat
+             [ I.string a_border " │"
+             ; I.string a_label " Carry ladder: "
+             ; I.string a_label "Trail "
+             ; I.string a_cyan (Printf.sprintf "+%.2f%%" l.trail_pct)
+             ; I.string a_dim " │ "
+             ; I.string a_label "Rungs "
+             ; I.string a_cyan (Printf.sprintf "%d" l.rungs)
+             ; I.string a_dim " │ "
+             ; I.string a_text
+                 (Printf.sprintf "%.1f%% -> %.1f%%" l.start_ratio_pct l.max_ratio_pct)
+             ])
+      | _ -> None
+    in
     let summary_card =
       (* Oracle line (rendered only when a decision exists): ACTIVE/INACTIVE verdict (the
          oracle-paused state), sizing, and reason. *)
@@ -604,7 +624,9 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         I.vcat
           ([ close_row w (I.hcat [ I.string a_border " │"; r1 ])
            ; close_row w (I.hcat [ I.string a_border " │"; r2 ])
-           ; close_row w (I.hcat [ I.string a_border " │"; latency_row ])
+           ]
+           @ (match ladder_line with Some l -> [ close_row w l ] | None -> [])
+           @ [ close_row w (I.hcat [ I.string a_border " │"; latency_row ])
            ; legend_row
            ]
            @ perp_line)
