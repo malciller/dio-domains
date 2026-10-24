@@ -271,7 +271,7 @@ let test_grid_order_ownership () =
   Alcotest.(check string) "owner: unknown tag" "other" (C.order_owner (Some 99))
 ;;
 
-let test_tracked_carry_order_has_no_age_bound () =
+let test_tracked_carry_order_is_ack_age_bounded () =
   let module C = Dio_strategies.Strategy_common in
   let key = "test:tracked|hyperliquid|TEST" in
   let order_id = "oid-tracked-test" in
@@ -282,19 +282,31 @@ let test_tracked_carry_order_has_no_age_bound () =
     ~kind:"carry:entry";
   C.bind_carry_order ~dedup_key:key ~order_id;
   Alcotest.(check bool) "acked order is tracked" true (C.has_tracked_carry_order ~key ());
-  (* Age the mapping well past 5 s. A resting take-profit can sit for minutes; the
-     tracked-order guard must still suppress a duplicate placement. *)
-  Mutex.lock C.carry_registry_mutex;
-  (match Hashtbl.find_opt C.carry_orders order_id with
-   | Some meta ->
-     Hashtbl.replace
-       C.carry_orders
-       order_id
-       { meta with C.com_at = Unix.gettimeofday () -. 3600.0 }
-   | None -> ());
-  Mutex.unlock C.carry_registry_mutex;
+  let age order_id seconds =
+    Mutex.lock C.carry_registry_mutex;
+    (match Hashtbl.find_opt C.carry_orders order_id with
+     | Some meta ->
+       Hashtbl.replace
+         C.carry_orders
+         order_id
+         { meta with C.com_at = Unix.gettimeofday () -. seconds }
+     | None -> ());
+    Mutex.unlock C.carry_registry_mutex
+  in
+  age order_id 5.0;
   Alcotest.(check bool)
-    "tracked guard does not age out"
+    "tracked guard survives the ack window"
+    true
+    (C.has_tracked_carry_order ~key ());
+  (* A lost terminal event plus an absent venue order must not suppress the TP forever. *)
+  age order_id 3600.0;
+  Alcotest.(check bool)
+    "stale mapping cannot suppress a replacement"
+    false
+    (C.has_tracked_carry_order ~key ());
+  age order_id 0.0;
+  Alcotest.(check bool)
+    "reactivated mapping is tracked"
     true
     (C.has_tracked_carry_order ~key ());
   C.retire_carry_order ~order_id;
@@ -352,9 +364,9 @@ let () =
             `Quick
             test_carry_order_terminal
         ; Alcotest.test_case
-            "tracked carry order guard has no age bound"
+            "tracked carry order guard is bounded by the ack window"
             `Quick
-            test_tracked_carry_order_has_no_age_bound
+            test_tracked_carry_order_is_ack_age_bounded
         ; Alcotest.test_case
             "only grid-tagged orders are grid-owned"
             `Quick

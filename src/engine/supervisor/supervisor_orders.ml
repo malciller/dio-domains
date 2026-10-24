@@ -309,8 +309,8 @@ let hedger_callbacks : strategy_callbacks =
           ~dedup_key:order.duplicate_key
           ~order_id;
         (* Release the placement key on ack, like the grid. The durable duplicate guard is
-           the acked id -> kind mapping in [carry_orders] ([has_tracked_carry_order], no
-           age bound), not this short-lived latch. *)
+           the acked id -> kind mapping in [carry_orders] ([has_tracked_carry_order],
+           bounded by the ack->feed grace), not this short-lived latch. *)
         ignore
           (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
              order.duplicate_key))

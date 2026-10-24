@@ -1127,10 +1127,13 @@ let order_replace
                          true
                      in
                      let kind_ok =
+                       (* No registry entry: the carry order's market+side identifies its
+                          kind. Ignoring it strands a live order that the next placement
+                          would duplicate. *)
                        match order_side, meta with
                        | Strategy_common.Buy, Some m ->
                          String.equal m.Strategy_common.com_kind kind_key
-                       | Strategy_common.Buy, None -> false
+                       | Strategy_common.Buy, None -> true
                        | Strategy_common.Sell, Some m ->
                          String.equal m.Strategy_common.com_kind kind_key
                        | Strategy_common.Sell, None -> true
