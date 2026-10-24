@@ -934,7 +934,13 @@ let order_place
             ~instrument
             ~reduce_only
         in
-        if Strategy_common.InFlightOrders.is_in_flight duplicate_key
+        if Strategy_common.Placement_backoff.remaining ~key:duplicate_key () > 0.0
+        then
+          Logging.debug_f
+            ~section
+            "Overlay placement backed off after a venue failure: %s"
+            duplicate_key
+        else if Strategy_common.InFlightOrders.is_in_flight duplicate_key
         then
           (* The previous attempt for this kind/symbol/venue is still awaiting the venue
              ack. Retrying now can only create a duplicate; the first cycle after the ack
@@ -1081,6 +1087,21 @@ let order_replace
           (try Ex.round_price ~symbol:instrument ~price:px with
            | _ -> px)
         | None -> px
+      in
+      let backoff_key =
+        overlay_inflight_key
+          ~dedup_key
+          ~side:(Strategy_common.string_of_order_side order_side)
+          ~qty
+          ~price:(Some rounded)
+          ~exchange:asset.exchange
+          ~instrument
+          ~reduce_only
+      in
+      let backoff =
+        if qty <= 0.0
+        then 0.0
+        else Strategy_common.Placement_backoff.remaining ~key:backoff_key ()
       in
       let matching =
         match ex with
@@ -1245,13 +1266,20 @@ let order_replace
          leave a duplicate; keep the first and cancel the rest so two take-profits cannot
          both target the same position (the chart then shows one close, not a doubled
          one). *)
-      (match matching with
-       | _ :: (_ :: _ as extras) when qty > 0.0 ->
-         List.iter (fun o -> cancel_one ~reason:"duplicate" o) extras
-       | _ -> ());
       if qty <= 0.0
       then List.iter (fun o -> cancel_one o) matching
+      else if backoff > 0.0
+      then
+        Logging.debug_f
+          ~section
+          "Overlay placement backed off %.1fs after a venue failure: %s"
+          backoff
+          backoff_key
       else (
+        (match matching with
+         | _ :: (_ :: _ as extras) ->
+           List.iter (fun o -> cancel_one ~reason:"duplicate" o) extras
+         | _ -> ());
         match matching with
         | o :: _ when same_price o && same_qty o -> ()
         | o :: _ when below_min_on_amend o ->

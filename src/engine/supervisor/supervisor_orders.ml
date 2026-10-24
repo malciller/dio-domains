@@ -308,6 +308,7 @@ let hedger_callbacks : strategy_callbacks =
         Dio_strategies.Strategy_common.bind_carry_order
           ~dedup_key:order.duplicate_key
           ~order_id;
+        Dio_strategies.Strategy_common.Placement_backoff.clear ~key:order.duplicate_key;
         (* Release the placement key on ack, like the grid. The durable duplicate guard is
            the acked id -> kind mapping in [carry_orders] ([has_tracked_carry_order],
            bounded by the ack->feed grace), not this short-lived latch. *)
@@ -327,6 +328,10 @@ let hedger_callbacks : strategy_callbacks =
           err;
         Dio_strategies.Strategy_common.retire_pending_carry_order
           ~dedup_key:order.duplicate_key;
+        Dio_strategies.Strategy_common.Placement_backoff.note_failure
+          ~err
+          ~key:order.duplicate_key
+          ();
         (* A terminal failure must free the key too, otherwise a single ALO/post-only
            rejection blocks the next retry until the TTL sweep. *)
         ignore
@@ -337,6 +342,7 @@ let hedger_callbacks : strategy_callbacks =
         if order.strategy = Dio_strategies.Strategy_common.Carry
            && not (String.equal order.duplicate_key "")
         then (
+          let key = carry_amend_inflight_key order in
           (* A venue amend lands as a new order id. Retire the old mapping first: if the
              old id's terminal event is lost, its full-key mapping would suppress every
              later replace for this kind forever (no entry, no take-profit). *)
@@ -351,11 +357,24 @@ let hedger_callbacks : strategy_callbacks =
                  Dio_strategies.Strategy_common.Carry_perp)
             ~maker:order.post_only
             ~kind:order.duplicate_key
-            ~key:(carry_amend_inflight_key order)))
+            ~key;
+          Dio_strategies.Strategy_common.Placement_backoff.clear ~key;
+          (* Hyperliquid amend is cancel+replace. If the ack left us on the old id the
+             replacement is live but unknown to the cache; hold the key briefly so the
+             next tick does not place a second entry/exit beside it. *)
+          if String.equal order.exchange "hyperliquid" && String.equal new_id target_id
+          then
+            Dio_strategies.Strategy_common.Placement_backoff.note_unresolved_amend ~key ()))
   ; on_amend_skipped = (fun _order _target_id -> ())
   ; on_amend_fail =
-      (fun order _target_id _err ->
-        if order.strategy = Carry then nudge_carry_recovery order)
+      (fun order _target_id err ->
+        if order.strategy = Carry
+        then (
+          Dio_strategies.Strategy_common.Placement_backoff.note_failure
+            ~err
+            ~key:(carry_amend_inflight_key order)
+            ();
+          nudge_carry_recovery order))
   ; on_cancel_ok =
       (fun _order target_order_id ->
         (* Retire the canceled carry order so a tracked-order check does not suppress the

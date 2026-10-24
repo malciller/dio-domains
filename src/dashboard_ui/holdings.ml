@@ -31,6 +31,32 @@ let accum_qty_of ~staked ~pending ~available base =
   if Float.is_finite base && base > 0.0 then Float.min base qty else qty
 ;;
 
+(** Mark-to-close distance that counts as "about to execute" for the row flash. *)
+let perp_close_flash_pct = 0.25
+
+(** Nearest perp exit (the side that reduces the position) as a percentage of the perp
+    mark. Negative when a short's close sits below the mark, positive for a long's above. *)
+let perp_close_dist_pct (p : Snapshot.perp) =
+  if (not p.has_position) || p.mark <= 0.0
+  then None
+  else (
+    let exits = if p.qty < 0.0 then p.buy_orders else p.sell_orders in
+    let exits = List.filter (fun (o : Snapshot.order) -> o.price > 0.0) exits in
+    match exits with
+    | [] -> None
+    | first :: rest ->
+      let nearest =
+        List.fold_left
+          (fun (best : Snapshot.order) (o : Snapshot.order) ->
+            if abs_float (o.price -. p.mark) < abs_float (best.price -. p.mark)
+            then o
+            else best)
+          first
+          rest
+      in
+      Some ((nearest.price -. p.mark) /. p.mark *. 100.0))
+;;
+
 let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
   let t = Theme.current () in
   let a_border = t.a_border in
@@ -59,9 +85,10 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col 14 a_label "SYMBOL"
            ; col 5 a_label "STGY"
            ; col 3 a_label "ST"
-           ; col 9 a_label "PERP PNL"
            ; col_right 12 a_label "PRICE"
            ; I.string a_border " │ "
+           ; col 9 a_label "PERP PNL"
+           ; col_right 7 a_label "Δ CLOSE"
            ; col_right 11 a_label "BUY @"
            ; col 17 a_label ""
            ; col_right 11 a_label "SELL @"
@@ -77,10 +104,11 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col 16 a_label "SYMBOL"
            ; col 5 a_label "STGY"
            ; col 3 a_label "ST"
-           ; col 9 a_label "PERP PNL"
            ; col_right 12 a_label "PRICE"
            ; col_right 8 a_label "SPREAD"
            ; I.string a_border " │ "
+           ; col 9 a_label "PERP PNL"
+           ; col_right 7 a_label "Δ CLOSE"
            ; col_right 12 a_label "BUY @"
            ; col_right 8 a_label "Δ BUY"
            ; col 17 a_label ""
@@ -187,6 +215,16 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
           Some ((mid -. buy_price) /. range *. 100.0))
         else None
     in
+    let close_dist_pct =
+      match s.perp with
+      | Some p -> perp_close_dist_pct p
+      | None -> None
+    in
+    let close_is_buy =
+      match s.perp with
+      | Some p -> p.qty < 0.0
+      | None -> false
+    in
     let near_buy, near_sell =
       let cap_pct_thresh = 0.25 in
       let abs_near_buy =
@@ -209,12 +247,20 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         in
         is_near_buy, false
     in
+    (* The close is an order too: reuse the side's near-fill tint. *)
+    let near_close =
+      match close_dist_pct with
+      | Some d -> abs_float d <= perp_close_flash_pct
+      | None -> false
+    in
+    let near_close_buy = near_close && close_is_buy in
+    let near_close_sell = near_close && not close_is_buy in
     (* Blink the near-fill tint while price is close to execution; a solid tint (the
        previous [Anim.flash] behavior) reads as static and loses the "about to fill" cue. *)
-    if near_buy || near_sell then Anim.motion_pending := true;
+    if near_buy || near_sell || near_close then Anim.motion_pending := true;
     let blink_on = Anim.blink () in
-    let flash_buy = near_buy && blink_on in
-    let flash_sell = near_sell && blink_on in
+    let flash_buy = (near_buy || near_close_buy) && blink_on in
+    let flash_sell = (near_sell || near_close_sell) && blink_on in
     let bg_color =
       if flash_buy
       then c_near_fill
@@ -265,6 +311,20 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       | _ -> "--", a_dim
     in
     let perp_str = truncate_string 9 perp_str in
+    let close_dist_str, close_dist_attr =
+      match close_dist_pct with
+      | None -> "--", a_dim
+      | Some d ->
+        let abs_d = abs_float d in
+        let attr =
+          if abs_d < close_thresh
+          then a_green
+          else if abs_d < far_thresh
+          then a_cyan
+          else a_dim
+        in
+        format_pct d, attr
+    in
     let exch_tag = exch_tag_of exchange in
     let spread_str = format_spread_bps bid ask in
     let spread_attr =
@@ -349,9 +409,10 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col 14 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 8 symbol) exch_tag)
            ; col 5 a_cyan (truncate_string 4 stype)
            ; I.hcat [ I.string status_attr status_str; I.string a_text "  " ]
-           ; col 9 perp_attr perp_str
            ; price_cell
            ; I.string a_border " │ "
+           ; col 9 perp_attr perp_str
+           ; col_right 7 close_dist_attr close_dist_str
            ; col_right
                11
                (if flash_buy
@@ -391,10 +452,11 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
                (Printf.sprintf "%s(%s)" (truncate_string 10 symbol) exch_tag)
            ; col 5 a_cyan (truncate_string 4 stype)
            ; I.hcat [ I.string status_attr status_str; I.string a_text "  " ]
-           ; col 9 perp_attr perp_str
            ; price_cell
            ; col_right 8 spread_attr spread_str
            ; I.string a_border " │ "
+           ; col 9 perp_attr perp_str
+           ; col_right 7 close_dist_attr close_dist_str
            ; col_right
                12
                (if flash_buy
@@ -632,9 +694,10 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col 14 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 8 asset) exch_tag)
            ; col 5 a_dim "--"
            ; I.hcat [ I.string status_attr status_str; I.string row_text "  " ]
-           ; col 9 a_dim "--"
            ; price_cell
            ; I.string a_border " │ "
+           ; col 9 a_dim "--"
+           ; col_right 7 a_dim "--"
            ; col_right 11 a_dim "--"
            ; gauge_img
            ; col_right 11 sell_price_attr sell_price_str
@@ -662,10 +725,11 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col 16 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag)
            ; col 5 a_dim "--"
            ; I.hcat [ I.string status_attr status_str; I.string row_text "  " ]
-           ; col 9 a_dim "--"
            ; price_cell
            ; col_right 8 spread_attr spread_str
            ; I.string a_border " │ "
+           ; col 9 a_dim "--"
+           ; col_right 7 a_dim "--"
            ; col_right 12 a_dim "--"
            ; col_right 8 a_dim "--"
            ; gauge_img
