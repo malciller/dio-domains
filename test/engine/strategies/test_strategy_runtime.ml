@@ -370,6 +370,7 @@ module Stub_engine = struct
 
   let quote_reserve _ ~amount:_ = ()
   let reserve_base _ ~qty:_ = ()
+  let credit_profit _ ~qty:_ = ()
   let mark_stale _ = ()
   let buy_cancel _ = ()
   let buy_place _ = ()

@@ -857,18 +857,7 @@ let asset_domain_worker
            else (
              let p = c.oc_params in
              let ladder = derive_overlay_ladder ~leverage:p.leverage p in
-             let recycle_base_share =
-               if c.oc_has_hl_spot_leg then p.recycle_base_share_pct /. 100.0 else 0.0
-             in
-             if (not c.oc_has_hl_spot_leg) && p.recycle_base_share_pct > 0.0
-             then
-               Logging.info_f
-                 ~section
-                 "carry controller %s/%s: no Hyperliquid spot leg; recycle is 100%% \
-                  quote (ignoring recycle_base_share_pct=%.1f)"
-                 c.oc_hedge_exchange
-                 c.oc_hedge_symbol
-                 p.recycle_base_share_pct;
+             let recycle_base_share = p.recycle_base_share_pct /. 100.0 in
              let params =
                [ "start_ratio", Dio_strategies.Strategy_expr.V_float ladder.ol_start_ratio
                ; ( "add_threshold"
@@ -933,6 +922,24 @@ let asset_domain_worker
           else (
             let ctx = Dio_strategies.Strategy_cycle_engine.create () in
             ctx.cg_symbol <- asset_with_fees.symbol;
+            (* The grid leg of a carry controller drains the overlay's profit credits. *)
+            (match
+               Config.get_overlay_controller
+                 ~exchange:asset_with_fees.exchange
+                 ~symbol:asset_with_fees.symbol
+             with
+             | Some c
+               when List.exists
+                      (fun (l : Config.overlay_leg) ->
+                        l.ol_has_grid
+                        && String.equal l.ol_exchange asset_with_fees.exchange
+                        && String.equal l.ol_symbol asset_with_fees.symbol)
+                      c.oc_legs ->
+               ctx.cg_credit_key
+               <- Dio_strategies.Accum_credit.key
+                    ~exchange:c.oc_hedge_exchange
+                    ~symbol:c.oc_hedge_symbol
+             | _ -> ());
             let handlers = Config_grid_handlers.handler ctx in
             Logging.info_f ~section "strategy: %s running %s" asset_with_fees.symbol path;
             Some (ctx, Dio_strategies.Strategy_runtime.create ~handlers file)))

@@ -30,9 +30,13 @@ type exchange_config =
   ; use_accumulation_sells : bool (** Enable profit-gated accumulation sell path *)
   ; sell_uses_mult : bool
   (** Size each sell at [qty * sell_mult], retaining the [(1 - sell_mult)] slice in the
-      order itself. Only for venues whose lot size and grid interval make the retained
-      slice a tradeable quantity (Kraken). Venues with tighter lots (Hyperliquid) sell 1:1
-      and retain a whole lot from accumulated quote profit instead. *)
+      order itself. Kept for venues whose lot size and grid interval make the retained
+      slice a tradeable quantity. *)
+
+  ; staked_backs_reserve : bool
+  (** Earn/staked base sits outside the tradeable float, so it backs [reserved_base]
+      before the float is reduced. Only venues whose balance figure excludes staked base
+      and whose reservation is a total-holdings claim (Kraken). *)
   ; sell_failure_sets_asset_low : bool
   (** Set asset_low on sell insufficient-balance rejection *)
   ; use_reserved_base_guard : bool
@@ -227,7 +231,9 @@ type strategy_state =
   ; mutable accumulated_profit : float
       (* realized PnL from buy/sell cycles; gates accumulation sell placement *)
   ; mutable reserved_base : float
-      (* base asset accumulated via sell_mult; excluded from sellable balance *)
+      (* base asset held out of selling; staked base backs it first *)
+  ; mutable staked_base : float
+      (* earn/staked base for this asset, refreshed each cycle; not sellable *)
   ; mutable last_buy_fill_price : float option
       (* fill price of most recent buy; cost basis for sell profit calc *)
   ; mutable last_sell_fill_price : float option
@@ -462,6 +468,7 @@ let default_kraken_config =
   ; track_pending_sells = true
   ; use_accumulation_sells = true
   ; sell_uses_mult = true
+  ; staked_backs_reserve = true
   ; sell_failure_sets_asset_low = true
   ; use_reserved_base_guard = true
   ; enforce_venue_min_qty = true
@@ -645,6 +652,7 @@ let rec get_strategy_state asset_symbol =
       ; sell_holds_since_balance = []
       ; accumulated_profit = persisted_accumulated_profit
       ; reserved_base = persisted_reserved_base
+      ; staked_base = 0.0
       ; last_buy_fill_price = persisted_last_buy_fill_price
       ; last_sell_fill_price = persisted_last_sell_fill_price
       ; last_buy_fill_qty = persisted_last_buy_fill_qty

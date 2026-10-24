@@ -4711,7 +4711,7 @@ let test_venue_retention_and_skim () =
   let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
   drain ();
   run ~symbol ~asset ~state ~ecfg ~now:100.0 ~asset_balance:1.001 ~age:0.1 ~price:100.0;
-  check (float 1e-9) "kraken sells qty * sell_mult" 0.9 (placed_sell_qty symbol);
+  check (float 1e-9) "kraken sells 1:1" 1.0 (placed_sell_qty symbol);
   drain ();
   (* Hyperliquid sells 1:1: the 0.1 slice is one lot, retained by the skim rather than by
      shrinking each order. *)

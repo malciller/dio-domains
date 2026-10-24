@@ -236,6 +236,7 @@ module type ENGINE = sig
 
   val quote_reserve : ctx -> amount:float -> unit
   val reserve_base : ctx -> qty:float -> unit
+  val credit_profit : ctx -> qty:float -> unit
   val mark_stale : ctx -> unit
   val buy_cancel : ctx -> unit
 
@@ -358,6 +359,8 @@ module Make (E : ENGINE) = struct
           | "quote_release" -> ph Facts (fun () -> E.quote_reserve ctx ~amount:0.0)
           | "reserve_base" ->
             ph Facts (fun () -> E.reserve_base ctx ~qty:(float_arg args "qty"))
+          | "credit_profit" ->
+            ph Facts (fun () -> E.credit_profit ctx ~qty:(float_arg args "qty"))
           | "mark_stale_cycle" -> ph Preamble (fun () -> E.mark_stale ctx)
           | "cancel_excess_buys" -> ph Buy (fun () -> E.buy_cancel ctx)
           | "buy_place" -> ph Buy (fun () -> E.buy_place ctx)
