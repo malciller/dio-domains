@@ -133,18 +133,22 @@ let register_pending_carry_order ~dedup_key ~market ~maker ~kind =
   Mutex.unlock carry_registry_mutex
 ;;
 
-(** True when an acked carry order for [key] is tracked (awaiting fill or cancel). Mirrors
-    the grid's [has.tracked.buy]: suppresses duplicates while the venue's open-orders scan
-    catches up.
+(** Age after which a mapping whose order the venue's open-order scan does not list stops
+    suppressing placement. A resting order is matched by that scan, so this never limits a
+    take-profit's life; it only releases mappings whose terminal event was lost. Matches
+    the grid's ghost-buy grace. *)
+let carry_tracked_ack_grace_s = 15.0
 
-    No age bound: the mapping is created on ack and retired only by a terminal event (or
-    an amend's old-id retirement). A resting take-profit can sit for minutes. A lost
-    terminal event is surfaced by the in-flight stale sweep, not by re-placing. *)
-let has_tracked_carry_order ~key () =
+(** True when a carry order acked within [max_age] for [key] is tracked. Suppresses
+    duplicates while the venue's open-orders scan catches up; only call after a scan
+    failed to find the order. *)
+let has_tracked_carry_order ?(max_age = carry_tracked_ack_grace_s) ~key () =
+  let now = Unix.gettimeofday () in
   Mutex.lock carry_registry_mutex;
   let found =
     Hashtbl.fold
-      (fun _ meta acc -> acc || String.equal meta.com_key key)
+      (fun _ meta acc ->
+        acc || (String.equal meta.com_key key && now -. meta.com_at <= max_age))
       carry_orders
       false
   in
