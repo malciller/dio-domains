@@ -80,7 +80,7 @@ let spot_base_total = platform "spot_base_total"
 let usdc_free = platform "usdc_free"
 let carry_reserved = platform "carry_reserved"
 let min_notional = platform "min_notional"
-let min_liq_reserve = platform "min_liq_reserve"
+let reserve_share = platform "reserve_share"
 
 (* Carry overlay actual-fill facts. Published from the durable carry state, never derived
    from the trigger mark. *)

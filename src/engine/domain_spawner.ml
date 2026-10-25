@@ -735,10 +735,10 @@ let asset_domain_worker
     in
     (* Controller-scoped values the overlay cycle needs every tick. Resolve them once here
        instead of re-normalizing the exchange and splitting the symbol in the loop. *)
-    let overlay_coin, overlay_min_liq_mult =
+    let overlay_coin =
       match overlay_controller with
-      | Some c -> Config.base_coin_of_symbol c.oc_hedge_symbol, c.oc_params.min_liq_mult
-      | None -> "", 0.0
+      | Some c -> Config.base_coin_of_symbol c.oc_hedge_symbol
+      | None -> ""
     in
     (* Open-sell sums per inventory leg, invalidated by the venue's open-orders
        generation. Without this the overlay walks every resting sell on every tick. *)
@@ -877,7 +877,7 @@ let asset_domain_worker
              in
              Logging.info_f
                ~section
-               "carry controller %s/%s: overlay %s, %d leg(s), spot_accum=%b, \
+               "carry controller %s/%s: overlay %s, %d leg(s), hl_leg=%b, \
                 full_balance_ref=%b, ladder=%d rung(s) to max, max trail +%.3f%%"
                c.oc_hedge_exchange
                c.oc_hedge_symbol
@@ -1370,6 +1370,11 @@ let asset_domain_worker
     let overlay_seen = ref false in
     let overlay_last_valid = ref false in
     let overlay_last_target = ref nan in
+    (* capdiag log throttle (one line per controller per minute). *)
+    let overlay_diag_log_at = ref 0.0 in
+    (* Wake the oracle when this controller's reserve share moves so a release is not left
+       until the next timed pass. *)
+    let overlay_last_reserve_share = ref nan in
     (* M1 event ownership: route an execution event through the interpreter when the entry
        is file-bound, else call the reference handler directly. The reference handler
        locks state.mutex itself, so the interpreter path must run outside the book-cycle
@@ -2358,12 +2363,181 @@ let asset_domain_worker
          ctx.cg_overlay_accumulated <- inventory.total;
          ctx.cg_overlay_has_spot_leg <- inventory.has_spot_leg;
          ctx.cg_overlay_spot_symbol <- inventory.spot_symbol;
-         ctx.cg_min_liq_reserve
-         <- Carry_reserve.compute_with
-              ~coin:overlay_coin
-              ~min_liq_mult:overlay_min_liq_mult
-              ~max_qty:(controller.oc_params.max_ratio_pct /. 100.0 *. inventory.total)
-              ~exchange:controller.oc_hedge_exchange;
+         let pbool key =
+           match Dio_strategies.Strategy_runtime.get_platform ort key with
+           | Dio_strategies.Strategy_expr.V_bool b -> b
+           | _ -> false
+         in
+         let pfloat key =
+           match Dio_strategies.Strategy_runtime.get_platform ort key with
+           | Dio_strategies.Strategy_expr.V_float f -> f
+           | _ -> nan
+         in
+         let sfloat key =
+           match Dio_strategies.Strategy_runtime.get_state ort key with
+           | Dio_strategies.Strategy_expr.V_float f -> f
+           | _ -> nan
+         in
+         let p = controller.oc_params in
+         let ladder_ratio = sfloat "ladder_ratio" in
+         let live =
+           derive_overlay_ladder
+             ?start_ratio:
+               (if Float.is_finite ladder_ratio && ladder_ratio > 0.0
+                then Some ladder_ratio
+                else None)
+             ~leverage:p.leverage
+             p
+         in
+         let anchor = sfloat "anchor" in
+         let next_add = sfloat "next_add" in
+         let max_qty = live.ol_max_ratio *. inventory.total in
+         let target_leg =
+           match
+             Carry_reserve.pos_leg
+               ~exchange:controller.oc_hedge_exchange
+               ~coin:overlay_coin
+           with
+           | Some t -> t
+           | None ->
+             { Carry_reserve.qty = 0.0; entry = 0.0; mark = 0.0; maintenance = 0.0 }
+         in
+         let quote_asset =
+           match String.index_opt controller.oc_hedge_symbol '/' with
+           | Some i ->
+             String.sub
+               controller.oc_hedge_symbol
+               (i + 1)
+               (String.length controller.oc_hedge_symbol - i - 1)
+           | None -> "USDC"
+         in
+         let free =
+           try Ex.get_tradeable_balance ~asset:quote_asset with
+           | _ -> nan
+         in
+         let spot_total =
+           try Ex.get_total_balance ~asset:quote_asset with
+           | _ -> nan
+         in
+         let acct_margin_used =
+           match
+             Dio_exchange.Market_context.get_margin ~exchange:controller.oc_hedge_exchange
+           with
+           | Some m -> m.margin_used
+           | None -> nan
+         in
+         let pos =
+           Dio_exchange.Market_context.get_position
+             ~exchange:controller.oc_hedge_exchange
+             ~coin:overlay_coin
+         in
+         let pos_margin_used =
+           match pos with
+           | Some s -> s.margin_used
+           | None -> nan
+         in
+         let leverage =
+           if p.leverage > 0.0
+           then p.leverage
+           else (
+             match pos with
+             | Some s -> Option.value s.leverage ~default:0.0
+             | None -> 0.0)
+         in
+         let p_top_guess =
+           if Float.is_finite anchor && anchor > 0.0
+           then anchor *. (1.0 +. (live.ol_max_trail_pct /. 100.0))
+           else if target_leg.mark > 0.0
+           then target_leg.mark
+           else target_leg.entry
+         in
+         let sells_below max_price =
+           List.fold_left
+             (fun acc (l : Config.overlay_leg) ->
+               if Config.is_hyperliquid l.ol_exchange
+               then
+                 acc
+                 +. Overlay_inventory.open_sell_proceeds_below
+                      ~exchange:l.ol_exchange
+                      ~symbol:l.ol_symbol
+                      ~max_price
+               else acc)
+             0.0
+             controller.oc_legs
+         in
+         let stress_price =
+           if p.min_liq_mult > 0.0 then p.min_liq_mult *. p_top_guess else p_top_guess
+         in
+         let req =
+           Carry_reserve.compute_requirement
+             ~target:target_leg
+             ~max_qty
+             ~leverage
+             ~min_liq_mult:p.min_liq_mult
+             ~anchor
+             ~max_trail_pct:live.ol_max_trail_pct
+             ~next_add
+             ~rungs:live.ol_num_rungs
+             ~add_growth:live.ol_add_growth
+             ~sells_top:(sells_below p_top_guess)
+             ~sells_stress:(sells_below stress_price)
+         in
+         let diag =
+           { Carry_reserve.dg_key =
+               Carry_reserve.diag_key
+                 ~exchange:controller.oc_hedge_exchange
+                 ~symbol:controller.oc_hedge_symbol
+           ; dg_exchange = controller.oc_hedge_exchange
+           ; dg_at = now_ov
+           ; dg_gross = req.Carry_reserve.rq_gross
+           ; dg_sells = req.Carry_reserve.rq_sells_applied
+           ; dg_required = req.Carry_reserve.rq_required
+           ; dg_margin = pos_margin_used
+           }
+         in
+         Carry_reserve.update_diag diag;
+         let diags =
+           Carry_reserve.diag_snapshot
+             ~exchange:controller.oc_hedge_exchange
+             ~now:now_ov
+             ~max_age:180.0
+         in
+         let pool_margin =
+           if Float.is_finite acct_margin_used
+           then acct_margin_used
+           else
+             List.fold_left
+               (fun acc (d : Carry_reserve.diag) -> acc +. d.dg_margin)
+               0.0
+               diags
+         in
+         let pool = Carry_reserve.pool_of ~margin_used:pool_margin ~free diags in
+         let expected_controllers =
+           List.length
+             (List.filter
+                (fun (c : overlay_controller) ->
+                  String.equal c.oc_hedge_exchange controller.oc_hedge_exchange)
+                (get_overlay_controllers ()))
+         in
+         let own_share =
+           if Float.is_finite pos_margin_used && Float.is_finite free
+           then
+             Float.min
+               free
+               (Float.max 0.0 (req.Carry_reserve.rq_required -. pos_margin_used))
+           else 0.0
+         in
+         let share =
+           if pool.pl_count >= expected_controllers
+           then Carry_reserve.allocation pool ~gross:req.Carry_reserve.rq_gross
+           else own_share
+         in
+         let share_changed =
+           Float.is_finite !overlay_last_reserve_share
+           && Float.abs (share -. !overlay_last_reserve_share) > 1e-6
+         in
+         overlay_last_reserve_share := share;
+         ctx.cg_reserve_share <- share;
          ctx.cg_carry <- Option.map (fun r -> !r) overlay_carry;
          ort.prof_enabled <- false;
          Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
@@ -2383,41 +2557,25 @@ let asset_domain_worker
               r
               ~now:now_ov
           | None -> ());
-         (* An overlay-only controller has no grid cycle to flush accumulation writes. *)
          (match overlay_state with
           | Some s when s.Dio_strategies.Strategy_state.persistence_dirty ->
             Dio_strategies.Strategy_api.Strategy.flush_persistence asset_with_fees.symbol
           | _ -> ());
-         let pbool key =
-           match Dio_strategies.Strategy_runtime.get_platform ort key with
-           | Dio_strategies.Strategy_expr.V_bool b -> b
-           | _ -> false
-         in
-         let pfloat key =
-           match Dio_strategies.Strategy_runtime.get_platform ort key with
-           | Dio_strategies.Strategy_expr.V_float f -> f
-           | _ -> nan
-         in
-         let sfloat key =
-           match Dio_strategies.Strategy_runtime.get_state ort key with
-           | Dio_strategies.Strategy_expr.V_float f -> f
-           | _ -> nan
-         in
+         (* The reserve block has written this cycle's share; wake the oracle so the
+            release is visible on the next pass. *)
+         if share_changed then Oracle_runtime.request_pass ();
          let valid = pbool "funding_valid" && pbool "perp_valid" in
-         let target = sfloat "target" in
+         let strat_target = sfloat "target" in
          let target_changed =
            valid
            && (Float.is_nan !overlay_last_target
-               || Float.abs (target -. !overlay_last_target) > 1e-9)
+               || Float.abs (strat_target -. !overlay_last_target) > 1e-9)
          in
          if (not !overlay_seen) || valid <> !overlay_last_valid || target_changed
          then (
            overlay_seen := true;
            overlay_last_valid := valid;
-           overlay_last_target := target;
-           (* Exchange-wide senior claim across every overlay on this venue. When it
-              approaches usdc_free, the venue's grids are starved of buy quote even though
-              the venue reports cash free - the D_surv 0 / halt condition. *)
+           overlay_last_target := strat_target;
            let quote_reserved =
              match
                Dio_exchange.Exchange_intf.Registry.get_capital_reservation
@@ -2428,12 +2586,12 @@ let asset_domain_worker
                 | _ -> 0.0)
              | None -> 0.0
            in
-           Logging.info_f
+           Logging.debug_f
              ~section
              "overlay %s: context_valid=%b funding_valid=%b perp_valid=%b \
               funding_apr=%.4f premium=%.6f mark=%.4f bid=%.4f ask=%.4f usdc_free=%.2f \
               quote_reserved=%.2f margin_ratio=%.3f target=%.8f short=%.8f \
-              carry_margin=%.2f"
+              reserve_share=%.2f"
              asset_with_fees.symbol
              valid
              (pbool "funding_valid")
@@ -2448,7 +2606,72 @@ let asset_domain_worker
              (pfloat "margin_ratio")
              (sfloat "target")
              (sfloat "short_qty")
-             (sfloat "carry_margin"))
+             (sfloat "reserve_share"));
+         if now_ov -. !overlay_diag_log_at >= 60.0
+         then (
+           overlay_diag_log_at := now_ov;
+           let sells_all = sells_below Float.max_float in
+           let ledger_total =
+             match
+               Dio_exchange.Exchange_intf.Registry.get_capital_reservation
+                 controller.oc_hedge_exchange
+             with
+             | Some (module Cr : Dio_exchange.Exchange_intf.Capital_reservation.S) ->
+               (try Cr.get_total () with
+                | _ -> nan)
+             | None -> 0.0
+           in
+           let reserve_net =
+             if Float.is_finite pos_margin_used && Float.is_finite free
+             then
+               Float.min
+                 free
+                 (Float.max 0.0 (req.Carry_reserve.rq_required -. pos_margin_used))
+             else nan
+           in
+           Logging.info_f
+             ~section
+             "capdiag %s: short=%.6f max_qty=%.6f ratio=%.4f rungs=%d anchor=%.4f \
+              next_add=%.4f p_top=%.4f entry=%.4f entry_max=%.4f lev=%.2f m=%.4f | \
+              IM_top=%.2f loss_top=%.2f MM_stress=%.2f loss_stress=%.2f | sells_all=%.2f \
+              sells_top=%.2f sells_stress=%.2f | required=%.2f pos_margin=%.2f \
+              acct_margin=%.2f free=%.2f spot_total=%.2f | ledger=%.2f share=%.2f \
+              reserve_net=%.2f | pool n=%d gross=%.2f sells=%.2f margin=%.2f \
+              required=%.2f own_net=%.2f reserve=%.2f"
+             controller.oc_hedge_symbol
+             req.Carry_reserve.rq_short_qty
+             req.Carry_reserve.rq_max_qty
+             ladder_ratio
+             live.ol_num_rungs
+             anchor
+             next_add
+             req.Carry_reserve.rq_p_top
+             req.Carry_reserve.rq_entry
+             req.Carry_reserve.rq_entry_max
+             req.Carry_reserve.rq_leverage
+             target_leg.maintenance
+             req.Carry_reserve.rq_im_top
+             req.Carry_reserve.rq_loss_top
+             req.Carry_reserve.rq_mm_stress
+             req.Carry_reserve.rq_loss_stress
+             sells_all
+             req.Carry_reserve.rq_sells_top
+             req.Carry_reserve.rq_sells_stress
+             req.Carry_reserve.rq_required
+             pos_margin_used
+             acct_margin_used
+             free
+             spot_total
+             ledger_total
+             share
+             reserve_net
+             pool.pl_count
+             pool.pl_gross
+             pool.pl_sells
+             pool.pl_margin
+             pool.pl_required
+             pool.pl_own_net
+             pool.pl_reserve)
        | _ -> ());
       (* PREP/STRATEGY boundary. [t3] ends the exec phase; the block below up to the
          strategy call (oracle apply, halt/reclaim, startup gate, balance reads, F&G

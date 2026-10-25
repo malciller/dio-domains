@@ -268,6 +268,21 @@ let get_min_notional_val symbol exchange =
   | None -> 0.0
 ;;
 
+(** Venue tradeable figure for [symbol]'s quote currency, or [nan]. Diagnostic: the grid
+    uses the domain figure (already net of overlay reservations); the raw figure lets
+    capital-low logs show the overlay claim. *)
+let venue_quote_balance ~exchange ~symbol =
+  match String.index_opt symbol '/' with
+  | None -> nan
+  | Some i ->
+    let quote = String.sub symbol (i + 1) (String.length symbol - i - 1) in
+    (match get_exchange_module exchange with
+     | Some (module Ex : Exchange.S) ->
+       (try Ex.get_tradeable_balance ~asset:quote with
+        | _ -> nan)
+     | None -> nan)
+;;
+
 let venue_lot_qty grid_qty exchange state =
   match exchange with
   | "ibkr" ->

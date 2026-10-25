@@ -78,6 +78,28 @@ let open_sell_base_cached (module Ex : Exchange.S) ~symbol ~(cache : open_sell_c
     value)
 ;;
 
+(** USDC notional of resting sells on [symbol] priced below [max_price] - only those fill
+    before a requirement at that price. Walks the order book. *)
+let open_sell_proceeds_below ~exchange ~symbol ~max_price =
+  if (not (Float.is_finite max_price)) || max_price <= 0.0
+  then 0.0
+  else (
+    match get_module exchange with
+    | None -> 0.0
+    | Some (module Ex : Exchange.S) ->
+      let total = ref 0.0 in
+      (try
+         Ex.iter_open_orders_fast ~symbol (fun _oid price qty side_str _userref ->
+           if qty > 0.0
+              && String.equal side_str "sell"
+              && price > 0.0
+              && price < max_price
+           then total := !total +. (qty *. price))
+       with
+       | _ -> ());
+      !total)
+;;
+
 let sanitize v = if Float.is_finite v && v > 0.0 then v else 0.0
 
 (** Hedgeable base for one leg. [free] is the tradeable (hold-netted) figure; [total]

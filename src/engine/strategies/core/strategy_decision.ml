@@ -365,13 +365,20 @@ let buy_place_latch_capital_low
     state.capital_low <- true;
     state.capital_low_logged <- true;
     state.capital_low_at_balance <- -1.0;
+    state.capital_low_last_log_at <- now;
+    let venue_quote, overlay_reserved = capital_low_venue_figures ~asset in
+    let grid_reserved = get_total_reserved_quote state in
     Logging.warn_f
       ~section
-      "Local balance insufficient for %s buy (need %.2f, available %.2f) - skipping \
-       placement until balance recovers"
+      "Local balance insufficient for %s buy (need %.2f, available %.2f; venue quote \
+       %.2f, overlays reserved %.2f, grids reserved %.2f) - skipping placement until \
+       balance recovers"
       asset.symbol
       quote_needed
-      available_quote_balance);
+      available_quote_balance
+      venue_quote
+      overlay_reserved
+      grid_reserved);
   Hashtbl.replace state.amend_cooldowns "place_Buy" (now +. 2.0)
 ;;
 
@@ -963,8 +970,8 @@ let sell_leg_prepare
     (if state.position_initialized then state.position_base else asset_balance)
     +. unreflected_credit
   in
-  (* Staked/earn base cannot be sold, so it backs the reservation first: only the
-     reserved amount above the staked balance reduces the tradeable float. *)
+  (* Staked/earn base cannot be sold, so it backs the reservation first: only the reserved
+     amount above the staked balance reduces the tradeable float. *)
   let staked = Float.max 0.0 state.staked_base in
   let reserved_tradeable = Float.max 0.0 (state.reserved_base -. staked) in
   (* Alpaca's sellable base: venue [qty_available] (free of resting holds) plus un-polled
@@ -1924,7 +1931,13 @@ let execute_strategy
         ~asset_balance
         ~lot_qty
         ~unnetted_hold;
-      evaluate_capital_low_recovery ~state ~asset ~quote_balance ~current_price ~lot_qty;
+      evaluate_capital_low_recovery
+        ~state
+        ~now
+        ~asset
+        ~quote_balance
+        ~current_price
+        ~lot_qty;
       if Float.is_nan current_price
       then (
         if state.last_cycle <> cycle
