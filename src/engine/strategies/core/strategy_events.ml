@@ -360,11 +360,20 @@ let handle_order_failed ~now asset_symbol side reason =
            state.capital_low <- true;
            state.capital_low_logged <- true;
            state.capital_low_at_balance <- -1.0;
+           state.capital_low_last_log_at <- now;
+           let venue_quote =
+             venue_quote_balance ~exchange:state.exchange_id ~symbol:asset_symbol
+           in
+           let overlay_reserved = overlay_reserved_quote ~exchange:state.exchange_id in
+           let grid_reserved = get_total_reserved_quote state in
            Logging.warn_f
              ~section
              "Exchange rejected buy for %s with insufficient funds - setting capital_low \
-              flag"
-             asset_symbol)
+              flag (venue quote %.2f, overlays reserved %.2f, grids reserved %.2f)"
+             asset_symbol
+             venue_quote
+             overlay_reserved
+             grid_reserved)
        | Sell when is_insufficient_balance ->
          let ecfg = get_exchange_config state.exchange_id in
          (* Local ledger has the base but the venue does not: stale/missed balance

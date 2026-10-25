@@ -20,7 +20,7 @@ type ctx =
   { mutable cg_asset : Types.trading_config option
   ; mutable cg_state : Types.strategy_state option
   ; mutable cg_carry : Dio_persistence.Carry_state_store.t option
-  ; mutable cg_min_liq_reserve : float
+  ; mutable cg_reserve_share : float
   (** Aggregate hedgeable inventory across every leg of this controller. [< 0] means "not
       an overlay controller"; [market_facts] then falls back to the local venue figure. *)
   ; mutable cg_overlay_accumulated : float
@@ -79,7 +79,7 @@ let create () =
   { cg_asset = None
   ; cg_state = None
   ; cg_carry = None
-  ; cg_min_liq_reserve = 0.0
+  ; cg_reserve_share = 0.0
   ; cg_overlay_accumulated = -1.0
   ; cg_overlay_has_spot_leg = false
   ; cg_overlay_spot_symbol = ""
@@ -278,6 +278,7 @@ let prepare_recovery c =
       ~unnetted_hold;
     Jac.evaluate_capital_low_recovery
       ~state
+      ~now:c.cg_now
       ~asset
       ~quote_balance:c.cg_qbal
       ~current_price:c.cg_price
@@ -653,7 +654,7 @@ let market_facts c (t : Strategy_runtime.t) =
      setf Slots.margin_ratio 0.0);
   setf Slots.carry_reserved reserved;
   setf Slots.min_notional (Strategy_venue.get_min_notional_val symbol exchange);
-  setf Slots.min_liq_reserve c.cg_min_liq_reserve;
+  setf Slots.reserve_share c.cg_reserve_share;
   (match c.cg_carry with
    | Some cs ->
      let close_price, close_kind, close_realized, close_qty =

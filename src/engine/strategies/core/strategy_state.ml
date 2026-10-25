@@ -32,7 +32,6 @@ type exchange_config =
   (** Size each sell at [qty * sell_mult], retaining the [(1 - sell_mult)] slice in the
       order itself. Kept for venues whose lot size and grid interval make the retained
       slice a tradeable quantity. *)
-
   ; sell_failure_sets_asset_low : bool
   (** Set asset_low on sell insufficient-balance rejection *)
   ; use_reserved_base_guard : bool
@@ -174,6 +173,9 @@ type strategy_state =
          Recovery is affordability-based: the flag clears once available quote covers the
          next buy (a price drop or released reservation counts - no balance increase
          required). *)
+  ; mutable capital_low_last_log_at : float
+      (* unix time of the last latched-status log; re-emitted every
+         [capital_low_log_interval_s]. *)
   ; mutable last_buy_attempted_insufficient : bool
       (* true for the one cycle where a buy was placed despite a known local balance
          shortfall (stale balance snapshot): the resulting rejection is foreordained, so
@@ -637,6 +639,7 @@ let rec get_strategy_state asset_symbol =
       ; capital_low = false
       ; capital_low_logged = false
       ; capital_low_at_balance = 0.0
+      ; capital_low_last_log_at = 0.0
       ; last_buy_attempted_insufficient = false
       ; resuming_after_balance_flag = false
       ; just_filled_buy = false

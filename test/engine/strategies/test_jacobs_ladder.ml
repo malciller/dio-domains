@@ -6209,6 +6209,60 @@ let test_buy_placement_balance_guard () =
   drain ()
 ;;
 
+let test_capital_low_recovery_requires_price_and_quote () =
+  (* A missing price must not clear the latch: [need] would be 0 and release the buy
+     cooldown without placing an order. *)
+  let open Dio_strategies.Strategy_api in
+  let symbol = "TESTCAPLOW/USD" in
+  let state = get_strategy_state symbol in
+  state.exchange_id <- "test_capital_low_recovery";
+  state.grid_qty <- 1.0;
+  let asset =
+    { exchange = state.exchange_id
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 0.5
+    ; sell_mult = "1.0"
+    ; strategy = "jacobs_ladder"
+    ; maker_fee = None
+    ; taker_fee = None
+    ; accumulation_buffer = 0.01
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let latch () =
+    state.capital_low <- true;
+    state.capital_low_at_balance <- -1.0;
+    state.capital_low_last_log_at <- 0.0
+  in
+  latch ();
+  evaluate_capital_low_recovery
+    ~state
+    ~now:0.0
+    ~asset
+    ~quote_balance:1000.0
+    ~current_price:nan
+    ~lot_qty:1.0;
+  check bool "missing price keeps capital_low latched" true state.capital_low;
+  evaluate_capital_low_recovery
+    ~state
+    ~now:1.0
+    ~asset
+    ~quote_balance:10.0
+    ~current_price:100.0
+    ~lot_qty:1.0;
+  check bool "insufficient quote keeps capital_low latched" true state.capital_low;
+  evaluate_capital_low_recovery
+    ~state
+    ~now:2.0
+    ~asset
+    ~quote_balance:150.0
+    ~current_price:100.0
+    ~lot_qty:1.0;
+  check bool "covering quote clears capital_low" false state.capital_low
+;;
+
 let test_reconcile_cross_boundary_tolerance () =
   (* Persisted-sell reconcile buckets by an int price key (price*10000 rounded) with a
      neighbor-bucket probe. Matching semantics are unchanged for prices straddling a
@@ -8408,6 +8462,10 @@ let () =
             "buy placement vs fresh/stale balance"
             `Quick
             test_buy_placement_balance_guard
+        ; test_case
+            "capital_low recovery needs a known price and covering quote"
+            `Quick
+            test_capital_low_recovery_requires_price_and_quote
         ; test_case
             "halted path still places the sell for a just-filled buy"
             `Quick

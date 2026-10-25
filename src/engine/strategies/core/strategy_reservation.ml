@@ -22,6 +22,16 @@ let get_total_reserved_quote state =
 (* Moved to Platform_accounting (milestone 2). *)
 let atomic_add = Platform_accounting.atomic_add
 
+(** Quote reserved on [exchange] by overlays, the senior claim [Cr.available] removes.
+    Diagnostic; the grid's own buy reservation is tracked separately. *)
+let overlay_reserved_quote ~exchange =
+  match Dio_exchange.Exchange_intf.Registry.get_capital_reservation exchange with
+  | Some (module Cr : Dio_exchange.Exchange_intf.Capital_reservation.S) ->
+    (try Cr.get_total () with
+     | _ -> 0.0)
+  | None -> 0.0
+;;
+
 (** Sets [state.reserved_quote]; applies the delta to the exchange atomic. *)
 let set_asset_reserved_quote state v =
   let diff = v -. state.reserved_quote in

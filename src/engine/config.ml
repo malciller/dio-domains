@@ -725,7 +725,8 @@ type overlay_controller =
   ; oc_legs : overlay_leg list
   ; oc_testnet : bool
   ; oc_has_hl_spot_leg : bool
-  (** true when a leg is on Hyperliquid, so recycle base accumulation applies *)
+  (** true when a leg is on Hyperliquid. Classification only: recycle profit is credited
+      as quote on every controller, so this is logged as [hl_leg]. *)
   }
 
 (** Controllers in config.json first-seen order. *)

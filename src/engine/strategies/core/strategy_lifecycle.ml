@@ -513,9 +513,19 @@ let evaluate_asset_low_recovery
         asset_needed_fast))
 ;;
 
+(** Repeat window for the latched-status line. *)
+let capital_low_log_interval_s = 60.0
+
+(** (venue raw quote, overlay reserved) for capital-low logs. *)
+let capital_low_venue_figures ~(asset : trading_config) =
+  ( venue_quote_balance ~exchange:asset.exchange ~symbol:asset.symbol
+  , overlay_reserved_quote ~exchange:asset.exchange )
+;;
+
 (** Evaluates capital (quote) balance recovery and clears capital_low flag. *)
 let evaluate_capital_low_recovery
   ~state
+  ~now
   ~(asset : trading_config)
   ~quote_balance
   ~current_price
@@ -525,9 +535,8 @@ let evaluate_capital_low_recovery
   then (
     let quote_bal = quote_balance in
     let qty_f = lot_qty in
-    let quote_needed_fast =
-      if not (Float.is_nan current_price) then current_price *. qty_f else 0.0
-    in
+    let price_known = not (Float.is_nan current_price) in
+    let quote_needed_fast = if price_known then current_price *. qty_f else 0.0 in
     let total_reserved = get_total_reserved_quote state in
     let available_quote = quote_bal -. total_reserved in
     if state.capital_low && state.capital_low_at_balance < 0.0
@@ -536,26 +545,51 @@ let evaluate_capital_low_recovery
        the quote can fund the next buy). Gating the clear on a balance increase latched
        the pause forever when a falling price made the same balance sufficient again, or
        when another asset's reclaim released reserved quote. The stamp below is for the
-       log line only. *)
-    if state.capital_low && available_quote < quote_needed_fast
-    then ()
+       log line only.
+
+       A missing price cannot size the next buy, so it must not clear the latch: the
+       requirement would be 0 and release the cooldown/guards even though no buy can
+       place. *)
+    if state.capital_low && ((not price_known) || available_quote < quote_needed_fast)
+    then (
+      if (* Long pause: per-cycle skip is debug; the latch warn may be stale. *)
+         now -. state.capital_low_last_log_at >= capital_low_log_interval_s
+      then (
+        state.capital_low_last_log_at <- now;
+        let venue_quote, overlay_reserved = capital_low_venue_figures ~asset in
+        Logging.info_f
+          ~section
+          "Capital still low for %s (available %.2f, need %.2f; venue quote %.2f, \
+           overlays reserved %.2f, grids reserved %.2f, at_balance %.2f) - buy placement \
+           paused"
+          asset.symbol
+          available_quote
+          quote_needed_fast
+          venue_quote
+          overlay_reserved
+          total_reserved
+          state.capital_low_at_balance))
     else if state.capital_low
     then (
       let was_at = state.capital_low_at_balance in
       state.capital_low <- false;
       state.capital_low_logged <- false;
       state.capital_low_at_balance <- 0.0;
+      state.capital_low_last_log_at <- 0.0;
       state.resuming_after_balance_flag <- true;
       Hashtbl.remove state.amend_cooldowns "place_Buy";
       state.inflight_buy <- false;
       ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_buy);
+      let venue_quote, overlay_reserved = capital_low_venue_figures ~asset in
       Logging.info_f
         ~section
-        "Capital restored for %s (available %.2f, need %.2f, total_reserved %.2f, was_at \
-         %.2f) - resuming buy placement"
+        "Capital restored for %s (available %.2f, need %.2f; venue quote %.2f, overlays \
+         reserved %.2f, grids reserved %.2f, was_at %.2f) - resuming buy placement"
         asset.symbol
         available_quote
         quote_needed_fast
+        venue_quote
+        overlay_reserved
         total_reserved
         was_at))
 ;;

@@ -89,7 +89,7 @@ let known_platform_caps =
   ; "usdc_free"
   ; "carry_reserved"
   ; "min_notional"
-  ; "min_liq_reserve"
+  ; "reserve_share"
   ; "carry_close_price"
   ; "carry_close_qty"
   ; "carry_close_kind"
