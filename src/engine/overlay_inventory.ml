@@ -78,6 +78,30 @@ let open_sell_base_cached (module Ex : Exchange.S) ~symbol ~(cache : open_sell_c
     value)
 ;;
 
+(** [(proceeds below price_a, proceeds below price_b)] from one order-book walk. *)
+let open_sell_proceeds_below2 ~exchange ~symbol ~price_a ~price_b =
+  let cap_a = if Float.is_finite price_a && price_a > 0.0 then price_a else 0.0 in
+  let cap_b = if Float.is_finite price_b && price_b > 0.0 then price_b else 0.0 in
+  if cap_a <= 0.0 && cap_b <= 0.0
+  then 0.0, 0.0
+  else (
+    match get_module exchange with
+    | None -> 0.0, 0.0
+    | Some (module Ex : Exchange.S) ->
+      let a = ref 0.0 in
+      let b = ref 0.0 in
+      (try
+         Ex.iter_open_orders_fast ~symbol (fun _oid price qty side_str _userref ->
+           if qty > 0.0 && String.equal side_str "sell" && price > 0.0
+           then (
+             let notional = qty *. price in
+             if cap_a > 0.0 && price < cap_a then a := !a +. notional;
+             if cap_b > 0.0 && price < cap_b then b := !b +. notional))
+       with
+       | _ -> ());
+      !a, !b)
+;;
+
 (** USDC notional of resting sells on [symbol] priced below [max_price] - only those fill
     before a requirement at that price. Walks the order book. *)
 let open_sell_proceeds_below ~exchange ~symbol ~max_price =

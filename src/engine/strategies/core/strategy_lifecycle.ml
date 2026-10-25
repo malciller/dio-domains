@@ -553,7 +553,7 @@ let evaluate_capital_low_recovery
     if state.capital_low && ((not price_known) || available_quote < quote_needed_fast)
     then (
       if (* Long pause: per-cycle skip is debug; the latch warn may be stale. *)
-         now -. state.capital_low_last_log_at >= capital_low_log_interval_s
+         price_known && now -. state.capital_low_last_log_at >= capital_low_log_interval_s
       then (
         state.capital_low_last_log_at <- now;
         let venue_quote, overlay_reserved = capital_low_venue_figures ~asset in

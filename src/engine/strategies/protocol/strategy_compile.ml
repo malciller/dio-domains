@@ -213,18 +213,37 @@ let rec guard_event = function
   | _ -> None
 ;;
 
+(** Guards are re-parsed by the runtime, which fails closed on a parse error: a typo would
+    silently disable the rule. Reject it at load instead. Action arguments are exempt: a
+    string that is not an expression is a literal or a template by design. *)
+let check_parseable_expr acc ~where s =
+  match Strategy_expr.parse s with
+  | Ok _ -> ()
+  | Error m -> err acc where (Printf.sprintf "invalid expression %S: %s" s m)
+;;
+
 let rec check_guard acc ~locals ~event ~where g =
   let open Strategy_file in
   match g with
   | G_event _ | G_side _ | G_pending _ | G_engine _ -> ()
   | G_all gs | G_any gs -> List.iter (check_guard acc ~locals ~event ~where) gs
   | G_not g -> check_guard acc ~locals ~event ~where g
-  | G_is_none s | G_is_some s | G_expr s -> check_string_refs acc ~locals ~event ~where s
-  | G_capacity kvs | G_order kvs | G_signal kvs ->
+  | G_is_none s | G_is_some s -> check_string_refs acc ~locals ~event ~where s
+  | G_expr s ->
+    check_string_refs acc ~locals ~event ~where s;
+    check_parseable_expr acc ~where s
+  | G_capacity kvs ->
+    List.iter
+      (fun (_, s) ->
+        check_string_refs acc ~locals ~event ~where s;
+        check_parseable_expr acc ~where s)
+      kvs
+  | G_order kvs | G_signal kvs ->
     List.iter (fun (_, s) -> check_string_refs acc ~locals ~event ~where s) kvs
   | G_cooldown { since; seconds } ->
     check_string_refs acc ~locals ~event ~where since;
-    check_string_refs acc ~locals ~event ~where seconds
+    check_string_refs acc ~locals ~event ~where seconds;
+    check_parseable_expr acc ~where seconds
 ;;
 
 let json_kind_ok (kind : Strategy_actions.arg_kind) (v : Yojson.Basic.t) =

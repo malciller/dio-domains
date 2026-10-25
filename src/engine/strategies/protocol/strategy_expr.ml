@@ -278,6 +278,20 @@ let tokenize (s : string) : token list =
         if s.[!j] = '.' then is_float := true;
         incr j
       done;
+      (* Scientific notation. The script renderer round-trips every parsed literal back
+         through this lexer via [string_of_float], which emits exponents below 1e-4
+         (0.000001 -> "1e-06"). *)
+      if !j < n && (s.[!j] = 'e' || s.[!j] = 'E')
+      then (
+        let k = ref (!j + 1) in
+        if !k < n && (s.[!k] = '+' || s.[!k] = '-') then incr k;
+        if !k < n && is_digit s.[!k]
+        then (
+          is_float := true;
+          while !k < n && is_digit s.[!k] do
+            incr k
+          done;
+          j := !k));
       let text = String.sub s !i (!j - !i) in
       (try
          toks

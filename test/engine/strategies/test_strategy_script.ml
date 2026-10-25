@@ -290,6 +290,42 @@ let test_jacobs_ladder_shape () =
        Alcotest.(check string) "round-trip stable" s s2)
 ;;
 
+let test_validate_rejects_bad_expr () =
+  register ();
+  (* A guard the runtime cannot parse compiles to a constant false, so validation must
+     reject it at load instead of leaving a silently dead rule. *)
+  let json =
+    {|{"name":"bad_expr","version":1,"triggers":["book_update"],"steps":[
+       {"id":"s","when":{"expr":"$price > 0.25 +"},"then":[]}]}|}
+  in
+  match Strategy_file.parse_string json with
+  | Error e -> Alcotest.failf "parse: %s" e
+  | Ok f ->
+    let errors = Strategy_compile.errors (Strategy_compile.validate f) in
+    Alcotest.(check bool)
+      "invalid guard expression is an error"
+      true
+      (List.exists
+         (fun (d : Strategy_compile.diagnostic) ->
+           Str.contains d.msg "invalid expression" && Str.contains d.msg "0.25 +")
+         errors)
+;;
+
+let test_validate_accepts_exponent_literal () =
+  register ();
+  (* The renderer emits this form for small literals; validation must accept it rather
+     than rejecting a guard the runtime can evaluate. *)
+  let json =
+    {|{"name":"tiny","version":1,"triggers":["book_update"],"steps":[
+       {"id":"s","when":{"expr":"$price > 0.25 + 1e-06"},"then":[]}]}|}
+  in
+  match Strategy_file.parse_string json with
+  | Error e -> Alcotest.failf "parse: %s" e
+  | Ok f ->
+    let errors = Strategy_compile.errors (Strategy_compile.validate f) in
+    Alcotest.(check int) "exponent literal validates" 0 (List.length errors)
+;;
+
 let () =
   Alcotest.run
     "strategy_script"
@@ -300,7 +336,17 @@ let () =
         ; Alcotest.test_case "if/otherwise" `Quick test_if_otherwise
         ; Alcotest.test_case "round-trip json" `Quick test_roundtrip_json
         ] )
-    ; "validate", [ Alcotest.test_case "clean file" `Quick test_validate_clean ]
+    ; ( "validate"
+      , [ Alcotest.test_case "clean file" `Quick test_validate_clean
+        ; Alcotest.test_case
+            "rejects an unparseable guard"
+            `Quick
+            test_validate_rejects_bad_expr
+        ; Alcotest.test_case
+            "accepts an exponent literal"
+            `Quick
+            test_validate_accepts_exponent_literal
+        ] )
     ; ( "errors"
       , [ Alcotest.test_case "positional rejected" `Quick test_error_positional
         ; Alcotest.test_case "unknown state type" `Quick test_error_bad_state

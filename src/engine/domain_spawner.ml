@@ -735,6 +735,16 @@ let asset_domain_worker
         ~exchange:asset_with_fees.exchange
         ~symbol:asset_with_fees.symbol
     in
+    let overlay_expected_controllers =
+      match overlay_controller with
+      | Some c ->
+        List.length
+          (List.filter
+             (fun (x : overlay_controller) ->
+               String.equal x.oc_hedge_exchange c.oc_hedge_exchange)
+             (get_overlay_controllers ()))
+      | None -> 0
+    in
     (* Controller-scoped values the overlay cycle needs every tick. Resolve them once here
        instead of re-normalizing the exchange and splitting the symbol in the loop. *)
     let overlay_coin =
@@ -1607,7 +1617,13 @@ let asset_domain_worker
                        | Some u ->
                          u = Dio_strategies.Strategy_common.strategy_userref_carry
                        | None -> false)
-                    | None -> false)
+                    | None ->
+                      (* Neither the id mapping nor the carry cloid: an order placed
+                         outside the engine. On a hedge-perp domain book it as an overlay
+                         fill so the close is recorded; a perp grid keeps its own fills. *)
+                      Option.is_some overlay_carry
+                      && event.market = Types.Perp
+                      && grid_market <> Types.Perp)
                in
                (* The grid is a SPOT strategy. A perp execution must never reach its
                   fill/cancel handlers, even when the id -> carry mapping was lost (a
@@ -2380,20 +2396,30 @@ let asset_domain_worker
            | Dio_strategies.Strategy_expr.V_float f -> f
            | _ -> nan
          in
+         let sint key =
+           match Dio_strategies.Strategy_runtime.get_state ort key with
+           | Dio_strategies.Strategy_expr.V_int i -> i
+           | _ -> 0
+         in
          let p = controller.oc_params in
          let ladder_ratio = sfloat "ladder_ratio" in
-         let live =
-           derive_overlay_ladder
-             ?start_ratio:
-               (if Float.is_finite ladder_ratio && ladder_ratio > 0.0
-                then Some ladder_ratio
-                else None)
-             ~leverage:p.leverage
-             p
+         let ladder_rungs = max 0 (sint "ladder_rungs") in
+         let add_growth = sfloat "ladder_growth" in
+         let max_trail_pct =
+           if p.leverage > 0.0
+           then
+             float_of_int ladder_rungs
+             *. (p.add_threshold_pct /. 100.0)
+             /. p.leverage
+             *. 100.0
+           else 0.0
+         in
+         let max_ratio =
+           if Float.is_finite p.max_ratio_pct then p.max_ratio_pct /. 100.0 else 0.0
          in
          let anchor = sfloat "anchor" in
          let next_add = sfloat "next_add" in
-         let max_qty = live.ol_max_ratio *. inventory.total in
+         let max_qty = max_ratio *. inventory.total in
          let target_leg =
            match
              Carry_reserve.pos_leg
@@ -2447,11 +2473,16 @@ let asset_domain_worker
              | None -> 0.0)
          in
          let p_top_guess =
-           if Float.is_finite anchor && anchor > 0.0
-           then anchor *. (1.0 +. (live.ol_max_trail_pct /. 100.0))
-           else if target_leg.mark > 0.0
+           let scheduled =
+             if Float.is_finite anchor && anchor > 0.0
+             then anchor *. (1.0 +. (max_trail_pct /. 100.0))
+             else if target_leg.mark > 0.0
+             then target_leg.mark
+             else target_leg.entry
+           in
+           if target_leg.mark > 0.0 && target_leg.mark > scheduled
            then target_leg.mark
-           else target_leg.entry
+           else scheduled
          in
          let sells_below max_price =
            List.fold_left
@@ -2467,9 +2498,27 @@ let asset_domain_worker
              0.0
              controller.oc_legs
          in
+         let sells_below2 price_a price_b =
+           List.fold_left
+             (fun (a, b) (l : Config.overlay_leg) ->
+               if Config.is_hyperliquid l.ol_exchange
+               then (
+                 let x, y =
+                   Overlay_inventory.open_sell_proceeds_below2
+                     ~exchange:l.ol_exchange
+                     ~symbol:l.ol_symbol
+                     ~price_a
+                     ~price_b
+                 in
+                 a +. x, b +. y)
+               else a, b)
+             (0.0, 0.0)
+             controller.oc_legs
+         in
          let stress_price =
            if p.min_liq_mult > 0.0 then p.min_liq_mult *. p_top_guess else p_top_guess
          in
+         let sells_top, sells_stress = sells_below2 p_top_guess stress_price in
          let req =
            Carry_reserve.compute_requirement
              ~target:target_leg
@@ -2477,12 +2526,12 @@ let asset_domain_worker
              ~leverage
              ~min_liq_mult:p.min_liq_mult
              ~anchor
-             ~max_trail_pct:live.ol_max_trail_pct
+             ~max_trail_pct
              ~next_add
-             ~rungs:live.ol_num_rungs
-             ~add_growth:live.ol_add_growth
-             ~sells_top:(sells_below p_top_guess)
-             ~sells_stress:(sells_below stress_price)
+             ~rungs:ladder_rungs
+             ~add_growth
+             ~sells_top
+             ~sells_stress
          in
          let diag =
            { Carry_reserve.dg_key =
@@ -2498,28 +2547,13 @@ let asset_domain_worker
            }
          in
          Carry_reserve.update_diag diag;
-         let diags =
-           Carry_reserve.diag_snapshot
+         let pool =
+           Carry_reserve.pool_for
              ~exchange:controller.oc_hedge_exchange
              ~now:now_ov
              ~max_age:180.0
-         in
-         let pool_margin =
-           if Float.is_finite acct_margin_used
-           then acct_margin_used
-           else
-             List.fold_left
-               (fun acc (d : Carry_reserve.diag) -> acc +. d.dg_margin)
-               0.0
-               diags
-         in
-         let pool = Carry_reserve.pool_of ~margin_used:pool_margin ~free diags in
-         let expected_controllers =
-           List.length
-             (List.filter
-                (fun (c : overlay_controller) ->
-                  String.equal c.oc_hedge_exchange controller.oc_hedge_exchange)
-                (get_overlay_controllers ()))
+             ~margin_used:acct_margin_used
+             ~free
          in
          let own_share =
            if Float.is_finite pos_margin_used && Float.is_finite free
@@ -2530,7 +2564,7 @@ let asset_domain_worker
            else 0.0
          in
          let share =
-           if pool.pl_count >= expected_controllers
+           if pool.pl_count >= overlay_expected_controllers
            then Carry_reserve.allocation pool ~gross:req.Carry_reserve.rq_gross
            else own_share
          in
@@ -2538,7 +2572,6 @@ let asset_domain_worker
            Float.is_finite !overlay_last_reserve_share
            && Float.abs (share -. !overlay_last_reserve_share) > 1e-6
          in
-         overlay_last_reserve_share := share;
          ctx.cg_reserve_share <- share;
          ctx.cg_carry <- Option.map (fun r -> !r) overlay_carry;
          ort.prof_enabled <- false;
@@ -2563,10 +2596,13 @@ let asset_domain_worker
           | Some s when s.Dio_strategies.Strategy_state.persistence_dirty ->
             Dio_strategies.Strategy_api.Strategy.flush_persistence asset_with_fees.symbol
           | _ -> ());
-         (* The reserve block has written this cycle's share; wake the oracle so the
-            release is visible on the next pass. *)
-         if share_changed then Oracle_runtime.request_pass ();
          let valid = pbool "funding_valid" && pbool "perp_valid" in
+         (* Only latch and wake after a valid cycle: an invalid feed stops the strategy's
+            reserve step, so the share it would release is not applied. *)
+         if valid
+         then (
+           if share_changed then Oracle_runtime.request_pass ();
+           overlay_last_reserve_share := share);
          let strat_target = sfloat "target" in
          let target_changed =
            valid
@@ -2644,7 +2680,7 @@ let asset_domain_worker
              req.Carry_reserve.rq_short_qty
              req.Carry_reserve.rq_max_qty
              ladder_ratio
-             live.ol_num_rungs
+             ladder_rungs
              anchor
              next_add
              req.Carry_reserve.rq_p_top
