@@ -109,9 +109,9 @@ COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 # 5b'. Strategy files. The engine resolves each config entry's `strategy` to
-#      strategies/<name>.strategy (preferred) or strategies/<name>.json at runtime;
-#      without these the domains start but no strategy is loaded and nothing
-#      trades. Baked into the image at /app/strategies (the engine's cwd).
+#      strategies/<name>.strategy, then .json, then the same pair under
+#      strategies/private/ for local-only strategies. Baked into the image at
+#      /app/strategies (the engine's cwd).
 COPY --from=builder /app/strategies /app/strategies
 
 # 5c. Third-party license notices. Required by the licenses of the bundled

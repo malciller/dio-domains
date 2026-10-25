@@ -1463,10 +1463,11 @@ let read_config () : config =
           | None ->
             Logging.critical_f
               ~section
-              "Strategy file for %s/%s does not exist (tried strategies/<name>.strategy \
-               and strategies/<name>.json). Strategy files must be deployed alongside \
-               config.json (e.g. /app/strategies); refusing to start with no strategy \
-               bound."
+              "Strategy file for %s/%s does not exist (tried strategies/<name>.strategy, \
+               strategies/<name>.json, strategies/private/<name>.strategy, and \
+               strategies/private/<name>.json). Strategy files must be deployed \
+               alongside config.json (e.g. /app/strategies); refusing to start with no \
+               strategy bound."
               t.exchange
               t.symbol;
             exit 1
@@ -1503,8 +1504,9 @@ let read_config () : config =
           Logging.critical_f
             ~section
             "Overlay strategy file for %s/%s does not exist (tried \
-             strategies/<name>.strategy and strategies/<name>.json). Refusing to start \
-             with a half-bound overlay."
+             strategies/<name>.strategy, strategies/<name>.json, \
+             strategies/private/<name>.strategy, and strategies/private/<name>.json). \
+             Refusing to start with a half-bound overlay."
             c.oc_hedge_exchange
             c.oc_hedge_symbol;
           exit 1

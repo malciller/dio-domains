@@ -78,8 +78,7 @@ id_rsa*
 id_ed25519*
 credentials*
 .DS_Store
-strategies/carry_overlay.strategy
 strategies/*.private.strategy
 docs/carry-overlay-design.md
-docs/private/
+# Any `private/` directory at any depth is local-only.
 private/

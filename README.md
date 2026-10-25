@@ -164,10 +164,10 @@ provenance and native-library notices.
 ## Strategy files
 
 Each entry in `config.json` names a strategy, for example
-`"strategy": "jacobs_ladder"`. The engine loads `strategies/<name>.strategy`,
-validates it, and compiles it to its internal step/action representation at
-startup. The script is a small dotted language. The compiled `.json` form is
-also accepted.
+`"strategy": "jacobs_ladder"`. The engine loads `strategies/<name>.strategy`
+(or its compiled `.json` form), falling back to `strategies/private/<name>` for
+local-only strategies, validates it, and compiles it to its internal
+step/action representation at startup. The script is a small dotted language.
 
 ```
 when book.updates:

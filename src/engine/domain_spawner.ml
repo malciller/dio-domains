@@ -134,7 +134,8 @@ let log_latency_window ~key ~window_seconds ~threshold_us ~ob ~exec ~prep ~strat
 ;;
 
 (** Path of the strategy file bound to an entry by name convention
-    ([strategies/<name>.strategy] preferred, then [strategies/<name>.json]). *)
+    ([strategies/<name>.strategy] preferred, then .json, then the same pair under
+    `strategies/private/`). *)
 let strategy_file_path (asset : trading_config) =
   match Dio_strategies.Strategy_loader.locate ~name:asset.strategy with
   | Some path -> Some path
@@ -255,9 +256,10 @@ let asset_domain_worker
       suffix
   in
   let trace_cycles = ref 0 in
-  (* Strategy-file binding (data-driven dispatch): an entry whose [strategy] names a
-     parsable [strategies/<name>.json] is a strategy-file asset. The engine selects the
-     interpreter/handler by the bound file, never by the strategy name. *)
+  (* Strategy-file binding (data-driven dispatch): an entry whose [strategy] resolves to a
+     parsable file under `strategies/` or `strategies/private/` is a strategy-file asset.
+     The engine selects the interpreter/handler by the bound file, never by the strategy
+     name. *)
   let bound_strategy_file = load_bound_strategy asset_with_fees in
   let is_file_bound_strategy = Option.is_some bound_strategy_file in
   (* Resolves accumulation_buffer from Fear & Greed on every venue (Kraken runs the same
