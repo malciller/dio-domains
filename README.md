@@ -69,7 +69,7 @@ balance-only inventory legs:
     "strategy": {
       "hyperliquid": { "name": "jacobs_ladder", "sell_mult": "0.98" }
     },
-    "overlay": { "name": "carry_overlay", "exchange": "hyperliquid" },
+    "overlay": { "name": "overlay", "exchange": "hyperliquid" },
     "oracle": { "target_survival": 0.95, "qty_cap_mult": 1.5 }
   },
   "assets": [

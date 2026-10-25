@@ -25,6 +25,12 @@ The script snapshots the grammar into a throwaway git repo, builds the
 extension to `wasm32-wasip2`, compiles the tree-sitter grammar with `wasi-sdk`,
 and symlinks the result into Zed's `extensions/installed` directory.
 
+Generated files are staged in `<zed data dir>/extensions/dev/dio-strategy`
+(`~/Library/Application Support/Zed/...` on macOS, `~/.local/share/zed/...` on
+Linux) rather than `_build`, so `dune clean` cannot leave the installed symlink
+dangling and cargo's `target/` survives between runs. Delete that directory to
+force a clean rebuild.
+
 The first run downloads `wasi-sdk` (about 180 MB) unless `WASI_SDK_PATH` is set
 or Zed already has one in `extensions/build/wasi-sdk`. Re-run the script after
 changing any extension or grammar file, then run `zed: reload extensions` from

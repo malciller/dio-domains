@@ -217,13 +217,33 @@ type diag =
   }
 
 let diagnostics : (string * diag) list Atomic.t = Atomic.make []
+let diagnostics_gen = Atomic.make 0
 let diag_key ~exchange ~symbol = exchange ^ "|" ^ String.uppercase_ascii symbol
+
+(* [dg_at] refreshes every cycle, so it must not count as a change: the generation is the
+   pool cache's invalidation key and a timestamp-only write has nothing new to publish. *)
+let same_requirement (a : diag) (b : diag) =
+  a.dg_exchange = b.dg_exchange
+  && a.dg_gross = b.dg_gross
+  && a.dg_sells = b.dg_sells
+  && a.dg_required = b.dg_required
+  && a.dg_margin = b.dg_margin
+;;
 
 let update_diag (d : diag) =
   let rec loop () =
     let old = Atomic.get diagnostics in
-    let next = (d.dg_key, d) :: List.remove_assoc d.dg_key old in
-    if not (Atomic.compare_and_set diagnostics old next) then loop ()
+    match List.assoc_opt d.dg_key old with
+    | Some prev when same_requirement prev d ->
+      let next =
+        (d.dg_key, { prev with dg_at = d.dg_at }) :: List.remove_assoc d.dg_key old
+      in
+      if not (Atomic.compare_and_set diagnostics old next) then loop ()
+    | _ ->
+      let next = (d.dg_key, d) :: List.remove_assoc d.dg_key old in
+      if Atomic.compare_and_set diagnostics old next
+      then Atomic.incr diagnostics_gen
+      else loop ()
   in
   loop ()
 ;;
@@ -272,4 +292,47 @@ let pool_of ~margin_used ~free diags =
     [pl_reserve]. *)
 let allocation (p : pool) ~gross =
   if p.pl_gross > 0.0 then p.pl_reserve *. (gross /. p.pl_gross) else 0.0
+;;
+
+(** One account roll-up per controller generation, shared by every controller on the venue
+    so their split comes from the same diag set. [free] is caller-scoped (each grid venue
+    caps its own quote), so it is part of the key; the TTL bounds how long a cached pool
+    can outlive the [max_age] filter. *)
+type pool_snapshot =
+  { ps_exchange : string
+  ; ps_gen : int
+  ; ps_at : float
+  ; ps_free : float
+  ; ps_pool : pool
+  }
+
+let pool_cache : pool_snapshot option Atomic.t = Atomic.make None
+let pool_ttl_s = 5.0
+
+let pool_for ~exchange ~now ~max_age ~margin_used ~free =
+  let gen = Atomic.get diagnostics_gen in
+  match Atomic.get pool_cache with
+  | Some ps
+    when String.equal ps.ps_exchange exchange
+         && ps.ps_gen = gen
+         && Float.equal ps.ps_free free
+         && now -. ps.ps_at <= pool_ttl_s -> ps.ps_pool
+  | _ ->
+    let diags = diag_snapshot ~exchange ~now ~max_age in
+    let margin_used =
+      if Float.is_finite margin_used
+      then margin_used
+      else List.fold_left (fun acc d -> acc +. d.dg_margin) 0.0 diags
+    in
+    let pool = pool_of ~margin_used ~free diags in
+    Atomic.set
+      pool_cache
+      (Some
+         { ps_exchange = exchange
+         ; ps_gen = gen
+         ; ps_at = now
+         ; ps_free = free
+         ; ps_pool = pool
+         });
+    pool
 ;;

@@ -418,6 +418,69 @@ let test_fine_dispatch () =
     Alcotest.(check int) "grid_sync invoked" 1 !ctx
 ;;
 
+let test_eval_exponent () =
+  let env = env_with_price 1.0 in
+  (* [string_of_float] emits this form for values below 1e-4, so the lexer must read it
+     back when the script renderer re-parses a literal. *)
+  (match Strategy_expr.parse "1e-06" with
+   | Error m -> Alcotest.failf "parse 1e-06: %s" m
+   | Ok e ->
+     (match Strategy_expr.eval_value env e with
+      | Strategy_expr.V_float f -> Alcotest.(check (float 1e-18)) "value" 1e-6 f
+      | v -> Alcotest.failf "unexpected %s" (Strategy_expr.string_of_value v)));
+  let eval e =
+    match Strategy_expr.eval_arg env e with
+    | Ok (Strategy_expr.V_bool b) -> b
+    | Ok v -> Alcotest.failf "unexpected value %s" (Strategy_expr.string_of_value v)
+    | Error m -> Alcotest.failf "%s: %s" e m
+  in
+  Alcotest.(check bool) "lower-case exponent" true (eval "$price > 1e-06");
+  Alcotest.(check bool) "upper-case signed exponent" false (eval "$price > 1E+06");
+  Alcotest.(check bool) "plain fraction still parses" true (eval "$price > 0.000001")
+;;
+
+let exponent_script =
+  {|
+strategy tiny
+version 1
+
+when book.updates:
+
+  tiny.threshold:
+    if $price > 0.25 + 0.000001:
+      probe.fired
+|}
+;;
+
+let test_numeric_literal_round_trip () =
+  (* The script parses 0.000001 as a float token, the renderer re-emits it as "1e-06", and
+     the runtime re-parses that string as the guard. An unreadable literal used to compile
+     the guard to a constant false, silently disabling the rule. *)
+  let f =
+    match Strategy_script.parse_string exponent_script with
+    | Error e -> Alcotest.failf "parse: %s" e
+    | Ok f -> f
+  in
+  let fire price =
+    let log = ref [] in
+    let rt = Strategy_runtime.create ~handlers:(make_handler log) f in
+    action_names
+      (Strategy_runtime.run_cycle
+         rt
+         ~price
+         ~now:0.0
+         ~event:(Strategy_runtime.make_event "book_update" []))
+  in
+  Alcotest.(check (list string))
+    "guard fires above 0.25 + 1e-06"
+    [ "probe_fired" ]
+    (fire 0.75);
+  Alcotest.(check (list string))
+    "guard stays false inside the epsilon"
+    []
+    (fire 0.2500005)
+;;
+
 let () =
   Alcotest.run
     "strategy_runtime"
@@ -425,6 +488,7 @@ let () =
       , [ Alcotest.test_case "arithmetic" `Quick test_eval_arith
         ; Alcotest.test_case "comparison/bool" `Quick test_eval_compare
         ; Alcotest.test_case "template" `Quick test_template
+        ; Alcotest.test_case "exponent literals" `Quick test_eval_exponent
         ] )
     ; ( "runtime"
       , [ Alcotest.test_case "buy then no repeat" `Quick test_runtime_buy_then_no_repeat
@@ -437,6 +501,10 @@ let () =
         ; Alcotest.test_case "grid available base handler" `Quick test_grid_available_base
         ; Alcotest.test_case "grid grid price handler" `Quick test_grid_grid_price
         ; Alcotest.test_case "fine grid dispatch" `Quick test_fine_dispatch
+        ; Alcotest.test_case
+            "numeric literal survives the script round trip"
+            `Quick
+            test_numeric_literal_round_trip
         ] )
     ]
 ;;

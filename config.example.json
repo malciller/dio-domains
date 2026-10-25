@@ -40,8 +40,11 @@
           "data_feed": "iex"
         }
       },
+      // Overlays are optional. An asset that configures one needs a strategy file
+      // resolved as strategies/<name> or strategies/private/<name>, declaring
+      // `strategy <name>`.
       "overlay": {
-        "name": "carry_overlay",
+        "name": "overlay",
         "exchange": "hyperliquid",
         // true: full spot holdings (open-sell base included); false: accumulated basis.
         "full_balance_ref": false,

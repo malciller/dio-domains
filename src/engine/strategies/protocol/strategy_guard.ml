@@ -291,7 +291,14 @@ let rec compile_exn ?(parse_expr = Strategy_expr.parse) ?memo (g : Strategy_file
           | _ -> true))
   | G_expr s ->
     (match parse_expr s with
-     | Error _ -> fun _ _ -> false
+     | Error m ->
+       (* Fail closed, loudly: this would otherwise be a dead rule for the process. *)
+       Logging.warn_f
+         ~section:"strategy_guard"
+         "guard expression failed to parse, rule disabled: %s (%s)"
+         s
+         m;
+       fun _ _ -> false
      | Ok e ->
        (match memo with
         | None -> fun env _ -> Strategy_expr.eval_bool env e
