@@ -1,8 +1,10 @@
 [@@@ocaml.text
   " Order actions for Lighter: place/cancel/modify via signed transactions. Dispatch uses\n\
-  \    REST [POST /api/v1/sendTx] to Lighter mainnet; signing happens in\n\
-  \    [lighter_signer.ml] over FFI. The WS [jsonapi/sendtx] path in [lighter_ws.ml] is\n\
-  \    unused. "]
+  \    REST [POST /api/v1/sendTx] to Lighter mainnet, dialled through the non-US egress \
+   relay\n\
+  \    (see [lighter_endpoints.ml]); signing happens in [lighter_signer.ml] over FFI. \
+   The WS\n\
+  \    [jsonapi/sendtx] path in [lighter_ws.ml] is unused. "]
 
 open Lwt.Infix
 
@@ -21,7 +23,12 @@ let next_client_order_index () =
 
 let send_tx ~tx_type ~tx_info =
   let url = Lighter_endpoints.api_base_url ^ "/api/v1/sendTx" in
-  Logging.debug_f ~section "Sending tx via REST (type=%d, tx_info=%s)" tx_type tx_info;
+  Logging.debug_f
+    ~section
+    "Sending tx via REST (type=%d, tx_info=%s, connect_host=%s)"
+    tx_type
+    tx_info
+    (Lighter_endpoints.private_rest_connect_host ());
   Lwt.catch
     (fun () ->
       let uri = Uri.of_string url in
@@ -46,7 +53,13 @@ let send_tx ~tx_type ~tx_info =
       in
       let body = Cohttp_lwt.Body.of_string body_str in
       let rest_start = Mtime_clock.now_ns () in
-      let __ppx_lwt_0 = Cohttp_lwt_unix.Client.post ~headers ~body uri in
+      let __ppx_lwt_0 =
+        Cohttp_lwt_unix.Client.post
+          ~connect_host:(Lighter_endpoints.private_rest_connect_host ())
+          ~headers
+          ~body
+          uri
+      in
       Lwt.backtrace_bind
         "src/integrations/venues/lighter/lighter_actions.ml"
         48
@@ -132,8 +145,7 @@ let place_order
        let client_order_index = next_client_order_index () in
        let client_order_id = Int64.to_string client_order_index in
        (match order_userref with
-        | Some u ->
-          Lighter_executions_feed.register_userref ~client_order_id ~userref:u
+        | Some u -> Lighter_executions_feed.register_userref ~client_order_id ~userref:u
         | None -> ());
        let base_amount =
          Lighter_types.float_to_lighter_int ~decimals:info.supported_size_decimals qty

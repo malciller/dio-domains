@@ -12,7 +12,7 @@
 
 (test
  (name test_lighter_executions_feed)
- (libraries dio.lighter alcotest))
+ (libraries dio.lighter dio.exchange alcotest))
 
 (test
  (name test_lighter_instruments_feed)

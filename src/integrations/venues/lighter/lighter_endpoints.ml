@@ -17,3 +17,9 @@ let private_ws_hostname = "lighter-private.zklighter.internal"
 
 let private_ws_connect_target () = private_ws_hostname, 443
 let private_ws_url () = Printf.sprintf "wss://%s/stream" hostname
+
+(** The same relay carries signed writes: [POST /api/v1/sendTx] started geo-blocking
+    independently of the socket, while reads still answer directly.
+    [Lighter_actions.send_tx] dials [private_rest_connect_host] but keeps the URL, TLS SNI
+    and [Host] header on [hostname]. *)
+let private_rest_connect_host () = private_ws_hostname
