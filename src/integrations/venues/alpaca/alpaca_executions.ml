@@ -464,7 +464,11 @@ let start_open_orders_resync () =
           "Periodic open-orders resync failed: %s"
           (Printexc.to_string exn);
         Lwt.return_unit)
-      >>= fun () -> loop ()
+      >>= fun () ->
+      (* Spawn the next reconcile independently so this process-lifetime poll does not
+         retain a recursive Lwt Forward chain. *)
+      Lwt.async loop;
+      Lwt.return_unit
     in
     Lwt.async (fun () ->
       Lwt.catch loop (fun exn ->

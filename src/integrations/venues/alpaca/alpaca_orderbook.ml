@@ -668,7 +668,9 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
                   Lwt.catch
                     (fun () -> Ws_lwt.close_transport conn)
                     (fun _exn -> Lwt.return_unit))
-                else session_watcher ()
+                else (
+                  Lwt.async session_watcher;
+                  Lwt.return_unit)
               | _ -> Lwt.return_unit)
           in
           Lwt.async session_watcher;

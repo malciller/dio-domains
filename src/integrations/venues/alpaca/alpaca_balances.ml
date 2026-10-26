@@ -188,7 +188,12 @@ let update_balances () =
 ;;
 
 let rec poll_loop () =
-  update_balances () >>= fun () -> Lwt_unix.sleep 2.0 >>= fun () -> poll_loop ()
+  update_balances ()
+  >>= fun () ->
+  Lwt_unix.sleep 2.0
+  >>= fun () ->
+  Lwt.async poll_loop;
+  Lwt.return_unit
 ;;
 
 let initialize () =

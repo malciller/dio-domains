@@ -881,7 +881,13 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
       then Lwt.return_unit
       else
         poll_earn_allocations ()
-        >>= fun () -> Lwt_unix.sleep 10.0 >>= fun () -> earn_poll_loop ()
+        >>= fun () ->
+        Lwt_unix.sleep 10.0
+        >>= fun () ->
+        (* Spawn the next poll independently: a recursive [sleep >>= loop] chain runs for
+           the process lifetime and retains one Lwt node per interval. *)
+        Lwt.async earn_poll_loop;
+        Lwt.return_unit
     in
     Lwt.async earn_poll_loop;
     let rec loop () =
