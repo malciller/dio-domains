@@ -4,7 +4,7 @@
    trailing reference/value, and last actual close/spot fills. Separate from the grid's
    accumulation store; the only shared field is the reserved-base ledger. *)
 
-let section = "carry_state_store"
+let section = "overlay_state_store"
 
 type fill =
   { price : float

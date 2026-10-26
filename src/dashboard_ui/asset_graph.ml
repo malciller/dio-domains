@@ -9,6 +9,7 @@ type price_snapshot =
   ; perp_mark : float option
   ; perp_buy_ps : float list
   ; perp_sell_ps : float list
+  ; long_marks : (string * float) list
   }
 
 let repeat_utf8 str count =
@@ -128,6 +129,17 @@ let record_all_prices (snapshot : Snapshot.t) =
            | _ -> None)
         | Snapshot.Balance _ -> None
       in
+      let long_marks =
+        match a.kind with
+        | Snapshot.Strategy s ->
+          List.filter_map
+            (fun (l : Snapshot.long_position) ->
+               if l.long_has_position && l.long_mark > 0.0
+               then Some (l.long_venue, l.long_mark)
+               else None)
+            s.longs
+        | Snapshot.Balance _ -> []
+      in
       if mid > 0.0
       then (
         let q =
@@ -155,6 +167,7 @@ let record_all_prices (snapshot : Snapshot.t) =
             || perp_mark <> last_snap.perp_mark
             || perp_buy_ps <> last_snap.perp_buy_ps
             || perp_sell_ps <> last_snap.perp_sell_ps
+            || long_marks <> last_snap.long_marks
         in
         if should_push
         then (
@@ -166,6 +179,7 @@ let record_all_prices (snapshot : Snapshot.t) =
             ; perp_mark
             ; perp_buy_ps
             ; perp_sell_ps
+            ; long_marks
             }
           in
           Queue.push snap q;
@@ -197,6 +211,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
   let c_bright = t.c_bright in
   let c_magenta = t.c_magenta in
   let a_magenta = A.(fg c_magenta ++ bg c_bg) in
+  let c_long = Theme.c_exch_li () in
+  let a_long = A.(fg c_long ++ bg c_bg) in
   let assets = snapshot.assets in
   let asset_opt =
     if asset_key = ""
@@ -268,6 +284,23 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       | Some s -> s.perp
       | None -> None
     in
+    let longs =
+      match strat_opt with
+      | Some s -> List.filter (fun (l : Snapshot.long_position) -> l.long_has_position) s.longs
+      | None -> []
+    in
+    let long_marks =
+      List.filter_map
+        (fun (l : Snapshot.long_position) ->
+           if l.long_mark > 0.0 then Some (l.long_venue, l.long_mark) else None)
+        longs
+    in
+    let long_close_orders =
+      List.concat_map
+        (fun (l : Snapshot.long_position) ->
+           List.map (fun (o : Snapshot.order) -> l.long_venue, o) l.long_close_orders)
+        longs
+    in
     (* Pending perp orders. The venue may also expose these through the spot pair's open
        orders (order updates are keyed by the registered pair), so their ids are removed
        from the spot lists below to avoid drawing the same target twice. *)
@@ -280,6 +313,9 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     List.iter
       (fun (id, _, _) -> Hashtbl.replace perp_order_ids id ())
       (perp_buy_orders @ perp_sell_orders);
+    List.iter
+      (fun (_venue, (o : Snapshot.order)) -> Hashtbl.replace perp_order_ids o.id ())
+      long_close_orders;
     let not_perp_order (id, _, _) = not (Hashtbl.mem perp_order_ids id) in
     (* Sell orders: the strategy's own list, else the exchange feed. *)
     let sell_orders =
@@ -573,7 +609,9 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
               w
               (I.hcat
                  ([ I.string a_border " │"
-                  ; I.string a_label " Perp: "
+                  ; I.string a_label " Short ("
+                  ; I.string a_cyan (exch_tag_of p.exchange)
+                  ; I.string a_label "): "
                   ; I.string a_magenta side
                   ; I.string a_dim " "
                   ; I.string a_bright qty
@@ -603,6 +641,41 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
                     ]))
           ]
       in
+      let long_lines =
+        List.map
+          (fun (l : Snapshot.long_position) ->
+             let close_item =
+               match l.long_close_price with
+               | Some p when p > 0.0 ->
+                 [ I.string a_dim " │ Close "
+                 ; I.string a_long (format_price p)
+                 ; I.string a_dim (" x" ^ format_qty (Float.abs l.long_qty))
+                 ]
+               | _ -> []
+             in
+             close_row
+               w
+               (I.hcat
+                  ([ I.string a_border " │"
+                   ; I.string a_label " Long ("
+                   ; I.string a_cyan (exch_tag_of l.long_venue)
+                   ; I.string a_label "): "
+                   ; I.string a_long (format_qty l.long_qty)
+                   ; I.string a_dim " @ "
+                   ; I.string a_text (format_price l.long_entry)
+                   ]
+                   @ close_item
+                   @ [ I.string a_dim " │ uPnL "
+                     ; I.string
+                         (if l.long_unrealized_pnl >= 0.0 then a_green else a_red)
+                         (format_pnl l.long_unrealized_pnl)
+                     ; I.string a_dim " │ Mark "
+                     ; I.string a_bright (format_price l.long_mark)
+                     ; I.string a_dim " │ Margin "
+                     ; I.string a_text (format_usd l.long_margin_used)
+                     ])))
+          longs
+      in
       let legend_row =
         close_row
           w
@@ -615,9 +688,11 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
              ; I.string a_dim "  "
              ; I.string a_magenta "── spot sells"
              ; I.string a_dim "  "
-             ; I.string a_bright "── perp mark"
+             ; I.string a_bright "── short mark"
              ; I.string a_dim "  "
-             ; I.string a_yellow "── perp orders"
+             ; I.string a_yellow "── short orders"
+             ; I.string a_dim "  "
+             ; I.string a_long "── long mark/close"
              ])
       in
       let summary =
@@ -629,7 +704,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
            @ [ close_row w (I.hcat [ I.string a_border " │"; latency_row ])
            ; legend_row
            ]
-           @ perp_line)
+           @ perp_line
+           @ long_lines)
       in
       match oracle_line with
       | Some line ->
@@ -657,6 +733,17 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     let hist_perp_marks = List.filter_map (fun s -> s.perp_mark) hist_points in
     let hist_perp_buy_prices = List.concat_map (fun s -> s.perp_buy_ps) hist_points in
     let hist_perp_sell_prices = List.concat_map (fun s -> s.perp_sell_ps) hist_points in
+    let long_mark_venue =
+      match long_marks with
+      | (venue, _) :: _ -> Some venue
+      | [] -> None
+    in
+    let hist_long_marks =
+      match long_mark_venue with
+      | None -> []
+      | Some venue ->
+        List.filter_map (fun s -> List.assoc_opt venue s.long_marks) hist_points
+    in
     let current_perp_mark =
       match perp_opt with
       | Some p when p.mark > 0.0 -> Some p.mark
@@ -674,9 +761,12 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       @ hist_perp_marks
       @ hist_perp_buy_prices
       @ hist_perp_sell_prices
+      @ hist_long_marks
       @ (match current_perp_mark with
          | Some p -> [ p ]
          | None -> [])
+      @ List.map snd long_marks
+      @ List.map (fun (_, (o : Snapshot.order)) -> o.price) long_close_orders
       @ List.map (fun (_, p, _) -> p) buy_orders
       @ List.map (fun (_, p, _) -> p) sell_orders
       @ List.map (fun (_, p, _) -> p) perp_buy_orders
@@ -1063,8 +1153,11 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     let sell_grid = Array.make_matrix sub_w sub_h false in
     let perp_grid = Array.make_matrix sub_w sub_h false in
     let perp_order_grid = Array.make_matrix sub_w sub_h false in
+    let long_mark_grid = Array.make_matrix sub_w sub_h false in
+    let long_close_grid = Array.make_matrix sub_w sub_h false in
     let mid_sub_y = Array.make sub_w (-1) in
     let perp_sub_y = Array.make sub_w (-1) in
+    let long_sub_y = Array.make sub_w (-1) in
     (* Connect pin traces across columns using one-to-one greedy matching within a small
        vertical threshold. *)
     let connect_pin_traces grid sub_y_list =
@@ -1132,6 +1225,14 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
           done;
           draw_line perp_grid 0 sy (sub_w - 1) sy
         | None -> ());
+       (match long_marks with
+        | (_, m) :: _ when m > 0.0 ->
+          let sy = price_to_sub_y m in
+          for sx = 0 to sub_w - 1 do
+            long_sub_y.(sx) <- sy
+          done;
+          draw_line long_mark_grid 0 sy (sub_w - 1) sy
+        | _ -> ());
        List.iter
          (fun (_, p, _) ->
            let sy = price_to_sub_y p in
@@ -1194,6 +1295,39 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
            then perp_at_t target_t rest
            else s0.perp_mark
        in
+       let rec long_at_t target_t = function
+         | [] ->
+           (match long_marks with
+            | (_, m) :: _ -> Some m
+            | [] -> None)
+         | [ s0 ] ->
+           (match long_mark_venue with
+            | Some venue -> List.assoc_opt venue s0.long_marks
+            | None -> None)
+         | s0 :: (s1 :: _ as rest) ->
+           if target_t >= s0.timestamp && target_t <= s1.timestamp
+           then (
+             let at snap =
+               match long_mark_venue with
+               | Some venue -> List.assoc_opt venue snap.long_marks
+               | None -> None
+             in
+             match at s0, at s1 with
+             | Some a, Some b ->
+               let ratio =
+                 (target_t -. s0.timestamp) /. max 0.0001 (s1.timestamp -. s0.timestamp)
+               in
+               Some (a +. ((b -. a) *. ratio))
+             | Some a, None -> Some a
+             | None, Some b -> Some b
+             | None, None -> None)
+           else if target_t >= s1.timestamp
+           then long_at_t target_t rest
+           else
+             (match long_mark_venue with
+              | Some venue -> List.assoc_opt venue s0.long_marks
+              | None -> None)
+       in
        for sx = 0 to sub_w - 1 do
          let ratio_x = float sx /. float (max 1 (sub_w - 1)) in
          let target_t = window_start +. (ratio_x *. window_seconds) in
@@ -1203,6 +1337,9 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
            mid_sub_y.(sx) <- price_to_sub_y p;
            (match perp_at_t target_t pts with
             | Some pp -> perp_sub_y.(sx) <- price_to_sub_y pp
+            | None -> ());
+           (match long_at_t target_t pts with
+            | Some lp -> long_sub_y.(sx) <- price_to_sub_y lp
             | None -> ());
            match snap_at_t target_t pts with
            | Some snap ->
@@ -1241,11 +1378,43 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
          then draw_line perp_grid sx sy0 sx sy0
          else if sy1 >= 0
          then draw_line perp_grid (sx + 1) sy1 (sx + 1) sy1
+       done;
+       for sx = 0 to sub_w - 2 do
+         let sy0 = long_sub_y.(sx) in
+         let sy1 = long_sub_y.(sx + 1) in
+         if sy0 >= 0 && sy1 >= 0
+         then draw_line long_mark_grid sx sy0 (sx + 1) sy1
+         else if sy0 >= 0
+         then draw_line long_mark_grid sx sy0 sx sy0
+         else if sy1 >= 0
+         then draw_line long_mark_grid (sx + 1) sy1 (sx + 1) sy1
        done);
+    (* Resting long close orders are horizontal price levels for their whole life. *)
+    List.iter
+      (fun (_, (o : Snapshot.order)) ->
+         if o.price > 0.0
+         then (
+           let sy = price_to_sub_y o.price in
+           draw_line long_close_grid 0 sy (sub_w - 1) sy))
+      long_close_orders;
     let perp_row_opt =
       match current_perp_mark with
       | Some p when p >= min_p && p <= max_p -> Some (price_to_row p)
       | _ -> None
+    in
+    let long_mark_rows =
+      List.filter_map
+        (fun (_venue, mark) ->
+           if mark >= min_p && mark <= max_p then Some (price_to_row mark) else None)
+        long_marks
+    in
+    let long_close_rows =
+      List.filter_map
+        (fun (_, (o : Snapshot.order)) ->
+           if o.price >= min_p && o.price <= max_p
+           then Some (price_to_row o.price)
+           else None)
+        long_close_orders
     in
     let buy_row_opt =
       if buy_orders <> []
@@ -1289,6 +1458,21 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     in
     let perp_buy_by_row = perp_order_rows perp_buy_orders in
     let perp_sell_by_row = perp_order_rows perp_sell_orders in
+    let long_close_by_row =
+      let by_row = Hashtbl.create 8 in
+      List.iter
+        (fun (venue, (o : Snapshot.order)) ->
+           if o.price > 0.0 && o.qty > 0.0
+           then (
+             let r = price_to_row o.price in
+             let existing =
+               try Hashtbl.find by_row r with
+               | Not_found -> []
+             in
+             Hashtbl.replace by_row r ((venue, o) :: existing)))
+        long_close_orders;
+      by_row
+    in
     (* Y-axis tick rows: always the mid and order rows, plus every 4th row that is not
        adjacent to a labeled row. *)
     let show_y_label = Array.make canvas_h false in
@@ -1308,6 +1492,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     Hashtbl.iter (fun r _ -> show_y_label.(r) <- true) sell_by_row;
     Hashtbl.iter (fun r _ -> show_y_label.(r) <- true) perp_buy_by_row;
     Hashtbl.iter (fun r _ -> show_y_label.(r) <- true) perp_sell_by_row;
+    List.iter (fun r -> show_y_label.(r) <- true) long_mark_rows;
+    List.iter (fun r -> show_y_label.(r) <- true) long_close_rows;
     for r = 0 to canvas_h - 1 do
       if (not show_y_label.(r)) && (r = 0 || r = canvas_h - 1 || r mod 4 = 0)
       then (
@@ -1328,7 +1514,11 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       match perp_opt with
       | None -> []
       | Some p ->
-        [ a_bright, Printf.sprintf "◆ PERP %s" (format_price p.mark)
+        [ ( a_bright
+          , Printf.sprintf
+              "◆ SHORT %s %s"
+              (exch_tag_of p.exchange)
+              (format_price p.mark) )
         ; ( (if p.unrealized_pnl >= 0.0 then a_green else a_red)
           , Printf.sprintf "uPnL %s" (format_pnl p.unrealized_pnl) )
         ]
@@ -1350,7 +1540,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     in
     (* One flag per visible order row, not one aggregate flag for the whole side. Each
        flag carries the row's price and total quantity; same-row orders are merged. *)
-    let order_flag_specs color prefix by_row =
+    let order_flag_specs color prefix rank by_row =
       Hashtbl.fold
         (fun row orders acc ->
           if orders = []
@@ -1371,7 +1561,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
                 total_q
                 (distance_suffix mid avg_p)
             in
-            (row, [ color, text ]) :: acc))
+            (avg_p, rank, row, [ color, text ]) :: acc))
         by_row
         []
     in
@@ -1379,7 +1569,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
        reduces it is the exit whose price closes the trade. Roles are one letter (C/A for
        close/add, B/S when flat) because the flag column is narrow and price, quantity and
        distance already fill most of it. *)
-    let perp_flag_specs by_row is_buy =
+    let perp_flag_specs rank by_row is_buy =
       let is_exit =
         match perp_opt with
         | Some p when p.has_position -> p.qty < 0.0 = is_buy
@@ -1422,20 +1612,109 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
                 total_q
                 (distance_suffix perp_reference avg_p)
             in
-            (row, [ a_yellow, text ]) :: acc))
+            (avg_p, rank, row, [ a_yellow, text ]) :: acc))
         by_row
         []
     in
+    let long_pin_specs =
+      List.filter_map
+        (fun (venue, mark) ->
+           if mark >= min_p && mark <= max_p
+           then (
+             let pnl =
+               match
+                 List.find_opt
+                   (fun (l : Snapshot.long_position) ->
+                      String.equal l.long_venue venue
+                      && Float.abs (l.long_mark -. mark) <= 1e-9)
+                   longs
+               with
+               | Some l -> l.long_unrealized_pnl
+               | None -> 0.0
+             in
+             Some
+               ( mark
+               , 2
+               , price_to_row mark
+               , [ ( a_long
+                   , Printf.sprintf
+                       "◆ LONG %s %s"
+                       (exch_tag_of venue)
+                       (format_price mark) )
+                 ; ( (if pnl >= 0.0 then a_green else a_red)
+                   , Printf.sprintf "uPnL %s" (format_pnl pnl) )
+                 ] ))
+           else None)
+        long_marks
+    in
+    let long_close_specs =
+      Hashtbl.fold
+        (fun row orders acc ->
+           if orders = []
+           then acc
+           else (
+             let count = List.length orders in
+             let total_q =
+               List.fold_left
+                 (fun acc (_, (o : Snapshot.order)) -> acc +. o.qty)
+                 0.0
+                 orders
+             in
+             let avg_p =
+               List.fold_left
+                 (fun acc (_, (o : Snapshot.order)) -> acc +. o.price)
+                 0.0
+                 orders
+               /. float count
+             in
+             let venue =
+               match orders with
+               | (v, _) :: _ -> v
+               | [] -> ""
+             in
+             let total_q =
+               match
+                 List.find_opt
+                   (fun (l : Snapshot.long_position) ->
+                      String.equal l.long_venue venue)
+                   longs
+               with
+               | Some l -> Float.min total_q (Float.abs l.long_qty)
+               | None -> total_q
+             in
+             let reference =
+               match List.assoc_opt venue long_marks with
+               | Some m when m > 0.0 -> m
+               | _ -> mid
+             in
+             let count_str = if count > 1 then "x" ^ string_of_int count else "" in
+             let text =
+               Printf.sprintf
+                 "◆LC %s%s %.6g %.4g%s"
+                 (exch_tag_of venue)
+                 count_str
+                 avg_p
+                 total_q
+                 (distance_suffix reference avg_p)
+             in
+             (avg_p, 6, row, [ a_long, text ]) :: acc))
+        long_close_by_row
+        []
+    in
     let specs =
-      [ mid_row, [ a_green, Printf.sprintf "◆ LIVE %s" (format_price mid) ] ]
-      @ (match perp_row_opt with
-         | Some r -> [ r, perp_pin_lines ]
-         | None -> [])
-      @ order_flag_specs a_cyan "B" buy_by_row
-      @ order_flag_specs a_magenta "S" sell_by_row
-      @ perp_flag_specs perp_buy_by_row true
-      @ perp_flag_specs perp_sell_by_row false
-      |> List.sort (fun (a, _) (b, _) -> compare a b)
+      [ (mid, 0, mid_row, [ a_green, Printf.sprintf "◆ LIVE %s" (format_price mid) ]) ]
+      @ (match perp_opt, perp_row_opt with
+         | Some p, Some r when p.mark > 0.0 -> [ p.mark, 1, r, perp_pin_lines ]
+         | _ -> [])
+      @ long_pin_specs
+      @ order_flag_specs a_cyan "B" 3 buy_by_row
+      @ order_flag_specs a_magenta "S" 4 sell_by_row
+      @ perp_flag_specs 5 perp_buy_by_row true
+      @ perp_flag_specs 5 perp_sell_by_row false
+      @ long_close_specs
+      |> List.sort (fun (pa, ra, _, _) (pb, rb, _, _) ->
+        let c = compare pb pa in
+        if c <> 0 then c else compare ra rb)
     in
     let occupied = Array.make canvas_h false in
     let pin_labels = Hashtbl.create 16 in
@@ -1451,7 +1730,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       !ok
     in
     List.iter
-      (fun (anchor, lines) ->
+      (fun (_price, _rank, anchor, lines) ->
         let height = List.length lines in
         if height > 0
         then (
@@ -1459,7 +1738,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
           for d = 0 to canvas_h - 1 do
             if !chosen = None
             then (
-              let candidates = if d = 0 then [ anchor ] else [ anchor - d; anchor + d ] in
+              let candidates = if d = 0 then [ anchor ] else [ anchor + d; anchor - d ] in
               List.iter
                 (fun st -> if !chosen = None && all_free st height then chosen := Some st)
                 candidates)
@@ -1493,6 +1772,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         let is_sell_l = s_orders_l <> [] in
         let is_buy_l = Some r = buy_row_opt || b_orders_l <> [] in
         let is_perp_l = Some r = perp_row_opt in
+        let is_long_mark_l = List.mem r long_mark_rows in
+        let is_long_close_l = List.mem r long_close_rows in
         let p_orders_l =
           (try Hashtbl.find perp_buy_by_row r with
            | Not_found -> [])
@@ -1518,6 +1799,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
           then A.(fg c_magenta ++ bg c_bg ++ st bold)
           else if is_perp_ord_l
           then A.(fg c_yellow ++ bg c_bg ++ st bold)
+          else if is_long_mark_l || is_long_close_l
+          then A.(fg c_long ++ bg c_bg)
           else if is_perp_l
           then A.(fg c_bright ++ bg c_bg ++ st bold)
           else if is_grid_line
@@ -1537,6 +1820,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
             let sell_mask = ref 0 in
             let perp_mask = ref 0 in
             let perp_ord_mask = ref 0 in
+            let long_mark_mask = ref 0 in
+            let long_close_mask = ref 0 in
             for sub_y = 0 to 3 do
               let current_sy = cell_sy_start + sub_y in
               if current_sy >= 0 && current_sy < sub_h
@@ -1560,7 +1845,15 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
                 if perp_order_grid.(sx0).(current_sy)
                 then perp_ord_mask := !perp_ord_mask lor braille_bit 0 sub_y;
                 if perp_order_grid.(sx1).(current_sy)
-                then perp_ord_mask := !perp_ord_mask lor braille_bit 1 sub_y)
+                then perp_ord_mask := !perp_ord_mask lor braille_bit 1 sub_y;
+                if long_mark_grid.(sx0).(current_sy)
+                then long_mark_mask := !long_mark_mask lor braille_bit 0 sub_y;
+                if long_mark_grid.(sx1).(current_sy)
+                then long_mark_mask := !long_mark_mask lor braille_bit 1 sub_y;
+                if long_close_grid.(sx0).(current_sy)
+                then long_close_mask := !long_close_mask lor braille_bit 0 sub_y;
+                if long_close_grid.(sx1).(current_sy)
+                then long_close_mask := !long_close_mask lor braille_bit 1 sub_y)
             done;
             let valid_sy =
               if mid_sy0 >= 0 && mid_sy1 >= 0
@@ -1584,6 +1877,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
             let bg_attr = if is_in_liquid then A.bg fill_rgb else A.bg c_bg in
             let combined_mask =
               !mid_mask lor !buy_mask lor !sell_mask lor !perp_mask lor !perp_ord_mask
+              lor !long_mark_mask lor !long_close_mask
             in
             if combined_mask <> 0
             then (
@@ -1591,7 +1885,13 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
               (* Overlapping traces collapse to the theme's dominant trace color (mid
                  wins, then perp orders, then buy/sell); colors are theme-derived. *)
               let fg_color =
-                if !perp_mask <> 0 && !mid_mask = 0 && !buy_mask = 0 && !sell_mask = 0
+                if
+                  (!long_mark_mask <> 0 || !long_close_mask <> 0)
+                  && !mid_mask = 0
+                  && !buy_mask = 0
+                  && !sell_mask = 0
+                then c_long
+                else if !perp_mask <> 0 && !mid_mask = 0 && !buy_mask = 0 && !sell_mask = 0
                 then c_bright
                 else if !mid_mask <> 0 && !buy_mask <> 0
                 then c_green

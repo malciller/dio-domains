@@ -60,6 +60,22 @@ module Impl : Exchange.Market_context.S = struct
   let get_margin () = Dio_exchange.Market_context.get_margin ~exchange:name
   let get_margin_ratio () = Dio_exchange.Market_context.get_margin_ratio ~exchange:name
 
+  let get_risk ~coin =
+    match Lighter_instruments_feed.lookup_info coin with
+    | None -> None
+    | Some info ->
+      Some
+        { Exchange.Market_context.maintenance_frac =
+            (if info.Lighter_types.maintenance_margin_fraction > 0.0
+             then info.maintenance_margin_fraction /. 10_000.0
+             else 0.0)
+        ; max_leverage =
+            (if info.min_initial_margin_fraction > 0.0
+             then Some (10_000.0 /. info.min_initial_margin_fraction)
+             else None)
+        }
+  ;;
+
   let get_open_orders ~coin =
     perp_symbols_for_coin coin
     |> List.concat_map Feed.get_open_orders

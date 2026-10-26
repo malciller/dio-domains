@@ -1460,7 +1460,7 @@ let close_row target_w img =
   I.hcat [ img_cropped; I.string A.(fg t.c_border ++ bg t.c_bg) " │" ]
 ;;
 
-let render_proximity_slider w pos_pct_opt =
+let render_proximity_slider ?(has_buy = true) ?(has_sell = true) w pos_pct_opt =
   let t = !active_theme_ref in
   let inner_w = max 3 (w - 2) in
   match pos_pct_opt with
@@ -1488,13 +1488,65 @@ let render_proximity_slider w pos_pct_opt =
       then A.(fg t.c_red ++ st bold)
       else A.(fg t.c_cyan ++ st bold)
     in
+    let left_attr = if has_buy then t.a_green else t.a_dim in
+    let right_attr = if has_sell then t.a_red else t.a_dim in
     I.hcat
-      [ I.string t.a_green "┠"
-      ; I.string t.a_green (repeat_str "━" left_w)
+      [ I.string left_attr "┠"
+      ; I.string left_attr (repeat_str "━" left_w)
       ; I.string dot_attr "◈"
-      ; I.string t.a_red (repeat_str "━" right_w)
-      ; I.string t.a_red "┨"
+      ; I.string right_attr (repeat_str "━" right_w)
+      ; I.string right_attr "┨"
       ]
+;;
+
+(** Two-sided distance bar: the short close fills left of centre, the long close fills
+    right. Fill length is distance up to [far_pct], so a present side always draws. *)
+let render_perp_distance_slider w ~short_dist ~long_dist ~far_pct =
+  let t = !active_theme_ref in
+  let inner_w = max 5 (w - 2) in
+  let half = inner_w / 2 in
+  let far_pct = if far_pct > 0.0 then far_pct else 1.0 in
+  let fill_of dist =
+    match dist with
+    | None -> 0
+    | Some d ->
+      let fraction = max 0.0 (min 1.0 (abs_float d /. far_pct)) in
+      max 1 (int_of_float (fraction *. float (max 0 (half - 1))))
+  in
+  let short_fill = fill_of short_dist in
+  let long_fill = fill_of long_dist in
+  let left_w = half in
+  let right_w = inner_w - 1 - half in
+  let left_empty = left_w - short_fill in
+  let right_empty = right_w - long_fill in
+  let near dist =
+    match dist with
+    | Some d -> abs_float d <= 0.05
+    | None -> false
+  in
+  let short_attr =
+    if short_fill = 0
+    then t.a_dim
+    else if near short_dist
+    then A.(fg t.c_green ++ st bold)
+    else A.(fg t.c_cyan)
+  in
+  let long_attr =
+    if long_fill = 0
+    then t.a_dim
+    else if near long_dist
+    then A.(fg t.c_green ++ st bold)
+    else A.(fg t.c_magenta)
+  in
+  I.hcat
+    [ I.string t.a_border "├"
+    ; I.string t.a_dim (repeat_str "─" left_empty)
+    ; I.string short_attr (repeat_str "━" short_fill)
+    ; I.string t.a_border "┼"
+    ; I.string long_attr (repeat_str "━" long_fill)
+    ; I.string t.a_dim (repeat_str "─" right_empty)
+    ; I.string t.a_border "┤"
+    ]
 ;;
 
 let render_card w title content_rows =

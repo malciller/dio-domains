@@ -5,12 +5,12 @@
     sides (the strategy runtime and the persistence store); the domain loop calls it at
     boot, on every fill, and after every overlay cycle. *)
 
-module Store = Dio_persistence.Carry_state_store
+module Store = Dio_persistence.Overlay_state_store
 module Rt = Strategy_runtime
 module Expr = Strategy_expr
 module Common = Strategy_common
 
-let section = "carry_runtime"
+let section = "overlay_runtime"
 
 let base_coin_of_symbol symbol =
   match String.split_on_char '/' symbol with

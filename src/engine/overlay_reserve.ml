@@ -7,7 +7,7 @@
     sizes buys from the remainder. The overlay's add gate uses the next rung's initial
     margin. *)
 
-let section = "carry_reserve"
+let section = "overlay_reserve"
 let base_coin_of_symbol symbol = Config.base_coin_of_symbol symbol
 
 (** Case-insensitive equality without allocating an uppercased copy. *)

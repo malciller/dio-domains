@@ -9,6 +9,22 @@ let section = "lighter_instruments_feed"
 let pair_cache : (string, Lighter_types.market_info) Hashtbl.t = Hashtbl.create 32
 let index_to_symbol : (int, string) Hashtbl.t = Hashtbl.create 32
 let cache_mutex = Mutex.create ()
+
+(** Published immutable copies for lock-free readers. Writes stay under [cache_mutex];
+    each publish replaces the whole table, so a reader never sees a partially updated
+    map. *)
+let pair_snapshot : (string, Lighter_types.market_info) Hashtbl.t Atomic.t =
+  Atomic.make (Hashtbl.create 32)
+;;
+
+let index_snapshot : (int, string) Hashtbl.t Atomic.t =
+  Atomic.make (Hashtbl.create 32)
+;;
+
+let publish () =
+  Atomic.set pair_snapshot (Hashtbl.copy pair_cache);
+  Atomic.set index_snapshot (Hashtbl.copy index_to_symbol)
+;;
 let is_ready = Atomic.make false
 let ready_condition = Lwt_condition.create ()
 
@@ -92,6 +108,13 @@ let fetch_and_initialize ~base_url ~required_symbols =
                             with
                             | _ -> 0.0
                           in
+                          let min_initial_margin_fraction =
+                            try
+                              Lighter_types.parse_json_float
+                                (member "min_initial_margin_fraction" market)
+                            with
+                            | _ -> 0.0
+                          in
                           let info : Lighter_types.market_info =
                             { market_index
                             ; symbol
@@ -100,6 +123,7 @@ let fetch_and_initialize ~base_url ~required_symbols =
                             ; min_base_amount
                             ; min_quote_amount
                             ; maintenance_margin_fraction
+                            ; min_initial_margin_fraction
                             ; taker_fee
                             ; maker_fee
                             }
@@ -122,6 +146,7 @@ let fetch_and_initialize ~base_url ~required_symbols =
                             "Failed to parse market entry: %s"
                             (Printexc.to_string exn))
                       markets);
+                publish ();
                 let __ppx_lwt_0 =
                   Lwt.catch
                     (fun () ->
@@ -179,7 +204,8 @@ let fetch_and_initialize ~base_url ~required_symbols =
                                               , price_dec
                                               , min_base
                                               , min_quote
-                                              , mmf )
+                                              , mmf
+                                              , min_imf )
                                             =
                                             match perp_info with
                                             | Some pi ->
@@ -187,8 +213,9 @@ let fetch_and_initialize ~base_url ~required_symbols =
                                               , pi.supported_price_decimals
                                               , pi.min_base_amount
                                               , pi.min_quote_amount
-                                              , pi.maintenance_margin_fraction )
-                                            | None -> 4, 2, 0.005, 10.0, 0.0
+                                              , pi.maintenance_margin_fraction
+                                              , pi.min_initial_margin_fraction )
+                                            | None -> 4, 2, 0.005, 10.0, 0.0, 0.0
                                           in
                                           let info : Lighter_types.market_info =
                                             { market_index = mi
@@ -198,6 +225,7 @@ let fetch_and_initialize ~base_url ~required_symbols =
                                             ; min_base_amount = min_base
                                             ; min_quote_amount = min_quote
                                             ; maintenance_margin_fraction = mmf
+                                            ; min_initial_margin_fraction = min_imf
                                             ; taker_fee = 0.0
                                             ; maker_fee = 0.0
                                             }
@@ -216,6 +244,7 @@ let fetch_and_initialize ~base_url ~required_symbols =
                                       with
                                       | _ -> ())
                                     all_markets);
+                              publish ();
                               Logging.info_f
                                 ~section
                                 "Spot market discovery complete: %d total markets in \
@@ -302,12 +331,8 @@ let fetch_and_initialize ~base_url ~required_symbols =
   \    fails. "]
 ;;
 
-let lookup_info symbol =
-  Mutex.lock cache_mutex;
-  Fun.protect
-    ~finally:(fun () -> Mutex.unlock cache_mutex)
-    (fun () -> Hashtbl.find_opt pair_cache symbol)
-[@@ocaml.doc " Thread-safe instrument metadata lookup by symbol. "]
+let lookup_info symbol = Hashtbl.find_opt (Atomic.get pair_snapshot) symbol
+[@@ocaml.doc " Lock-free instrument metadata lookup by symbol. "]
 ;;
 
 let get_market_index ~symbol =
@@ -317,12 +342,8 @@ let get_market_index ~symbol =
 [@@ocaml.doc " Symbol to Lighter market index. "]
 ;;
 
-let get_symbol ~market_index =
-  Mutex.lock cache_mutex;
-  Fun.protect
-    ~finally:(fun () -> Mutex.unlock cache_mutex)
-    (fun () -> Hashtbl.find_opt index_to_symbol market_index)
-[@@ocaml.doc " Market index to symbol (thread-safe). "]
+let get_symbol ~market_index = Hashtbl.find_opt (Atomic.get index_snapshot) market_index
+[@@ocaml.doc " Lock-free market index to symbol. "]
 ;;
 
 let get_price_increment symbol =
@@ -370,7 +391,11 @@ let round_qty_for_symbol symbol qty =
 [@@ocaml.doc " Round qty down to lot precision for [symbol]. "]
 ;;
 
-let initialize ?(maintenance_margin_fraction = 0.0) symbols =
+let initialize
+  ?(maintenance_margin_fraction = 0.0)
+  ?(min_initial_margin_fraction = 0.0)
+  symbols
+  =
   Mutex.lock cache_mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock cache_mutex)
@@ -385,6 +410,7 @@ let initialize ?(maintenance_margin_fraction = 0.0) symbols =
             ; min_base_amount = 0.001
             ; min_quote_amount = 1.0
             ; maintenance_margin_fraction
+            ; min_initial_margin_fraction
             ; taker_fee = 0.0
             ; maker_fee = 0.0
             }
@@ -392,6 +418,7 @@ let initialize ?(maintenance_margin_fraction = 0.0) symbols =
           Hashtbl.replace pair_cache symbol info;
           Hashtbl.replace index_to_symbol idx symbol)
         symbols);
+  publish ();
   Logging.info_f
     ~section
     "Initialized Lighter instruments feed with %d mock symbols"

@@ -19,7 +19,7 @@ let section = "strategy_cycle_engine"
 type ctx =
   { mutable cg_asset : Types.trading_config option
   ; mutable cg_state : Types.strategy_state option
-  ; mutable cg_carry : Dio_persistence.Carry_state_store.t option
+  ; mutable cg_carry : Dio_persistence.Overlay_state_store.t option
   ; mutable cg_reserve_share : float
   (** Aggregate hedgeable inventory across every leg of this controller. [< 0] means "not
       an overlay controller"; [market_facts] then falls back to the local venue figure. *)
@@ -561,6 +561,12 @@ let market_facts c (t : Strategy_runtime.t) =
     | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) -> Mc.get_margin ()
     | None -> None
   in
+  let risk =
+    match mc with
+    | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
+      Mc.get_risk ~coin:base
+    | None -> None
+  in
   let reserved =
     match Dio_exchange.Exchange_intf.Registry.get_capital_reservation exchange with
     | Some (module Cr : Dio_exchange.Exchange_intf.Capital_reservation.S) ->
@@ -643,6 +649,7 @@ let market_facts c (t : Strategy_runtime.t) =
    | Some m when fresh m.updated_at ->
      setf Slots.perp_account_value m.account_value;
      setf Slots.perp_maintenance m.maintenance_margin;
+     setf Slots.perp_withdrawable m.withdrawable;
      setf
        Slots.margin_ratio
        (if m.maintenance_margin > 0.0
@@ -651,19 +658,29 @@ let market_facts c (t : Strategy_runtime.t) =
    | _ ->
      setf Slots.perp_account_value 0.0;
      setf Slots.perp_maintenance 0.0;
+     setf Slots.perp_withdrawable 0.0;
      setf Slots.margin_ratio 0.0);
-  setf Slots.carry_reserved reserved;
+  (match risk with
+   | Some r ->
+     setf Slots.perp_maintenance_frac r.maintenance_frac;
+     (match r.max_leverage with
+      | Some l -> setf Slots.perp_max_leverage l
+      | None -> setf Slots.perp_max_leverage 0.0)
+   | None ->
+     setf Slots.perp_maintenance_frac 0.0;
+     setf Slots.perp_max_leverage 0.0);
+  setf Slots.overlay_reserved reserved;
   setf Slots.min_notional (Strategy_venue.get_min_notional_val symbol exchange);
   setf Slots.reserve_share c.cg_reserve_share;
   (match c.cg_carry with
    | Some cs ->
      let close_price, close_kind, close_realized, close_qty =
-       match cs.Dio_persistence.Carry_state_store.last_close with
+       match cs.Dio_persistence.Overlay_state_store.last_close with
        | Some f -> f.price, f.kind, f.realized, f.qty
        | None -> 0.0, "", 0.0, 0.0
      in
      let spot_price, spot_qty =
-       match cs.Dio_persistence.Carry_state_store.last_spot with
+       match cs.Dio_persistence.Overlay_state_store.last_spot with
        | Some f -> f.price, f.qty
        | None -> 0.0, 0.0
      in
@@ -677,15 +694,15 @@ let market_facts c (t : Strategy_runtime.t) =
      setf Slots.carry_close_realized close_realized;
      setf
        Slots.carry_close_realized_total
-       cs.Dio_persistence.Carry_state_store.close_realized_total;
-     seti Slots.carry_close_seq cs.Dio_persistence.Carry_state_store.close_seq;
+       cs.Dio_persistence.Overlay_state_store.close_realized_total;
+     seti Slots.carry_close_seq cs.Dio_persistence.Overlay_state_store.close_seq;
      setf
        Slots.carry_recycle_realized_total
-       cs.Dio_persistence.Carry_state_store.recycle_realized_total;
-     seti Slots.carry_recycle_seq cs.Dio_persistence.Carry_state_store.recycle_seq;
+       cs.Dio_persistence.Overlay_state_store.recycle_realized_total;
+     seti Slots.carry_recycle_seq cs.Dio_persistence.Overlay_state_store.recycle_seq;
      setf Slots.carry_spot_price spot_price;
      setf Slots.carry_spot_qty spot_qty;
-     seti Slots.carry_spot_seq cs.Dio_persistence.Carry_state_store.spot_seq
+     seti Slots.carry_spot_seq cs.Dio_persistence.Overlay_state_store.spot_seq
    | None ->
      setf Slots.carry_close_price 0.0;
      setf Slots.carry_close_qty 0.0;
@@ -1142,8 +1159,23 @@ let order_replace
             try
               Ex.iter_open_orders_fast
                 ~symbol
-                (fun oid _price _remaining side_str userref ->
-                   if userref = Some Strategy_common.strategy_userref_carry
+                (fun oid price _remaining side_str userref ->
+                   (* Venues that do not echo the engine's user reference (Lighter) return
+                      [None]/[0]. Match those by the exact target price so an order placed
+                      before a restart (or before the tag existed) is adopted and its
+                      duplicates cancelled instead of being layered again. *)
+                   let userref_ok =
+                     match userref with
+                     | Some 0 | None ->
+                       (* Only Lighter drops the tag; other venues' untagged orders are
+                          external and must not be adopted. *)
+                       String.equal (String.lowercase_ascii asset.exchange) "lighter"
+                       && price > 0.0
+                       && Float.abs (price -. rounded)
+                          <= 1e-9 *. Float.max 1.0 (Float.abs rounded)
+                     | Some u -> u = Strategy_common.strategy_userref_carry
+                   in
+                   if userref_ok
                       && String.equal side_str want_side
                       && not (Hashtbl.mem seen oid)
                    then (

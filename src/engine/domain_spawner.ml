@@ -221,6 +221,18 @@ let derive_overlay_ladder ?start_ratio ~leverage (p : overlay_params) =
   }
 ;;
 
+(** Maximum venue leverage for an overlay's hedge asset, from startup instrument
+    metadata. Seeds the ladder and take-profit only while no live position supplies the
+    account's actual leverage. *)
+let overlay_venue_leverage (c : overlay_controller) =
+  match Dio_exchange.Exchange_intf.Registry.get_market_context c.oc_hedge_exchange with
+  | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
+    (match Mc.get_risk ~coin:c.oc_hedge_coin with
+     | Some { Dio_exchange.Exchange_intf.Market_context.max_leverage = Some l; _ } -> l
+     | _ -> 0.0)
+  | None -> 0.0
+;;
+
 (** Reconstructed ladder position from an open short. *)
 type overlay_ladder_seed =
   { ls_anchor : float
@@ -229,6 +241,89 @@ type overlay_ladder_seed =
   ; ls_carry : float
   ; ls_next_add : float
   }
+
+(** One generic additional overlay-strategy instance running inside the owner grid's
+    domain. The strategy file owns its policy; the engine owns state persistence and event
+    dispatch. *)
+type overlay_instance_rt =
+  { oir_config : Config.overlay_instance
+  ; oir_asset : Dio_strategies.Strategy_state.trading_config
+  ; oir_ctx : Dio_strategies.Strategy_cycle_engine.ctx
+  ; oir_rt : Dio_strategies.Strategy_runtime.t
+  ; oir_state : Yojson.Basic.t ref
+  ; mutable oir_seen_positions_at : float
+  ; mutable oir_seen_margin_at : float
+  }
+
+(** Load every overlay instance owned by [owner]. A failed instance is logged and skipped;
+    config validation has already checked the file exists and its name matches. *)
+let load_overlay_instances ~(owner : trading_config) : overlay_instance_rt list =
+  Config.get_overlay_instances_for ~exchange:owner.exchange ~symbol:owner.symbol
+  |> List.filter_map (fun (oi : Config.overlay_instance) ->
+    match Dio_strategies.Strategy_loader.load ~name:oi.oi_strategy with
+    | Error msg ->
+      Logging.critical_f
+        ~section
+        "overlay strategy %s for %s/%s failed to load: %s"
+        oi.oi_strategy
+        oi.oi_owner_exchange
+        oi.oi_owner_symbol
+        msg;
+      None
+    | Ok (path, file) ->
+      let diags = Dio_strategies.Strategy_compile.validate file in
+      if Dio_strategies.Strategy_compile.has_errors diags
+      then (
+        Logging.critical_f
+          ~section
+          "overlay strategy file %s has errors: %s"
+          path
+          (Dio_strategies.Strategy_compile.format diags);
+        None)
+      else (
+        let asset : Dio_strategies.Strategy_state.trading_config =
+          { exchange = oi.oi_exchange
+          ; symbol = oi.oi_symbol
+          ; qty = owner.qty
+          ; grid_interval = fst owner.grid_interval
+          ; sell_mult = owner.sell_mult
+          ; strategy = oi.oi_strategy
+          ; maker_fee = owner.maker_fee
+          ; taker_fee = owner.taker_fee
+          ; accumulation_buffer = fst owner.accumulation_buffer
+          ; base_accumulation = owner.base_accumulation
+          ; sell_levels_persistence = owner.sell_levels
+          }
+        in
+        let ctx = Dio_strategies.Strategy_cycle_engine.create () in
+        ctx.cg_symbol <- oi.oi_symbol;
+        let state =
+          ref
+            (Dio_persistence.Overlay_instance_store.load
+               ~owner_exchange:oi.oi_owner_exchange
+               ~owner_symbol:oi.oi_owner_symbol
+               ~id:oi.oi_id)
+        in
+        let params =
+          Dio_strategies.Overlay_instance_runtime.params_of_file file oi.oi_params
+        in
+        let rt =
+          Dio_strategies.Strategy_runtime.create
+            ~handlers:(Config_grid_handlers.handler ctx)
+            ~params
+            file
+        in
+        Dio_strategies.Overlay_instance_runtime.seed rt !state;
+        Some
+          { oir_config = oi
+          ; oir_asset = asset
+          ; oir_ctx = ctx
+          ; oir_rt = rt
+          ; oir_state = state
+          ; oir_seen_positions_at = -1.0
+          ; oir_seen_margin_at = -1.0
+          }))
+;;
 
 (** Rebuild the ladder from the live short instead of persisting it.
 
@@ -369,7 +464,7 @@ let seed_ladder_from_position
       ladder.ol_num_rungs
       seed.ls_carry
       seed.ls_next_add;
-    Dio_strategies.Carry_runtime.restore_ladder
+    Dio_strategies.Overlay_runtime.restore_ladder
       ~anchor:seed.ls_anchor
       ~add_index:seed.ls_add_index
       ~rung_qty:seed.ls_rung_qty
@@ -471,6 +566,9 @@ let asset_domain_worker
       asset_with_fees.symbol
   | Some (module Ex) ->
     let exec_read_pos = ref 0 in
+    (* The first execution scan replays the feed's snapshot. Generic overlay instances
+       must not treat those historical fills as new spot sells. *)
+    let startup_replay = ref true in
     let orderbook_read_pos = ref 0 in
     (* Latest market data derived from consumed ring buffer events *)
     let current_price = ref nan in
@@ -1032,7 +1130,7 @@ let asset_domain_worker
              None)
            else (
              let p = c.oc_params in
-             let ladder = derive_overlay_ladder ~leverage:p.leverage p in
+             let ladder = derive_overlay_ladder ~leverage:(overlay_venue_leverage c) p in
              let recycle_base_share = p.recycle_base_share_pct /. 100.0 in
              let params =
                [ "start_ratio", Dio_strategies.Strategy_expr.V_float ladder.ol_start_ratio
@@ -1042,8 +1140,8 @@ let asset_domain_worker
                ; "add_growth", Dio_strategies.Strategy_expr.V_float ladder.ol_add_growth
                ; "max_ratio", Dio_strategies.Strategy_expr.V_float ladder.ol_max_ratio
                ; "num_adds", Dio_strategies.Strategy_expr.V_int ladder.ol_num_rungs
-               ; ( "recycle_profit"
-                 , Dio_strategies.Strategy_expr.V_float (p.recycle_profit_pct /. 100.0) )
+               ; ( "short_tp_roe"
+                 , Dio_strategies.Strategy_expr.V_float p.short_tp_roe )
                ; ( "recycle_base_share"
                  , Dio_strategies.Strategy_expr.V_float recycle_base_share )
                ; ( "min_entry_margin_ratio"
@@ -1069,6 +1167,100 @@ let asset_domain_worker
                   ~params
                   overlay_file)))
       | _ -> None
+    in
+    (* Additional generic overlays owned by this grid entry. They run in the same domain:
+       no new process, and grid sell fills are available locally. *)
+    let overlay_instances = load_overlay_instances ~owner:asset_with_fees in
+    let run_overlay_cycles (ov : overlay_instance_rt) ~now ~price ~events =
+      let ctx = ov.oir_ctx in
+      let asset = ov.oir_asset in
+      ctx.cg_asset <- Some asset;
+      ctx.cg_symbol <- asset.symbol;
+      ctx.cg_now <- now;
+      ctx.cg_cycle <- !cycle_count;
+      ctx.cg_price <- price;
+      ctx.cg_bid <- price;
+      ctx.cg_ask <- price;
+      ctx.cg_overlay_accumulated <- -1.0;
+      ctx.cg_overlay_has_spot_leg <- false;
+      ctx.cg_overlay_spot_symbol <- "";
+      ctx.cg_carry <- None;
+      ctx.cg_state <- None;
+      ctx.cg_reserve_share <- 0.0;
+      ctx.cg_credit_key <- "";
+      ctx.cg_quote_stale <- false;
+      ctx.cg_oracle_halted <- false;
+      ctx.cg_base_age <- None;
+      ctx.cg_gen <- 0;
+      ctx.cg_profile <- false;
+      List.iter
+        (fun (event_name, fields) ->
+           Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
+             ignore
+               (Dio_strategies.Strategy_runtime.run_cycle
+                  ov.oir_rt
+                  ~price
+                  ~now
+                  ~event:(Dio_strategies.Strategy_runtime.make_event event_name fields))))
+        events;
+      Dio_strategies.Overlay_instance_runtime.save_if_changed
+        ~owner_exchange:ov.oir_config.oi_owner_exchange
+        ~owner_symbol:ov.oir_config.oi_owner_symbol
+        ~id:ov.oir_config.oi_id
+        ov.oir_rt
+        ov.oir_state
+    in
+    let overlay_mark (ov : overlay_instance_rt) =
+      match
+        Dio_exchange.Exchange_intf.Registry.get_market_context ov.oir_config.oi_exchange
+      with
+      | None -> 0.0
+      | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
+        (match Mc.get_funding ~coin:ov.oir_config.oi_symbol with
+         | Some f -> f.mark
+         | None -> 0.0)
+    in
+    let overlay_entry_resting (ov : overlay_instance_rt) =
+      match
+        Dio_strategies.Strategy_venue.get_exchange_module ov.oir_config.oi_exchange
+      with
+      | None -> false
+      | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+        let found = ref false in
+        (try
+           Ex.iter_open_orders_fast
+             ~symbol:ov.oir_config.oi_symbol
+             (fun _ _ remaining side _ ->
+                if remaining > 0.0 && String.equal side "buy" then found := true)
+         with
+         | _ -> ());
+        !found
+    in
+    let overlay_venue_changed (ov : overlay_instance_rt) ~now =
+      match
+        Dio_exchange.Exchange_intf.Registry.get_market_context ov.oir_config.oi_exchange
+      with
+      | None -> ()
+      | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
+        let positions_at =
+          Option.value (Mc.get_positions_updated_at ()) ~default:0.0
+        in
+        let margin_at =
+          match Mc.get_margin () with
+          | Some m -> m.updated_at
+          | None -> 0.0
+        in
+        if
+          positions_at > ov.oir_seen_positions_at
+          || margin_at > ov.oir_seen_margin_at
+        then (
+          ov.oir_seen_positions_at <- positions_at;
+          ov.oir_seen_margin_at <- margin_at;
+          run_overlay_cycles
+            ov
+            ~now
+            ~price:(overlay_mark ov)
+            ~events:[ "book_update", [] ])
     in
     (* Config-driven grid runtime (milestone 3, coarse wrapper; default off). When a
        strategy file is bound to the entry, the loop dispatches to the interpreter whose
@@ -1128,14 +1320,14 @@ let asset_domain_worker
       | Some _ ->
         Some
           (ref
-             (Dio_strategies.Carry_runtime.load
+             (Dio_strategies.Overlay_runtime.load
                 ~exchange:asset_with_fees.exchange
                 ~symbol:asset_with_fees.symbol))
       | None -> None
     in
     (match overlay_rt, overlay_ctx, overlay_controller, overlay_carry with
      | Some ort, Some ctx, Some controller, Some st ->
-       Dio_strategies.Carry_runtime.seed ort !st;
+       Dio_strategies.Overlay_runtime.seed ort !st;
        let p = controller.oc_params in
        (* webData2 carries the position and its leverage. Wait for the first full frame so
           the ladder and the take-profit seed from the live position instead of the
@@ -1161,18 +1353,20 @@ let asset_domain_worker
            "position snapshot not ready for %s/%s after 15s, keeping the persisted ladder"
            asset_with_fees.exchange
            asset_with_fees.symbol;
-       let venue_leverage =
+       let position_leverage =
          match position with
          | Some pos -> Option.value pos.leverage ~default:0.0
          | None -> 0.0
        in
        (* The venue's leverage is the margin the bands and the take-profit are measured
-          against. Config and persisted values only cover a flat or unseen position. *)
+          against. The live position wins; otherwise seed from the venue maximum derived
+          at startup; persisted values only cover a flat or unseen position. *)
+       let max_leverage = overlay_venue_leverage controller in
        let seeded_leverage, source =
-         if venue_leverage > 0.0
-         then venue_leverage, "position snapshot"
-         else if p.leverage > 0.0
-         then p.leverage, "config"
+         if position_leverage > 0.0
+         then position_leverage, "position snapshot"
+         else if max_leverage > 0.0
+         then max_leverage, "venue max"
          else if !st.last_leverage > 0.0
          then !st.last_leverage, "carry state"
          else 0.0, "unknown"
@@ -1196,14 +1390,14 @@ let asset_domain_worker
          Logging.info_f
            ~section
            "carry leverage seed %s: unknown; the first take-profit waits for the first \
-            position snapshot (set trading[].overlay.params.leverage to seed it)"
+            position snapshot or venue instrument metadata"
            asset_with_fees.symbol;
        (* Reconstruct the ladder from the live short: the average entry and size identify
           the anchor and the last completed rung. Bands the price crossed while the
           process was down stay ahead of [add_index], so the arming path fills them
           instead of re-basing the trail at the restart mark. A flat account has no rung
           to derive; the strategy starts one on its next entry. *)
-       let ladder = derive_overlay_ladder ~leverage:p.leverage p in
+       let ladder = derive_overlay_ladder ~leverage:max_leverage p in
        let mode_changed = !st.full_balance_ref <> p.full_balance_ref in
        let accumulated = (Overlay_inventory.aggregate controller).total in
        let seeded =
@@ -1218,7 +1412,9 @@ let asset_domain_worker
        in
        if (not seeded) && mode_changed
        then
-         Dio_strategies.Carry_runtime.reset_ladder ~start_ratio:ladder.ol_start_ratio ort;
+         Dio_strategies.Overlay_runtime.reset_ladder
+           ~start_ratio:ladder.ol_start_ratio
+           ort;
        if mode_changed then st := { !st with full_balance_ref = p.full_balance_ref }
      | _ -> ());
     (* Adopt carry orders that survived a restart. The order-id -> kind registry is
@@ -1476,7 +1672,7 @@ let asset_domain_worker
                         ~symbol:fee_symbol)
                    ~current:default_taker
                in
-               Dio_strategies.Carry_runtime.record_fill
+               Dio_strategies.Overlay_runtime.record_fill
                  ~exchange:asset_with_fees.exchange
                  ~symbol:asset_with_fees.symbol
                  ~market:
@@ -1748,6 +1944,73 @@ let asset_domain_worker
       then (
         open_orders_dirty := true;
         let now_exec = Unix.gettimeofday () in
+        let dispatch_generic_overlay_fill (event : Types.execution_event) =
+          if overlay_instances <> [] && event.order_status = Types.Filled
+          then (
+            if event.market = Types.Spot && event.side = Types.Sell
+            then
+              Logging.info_f
+                ~section
+                "overlay spot sell fill %s/%s qty=%.8g order=%s replay=%b"
+                asset_with_fees.exchange
+                asset_with_fees.symbol
+                event.filled_qty
+                event.order_id
+                !startup_replay
+            else
+              Logging.debug_f
+                ~section
+                "overlay fill %s/%s %s qty=%.8g order=%s replay=%b"
+                asset_with_fees.exchange
+                asset_with_fees.symbol
+                (Types.string_of_market event.market)
+                event.filled_qty
+                event.order_id
+                !startup_replay;
+            let fields =
+              [ "now", Dio_strategies.Strategy_expr.V_float now_exec
+              ; "order_id", Dio_strategies.Strategy_expr.V_string event.order_id
+              ; ( "side"
+                , Dio_strategies.Strategy_expr.V_string
+                    (match event.side with
+                     | Types.Buy -> "buy"
+                     | Types.Sell -> "sell") )
+              ; ( "market"
+                , Dio_strategies.Strategy_expr.V_string
+                    (Types.string_of_market event.market) )
+              ; ( "is_perp"
+                , Dio_strategies.Strategy_expr.V_float
+                    (if event.market = Types.Perp then 1.0 else 0.0) )
+              ; ( "is_buy"
+                , Dio_strategies.Strategy_expr.V_float
+                    (match event.side with
+                     | Types.Buy -> 1.0
+                     | Types.Sell -> 0.0) )
+              ; "price", Dio_strategies.Strategy_expr.V_float event.avg_price
+              ; "qty", Dio_strategies.Strategy_expr.V_float event.filled_qty
+              ; "timestamp", Dio_strategies.Strategy_expr.V_float event.timestamp
+              ; ( "is_replay"
+                , Dio_strategies.Strategy_expr.V_float
+                    (if !startup_replay then 1.0 else 0.0) )
+              ]
+            in
+            (* A spot fill changes the sale-funded target, so evaluate the strategy now.
+               Perp fills only change the venue position; the position timestamp drives
+               that cycle, avoiding an interpreter run on every carry fill. *)
+            let events =
+              if event.market = Types.Spot
+              then [ "filled", fields; "book_update", [] ]
+              else [ "filled", fields ]
+            in
+            List.iter
+              (fun (ov : overlay_instance_rt) ->
+                 run_overlay_cycles
+                   ov
+                   ~now:now_exec
+                   ~price:event.avg_price
+                   ~events)
+              overlay_instances)
+        in
         let new_pos =
           Ex.iter_execution_events
             ~symbol:asset_with_fees.symbol
@@ -1848,6 +2111,7 @@ let asset_domain_worker
                      ()
                | Types.Filled ->
                  should_execute_strategy := true;
+                 dispatch_generic_overlay_fill event;
                  (* The feed publishes fills to the oracle's ring directly. *)
                  let side =
                    match event.side with
@@ -2070,6 +2334,7 @@ let asset_domain_worker
               asset_with_fees.symbol);
         exec_read_pos := new_pos;
         exec_checked := true);
+      startup_replay := false;
       let t3 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
       let alloc_at_t3 =
         if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
@@ -2561,6 +2826,7 @@ let asset_domain_worker
            | _ -> 0
          in
          let p = controller.oc_params in
+         let venue_leverage = overlay_venue_leverage controller in
          let ladder_ratio = sfloat "ladder_ratio" in
          let ladder_rungs = max 0 (sint "ladder_rungs") in
          let ladder_index = max 0 (sint "add_index") in
@@ -2568,12 +2834,12 @@ let asset_domain_worker
          let add_growth = sfloat "ladder_growth" in
          let add_carry = sfloat "add_carry" in
          let max_trail_pct =
-           if p.leverage > 0.0
+           if venue_leverage > 0.0
            then
              (* Full path from the reconstructed anchor to the terminal rung. *)
              float_of_int ladder_rungs
              *. (p.add_threshold_pct /. 100.0)
-             /. p.leverage
+             /. venue_leverage
              *. 100.0
            else 0.0
          in
@@ -2585,13 +2851,13 @@ let asset_domain_worker
          let max_qty = max_ratio *. inventory.total in
          let target_leg =
            match
-             Carry_reserve.pos_leg
+             Overlay_reserve.pos_leg
                ~exchange:controller.oc_hedge_exchange
                ~coin:overlay_coin
            with
            | Some t -> t
            | None ->
-             { Carry_reserve.qty = 0.0; entry = 0.0; mark = 0.0; maintenance = 0.0 }
+             { Overlay_reserve.qty = 0.0; entry = 0.0; mark = 0.0; maintenance = 0.0 }
          in
          let quote_asset =
            match String.index_opt controller.oc_hedge_symbol '/' with
@@ -2628,12 +2894,9 @@ let asset_domain_worker
            | None -> nan
          in
          let leverage =
-           if p.leverage > 0.0
-           then p.leverage
-           else (
-             match pos with
-             | Some s -> Option.value s.leverage ~default:0.0
-             | None -> 0.0)
+           match pos with
+           | Some s -> Option.value s.leverage ~default:venue_leverage
+           | None -> venue_leverage
          in
          let p_top_guess =
            let scheduled =
@@ -2683,7 +2946,7 @@ let asset_domain_worker
          in
          let sells_top, sells_stress = sells_below2 p_top_guess stress_price in
          let req =
-           Carry_reserve.compute_requirement
+           Overlay_reserve.compute_requirement
              ~target:target_leg
              ~max_qty
              ~leverage
@@ -2697,21 +2960,21 @@ let asset_domain_worker
              ~sells_stress
          in
          let diag =
-           { Carry_reserve.dg_key =
-               Carry_reserve.diag_key
+           { Overlay_reserve.dg_key =
+               Overlay_reserve.diag_key
                  ~exchange:controller.oc_hedge_exchange
                  ~symbol:controller.oc_hedge_symbol
            ; dg_exchange = controller.oc_hedge_exchange
            ; dg_at = now_ov
-           ; dg_gross = req.Carry_reserve.rq_gross
-           ; dg_sells = req.Carry_reserve.rq_sells_applied
-           ; dg_required = req.Carry_reserve.rq_required
+           ; dg_gross = req.Overlay_reserve.rq_gross
+           ; dg_sells = req.Overlay_reserve.rq_sells_applied
+           ; dg_required = req.Overlay_reserve.rq_required
            ; dg_margin = pos_margin_used
            }
          in
-         Carry_reserve.update_diag diag;
+         Overlay_reserve.update_diag diag;
          let pool =
-           Carry_reserve.pool_for
+           Overlay_reserve.pool_for
              ~exchange:controller.oc_hedge_exchange
              ~now:now_ov
              ~max_age:180.0
@@ -2723,12 +2986,12 @@ let asset_domain_worker
            then
              Float.min
                free
-               (Float.max 0.0 (req.Carry_reserve.rq_required -. pos_margin_used))
+               (Float.max 0.0 (req.Overlay_reserve.rq_required -. pos_margin_used))
            else 0.0
          in
          let share =
            if pool.pl_count >= overlay_expected_controllers
-           then Carry_reserve.allocation pool ~gross:req.Carry_reserve.rq_gross
+           then Overlay_reserve.allocation pool ~gross:req.Overlay_reserve.rq_gross
            else own_share
          in
          let share_changed =
@@ -2748,7 +3011,7 @@ let asset_domain_worker
                 ~event:(Dio_strategies.Strategy_runtime.make_event "book_update" [])));
          (match overlay_carry with
           | Some r ->
-            Dio_strategies.Carry_runtime.save_if_changed
+            Dio_strategies.Overlay_runtime.save_if_changed
               ~exchange:asset_with_fees.exchange
               ~symbol:asset_with_fees.symbol
               ort
@@ -2827,7 +3090,7 @@ let asset_domain_worker
              then
                Float.min
                  free
-                 (Float.max 0.0 (req.Carry_reserve.rq_required -. pos_margin_used))
+                 (Float.max 0.0 (req.Overlay_reserve.rq_required -. pos_margin_used))
              else nan
            in
            Logging.info_f
@@ -2840,27 +3103,27 @@ let asset_domain_worker
               share=%.2f reserve_net=%.2f | pool n=%d gross=%.2f sells=%.2f margin=%.2f \
               required=%.2f own_net=%.2f reserve=%.2f"
              controller.oc_hedge_symbol
-             req.Carry_reserve.rq_short_qty
-             req.Carry_reserve.rq_max_qty
+             req.Overlay_reserve.rq_short_qty
+             req.Overlay_reserve.rq_max_qty
              ladder_ratio
              ladder_index
              ladder_rungs
              add_carry
              anchor
              next_add
-             req.Carry_reserve.rq_p_top
-             req.Carry_reserve.rq_entry
-             req.Carry_reserve.rq_entry_max
-             req.Carry_reserve.rq_leverage
+             req.Overlay_reserve.rq_p_top
+             req.Overlay_reserve.rq_entry
+             req.Overlay_reserve.rq_entry_max
+             req.Overlay_reserve.rq_leverage
              target_leg.maintenance
-             req.Carry_reserve.rq_im_top
-             req.Carry_reserve.rq_loss_top
-             req.Carry_reserve.rq_mm_stress
-             req.Carry_reserve.rq_loss_stress
+             req.Overlay_reserve.rq_im_top
+             req.Overlay_reserve.rq_loss_top
+             req.Overlay_reserve.rq_mm_stress
+             req.Overlay_reserve.rq_loss_stress
              sells_all
-             req.Carry_reserve.rq_sells_top
-             req.Carry_reserve.rq_sells_stress
-             req.Carry_reserve.rq_required
+             req.Overlay_reserve.rq_sells_top
+             req.Overlay_reserve.rq_sells_stress
+             req.Overlay_reserve.rq_required
              pos_margin_used
              acct_margin_used
              free
@@ -2876,6 +3139,21 @@ let asset_domain_worker
              pool.pl_own_net
              pool.pl_reserve)
        | _ -> ());
+      (* Generic overlays run on their venue's position/margin changes. A resting entry
+         is a live GTC limit and needs the book to reprice, so subscribe only while one
+         exists; every other tick stays out of the interpreter. *)
+      List.iter
+        (fun (ov : overlay_instance_rt) ->
+           let now = Unix.gettimeofday () in
+           if overlay_entry_resting ov
+           then
+             run_overlay_cycles
+               ov
+               ~now
+               ~price:(overlay_mark ov)
+               ~events:[ "book_update", [] ]
+           else overlay_venue_changed ov ~now)
+        overlay_instances;
       (* PREP/STRATEGY boundary. [t3] ends the exec phase; the block below up to the
          strategy call (oracle apply, halt/reclaim, startup gate, balance reads, F&G
          re-evaluation) is PREP. [t3_strategy] is seeded here so idle cycles still report

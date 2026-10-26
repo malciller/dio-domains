@@ -58,7 +58,8 @@ type oracle =
   }
 
 type perp =
-  { coin : string
+  { exchange : string
+  ; coin : string
   ; side : string
   ; has_position : bool
   ; qty : float
@@ -80,6 +81,24 @@ type perp =
   ; updated_at : float
   ; buy_orders : order list
   ; sell_orders : order list
+  }
+
+(** One additional overlay long (a generic instance on its own venue). *)
+type long_position =
+  { long_venue : string
+  ; long_coin : string
+  ; long_has_position : bool
+  ; long_qty : float
+  ; long_entry : float
+  ; long_mark : float
+  ; long_notional : float
+  ; long_unrealized_pnl : float
+  ; long_margin_used : float
+  ; long_leverage : float option
+  ; long_liquidation : float option
+  ; long_close_price : float option
+  ; long_close_distance_pct : float option
+  ; long_close_orders : order list
   }
 
 type ladder =
@@ -106,6 +125,7 @@ type strategy =
   ; market : market
   ; ladder : ladder option
   ; perp : perp option
+  ; longs : long_position list
   ; oracle : oracle option
   }
 
@@ -290,7 +310,8 @@ let parse_oracle j =
 let parse_perp j =
   let f key = j |?> key |> to_float_d 0.0 in
   let opt key = j |?> key |> to_float_opt in
-  { coin = j |?> "coin" |> to_string_d ""
+  { exchange = j |?> "exchange" |> to_string_d "?"
+  ; coin = j |?> "coin" |> to_string_d ""
   ; side = j |?> "side" |> to_string_d "flat"
   ; has_position = j |?> "has_position" |> to_bool_d false
   ; qty = f "qty"
@@ -312,6 +333,26 @@ let parse_perp j =
   ; updated_at = f "updated_at"
   ; buy_orders = parse_orders (j |?> "buy_orders")
   ; sell_orders = parse_orders (j |?> "sell_orders")
+  }
+;;
+
+let parse_long j =
+  let f key = j |?> key |> to_float_d 0.0 in
+  let opt key = j |?> key |> to_float_opt in
+  { long_venue = j |?> "exchange" |> to_string_d "?"
+  ; long_coin = j |?> "coin" |> to_string_d "?"
+  ; long_has_position = j |?> "has_position" |> to_bool_d false
+  ; long_qty = f "qty"
+  ; long_entry = f "entry"
+  ; long_mark = f "mark"
+  ; long_notional = f "notional"
+  ; long_unrealized_pnl = f "unrealized_pnl"
+  ; long_margin_used = f "margin_used"
+  ; long_leverage = opt "leverage"
+  ; long_liquidation = opt "liquidation"
+  ; long_close_price = opt "close_price"
+  ; long_close_distance_pct = opt "close_distance_pct"
+  ; long_close_orders = parse_orders (j |?> "close_orders")
   }
 ;;
 
@@ -348,6 +389,10 @@ let parse_strategy symbol j =
       (match j |?> "perp" with
        | `Assoc _ as p -> Some (parse_perp p)
        | _ -> None)
+  ; longs =
+      (match j |?> "longs" with
+       | `List items -> List.filter_map (fun x -> match x with `Assoc _ -> Some (parse_long x) | _ -> None) items
+       | _ -> [])
   ; oracle =
       (match j |?> "oracle" with
        | `Assoc _ as o -> Some (parse_oracle o)

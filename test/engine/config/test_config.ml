@@ -50,9 +50,9 @@ let test_parse_overlays () =
         {"symbol":"BTC/USDC","exchange":"hyperliquid","overlay":{
           "strategy":"carry_overlay",
           "params":{"start_ratio_pct":30,"add_threshold_pct":8,"max_ratio_pct":80,
-                    "recycle_profit_pct":3,"recycle_base_share_pct":60,
+                    "short_tp_roe":3,"recycle_base_share_pct":60,
                     "min_entry_margin_ratio":2.5,"min_liq_mult":3.0,
-                    "leverage":10,"full_balance_ref":true}}},
+                    "full_balance_ref":true}}},
         {"symbol":"HYPE/USDC","exchange":"hyperliquid"}]}|}
   in
   Dio_engine.Config.parse_overlays json;
@@ -76,7 +76,6 @@ let test_parse_overlays () =
     "entry margin ratio"
     2.5
     p.Dio_engine.Config.min_entry_margin_ratio;
-  Alcotest.(check (float 1e-9)) "leverage" 10.0 p.Dio_engine.Config.leverage;
   Alcotest.(check bool) "full balance ref" true p.Dio_engine.Config.full_balance_ref
 ;;
 
@@ -98,7 +97,6 @@ let test_parse_overlay_params_defaults () =
     "entry margin default"
     2.0
     p.Dio_engine.Config.min_entry_margin_ratio;
-  Alcotest.(check (float 1e-9)) "leverage default" 0.0 p.Dio_engine.Config.leverage;
   Alcotest.(check bool)
     "full balance ref default"
     false
@@ -135,9 +133,12 @@ let grouped_json =
                   "accumulation_buffer":[0.05,0.4],"testnet":true,
                   "sell_levels":true,"data_feed":"iex"}
       },
-      "overlay":{"name":"carry_overlay","exchange":"hyperliquid",
-                 "min_entry_margin_ratio":1.0,"min_liq_mult":1.0,
-                 "recycle_base_share_pct":0},
+      "overlay":{"carry_overlay":{"exchange":"hyperliquid",
+                                  "params":{"min_entry_margin_ratio":1.0,
+                                            "min_liq_mult":1.0,
+                                            "recycle_base_share_pct":0}},
+                 "long_overlay":{"exchange":"lighter",
+                                 "params":{"stress_drop":0.8}}},
       "oracle":{"target_survival":0.95,"min_active_dsurv":0.0,
                 "qty_cap_mult":1.5,"refresh_seconds":300}
     },
@@ -147,16 +148,22 @@ let grouped_json =
        "strategy":{"exchange":"hyperliquid","symbol":"BTC/USDC","qty":"0.0003",
                    "grid_interval":[0.15,0.18],
                    "accumulation_buffer":[0.04,0.35],"cpu_priority":10},
-       "overlay":{"leverage":20,"start_ratio_pct":25,"add_threshold_pct":5,
-                  "max_ratio_pct":75,"recycle_profit_pct":5,
-                  "recycle_base_share_pct":50,
-                  "inventory":[{"exchange":"kraken","symbol":"BTC/USD"}]}},
+       "overlay":[
+         {"name":"carry_overlay",
+          "params":{"start_ratio_pct":25,"add_threshold_pct":5,
+                    "max_ratio_pct":75,"short_tp_roe":5,
+                    "recycle_base_share_pct":50},
+          "inventory":[{"exchange":"kraken","symbol":"BTC/USD"}]},
+         {"name":"long_overlay","symbol":"BTC",
+          "params":{"stress_drop":80}}]},
       {"asset":"ETH",
        "strategy":{"exchange":"kraken","symbol":"ETH/USD","qty":"0.0045",
                    "grid_interval":[2.5,10.0]},
-       "overlay":{"leverage":20,"start_ratio_pct":40,"add_threshold_pct":5,
-                  "max_ratio_pct":75,"recycle_profit_pct":5,
-                  "inventory":[{"exchange":"hyperliquid","symbol":"ETH/USDC"}]}},
+       "overlay":[
+         {"name":"carry_overlay",
+          "params":{"start_ratio_pct":40,"add_threshold_pct":5,
+                    "max_ratio_pct":75,"short_tp_roe":5},
+          "inventory":[{"exchange":"hyperliquid","symbol":"ETH/USDC"}]}]},
       {"asset":"BOTZ",
        "oracle":{"target_survival":0.7,"qty_cap_mult":2.0},
        "strategy":{"exchange":"alpaca","symbol":"BOTZ","qty":"0.28",
@@ -217,7 +224,7 @@ let test_grouped_trading_flattens_and_merges () =
    | None -> Alcotest.fail "expected the BTC controller"
    | Some c ->
      Alcotest.(check int) "two BTC legs" 2 (List.length c.oc_legs);
-     Alcotest.(check (float 1e-9)) "leverage" 20.0 c.oc_params.leverage;
+     Alcotest.(check (float 1e-9)) "start ratio" 25.0 c.oc_params.start_ratio_pct;
      Alcotest.(check (float 1e-9)) "base share" 50.0 c.oc_params.recycle_base_share_pct;
      Alcotest.(check bool) "hl spot leg" true c.oc_has_hl_spot_leg);
   let eth =
@@ -519,8 +526,8 @@ let cross_venue_json =
     {"symbol":"BTC/USD","exchange":"Kraken","overlay":{
       "strategy":"carry_overlay","exchange":"hyperliquid",
       "params":{"start_ratio_pct":25,"add_threshold_pct":7.5,"max_ratio_pct":75,
-                "recycle_profit_pct":1.5,"recycle_base_share_pct":50,
-                "min_entry_margin_ratio":2.0,"min_liq_mult":2.5,"leverage":10}}}]}|}
+                "short_tp_roe":1.5,"recycle_base_share_pct":50,
+                "min_entry_margin_ratio":2.0,"min_liq_mult":2.5}}}]}|}
 ;;
 
 let test_overlay_cross_venue () =
@@ -700,6 +707,106 @@ let test_read_config_keeps_last_good () =
     Alcotest.(check int) "complete file replaces the fallback" 4242 recovered.cycle_mod)
 ;;
 
+let test_parse_overlay_instances () =
+  let entry =
+    {|{"symbol":"BTC/USDC","exchange":"hyperliquid","qty":"0.001",
+       "strategy":"jacobs_ladder",
+       "overlays":[{"name":"long_overlay","exchange":"lighter",
+                    "params":{"long_pct":0.25,"stress_drop":0.8}}]}|}
+  in
+  ignore (Dio_engine.Config.parse_config (Yojson.Basic.from_string entry));
+  Dio_engine.Config.parse_overlay_instances
+    (Yojson.Basic.from_string (Printf.sprintf {|{"trading":[%s]}|} entry));
+  (match
+     Dio_engine.Config.get_overlay_instances_for ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
+   with
+   | [ oi ] ->
+     Alcotest.(check string)
+       "id defaults to the strategy name"
+       "long_overlay"
+       oi.Dio_engine.Config.oi_id;
+     Alcotest.(check string) "strategy" "long_overlay" oi.Dio_engine.Config.oi_strategy;
+     Alcotest.(check string) "overlay venue" "lighter" oi.Dio_engine.Config.oi_exchange;
+     Alcotest.(check string)
+       "symbol defaults to the owner's base coin"
+       "BTC"
+       oi.Dio_engine.Config.oi_symbol;
+     let open Yojson.Basic.Util in
+     Alcotest.(check (float 1e-9))
+       "param"
+       0.25
+       (oi.Dio_engine.Config.oi_params
+        |> member "long_pct"
+        |> Dio_engine.Config.to_float_opt
+        |> Option.value ~default:0.0)
+   | _ -> Alcotest.fail "expected one overlay instance for hyperliquid/BTC/USDC");
+  Alcotest.(check int)
+    "other owners have none"
+    0
+    (List.length
+       (Dio_engine.Config.get_overlay_instances_for
+          ~exchange:"hyperliquid"
+          ~symbol:"HYPE/USDC"))
+;;
+
+let test_parse_overlay_instances_grouped () =
+  let json =
+    Yojson.Basic.from_string
+      {|{"trading":{
+        "defaults":{"strategy":{"hyperliquid":{"name":"jacobs_ladder",
+                                                "sell_mult":"0.98"}}},
+        "assets":[{"asset":"BTC",
+          "strategy":{"exchange":"hyperliquid","symbol":"BTC/USDC","qty":"0.001",
+                      "grid_interval":[0.1,0.2]},
+          "overlay":[
+            {"name":"carry_overlay","exchange":"hyperliquid",
+             "params":{"start_ratio_pct":25}},
+            {"name":"long_overlay","exchange":"lighter",
+             "params":{"stress_drop":0.8}}]}]}}|}
+  in
+  Dio_engine.Config.parse_overlay_instances json;
+  (match
+     Dio_engine.Config.get_overlay_instances_for ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
+   with
+   | [ oi ] ->
+     Alcotest.(check string)
+       "grouped asset owner"
+       "BTC/USDC"
+       oi.Dio_engine.Config.oi_owner_symbol;
+     let open Yojson.Basic.Util in
+     Alcotest.(check (float 1e-9))
+       "grouped param"
+       0.8
+       (oi.Dio_engine.Config.oi_params
+        |> member "stress_drop"
+        |> Dio_engine.Config.to_float_opt
+        |> Option.value ~default:0.0)
+   | _ -> Alcotest.fail "expected one grouped overlay instance");
+  (match
+     Dio_engine.Config.get_overlay_controller ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
+   with
+   | Some c ->
+     Alcotest.(check (float 1e-9)) "controller start ratio" 25.0 c.oc_params.start_ratio_pct
+   | None -> Alcotest.fail "expected the carry controller from the same overlay list")
+;;
+
+let test_parse_overlay_flat_params () =
+  (* Older configs put the carry params directly on the overlay object. *)
+  let json =
+    Yojson.Basic.from_string
+      {|{"trading":[{"symbol":"BTC/USD","exchange":"kraken",
+         "overlay":{"name":"carry_overlay","exchange":"hyperliquid",
+                    "start_ratio_pct":25}}]}|}
+  in
+  Dio_engine.Config.parse_overlays json;
+  match
+    Dio_engine.Config.get_overlay_controller ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
+  with
+  | Some c ->
+    Alcotest.(check (float 1e-9)) "flat start ratio" 25.0 c.oc_params.start_ratio_pct
+  | None -> Alcotest.fail "expected a hyperliquid/BTC controller"
+;;
+
 let () =
   Alcotest.run
     "Config"
@@ -753,6 +860,18 @@ let () =
             `Quick
             test_domain_assets_spawns_overlay_only
         ; Alcotest.test_case "inventory formula" `Quick test_inventory_formula
+        ; Alcotest.test_case
+            "instances parse flat"
+            `Quick
+            test_parse_overlay_instances
+        ; Alcotest.test_case
+            "instances parse grouped"
+            `Quick
+            test_parse_overlay_instances_grouped
+        ; Alcotest.test_case
+            "flat params are hoisted"
+            `Quick
+            test_parse_overlay_flat_params
         ; Alcotest.test_case
             "hedge-venue inventory leg is balance-only"
             `Quick

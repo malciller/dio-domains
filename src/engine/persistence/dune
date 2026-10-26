@@ -6,4 +6,5 @@
   Persistence_orchestrator
   Base_accumulation_store
   Sell_levels_store
-  Carry_state_store))
+  Overlay_state_store
+  Overlay_instance_store))

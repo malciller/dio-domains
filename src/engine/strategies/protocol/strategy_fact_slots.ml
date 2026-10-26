@@ -74,11 +74,23 @@ let perp_leverage = platform "perp_leverage"
 let perp_liq = platform "perp_liq"
 let perp_account_value = platform "perp_account_value"
 let perp_maintenance = platform "perp_maintenance"
+
+(** Venue market metadata, published at startup. Strategies size from these instead of
+    config constants. [perp_maintenance_frac] is per unit notional; [perp_max_leverage] is
+    the venue maximum for this instrument. *)
+let perp_maintenance_frac = platform "perp_maintenance_frac"
+let perp_max_leverage = platform "perp_max_leverage"
+
+(** Quote the venue will let us deploy now: account equity minus margin already used.
+    Shared by every asset on the venue, so sizing from it competes for live capital
+    instead of a preallocated per-asset budget. *)
+let perp_withdrawable = platform "perp_withdrawable"
+
 let margin_ratio = platform "margin_ratio"
 let accumulated_balance = platform "accumulated_balance"
 let spot_base_total = platform "spot_base_total"
 let usdc_free = platform "usdc_free"
-let carry_reserved = platform "carry_reserved"
+let overlay_reserved = platform "overlay_reserved"
 let min_notional = platform "min_notional"
 let reserve_share = platform "reserve_share"
 

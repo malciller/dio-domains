@@ -668,6 +668,13 @@ module Market_context = struct
     ; updated_at : float
     }
 
+  (** Venue risk parameters for one instrument, published at startup from the venue's
+      market metadata. Strategies size from these instead of hardcoding them. *)
+  type risk =
+    { maintenance_frac : float (** maintenance margin per unit notional, e.g. 0.012 *)
+    ; max_leverage : float option (** venue maximum leverage for this instrument *)
+    }
+
   module type S = sig
     val name : string
     val get_funding : coin:string -> funding option
@@ -675,6 +682,10 @@ module Market_context = struct
     val get_position : coin:string -> position option
     val get_margin : unit -> margin option
     val get_margin_ratio : unit -> float option
+
+    (** Instrument risk parameters for [coin], from venue market metadata. [None] when the
+        venue has not published metadata for the instrument. *)
+    val get_risk : coin:string -> risk option
 
     (** Live open orders for the perpetual [coin], including reduce-only exits. This is
         separate from the venue's spot open orders because a perp order and a spot order

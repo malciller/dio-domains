@@ -22,16 +22,23 @@ let initialize_feeds ()  :
             c.oc_hedge_coin :: c.oc_hedge_symbol :: acc)
           []
    in
+   let overlay_instance_symbols (exchange : string) =
+     Dio_engine.Config.get_overlay_instances ()
+     |> List.filter (fun (o : Dio_engine.Config.overlay_instance) ->
+       String.equal o.oi_exchange exchange)
+     |> List.map (fun (o : Dio_engine.Config.overlay_instance) -> o.oi_symbol)
+   in
    Logging.info_f ~section "Loaded %d trading configuration(s)"
      (List.length app_configs);
    (let kraken_symbols =
-      (app_configs |>
-         (List.filter
-            (fun cfg ->
-               (Dio_exchange.Exchange_intf.Types.exchange_of_string
-                  cfg.Dio_engine.Config.exchange)
-                 = Kraken)))
-        |> (List.map (fun cfg -> cfg.Dio_engine.Config.symbol)) in
+      ((app_configs |>
+          (List.filter
+             (fun cfg ->
+                (Dio_exchange.Exchange_intf.Types.exchange_of_string
+                   cfg.Dio_engine.Config.exchange)
+                  = Kraken)))
+         |> (List.map (fun cfg -> cfg.Dio_engine.Config.symbol)))
+      @ overlay_instance_symbols "kraken" in
     let hyperliquid_symbols =
       let from_trading =
         ((app_configs |>
@@ -54,7 +61,9 @@ let initialize_feeds ()  :
          trades it there. *)
       List.sort_uniq
         String.compare
-        (from_trading @ overlay_hedge_symbols "hyperliquid") in
+        (from_trading
+         @ overlay_hedge_symbols "hyperliquid"
+         @ overlay_instance_symbols "hyperliquid") in
     let has_hyperliquid = (List.length hyperliquid_symbols) > 0 in
     let has_kraken = (List.length kraken_symbols) > 0 in
     let hyperliquid_testnet =
@@ -76,13 +85,14 @@ let initialize_feeds ()  :
          | Some c -> c.oc_testnet
          | None -> false) in
     let ibkr_symbols =
-      (app_configs |>
-         (List.filter
-            (fun cfg ->
-               (Dio_exchange.Exchange_intf.Types.exchange_of_string
-                  cfg.Dio_engine.Config.exchange)
-                 = Ibkr)))
-        |> (List.map (fun cfg -> cfg.Dio_engine.Config.symbol)) in
+      ((app_configs |>
+          (List.filter
+             (fun cfg ->
+                (Dio_exchange.Exchange_intf.Types.exchange_of_string
+                   cfg.Dio_engine.Config.exchange)
+                  = Ibkr)))
+         |> (List.map (fun cfg -> cfg.Dio_engine.Config.symbol)))
+      @ overlay_instance_symbols "ibkr" in
     let has_ibkr = (List.length ibkr_symbols) > 0 in
     let ibkr_testnet =
       match app_configs |>
@@ -95,22 +105,24 @@ let initialize_feeds ()  :
       | Some cfg -> cfg.testnet
       | None -> true in
     let lighter_symbols =
-      (app_configs |>
-         (List.filter
-            (fun cfg ->
-               (Dio_exchange.Exchange_intf.Types.exchange_of_string
-                  cfg.Dio_engine.Config.exchange)
-                 = Lighter)))
-        |> (List.map (fun cfg -> cfg.Dio_engine.Config.symbol)) in
+      ((app_configs |>
+          (List.filter
+             (fun cfg ->
+                (Dio_exchange.Exchange_intf.Types.exchange_of_string
+                   cfg.Dio_engine.Config.exchange)
+                  = Lighter)))
+         |> (List.map (fun cfg -> cfg.Dio_engine.Config.symbol)))
+      @ overlay_instance_symbols "lighter" in
     let has_lighter = (List.length lighter_symbols) > 0 in
     let alpaca_symbols =
-      (app_configs |>
-         (List.filter
-            (fun cfg ->
-               (Dio_exchange.Exchange_intf.Types.exchange_of_string
-                  cfg.Dio_engine.Config.exchange)
-                 = Alpaca)))
-        |> (List.map (fun cfg -> cfg.Dio_engine.Config.symbol)) in
+      ((app_configs |>
+          (List.filter
+             (fun cfg ->
+                (Dio_exchange.Exchange_intf.Types.exchange_of_string
+                   cfg.Dio_engine.Config.exchange)
+                  = Alpaca)))
+         |> (List.map (fun cfg -> cfg.Dio_engine.Config.symbol)))
+      @ overlay_instance_symbols "alpaca" in
     let has_alpaca = (List.length alpaca_symbols) > 0 in
     let alpaca_configs =
       app_configs |>
@@ -393,10 +405,28 @@ let initialize_feeds ()  :
                                                   c.oc_hedge_coin)
                                                 overlay_controllers
                                             in
+                                            let from_overlay_instances =
+                                              Dio_engine.Config.get_overlay_instances ()
+                                              |> List.map
+                                                   (fun
+                                                     (o : Dio_engine.Config.overlay_instance)
+                                                     ->
+                                                     if
+                                                       String.contains
+                                                         o.oi_symbol
+                                                         '/'
+                                                     then
+                                                       (String.split_on_char
+                                                          '/' o.oi_symbol)
+                                                       |> List.hd
+                                                     else o.oi_symbol)
+                                            in
                                             List.sort_uniq
                                               String.compare
                                               ("USD"
-                                               :: (from_trading @ from_overlays)) in
+                                               :: (from_trading
+                                                   @ from_overlays
+                                                   @ from_overlay_instances)) in
                                          let all_assets =
                                            if has_hyperliquid
                                            then "USDC" :: all_assets

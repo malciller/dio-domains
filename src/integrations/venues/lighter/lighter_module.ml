@@ -39,7 +39,7 @@ module Lighter_impl = struct
     ?time_in_force
     ?post_only
     ?reduce_only
-    ?order_userref:_
+    ?order_userref
     ?cl_ord_id:_
     ?trigger_price:_
     ?display_qty:_
@@ -78,6 +78,7 @@ module Lighter_impl = struct
       ~is_buy
       ~qty:sz_rounded
       ~price:px_rounded
+      ?order_userref
       ~order_type
       ~tif
       ~post_only:post_only_val

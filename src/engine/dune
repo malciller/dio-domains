@@ -25,5 +25,5 @@
   Domain_spawner
   Order_executor
   Strategy_replay
-  Carry_reserve
+  Overlay_reserve
   Overlay_inventory))

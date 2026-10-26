@@ -47,7 +47,34 @@ type execution_event =
   ; timestamp : float
   ; is_amended : bool
   ; cl_ord_id : string option
+  ; user_ref : int option
   }
+
+(** The Lighter signed order has no user-reference field, so the exchange never echoes the
+    engine's order tag. Keep the client-order-index -> tag map here and stamp it onto the
+    order records. Without it the overlay cannot recognise its own resting order and
+    re-places it every tick. *)
+let user_refs : (string, int) Hashtbl.t = Hashtbl.create 64
+let user_refs_mutex = Mutex.create ()
+
+let register_userref ~client_order_id ~userref =
+  Mutex.lock user_refs_mutex;
+  Hashtbl.replace user_refs client_order_id userref;
+  Mutex.unlock user_refs_mutex
+;;
+
+let lookup_userref client_order_id =
+  Mutex.lock user_refs_mutex;
+  let r = Hashtbl.find_opt user_refs client_order_id in
+  Mutex.unlock user_refs_mutex;
+  r
+;;
+
+let forget_userref client_order_id =
+  Mutex.lock user_refs_mutex;
+  Hashtbl.remove user_refs client_order_id;
+  Mutex.unlock user_refs_mutex
+;;
 
 (** Lock-free ring buffer of execution events, one per symbol. *)
 module RingBuffer = Concurrency.Ring_buffer.RingBuffer
@@ -272,6 +299,10 @@ let update_orders_internal store (event : execution_event) =
         Hashtbl.remove store.open_orders event.order_id;
         note_change store event.order_id None;
         publish_open_orders_cache store;
+        forget_userref event.order_id;
+        (match resolved_cl_ord_id with
+         | Some c when not (String.equal c event.order_id) -> forget_userref c
+         | _ -> ());
         Mutex.lock initialization_mutex;
         Fun.protect
           ~finally:(fun () -> Mutex.unlock initialization_mutex)
@@ -293,7 +324,7 @@ let update_orders_internal store (event : execution_event) =
           ; limit_price = event.limit_price
           ; avg_price = event.avg_price
           ; order_status = event.order_status
-          ; order_userref = None
+          ; order_userref = event.user_ref
           ; cl_ord_id = resolved_cl_ord_id
           ; last_updated = now
           ; order_expiry = preserved_expiry
@@ -429,7 +460,7 @@ let clear_all_open_orders () =
 
 (** Pre-registers a locally placed order before exchange confirmation arrives, so
     strategies see it immediately. *)
-let inject_order ~symbol ~order_id ~side ~qty ~price ?cl_ord_id () =
+let inject_order ~symbol ~order_id ~side ~qty ~price ?cl_ord_id ?order_userref () =
   let store = get_symbol_store symbol in
   let now = Unix.gettimeofday () in
   let event : execution_event =
@@ -444,6 +475,7 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?cl_ord_id () =
     ; timestamp = now
     ; is_amended = false
     ; cl_ord_id
+    ; user_ref = order_userref
     }
   in
   update_orders_internal store event;
@@ -753,6 +785,13 @@ let process_account_orders_update json =
                 ; timestamp = now
                 ; is_amended
                 ; cl_ord_id
+                ; user_ref =
+                    (match
+                       (try member "order_userref" order_json |> to_int with
+                        | _ -> 0)
+                     with
+                     | 0 -> lookup_userref client_order_id
+                     | n -> Some n)
                 }
               in
               update_orders_internal store event;
@@ -953,6 +992,7 @@ let handle_snapshot json =
         ; timestamp = Unix.gettimeofday ()
         ; is_amended = false
         ; cl_ord_id = cached_order.cl_ord_id
+        ; user_ref = cached_order.order_userref
         }
       in
       update_orders_internal store event;

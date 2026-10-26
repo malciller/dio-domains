@@ -57,6 +57,7 @@ module Fake_perp_context : Dio_exchange.Exchange_intf.Market_context.S = struct
 
   let get_margin () = None
   let get_margin_ratio () = None
+  let get_risk ~coin:_ = None
 
   let get_open_orders ~coin:_ =
     [ { Dio_exchange.Exchange_intf.Types.order_id = "tp-close"

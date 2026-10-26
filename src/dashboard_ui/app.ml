@@ -420,14 +420,12 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
         match !view_mode_ref with
         | `MainView ->
           I.vcat
-            [ Kpi_cards.render_kpi_cards w !snapshot
-            ; Ticker_feed.render_ticker w !snapshot
+            [ Ticker_feed.render_ticker w !snapshot
             ; Holdings.render_strategies
                 ~selected_index:(Some !selected_index_ref)
                 w
                 !snapshot
             ; Recent_fills_feed.render_fills w !snapshot
-            ; Memory.render_memory w !snapshot
             ; (match !panel_ref with
                | `Logs -> Log_feed.render_logs w !snapshot !feed_entries
                | `Latency -> Latencies.render_latencies w !snapshot)
