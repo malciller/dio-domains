@@ -666,7 +666,8 @@ let json_of_perp ~exchange ~coin =
       | None -> `Null
     in
     `Assoc
-      [ "coin", `String coin
+      [ "exchange", `String exchange
+      ; "coin", `String coin
       ; "side", `String side
       ; "has_position", `Bool (abs_float qty > 1e-12)
       ; "qty", `Float qty
@@ -733,6 +734,121 @@ let json_of_perp ~exchange ~coin =
              | Some p -> p.updated_at
              | None -> 0.0) )
       ]
+;;
+
+(** A generic overlay instance's perp leg (the long). The short lives on the controller's
+    hedge venue; this one can be on a different venue, so the dashboard keeps it separate
+    and labels its venue. *)
+let json_of_overlay_long (oi : Dio_engine.Config.overlay_instance) =
+  match
+    Dio_exchange.Exchange_intf.Registry.get_market_context oi.oi_exchange
+  with
+  | None -> None
+  | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
+    let coin = Dio_engine.Config.base_coin_of_symbol oi.oi_symbol in
+    let position = Mc.get_position ~coin in
+    let funding = Mc.get_funding ~coin in
+    let mark =
+      match funding with
+      | Some f -> f.mark
+      | None -> 0.0
+    in
+    let qty = match position with Some p -> p.qty | None -> 0.0 in
+    let entry = match position with Some p -> p.entry | None -> 0.0 in
+    let notional =
+      match position with
+      | Some p when p.position_value > 0.0 -> abs_float p.position_value
+      | _ -> abs_float (qty *. mark)
+    in
+    let orders =
+      try Mc.get_open_orders ~coin with
+      | _ -> []
+    in
+    let closes =
+      List.filter
+        (fun (o : Exchange.Types.open_order) ->
+           o.side = Exchange.Types.Sell && o.remaining_qty > 0.0)
+        orders
+    in
+    let close_orders =
+      List.filter_map
+        (fun (o : Exchange.Types.open_order) ->
+           match o.limit_price with
+           | Some price when price > 0.0 ->
+             Some
+               (`Assoc
+                 [ "id", `String o.order_id
+                 ; "price", `Float price
+                 ; "qty", `Float o.remaining_qty
+                 ; "owner", `String "long"
+                 ])
+           | _ -> None)
+        closes
+    in
+    let close_price =
+      closes
+      |> List.filter_map (fun (o : Exchange.Types.open_order) -> o.limit_price)
+      |> List.filter (fun p -> p > 0.0)
+      |> (function
+       | [] -> None
+       | p :: ps ->
+         Some
+           (List.fold_left
+              (fun best x ->
+                 if mark > 0.0 && abs_float (x -. mark) < abs_float (best -. mark)
+                 then x
+                 else best)
+              p
+              ps))
+    in
+    let close_distance_pct =
+      match close_price with
+      | Some p when mark > 0.0 -> Some ((p -. mark) /. mark *. 100.0)
+      | _ -> None
+    in
+    (* Lighter's WS position frames can omit [unrealized_pnl]; derive it from the venue
+       mark instead of showing a flat zero. *)
+    let unrealized_pnl =
+      match position with
+      | Some p when Float.abs p.unrealized_pnl > 1e-9 -> p.unrealized_pnl
+      | Some p when p.entry > 0.0 && mark > 0.0 && Float.abs p.qty > 1e-12 ->
+        (mark -. p.entry) *. p.qty
+      | _ -> 0.0
+    in
+    let fopt f =
+      match f with
+      | Some v -> `Float v
+      | None -> `Null
+    in
+    Some
+      (`Assoc
+        [ "exchange", `String oi.oi_exchange
+        ; "coin", `String coin
+        ; "has_position", `Bool (abs_float qty > 1e-12)
+        ; "qty", `Float qty
+        ; "entry", `Float entry
+        ; "mark", `Float mark
+        ; "notional", `Float notional
+        ; "unrealized_pnl", `Float unrealized_pnl
+        ; ( "margin_used"
+          , `Float
+              (match position with
+               | Some p -> p.margin_used
+               | None -> 0.0) )
+        ; ( "leverage"
+          , fopt
+              (match position with
+               | Some p -> p.leverage
+               | None -> None) )
+        ; ( "liquidation"
+          , fopt
+              (match position with
+               | Some p -> p.liquidation
+               | None -> None) )
+        ; "close_price", fopt close_price
+        ; "close_distance_pct", fopt close_distance_pct
+        ; "close_orders", `List close_orders
+        ])
 ;;
 
 let build_snapshot () =
@@ -821,8 +937,9 @@ let build_snapshot () =
           match overlay, strategy_json with
           | Some c, `Assoc fields ->
             let p = c.oc_params in
+            let venue_leverage = Dio_engine.Domain_spawner.overlay_venue_leverage c in
             let config_ladder =
-              Dio_engine.Domain_spawner.derive_overlay_ladder ~leverage:p.leverage p
+              Dio_engine.Domain_spawner.derive_overlay_ladder ~leverage:venue_leverage p
             in
             let live =
               let acc = (Dio_engine.Overlay_inventory.aggregate c).total in
@@ -835,7 +952,7 @@ let build_snapshot () =
                 let ratio = Float.min (p.max_ratio_pct /. 100.0) (Float.abs pos.qty /. acc) in
                 Dio_engine.Domain_spawner.derive_overlay_ladder
                   ~start_ratio:ratio
-                  ~leverage:p.leverage
+                  ~leverage:venue_leverage
                   p
               | _ -> config_ladder
             in
@@ -863,12 +980,36 @@ let build_snapshot () =
           | Some c -> c.oc_hedge_exchange, c.oc_hedge_coin
           | None -> tc.exchange, base_asset
         in
+        let longs =
+          let exact =
+            Dio_engine.Config.get_overlay_instances_for
+              ~exchange:tc.exchange
+              ~symbol:tc.symbol
+          in
+          let instances =
+            if exact <> []
+            then exact
+            else
+              (* Fall back to the base asset when the owner symbol was written in the
+                 overlay's bare form (HYPE vs HYPE/USDC). *)
+              Dio_engine.Config.get_overlay_instances ()
+              |> List.filter (fun (o : Dio_engine.Config.overlay_instance) ->
+                String.equal
+                  (Dio_engine.Config.normalize_exchange o.oi_owner_exchange)
+                  (Dio_engine.Config.normalize_exchange tc.exchange)
+                && String.equal
+                     (Dio_engine.Config.base_coin_of_symbol o.oi_owner_symbol)
+                     base_asset)
+          in
+          instances |> List.filter_map json_of_overlay_long
+        in
         ( tc.symbol
         , `Assoc
             [ "exchange", `String tc.exchange
             ; "strategy", strategy_json
             ; "market", market_json
             ; "perp", json_of_perp ~exchange:perp_exchange ~coin:perp_coin
+            ; "longs", `List longs
             ; "oracle", oracle_of tc.symbol
             ; "qty", `String tc.qty
             ; "grid_interval_lo", `Float (fst tc.grid_interval)

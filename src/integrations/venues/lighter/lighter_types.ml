@@ -14,6 +14,8 @@ type market_info =
   ; min_quote_amount : float (** Minimum order notional in quote units. *)
   ; maintenance_margin_fraction : float
   (** Maintenance margin fraction in basis points (120 = 1.2%). *)
+  ; min_initial_margin_fraction : float
+  (** Minimum initial margin fraction in basis points (200 = 2%, i.e. 50x max). *)
   ; taker_fee : float (** Taker fee bps. *)
   ; maker_fee : float (** Maker fee bps. *)
   }

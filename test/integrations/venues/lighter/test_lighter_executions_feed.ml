@@ -7,6 +7,7 @@ let test_inject_order () =
     ~qty:1.5
     ~price:2180.00
     ~cl_ord_id:"cl_001"
+    ~order_userref:42
     ();
   let order_opt = Lighter.Executions_feed.get_open_order "EXETH" "order_001" in
   match order_opt with
@@ -15,7 +16,8 @@ let test_inject_order () =
     Alcotest.(check string) "order_id" "order_001" o.order_id;
     Alcotest.(check (float 0.000001)) "qty" 1.5 o.order_qty;
     Alcotest.(check (option (float 0.000001))) "price" (Some 2180.00) o.limit_price;
-    Alcotest.(check (option string)) "cl_ord_id" (Some "cl_001") o.cl_ord_id
+    Alcotest.(check (option string)) "cl_ord_id" (Some "cl_001") o.cl_ord_id;
+    Alcotest.(check (option int)) "order_userref" (Some 42) o.order_userref
   | None -> Alcotest.fail "Order not injected"
 ;;
 
@@ -108,6 +110,40 @@ let test_terminal_status_removes_order () =
   Alcotest.(check bool) "order removed after fill" true (Option.is_none after)
 ;;
 
+let test_userref_lookup () =
+  Lighter.Instruments_feed.initialize [ "EXREF" ];
+  Lighter.Executions_feed.initialize [ "EXREF" ];
+  Lighter.Executions_feed.register_userref ~client_order_id:"cl_ref" ~userref:7;
+  let json =
+    `Assoc
+      [ "type", `String "update/account_all_orders"
+      ; ( "account_all_orders"
+        , `Assoc
+            [ ( "0"
+              , `Assoc
+                  [ "order_index", `String "ref_1"
+                  ; "client_order_id", `String "cl_ref"
+                  ; "market_index", `Int 0
+                  ; "status", `Int 2
+                  ; "is_ask", `Bool true
+                  ; "price", `String "100.0"
+                  ; "initial_base_amount", `String "1.0"
+                  ; "filled_base_amount", `String "0.0"
+                  ; "avg_fill_price", `String "0.0"
+                  ] )
+            ] )
+      ]
+  in
+  Lighter.Executions_feed.process_account_orders_update json;
+  match Lighter.Executions_feed.get_open_order "EXREF" "ref_1" with
+  | Some o ->
+    Alcotest.(check (option int))
+      "tag resolved from client order id"
+      (Some 7)
+      o.order_userref
+  | None -> Alcotest.fail "order not parsed"
+;;
+
 let test_startup_snapshot_done () =
   Lighter.Executions_feed.initialize [ "EXSNAP" ];
   Lighter.Executions_feed.set_startup_snapshot_done ();
@@ -191,6 +227,7 @@ let () =
       , [ Alcotest.test_case "inject_order" `Quick test_inject_order
         ; Alcotest.test_case "get_open_orders" `Quick test_get_open_orders
         ; Alcotest.test_case "find_order_everywhere" `Quick test_find_order_everywhere
+        ; Alcotest.test_case "userref lookup" `Quick test_userref_lookup
         ; Alcotest.test_case
             "terminal status removes order"
             `Quick

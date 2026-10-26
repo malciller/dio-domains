@@ -174,7 +174,7 @@ let take_first n l =
 
 (** Section title with page tabs embedded: the active page is wrapped in ◀ ▶ (bold cyan),
     inactive pages are dim, and the ←/→ hint marks the switch keys. *)
-let render_latency_title w =
+let render_latency_title w (snapshot : Snapshot.t) =
   let t = Theme.current () in
   let left =
     I.string A.(fg t.c_title ++ bg t.c_bg ++ st bold) " ╭── ENGINE LATENCY ── "
@@ -197,7 +197,17 @@ let render_latency_title w =
       ; I.string t.a_dim " · LOGS (v) "
       ]
   in
-  let prefix = I.hcat (left :: (tabs @ [ hint; selector; I.string A.(bg t.c_bg) " " ])) in
+  let heap =
+    I.hcat
+      [ I.string t.a_dim "  │ HEAP "
+      ; I.string t.a_text (Printf.sprintf "%d MB" snapshot.memory.heap_mb)
+      ; I.string t.a_dim " · LIVE "
+      ; I.string t.a_text (Printf.sprintf "%d MB" (snapshot.memory.live_kb / 1024))
+      ]
+  in
+  let prefix =
+    I.hcat (left :: (tabs @ [ hint; selector; heap; I.string A.(bg t.c_bg) " " ]))
+  in
   let len = I.width prefix in
   let pad_count = max 0 (w - len - 1) in
   let left_rgb = t.accent_rgb in
@@ -275,7 +285,7 @@ let render_latencies w (snapshot : Snapshot.t) =
     in
     let page = List.nth metric_pages (current_page_index ()) in
     let n_metrics = List.length page.metrics in
-    let full_page_w = 71 + (27 * (n_metrics - 1)) in
+    let full_page_w = 62 + (27 * (n_metrics - 1)) in
     let page_cols = if w < full_page_w then take_first 2 page.metrics else page.metrics in
     let page_labels = List.map short_label page_cols in
     let metric_cell_w = 8 in
@@ -296,8 +306,7 @@ let render_latencies w (snapshot : Snapshot.t) =
                let s = String.make pad ' ' ^ lbl in
                let img = col 24 t.a_label s in
                if i = 0 then img else I.hcat [ I.string t.a_border " │ "; img ])
-             page_labels
-         @ [ I.string t.a_border " │ "; col 7 t.a_label "STRAT/S" ])
+             page_labels)
     in
     let header_row2 =
       I.hcat
@@ -317,8 +326,7 @@ let render_latencies w (snapshot : Snapshot.t) =
                    ]
                in
                if i = 0 then img else I.hcat [ I.string t.a_border " │ "; img ])
-             page_labels
-         @ [ I.string t.a_border " │ "; col 7 t.a_dim "  rate  " ])
+             page_labels)
     in
     let header = I.vcat [ close_row w header_row1; close_row w header_row2 ] in
     let rows =
@@ -455,14 +463,6 @@ let render_latencies w (snapshot : Snapshot.t) =
           in
           let exch = exch_of_symbol symbol in
           let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
-          let exec_s_cell =
-            match List.assoc_opt "strategy" mlist with
-            | Some (m : Snapshot.latency_metric) ->
-              if m.executions > 0
-              then col_right 7 a_bright (Printf.sprintf "%.1f/s" m.executions_per_sec)
-              else col_right 7 a_dim "idle"
-            | None -> col_right 7 a_dim "--"
-          in
           close_row
             w
             (I.hcat
@@ -475,10 +475,9 @@ let render_latencies w (snapshot : Snapshot.t) =
                 ; trend_spark
                 ; I.string a_border " │ "
                 ]
-                @ metric_cells
-                @ [ I.string a_border " │ "; exec_s_cell ])))
+                @ metric_cells)))
         active_lats
     in
-    let title = render_latency_title w in
+    let title = render_latency_title w snapshot in
     I.vcat ((title :: header :: rows) @ [ section_footer w ]))
 ;;

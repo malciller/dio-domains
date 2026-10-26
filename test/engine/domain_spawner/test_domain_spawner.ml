@@ -260,11 +260,10 @@ let ladder_params : Dio_engine.Config.overlay_params =
   { start_ratio_pct = 5.0
   ; add_threshold_pct = 2.5
   ; max_ratio_pct = 75.0
-  ; recycle_profit_pct = 5.0
+  ; short_tp_roe = 5.0
   ; recycle_base_share_pct = 50.0
   ; min_entry_margin_ratio = 1.0
   ; min_liq_mult = 1.0
-  ; leverage = 20.0
   ; full_balance_ref = true
   }
 ;;

@@ -118,6 +118,7 @@ let place_order
   ?(tif = Lighter_types.Types.GTC)
   ?(post_only = false)
   ?(reduce_only = false)
+  ?order_userref
   ()
   =
   match Lighter_instruments_feed.get_market_index ~symbol with
@@ -129,6 +130,11 @@ let place_order
      | Some info ->
        let is_ask = not is_buy in
        let client_order_index = next_client_order_index () in
+       let client_order_id = Int64.to_string client_order_index in
+       (match order_userref with
+        | Some u ->
+          Lighter_executions_feed.register_userref ~client_order_id ~userref:u
+        | None -> ());
        let base_amount =
          Lighter_types.float_to_lighter_int ~decimals:info.supported_size_decimals qty
        in
@@ -154,7 +160,7 @@ let place_order
        >>= fun result ->
        (match result with
         | Ok _ ->
-          let order_id = Int64.to_string client_order_index in
+          let order_id = client_order_id in
           Logging.info_f
             ~section
             "Order placed: %s [%s] %s %.8f @ %.2f (market=%d)"
@@ -174,10 +180,12 @@ let place_order
             ~qty
             ~price
             ~cl_ord_id:order_id
+            ?order_userref
             ();
           Lwt.return
-            (Ok { Lighter_types.Types.order_id; cl_ord_id = None; order_userref = None })
+            (Ok { Lighter_types.Types.order_id; cl_ord_id = None; order_userref })
         | Error msg ->
+          Lighter_executions_feed.forget_userref client_order_id;
           Logging.error_f
             ~section
             "Order failed: [%s] %s %.8f @ %.2f: %s"

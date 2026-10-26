@@ -50,5 +50,22 @@ module Impl : Exchange.Market_context.S = struct
   let get_position ~coin = Dio_exchange.Market_context.get_position ~exchange:name ~coin
   let get_margin () = Dio_exchange.Market_context.get_margin ~exchange:name
   let get_margin_ratio () = Dio_exchange.Market_context.get_margin_ratio ~exchange:name
+
+  let get_risk ~coin =
+    match Hyperliquid_instruments_feed.lookup_info coin with
+    | None -> None
+    | Some info ->
+      (match info.Hyperliquid_instruments_feed.max_leverage with
+       | Some l when l > 0 ->
+         let max_leverage = float_of_int l in
+         (* Hyperliquid maintenance is half the initial requirement. At the venue maximum
+            leverage that is [0.5 / max_leverage]. *)
+         Some
+           { Exchange.Market_context.maintenance_frac = 0.5 /. max_leverage
+           ; max_leverage = Some max_leverage
+           }
+       | _ -> None)
+  ;;
+
   let get_open_orders ~coin = Feed.get_perp_open_orders ~coin |> List.map order_of_feed
 end

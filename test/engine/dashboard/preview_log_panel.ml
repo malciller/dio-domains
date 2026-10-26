@@ -63,7 +63,7 @@ let () =
   print_string (Buffer.contents buf);
   print_newline ();
   (* The latency panel's title, which must also advertise the LOGS selector. *)
-  let ti = Dashboard_ui.Latencies.render_latency_title w in
+  let ti = Dashboard_ui.Latencies.render_latency_title w snap in
   let buf2 = Buffer.create 4096 in
   Notty.Render.to_buffer buf2 Notty.Cap.ansi (0, 0) (w, Notty.I.height ti) ti;
   print_string (Buffer.contents buf2);

@@ -511,6 +511,49 @@ let test_perp_close_distance () =
     (dist (parse (perp_json ~mark:0.0 ~buys:[ order_json "b1" 99.0 1.0 ] ())) = None)
 ;;
 
+let test_parse_long () =
+  let json =
+    `Assoc
+      [ "exchange", `String "hyperliquid"
+      ; "strategy", `Assoc [ "type", `String "Ladder" ]
+      ; "market", `Assoc []
+      ; "longs"
+        , `List
+            [ `Assoc
+                [ "exchange", `String "lighter"
+                ; "coin", `String "HYPE"
+                ; "has_position", `Bool true
+                ; "qty", `Float 0.6
+                ; "entry", `Float 78.0
+                ; "mark", `Float 78.3
+                ; "unrealized_pnl", `Float 0.18
+                ; "close_price", `Float 78.5
+                ; "close_distance_pct", `Float 0.255
+                ; "close_orders"
+                  , `List
+                      [ `Assoc
+                          [ "id", `String "tp"
+                          ; "price", `Float 78.5
+                          ; "qty", `Float 0.6
+                          ]
+                      ]
+                ]
+            ]
+      ]
+  in
+  let s = strategy_of_json json in
+  match s.Dashboard_ui.Snapshot.longs with
+  | [ l ] ->
+    Alcotest.(check string) "venue" "lighter" l.long_venue;
+    Alcotest.(check (float 1e-9)) "pnl" 0.18 l.long_unrealized_pnl;
+    Alcotest.(check (option (float 1e-9)))
+      "close distance"
+      (Some 0.255)
+      l.long_close_distance_pct;
+    Alcotest.(check int) "close orders" 1 (List.length l.long_close_orders)
+  | _ -> Alcotest.fail "expected one parsed long"
+;;
+
 let () =
   Alcotest.run
     "dashboard_holdings"
@@ -536,6 +579,8 @@ let () =
             `Quick
             test_available_balance_parse
         ] )
+    ; ( "long overlay"
+      , [ Alcotest.test_case "parses venue and close" `Quick test_parse_long ] )
     ; ( "perp close"
       , [ Alcotest.test_case
             "nearest exit distance uses the reducing side"

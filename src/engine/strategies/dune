@@ -65,4 +65,5 @@
   Strategy_equivalence
   Strategy_lsp
   Strategy_cli
-  Carry_runtime))
+  Overlay_runtime
+  Overlay_instance_runtime))

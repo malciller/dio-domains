@@ -225,6 +225,19 @@ let test_oracle () =
     (List.length (Lighter.Oracle.clip_from (Some "2024-01-03") bars))
 ;;
 
+let test_risk_parameters () =
+  reset_context ();
+  Lighter.Instruments_feed.initialize
+    ~maintenance_margin_fraction:120.0
+    ~min_initial_margin_fraction:200.0
+    [ "TESTBTC" ];
+  match Lighter.Market_context.Impl.get_risk ~coin:"TESTBTC" with
+  | None -> fail "expected risk parameters"
+  | Some r ->
+    check (float 1e-9) "maintenance fraction" 0.012 r.maintenance_frac;
+    check (option (float 1e-9)) "max leverage" (Some 50.0) r.max_leverage
+;;
+
 let test_capabilities () =
   ignore Lighter.Module.Lighter_impl.name;
   let module Registry = Dio_exchange.Exchange_intf.Registry in
@@ -258,6 +271,8 @@ let () =
         ; test_case "open orders" `Quick test_open_orders
         ; test_case "WS routing" `Quick test_ws_routing
         ] )
+    ; ( "risk"
+      , [ test_case "venue metadata" `Quick test_risk_parameters ] )
     ; "capabilities", [ test_case "registered" `Quick test_capabilities ]
     ; "oracle", [ test_case "fees, candles, balances" `Quick test_oracle ]
     ]

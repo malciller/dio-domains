@@ -415,6 +415,9 @@ let parse_accumulation_buffer json exchange symbol =
 (** Parses one flattened entry of the trading section into a [trading_config]. Validates
     keys and venue restrictions; [exit 1] on schema violation. *)
 let parse_config json =
+  (* [overlays] is the lowered form of additional declarations inside [overlay]; it is not
+     an authoring key. *)
+  let json = json_remove "overlays" json in
   if validate_keys ~context:"trading entry" ~allowed:known_trading_keys json then exit 1;
   let open Yojson.Basic.Util in
   let symbol = json |> member "symbol" |> to_string in
@@ -661,34 +664,40 @@ let known_overlay_param_keys =
   [ "start_ratio_pct"
   ; "add_threshold_pct"
   ; "max_ratio_pct"
-  ; "recycle_profit_pct"
+  ; "short_tp_roe"
   ; "recycle_base_share_pct"
   ; "min_entry_margin_ratio"
   ; "min_liq_mult"
-  ; "leverage"
   ; "full_balance_ref"
   ]
 ;;
 
-(** Permitted keys inside a grouped [overlay] section. The file is named by [name]
-    (default [carry_overlay]); params sit directly under [overlay]. *)
-let known_overlay_section_keys =
-  [ "name"; "exchange"; "symbol"; "inventory" ] @ known_overlay_param_keys
+(** One declaration in an [overlay] list. [name] is the strategy file; [params] is a free
+    object because each strategy file defines its own tunables. *)
+let known_overlay_item_keys =
+  [ "name"; "strategy"; "exchange"; "symbol"; "inventory"; "params" ]
+;;
+
+(** [trading.defaults.overlay] is keyed by overlay name, so the key supplies [name]. *)
+let known_overlay_default_keys = [ "exchange"; "symbol"; "inventory"; "params" ]
+
+(** Strategy whose overlay wiring is engine-integrated: it owns the group's inventory legs,
+    shares the venue reserve, and persists the carry ladder. Every other name in an
+    [overlay] list is a generic overlay instance. *)
+let controller_overlay_strategy = "carry_overlay"
 ;;
 
 (** Per-asset carry policy. Percentages are whole numbers in config.json (25, 10, 75, 1,
     50); [min_liq_mult] is a multiple of the mark (2.5), [min_entry_margin_ratio] is a
-    margin ratio (2.0), and [leverage] seeds the fill-time take-profit before the first
-    position snapshot (0 means unknown). *)
+    margin ratio (2.0). Venue leverage is derived from instrument metadata at startup. *)
 type overlay_params =
   { start_ratio_pct : float
   ; add_threshold_pct : float
   ; max_ratio_pct : float
-  ; recycle_profit_pct : float
+  ; short_tp_roe : float
   ; recycle_base_share_pct : float
   ; min_entry_margin_ratio : float
   ; min_liq_mult : float
-  ; leverage : float
   ; full_balance_ref : bool
   (** Reference total spot holdings instead of the accumulated basis. *)
   }
@@ -697,11 +706,10 @@ let default_overlay_params =
   { start_ratio_pct = 25.0
   ; add_threshold_pct = 10.0
   ; max_ratio_pct = 75.0
-  ; recycle_profit_pct = 1.0
+  ; short_tp_roe = 1.0
   ; recycle_base_share_pct = 50.0
   ; min_entry_margin_ratio = 2.0
   ; min_liq_mult = 2.5
-  ; leverage = 0.0
   ; full_balance_ref = false
   }
 ;;
@@ -731,6 +739,33 @@ type overlay_controller =
 
 (** Controllers in config.json first-seen order. *)
 let overlay_controllers : overlay_controller list ref = ref []
+
+(** Generic overlay-strategy instances, owned by a grid entry. *)
+type overlay_instance =
+  { oi_id : string
+  ; oi_strategy : string
+  ; oi_exchange : string
+  ; oi_symbol : string
+  ; oi_owner_exchange : string
+  ; oi_owner_symbol : string
+  ; oi_params : Yojson.Basic.t
+  }
+
+let overlay_instances : overlay_instance list ref = ref []
+let get_overlay_instances () = !overlay_instances
+
+let overlay_instance_key ~owner_exchange ~owner_symbol ~id =
+  normalize_exchange owner_exchange ^ "|" ^ owner_symbol ^ "|" ^ id
+;;
+
+let get_overlay_instances_for ~exchange ~symbol =
+  let exchange = normalize_exchange exchange in
+  List.filter
+    (fun (o : overlay_instance) ->
+      String.equal (normalize_exchange o.oi_owner_exchange) exchange
+      && String.equal o.oi_owner_symbol symbol)
+    !overlay_instances
+;;
 
 (** Legs in config.json order. *)
 let overlay_legs : overlay_leg list ref = ref []
@@ -802,11 +837,10 @@ let params_equal a b =
   eq a.start_ratio_pct b.start_ratio_pct
   && eq a.add_threshold_pct b.add_threshold_pct
   && eq a.max_ratio_pct b.max_ratio_pct
-  && eq a.recycle_profit_pct b.recycle_profit_pct
+  && eq a.short_tp_roe b.short_tp_roe
   && eq a.recycle_base_share_pct b.recycle_base_share_pct
   && eq a.min_entry_margin_ratio b.min_entry_margin_ratio
   && eq a.min_liq_mult b.min_liq_mult
-  && eq a.leverage b.leverage
   && Bool.equal a.full_balance_ref b.full_balance_ref
 ;;
 
@@ -829,17 +863,198 @@ let require_string ~context json key =
   | _ -> config_error context "missing required string '%s'" key
 ;;
 
+(** Merge an overlay declaration over its per-strategy defaults. [params] merges
+    key-by-key so an asset can override one tunable without repeating the rest. *)
+let merge_overlay_item ~base ~override =
+  let merged = json_merge ~base ~override in
+  match
+    ( base |> Yojson.Basic.Util.member "params"
+    , override |> Yojson.Basic.Util.member "params" )
+  with
+  | `Assoc _, `Assoc _ ->
+    json_set
+      "params"
+      (json_merge
+         ~base:(base |> Yojson.Basic.Util.member "params")
+         ~override:(override |> Yojson.Basic.Util.member "params"))
+      merged
+  | _ -> merged
+;;
+
+let overlay_item_params ~context item =
+  match item |> Yojson.Basic.Util.member "params" with
+  | `Assoc _ as p -> p
+  | `Null -> `Assoc []
+  | _ -> config_error context "'params' must be an object"
+;;
+
+let overlay_item_symbol item =
+  item |> Yojson.Basic.Util.member "symbol" |> Yojson.Basic.Util.to_string_option
+;;
+
+(** The flat [overlay] object the carry controller consumes, built from a declaration. *)
+let controller_overlay_json ~context ~name item =
+  let exchange =
+    item |> Yojson.Basic.Util.member "exchange" |> Yojson.Basic.Util.to_string_option
+  in
+  `Assoc
+    ([ "strategy", `String name ]
+     @ (match exchange with
+        | Some e -> [ "exchange", `String e ]
+        | None -> [])
+     @ (match overlay_item_symbol item with
+        | Some s -> [ "symbol", `String s ]
+        | None -> [])
+     @ [ "params", overlay_item_params ~context item ])
+;;
+
+(** The generic overlay instance for an additional strategy on the same asset. *)
+let instance_overlay_json ~context ~name item =
+  let exchange = require_string ~context item "exchange" in
+  `Assoc
+    ([ "name", `String name; "exchange", `String exchange ]
+     @ (match overlay_item_symbol item with
+        | Some s -> [ "symbol", `String s ]
+        | None -> [])
+     @ [ "params", overlay_item_params ~context item ])
+;;
+
+(** Pre-list configs put the carry params directly on the overlay object. Hoist them under
+    [params] so both spellings keep working. *)
+let hoist_overlay_params item =
+  let flat, _ =
+    List.partition
+      (fun (k, _) -> List.mem k known_overlay_param_keys)
+      (Yojson.Basic.Util.to_assoc item)
+  in
+  if flat = []
+  then item
+  else
+    let params =
+      match item |> Yojson.Basic.Util.member "params" with
+      | `Assoc _ as p -> json_merge ~base:(`Assoc flat) ~override:p
+      | _ -> `Assoc flat
+    in
+    let item =
+      List.fold_left (fun acc (k, _) -> json_remove k acc) item flat
+    in
+    json_set "params" params item
+;;
+
+(** Normalize one [overlay] declaration. A single-object section may omit [name]; it then
+    means the engine-integrated carry controller. *)
+let normalize_overlay_item ~context ~defaults ~legacy_name item =
+  let item = require_object ~context item |> hoist_overlay_params in
+  let name_of key =
+    match
+      item |> Yojson.Basic.Util.member key |> Yojson.Basic.Util.to_string_option
+    with
+    | Some n when String.trim n <> "" -> Some (String.trim n)
+    | _ -> None
+  in
+  let name =
+    match name_of "name" with
+    | Some n -> n
+    | None ->
+      (match name_of "strategy" with
+       | Some n -> n
+       | None ->
+         (match legacy_name with
+          | Some n -> n
+          | None -> config_error context "missing required string 'name'"))
+  in
+  let base =
+    match defaults |> Yojson.Basic.Util.member name with
+    | `Assoc _ as d -> d
+    | _ -> `Assoc []
+  in
+  let item = merge_overlay_item ~base ~override:item in
+  let item = json_set "name" (`String name) (json_remove "strategy" item) in
+  if validate_keys ~context ~allowed:known_overlay_item_keys item then exit 1;
+  name, item
+;;
+
+(** [overlay] accepts one object (the historical carry-only form) or a list of named
+    declarations. *)
+let normalize_overlay_items ~context ~defaults json =
+  let items =
+    match json with
+    | `Null -> []
+    | `Assoc _ as item -> [ true, item ]
+    | `List items -> List.map (fun item -> false, item) items
+    | _ -> config_error context "'overlay' must be an object or an array of objects"
+  in
+  List.map
+    (fun (legacy, item) ->
+       normalize_overlay_item
+         ~context
+         ~defaults
+         ~legacy_name:(if legacy then Some controller_overlay_strategy else None)
+         item)
+    items
+;;
+
+(** At most one carry controller per asset. *)
+let overlay_controller_item ~context items =
+  match
+    List.filter
+      (fun (name, _) -> String.equal name controller_overlay_strategy)
+      items
+  with
+  | [] -> None
+  | [ item ] -> Some item
+  | _ -> config_error context "declares more than one carry_overlay"
+;;
+
+(** Lower a flat entry's [overlay] list to the internal controller + instance shape. The
+    grouped layout does this with defaults and inventory legs; a flat entry has neither. *)
+let normalize_flat_entry entry =
+  let items =
+    normalize_overlay_items
+      ~context:"overlay"
+      ~defaults:(`Assoc [])
+      (entry |> Yojson.Basic.Util.member "overlay")
+  in
+  match items with
+  | [] -> entry
+  | _ ->
+    let controller =
+      match overlay_controller_item ~context:"overlay" items with
+      | Some (name, item) ->
+        Some (controller_overlay_json ~context:"overlay" ~name item)
+      | None -> None
+    in
+    let generics =
+      List.filter_map
+        (fun (name, item) ->
+           if String.equal name controller_overlay_strategy
+           then None
+           else Some (instance_overlay_json ~context:"overlay" ~name item))
+        items
+    in
+    let entry =
+      match controller with
+      | Some c -> json_set "overlay" c entry
+      | None -> json_remove "overlay" entry
+    in
+    if generics = []
+    then entry
+    else json_set "overlays" (`List generics) entry
+;;
+
 (** Flatten the grouped [trading] section into the flat entry list the engine consumes.
 
-    One group = one asset. [strategy] is the primary section; [overlay] is the single
-    controller fed by every primary/inventory leg. [inventory] legs are balance-only. The
-    group's [oracle] rides on the primary entry for {!parse_oracle_config}. A legacy flat
-    [trading] array is returned unchanged. *)
+    One group = one asset. [strategy] is the primary section; [overlay] is a list of
+    overlay declarations. Exactly one may be [carry_overlay] (the inventory hedge); every
+    other name lowers to a generic instance attached to the primary entry. [inventory]
+    legs are balance-only. The group's [oracle] rides on the primary entry for
+    {!parse_oracle_config}. A flat [trading] array is lowered the same way, minus defaults
+    and inventory legs. *)
 let flatten_grouped_trading json =
   let open Yojson.Basic.Util in
   let section = json |> member "trading" in
   match section with
-  | `List _ -> section
+  | `List entries -> `List (List.map normalize_flat_entry entries)
   | `Assoc _ ->
     if validate_keys ~context:"trading" ~allowed:known_grouped_trading_keys section
     then exit 1;
@@ -871,13 +1086,26 @@ let flatten_grouped_trading json =
     let overlay_defaults =
       match defaults |> member "overlay" with
       | `Assoc _ as c ->
-        if validate_keys
-             ~context:"trading.defaults.overlay"
-             ~allowed:known_overlay_section_keys
-             c
-        then exit 1;
+        List.iter
+          (fun (name, d) ->
+             match d with
+             | `Assoc _ ->
+               if validate_keys
+                    ~context:(Printf.sprintf "trading.defaults.overlay.%s" name)
+                    ~allowed:known_overlay_default_keys
+                    d
+               then exit 1
+             | _ ->
+               config_error
+                 (Printf.sprintf "trading.defaults.overlay.%s" name)
+                 "expected an object")
+          (to_assoc c);
         c
-      | _ -> `Assoc []
+      | `Null -> `Assoc []
+      | _ ->
+        config_error
+          "trading.defaults.overlay"
+          "expected an object keyed by overlay name"
     in
     (match defaults |> member "oracle" with
      | `Assoc _ as o ->
@@ -915,50 +1143,38 @@ let flatten_grouped_trading json =
           | `Null -> `Null
           | _ -> config_error "trading asset group" "'oracle' must be an object"
         in
-        let overlay_section =
-          match group |> member "overlay" with
-          | `Assoc _ as c ->
-            let c = json_merge ~base:overlay_defaults ~override:c in
-            if validate_keys
-                 ~context:(Printf.sprintf "overlay for asset '%s'" asset)
-                 ~allowed:known_overlay_section_keys
-                 c
-            then exit 1;
-            c
-          | `Null -> `Null
-          | _ -> config_error "trading asset group" "'overlay' must be an object"
+        let overlay_context = Printf.sprintf "overlay for asset '%s'" asset in
+        let overlay_items =
+          normalize_overlay_items
+            ~context:overlay_context
+            ~defaults:overlay_defaults
+            (group |> member "overlay")
+        in
+        let controller_item =
+          overlay_controller_item ~context:overlay_context overlay_items
         in
         let overlay_json =
-          match overlay_section with
-          | `Null -> None
-          | `Assoc _ ->
-            let hedge =
-              require_string
-                ~context:("overlay for asset '" ^ asset ^ "'")
-                overlay_section
-                "exchange"
-            in
-            let name =
-              overlay_section
-              |> member "name"
-              |> to_string_option
-              |> Option.value ~default:"carry_overlay"
-            in
-            let symbol = overlay_section |> member "symbol" |> to_string_option in
-            let params =
-              `Assoc
-                (List.filter
-                   (fun (k, _) -> List.mem k known_overlay_param_keys)
-                   (to_assoc overlay_section))
-            in
-            Some
-              (`Assoc
-                ([ "strategy", `String name; "exchange", `String hedge ]
-                 @ (match symbol with
-                    | Some s -> [ "symbol", `String s ]
-                    | None -> [])
-                 @ [ "params", params ]))
-          | _ -> assert false
+          match controller_item with
+          | Some (name, item) ->
+            Some (controller_overlay_json ~context:overlay_context ~name item)
+          | None -> None
+        in
+        let overlays_section =
+          List.filter_map
+            (fun (name, item) ->
+               if String.equal name controller_overlay_strategy
+               then None
+               else Some (instance_overlay_json ~context:overlay_context ~name item))
+            overlay_items
+        in
+        let inventory =
+          match controller_item with
+          | Some (_, item) ->
+            (match item |> member "inventory" with
+             | `List is -> is
+             | `Null -> []
+             | _ -> config_error overlay_context "'inventory' must be an array")
+          | None -> []
         in
         let has_strategy =
           match group |> member "strategy" with
@@ -966,15 +1182,16 @@ let flatten_grouped_trading json =
           | `Null -> false
           | _ -> config_error "trading asset group" "'strategy' must be an object"
         in
-        if (not has_strategy)
-           &&
-           match overlay_section with
-           | `Null -> true
-           | _ -> false
+        if (not has_strategy) && Option.is_none overlay_json && overlays_section = []
         then
           config_error
             ("trading asset '" ^ asset ^ "'")
-            "needs a 'strategy', an 'overlay', or both";
+            "needs a 'strategy' or an 'overlay'";
+        if overlays_section <> [] && not has_strategy
+        then
+          config_error
+            ("trading asset '" ^ asset ^ "'")
+            "'overlay' strategies require a primary 'strategy' section";
         if (match group_oracle with
             | `Null -> false
             | _ -> true)
@@ -1017,47 +1234,41 @@ let flatten_grouped_trading json =
              | Some o -> json_set "overlay" o g
              | None -> g
            in
+           let g =
+             if overlays_section = []
+             then g
+             else json_set "overlays" (`List overlays_section) g
+           in
            out := g :: !out
          | _ -> ());
-        match overlay_section with
-        | `Assoc _ ->
-          let overlay_json =
-            match overlay_json with
-            | Some o -> o
-            | None -> assert false
-          in
-          let inventory =
-            match overlay_section |> member "inventory" with
-            | `List is -> is
-            | `Null -> []
-            | _ -> config_error "overlay" "'inventory' must be an array"
-          in
+        match overlay_json with
+        | Some overlay_json ->
           if (not has_strategy) && inventory = []
-          then
-            config_error
-              ("overlay for asset '" ^ asset ^ "'")
-              "has no legs: add a strategy or an inventory entry";
-          List.iter
-            (fun inv ->
-              let inv = require_object ~context:"overlay.inventory[]" inv in
-              if validate_keys
-                   ~context:("inventory leg for asset '" ^ asset ^ "'")
-                   ~allowed:known_inventory_keys
-                   inv
-              then exit 1;
-              ignore
-                (require_string
-                   ~context:("inventory leg for asset '" ^ asset ^ "'")
-                   inv
-                   "exchange");
-              ignore
-                (require_string
-                   ~context:("inventory leg for asset '" ^ asset ^ "'")
-                   inv
-                   "symbol");
-              out := json_set "overlay" overlay_json inv :: !out)
-            inventory
-        | _ -> ())
+           then
+             config_error
+               overlay_context
+               "has no legs: add a strategy or an inventory entry";
+           List.iter
+             (fun inv ->
+                let inv = require_object ~context:"overlay.inventory[]" inv in
+                if validate_keys
+                     ~context:("inventory leg for asset '" ^ asset ^ "'")
+                     ~allowed:known_inventory_keys
+                     inv
+                then exit 1;
+                ignore
+                  (require_string
+                     ~context:("inventory leg for asset '" ^ asset ^ "'")
+                     inv
+                     "exchange");
+                ignore
+                  (require_string
+                     ~context:("inventory leg for asset '" ^ asset ^ "'")
+                     inv
+                     "symbol");
+                out := json_set "overlay" overlay_json inv :: !out)
+             inventory
+        | None -> ())
       groups;
     `List (List.rev !out)
   | _ -> `List []
@@ -1091,14 +1302,13 @@ let parse_overlays_from_trading trading_json =
     { start_ratio_pct = p "start_ratio_pct" default_overlay_params.start_ratio_pct
     ; add_threshold_pct = p "add_threshold_pct" default_overlay_params.add_threshold_pct
     ; max_ratio_pct = p "max_ratio_pct" default_overlay_params.max_ratio_pct
-    ; recycle_profit_pct =
-        p "recycle_profit_pct" default_overlay_params.recycle_profit_pct
+    ; short_tp_roe =
+        p "short_tp_roe" default_overlay_params.short_tp_roe
     ; recycle_base_share_pct =
         p "recycle_base_share_pct" default_overlay_params.recycle_base_share_pct
     ; min_entry_margin_ratio =
         p "min_entry_margin_ratio" default_overlay_params.min_entry_margin_ratio
     ; min_liq_mult = p "min_liq_mult" default_overlay_params.min_liq_mult
-    ; leverage = p "leverage" default_overlay_params.leverage
     ; full_balance_ref = b "full_balance_ref" default_overlay_params.full_balance_ref
     }
   in
@@ -1255,6 +1465,113 @@ let parse_overlays_from_trading trading_json =
 
 (** Parses overlay declarations from either layout. Grouped sections are flattened first. *)
 let parse_overlays json = parse_overlays_from_trading (trading_entries_json json)
+
+(** Parses additional overlay-strategy instances from the flattened trading entries. *)
+let parse_overlay_instances_from_trading trading_json =
+  overlay_instances := [];
+  let open Yojson.Basic.Util in
+  let entries =
+    match trading_json with
+    | `List entries -> entries
+    | _ -> []
+  in
+  let instances = ref [] in
+  List.iter
+    (fun entry ->
+      match entry |> member "overlays" with
+      | `List overlays ->
+        let owner_exchange =
+          entry
+          |> member "exchange"
+          |> to_string_option
+          |> Option.value ~default:"kraken"
+          |> normalize_exchange
+        in
+        let owner_symbol = entry |> member "symbol" |> to_string in
+        if String.equal owner_symbol ""
+        then config_error "overlays" "owning entry has no symbol";
+        let owner_strategy =
+          entry |> member "strategy" |> to_string_option |> Option.value ~default:""
+        in
+        if String.equal owner_strategy ""
+        then
+          config_error
+            ("overlay for " ^ owner_exchange ^ "/" ^ owner_symbol)
+            "requires a primary strategy (overlay orders are driven by its events)";
+        List.iter
+          (fun overlay_json ->
+            let o = require_object ~context:"overlays[]" overlay_json in
+            let strategy =
+              match o |> member "strategy" |> to_string_option with
+              | Some s when String.trim s <> "" -> String.trim s
+              | _ ->
+                (match o |> member "name" |> to_string_option with
+                 | Some s when String.trim s <> "" -> String.trim s
+                 | _ ->
+                   config_error
+                     ("overlays for " ^ owner_exchange ^ "/" ^ owner_symbol)
+                     "missing required 'name' or 'strategy'")
+            in
+            let exchange =
+              o
+              |> member "exchange"
+              |> to_string_option
+              |> Option.map normalize_exchange
+              |> Option.value ~default:""
+            in
+            if String.equal exchange ""
+            then config_error ("overlay " ^ strategy) "missing required string 'exchange'";
+            let symbol =
+              o
+              |> member "symbol"
+              |> to_string_option
+              |> Option.value ~default:(base_coin_of_symbol owner_symbol)
+            in
+            let id =
+              o |> member "id" |> to_string_option |> Option.value ~default:strategy
+            in
+            let params =
+              match o |> member "params" with
+              | `Assoc _ as p -> p
+              | `Null -> `Assoc []
+              | _ -> config_error ("overlay " ^ strategy) "'params' must be an object"
+            in
+            let instance =
+              { oi_id = id
+              ; oi_strategy = strategy
+              ; oi_exchange = exchange
+              ; oi_symbol = symbol
+              ; oi_owner_exchange = owner_exchange
+              ; oi_owner_symbol = owner_symbol
+              ; oi_params = params
+              }
+            in
+            let key = overlay_instance_key ~owner_exchange ~owner_symbol ~id in
+            if List.exists
+                 (fun (x : overlay_instance) ->
+                   String.equal
+                     (overlay_instance_key
+                        ~owner_exchange:x.oi_owner_exchange
+                        ~owner_symbol:x.oi_owner_symbol
+                        ~id:x.oi_id)
+                     key)
+                 !instances
+            then
+              config_error
+                ("overlay " ^ strategy)
+                "duplicate overlay instance id for this asset"
+            else instances := instance :: !instances)
+          overlays
+      | `Null -> ()
+      | _ -> config_error "overlays" "expected an array")
+    entries;
+  overlay_instances := List.rev !instances
+;;
+
+(** Parses overlay instances from either layout. *)
+let parse_overlay_instances json =
+  parse_overlay_instances_from_trading (trading_entries_json json)
+;;
 
 let asset_overrides_of_json ~context entry =
   let open Yojson.Basic.Util in
@@ -1441,6 +1758,7 @@ let read_config () : config =
     (* Overlay declarations are parsed first: a trading entry without [strategy] is valid
        only as an inventory leg of a carry overlay. *)
     parse_overlays_from_trading trading_json;
+    parse_overlay_instances_from_trading trading_json;
     (* Fail fast if any entry's strategy file is missing/invalid/name-mismatched: without
        it the domain starts but binds no strategy and trades nothing. Checked here (engine
        config load) rather than in [parse_config] so the pure parser stays side-effect
@@ -1535,6 +1853,46 @@ let read_config () : config =
                  file.name;
                exit 1)))
       (get_overlay_controllers ());
+    List.iter
+      (fun (o : overlay_instance) ->
+        match Dio_strategies.Strategy_loader.locate ~name:o.oi_strategy with
+        | None ->
+          Logging.critical_f
+            ~section
+            "Overlay strategy file for %s/%s (%s) does not exist (tried \
+             strategies/<name>.strategy, strategies/<name>.json, \
+             strategies/private/<name>.strategy, and strategies/private/<name>.json). \
+             Refusing to start with a half-bound overlay."
+            o.oi_owner_exchange
+            o.oi_owner_symbol
+            o.oi_strategy;
+          exit 1
+        | Some path ->
+          (match Dio_strategies.Strategy_loader.parse_file ~path with
+           | Error msg ->
+             Logging.critical_f
+               ~section
+               "Overlay strategy file '%s' for %s/%s (%s) is invalid: %s"
+               path
+               o.oi_owner_exchange
+               o.oi_owner_symbol
+               o.oi_strategy
+               msg;
+             exit 1
+           | Ok file ->
+             if not (String.equal file.name o.oi_strategy)
+             then (
+               Logging.critical_f
+                 ~section
+                 "Overlay strategy name mismatch for %s/%s: config.json declares '%s' \
+                  but strategy file '%s' declares '%s'"
+                 o.oi_owner_exchange
+                 o.oi_owner_symbol
+                 o.oi_strategy
+                 path
+                 file.name;
+               exit 1)))
+      (get_overlay_instances ());
     let fng_check_threshold =
       json |> member "fng_check_threshold" |> to_float_opt |> Option.value ~default:1.5
     in
