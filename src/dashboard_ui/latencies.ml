@@ -253,6 +253,62 @@ let render_latencies w (snapshot : Snapshot.t) =
       all_page_labels
   in
   let active_lats = List.filter row_is_active lats in
+  (* The overlay-only perp domains (XMR/USDC, ETH/USDC, SOL/USDC, ADA/USDC) are the carry
+     controller's legs. Nest them under the grid row for the same base asset. *)
+  let base_of_symbol symbol =
+    match String.index_opt symbol '/' with
+    | Some i -> String.sub symbol 0 i
+    | None -> symbol
+  in
+  let grid_symbols = List.map fst snapshot.strategies in
+  let parent_of symbol =
+    if List.mem symbol grid_symbols
+    then None
+    else (
+      let base = base_of_symbol symbol in
+      List.find_opt (fun grid -> String.equal (base_of_symbol grid) base) grid_symbols)
+  in
+  let child_rows = Hashtbl.create 8 in
+  List.iter
+    (fun ((symbol, _) as row) ->
+      match parent_of symbol with
+      | Some parent ->
+        let previous =
+          try Hashtbl.find child_rows parent with
+          | Not_found -> []
+        in
+        Hashtbl.replace child_rows parent (row :: previous)
+      | None -> ())
+    active_lats;
+  let ordered_rows =
+    let emitted = Hashtbl.create 16 in
+    let out = ref [] in
+    let add (symbol, metrics) is_child =
+      if not (Hashtbl.mem emitted symbol)
+      then (
+        Hashtbl.replace emitted symbol ();
+        out := (symbol, metrics, is_child) :: !out)
+    in
+    List.iter
+      (fun (symbol, metrics) ->
+        match parent_of symbol with
+        | Some _ -> ()
+        | None ->
+          add (symbol, metrics) false;
+          (match Hashtbl.find_opt child_rows symbol with
+           | Some children ->
+             List.iter
+               (fun (csymbol, cmetrics) ->
+                 if not (Hashtbl.mem emitted csymbol) then add (csymbol, cmetrics) true)
+               (List.rev children)
+           | None -> ()))
+      active_lats;
+    List.iter
+      (fun (symbol, metrics) ->
+        if not (Hashtbl.mem emitted symbol) then add (symbol, metrics) false)
+      active_lats;
+    List.rev !out
+  in
   if active_lats = []
   then I.empty
   else (
@@ -331,7 +387,7 @@ let render_latencies w (snapshot : Snapshot.t) =
     let header = I.vcat [ close_row w header_row1; close_row w header_row2 ] in
     let rows =
       List.mapi
-        (fun i (symbol, metrics) ->
+        (fun i (symbol, metrics, is_child) ->
           let bg_color = if i mod 2 = 1 then t.c_panel else t.c_bg in
           let a_text = A.(t.a_text ++ bg bg_color) in
           let a_green = A.(t.a_green ++ bg bg_color) in
@@ -462,7 +518,18 @@ let render_latencies w (snapshot : Snapshot.t) =
               latency_cell_attr (attr_of_sev (severity_of_value page.trend_metric v)) v)
           in
           let exch = exch_of_symbol symbol in
-          let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
+          let sym_attr =
+            if is_child
+            then a_dim
+            else if exch <> ""
+            then exch_sym_attr exch
+            else a_bright
+          in
+          let display_symbol =
+            if is_child
+            then " ↳" ^ truncate_string 8 symbol
+            else truncate_string 10 symbol
+          in
           close_row
             w
             (I.hcat
@@ -470,13 +537,13 @@ let render_latencies w (snapshot : Snapshot.t) =
                 ; I.string A.(bg bg_color) "  "
                 ; I.string dot_attr "●"
                 ; I.string a_text " "
-                ; col 11 sym_attr (truncate_string 10 symbol)
+                ; col 11 sym_attr display_symbol
                 ; I.string a_border " │ "
                 ; trend_spark
                 ; I.string a_border " │ "
                 ]
                 @ metric_cells)))
-        active_lats
+        ordered_rows
     in
     let title = render_latency_title w snapshot in
     I.vcat ((title :: header :: rows) @ [ section_footer w ]))

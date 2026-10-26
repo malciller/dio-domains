@@ -504,14 +504,18 @@ let connect_one
   =
   let connect_host, connect_port = connect_target () in
   let url = ws_url () in
+  let uri = Uri.of_string url in
+  (* Dial target may differ from the URL host: the private socket is pinned to the egress
+     relay, while TLS must still validate Lighter's real hostname. *)
+  let tls_host = Uri.host uri |> Option.value ~default:connect_host in
   Logging.debug_f
     ~section
-    "Connecting to [%s] Lighter WebSocket: %s (host=%s:%d)"
+    "Connecting to [%s] Lighter WebSocket: %s (host=%s:%d tls=%s)"
     label
     url
     connect_host
-    connect_port;
-  let uri = Uri.of_string url in
+    connect_port
+    tls_host;
   Lwt.catch
     (fun () ->
       Lwt_unix.getaddrinfo
@@ -525,7 +529,7 @@ let connect_one
           Ipaddr_unix.of_inet_addr addr
         | _ -> failwith (Printf.sprintf "Failed to resolve %s" connect_host)
       in
-      let client = `TLS (`Hostname connect_host, `IP ip, `Port connect_port) in
+      let client = `TLS (`Hostname tls_host, `IP ip, `Port connect_port) in
       let ctx = Ws_lwt.resolve_ctx () in
       Lwt_unix.with_timeout 20.0 (fun () -> Ws_lwt.connect ~ctx client uri)
       >>= fun conn ->
@@ -766,7 +770,7 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
           else Lwt.return_unit)
     ; reconnect_loop
         ~state:private_state
-        ~connect_target:Lighter_endpoints.ws_connect_target
+        ~connect_target:Lighter_endpoints.private_ws_connect_target
         ~ws_url:Lighter_endpoints.private_ws_url
         ~label:"Private"
         ~ready_flag:priv_ready
