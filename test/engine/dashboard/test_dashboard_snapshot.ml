@@ -190,25 +190,20 @@ let test_perp_orders_parsing () =
 ;;
 
 let test_zoom_clamps_to_deepest_order () =
-  let low, high =
-    Asset_graph.zoom_cap_span ~mid:100.0 ~bottom_ps:[ 98.0; 95.0 ] ~top_ps:[ 105.0 ]
-  in
+  let low, high = Asset_graph.zoom_cap_span ~mid:100.0 ~bottom_ps:[ 98.0; 95.0 ] in
   Alcotest.(check (float 1e-9))
     "floor is the deepest buy (a perp short's close)"
     (95.0 *. 0.995)
     low;
-  Alcotest.(check (float 1e-9)) "ceiling is the highest sell" (105.0 *. 1.005) high;
-  (* Levels on the wrong side of the mid never widen the clamp, and an empty side falls
-     back to the default band. *)
-  let low, high = Asset_graph.zoom_cap_span ~mid:100.0 ~bottom_ps:[] ~top_ps:[ 99.0 ] in
+  Alcotest.(check (float 1e-9))
+    "ceiling stays near price instead of following the highest sell"
+    (100.0 *. 1.015 *. 1.005)
+    high;
+  let low, _ = Asset_graph.zoom_cap_span ~mid:100.0 ~bottom_ps:[] in
   Alcotest.(check (float 1e-9))
     "empty buy side keeps the default floor"
     (100.0 *. 0.985 *. 0.995)
-    low;
-  Alcotest.(check (float 1e-9))
-    "sub-mid sell keeps the default ceiling"
-    (100.0 *. 1.015 *. 1.005)
-    high
+    low
 ;;
 
 let test_asset_chart_renders_perp_orders () =
@@ -248,10 +243,7 @@ let test_asset_chart_renders_perp_orders () =
   Asset_graph.record_all_prices s;
   let img = Asset_graph.render_asset_detail 160 50 "" s in
   Alcotest.(check int) "chart fills width" 160 (Notty.I.width img);
-  Alcotest.(check bool)
-    "chart renders at least the requested height"
-    true
-    (Notty.I.height img >= 50)
+  Alcotest.(check int) "chart height matches the viewport" 50 (Notty.I.height img)
 ;;
 
 let test_latency_and_oracle_parsing () =
