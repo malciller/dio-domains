@@ -221,6 +221,152 @@ let derive_overlay_ladder ?start_ratio ~leverage (p : overlay_params) =
   }
 ;;
 
+(** Reconstructed ladder position from an open short. *)
+type overlay_ladder_seed =
+  { ls_anchor : float
+  ; ls_add_index : int
+  ; ls_rung_qty : float
+  ; ls_next_add : float
+  }
+
+(** Rebuild the ladder from the live short instead of persisting it.
+
+    A ladder is a deterministic function of its config, its anchor (the price the short
+    was first opened at) and how many rungs have filled. A restart only knows the
+    position: average entry [entry], short [short_qty], accumulated balance [accumulated],
+    and the live [mark]. Invert it:
+
+    - the size gives the last completed rung [n] (the geometric add sizes sum to
+      [short_qty / accumulated] - start_ratio);
+    - the average entry then gives the anchor [a] that produced it from rungs 0..n:
+      [entry = a * (r0 + sum s_k * (1 + k*threshold/leverage)) / r_n].
+
+    The bands below [mark] are rungs the price crossed while the process was down. Keeping
+    [add_index] at the last completed rung leaves them armed, so the strategy places them
+    on the next cycles rather than re-basing the trail at the restart mark. On a retrace,
+    clamping [add_index] to the price-implied rung re-arms the retraced rungs so their
+    size is added again on the way back up, ratcheting the average entry toward the mark. *)
+let reconstruct_ladder
+  (ladder : overlay_ladder)
+  ~leverage
+  ~entry
+  ~short_qty
+  ~accumulated
+  ~mark
+  =
+  let r0 = ladder.ol_start_ratio in
+  let threshold = ladder.ol_add_threshold in
+  let first = ladder.ol_add_first in
+  let growth = ladder.ol_add_growth in
+  let n_max = ladder.ol_num_rungs in
+  let step = if leverage > 0.0 then threshold /. leverage else 0.0 in
+  let ratio = if accumulated > 0.0 then short_qty /. accumulated else 0.0 in
+  let rung_size k = first *. (growth ** float_of_int k) in
+  (* Walk the geometric schedule until the next rung would overshoot the live size. *)
+  let rec walk k acc_ratio acc_price =
+    if k >= n_max
+    then k, acc_ratio, acc_price
+    else (
+      let size = rung_size k in
+      let next_ratio = acc_ratio +. size in
+      if next_ratio > ratio +. (1e-9 *. Float.max 1.0 (Float.abs ratio))
+      then k, acc_ratio, acc_price
+      else
+        walk
+          (k + 1)
+          next_ratio
+          (acc_price +. (size *. (1.0 +. (float_of_int (k + 1) *. step)))))
+  in
+  let filled, r_n, weighted = walk 0 r0 r0 in
+  let anchor =
+    if entry > 0.0 && r_n > 0.0 && weighted > 0.0
+    then entry *. r_n /. weighted
+    else if entry > 0.0
+    then entry
+    else mark
+  in
+  let price_rung =
+    if mark > 0.0 && anchor > 0.0 && step > 0.0
+    then int_of_float (Float.floor ((((mark /. anchor) -. 1.0) /. step) +. 1e-9))
+    else filled
+  in
+  let index = max 0 (min filled (min n_max price_rung)) in
+  let rung_qty = if index < n_max then rung_size index *. accumulated else 0.0 in
+  let next_add =
+    if index < n_max && anchor > 0.0 && step > 0.0
+    then anchor *. (1.0 +. (float_of_int (index + 1) *. step))
+    else 0.0
+  in
+  { ls_anchor = anchor
+  ; ls_add_index = index
+  ; ls_rung_qty = rung_qty
+  ; ls_next_add = next_add
+  }
+;;
+
+(** Reconstruct the ladder from the current position and seed the runtime. Returns false
+    for a flat position or a missing accumulated basis. *)
+let seed_ladder_from_position
+  (ladder : overlay_ladder)
+  ~leverage
+  ~exchange
+  ~coin
+  ~symbol
+  ~accumulated
+  rt
+  =
+  match Dio_exchange.Market_context.get_position ~exchange ~coin with
+  | Some pos when pos.qty < -0.0001 && pos.entry > 0.0 && accumulated > 0.0 ->
+    let short_qty = -.pos.qty in
+    let ratio = short_qty /. accumulated in
+    if ratio > ladder.ol_max_ratio +. 1e-9
+    then
+      Logging.warn_f
+        ~section
+        "carry %s: grandfathered ratio %.4f exceeds configured max %.4f; no adds until \
+         the first profitable recycle"
+        symbol
+        ratio
+        ladder.ol_max_ratio;
+    let mark =
+      match Dio_exchange.Market_context.get_funding ~exchange ~coin with
+      | Some f when f.mark > 0.0 -> f.mark
+      (* webData2 carries the mark indirectly as position value / size, so a retrace on
+         boot re-arms even before the asset-context feed publishes. *)
+      | _ when pos.qty <> 0.0 -> Float.abs (pos.position_value /. pos.qty)
+      | _ -> 0.0
+    in
+    let seed =
+      reconstruct_ladder ladder ~leverage ~entry:pos.entry ~short_qty ~accumulated ~mark
+    in
+    Logging.info_f
+      ~section
+      "carry ladder %s: entry=%.4f short=%.6f ratio=%.4f mark=%.4f -> anchor=%.4f \
+       rung=%d/%d next_add=%.4f"
+      symbol
+      pos.entry
+      short_qty
+      ratio
+      mark
+      seed.ls_anchor
+      seed.ls_add_index
+      ladder.ol_num_rungs
+      seed.ls_next_add;
+    Dio_strategies.Carry_runtime.restore_ladder
+      ~anchor:seed.ls_anchor
+      ~add_index:seed.ls_add_index
+      ~rung_qty:seed.ls_rung_qty
+      ~next_add:seed.ls_next_add
+      ~first:ladder.ol_add_first
+      ~growth:ladder.ol_add_growth
+      ~rungs:ladder.ol_num_rungs
+      ~ratio
+      ~start_ratio:ladder.ol_start_ratio
+      rt;
+    true
+  | _ -> false
+;;
+
 (** Core worker function executed by each OCaml domain for a trading asset. Runs the
     event-driven loop: consumes ring buffer events, executes strategy, and blocks on
     Exchange_wakeup between cycles. *)
@@ -973,12 +1119,41 @@ let asset_domain_worker
      | Some ort, Some ctx, Some controller, Some st ->
        Dio_strategies.Carry_runtime.seed ort !st;
        let p = controller.oc_params in
-       (* Seed the leverage used by the fill-time take-profit. The venue only reports a
-          position's leverage when a position exists, so a flat account has no value to
-          fetch. Prefer the explicit config; otherwise reuse the last value persisted by
-          the previous run. The first position snapshot corrects either seed. *)
+       (* webData2 carries the position and its leverage. Wait for the first full frame so
+          the ladder and the take-profit seed from the live position instead of the
+          persisted ladder or a config fallback. A flat account has no position entry. *)
+       let positions_ready () =
+         Option.is_some
+           (Dio_exchange.Market_context.get_positions_updated_at
+              ~exchange:asset_with_fees.exchange)
+       in
+       let deadline = Unix.gettimeofday () +. 15.0 in
+       while (not (positions_ready ())) && Unix.gettimeofday () < deadline do
+         Thread.delay 0.05
+       done;
+       let position =
+         Dio_exchange.Market_context.get_position
+           ~exchange:asset_with_fees.exchange
+           ~coin:base_asset
+       in
+       if not (positions_ready ())
+       then
+         Logging.warn_f
+           ~section
+           "position snapshot not ready for %s/%s after 15s, keeping the persisted ladder"
+           asset_with_fees.exchange
+           asset_with_fees.symbol;
+       let venue_leverage =
+         match position with
+         | Some pos -> Option.value pos.leverage ~default:0.0
+         | None -> 0.0
+       in
+       (* The venue's leverage is the margin the bands and the take-profit are measured
+          against. Config and persisted values only cover a flat or unseen position. *)
        let seeded_leverage, source =
-         if p.leverage > 0.0
+         if venue_leverage > 0.0
+         then venue_leverage, "position snapshot"
+         else if p.leverage > 0.0
          then p.leverage, "config"
          else if !st.last_leverage > 0.0
          then !st.last_leverage, "carry state"
@@ -1005,63 +1180,27 @@ let asset_domain_worker
            "carry leverage seed %s: unknown; the first take-profit waits for the first \
             position snapshot (set trading[].overlay.params.leverage to seed it)"
            asset_with_fees.symbol;
-       (* Startup re-derives the ladder from the LIVE short, which may be mid-ladder or
-          over max. The current size is the ladder start, so the rungs and trail are the
-          distance left to [max_ratio], not a historical schedule. Flat keeps the
-          persisted state. *)
+       (* Reconstruct the ladder from the live short: the average entry and size identify
+          the anchor and the last completed rung. Bands the price crossed while the
+          process was down stay ahead of [add_index], so the arming path fills them
+          instead of re-basing the trail at the restart mark. A flat account has no rung
+          to derive; the strategy starts one on its next entry. *)
        let ladder = derive_overlay_ladder ~leverage:p.leverage p in
        let mode_changed = !st.full_balance_ref <> p.full_balance_ref in
        let accumulated = (Overlay_inventory.aggregate controller).total in
-       (match
-          Dio_exchange.Market_context.get_position
-            ~exchange:asset_with_fees.exchange
-            ~coin:base_asset
-        with
-        | Some pos when pos.qty < -0.0001 && accumulated > 0.0 && pos.entry > 0.0 ->
-          let short_qty = -.pos.qty in
-          let ratio = short_qty /. accumulated in
-          if ratio > ladder.ol_max_ratio +. 1e-9
-          then
-            Logging.warn_f
-              ~section
-              "carry %s: grandfathered ratio %.4f exceeds configured max %.4f; no adds \
-               until the first profitable recycle"
-              asset_with_fees.symbol
-              ratio
-              ladder.ol_max_ratio;
-          let live =
-            derive_overlay_ladder
-              ~start_ratio:(Float.min ladder.ol_max_ratio ratio)
-              ~leverage:p.leverage
-              p
-          in
-          let mark =
-            match
-              Dio_exchange.Market_context.get_funding
-                ~exchange:asset_with_fees.exchange
-                ~coin:base_asset
-            with
-            | Some f when f.mark > 0.0 -> f.mark
-            | _ -> 0.0
-          in
-          Dio_strategies.Carry_runtime.init_ladder
-            ~max_ratio:live.ol_max_ratio
-            ~add_first:live.ol_add_first
-            ~add_growth:live.ol_add_growth
-            ~num_rungs:live.ol_num_rungs
-            ~add_threshold:live.ol_add_threshold
-            ~leverage:p.leverage
-            ~mark
-            ~entry:pos.entry
-            ~accumulated
-            ~short_qty
-            ort
-        | _ ->
-          if mode_changed
-          then
-            Dio_strategies.Carry_runtime.reset_ladder
-              ~start_ratio:ladder.ol_start_ratio
-              ort);
+       let seeded =
+         seed_ladder_from_position
+           ladder
+           ~leverage:seeded_leverage
+           ~exchange:asset_with_fees.exchange
+           ~coin:base_asset
+           ~symbol:asset_with_fees.symbol
+           ~accumulated
+           ort
+       in
+       if (not seeded) && mode_changed
+       then
+         Dio_strategies.Carry_runtime.reset_ladder ~start_ratio:ladder.ol_start_ratio ort;
        if mode_changed then st := { !st with full_balance_ref = p.full_balance_ref }
      | _ -> ());
     (* Adopt carry orders that survived a restart. The order-id -> kind registry is
@@ -2399,15 +2538,20 @@ let asset_domain_worker
          let sint key =
            match Dio_strategies.Strategy_runtime.get_state ort key with
            | Dio_strategies.Strategy_expr.V_int i -> i
+           (* Counters incremented in the strategy go through the float path. *)
+           | Dio_strategies.Strategy_expr.V_float f -> int_of_float f
            | _ -> 0
          in
          let p = controller.oc_params in
          let ladder_ratio = sfloat "ladder_ratio" in
          let ladder_rungs = max 0 (sint "ladder_rungs") in
+         let ladder_index = max 0 (sint "add_index") in
+         let remaining_rungs = max 0 (ladder_rungs - ladder_index) in
          let add_growth = sfloat "ladder_growth" in
          let max_trail_pct =
            if p.leverage > 0.0
            then
+             (* Full path from the reconstructed anchor to the terminal rung. *)
              float_of_int ladder_rungs
              *. (p.add_threshold_pct /. 100.0)
              /. p.leverage
@@ -2527,8 +2671,8 @@ let asset_domain_worker
              ~min_liq_mult:p.min_liq_mult
              ~anchor
              ~max_trail_pct
-             ~next_add
-             ~rungs:ladder_rungs
+             ~next_add (* Remaining bands weight the entry at the top. *)
+             ~rungs:remaining_rungs
              ~add_growth
              ~sells_top
              ~sells_stress
@@ -2669,7 +2813,7 @@ let asset_domain_worker
            in
            Logging.info_f
              ~section
-             "capdiag %s: short=%.6f max_qty=%.6f ratio=%.4f rungs=%d anchor=%.4f \
+             "capdiag %s: short=%.6f max_qty=%.6f ratio=%.4f rung=%d/%d anchor=%.4f \
               next_add=%.4f p_top=%.4f entry=%.4f entry_max=%.4f lev=%.2f m=%.4f | \
               IM_top=%.2f loss_top=%.2f MM_stress=%.2f loss_stress=%.2f | sells_all=%.2f \
               sells_top=%.2f sells_stress=%.2f | required=%.2f pos_margin=%.2f \
@@ -2680,6 +2824,7 @@ let asset_domain_worker
              req.Carry_reserve.rq_short_qty
              req.Carry_reserve.rq_max_qty
              ladder_ratio
+             ladder_index
              ladder_rungs
              anchor
              next_add
