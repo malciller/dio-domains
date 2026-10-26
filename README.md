@@ -128,7 +128,6 @@ container walkthrough.
 | `bin/` | The `dio`, `dio-dashboard`, and `dio-oracle` executables. |
 | `test/` | Test suites mirroring `src/`. |
 | `strategies/` | Strategy scripts loaded by name from `config.json`. |
-| `proxy/` | Optional Cloudflare relay for Lighter traffic. |
 | `editors/` | Editor support for the strategy language: VS Code (`vscode-strategy`), Zed (`zed-strategy`), and the shared tree-sitter grammar. |
 
 ## Performance

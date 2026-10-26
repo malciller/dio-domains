@@ -213,7 +213,7 @@ let () = ignore Alpaca.Module.Alpaca_impl.name
 - Perpetual DEX. Signing goes through the in-tree `lighter_ffi` C stubs to the precompiled Lighter signer shared library (`lighter_signer.ml`); requests are signed locally.
 - `LIGHTER_SIGNER_LIB_PATH` must point at the shared library (default `./native/lighter-signer-<os>-<arch>`); `LIGHTER_API_PRIVATE_KEY` is required. Account selection uses `LIGHTER_API_KEY_INDEX` / `LIGHTER_ACCOUNT_INDEX` (both default `0`).
 - The published image ships WITHOUT the signer: it is a precompiled Go library that bundles `go-ethereum`/`gnark-crypto` and dominates container CVE scans, and the engine only dlopens it when a Lighter symbol runs. To trade Lighter from a container, build with `--build-arg INCLUDE_LIGHTER_SIGNER=1` (the image puts it at `/opt/lighter-signer/`), or mount the `.so` and set `LIGHTER_SIGNER_LIB_PATH` to it. Non-Lighter deployments need neither.
-- `LIGHTER_PROXY_URL` is a comma-separated pool of relay endpoints with round-robin and failover. REST and the private/auth WebSocket go through the proxy when configured; the public market-data WebSocket is always direct.
+- REST and the private/auth WebSocket connect directly to `mainnet.zklighter.elliot.ai`; the public market-data WebSocket is also direct.
 - Orders are Good-Till-Time with a maximum 28-day TTL, and TIF cannot be changed by modify, so the renewal daemon (`lighter_tif_renewal.ml`) checks hourly and cancel-and-replaces orders within 1 day of expiry to approximate GTC. Order IDs are not stable across a restart.
 - Trading-only: there is no `lighter_oracle.ml` and no oracle registration, so the oracle-only fields (`min_notional`, `default_fees`, `default_quote`) do not apply.
 - The executions feed maintains an order-id-to-symbol index (hashtable plus bounded FIFO queue).
@@ -287,7 +287,7 @@ Three reference adapters exist: `kraken_oracle.ml`, `hyperliquid_oracle.ml`, and
 | Daily bars (oracle) | REST OHLC | REST `candleSnapshot` | REST bars + calendar |
 | Deep history | Yahoo | Yahoo | Yahoo |
 
-Lighter is REST plus WebSocket, signed locally and optionally relayed through the proxy pool; IBKR is a TCP gateway connection with polled/streamed messages. Neither has oracle data.
+Lighter is REST plus WebSocket, signed locally and connected directly to the venue; IBKR is a TCP gateway connection with polled/streamed messages. Neither has oracle data.
 
 ---
 

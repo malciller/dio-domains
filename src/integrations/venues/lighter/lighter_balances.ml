@@ -447,7 +447,7 @@ let request_balance_refresh () =
                | _ -> 0)
             | None -> 0
           in
-          let base_url = Lighter_proxy.api_base_url () in
+          let base_url = Lighter_endpoints.api_base_url in
           let url =
             Printf.sprintf "%s/api/v1/account?by=index&value=%d" base_url account_index
           in
