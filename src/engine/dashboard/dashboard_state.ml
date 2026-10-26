@@ -402,11 +402,24 @@ let merge_oracle_asset_latencies latencies =
   Hashtbl.fold (fun _ (orig, json) acc -> (orig, json) :: acc) by_symbol []
 ;;
 
+(** Network windows for [venue] under the NETWORK-page labels, or [] when the venue has
+    not published a window yet. *)
+let network_entries venue =
+  Network_latency.snapshots venue
+  |> List.filter_map (fun (label, snap_opt) ->
+    match snap_opt with
+    | Some snap -> Some (label, json_of_latency_snapshot snap)
+    | None -> None)
+;;
+
 (** Merge the per-venue network latency windows into the per-domain latency map under the
     NETWORK-page labels (ws_ping / ws_feed / rest_request / signer), so ENGINE LATENCY
     rows show each domain venue's network characteristics. Keys match the trading-config
     symbols the domains are keyed by, case-insensitively. Venues with no network
-    measurement are absent; the NETWORK page renders "--". *)
+    measurement are absent; the NETWORK page renders "--".
+
+    A venue reached only through an overlay leg (a Lighter long funded by a spot grid on
+    another venue) belongs to no domain row, so it gets a row keyed by the venue name. *)
 let merge_network_latencies latencies =
   let by_symbol = Hashtbl.create 16 in
   List.iter
@@ -414,26 +427,32 @@ let merge_network_latencies latencies =
       Hashtbl.replace by_symbol (String.lowercase_ascii symbol) (symbol, json))
     latencies;
   let config = get_config () in
+  let merge_into key venue =
+    match Hashtbl.find_opt by_symbol key with
+    | None -> ()
+    | Some (orig, json) ->
+      let entries = network_entries venue in
+      (match json with
+       | `Assoc l when entries <> [] ->
+         Hashtbl.replace by_symbol key (orig, `Assoc (entries @ l))
+       | _ -> ())
+  in
   List.iter
     (fun (tc : Dio_engine.Config.trading_config) ->
-      let key = String.lowercase_ascii tc.symbol in
-      let venue_snaps = Network_latency.snapshots tc.exchange in
-      if venue_snaps <> []
-      then (
-        match Hashtbl.find_opt by_symbol key with
-        | Some (orig, `Assoc l) ->
-          let network_entries =
-            List.filter_map
-              (fun (label, snap_opt) ->
-                match snap_opt with
-                | Some snap -> Some (label, json_of_latency_snapshot snap)
-                | None -> None)
-              venue_snaps
-          in
-          if network_entries <> []
-          then Hashtbl.replace by_symbol key (orig, `Assoc (network_entries @ l))
-        | _ -> ()))
+      merge_into (String.lowercase_ascii tc.symbol) tc.exchange)
     config.trading;
+  let domain_venues =
+    List.map (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange) config.trading
+  in
+  Dio_engine.Config.get_overlay_instances ()
+  |> List.map (fun (o : Dio_engine.Config.overlay_instance) -> o.oi_exchange)
+  |> List.sort_uniq String.compare
+  |> List.iter (fun venue ->
+    let key = String.lowercase_ascii venue in
+    if (not (List.mem venue domain_venues)) && not (Hashtbl.mem by_symbol key)
+    then (
+      let entries = network_entries venue in
+      if entries <> [] then Hashtbl.replace by_symbol key (venue, `Assoc entries)));
   Hashtbl.fold (fun _ (orig, json) acc -> (orig, json) :: acc) by_symbol []
 ;;
 
@@ -740,9 +759,7 @@ let json_of_perp ~exchange ~coin =
     hedge venue; this one can be on a different venue, so the dashboard keeps it separate
     and labels its venue. *)
 let json_of_overlay_long (oi : Dio_engine.Config.overlay_instance) =
-  match
-    Dio_exchange.Exchange_intf.Registry.get_market_context oi.oi_exchange
-  with
+  match Dio_exchange.Exchange_intf.Registry.get_market_context oi.oi_exchange with
   | None -> None
   | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
     let coin = Dio_engine.Config.base_coin_of_symbol oi.oi_symbol in
@@ -753,8 +770,16 @@ let json_of_overlay_long (oi : Dio_engine.Config.overlay_instance) =
       | Some f -> f.mark
       | None -> 0.0
     in
-    let qty = match position with Some p -> p.qty | None -> 0.0 in
-    let entry = match position with Some p -> p.entry | None -> 0.0 in
+    let qty =
+      match position with
+      | Some p -> p.qty
+      | None -> 0.0
+    in
+    let entry =
+      match position with
+      | Some p -> p.entry
+      | None -> 0.0
+    in
     let notional =
       match position with
       | Some p when p.position_value > 0.0 -> abs_float p.position_value
@@ -767,39 +792,39 @@ let json_of_overlay_long (oi : Dio_engine.Config.overlay_instance) =
     let closes =
       List.filter
         (fun (o : Exchange.Types.open_order) ->
-           o.side = Exchange.Types.Sell && o.remaining_qty > 0.0)
+          o.side = Exchange.Types.Sell && o.remaining_qty > 0.0)
         orders
     in
     let close_orders =
       List.filter_map
         (fun (o : Exchange.Types.open_order) ->
-           match o.limit_price with
-           | Some price when price > 0.0 ->
-             Some
-               (`Assoc
-                 [ "id", `String o.order_id
-                 ; "price", `Float price
-                 ; "qty", `Float o.remaining_qty
-                 ; "owner", `String "long"
-                 ])
-           | _ -> None)
+          match o.limit_price with
+          | Some price when price > 0.0 ->
+            Some
+              (`Assoc
+                [ "id", `String o.order_id
+                ; "price", `Float price
+                ; "qty", `Float o.remaining_qty
+                ; "owner", `String "long"
+                ])
+          | _ -> None)
         closes
     in
     let close_price =
       closes
       |> List.filter_map (fun (o : Exchange.Types.open_order) -> o.limit_price)
       |> List.filter (fun p -> p > 0.0)
-      |> (function
-       | [] -> None
-       | p :: ps ->
-         Some
-           (List.fold_left
-              (fun best x ->
-                 if mark > 0.0 && abs_float (x -. mark) < abs_float (best -. mark)
-                 then x
-                 else best)
-              p
-              ps))
+      |> function
+      | [] -> None
+      | p :: ps ->
+        Some
+          (List.fold_left
+             (fun best x ->
+               if mark > 0.0 && abs_float (x -. mark) < abs_float (best -. mark)
+               then x
+               else best)
+             p
+             ps)
     in
     let close_distance_pct =
       match close_price with
@@ -949,7 +974,9 @@ let build_snapshot () =
                   ~coin:c.oc_hedge_coin
               with
               | Some pos when acc > 0.0 && pos.qty < -0.0001 ->
-                let ratio = Float.min (p.max_ratio_pct /. 100.0) (Float.abs pos.qty /. acc) in
+                let ratio =
+                  Float.min (p.max_ratio_pct /. 100.0) (Float.abs pos.qty /. acc)
+                in
                 Dio_engine.Domain_spawner.derive_overlay_ladder
                   ~start_ratio:ratio
                   ~leverage:venue_leverage

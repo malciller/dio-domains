@@ -260,6 +260,37 @@ let test_capabilities () =
   | None -> fail "oracle capability missing"
 ;;
 
+let test_position_retention () =
+  reset_context ();
+  (* Market 0 only: market 5 is unknown to the instruments feed, so a frame without a
+     symbol can only resolve it from the remembered market index. *)
+  Lighter.Instruments_feed.initialize [ "TESTETH" ];
+  check
+    bool
+    "first frame applied"
+    true
+    (Lighter.Positions.process_account_all
+       (json
+          {|{"channel":"account_all:1","positions":{"5":{"market_id":5,"symbol":"TESTBTC","sign":1,"position":"0.5","avg_entry_price":"100","position_value":"50","allocated_margin":"10"}}}|}));
+  ignore
+    (Lighter.Positions.process_account_all
+       (json
+          {|{"channel":"account_all:1","positions":{"5":{"market_id":5,"sign":1,"position":"0.5","avg_entry_price":"100","position_value":"50","allocated_margin":"10"}}}|}));
+  (match Dio_exchange.Market_context.get_position ~exchange:"lighter" ~coin:"TESTBTC" with
+   | Some p -> check (float 1e-12) "symbol-less frame keeps the position" 0.5 p.qty
+   | None -> fail "a frame without a symbol cleared the live position");
+  (* An unresolvable node is skipped instead of taking the resolved one with it. *)
+  ignore
+    (Lighter.Positions.process_account_all
+       (json
+          {|{"channel":"account_all:1","positions":{"5":{"market_id":5,"sign":1,"position":"0.5"},"9":{"market_id":9,"sign":1,"position":"1"}}}|}));
+  check
+    bool
+    "unresolved node does not clear others"
+    true
+    (Dio_exchange.Market_context.get_position ~exchange:"lighter" ~coin:"TESTBTC" <> None)
+;;
+
 let () =
   Alcotest.run
     "Lighter Market Context"
@@ -268,11 +299,11 @@ let () =
     ; ( "positions"
       , [ test_case "positions and margin" `Quick test_positions_and_margin
         ; test_case "REST snapshot" `Quick test_rest_snapshot
+        ; test_case "position retention" `Quick test_position_retention
         ; test_case "open orders" `Quick test_open_orders
         ; test_case "WS routing" `Quick test_ws_routing
         ] )
-    ; ( "risk"
-      , [ test_case "venue metadata" `Quick test_risk_parameters ] )
+    ; "risk", [ test_case "venue metadata" `Quick test_risk_parameters ]
     ; "capabilities", [ test_case "registered" `Quick test_capabilities ]
     ; "oracle", [ test_case "fees, candles, balances" `Quick test_oracle ]
     ]

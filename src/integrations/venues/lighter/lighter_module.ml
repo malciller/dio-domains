@@ -577,8 +577,8 @@ let fetch_open_orders () =
   \    reconcile state after a reconnect. "]
 ;;
 
-let fetch_balances () =
-  let section = "lighter_startup" in
+let fetch_balances ?(quiet = false) () =
+  let section = if quiet then "lighter_resync" else "lighter_startup" in
   let account_index =
     match Sys.getenv_opt "LIGHTER_ACCOUNT_INDEX" |> Option.map String.trim with
     | Some s ->
@@ -622,7 +622,7 @@ let fetch_balances () =
                 Lwt.return_unit)
               else (
                 let trimmed = String.trim body_str in
-                Logging.info_f
+                (if quiet then Logging.debug_f else Logging.info_f)
                   ~section
                   "Lighter account response: %s"
                   (if String.length trimmed > 500
@@ -716,7 +716,7 @@ let fetch_balances () =
                   in
                   Lighter_balances.process_market_data synthetic_json;
                   let usdc_bal = Lighter_balances.get_balance "USDC" in
-                  Logging.info_f
+                  (if quiet then Logging.debug_f else Logging.info_f)
                     ~section
                     "Lighter balances fetched via REST: USDC=%.6f (%d assets from array, \
                      %d total injected)"
@@ -731,9 +731,26 @@ let fetch_balances () =
         (Printexc.to_string exn);
       Lwt.return_unit)
 [@@ocaml.doc
-  " Fetches all asset balances via the REST API at startup, ensuring balances (including\n\
-  \    USDC) are populated before domains start. Handles both unified accounts (USDC is\n\
-  \    account-level collateral) and split accounts (USDC is in the assets array). "]
+  " Fetches all asset balances, positions, and margin via the REST API. Seeds them at\n\
+  \    startup and re-seeds on the periodic resync (see [start_account_resync]); [quiet]\n\
+  \    demotes the per-refresh log. Handles unified accounts (USDC is account-level\n\
+  \    collateral) and split accounts (USDC is in the assets array). "]
+;;
+
+(** Periodic REST re-seed of the account snapshot. [account_all] frames are the only live
+    position source after startup, so a dropped frame otherwise leaves positions stale
+    until a restart. *)
+let start_account_resync ?(interval_s = 60.0) () =
+  let rec loop () =
+    Lwt_unix.sleep interval_s
+    >>= fun () ->
+    fetch_balances ~quiet:true ()
+    >>= fun () ->
+    (* Independent next pass: a retained Lwt Forward node per interval would leak. *)
+    Lwt.async loop;
+    Lwt.return_unit
+  in
+  Lwt.async loop
 ;;
 
 let () = Exchange.Registry.register (module Lighter_impl)

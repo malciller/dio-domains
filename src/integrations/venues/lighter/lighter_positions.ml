@@ -9,6 +9,7 @@
 module Exchange = Dio_exchange.Exchange_intf
 
 let exchange = "lighter"
+let section = "lighter_positions"
 
 type margin_inputs =
   { account_value : float
@@ -58,6 +59,32 @@ let position_nodes account =
   | _ -> None
 ;;
 
+(** Frame node truncated to 200 bytes, for logs. *)
+let json_snippet json =
+  let s = Yojson.Safe.to_string json in
+  if String.length s <= 200 then s else String.sub s 0 200 ^ "..."
+;;
+
+(** [market_id -> coin] seen on an earlier frame. Position frames can omit [symbol], and a
+    node that resolves to no coin is dropped. Copy-on-write: parsed frames and the REST
+    resync both write it. *)
+let market_coins : (int, string) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
+
+let remember_market_coin market_id coin =
+  let rec loop () =
+    let current = Atomic.get market_coins in
+    match Hashtbl.find_opt current market_id with
+    | Some c when String.equal c coin -> ()
+    | _ ->
+      let copy = Hashtbl.copy current in
+      Hashtbl.replace copy market_id coin;
+      if not (Atomic.compare_and_set market_coins current copy) then loop ()
+  in
+  loop ()
+;;
+
+let market_coin market_id = Hashtbl.find_opt (Atomic.get market_coins) market_id
+
 let parse_position ~now json =
   let open Yojson.Safe.Util in
   let market_id =
@@ -78,7 +105,16 @@ let parse_position ~now json =
         ~default:""
     else ""
   in
-  let coin = Lighter_types.base_coin symbol in
+  let coin =
+    let resolved = Lighter_types.base_coin symbol in
+    if resolved <> ""
+    then (
+      if market_id >= 0 then remember_market_coin market_id resolved;
+      resolved)
+    else if market_id >= 0
+    then Option.value (market_coin market_id) ~default:""
+    else ""
+  in
   let raw_qty = float_of_json (member "position" json) in
   let sign =
     try member "sign" json |> to_int with
@@ -147,14 +183,39 @@ let apply_positions ~now nodes =
       (fun json ->
         try
           let p = parse_position ~now json in
-          if p.Exchange.Market_context.coin = ""
-             || Float.abs p.Exchange.Market_context.qty <= 1e-12
+          if Float.abs p.Exchange.Market_context.qty <= 1e-12
           then None
+          else if p.Exchange.Market_context.coin = ""
+          then (
+            Logging.warn_f
+              ~section
+              "Dropping position with no resolvable market: %s"
+              (json_snippet json);
+            None)
           else Some p
         with
-        | _ -> None)
+        | exn ->
+          Logging.warn_f
+            ~section
+            "Dropping unparseable position node: %s"
+            (Printexc.to_string exn);
+          None)
       nodes
   in
+  let previous = Atomic.get last_positions in
+  List.iter
+    (fun (old : Exchange.Market_context.position) ->
+      if not
+           (List.exists
+              (fun p -> String.equal p.Exchange.Market_context.coin old.coin)
+              live)
+      then
+        Logging.info_f
+          ~section
+          "Position cleared: %s qty=%.8g"
+          old.Exchange.Market_context.coin
+          old.Exchange.Market_context.qty)
+    previous;
   Atomic.set last_positions live;
   Dio_exchange.Market_context.replace_positions ~exchange ~updated_at:now live;
   List.iter

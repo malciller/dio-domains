@@ -189,6 +189,28 @@ let test_perp_orders_parsing () =
   | _ -> Alcotest.fail "expected one strategy with a perp block"
 ;;
 
+let test_zoom_clamps_to_deepest_order () =
+  let low, high =
+    Asset_graph.zoom_cap_span ~mid:100.0 ~bottom_ps:[ 98.0; 95.0 ] ~top_ps:[ 105.0 ]
+  in
+  Alcotest.(check (float 1e-9))
+    "floor is the deepest buy (a perp short's close)"
+    (95.0 *. 0.995)
+    low;
+  Alcotest.(check (float 1e-9)) "ceiling is the highest sell" (105.0 *. 1.005) high;
+  (* Levels on the wrong side of the mid never widen the clamp, and an empty side falls
+     back to the default band. *)
+  let low, high = Asset_graph.zoom_cap_span ~mid:100.0 ~bottom_ps:[] ~top_ps:[ 99.0 ] in
+  Alcotest.(check (float 1e-9))
+    "empty buy side keeps the default floor"
+    (100.0 *. 0.985 *. 0.995)
+    low;
+  Alcotest.(check (float 1e-9))
+    "sub-mid sell keeps the default ceiling"
+    (100.0 *. 1.015 *. 1.005)
+    high
+;;
+
 let test_asset_chart_renders_perp_orders () =
   let perp =
     `Assoc
@@ -398,6 +420,10 @@ let () =
             "perp orders render on the chart"
             `Quick
             test_asset_chart_renders_perp_orders
+        ; Alcotest.test_case
+            "zoom clamp anchors the deepest order"
+            `Quick
+            test_zoom_clamps_to_deepest_order
         ; Alcotest.test_case
             "latency and oracle parsing"
             `Quick
