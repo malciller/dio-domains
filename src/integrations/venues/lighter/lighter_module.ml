@@ -477,7 +477,7 @@ let initialize_signer () =
        | _ -> 0)
     | None -> 0
   in
-  let base_url = Lighter_proxy.api_base_url () in
+  let base_url = Lighter_endpoints.api_base_url in
   match
     Lighter_signer.initialize
       ~base_url
@@ -494,7 +494,7 @@ let initialize_signer () =
 ;;
 
 let initialize_instruments ~symbols =
-  let base_url = Lighter_proxy.api_base_url () in
+  let base_url = Lighter_endpoints.api_base_url in
   Lighter_instruments_feed.fetch_and_initialize ~base_url ~required_symbols:symbols
 [@@ocaml.doc
   " Fetches instrument metadata over REST for [symbols] into the instruments feed. "]
@@ -509,7 +509,7 @@ let fetch_open_orders () =
        | _ -> 0)
     | None -> 0
   in
-  let base_url = Lighter_proxy.api_base_url () in
+  let base_url = Lighter_endpoints.api_base_url in
   let token = Lighter_signer.get_auth_token () in
   let url =
     Printf.sprintf
@@ -549,7 +549,6 @@ let fetch_open_orders () =
                   (if String.length body_str > 200
                    then String.sub body_str 0 200 ^ "..."
                    else body_str);
-                if status >= 500 then Lighter_proxy.rotate_proxy ();
                 Lighter_executions_feed.set_startup_snapshot_done ();
                 Lwt.return_unit)
               else (
@@ -583,7 +582,7 @@ let fetch_balances () =
        | _ -> 0)
     | None -> 0
   in
-  let base_url = Lighter_proxy.api_base_url () in
+  let base_url = Lighter_endpoints.api_base_url in
   let url = Printf.sprintf "%s/api/v1/account?by=index&value=%d" base_url account_index in
   Lwt.catch
     (fun () ->
@@ -616,7 +615,6 @@ let fetch_balances () =
                   (if String.length body_str > 300
                    then String.sub body_str 0 300 ^ "..."
                    else body_str);
-                if status >= 500 then Lighter_proxy.rotate_proxy ();
                 Lwt.return_unit)
               else (
                 let trimmed = String.trim body_str in

@@ -1,6 +1,6 @@
 [@@@ocaml.text
   " Order actions for Lighter: place/cancel/modify via signed transactions. Dispatch uses\n\
-  \    REST [POST /api/v1/sendTx] via the configured LIGHTER_PROXY; signing happens in\n\
+  \    REST [POST /api/v1/sendTx] to Lighter mainnet; signing happens in\n\
   \    [lighter_signer.ml] over FFI. The WS [jsonapi/sendtx] path in [lighter_ws.ml] is\n\
   \    unused. "]
 
@@ -20,7 +20,7 @@ let next_client_order_index () =
 ;;
 
 let send_tx ~tx_type ~tx_info =
-  let url = Lighter_proxy.api_base_url () ^ "/api/v1/sendTx" in
+  let url = Lighter_endpoints.api_base_url ^ "/api/v1/sendTx" in
   Logging.debug_f ~section "Sending tx via REST (type=%d, tx_info=%s)" tx_type tx_info;
   Lwt.catch
     (fun () ->
@@ -86,7 +86,7 @@ let send_tx ~tx_type ~tx_info =
                     Logging.warn_f
                       ~section
                       "Nonce desync detected. Re-fetching correct nonce from exchange.";
-                    let base_url = Lighter_proxy.api_base_url () in
+                    let base_url = Lighter_endpoints.api_base_url in
                     Lwt.dont_wait
                       (fun () ->
                         Lighter_signer.initialize_nonce

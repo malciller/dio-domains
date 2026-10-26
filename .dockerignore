@@ -42,7 +42,6 @@ credentials*
 
 # Node
 node_modules
-proxy/
 
 # Docker
 Dockerfile

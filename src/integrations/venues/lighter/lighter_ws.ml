@@ -1,7 +1,6 @@
 [@@@ocaml.text
   " Lighter WebSocket client: dual persistent connections (public market data, private\n\
-  \    authenticated), routed through a Cloudflare Durable Object proxy. Each side \
-   reconnects\n\
+  \    authenticated) to the Lighter mainnet. Each side reconnects\n\
   \    independently; one side's failure does not tear down the other or force a full \
    order\n\
   \    book rebuild. "]
@@ -77,8 +76,8 @@ let incr_ping_failures () = Atomic.incr ping_failures
 
 let private_stream_confirmed = Atomic.make false
 [@@ocaml.doc
-  " Gates pings on the private connection until the first inbound frame proves the Durable\n\
-  \    Object relay is forwarding. "]
+  " Gates pings on the private connection until the first inbound frame proves the\n\
+  \    connection is live. "]
 ;;
 
 [@@@ocaml.text " Diagnostic counters by message category. "]
@@ -452,7 +451,7 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
 [@@ocaml.doc " Dispatches one WS frame by opcode and message type. "]
 ;;
 
-let rec connect_one
+let connect_one
   ~state
   ~connect_target
   ~ws_url
@@ -561,45 +560,14 @@ let rec connect_one
     (fun exn ->
       let error_msg = Printexc.to_string exn in
       Logging.debug_f ~section "[%s] WebSocket connection error: %s" label error_msg;
-      let is_server_error =
-        let rec contains_5xx i =
-          if i > String.length error_msg - 3
-          then false
-          else (
-            let sub = String.sub error_msg i 3 in
-            if sub = "500" || sub = "502" || sub = "503" || sub = "504"
-            then true
-            else contains_5xx (i + 1))
-        in
-        contains_5xx 0
-      in
-      if label = "Private" && is_server_error
-      then (
-        Lighter_proxy.rotate_proxy ();
-        if Lighter_proxy.has_more_proxies ()
-        then (
-          Atomic.set state.is_connected_ref false;
-          connect_one
-            ~state
-            ~connect_target
-            ~ws_url
-            ~on_failure
-            ~on_connected
-            ~on_heartbeat
-            ~label)
-        else (
-          Atomic.set state.is_connected_ref false;
-          on_failure error_msg;
-          Lwt.return_unit))
-      else (
-        Atomic.set state.is_connected_ref false;
-        on_failure error_msg;
-        Lwt.return_unit))
+      Atomic.set state.is_connected_ref false;
+      on_failure error_msg;
+      Lwt.return_unit)
 [@@ocaml.doc
   " Connects one side and reads frames until the transport dies. Raises on failure so the\n\
   \    [connect_and_monitor] loop can retry; never closes subscriber streams (the other \
    side\n\
-  \    stays unaffected). Rotates the proxy on 5xx errors from the private connection. "]
+  \    stays unaffected). "]
 ;;
 
 let close () : unit Lwt.t =
@@ -666,7 +634,6 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
       if not (Atomic.exchange both_ready_fired true)
       then (
         reset_ping_failures ();
-        Lighter_proxy.reset_proxy_failures ();
         on_connected ())
   in
   let reconnect_loop
@@ -737,8 +704,8 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
   Lwt.join
     [ reconnect_loop
         ~state:public_state
-        ~connect_target:Lighter_proxy.public_ws_connect_target
-        ~ws_url:Lighter_proxy.public_ws_url
+        ~connect_target:Lighter_endpoints.ws_connect_target
+        ~ws_url:Lighter_endpoints.public_ws_url
         ~label:"Public"
         ~ready_flag:pub_ready
         ~other_ready_flag:priv_ready
@@ -754,8 +721,8 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
           else Lwt.return_unit)
     ; reconnect_loop
         ~state:private_state
-        ~connect_target:Lighter_proxy.private_ws_connect_target
-        ~ws_url:Lighter_proxy.private_ws_url
+        ~connect_target:Lighter_endpoints.ws_connect_target
+        ~ws_url:Lighter_endpoints.private_ws_url
         ~label:"Private"
         ~ready_flag:priv_ready
         ~other_ready_flag:pub_ready

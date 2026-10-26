@@ -1,9 +1,6 @@
 .ruff_cache/
 reference/*
 
-
-proxy/cloudflare/.wrangler/
-proxy/cloudflare/node_modules/
 *.annot
 *.cmo
 *.cma
