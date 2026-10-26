@@ -220,6 +220,64 @@ let test_clear_all_open_orders_resets_reconnect_state () =
     (Lighter.Executions_feed.is_startup_snapshot_done ())
 ;;
 
+let test_fill_intent () =
+  let check label expected ~is_ask ~reduce_only =
+    Alcotest.(check string)
+      label
+      expected
+      (Lighter.Executions_feed.fill_intent ~symbol:"BTC" ~is_ask ~reduce_only)
+  in
+  check "buy opens long" "open_long" ~is_ask:false ~reduce_only:(Some false);
+  check "sell opens short" "open_short" ~is_ask:true ~reduce_only:(Some false);
+  check "buy closes short" "close_short" ~is_ask:false ~reduce_only:(Some true);
+  check "sell closes long" "close_long" ~is_ask:true ~reduce_only:(Some true)
+;;
+
+let test_parse_reduce_only () =
+  let check label expected json =
+    Alcotest.(check (option bool))
+      label
+      expected
+      (Lighter.Executions_feed.parse_reduce_only json)
+  in
+  check "snake bool" (Some true) (`Assoc [ "reduce_only", `Bool true ]);
+  check "camel bool" (Some false) (`Assoc [ "reduceOnly", `Bool false ]);
+  check "int" (Some true) (`Assoc [ "reduce_only", `Int 1 ]);
+  check "string" (Some false) (`Assoc [ "reduce_only", `String "false" ]);
+  check "absent" None (`Assoc [ "is_ask", `Bool true ])
+;;
+
+let test_fill_intent_position_fallback () =
+  let position qty : Dio_exchange.Market_context.position =
+    { coin = "EXFALL"
+    ; qty
+    ; entry = 100.0
+    ; position_value = 100.0
+    ; unrealized_pnl = 0.0
+    ; margin_used = 0.0
+    ; liquidation = None
+    ; leverage = None
+    ; updated_at = 1.0
+    }
+  in
+  let check label expected ~is_ask qty =
+    Dio_exchange.Market_context.replace_positions
+      ~exchange:"lighter"
+      ~updated_at:1.0
+      [ position qty ];
+    Alcotest.(check string)
+      label
+      expected
+      (Lighter.Executions_feed.fill_intent ~symbol:"EXFALL" ~is_ask ~reduce_only:None)
+  in
+  check "sell against long closes" "close_long" ~is_ask:true 2.0;
+  check "buy with long adds" "open_long" ~is_ask:false 2.0;
+  check "buy against short closes" "close_short" ~is_ask:false (-2.0);
+  check "sell with short adds" "open_short" ~is_ask:true (-2.0);
+  check "sell when flat opens short" "open_short" ~is_ask:true 0.0;
+  check "buy when flat opens long" "open_long" ~is_ask:false 0.0
+;;
+
 let () =
   Alcotest.run
     "Lighter Executions Feed"
@@ -236,6 +294,11 @@ let () =
             "clear resets reconnect state"
             `Quick
             test_clear_all_open_orders_resets_reconnect_state
+        ] )
+    ; ( "intent"
+      , [ Alcotest.test_case "reduce-only mapping" `Quick test_fill_intent
+        ; Alcotest.test_case "parse reduce_only" `Quick test_parse_reduce_only
+        ; Alcotest.test_case "position fallback" `Quick test_fill_intent_position_fallback
         ] )
     ; ( "state"
       , [ Alcotest.test_case "startup_snapshot_done" `Quick test_startup_snapshot_done

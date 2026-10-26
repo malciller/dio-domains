@@ -55,6 +55,7 @@ type execution_event =
     order records. Without it the overlay cannot recognise its own resting order and
     re-places it every tick. *)
 let user_refs : (string, int) Hashtbl.t = Hashtbl.create 64
+
 let user_refs_mutex = Mutex.create ()
 
 let register_userref ~client_order_id ~userref =
@@ -492,6 +493,53 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?cl_ord_id ?order_userref (
      | None -> "none")
 ;;
 
+(** [Some flag] when the order payload carries a reduce-only marker; [None] for venue
+    payloads that omit it. Accepts snake/camel spellings and string-encoded booleans. *)
+let parse_reduce_only json =
+  let open Yojson.Safe.Util in
+  let field =
+    try
+      let v = member "reduce_only" json in
+      if v <> `Null then v else member "reduceOnly" json
+    with
+    | _ -> `Null
+  in
+  match field with
+  | `Bool b -> Some b
+  | `Int i -> Some (i <> 0)
+  | `String s ->
+    (match String.lowercase_ascii s with
+     | "true" | "1" -> Some true
+     | "false" | "0" -> Some false
+     | _ -> None)
+  | _ -> None
+;;
+
+(** Resolves the fill's direction from the order itself. Lighter perps are two-sided, so
+    [is_ask] alone cannot say whether a sell opens a short or closes a long: reduce-only
+    marks an exit, a plain limit/market order opens. Falls back to the live position sign
+    when the venue omits the flag. *)
+let fill_intent ~symbol ~is_ask ~reduce_only =
+  match reduce_only with
+  | Some true -> if is_ask then "close_long" else "close_short"
+  | Some false -> if is_ask then "open_short" else "open_long"
+  | None ->
+    let held =
+      match
+        Dio_exchange.Market_context.get_position
+          ~exchange:"lighter"
+          ~coin:(Lighter_types.base_coin symbol)
+      with
+      | Some (p : Dio_exchange.Market_context.position) -> p.qty
+      | None -> 0.0
+    in
+    if is_ask
+    then if held > 0.0 then "close_long" else "open_short"
+    else if held < 0.0
+    then "close_short"
+    else "open_long"
+;;
+
 (** Ingests one account_all_orders broadcast: parses each order entry, maps statuses, and
     applies them via [update_orders_internal]. *)
 let process_account_orders_update json =
@@ -787,8 +835,8 @@ let process_account_orders_update json =
                 ; cl_ord_id
                 ; user_ref =
                     (match
-                       (try member "order_userref" order_json |> to_int with
-                        | _ -> 0)
+                       try member "order_userref" order_json |> to_int with
+                       | _ -> 0
                      with
                      | 0 -> lookup_userref client_order_id
                      | n -> Some n)
@@ -844,7 +892,11 @@ let process_account_orders_update json =
                    ; order_id
                    ; trade_id = order_id (* no separate trade id available *)
                    ; market = "perp"
-                   ; intent = if is_ask then "open_short" else "close_short"
+                   ; intent =
+                       fill_intent
+                         ~symbol
+                         ~is_ask
+                         ~reduce_only:(parse_reduce_only order_json)
                    ; strategy = "carry"
                    ; realized_pnl = None
                    ; note = None

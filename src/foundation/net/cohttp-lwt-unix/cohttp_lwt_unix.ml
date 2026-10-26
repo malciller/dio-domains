@@ -178,6 +178,7 @@ let make_body_stream ic oc headers ~is_head ~status_code : Cohttp_lwt.Body.t Lwt
 ;;
 
 let request
+  ?connect_host
   ~meth
   ?(headers = Cohttp.Header.init ())
   ?(body = Cohttp_lwt.Body.of_string "")
@@ -194,12 +195,18 @@ let request
     then host
     else Printf.sprintf "%s:%d" host port
   in
-  Lwt_unix.getaddrinfo host (string_of_int port) [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM ]
+  (* Dial target may differ from the URL host: a pinned egress relay answers for the real
+     host, so TLS SNI and [Host] stay on [host] while DNS resolves [connect_host]. *)
+  let dial_host = Option.value connect_host ~default:host in
+  Lwt_unix.getaddrinfo
+    dial_host
+    (string_of_int port)
+    [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM ]
   >>= fun addresses ->
   let ip =
     match addresses with
     | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ -> Ipaddr_unix.of_inet_addr addr
-    | _ -> failwith (Printf.sprintf "cannot resolve %s:%d" host port)
+    | _ -> failwith (Printf.sprintf "cannot resolve %s:%d" dial_host port)
   in
   let client : Conduit_lwt_unix.client =
     if is_tls then `TLS (`Hostname host, `IP ip, `Port port) else `TCP (`IP ip, `Port port)
@@ -252,7 +259,11 @@ let request
 
 module Client = struct
   let get ?headers uri = request ~meth:`GET ?headers uri
-  let post ?headers ?body uri = request ~meth:`POST ?headers ?body uri
+
+  let post ?connect_host ?headers ?body uri =
+    request ?connect_host ~meth:`POST ?headers ?body uri
+  ;;
+
   let patch ?headers ?body uri = request ~meth:`PATCH ?headers ?body uri
   let delete ?headers uri = request ~meth:`DELETE ?headers uri
 end
