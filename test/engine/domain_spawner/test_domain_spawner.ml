@@ -296,29 +296,30 @@ let test_reconstruct_fresh () =
   let seed =
     reconstruct_ladder l ~leverage:20.0 ~entry ~short_qty ~accumulated:1.0 ~mark:80_100.0
   in
+  let size k = l.ol_add_first *. (l.ol_add_growth ** float_of_int k) in
   close "fresh anchor is the entry" entry seed.ls_anchor;
   Alcotest.(check int) "fresh starts at rung 0" 0 seed.ls_add_index;
-  close "first rung size" l.ol_add_first seed.ls_rung_qty;
+  close "fresh carries nothing" 0.0 seed.ls_carry;
+  close "first rung size" (size 0) seed.ls_rung_qty;
   close "first band one step above the entry" (entry *. (1.0 +. step ())) seed.ls_next_add
 ;;
 
-let test_reconstruct_mid_ladder () =
-  (* Five rungs filled, price now at rung 8: the last completed rung is kept so the missed
-     bands stay armed for the catch-up instead of being marked done. *)
+let test_reconstruct_catches_up () =
+  (* Five rungs on the book, price now at rung 8: rungs 6-7 move into the carry, the
+     index stops at rung 7 so the next arm places 6-8 at the current mark. *)
   let l = test_ladder () in
   let anchor = 80_000.0 in
+  let size k = l.ol_add_first *. (l.ol_add_growth ** float_of_int k) in
   let entry, short_qty = ladder_position ~filled:5 ~anchor ~balance:1.0 in
   let mark = anchor *. (1.0 +. (8.0 *. step ())) in
   let seed =
     reconstruct_ladder l ~leverage:20.0 ~entry ~short_qty ~accumulated:1.0 ~mark
   in
   close "mid-ladder anchor recovered" anchor seed.ls_anchor;
-  Alcotest.(check int) "last completed rung" 5 seed.ls_add_index;
-  close
-    "next rung size follows the geometric schedule"
-    (l.ol_add_first *. (l.ol_add_growth ** 5.0))
-    seed.ls_rung_qty;
-  close "next band is rung 6" (anchor *. (1.0 +. (6.0 *. step ()))) seed.ls_next_add
+  Alcotest.(check int) "stopped one rung below the price" 7 seed.ls_add_index;
+  close "missed sizes are carried" (size 5 +. size 6) seed.ls_carry;
+  close "next rung is the price rung" (size 7) seed.ls_rung_qty;
+  close "next band is the price band" mark seed.ls_next_add
 ;;
 
 let test_reconstruct_retrace_rearms () =
@@ -333,6 +334,7 @@ let test_reconstruct_retrace_rearms () =
   in
   close "anchor still recovered" anchor seed.ls_anchor;
   Alcotest.(check int) "retrace re-arms down to the price rung" 2 seed.ls_add_index;
+  close "retrace carries nothing" 0.0 seed.ls_carry;
   close
     "next band is one step above the retrace"
     (anchor *. (1.0 +. (3.0 *. step ())))
@@ -355,9 +357,9 @@ let () =
             `Quick
             test_reconstruct_fresh
         ; Alcotest.test_case
-            "mid-ladder recovers the anchor and rung"
+            "mid-ladder catch-up carries the crossed rungs"
             `Quick
-            test_reconstruct_mid_ladder
+            test_reconstruct_catches_up
         ; Alcotest.test_case
             "retrace re-arms the rungs below the price"
             `Quick
