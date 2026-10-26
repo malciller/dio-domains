@@ -12,6 +12,8 @@ type market_info =
   ; supported_price_decimals : int (** Decimal precision for prices. *)
   ; min_base_amount : float (** Minimum order size in base units. *)
   ; min_quote_amount : float (** Minimum order notional in quote units. *)
+  ; maintenance_margin_fraction : float
+  (** Maintenance margin fraction in basis points (120 = 1.2%). *)
   ; taker_fee : float (** Taker fee bps. *)
   ; maker_fee : float (** Maker fee bps. *)
   }
@@ -150,4 +152,17 @@ let parse_json_int64 json =
   | `Int i -> Int64.of_int i
   | `Float f -> Int64.of_float f
   | _ -> 0L
+;;
+
+(** Base coin from a venue symbol: ["BTC/USDC"] and ["BTC-USD"] both yield ["BTC"]. *)
+let base_coin symbol =
+  let stop =
+    match String.index_opt symbol '/', String.index_opt symbol '-' with
+    | Some a, Some b -> Some (min a b)
+    | Some i, None | None, Some i -> Some i
+    | None, None -> None
+  in
+  match stop with
+  | Some i -> String.sub symbol 0 i
+  | None -> symbol
 ;;

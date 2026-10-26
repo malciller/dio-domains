@@ -264,9 +264,12 @@ module Lighter_impl = struct
   ;;
 
   let get_all_orders_for_asset ~asset =
-    let prefix = asset ^ "/" in
     let all_symbols = Lighter_executions_feed.get_all_symbols () in
-    let matching = List.filter (fun sym -> String.starts_with ~prefix sym) all_symbols in
+    let matching =
+      List.filter
+        (fun symbol -> symbol = asset || Lighter_types.base_coin symbol = asset)
+        all_symbols
+    in
     List.concat_map (fun symbol -> get_open_orders ~symbol) matching
   ;;
 
@@ -625,6 +628,7 @@ let fetch_balances () =
                    then String.sub trimmed 0 500 ^ "..."
                    else trimmed);
                 let json = Yojson.Safe.from_string trimmed in
+                Lighter_positions.process_rest_account json;
                 let open Yojson.Safe.Util in
                 let accounts =
                   try member "accounts" json |> to_list with
@@ -732,6 +736,14 @@ let fetch_balances () =
 ;;
 
 let () = Exchange.Registry.register (module Lighter_impl)
+let () = Exchange.Oracle.Registry.register (module Lighter_oracle)
+
+(** Register the optional perp capabilities when this module loads. *)
+let () =
+  let module Registry = Dio_exchange.Exchange_intf.Registry in
+  Registry.register_market_context (module Lighter_market_context.Impl);
+  Registry.register_capital_reservation (module Lighter_capital_reservation.Impl)
+;;
 
 let () =
   Concurrency.Parse_worker.register_venue_decoder

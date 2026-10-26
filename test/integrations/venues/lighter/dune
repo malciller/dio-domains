@@ -25,3 +25,8 @@
 (test
  (name test_lighter_module)
  (libraries dio.lighter dio.exchange alcotest))
+
+(test
+ (name test_lighter_market_context)
+ (modules test_lighter_market_context)
+ (libraries dio.lighter dio.exchange alcotest))

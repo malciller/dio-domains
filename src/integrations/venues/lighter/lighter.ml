@@ -27,6 +27,22 @@ module Executions_feed = Lighter_executions_feed
 (** Market metadata: contract specs, precision parameters, symbol/market index mappings. *)
 module Instruments_feed = Lighter_instruments_feed
 
+(** Perp position and margin snapshots from the account channels. *)
+module Positions = Lighter_positions
+
+(** Funding, mark, index, and premium snapshots from [market_stats]. *)
+module Market_stats = Lighter_market_stats
+
+(** Optional engine-facing market-context capability. *)
+module Market_context = Lighter_market_context
+
+(** Oracle data-venue adapter (candles, fees, balances, instruments); implements
+    [Exchange_intf.Oracle.S]. *)
+module Oracle = Lighter_oracle
+
+(** Optional engine-facing quote reservation capability. *)
+module Capital_reservation = Lighter_capital_reservation
+
 (** Lifecycle controller: initialization, startup, and shutdown of the connectivity
     subcomponents. *)
 module Module = Lighter_module

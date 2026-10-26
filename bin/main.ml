@@ -108,6 +108,7 @@ let setup_signal_handlers () =
    registration. *)
 let () = ignore Kraken.Kraken_module.Kraken_impl.name
 let () = ignore Hyperliquid.Module.Hyperliquid_impl.name
+let () = ignore Lighter.Module.Lighter_impl.name
 let () = ignore Alpaca.Module.Alpaca_impl.name
 
 (** Register handlers for fatal signals (SIGSEGV, SIGABRT, SIGBUS, SIGFPE) to capture

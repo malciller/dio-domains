@@ -477,6 +477,7 @@ let request_balance_refresh () =
                     if trimmed <> "" && trimmed <> "{}"
                     then (
                       let json = Yojson.Safe.from_string trimmed in
+                      Lighter_positions.process_rest_account json;
                       let open Yojson.Safe.Util in
                       let accounts =
                         try member "accounts" json |> to_list with

@@ -45,4 +45,5 @@
   dio.cmc
   dio.kraken
   dio.hyperliquid
+  dio.lighter
   dio.alpaca))

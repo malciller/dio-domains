@@ -85,6 +85,13 @@ let fetch_and_initialize ~base_url ~required_symbols =
                             with
                             | _ -> 0.0
                           in
+                          let maintenance_margin_fraction =
+                            try
+                              Lighter_types.parse_json_float
+                                (member "maintenance_margin_fraction" market)
+                            with
+                            | _ -> 0.0
+                          in
                           let info : Lighter_types.market_info =
                             { market_index
                             ; symbol
@@ -92,6 +99,7 @@ let fetch_and_initialize ~base_url ~required_symbols =
                             ; supported_price_decimals
                             ; min_base_amount
                             ; min_quote_amount
+                            ; maintenance_margin_fraction
                             ; taker_fee
                             ; maker_fee
                             }
@@ -167,14 +175,20 @@ let fetch_and_initialize ~base_url ~required_symbols =
                                           let perp_info =
                                             Hashtbl.find_opt pair_cache perp_symbol
                                           in
-                                          let size_dec, price_dec, min_base, min_quote =
+                                          let ( size_dec
+                                              , price_dec
+                                              , min_base
+                                              , min_quote
+                                              , mmf )
+                                            =
                                             match perp_info with
                                             | Some pi ->
                                               ( pi.supported_size_decimals
                                               , pi.supported_price_decimals
                                               , pi.min_base_amount
-                                              , pi.min_quote_amount )
-                                            | None -> 4, 2, 0.005, 10.0
+                                              , pi.min_quote_amount
+                                              , pi.maintenance_margin_fraction )
+                                            | None -> 4, 2, 0.005, 10.0, 0.0
                                           in
                                           let info : Lighter_types.market_info =
                                             { market_index = mi
@@ -183,6 +197,7 @@ let fetch_and_initialize ~base_url ~required_symbols =
                                             ; supported_price_decimals = price_dec
                                             ; min_base_amount = min_base
                                             ; min_quote_amount = min_quote
+                                            ; maintenance_margin_fraction = mmf
                                             ; taker_fee = 0.0
                                             ; maker_fee = 0.0
                                             }
@@ -333,6 +348,13 @@ let get_qty_min symbol =
 [@@ocaml.doc " Minimum order quantity for [symbol]. "]
 ;;
 
+let get_maintenance_margin_fraction symbol =
+  match lookup_info symbol with
+  | Some info -> Some info.maintenance_margin_fraction
+  | None -> None
+[@@ocaml.doc " Maintenance margin fraction in basis points for [symbol] (120 = 1.2%). "]
+;;
+
 let round_price_for_symbol symbol price =
   match lookup_info symbol with
   | Some info ->
@@ -348,7 +370,7 @@ let round_qty_for_symbol symbol qty =
 [@@ocaml.doc " Round qty down to lot precision for [symbol]. "]
 ;;
 
-let initialize symbols =
+let initialize ?(maintenance_margin_fraction = 0.0) symbols =
   Mutex.lock cache_mutex;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock cache_mutex)
@@ -362,6 +384,7 @@ let initialize symbols =
             ; supported_price_decimals = 2
             ; min_base_amount = 0.001
             ; min_quote_amount = 1.0
+            ; maintenance_margin_fraction
             ; taker_fee = 0.0
             ; maker_fee = 0.0
             }

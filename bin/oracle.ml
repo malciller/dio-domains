@@ -415,6 +415,7 @@ let apply_venue_shared_sim (rows : row list) : row list =
    that registry. *)
 let () = ignore Kraken.Kraken_module.Kraken_impl.name
 let () = ignore Hyperliquid.Module.Hyperliquid_impl.name
+let () = ignore Lighter.Module.Lighter_impl.name
 let () = ignore Alpaca.Module.Alpaca_impl.name
 
 let () =

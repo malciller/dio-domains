@@ -212,11 +212,46 @@ let subscribe_public_orderbook ~symbols =
     public_stream
 ;;
 
+let subscribe_public_market_stats ~symbols =
+  let perp_symbols = List.filter (fun s -> not (String.contains s '/')) symbols in
+  let public_stream = Lwt_stream.of_list perp_symbols in
+  Concurrency.Lwt_util.consume_stream_s
+    (fun symbol ->
+      match Lighter_instruments_feed.get_market_index ~symbol with
+      | Some market_index ->
+        let mi_str = string_of_int market_index in
+        let __ppx_lwt_0 =
+          send_public_json
+            (`Assoc
+              [ "type", `String "subscribe"
+              ; "channel", `String ("market_stats/" ^ mi_str)
+              ])
+            "Public"
+        in
+        Lwt.backtrace_bind
+          "src/integrations/venues/lighter/lighter_ws.ml"
+          196
+          (fun exn ->
+            try Lwt.reraise exn with
+            | exn -> exn)
+          __ppx_lwt_0
+          (fun () ->
+            Logging.debug_f ~section "Subscribed to market_stats/%s for %s" mi_str symbol;
+            Lwt.return_unit)
+      | None ->
+        Logging.error_f ~section "Cannot subscribe: no market_index for symbol %s" symbol;
+        Lwt.return_unit)
+    public_stream
+;;
+
 let subscribe_to_feeds ~symbols ~account_index ~auth_token =
   subscribed_symbols := symbols;
   subscribed_account_index := account_index;
   subscribed_auth_token := auth_token;
-  let __ppx_lwt_0 = subscribe_public_orderbook ~symbols in
+  let __ppx_lwt_0 =
+    Lwt.join
+      [ subscribe_public_orderbook ~symbols; subscribe_public_market_stats ~symbols ]
+  in
   Lwt.backtrace_bind
     "src/integrations/venues/lighter/lighter_ws.ml"
     203
@@ -376,17 +411,24 @@ let decode_text_frame content : text_frame_kind =
     Atomic.incr msg_counter_account;
     Lighter_executions_feed.process_account_orders_update json;
     Frame_data
-  | "update/account_all"
-  | "snapshot/account_all"
-  | "subscribed/account_all"
-  | "update/account_all_assets"
-  | "snapshot/account_all_assets"
-  | "subscribed/account_all_assets"
-  | "update/user_stats"
-  | "snapshot/user_stats"
-  | "subscribed/user_stats" ->
+  | "update/account_all" | "snapshot/account_all" | "subscribed/account_all" ->
     Atomic.incr msg_counter_account;
     Lighter_balances.process_market_data json;
+    ignore (Lighter_positions.process_account_all json);
+    Frame_data
+  | "update/account_all_assets"
+  | "snapshot/account_all_assets"
+  | "subscribed/account_all_assets" ->
+    Atomic.incr msg_counter_account;
+    Lighter_balances.process_market_data json;
+    Frame_data
+  | "update/user_stats" | "snapshot/user_stats" | "subscribed/user_stats" ->
+    Atomic.incr msg_counter_account;
+    Lighter_balances.process_market_data json;
+    ignore (Lighter_positions.process_user_stats json);
+    Frame_data
+  | "update/market_stats" | "snapshot/market_stats" | "subscribed/market_stats" ->
+    Lighter_market_stats.process_market_data json;
     Frame_data
   | "pong" -> Frame_pong
   | t -> Frame_unmatched (t, channel)
@@ -717,7 +759,10 @@ let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
               ~section
               "Public WS reconnected \226\128\148 resubscribing %d orderbook channels"
               (List.length symbols);
-            subscribe_public_orderbook ~symbols)
+            Lwt.join
+              [ subscribe_public_orderbook ~symbols
+              ; subscribe_public_market_stats ~symbols
+              ])
           else Lwt.return_unit)
     ; reconnect_loop
         ~state:private_state
