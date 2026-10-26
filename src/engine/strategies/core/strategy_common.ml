@@ -106,8 +106,20 @@ type carry_order_meta =
 
 let carry_registry_mutex = Mutex.create ()
 let carry_pending : (string, carry_order_meta) Hashtbl.t = Hashtbl.create 16
-let carry_orders : (string, carry_order_meta) Hashtbl.t = Hashtbl.create 64
-let carry_order_queue : string Queue.t = Queue.create ()
+
+(** Bounded id -> meta index. The keyspace is every venue order id ever registered, which
+    is unbounded because an amend replaces the id. [Fifo_index] tracks admission
+    separately from map membership, so retiring an id out of band cannot make a later
+    re-insert double-queue and evict a live row; its FIFO queue still needs a periodic
+    [trim_carry_orders] because removals leave superseded queue records behind. *)
+let carry_orders : carry_order_meta Concurrency.Fifo_index.t =
+  Concurrency.Fifo_index.create
+    ~label:"strategy.carry_orders"
+    ~cap:Concurrency.Cache_limits.carry_order_index_cap
+    ()
+;;
+
+let carry_order_capacity = Concurrency.Fifo_index.cap carry_orders
 
 (** True only for the execution statuses that end an order's life. [New] and
     [PartiallyFilled] are live: the id -> kind mapping must survive so [order_replace]
@@ -146,7 +158,7 @@ let has_tracked_carry_order ?(max_age = carry_tracked_ack_grace_s) ~key () =
   let now = Unix.gettimeofday () in
   Mutex.lock carry_registry_mutex;
   let found =
-    Hashtbl.fold
+    Concurrency.Fifo_index.fold
       (fun _ meta acc ->
         acc || (String.equal meta.com_key key && now -. meta.com_at <= max_age))
       carry_orders
@@ -156,11 +168,19 @@ let has_tracked_carry_order ?(max_age = carry_tracked_ack_grace_s) ~key () =
   found
 ;;
 
-let trim_carry_orders_locked () =
-  while Hashtbl.length carry_orders > 2048 && not (Queue.is_empty carry_order_queue) do
-    let oid = Queue.pop carry_order_queue in
-    Hashtbl.remove carry_orders oid
-  done
+(** Drop admission records whose row was retired out of band. [Fifo_index.evict] only pops
+    while the map is over its cap, so without this sweep a long-lived process that retires
+    most orders leaves one queue record per order ever seen. Called from the engine's
+    periodic in-flight cleanup; returns the number dropped. *)
+let trim_carry_orders () =
+  Mutex.lock carry_registry_mutex;
+  let dropped = Concurrency.Fifo_index.trim_queue carry_orders in
+  Mutex.unlock carry_registry_mutex;
+  dropped
+;;
+
+let set_carry_order_locked order_id meta =
+  Concurrency.Fifo_index.set carry_orders ~key:order_id ~value:meta
 ;;
 
 let bind_carry_order ~dedup_key ~order_id =
@@ -170,9 +190,7 @@ let bind_carry_order ~dedup_key ~order_id =
     (match Hashtbl.find_opt carry_pending dedup_key with
      | Some meta ->
        Hashtbl.remove carry_pending dedup_key;
-       Hashtbl.replace carry_orders order_id meta;
-       Queue.push order_id carry_order_queue;
-       trim_carry_orders_locked ()
+       set_carry_order_locked order_id meta
      | None -> ());
     Mutex.unlock carry_registry_mutex)
 ;;
@@ -182,8 +200,7 @@ let bind_carry_order ~dedup_key ~order_id =
     removed it keeps suppressing replacements for the same kind. *)
 let register_carry_order_id ~order_id ~market ~maker ~kind ~key =
   Mutex.lock carry_registry_mutex;
-  Hashtbl.replace
-    carry_orders
+  set_carry_order_locked
     order_id
     { com_market = market
     ; com_maker = maker
@@ -191,8 +208,6 @@ let register_carry_order_id ~order_id ~market ~maker ~kind ~key =
     ; com_key = key
     ; com_at = Unix.gettimeofday ()
     };
-  Queue.push order_id carry_order_queue;
-  trim_carry_orders_locked ();
   Mutex.unlock carry_registry_mutex
 ;;
 
@@ -206,14 +221,14 @@ let retire_pending_carry_order ~dedup_key =
 
 let lookup_carry_order ~order_id =
   Mutex.lock carry_registry_mutex;
-  let meta = Hashtbl.find_opt carry_orders order_id in
+  let meta = Concurrency.Fifo_index.find_opt carry_orders order_id in
   Mutex.unlock carry_registry_mutex;
   meta
 ;;
 
 let retire_carry_order ~order_id =
   Mutex.lock carry_registry_mutex;
-  Hashtbl.remove carry_orders order_id;
+  Concurrency.Fifo_index.remove carry_orders order_id;
   Mutex.unlock carry_registry_mutex
 ;;
 
@@ -222,8 +237,8 @@ let retire_carry_order ~order_id =
     [None] when the id was untracked. *)
 let retire_carry_order_key ~order_id =
   Mutex.lock carry_registry_mutex;
-  let meta = Hashtbl.find_opt carry_orders order_id in
-  Hashtbl.remove carry_orders order_id;
+  let meta = Concurrency.Fifo_index.find_opt carry_orders order_id in
+  Concurrency.Fifo_index.remove carry_orders order_id;
   Mutex.unlock carry_registry_mutex;
   match meta with
   | Some m -> Some m.com_key
@@ -540,6 +555,22 @@ module Placement_backoff = struct
     Mutex.unlock mutex;
     left
   ;;
+
+  (** Drop expired holds. [remaining] prunes only the key it is asked about, so a symbol
+      that stops being replaced after a rejection would otherwise retain its entry for the
+      life of the process. Keys are bounded by configuration; this sweep keeps the table
+      at the live backoff set rather than everything that ever failed. *)
+  let cleanup () =
+    let now = Unix.gettimeofday () in
+    Mutex.lock mutex;
+    let before = Hashtbl.length table in
+    Hashtbl.filter_map_inplace
+      (fun _ until -> if until > now then Some until else None)
+      table;
+    let removed = before - Hashtbl.length table in
+    Mutex.unlock mutex;
+    removed
+  ;;
 end
 
 (** In-flight amendment lifecycle registry: deduplication of pending amend requests plus
@@ -572,6 +603,13 @@ module InFlightAmendments = struct
 
   (* Sharded like InFlightOrders: keyed by hash of the order id. *)
   let num_shards = 64
+
+  (** A [Pending] entry normally lives for one REST round-trip (seconds). Ten minutes is
+      far beyond the longest request timeout, so an entry older than this cannot still
+      have a request in flight: its response was lost or its callback never ran. Dropping
+      it bounds the only phase that is otherwise never evicted; a terminal event that
+      arrives later still reconciles tracking. *)
+  let pending_max_age_s = 600.0
 
   let registries : (string, entry) Hashtbl.t array =
     Array.init num_shards (fun _ -> Hashtbl.create 128)
@@ -731,6 +769,7 @@ module InFlightAmendments = struct
     if now -. last > 1.0 && Atomic.compare_and_set last_cleanup last now
     then (
       let removed = ref 0 in
+      let stale_pending = ref 0 in
       for s = 0 to num_shards - 1 do
         let mutex = shard_mutexes.(s) in
         Mutex.lock mutex;
@@ -739,13 +778,26 @@ module InFlightAmendments = struct
         Hashtbl.filter_map_inplace
           (fun _ (entry : entry) ->
             match entry.phase with
-            | Pending -> Some entry
+            | Pending ->
+              if now -. entry.last <= pending_max_age_s
+              then Some entry
+              else (
+                incr stale_pending;
+                None)
             | Replaced _ | Failed _ | Skipped ->
               if now -. entry.last <= max_age then Some entry else None)
           registry;
         removed := !removed + (initial_size - Hashtbl.length registry);
         Mutex.unlock mutex
       done;
+      if !stale_pending > 0
+      then
+        Logging.warn_f
+          ~section:"strategy_common"
+          "evicted %d unanswered amendment(s) older than %.0fs (lost terminal event); \
+           the amend registry stays bounded"
+          !stale_pending
+          pending_max_age_s;
       0, !removed)
     else 0, 0
   ;;

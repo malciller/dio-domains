@@ -61,6 +61,12 @@ let order_index_min_cap = 32
     expected to be well above the common floor. *)
 let order_index_hyperliquid_min_cap = 1024
 
+(** Carry-overlay order-id -> logical-kind mappings. A venue amend replaces the order id,
+    so the keyspace grows with every amendment for the life of the process. The live set
+    is one entry per resting carry order, but the bound is generous enough to cover a
+    ladder pass over several instruments without evicting a resting take-profit. *)
+let carry_order_index_cap = 2048
+
 (* --- TTL / sweep intervals ------------------------------------------------------------ *)
 
 (** Minimum seconds between [Fee_cache] expiry sweeps. The fee keyspace is bounded by

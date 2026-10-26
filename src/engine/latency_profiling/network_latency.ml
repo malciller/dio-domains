@@ -508,7 +508,10 @@ let start_publisher ?(log_spikes = false) ?(threshold_us = 10.0) () =
     Lwt_unix.sleep publish_interval_seconds
     >>= fun () ->
     publish_all ~log_spikes ~threshold_us ();
-    loop ()
+    (* Spawn the next window independently so a process-lifetime publisher does not retain
+       one Lwt Forward node per interval. *)
+    Lwt.async loop;
+    Lwt.return_unit
   in
   Lwt.async loop
 ;;

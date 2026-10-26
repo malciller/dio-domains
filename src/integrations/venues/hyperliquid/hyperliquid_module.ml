@@ -1127,7 +1127,13 @@ let start_staking_balance_poller () =
           "Staking poller loop exception: %s"
           (Printexc.to_string exn);
         Lwt.return_unit)
-    >>= fun () -> Lwt_unix.sleep 10.0 >>= fun () -> loop ()
+    >>= fun () ->
+    Lwt_unix.sleep 10.0
+    >>= fun () ->
+    (* Spawn the next poll independently: a recursive [sleep >>= loop] chain runs for the
+       process lifetime and retains one Lwt node per interval. *)
+    Lwt.async loop;
+    Lwt.return_unit
   in
   Lwt.async loop
 ;;
@@ -1481,7 +1487,12 @@ let () =
            balance/positions/open-orders resync";
         resync_user_state ())
       else Hyperliquid_ws.note_user_resync_needed ());
-    Lwt_unix.sleep 0.25 >>= watch
+    Lwt_unix.sleep 0.25
+    >>= fun () ->
+    (* Sever the poll chain: [watch] runs for the process lifetime, so a recursive bind
+       would retain one Lwt Forward/task per 250ms tick. *)
+    Lwt.async watch;
+    Lwt.return_unit
   in
   Lwt.async watch
 ;;

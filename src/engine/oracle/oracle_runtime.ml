@@ -405,7 +405,10 @@ let rec pump_wake () =
    | _ -> ());
   Atomic.set wake_pending false;
   Lwt_condition.broadcast wake_condition ();
-  pump_wake ()
+  (* Spawn the next reader independently: chaining it with [>>=] would leave one Lwt
+     Forward node behind per doorbell for the life of the process. *)
+  Lwt.async pump_wake;
+  Lwt.return_unit
 ;;
 
 (** Starts the pump fiber. Idempotent; must run on the main Lwt domain. *)
@@ -419,15 +422,34 @@ let pass_requested_changed generation = Atomic.get pass_requested <> generation
     deadline, because every input transition rings the doorbell. The periodic history /
     balance refresh still calls [request_pass] when it completes, so a restarted or
     recovered feed also wakes the loop. *)
-let rec wait_event ~(generation : int) () =
-  if is_stopped () || pass_requested_changed generation
-  then Lwt.return_unit
-  else (
-    start_waker ();
-    let w = Lwt_condition.wait wake_condition in
+let wait_event ~(generation : int) () =
+  let finished, finished_u = Lwt.wait () in
+  let finish () = if Lwt.is_sleeping finished then Lwt.wakeup_later finished_u () in
+  let rec loop () =
     if is_stopped () || pass_requested_changed generation
-    then Lwt_condition.broadcast wake_condition ();
-    w >|= (fun () -> ()) >>= fun () -> wait_event ~generation ())
+    then (
+      finish ();
+      Lwt.return_unit)
+    else (
+      start_waker ();
+      let w = Lwt_condition.wait wake_condition in
+      (* Close the race between the predicate check above and registering the waiter. *)
+      if is_stopped () || pass_requested_changed generation
+      then Lwt_condition.broadcast wake_condition ();
+      w
+      >>= fun () ->
+      (* A spurious broadcast (or a wake for an unrelated waiter) must not accumulate a
+         recursive [>>=] chain: park again from a freshly-spawned iteration. *)
+      if is_stopped () || pass_requested_changed generation
+      then (
+        finish ();
+        Lwt.return_unit)
+      else (
+        Lwt.async loop;
+        Lwt.return_unit))
+  in
+  Lwt.async loop;
+  finished
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -1669,20 +1691,46 @@ let run_loop
   in
   wait_initial_refresh ()
   >>= fun () ->
+  (* [run_loop]'s promise is held by the supervisor's [Lwt.pick] for the life of the
+     oracle. A recursive [wait_event >>= loop] would therefore pin one Lwt Forward node
+     per pass (the head stays reachable from the pick), growing the heap without bound.
+     Each iteration is spawned independently and [finished] preserves the old contract: it
+     resolves on shutdown or fails if an iteration raises. *)
+  let finished, finished_u = Lwt.wait () in
+  let finish_ok () = if Lwt.is_sleeping finished then Lwt.wakeup_later finished_u () in
+  let finish_error exn =
+    if Lwt.is_sleeping finished then Lwt.wakeup_later_exn finished_u exn
+  in
   let rec loop () =
     if is_stopped ()
     then (
       Logging.info ~section "oracle runtime stopped";
-      Lwt.return ())
+      finish_ok ();
+      Lwt.return_unit)
     else (
       (* Capture before the pass so a request landing mid-pass is consumed by the
          post-pass predicate recheck. *)
       let generation = Atomic.get pass_requested in
       Atomic.set pass_running true;
-      run_pass ~config ~tasks ~on_publish
-      >>= fun () ->
-      Atomic.set pass_running false;
-      wait_event ~generation () >>= loop)
+      Lwt.catch
+        (fun () ->
+          run_pass ~config ~tasks ~on_publish
+          >>= fun () ->
+          Atomic.set pass_running false;
+          wait_event ~generation ()
+          >>= fun () ->
+          if is_stopped ()
+          then (
+            finish_ok ();
+            Lwt.return_unit)
+          else (
+            Lwt.async loop;
+            Lwt.return_unit))
+        (fun exn ->
+          Atomic.set pass_running false;
+          finish_error exn;
+          Lwt.return_unit))
   in
-  loop ()
+  Lwt.async loop;
+  finished
 ;;

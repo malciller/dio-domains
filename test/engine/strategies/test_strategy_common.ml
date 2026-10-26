@@ -284,12 +284,12 @@ let test_tracked_carry_order_is_ack_age_bounded () =
   Alcotest.(check bool) "acked order is tracked" true (C.has_tracked_carry_order ~key ());
   let age order_id seconds =
     Mutex.lock C.carry_registry_mutex;
-    (match Hashtbl.find_opt C.carry_orders order_id with
+    (match Concurrency.Fifo_index.find_opt C.carry_orders order_id with
      | Some meta ->
-       Hashtbl.replace
+       Concurrency.Fifo_index.set
          C.carry_orders
-         order_id
-         { meta with C.com_at = Unix.gettimeofday () -. seconds }
+         ~key:order_id
+         ~value:{ meta with C.com_at = Unix.gettimeofday () -. seconds }
      | None -> ());
     Mutex.unlock C.carry_registry_mutex
   in
@@ -314,6 +314,61 @@ let test_tracked_carry_order_is_ack_age_bounded () =
     "terminal retirement clears the guard"
     false
     (C.has_tracked_carry_order ~key ())
+;;
+
+let test_carry_registry_stays_bounded () =
+  let module C = Dio_strategies.Strategy_common in
+  let module F = Concurrency.Fifo_index in
+  let key = "test:bounded|hyperliquid|TEST" in
+  (* Amend acks retire the old id and register a new one. Retiring cannot remove the FIFO
+     admission record in O(1), so without the periodic trim the queue would retain one
+     record per order ever seen while the map stayed at one entry. *)
+  for i = 1 to 5_000 do
+    let order_id = Printf.sprintf "oid-bounded-%d" i in
+    C.register_carry_order_id
+      ~order_id
+      ~market:C.Carry_perp
+      ~maker:false
+      ~kind:"carry:entry"
+      ~key;
+    C.retire_carry_order ~order_id
+  done;
+  let before = F.stats C.carry_orders in
+  Alcotest.(check int) "retired ids leave the map empty" 0 before.entries;
+  Alcotest.(check bool)
+    "superseded queue records are retained until the sweep"
+    true
+    (before.pending_queue >= 5_000);
+  ignore (C.trim_carry_orders ());
+  let after = F.stats C.carry_orders in
+  Alcotest.(check int) "sweep compacts the admission queue" 0 after.pending_queue;
+  Alcotest.(check bool)
+    "map never exceeds its declared cap"
+    true
+    (after.entries <= C.carry_order_capacity)
+;;
+
+let test_unanswered_amendment_is_age_bounded () =
+  let module C = Dio_strategies.Strategy_common in
+  let module A = C.InFlightAmendments in
+  let order_id = "oid-amend-stale" in
+  ignore (A.add_in_flight_amendment order_id);
+  let shard = A.shard_of order_id in
+  Mutex.lock A.shard_mutexes.(shard);
+  (match Hashtbl.find_opt A.registries.(shard) order_id with
+   | Some entry -> entry.last <- Unix.gettimeofday () -. (A.pending_max_age_s +. 1.0)
+   | None -> ());
+  Mutex.unlock A.shard_mutexes.(shard);
+  (* [cleanup] only runs once a second; make the throttle window already elapsed. *)
+  Atomic.set A.last_cleanup 0.0;
+  ignore (A.cleanup ());
+  Mutex.lock A.shard_mutexes.(shard);
+  let still_present = Hashtbl.mem A.registries.(shard) order_id in
+  Mutex.unlock A.shard_mutexes.(shard);
+  Alcotest.(check bool)
+    "an amendment older than any possible REST round-trip is evicted"
+    false
+    still_present
 ;;
 
 let test_placement_backoff_is_bounded () =
@@ -397,6 +452,14 @@ let () =
             "tracked carry order guard is bounded by the ack window"
             `Quick
             test_tracked_carry_order_is_ack_age_bounded
+        ; Alcotest.test_case
+            "carry registry queue is compacted and capped"
+            `Quick
+            test_carry_registry_stays_bounded
+        ; Alcotest.test_case
+            "unanswered amendment is age bounded"
+            `Quick
+            test_unanswered_amendment_is_age_bounded
         ; Alcotest.test_case
             "placement backoff is bounded"
             `Quick

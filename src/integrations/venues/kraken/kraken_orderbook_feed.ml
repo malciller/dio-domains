@@ -1670,7 +1670,13 @@ let rec subscribe_symbols symbols =
                Lwt.async (fun () -> resubscribe_with_retry s))
              pending
          else ());
-      Lwt_unix.sleep 0.05 >>= fun () -> watcher ()
+      Lwt_unix.sleep 0.05
+      >>= fun () ->
+      (* Spawn the next poll independently. A recursive [sleep >>= watcher] chain is never
+         resolved - the loop runs for the process lifetime - so it retains one Lwt
+         Forward/task per 50ms tick (about 0.6 MB/min at the observed object size). *)
+      Lwt.async watcher;
+      Lwt.return_unit
     in
     Lwt.async watcher);
   let missing_meta =
@@ -1797,7 +1803,10 @@ and resubscribe_with_retry symbol =
           next
           max_attempts
           delay;
-        Lwt_unix.sleep delay >>= fun () -> resubscribe_with_retry symbol)
+        Lwt_unix.sleep delay
+        >>= fun () ->
+        Lwt.async (fun () -> resubscribe_with_retry symbol);
+        Lwt.return_unit)
 ;;
 
 let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =

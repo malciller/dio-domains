@@ -22,27 +22,33 @@ let mutex = Mutex.create ()
 
 let frame_of (a : Gc.Memprof.allocation) =
   let entries = Printexc.raw_backtrace_entries a.callstack in
-  let rec go i =
-    if i >= Array.length entries
-    then "<no-debug-info>"
+  let describe slot =
+    let name =
+      match Printexc.Slot.name slot with
+      | Some n -> n
+      | None -> "?"
+    in
+    let loc =
+      match Printexc.Slot.location slot with
+      | Some l -> Printf.sprintf "%s:%d" (Filename.basename l.filename) l.line_number
+      | None -> "?"
+    in
+    name ^ " @ " ^ loc
+  in
+  (* Three frames separate the allocating primitive from its caller; more only bloats the
+     aggregation key. *)
+  let rec go i acc =
+    if i >= Array.length entries || List.length acc >= 3
+    then (
+      match List.rev acc with
+      | [] -> "<no-debug-info>"
+      | frames -> String.concat " <- " frames)
     else (
       match Printexc.backtrace_slots_of_raw_entry entries.(i) with
-      | Some slots when Array.length slots > 0 ->
-        let s = slots.(0) in
-        let name =
-          match Printexc.Slot.name s with
-          | Some n -> n
-          | None -> "?"
-        in
-        let loc =
-          match Printexc.Slot.location s with
-          | Some l -> Printf.sprintf "%s:%d" (Filename.basename l.filename) l.line_number
-          | None -> "?"
-        in
-        name ^ " @ " ^ loc
-      | _ -> go (i + 1))
+      | Some slots when Array.length slots > 0 -> go (i + 1) (describe slots.(0) :: acc)
+      | _ -> go (i + 1) acc)
   in
-  go 0
+  go 0 []
 ;;
 
 (* [try_lock]: the memprof callback can fire on a thread that already holds [mutex] - the
@@ -90,7 +96,7 @@ let start () =
       ; dealloc_major = (fun k -> bump k (-1))
       }
     in
-    ignore (Gc.Memprof.start ~sampling_rate:rate ~callstack_size:10 tracker);
+    ignore (Gc.Memprof.start ~sampling_rate:rate ~callstack_size:16 tracker);
     Logging.info_f ~section "live survivor profiler started (rate %g)" rate)
 ;;
 
@@ -118,7 +124,18 @@ let report () =
       List.iteri
         (fun i (k, v, growth) ->
           if i < 12 then Logging.info_f ~section "  %6d  (%+d)  %s" v growth k)
-        rows
+        rows;
+      (* A slow leak can sit below the absolute-count top 12: rank the positive growers
+         separately so the site adding survivors is visible even when its total is small. *)
+      let growers =
+        List.filter (fun (_, _, growth) -> growth > 0) rows
+        |> List.sort (fun (_, _, a) (_, _, b) -> compare b a)
+      in
+      if growers <> [] then Logging.info_f ~section "fastest-growing survivor sites:";
+      List.iteri
+        (fun i (k, v, growth) ->
+          if i < 8 then Logging.info_f ~section "  (+%d)  %6d  %s" growth v k)
+        growers
     with
     | e ->
       (try Mutex.unlock mutex with

@@ -1,7 +1,7 @@
 (test
  (name test_strategy_common)
  (modules test_strategy_common)
- (libraries dio.strategies dio.engine alcotest))
+ (libraries dio.strategies dio.engine dio.concurrency alcotest))
 
 (test
  (name test_jacobs_ladder)

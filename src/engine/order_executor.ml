@@ -616,13 +616,23 @@ let start_periodic_inflight_cleanup () =
             (fun () ->
               let _drift1, trimmed1 = InFlightOrders.cleanup () in
               let _drift2, trimmed2 = InFlightAmendments.cleanup () in
-              if trimmed1 > 0 || trimmed2 > 0
+              (* Retired carry ids cannot remove their FIFO admission records in O(1);
+                 compact them here so the queue tracks the live mapping set instead of
+                 every id the process has ever seen. *)
+              let trimmed_carry = Dio_strategies.Strategy_common.trim_carry_orders () in
+              let trimmed_backoff =
+                Dio_strategies.Strategy_common.Placement_backoff.cleanup ()
+              in
+              if trimmed1 > 0 || trimmed2 > 0 || trimmed_carry > 0 || trimmed_backoff > 0
               then
                 Logging.debug_f
                   ~section
-                  "Periodic in-flight cleanup: removed %d orders, %d amendments"
+                  "Periodic in-flight cleanup: removed %d orders, %d amendments, %d \
+                   carry queue records, %d backoff entries"
                   trimmed1
-                  trimmed2;
+                  trimmed2
+                  trimmed_carry
+                  trimmed_backoff;
               (* A placement key should be released by its ack in well under a second.
                  Anything held for tens of seconds is wedged and is silently suppressing
                  every retry for that overlay kind, so surface it once per sweep. *)
@@ -639,13 +649,17 @@ let start_periodic_inflight_cleanup () =
                    "In-flight order keys held over 30s: %d%s"
                    count
                    detail);
-              loop ())
+              (* Spawn the next sweep independently: this fiber is process-lifetime, and a
+                 recursive [sleep >>= loop] chain would retain one Lwt node per tick. *)
+              Lwt.async loop;
+              Lwt.return_unit)
             (fun exn ->
               Logging.error_f
                 ~section
                 "Periodic in-flight cleanup sweep failed: %s (continuing)"
                 (Printexc.to_string exn);
-              loop ())
+              Lwt.async loop;
+              Lwt.return_unit)
       in
       loop ())
 ;;
