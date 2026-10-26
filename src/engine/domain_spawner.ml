@@ -226,6 +226,7 @@ type overlay_ladder_seed =
   { ls_anchor : float
   ; ls_add_index : int
   ; ls_rung_qty : float
+  ; ls_carry : float
   ; ls_next_add : float
   }
 
@@ -241,11 +242,11 @@ type overlay_ladder_seed =
     - the average entry then gives the anchor [a] that produced it from rungs 0..n:
       [entry = a * (r0 + sum s_k * (1 + k*threshold/leverage)) / r_n].
 
-    The bands below [mark] are rungs the price crossed while the process was down. Keeping
-    [add_index] at the last completed rung leaves them armed, so the strategy places them
-    on the next cycles rather than re-basing the trail at the restart mark. On a retrace,
-    clamping [add_index] to the price-implied rung re-arms the retraced rungs so their
-    size is added again on the way back up, ratcheting the average entry toward the mark. *)
+    The bands below [mark] are rungs the price crossed while the process was down. Their
+    size is carried into [add_carry] and the index is left one rung below the price, so
+    the next arm places the missed size at the current mark instead of re-basing the
+    trail. On a retrace the index stops at the price rung, so the rungs above it re-arm
+    and their size is added again on the way back up. *)
 let reconstruct_ladder
   (ladder : overlay_ladder)
   ~leverage
@@ -290,7 +291,21 @@ let reconstruct_ladder
     then int_of_float (Float.floor ((((mark /. anchor) -. 1.0) /. step) +. 1e-9))
     else filled
   in
-  let index = max 0 (min filled (min n_max price_rung)) in
+  let price_rung = max 0 (min n_max price_rung) in
+  (* Rungs the price crossed but the book never filled. Leave the ladder at the band below
+     the price and preload their size so the next arm places it at the current mark,
+     instead of re-skipping the same bands after every restart. A retrace stops at the
+     price rung so the rungs above it re-arm on the way back up. *)
+  let index, carry =
+    if price_rung > filled
+    then (
+      let carry = ref 0.0 in
+      for k = filled to price_rung - 2 do
+        carry := !carry +. (rung_size k *. accumulated)
+      done;
+      price_rung - 1, !carry)
+    else price_rung, 0.0
+  in
   let rung_qty = if index < n_max then rung_size index *. accumulated else 0.0 in
   let next_add =
     if index < n_max && anchor > 0.0 && step > 0.0
@@ -300,6 +315,7 @@ let reconstruct_ladder
   { ls_anchor = anchor
   ; ls_add_index = index
   ; ls_rung_qty = rung_qty
+  ; ls_carry = carry
   ; ls_next_add = next_add
   }
 ;;
@@ -342,7 +358,7 @@ let seed_ladder_from_position
     Logging.info_f
       ~section
       "carry ladder %s: entry=%.4f short=%.6f ratio=%.4f mark=%.4f -> anchor=%.4f \
-       rung=%d/%d next_add=%.4f"
+       rung=%d/%d carry=%.6f next_add=%.4f"
       symbol
       pos.entry
       short_qty
@@ -351,11 +367,13 @@ let seed_ladder_from_position
       seed.ls_anchor
       seed.ls_add_index
       ladder.ol_num_rungs
+      seed.ls_carry
       seed.ls_next_add;
     Dio_strategies.Carry_runtime.restore_ladder
       ~anchor:seed.ls_anchor
       ~add_index:seed.ls_add_index
       ~rung_qty:seed.ls_rung_qty
+      ~carry:seed.ls_carry
       ~next_add:seed.ls_next_add
       ~first:ladder.ol_add_first
       ~growth:ladder.ol_add_growth
@@ -2548,6 +2566,7 @@ let asset_domain_worker
          let ladder_index = max 0 (sint "add_index") in
          let remaining_rungs = max 0 (ladder_rungs - ladder_index) in
          let add_growth = sfloat "ladder_growth" in
+         let add_carry = sfloat "add_carry" in
          let max_trail_pct =
            if p.leverage > 0.0
            then
@@ -2813,12 +2832,12 @@ let asset_domain_worker
            in
            Logging.info_f
              ~section
-             "capdiag %s: short=%.6f max_qty=%.6f ratio=%.4f rung=%d/%d anchor=%.4f \
-              next_add=%.4f p_top=%.4f entry=%.4f entry_max=%.4f lev=%.2f m=%.4f | \
-              IM_top=%.2f loss_top=%.2f MM_stress=%.2f loss_stress=%.2f | sells_all=%.2f \
-              sells_top=%.2f sells_stress=%.2f | required=%.2f pos_margin=%.2f \
-              acct_margin=%.2f free=%.2f spot_total=%.2f | ledger=%.2f share=%.2f \
-              reserve_net=%.2f | pool n=%d gross=%.2f sells=%.2f margin=%.2f \
+             "capdiag %s: short=%.6f max_qty=%.6f ratio=%.4f rung=%d/%d carry=%.6f \
+              anchor=%.4f next_add=%.4f p_top=%.4f entry=%.4f entry_max=%.4f lev=%.2f \
+              m=%.4f | IM_top=%.2f loss_top=%.2f MM_stress=%.2f loss_stress=%.2f | \
+              sells_all=%.2f sells_top=%.2f sells_stress=%.2f | required=%.2f \
+              pos_margin=%.2f acct_margin=%.2f free=%.2f spot_total=%.2f | ledger=%.2f \
+              share=%.2f reserve_net=%.2f | pool n=%d gross=%.2f sells=%.2f margin=%.2f \
               required=%.2f own_net=%.2f reserve=%.2f"
              controller.oc_hedge_symbol
              req.Carry_reserve.rq_short_qty
@@ -2826,6 +2845,7 @@ let asset_domain_worker
              ladder_ratio
              ladder_index
              ladder_rungs
+             add_carry
              anchor
              next_add
              req.Carry_reserve.rq_p_top

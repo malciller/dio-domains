@@ -180,7 +180,7 @@ let reset_ladder ~start_ratio rt =
   setf rt "add_arm_qty" 0.0
 ;;
 
-(** Seed a ladder reconstructed from the live short (see
+(** Seed a reconstructed ladder from the live short (see
     [Domain_spawner.reconstruct_ladder]). Unlike [init_ladder], the anchor and rung index
     come from the position, so bands the price crossed while the process was down stay
     ahead of [add_index] and are placed by the normal arming path. *)
@@ -188,6 +188,7 @@ let restore_ladder
   ~anchor
   ~add_index
   ~rung_qty
+  ~carry
   ~next_add
   ~first
   ~growth
@@ -204,7 +205,7 @@ let restore_ladder
   seti rt "ladder_rungs" rungs;
   seti rt "add_index" add_index;
   setf rt "next_add" next_add;
-  setf rt "add_carry" 0.0;
+  setf rt "add_carry" carry;
   setf rt "add_rung_qty" rung_qty;
   setf rt "add_target" 0.0;
   setf rt "add_arm_qty" 0.0;
