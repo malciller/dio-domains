@@ -119,6 +119,14 @@ let metric_pages =
   ]
 ;;
 
+(** Every metric label from the in-process pages. A row carrying none of them is a
+    venue-only row (an overlay venue with no domain of its own). *)
+let internal_labels =
+  List.concat_map
+    (fun p -> if String.equal p.page_label "NETWORK" then [] else p.metrics)
+    metric_pages
+;;
+
 let page_count () = List.length metric_pages
 let current_page_index () = min !active_page_ref (max 0 (page_count () - 1))
 let next_page () = active_page_ref := (current_page_index () + 1) mod page_count ()
@@ -230,10 +238,12 @@ let render_latencies w (snapshot : Snapshot.t) =
   let sym_to_exch =
     List.map (fun (sym, (s : Snapshot.strategy)) -> sym, s.exchange) snapshot.strategies
   in
+  (* A row key without a '/' is a venue-only row (an overlay venue with no domain of its
+     own), so the key names the exchange to colour it with. *)
   let exch_of_symbol sym =
     match List.assoc_opt sym sym_to_exch with
     | Some e when e <> "" -> e
-    | _ -> ""
+    | _ -> if String.contains sym '/' then "" else sym
   in
   (* Keep rows with at least one metric window fresh within its tolerance. A running
      domain publishes a window even with zero samples, so idle-but-running domains stay
@@ -340,6 +350,17 @@ let render_latencies w (snapshot : Snapshot.t) =
       if samples = 0 then 3 (* dim *) else severity_of_value label f
     in
     let page = List.nth metric_pages (current_page_index ()) in
+    (* Venue-only rows carry network windows only; keep them off the in-process pages
+       rather than draw a row of "--". *)
+    let page_rows =
+      if String.equal page.page_label "NETWORK"
+      then ordered_rows
+      else
+        List.filter
+          (fun (_, metrics, _) ->
+            List.exists (fun label -> List.mem_assoc label metrics) internal_labels)
+          ordered_rows
+    in
     let n_metrics = List.length page.metrics in
     let full_page_w = 62 + (27 * (n_metrics - 1)) in
     let page_cols = if w < full_page_w then take_first 2 page.metrics else page.metrics in
@@ -543,7 +564,7 @@ let render_latencies w (snapshot : Snapshot.t) =
                 ; I.string a_border " │ "
                 ]
                 @ metric_cells)))
-        ordered_rows
+        page_rows
     in
     let title = render_latency_title w snapshot in
     I.vcat ((title :: header :: rows) @ [ section_footer w ]))

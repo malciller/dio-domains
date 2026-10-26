@@ -63,7 +63,7 @@ let price_history : (string, price_snapshot Queue.t) Hashtbl.t = Hashtbl.create 
 let last_snapshots : (string, price_snapshot) Hashtbl.t = Hashtbl.create 32
 
 (** Zoom level per asset key. 0 = full view (all orders); higher values zoom in around the
-    mid price, capped at one order per side. *)
+    mid price, capped at the outermost resting level per side. *)
 let zoom_levels : (string, int) Hashtbl.t = Hashtbl.create 16
 
 let get_zoom asset_key =
@@ -84,6 +84,26 @@ let order_prices (os : Snapshot.order list) =
 
 let to_triples (os : Snapshot.order list) =
   List.map (fun (o : Snapshot.order) -> o.id, o.price, o.qty) os
+;;
+
+let prices_of os = List.filter_map (fun (_, p, _) -> if p > 0.0 then Some p else None) os
+
+(** Price span the zoom clamps to. The floor is the deepest bottom-side level (a perp
+    short's close, its adds, or the spot buy ladder) and the ceiling the highest top-side
+    level (the sell ladder or a long's exit), so zooming never pushes a resting order out
+    of the view. A side without levels falls back to mid * 0.985 / mid * 1.015. *)
+let zoom_cap_span ~mid ~bottom_ps ~top_ps =
+  let lowest fallback = function
+    | [] -> fallback
+    | p :: rest -> List.fold_left min p rest
+  in
+  let highest fallback = function
+    | [] -> fallback
+    | p :: rest -> List.fold_left max p rest
+  in
+  let below = List.filter (fun p -> p < mid) bottom_ps in
+  let above = List.filter (fun p -> p > mid) top_ps in
+  lowest (mid *. 0.985) below *. 0.995, highest (mid *. 1.015) above *. 1.005
 ;;
 
 let record_all_prices (snapshot : Snapshot.t) =
@@ -134,9 +154,9 @@ let record_all_prices (snapshot : Snapshot.t) =
         | Snapshot.Strategy s ->
           List.filter_map
             (fun (l : Snapshot.long_position) ->
-               if l.long_has_position && l.long_mark > 0.0
-               then Some (l.long_venue, l.long_mark)
-               else None)
+              if l.long_has_position && l.long_mark > 0.0
+              then Some (l.long_venue, l.long_mark)
+              else None)
             s.longs
         | Snapshot.Balance _ -> []
       in
@@ -286,19 +306,20 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     in
     let longs =
       match strat_opt with
-      | Some s -> List.filter (fun (l : Snapshot.long_position) -> l.long_has_position) s.longs
+      | Some s ->
+        List.filter (fun (l : Snapshot.long_position) -> l.long_has_position) s.longs
       | None -> []
     in
     let long_marks =
       List.filter_map
         (fun (l : Snapshot.long_position) ->
-           if l.long_mark > 0.0 then Some (l.long_venue, l.long_mark) else None)
+          if l.long_mark > 0.0 then Some (l.long_venue, l.long_mark) else None)
         longs
     in
     let long_close_orders =
       List.concat_map
         (fun (l : Snapshot.long_position) ->
-           List.map (fun (o : Snapshot.order) -> l.long_venue, o) l.long_close_orders)
+          List.map (fun (o : Snapshot.order) -> l.long_venue, o) l.long_close_orders)
         longs
     in
     (* Pending perp orders. The venue may also expose these through the spot pair's open
@@ -512,7 +533,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
              ; I.string a_label "Rungs "
              ; I.string a_cyan (Printf.sprintf "%d" l.rungs)
              ; I.string a_dim " │ "
-             ; I.string a_text
+             ; I.string
+                 a_text
                  (Printf.sprintf "%.1f%% -> %.1f%%" l.start_ratio_pct l.max_ratio_pct)
              ])
       | _ -> None
@@ -644,36 +666,36 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       let long_lines =
         List.map
           (fun (l : Snapshot.long_position) ->
-             let close_item =
-               match l.long_close_price with
-               | Some p when p > 0.0 ->
-                 [ I.string a_dim " │ Close "
-                 ; I.string a_long (format_price p)
-                 ; I.string a_dim (" x" ^ format_qty (Float.abs l.long_qty))
-                 ]
-               | _ -> []
-             in
-             close_row
-               w
-               (I.hcat
-                  ([ I.string a_border " │"
-                   ; I.string a_label " Long ("
-                   ; I.string a_cyan (exch_tag_of l.long_venue)
-                   ; I.string a_label "): "
-                   ; I.string a_long (format_qty l.long_qty)
-                   ; I.string a_dim " @ "
-                   ; I.string a_text (format_price l.long_entry)
-                   ]
-                   @ close_item
-                   @ [ I.string a_dim " │ uPnL "
-                     ; I.string
-                         (if l.long_unrealized_pnl >= 0.0 then a_green else a_red)
-                         (format_pnl l.long_unrealized_pnl)
-                     ; I.string a_dim " │ Mark "
-                     ; I.string a_bright (format_price l.long_mark)
-                     ; I.string a_dim " │ Margin "
-                     ; I.string a_text (format_usd l.long_margin_used)
-                     ])))
+            let close_item =
+              match l.long_close_price with
+              | Some p when p > 0.0 ->
+                [ I.string a_dim " │ Close "
+                ; I.string a_long (format_price p)
+                ; I.string a_dim (" x" ^ format_qty (Float.abs l.long_qty))
+                ]
+              | _ -> []
+            in
+            close_row
+              w
+              (I.hcat
+                 ([ I.string a_border " │"
+                  ; I.string a_label " Long ("
+                  ; I.string a_cyan (exch_tag_of l.long_venue)
+                  ; I.string a_label "): "
+                  ; I.string a_long (format_qty l.long_qty)
+                  ; I.string a_dim " @ "
+                  ; I.string a_text (format_price l.long_entry)
+                  ]
+                  @ close_item
+                  @ [ I.string a_dim " │ uPnL "
+                    ; I.string
+                        (if l.long_unrealized_pnl >= 0.0 then a_green else a_red)
+                        (format_pnl l.long_unrealized_pnl)
+                    ; I.string a_dim " │ Mark "
+                    ; I.string a_bright (format_price l.long_mark)
+                    ; I.string a_dim " │ Margin "
+                    ; I.string a_text (format_usd l.long_margin_used)
+                    ])))
           longs
       in
       let legend_row =
@@ -700,10 +722,10 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
           ([ close_row w (I.hcat [ I.string a_border " │"; r1 ])
            ; close_row w (I.hcat [ I.string a_border " │"; r2 ])
            ]
-           @ (match ladder_line with Some l -> [ close_row w l ] | None -> [])
-           @ [ close_row w (I.hcat [ I.string a_border " │"; latency_row ])
-           ; legend_row
-           ]
+           @ (match ladder_line with
+              | Some l -> [ close_row w l ]
+              | None -> [])
+           @ [ close_row w (I.hcat [ I.string a_border " │"; latency_row ]); legend_row ]
            @ perp_line
            @ long_lines)
       in
@@ -782,32 +804,14 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         let span = max (high -. low) (low *. 0.01) in
         low -. (span *. 0.06), high +. (span *. 0.06)
     in
-    (* Nearest buy (highest below mid) and nearest sell (lowest above mid). Defaults to
-       mid * 0.985 / mid * 1.015 when that side is absent. *)
-    let nearest_buy_p =
-      let buy_ps =
-        List.filter_map
-          (fun (_, p, _) -> if p < mid && p > 0.0 then Some p else None)
-          (buy_orders @ perp_buy_orders)
-      in
-      match buy_ps with
-      | [] -> mid *. 0.985
-      | l -> List.fold_left max 0.0 l
+    let bottom_ps = prices_of (buy_orders @ perp_buy_orders) in
+    let top_ps =
+      prices_of (sell_orders @ perp_sell_orders)
+      @ List.filter_map
+          (fun (_, (o : Snapshot.order)) -> if o.price > 0.0 then Some o.price else None)
+          long_close_orders
     in
-    let nearest_sell_p =
-      let sell_ps =
-        List.filter_map
-          (fun (_, p, _) -> if p > mid && p > 0.0 then Some p else None)
-          (sell_orders @ perp_sell_orders)
-      in
-      match sell_ps with
-      | [] -> mid *. 1.015
-      | l -> List.fold_left min Float.max_float l
-    in
-    (* Cap bounds: at most one order visible per side; zooming never goes inside that
-       span. *)
-    let cap_span_low = nearest_buy_p *. 0.995 in
-    let cap_span_high = nearest_sell_p *. 1.005 in
+    let cap_span_low, cap_span_high = zoom_cap_span ~mid ~bottom_ps ~top_ps in
     (* [max_z]: zoom level at which the zoomed bounds reach the cap span (searched over
        1..15). *)
     let max_z =
@@ -1323,10 +1327,10 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
              | None, None -> None)
            else if target_t >= s1.timestamp
            then long_at_t target_t rest
-           else
-             (match long_mark_venue with
-              | Some venue -> List.assoc_opt venue s0.long_marks
-              | None -> None)
+           else (
+             match long_mark_venue with
+             | Some venue -> List.assoc_opt venue s0.long_marks
+             | None -> None)
        in
        for sx = 0 to sub_w - 1 do
          let ratio_x = float sx /. float (max 1 (sub_w - 1)) in
@@ -1392,10 +1396,10 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     (* Resting long close orders are horizontal price levels for their whole life. *)
     List.iter
       (fun (_, (o : Snapshot.order)) ->
-         if o.price > 0.0
-         then (
-           let sy = price_to_sub_y o.price in
-           draw_line long_close_grid 0 sy (sub_w - 1) sy))
+        if o.price > 0.0
+        then (
+          let sy = price_to_sub_y o.price in
+          draw_line long_close_grid 0 sy (sub_w - 1) sy))
       long_close_orders;
     let perp_row_opt =
       match current_perp_mark with
@@ -1405,15 +1409,15 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     let long_mark_rows =
       List.filter_map
         (fun (_venue, mark) ->
-           if mark >= min_p && mark <= max_p then Some (price_to_row mark) else None)
+          if mark >= min_p && mark <= max_p then Some (price_to_row mark) else None)
         long_marks
     in
     let long_close_rows =
       List.filter_map
         (fun (_, (o : Snapshot.order)) ->
-           if o.price >= min_p && o.price <= max_p
-           then Some (price_to_row o.price)
-           else None)
+          if o.price >= min_p && o.price <= max_p
+          then Some (price_to_row o.price)
+          else None)
         long_close_orders
     in
     let buy_row_opt =
@@ -1462,14 +1466,14 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       let by_row = Hashtbl.create 8 in
       List.iter
         (fun (venue, (o : Snapshot.order)) ->
-           if o.price > 0.0 && o.qty > 0.0
-           then (
-             let r = price_to_row o.price in
-             let existing =
-               try Hashtbl.find by_row r with
-               | Not_found -> []
-             in
-             Hashtbl.replace by_row r ((venue, o) :: existing)))
+          if o.price > 0.0 && o.qty > 0.0
+          then (
+            let r = price_to_row o.price in
+            let existing =
+              try Hashtbl.find by_row r with
+              | Not_found -> []
+            in
+            Hashtbl.replace by_row r ((venue, o) :: existing)))
         long_close_orders;
       by_row
     in
@@ -1515,10 +1519,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       | None -> []
       | Some p ->
         [ ( a_bright
-          , Printf.sprintf
-              "◆ SHORT %s %s"
-              (exch_tag_of p.exchange)
-              (format_price p.mark) )
+          , Printf.sprintf "◆ SHORT %s %s" (exch_tag_of p.exchange) (format_price p.mark)
+          )
         ; ( (if p.unrealized_pnl >= 0.0 then a_green else a_red)
           , Printf.sprintf "uPnL %s" (format_pnl p.unrealized_pnl) )
         ]
@@ -1619,90 +1621,87 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     let long_pin_specs =
       List.filter_map
         (fun (venue, mark) ->
-           if mark >= min_p && mark <= max_p
-           then (
-             let pnl =
-               match
-                 List.find_opt
-                   (fun (l : Snapshot.long_position) ->
-                      String.equal l.long_venue venue
-                      && Float.abs (l.long_mark -. mark) <= 1e-9)
-                   longs
-               with
-               | Some l -> l.long_unrealized_pnl
-               | None -> 0.0
-             in
-             Some
-               ( mark
-               , 2
-               , price_to_row mark
-               , [ ( a_long
-                   , Printf.sprintf
-                       "◆ LONG %s %s"
-                       (exch_tag_of venue)
-                       (format_price mark) )
-                 ; ( (if pnl >= 0.0 then a_green else a_red)
-                   , Printf.sprintf "uPnL %s" (format_pnl pnl) )
-                 ] ))
-           else None)
+          if mark >= min_p && mark <= max_p
+          then (
+            let pnl =
+              match
+                List.find_opt
+                  (fun (l : Snapshot.long_position) ->
+                    String.equal l.long_venue venue
+                    && Float.abs (l.long_mark -. mark) <= 1e-9)
+                  longs
+              with
+              | Some l -> l.long_unrealized_pnl
+              | None -> 0.0
+            in
+            Some
+              ( mark
+              , 2
+              , price_to_row mark
+              , [ ( a_long
+                  , Printf.sprintf "◆ LONG %s %s" (exch_tag_of venue) (format_price mark)
+                  )
+                ; ( (if pnl >= 0.0 then a_green else a_red)
+                  , Printf.sprintf "uPnL %s" (format_pnl pnl) )
+                ] ))
+          else None)
         long_marks
     in
     let long_close_specs =
       Hashtbl.fold
         (fun row orders acc ->
-           if orders = []
-           then acc
-           else (
-             let count = List.length orders in
-             let total_q =
-               List.fold_left
-                 (fun acc (_, (o : Snapshot.order)) -> acc +. o.qty)
-                 0.0
-                 orders
-             in
-             let avg_p =
-               List.fold_left
-                 (fun acc (_, (o : Snapshot.order)) -> acc +. o.price)
-                 0.0
-                 orders
-               /. float count
-             in
-             let venue =
-               match orders with
-               | (v, _) :: _ -> v
-               | [] -> ""
-             in
-             let total_q =
-               match
-                 List.find_opt
-                   (fun (l : Snapshot.long_position) ->
-                      String.equal l.long_venue venue)
-                   longs
-               with
-               | Some l -> Float.min total_q (Float.abs l.long_qty)
-               | None -> total_q
-             in
-             let reference =
-               match List.assoc_opt venue long_marks with
-               | Some m when m > 0.0 -> m
-               | _ -> mid
-             in
-             let count_str = if count > 1 then "x" ^ string_of_int count else "" in
-             let text =
-               Printf.sprintf
-                 "◆LC %s%s %.6g %.4g%s"
-                 (exch_tag_of venue)
-                 count_str
-                 avg_p
-                 total_q
-                 (distance_suffix reference avg_p)
-             in
-             (avg_p, 6, row, [ a_long, text ]) :: acc))
+          if orders = []
+          then acc
+          else (
+            let count = List.length orders in
+            let total_q =
+              List.fold_left
+                (fun acc (_, (o : Snapshot.order)) -> acc +. o.qty)
+                0.0
+                orders
+            in
+            let avg_p =
+              List.fold_left
+                (fun acc (_, (o : Snapshot.order)) -> acc +. o.price)
+                0.0
+                orders
+              /. float count
+            in
+            let venue =
+              match orders with
+              | (v, _) :: _ -> v
+              | [] -> ""
+            in
+            let total_q =
+              match
+                List.find_opt
+                  (fun (l : Snapshot.long_position) -> String.equal l.long_venue venue)
+                  longs
+              with
+              | Some l -> Float.min total_q (Float.abs l.long_qty)
+              | None -> total_q
+            in
+            let reference =
+              match List.assoc_opt venue long_marks with
+              | Some m when m > 0.0 -> m
+              | _ -> mid
+            in
+            let count_str = if count > 1 then "x" ^ string_of_int count else "" in
+            let text =
+              Printf.sprintf
+                "◆LC %s%s %.6g %.4g%s"
+                (exch_tag_of venue)
+                count_str
+                avg_p
+                total_q
+                (distance_suffix reference avg_p)
+            in
+            (avg_p, 6, row, [ a_long, text ]) :: acc))
         long_close_by_row
         []
     in
     let specs =
-      [ (mid, 0, mid_row, [ a_green, Printf.sprintf "◆ LIVE %s" (format_price mid) ]) ]
+      [ mid, 0, mid_row, [ a_green, Printf.sprintf "◆ LIVE %s" (format_price mid) ] ]
       @ (match perp_opt, perp_row_opt with
          | Some p, Some r when p.mark > 0.0 -> [ p.mark, 1, r, perp_pin_lines ]
          | _ -> [])
@@ -1876,8 +1875,13 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
             in
             let bg_attr = if is_in_liquid then A.bg fill_rgb else A.bg c_bg in
             let combined_mask =
-              !mid_mask lor !buy_mask lor !sell_mask lor !perp_mask lor !perp_ord_mask
-              lor !long_mark_mask lor !long_close_mask
+              !mid_mask
+              lor !buy_mask
+              lor !sell_mask
+              lor !perp_mask
+              lor !perp_ord_mask
+              lor !long_mark_mask
+              lor !long_close_mask
             in
             if combined_mask <> 0
             then (
@@ -1885,13 +1889,15 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
               (* Overlapping traces collapse to the theme's dominant trace color (mid
                  wins, then perp orders, then buy/sell); colors are theme-derived. *)
               let fg_color =
-                if
-                  (!long_mark_mask <> 0 || !long_close_mask <> 0)
-                  && !mid_mask = 0
-                  && !buy_mask = 0
-                  && !sell_mask = 0
+                if (!long_mark_mask <> 0 || !long_close_mask <> 0)
+                   && !mid_mask = 0
+                   && !buy_mask = 0
+                   && !sell_mask = 0
                 then c_long
-                else if !perp_mask <> 0 && !mid_mask = 0 && !buy_mask = 0 && !sell_mask = 0
+                else if !perp_mask <> 0
+                        && !mid_mask = 0
+                        && !buy_mask = 0
+                        && !sell_mask = 0
                 then c_bright
                 else if !mid_mask <> 0 && !buy_mask <> 0
                 then c_green
