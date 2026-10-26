@@ -89,21 +89,16 @@ let to_triples (os : Snapshot.order list) =
 let prices_of os = List.filter_map (fun (_, p, _) -> if p > 0.0 then Some p else None) os
 
 (** Price span the zoom clamps to. The floor is the deepest bottom-side level (a perp
-    short's close, its adds, or the spot buy ladder) and the ceiling the highest top-side
-    level (the sell ladder or a long's exit), so zooming never pushes a resting order out
-    of the view. A side without levels falls back to mid * 0.985 / mid * 1.015. *)
-let zoom_cap_span ~mid ~bottom_ps ~top_ps =
+    short's close, its adds, or the spot buy ladder). The ceiling stays at the default
+    band above the live price rather than following the highest top-side rung, so zooming
+    focuses on price and the bottom rungs; higher sells fall out of band and are hidden. *)
+let zoom_cap_span ~mid ~bottom_ps =
   let lowest fallback = function
     | [] -> fallback
     | p :: rest -> List.fold_left min p rest
   in
-  let highest fallback = function
-    | [] -> fallback
-    | p :: rest -> List.fold_left max p rest
-  in
   let below = List.filter (fun p -> p < mid) bottom_ps in
-  let above = List.filter (fun p -> p > mid) top_ps in
-  lowest (mid *. 0.985) below *. 0.995, highest (mid *. 1.015) above *. 1.005
+  lowest (mid *. 0.985) below *. 0.995, mid *. 1.015 *. 1.005
 ;;
 
 let record_all_prices (snapshot : Snapshot.t) =
@@ -805,13 +800,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
         low -. (span *. 0.06), high +. (span *. 0.06)
     in
     let bottom_ps = prices_of (buy_orders @ perp_buy_orders) in
-    let top_ps =
-      prices_of (sell_orders @ perp_sell_orders)
-      @ List.filter_map
-          (fun (_, (o : Snapshot.order)) -> if o.price > 0.0 then Some o.price else None)
-          long_close_orders
-    in
-    let cap_span_low, cap_span_high = zoom_cap_span ~mid ~bottom_ps ~top_ps in
+    let cap_span_low, cap_span_high = zoom_cap_span ~mid ~bottom_ps in
     (* [max_z]: zoom level at which the zoomed bounds reach the cap span (searched over
        1..15). *)
     let max_z =
@@ -849,7 +838,10 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     let y_axis_w = 14 in
     let pin_col_w = min 32 (max 18 (chart_area_w / 3)) in
     let canvas_w = max 15 (chart_area_w - y_axis_w - pin_col_w - 4) in
-    let canvas_h = max 8 (h - 8) in
+    (* Header, summary, title, tick axis, and footers; the summary card grows with
+       oracle/perp/long lines, so measure the chrome instead of assuming a row count. *)
+    let chrome_h = 1 + I.height summary_card + 1 + 2 + 2 in
+    let canvas_h = max 4 (h - chrome_h) in
     let sub_h = canvas_h * 4 in
     let sub_w = canvas_w * 2 in
     (* Depth fill near the mid price: a dimmed accent tint blended into the theme
@@ -1103,27 +1095,34 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       min (canvas_h - 1) (sy / 4)
     in
     let mid_row = price_to_row mid in
+    (* Zoom can leave top-side rungs above the band; drop them instead of clamping their
+       flags onto the edge rows. *)
+    let in_band p = p >= min_p && p <= max_p in
     (* Sell orders grouped by their exact canvas row. *)
     let sell_by_row = Hashtbl.create 16 in
     List.iter
       (fun (id, p, q) ->
-        let r = price_to_row p in
-        let existing =
-          try Hashtbl.find sell_by_row r with
-          | Not_found -> []
-        in
-        Hashtbl.replace sell_by_row r ((id, p, q) :: existing))
+        if in_band p
+        then (
+          let r = price_to_row p in
+          let existing =
+            try Hashtbl.find sell_by_row r with
+            | Not_found -> []
+          in
+          Hashtbl.replace sell_by_row r ((id, p, q) :: existing)))
       sell_orders;
     (* Buy orders grouped by their exact canvas row. *)
     let buy_by_row = Hashtbl.create 16 in
     List.iter
       (fun (id, p, q) ->
-        let r = price_to_row p in
-        let existing =
-          try Hashtbl.find buy_by_row r with
-          | Not_found -> []
-        in
-        Hashtbl.replace buy_by_row r ((id, p, q) :: existing))
+        if in_band p
+        then (
+          let r = price_to_row p in
+          let existing =
+            try Hashtbl.find buy_by_row r with
+            | Not_found -> []
+          in
+          Hashtbl.replace buy_by_row r ((id, p, q) :: existing)))
       buy_orders;
     (* Subpixel line drawing over the 2x4 Braille grid. *)
     let draw_line grid x0 y0 x1 y1 =
@@ -1347,10 +1346,14 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
             | None -> ());
            match snap_at_t target_t pts with
            | Some snap ->
-             buy_sub_y_list.(sx) <- List.map price_to_sub_y snap.buy_ps;
-             sell_sub_y_list.(sx) <- List.map price_to_sub_y snap.sell_ps;
-             perp_buy_sub_y_list.(sx) <- List.map price_to_sub_y snap.perp_buy_ps;
-             perp_sell_sub_y_list.(sx) <- List.map price_to_sub_y snap.perp_sell_ps
+             buy_sub_y_list.(sx)
+             <- List.filter in_band snap.buy_ps |> List.map price_to_sub_y;
+             sell_sub_y_list.(sx)
+             <- List.filter in_band snap.sell_ps |> List.map price_to_sub_y;
+             perp_buy_sub_y_list.(sx)
+             <- List.filter in_band snap.perp_buy_ps |> List.map price_to_sub_y;
+             perp_sell_sub_y_list.(sx)
+             <- List.filter in_band snap.perp_sell_ps |> List.map price_to_sub_y
            | None -> ())
        done;
        (* Interpolate the mid price curve across consecutive columns. *)
@@ -1396,7 +1399,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     (* Resting long close orders are horizontal price levels for their whole life. *)
     List.iter
       (fun (_, (o : Snapshot.order)) ->
-        if o.price > 0.0
+        if o.price > 0.0 && in_band o.price
         then (
           let sy = price_to_sub_y o.price in
           draw_line long_close_grid 0 sy (sub_w - 1) sy))
@@ -1442,7 +1445,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
             | Some s -> s.buy_price
             | None -> 0.0
           in
-          if bp > 0.0 then Some (price_to_row bp) else None
+          if bp > 0.0 && in_band bp then Some (price_to_row bp) else None
         | _ -> None)
       else None
     in
@@ -1451,12 +1454,14 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       let by_row = Hashtbl.create 8 in
       List.iter
         (fun (id, p, q) ->
-          let r = price_to_row p in
-          let existing =
-            try Hashtbl.find by_row r with
-            | Not_found -> []
-          in
-          Hashtbl.replace by_row r ((id, p, q) :: existing))
+          if in_band p
+          then (
+            let r = price_to_row p in
+            let existing =
+              try Hashtbl.find by_row r with
+              | Not_found -> []
+            in
+            Hashtbl.replace by_row r ((id, p, q) :: existing)))
         orders;
       by_row
     in
@@ -1466,7 +1471,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       let by_row = Hashtbl.create 8 in
       List.iter
         (fun (venue, (o : Snapshot.order)) ->
-          if o.price > 0.0 && o.qty > 0.0
+          if o.price > 0.0 && o.qty > 0.0 && in_band o.price
           then (
             let r = price_to_row o.price in
             let existing =
@@ -2052,4 +2057,5 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       ; section_footer w
       ; nav_footer
       ]
+    |> I.vsnap ~align:`Top h
 ;;
