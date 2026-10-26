@@ -5,7 +5,7 @@ opam-version: "2.0"
 synopsis: "Domain-Oriented Trading Engine"
 description:
   "A high-performance, domain-oriented trading engine built with OCaml 5 multicore"
-maintainer: ["Cal Miller <malciller@gmail.com>"]
+maintainer: ["Diophant Solutions, LLC"]
 authors: ["Cal Miller <malciller@gmail.com>"]
 license: "LICENSE"
 tags: ["trading" "finance" "multicore" "ocaml" "domains"]
