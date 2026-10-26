@@ -41,6 +41,9 @@ let getb rt key default =
 let geti rt key default =
   match Rt.get_state rt key with
   | Expr.V_int i -> i
+  (* Ladder arithmetic (add_index + 1) evaluates through the float path, so an incremented
+     counter is stored as a float. *)
+  | Expr.V_float f -> int_of_float f
   | _ -> default
 ;;
 
@@ -170,6 +173,41 @@ let reset_ladder ~start_ratio rt =
   seti rt "add_index" 0;
   seti rt "ladder_rungs" 0;
   setf rt "next_add" 0.0;
+  setb rt "add_armed" false;
+  setf rt "add_carry" 0.0;
+  setf rt "add_rung_qty" 0.0;
+  setf rt "add_target" 0.0;
+  setf rt "add_arm_qty" 0.0
+;;
+
+(** Seed a ladder reconstructed from the live short (see
+    [Domain_spawner.reconstruct_ladder]). Unlike [init_ladder], the anchor and rung index
+    come from the position, so bands the price crossed while the process was down stay
+    ahead of [add_index] and are placed by the normal arming path. *)
+let restore_ladder
+  ~anchor
+  ~add_index
+  ~rung_qty
+  ~next_add
+  ~first
+  ~growth
+  ~rungs
+  ~ratio
+  ~start_ratio
+  rt
+  =
+  setf rt "anchor" anchor;
+  setf rt "ladder_ratio" ratio;
+  setf rt "ladder_start" start_ratio;
+  setf rt "ladder_first" first;
+  setf rt "ladder_growth" growth;
+  seti rt "ladder_rungs" rungs;
+  seti rt "add_index" add_index;
+  setf rt "next_add" next_add;
+  setf rt "add_carry" 0.0;
+  setf rt "add_rung_qty" rung_qty;
+  setf rt "add_target" 0.0;
+  setf rt "add_arm_qty" 0.0;
   setb rt "add_armed" false
 ;;
 
@@ -195,7 +233,7 @@ let init_ladder
     let anchor = if mark > 0.0 then mark else entry in
     let next_add =
       if num_rungs > 0 && leverage > 0.0
-      then anchor *. (1.0 +. add_threshold /. leverage)
+      then anchor *. (1.0 +. (add_threshold /. leverage))
       else 0.0
     in
     setf rt "anchor" anchor;
@@ -206,5 +244,9 @@ let init_ladder
     seti rt "ladder_rungs" num_rungs;
     seti rt "add_index" 0;
     setf rt "next_add" next_add;
+    setf rt "add_carry" 0.0;
+    setf rt "add_rung_qty" (add_first *. accumulated);
+    setf rt "add_target" 0.0;
+    setf rt "add_arm_qty" 0.0;
     setb rt "add_armed" false)
 ;;

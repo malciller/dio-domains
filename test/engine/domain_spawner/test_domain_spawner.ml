@@ -254,6 +254,91 @@ let test_order_by_cpu_priority () =
           [ mk_asset "A" 0; mk_asset "C" 0 ]))
 ;;
 
+open Dio_engine.Domain_spawner
+
+let ladder_params : Dio_engine.Config.overlay_params =
+  { start_ratio_pct = 5.0
+  ; add_threshold_pct = 2.5
+  ; max_ratio_pct = 75.0
+  ; recycle_profit_pct = 5.0
+  ; recycle_base_share_pct = 50.0
+  ; min_entry_margin_ratio = 1.0
+  ; min_liq_mult = 1.0
+  ; leverage = 20.0
+  ; full_balance_ref = true
+  }
+;;
+
+let test_ladder () = derive_overlay_ladder ~leverage:20.0 ladder_params
+let close name expected actual = Alcotest.(check (float 1e-6)) name expected actual
+let step () = (test_ladder ()).ol_add_threshold /. 20.0
+
+(* Average entry and short of a ladder that filled [filled] rungs from [anchor]. *)
+let ladder_position ~filled ~anchor ~balance =
+  let l = test_ladder () in
+  let step = step () in
+  let size k = l.ol_add_first *. (l.ol_add_growth ** float_of_int k) in
+  let ratio = ref l.ol_start_ratio in
+  let weighted = ref l.ol_start_ratio in
+  for k = 0 to filled - 1 do
+    let s = size k in
+    ratio := !ratio +. s;
+    weighted := !weighted +. (s *. (1.0 +. (float_of_int (k + 1) *. step)))
+  done;
+  !weighted /. !ratio *. anchor, !ratio *. balance
+;;
+
+let test_reconstruct_fresh () =
+  (* No adds: the entry is the origin and the first band is one ROE step above it. *)
+  let l = test_ladder () in
+  let entry = 80_000.0 in
+  let short_qty = l.ol_start_ratio *. 1.0 in
+  let seed =
+    reconstruct_ladder l ~leverage:20.0 ~entry ~short_qty ~accumulated:1.0 ~mark:80_100.0
+  in
+  close "fresh anchor is the entry" entry seed.ls_anchor;
+  Alcotest.(check int) "fresh starts at rung 0" 0 seed.ls_add_index;
+  close "first rung size" l.ol_add_first seed.ls_rung_qty;
+  close "first band one step above the entry" (entry *. (1.0 +. step ())) seed.ls_next_add
+;;
+
+let test_reconstruct_mid_ladder () =
+  (* Five rungs filled, price now at rung 8: the last completed rung is kept so the missed
+     bands stay armed for the catch-up instead of being marked done. *)
+  let l = test_ladder () in
+  let anchor = 80_000.0 in
+  let entry, short_qty = ladder_position ~filled:5 ~anchor ~balance:1.0 in
+  let mark = anchor *. (1.0 +. (8.0 *. step ())) in
+  let seed =
+    reconstruct_ladder l ~leverage:20.0 ~entry ~short_qty ~accumulated:1.0 ~mark
+  in
+  close "mid-ladder anchor recovered" anchor seed.ls_anchor;
+  Alcotest.(check int) "last completed rung" 5 seed.ls_add_index;
+  close
+    "next rung size follows the geometric schedule"
+    (l.ol_add_first *. (l.ol_add_growth ** 5.0))
+    seed.ls_rung_qty;
+  close "next band is rung 6" (anchor *. (1.0 +. (6.0 *. step ()))) seed.ls_next_add
+;;
+
+let test_reconstruct_retrace_rearms () =
+  (* A price below the last filled band re-arms the retraced rungs: their size is added
+     again on the way back up, ratcheting the average entry toward the mark. *)
+  let l = test_ladder () in
+  let anchor = 80_000.0 in
+  let entry, short_qty = ladder_position ~filled:5 ~anchor ~balance:1.0 in
+  let mark = anchor *. (1.0 +. (2.0 *. step ())) in
+  let seed =
+    reconstruct_ladder l ~leverage:20.0 ~entry ~short_qty ~accumulated:1.0 ~mark
+  in
+  close "anchor still recovered" anchor seed.ls_anchor;
+  Alcotest.(check int) "retrace re-arms down to the price rung" 2 seed.ls_add_index;
+  close
+    "next band is one step above the retrace"
+    (anchor *. (1.0 +. (3.0 *. step ())))
+    seed.ls_next_add
+;;
+
 let () =
   Alcotest.run
     "Domain Spawner"
@@ -264,6 +349,20 @@ let () =
         ] )
     ; ( "affinity"
       , [ Alcotest.test_case "cpu priority ordering" `Quick test_order_by_cpu_priority ] )
+    ; ( "ladder"
+      , [ Alcotest.test_case
+            "fresh short anchors at the entry"
+            `Quick
+            test_reconstruct_fresh
+        ; Alcotest.test_case
+            "mid-ladder recovers the anchor and rung"
+            `Quick
+            test_reconstruct_mid_ladder
+        ; Alcotest.test_case
+            "retrace re-arms the rungs below the price"
+            `Quick
+            test_reconstruct_retrace_rearms
+        ] )
     ; ( "integration"
       , [ Alcotest.test_case "fee fetcher" `Quick test_fee_fetcher_integration
         ; Alcotest.test_case "strategy init" `Quick test_strategy_initialization
