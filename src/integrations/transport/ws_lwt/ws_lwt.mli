@@ -33,3 +33,8 @@ val write : conn -> Websocket.Frame.t -> unit Lwt.t
 (** Closes the underlying transport. Connection state (close frames, etc.) remains the
     caller's responsibility. *)
 val close_transport : conn -> unit Lwt.t
+
+(** Like {!close_transport} but discards buffered output instead of flushing it.
+    [Lwt_io.close] flushes first, which blocks indefinitely on a peer that stopped
+    draining; use this when waiting is not an option. *)
+val abort_transport : conn -> unit Lwt.t

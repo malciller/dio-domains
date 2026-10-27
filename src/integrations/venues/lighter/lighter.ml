@@ -14,6 +14,11 @@ module Ws = Lighter_ws
     private WebSocket or REST fallback. *)
 module Actions = Lighter_actions
 
+(** Ordered, non-blocking submission queue: one writer signs and sends txs in FIFO order
+    so nonces reach the exchange monotonically without serialising callers on a
+    round-trip. *)
+module Outbox = Lighter_outbox
+
 (** Account balance tracking: aggregates collateral updates from WS channels. *)
 module Balances = Lighter_balances
 

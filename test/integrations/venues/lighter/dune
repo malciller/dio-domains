@@ -30,3 +30,11 @@
  (name test_lighter_market_context)
  (modules test_lighter_market_context)
  (libraries dio.lighter dio.exchange alcotest))
+
+(test
+ (name test_lighter_signer)
+ (libraries dio.lighter alcotest))
+
+(test
+ (name test_lighter_outbox)
+ (libraries dio.lighter dio.lwt.unix alcotest))

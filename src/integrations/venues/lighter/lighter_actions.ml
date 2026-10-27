@@ -1,14 +1,19 @@
 [@@@ocaml.text
-  " Order actions for Lighter: place/cancel/modify via signed transactions. Dispatch uses\n\
-  \    REST [POST /api/v1/sendTx] to Lighter mainnet, dialled through the non-US egress \
-   relay\n\
-  \    (see [lighter_endpoints.ml]); signing happens in [lighter_signer.ml] over FFI. \
-   The WS\n\
-  \    [jsonapi/sendtx] path in [lighter_ws.ml] is unused. "]
+  " Order actions for Lighter: signed transactions go over the private WebSocket\n\
+  \    ([jsonapi/sendtx]) when that socket is connected, falling back to REST [sendTx]\n\
+  \    through the non-US egress relay otherwise. One writer owns signing and dispatch\n\
+  \    ([lighter_outbox.ml]) so nonces reach the exchange in allocation order without\n\
+  \    callers waiting on a round-trip. "]
 
 open Lwt.Infix
 
 let section = "lighter_actions"
+
+let tx_timeout_s = 10.0
+[@@ocaml.doc
+  " Budget for one REST [sendTx] round-trip. The outbox writer is serialised, so an\n\
+  \    unanswered request would wedge every queued tx. "]
+;;
 
 let client_order_counter = Atomic.make (int_of_float (Unix.gettimeofday () *. 1000.0))
 [@@ocaml.doc
@@ -91,26 +96,6 @@ let send_tx ~tx_type ~tx_info =
                   "REST sendTx failed (status=%s): %s"
                   (Cohttp.Code.string_of_status status)
                   resp_str;
-                let lower = String.lowercase_ascii resp_str in
-                if String.length lower > 0
-                then
-                  if Error_handling.string_contains lower "invalid nonce"
-                  then (
-                    Logging.warn_f
-                      ~section
-                      "Nonce desync detected. Re-fetching correct nonce from exchange.";
-                    let base_url = Lighter_endpoints.api_base_url in
-                    Lwt.dont_wait
-                      (fun () ->
-                        Lighter_signer.initialize_nonce
-                          ~base_url
-                          ~api_key_index:(Lighter_signer.get_api_key_index ())
-                          ~account_index:(Lighter_signer.get_account_index ()))
-                      (fun exn ->
-                        Logging.error_f
-                          ~section
-                          "Failed to initialize nonce: %s"
-                          (Printexc.to_string exn)));
                 Lwt.return (Error resp_str)))))
     (fun exn ->
       let err = Printexc.to_string exn in
@@ -119,7 +104,95 @@ let send_tx ~tx_type ~tx_info =
 [@@ocaml.doc
   " Submits a signed transaction over REST as multipart form data, matching the Python\n\
   \    SDK: fields [tx_type] (integer) and [tx_info] (JSON string produced by the Go \
-   signer). "]
+   signer).\n\
+  \    Callers must go through [submit]: signing allocates the nonce and Lighter requires\n\
+  \    nonces to reach the exchange in ascending order. "]
+;;
+
+(** Lighter rejects any tx whose nonce is not strictly greater than the last one it
+    accepted, so the nonce must be allocated in the order the requests reach the exchange.
+    Every submission goes through [outbox]: one writer signs and sends, so allocation
+    order is wire order and queued txs do not wait on a round-trip. *)
+type tx =
+  { tx_type : int
+  ; id : string option
+  ; sign : unit -> string
+  }
+
+let is_nonce_error msg =
+  Error_handling.string_contains (String.lowercase_ascii msg) "invalid nonce"
+;;
+
+let resync_nonce () =
+  Lighter_signer.initialize_nonce
+    ~timeout_s:2.0
+    ~base_url:Lighter_endpoints.api_base_url
+    ~api_key_index:(Lighter_signer.get_api_key_index ())
+    ~account_index:(Lighter_signer.get_account_index ())
+    ()
+;;
+
+(** Signs and dispatches queued txs: WS when the private socket is up, REST otherwise. A
+    WS frame that fails on a now-dead socket falls through to REST. REST rejections are
+    retried once after a nonce resync; a nonce rejection means the tx was never applied,
+    so the replay is safe. There is no WS equivalent — the frame either left or it did
+    not. *)
+let max_nonce_attempts = 2
+
+(* Lighter's API reference gives the batch cap as both 15 and 50; stay on the lower bound
+   rather than risk 21514 rejecting a whole ladder. *)
+let max_tx_batch = 15
+
+let rec dispatch_rest ~tx_type ~sign n =
+  let tx_info = sign () in
+  Lwt.catch
+    (fun () -> Lwt_unix.with_timeout tx_timeout_s (fun () -> send_tx ~tx_type ~tx_info))
+    (fun exn ->
+      let err =
+        match exn with
+        | Lwt_unix.Timeout -> Printf.sprintf "sendTx timed out after %.1fs" tx_timeout_s
+        | exn -> Printexc.to_string exn
+      in
+      Logging.error_f ~section "REST sendTx exception: %s" err;
+      Lwt.return (Error err))
+  >>= function
+  | Error msg when n < max_nonce_attempts && is_nonce_error msg ->
+    Logging.warn_f
+      ~section
+      "Nonce rejected (attempt %d/%d), resyncing: %s"
+      n
+      max_nonce_attempts
+      msg;
+    resync_nonce () >>= fun () -> dispatch_rest ~tx_type ~sign (n + 1)
+  | result -> Lwt.return result
+;;
+
+let dispatch_batch (txs : tx list) =
+  let rest_all () =
+    Lwt_list.map_s (fun (t : tx) -> dispatch_rest ~tx_type:t.tx_type ~sign:t.sign 1) txs
+  in
+  match txs with
+  | [] -> Lwt.return []
+  | _ :: _ when not (Lighter_ws.private_connected ()) -> rest_all ()
+  | _ ->
+    let signed = List.map (fun (t : tx) -> t, t.sign ()) txs in
+    let frames = List.map (fun ((t : tx), info) -> t.tx_type, info, t.id) signed in
+    Lighter_ws.send_txs_ws frames
+    >>= (function
+     | Ok ids -> Lwt.return (List.map (fun id -> Ok id) ids)
+     | Error err when not (Lighter_ws.private_connected ()) ->
+       Logging.warn_f
+         ~section
+         "WS tx frame failed on a dropped socket, falling back to REST: %s"
+         err;
+       rest_all ()
+     | Error err -> Lwt.return (List.map (fun _ -> Error err) signed))
+;;
+
+let outbox = Lighter_outbox.create ~max_batch:max_tx_batch ~send:dispatch_batch ()
+
+let submit ?id ~tx_type ~sign () = Lighter_outbox.submit outbox { tx_type; id; sign }
+[@@ocaml.doc " Enqueues a signed-tx thunk on the ordered outbox. "]
 ;;
 
 let place_order
@@ -156,7 +229,7 @@ let place_order
        let lighter_ot = Lighter_types.lighter_order_type_int order_type in
        let lighter_tif = Lighter_types.lighter_tif_int ~post_only tif in
        let expiry = Int64.of_int (-1) in
-       let tx_info =
+       let sign () =
          Lighter_signer.sign_create_order
            ~market_index
            ~client_order_index
@@ -168,7 +241,7 @@ let place_order
            ~reduce_only
            ~expiry
        in
-       send_tx ~tx_type:Lighter_types.tx_type_create_order ~tx_info
+       submit ~id:client_order_id ~tx_type:Lighter_types.tx_type_create_order ~sign ()
        >>= fun result ->
        (match result with
         | Ok _ ->
@@ -218,8 +291,8 @@ let cancel_order ~symbol ~order_id =
   | None -> Lwt.return (Error (Printf.sprintf "Unknown symbol: %s" symbol))
   | Some market_index ->
     let order_index = Int64.of_string order_id in
-    let tx_info = Lighter_signer.sign_cancel_order ~market_index ~order_index in
-    send_tx ~tx_type:Lighter_types.tx_type_cancel_order ~tx_info
+    let sign () = Lighter_signer.sign_cancel_order ~market_index ~order_index in
+    submit ~id:order_id ~tx_type:Lighter_types.tx_type_cancel_order ~sign ()
     >>= fun result ->
     (match result with
      | Ok _ ->
@@ -249,14 +322,14 @@ let modify_order ~symbol ~order_id ~new_qty ~new_price =
            ~decimals:info.supported_price_decimals
            new_price
        in
-       let tx_info =
+       let sign () =
          Lighter_signer.sign_modify_order
            ~market_index
            ~order_index
            ~new_base_amount
            ~new_price:new_price_int
        in
-       send_tx ~tx_type:Lighter_types.tx_type_modify_order ~tx_info
+       submit ~id:order_id ~tx_type:Lighter_types.tx_type_modify_order ~sign ()
        >>= fun result ->
        (match result with
         | Ok _ ->
@@ -286,8 +359,8 @@ let cancel_all_orders ~symbol =
   match Lighter_instruments_feed.get_market_index ~symbol with
   | None -> Lwt.return (Error (Printf.sprintf "Unknown symbol: %s" symbol))
   | Some market_index ->
-    let tx_info = Lighter_signer.sign_cancel_all_orders ~market_index in
-    send_tx ~tx_type:Lighter_types.tx_type_cancel_all_orders ~tx_info
+    let sign () = Lighter_signer.sign_cancel_all_orders ~market_index in
+    submit ~tx_type:Lighter_types.tx_type_cancel_all_orders ~sign ()
     >>= fun result ->
     (match result with
      | Ok _ ->

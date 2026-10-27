@@ -105,6 +105,10 @@ type conn =
 let read conn = conn.next_frame ()
 let write conn frame = conn.send_frame frame
 let close_transport conn = close_channels conn.input conn.output
+
+(* Drops buffered output instead of flushing it: [close] flushes first, which blocks
+   forever on a peer that stopped draining. The only teardown that cannot hang. *)
+let abort_transport conn = Lwt.join [ Lwt_io.abort conn.output; Lwt_io.abort conn.input ]
 let resolve_ctx () = Ctx.resolve ()
 
 let connect

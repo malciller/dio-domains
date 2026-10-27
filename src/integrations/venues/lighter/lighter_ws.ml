@@ -162,6 +162,29 @@ let subscribe_market_data () =
   \    arrive after close returns false and closes the stream. "]
 ;;
 
+let write_timeout_s = 5.0
+[@@ocaml.doc
+  " Deadline for one frame write. A peer that stops draining leaves [Lwt_io.flush] pending\n\
+  \    forever; the write holds [connection_mutex], so that would also starve the \
+   heartbeat\n\
+  \    that would otherwise detect the stall. "]
+;;
+
+(* A timed-out or failed write leaves a partial frame on the wire, so the stream cannot be
+   reused: abort the socket (never flush a stalled buffer) and let the reconnect loop
+   rebuild and resubscribe. *)
+let write_frame_locked state conn frame =
+  Lwt.catch
+    (fun () ->
+      Lwt_unix.with_timeout write_timeout_s (fun () -> Ws_lwt.write conn frame)
+      >|= fun () -> Ok ())
+    (fun exn ->
+      state.active_connection := None;
+      Atomic.set state.is_connected_ref false;
+      Ws_lwt.abort_transport conn
+      >>= fun () -> Lwt.return (Error (Printexc.to_string exn)))
+;;
+
 let send_json_on state json label =
   Lwt_mutex.with_lock state.connection_mutex (fun () ->
     match !(state.active_connection) with
@@ -172,16 +195,26 @@ let send_json_on state json label =
         "[%s] Sending WS message: %s"
         label
         (if String.length msg > 500 then String.sub msg 0 500 ^ "..." else msg);
-      Ws_lwt.write conn (Websocket.Frame.create ~content:msg ())
+      write_frame_locked state conn (Websocket.Frame.create ~content:msg ())
+      >>= (function
+       | Ok () -> Lwt.return (Ok ())
+       | Error err ->
+         Logging.error_f ~section "[%s] Write failed, connection dropped: %s" label err;
+         Lwt.return (Error err))
     | None ->
       Logging.warn_f ~section "[%s] Cannot send: WebSocket not connected" label;
-      Lwt.return_unit)
+      Lwt.return (Error "WebSocket not connected"))
 [@@ocaml.doc
-  " Serializes and sends a JSON payload on the given connection under its lock. "]
+  " Serializes and sends a JSON payload on the given connection under its lock, reporting\n\
+  \    whether the frame reached the socket. "]
 ;;
 
-let send_public_json = send_json_on public_state
-let send_private_json = send_json_on private_state
+let send_public_json json label = send_json_on public_state json label >|= fun _ -> ()
+let send_private_json json label = send_json_on private_state json label >|= fun _ -> ()
+
+(* Tx submission needs the failure, not just the log line: a silently dropped order is
+   worse than a reported one. *)
+let send_private_tx json = send_json_on private_state json "Private"
 
 let subscribe_public_orderbook ~symbols =
   let public_stream = Lwt_stream.of_list symbols in
@@ -305,18 +338,80 @@ let subscribe_to_feeds ~symbols ~account_index ~auth_token =
   \    parameters so reconnect loops can replay them. "]
 ;;
 
-let send_tx_ws ~tx_type ~tx_info =
-  let json =
+let tx_id_counter = Atomic.make 0
+let next_tx_id () = Atomic.fetch_and_add tx_id_counter 1
+
+(** Pure frame builder: one tx becomes [jsonapi/sendtx], several [jsonapi/sendtxbatch].
+    Batch fields are JSON *strings* holding arrays, per the reference client. *)
+let tx_frame txs =
+  match txs with
+  | [ (tx_type, tx_info, id) ] ->
     `Assoc
       [ "type", `String "jsonapi/sendtx"
       ; ( "data"
-        , `Assoc [ "tx_type", `Int tx_type; "tx_info", Yojson.Safe.from_string tx_info ] )
+        , `Assoc
+            [ "id", `String id
+            ; "tx_type", `Int tx_type
+            ; "tx_info", Yojson.Safe.from_string tx_info
+            ] )
       ]
+  | (_, _, first_id) :: _ as many ->
+    let types = `List (List.map (fun (t, _, _) -> `Int t) many) in
+    let infos =
+      `List (List.map (fun (_, info, _) -> Yojson.Safe.from_string info) many)
+    in
+    `Assoc
+      [ "type", `String "jsonapi/sendtxbatch"
+      ; ( "data"
+        , `Assoc
+            [ "id", `String first_id
+            ; "tx_types", `String (Yojson.Safe.to_string types)
+            ; "tx_infos", `String (Yojson.Safe.to_string infos)
+            ] )
+      ]
+  | [] -> `Assoc []
+;;
+
+(** [txs] is [(tx_type, tx_info, id)] in nonce order. Both forms are a single frame, so a
+    burst costs one write. Resolves with the id assigned to each tx, in input order. *)
+let send_txs_ws txs =
+  let txs =
+    List.map
+      (fun (tx_type, tx_info, id) ->
+        let id =
+          match id with
+          | Some i -> i
+          | None -> Printf.sprintf "dio-%d" (next_tx_id ())
+        in
+        tx_type, tx_info, id)
+      txs
   in
-  send_private_json json "Private"
+  let frame = tx_frame txs in
+  match txs with
+  | [] -> Lwt.return (Ok [])
+  | _ ->
+    if not (private_connected ())
+    then Lwt.return (Error "lighter private WS not connected")
+    else (
+      let ids = List.map (fun (_, _, id) -> id) txs in
+      let id_str = String.concat "," ids in
+      Lwt.catch
+        (fun () ->
+          send_private_tx frame
+          >|= function
+          | Ok () ->
+            Logging.debug_f ~section "tx over WS: n=%d ids=[%s]" (List.length txs) id_str;
+            Ok ids
+          | Error e -> Error (Printf.sprintf "tx over WS failed (ids=[%s]): %s" id_str e))
+        (fun exn ->
+          let err = Printexc.to_string exn in
+          Logging.error_f ~section "tx over WS failed (ids=[%s]): %s" id_str err;
+          Lwt.return (Error err)))
 [@@ocaml.doc
-  " Sends a signed tx over the private WS ([jsonapi/sendtx]). Unused; orders go through\n\
-  \    REST in [lighter_actions.ml]. "]
+  " Sends signed txs over the private WS ([jsonapi/sendtx] or [jsonapi/sendtxbatch]),\n\
+  \    resolving once the frame is written. [Error] means the frame was not written;\n\
+  \    acceptance is confirmed by the account order stream, as the API documents for both\n\
+  \    transports. "]
 ;;
 
 let record_orderbook_latency json =
@@ -345,6 +440,7 @@ let record_orderbook_latency json =
 type text_frame_kind =
   | Frame_data
   | Frame_pong
+  | Frame_tx_ack of int * string
   | Frame_unmatched of string * string
 [@@ocaml.doc " Classification of an inbound text frame. "]
 
@@ -431,6 +527,24 @@ let decode_text_frame content : text_frame_kind =
     Lighter_market_stats.process_market_data json;
     Frame_data
   | "pong" -> Frame_pong
+  | "jsonapi/sendtx" | "jsonapi/sendtxbatch" ->
+    (* Acceptance reply for a submitted tx. The schema is undocumented beyond "id is
+       returned", so read [code]/[message] from the payload or the envelope and default to
+       accepted. *)
+    let open Yojson.Safe.Util in
+    let data = member "data" json in
+    let pick f =
+      match f data with
+      | Some v -> Some v
+      | None -> f json
+    in
+    let code =
+      Option.value (pick (fun j -> to_int_option (member "code" j))) ~default:200
+    in
+    let message =
+      Option.value (pick (fun j -> to_string_option (member "message" j))) ~default:""
+    in
+    Frame_tx_ack (code, message)
   | t -> Frame_unmatched (t, channel)
 [@@ocaml.doc
   " Pure decode of one inbound text frame: routes market-data and execution frames to the\n\
@@ -449,6 +563,27 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
     (try
        (match decode_text_frame frame.Websocket.Frame.content with
         | Frame_data -> ()
+        | Frame_tx_ack (code, message) ->
+          if code = 200
+          then Logging.debug_f ~section "Tx accepted (code=%d)" code
+          else (
+            Logging.warn_f
+              ~section
+              "Tx rejected by exchange: code=%d message=%s"
+              code
+              message;
+            (* Without this a desync rejects every later tx on this transport. *)
+            if Error_handling.string_contains
+                 (String.lowercase_ascii message)
+                 "invalid nonce"
+            then
+              Lwt.async (fun () ->
+                Lighter_signer.initialize_nonce
+                  ~timeout_s:2.0
+                  ~base_url:Lighter_endpoints.api_base_url
+                  ~api_key_index:(Lighter_signer.get_api_key_index ())
+                  ~account_index:(Lighter_signer.get_account_index ())
+                  ()))
         | Frame_pong ->
           state.last_pong_time := Unix.gettimeofday ();
           (try Lwt_condition.broadcast state.pong_condition () with
@@ -825,9 +960,11 @@ let send_ping ~req_id:_ ~timeout_ms =
         Lwt_mutex.with_lock state.connection_mutex (fun () ->
           match !(state.active_connection) with
           | Some conn ->
-            Ws_lwt.write
+            write_frame_locked
+              state
               conn
               (Websocket.Frame.create ~opcode:Websocket.Frame.Opcode.Ping ())
+            >|= fun _ -> ()
           | None -> Lwt.return_unit)
         >>= fun () ->
         Lwt.pick

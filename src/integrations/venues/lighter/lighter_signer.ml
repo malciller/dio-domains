@@ -170,9 +170,24 @@ let with_signer_lock f =
 
 let nonce_counter = Atomic.make 0
 let get_and_increment_nonce () = Atomic.fetch_and_add nonce_counter 1
-let set_nonce n = Atomic.set nonce_counter n
 
-let initialize_nonce ~base_url ~api_key_index ~account_index =
+(** Advances the counter to [n], never rewinds it. A resync fetches the exchange's next
+    nonce while other signed txs may already be in flight; those txs hold higher local
+    nonces, so assigning [n] blindly would hand out duplicates. Lock-free CAS, mirroring
+    [Hyperliquid_actions.get_next_nonce]. *)
+let advance_nonce_to n =
+  let rec loop () =
+    let current = Atomic.get nonce_counter in
+    if n <= current
+    then ()
+    else if Atomic.compare_and_set nonce_counter current n
+    then ()
+    else loop ()
+  in
+  loop ()
+;;
+
+let initialize_nonce ?(timeout_s = 10.0) ~base_url ~api_key_index ~account_index () =
   let url =
     Printf.sprintf
       "%s/api/v1/nextNonce?account_index=%d&api_key_index=%d"
@@ -180,7 +195,7 @@ let initialize_nonce ~base_url ~api_key_index ~account_index =
       account_index
       api_key_index
   in
-  Logging.info_f ~section "Fetching initial nonce from %s..." url;
+  Logging.info_f ~section "Fetching next nonce from %s..." url;
   let fetch =
     Lwt.catch
       (fun () ->
@@ -208,10 +223,10 @@ let initialize_nonce ~base_url ~api_key_index ~account_index =
                   let open Yojson.Safe.Util in
                   member "nonce" json |> to_int
                 in
-                set_nonce nonce;
+                advance_nonce_to nonce;
                 Logging.info_f
                   ~section
-                  "Initialized nonce to %d for account %d, api_key %d"
+                  "Advanced nonce to %d for account %d, api_key %d"
                   nonce
                   account_index
                   api_key_index;
@@ -224,15 +239,16 @@ let initialize_nonce ~base_url ~api_key_index ~account_index =
         Lwt.return_unit)
   in
   let timeout =
-    Lwt_unix.sleep 10.0
+    Lwt_unix.sleep timeout_s
     >>= fun () ->
-    Logging.error_f ~section "Nonce fetch timed out after 10s";
+    Logging.error_f ~section "Nonce fetch timed out after %.0fs" timeout_s;
     Lwt.return_unit
   in
   Lwt.pick [ fetch; timeout ]
 [@@ocaml.doc
-  " Fetches the next nonce from [/api/v1/nextNonce] and resets the local atomic counter to\n\
-  \    match the exchange. Races a 10s timeout. "]
+  " Fetches the next nonce from [/api/v1/nextNonce] and advances the local atomic counter\n\
+  \    to match the exchange. Races a [timeout_s] timeout (default 10s); the order path\n\
+  \    passes a shorter one so a resync cannot stall submissions. "]
 ;;
 
 let api_key_index = ref 0
