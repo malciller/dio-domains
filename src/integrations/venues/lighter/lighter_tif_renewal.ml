@@ -159,8 +159,8 @@ let run_renewal_cycle () =
           order.order_id
           order.symbol)
     all_orders;
-  (* Renew sequentially with a pause between operations so signer nonces are consumed in
-     order; [consume_stream_s] also bounds pending work instead of accumulating unbounded
+  (* Renew sequentially; [Lighter_actions.submit] enforces nonce ordering, so this only
+     needs [consume_stream_s] to bound pending work instead of accumulating unbounded
      [Forward] promises in the runtime. *)
   let expiring_stream = Lwt_stream.of_list expiring in
   Concurrency.Lwt_util.consume_stream_s
@@ -182,8 +182,7 @@ let run_renewal_cycle () =
         (match result with
          | Ok () -> ()
          | Error _ -> ());
-        (* 200ms spacing keeps signer nonces monotonic between renewals. *)
-        Lwt_unix.sleep 0.2))
+        Lwt.return_unit))
     expiring_stream
 ;;
 

@@ -52,6 +52,34 @@ let test_ping_failure_counter () =
   Alcotest.(check int) "after reset" 0 (Lighter.Ws.get_ping_failures ())
 ;;
 
+let test_tx_frame_single () =
+  let open Yojson.Safe.Util in
+  let frame = Lighter.Ws.tx_frame [ 1, {|{"Index":42}|}, "id-1" ] in
+  Alcotest.(check string) "type" "jsonapi/sendtx" (member "type" frame |> to_string);
+  let data = member "data" frame in
+  Alcotest.(check string) "id" "id-1" (member "id" data |> to_string);
+  Alcotest.(check int) "tx_type" 1 (member "tx_type" data |> to_int);
+  Alcotest.(check int)
+    "tx_info is an object"
+    42
+    (member "Index" (member "tx_info" data) |> to_int)
+;;
+
+let test_tx_frame_batch () =
+  let open Yojson.Safe.Util in
+  let frame =
+    Lighter.Ws.tx_frame [ 1, {|{"Index":1}|}, "id-1"; 2, {|{"Index":2}|}, "id-2" ]
+  in
+  Alcotest.(check string) "type" "jsonapi/sendtxbatch" (member "type" frame |> to_string);
+  let data = member "data" frame in
+  (* Batch fields are JSON strings holding arrays, per the reference client. *)
+  let types = member "tx_types" data |> to_string |> Yojson.Safe.from_string |> to_list in
+  Alcotest.(check (list int)) "tx_types" [ 1; 2 ] (List.map to_int types);
+  let infos = member "tx_infos" data |> to_string |> Yojson.Safe.from_string |> to_list in
+  Alcotest.(check int) "one info per tx" 2 (List.length infos);
+  Alcotest.(check int) "first info" 1 (member "Index" (List.nth infos 0) |> to_int)
+;;
+
 let () =
   Alcotest.run
     "Lighter WebSocket"
@@ -66,6 +94,10 @@ let () =
             `Quick
             test_broadcast_multiple_subscribers
         ; Alcotest.test_case "close_unsubscribes" `Quick test_close_unsubscribes
+        ] )
+    ; ( "tx_frames"
+      , [ Alcotest.test_case "single" `Quick test_tx_frame_single
+        ; Alcotest.test_case "batch" `Quick test_tx_frame_batch
         ] )
     ; ( "ping"
       , [ Alcotest.test_case "ping_failure_counter" `Quick test_ping_failure_counter ] )

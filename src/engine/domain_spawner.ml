@@ -1330,8 +1330,7 @@ let asset_domain_worker
     let run_overlay_cycles (ov : overlay_instance_rt) ~now ~price ~events =
       let measured = !latency_active in
       let profs = ov.oir_profs in
-      let now_ns () = Monotonic_clock.now_ns () in
-      let t0 = if measured then now_ns () else 0 in
+      let t0 = if measured then Monotonic_clock.now_ns () else 0 in
       let ctx = ov.oir_ctx in
       let asset = ov.oir_asset in
       ctx.cg_asset <- Some asset;
@@ -1353,10 +1352,10 @@ let asset_domain_worker
       ctx.cg_base_age <- None;
       ctx.cg_gen <- 0;
       ctx.cg_profile <- false;
-      let t_prep = if measured then now_ns () else 0 in
+      let t_prep = if measured then Monotonic_clock.now_ns () else 0 in
       List.iter
         (fun (event_name, fields) ->
-           let t_ev = if measured then now_ns () else 0 in
+           let t_ev = if measured then Monotonic_clock.now_ns () else 0 in
            Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
              ignore
                (Dio_strategies.Strategy_runtime.run_cycle
@@ -1366,18 +1365,18 @@ let asset_domain_worker
                   ~event:(Dio_strategies.Strategy_runtime.make_event event_name fields)));
            if measured
            then (
-             let ns = now_ns () - t_ev in
-             (* Charge the reaction to what woke the leg: a book tick is book work, a fill
-                is event work, anything else is strategy work. *)
+             let ns = Monotonic_clock.now_ns () - t_ev in
+             (* A fill is execution-event work; everything else is the leg's own decision
+                pass, which is strategy work like a grid's. The leg applies no book frames
+                itself (the host domain does), so its BOOK column stays empty. *)
              let prof =
                match event_name with
-               | "book_update" -> profs.prof_ob
                | "filled" -> profs.prof_exec
                | _ -> profs.prof_strategy
              in
              if ns > 0 then Latency_profiler.record_ns prof ns))
         events;
-      let t_save = if measured then now_ns () else 0 in
+      let t_save = if measured then Monotonic_clock.now_ns () else 0 in
       Dio_strategies.Overlay_instance_runtime.save_if_changed
         ~owner_exchange:ov.oir_config.oi_owner_exchange
         ~owner_symbol:ov.oir_config.oi_owner_symbol
@@ -1387,7 +1386,7 @@ let asset_domain_worker
       if not measured
       then 0
       else (
-        let t_end = now_ns () in
+        let t_end = Monotonic_clock.now_ns () in
         let prep_ns = t_prep - t0 + (t_end - t_save) in
         if prep_ns > 0 then Latency_profiler.record_ns profs.prof_prep prep_ns;
         let ns = t_end - t0 in

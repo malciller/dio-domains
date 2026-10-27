@@ -491,7 +491,7 @@ let initialize_signer () =
   with
   | Ok () ->
     Logging.info_f ~section "Lighter signer initialized successfully";
-    Lighter_signer.initialize_nonce ~base_url ~api_key_index ~account_index
+    Lighter_signer.initialize_nonce ~base_url ~api_key_index ~account_index ()
   | Error msg ->
     Logging.error_f ~section "Failed to initialize Lighter signer: %s" msg;
     Lwt.return_unit
