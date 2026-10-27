@@ -99,10 +99,11 @@ type metric_group =
     - INTERNAL: per-asset work. [oracle] is the capital-oracle's per-asset analysis pass
       (own ~5 min cadence, outside the per-cycle span). [orderbook] -> [execution] ->
       [prep] -> [strategy] are the four sequential segments of one cycle; [cycle] is their
-      sum. All are in-process work with the same sub-10us target. A generic overlay
-      instance (a perp long on its own venue, executing inside its owner's domain) gets a
-      nested row carrying only [strategy]: that instance's cycle span, kept off the
-      owner's STRATEGY cell so it is not counted twice.
+      sum. All are in-process work with the same sub-10us target. A perp leg that runs
+      inside its owner's domain (a generic overlay instance, or a carry controller sharing
+      the hedge grid's domain) gets its own nested row keyed by venue; a generic instance
+      publishes its whole cycle span as both [strategy] and [cycle], and its time stays off
+      the owner's STRATEGY cell so it is not counted twice.
     - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed one-way latency,
       REST round-trip, signer time). These measure exchange round-trips and feed transit,
       not in-process work, and carry their own budgets. *)
@@ -547,19 +548,10 @@ let render_latencies w (snapshot : Snapshot.t) =
                 if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
               page_cols
           in
-          (* An overlay instance publishes its whole cycle span as [strategy]; plot that
-             when the page's own metric is absent. *)
-          let trend_key =
-            if List.mem_assoc page.trend_metric metrics
-            then page.trend_metric
-            else if List.mem_assoc "strategy" metrics
-            then "strategy"
-            else page.trend_metric
-          in
-          let t_smooth = ema_smooth (hist_of key trend_key) ~alpha:0.5 in
+          let t_smooth = ema_smooth (hist_of key page.trend_metric) ~alpha:0.5 in
           let trend_spark =
             render_sparkline_local trend_col_w t_smooth page.trend_max_us (fun v ->
-              latency_cell_attr (attr_of_sev (severity_of_value trend_key v)) v)
+              latency_cell_attr (attr_of_sev (severity_of_value page.trend_metric v)) v)
           in
           let exch = exch_of_row key in
           let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in

@@ -137,7 +137,50 @@ let get_overlay_profiler_snapshots () =
   in
   Mutex.unlock profiler_cache_mutex;
   List.map
-    (fun (key, prof) -> key, [ "strategy", Latency_profiler.published_snapshot prof ])
+    (fun (key, prof) ->
+       (* The instance has no measured sub-segments: its whole cycle span is both its
+          strategy step and its total, so the row fills STRATEGY and TOTAL. *)
+       let snap = Latency_profiler.published_snapshot prof in
+       key, [ "strategy", snap; "cycle", snap ])
+    rows
+;;
+
+(** One carry controller runs inside the domain of the instrument it hedges, so when a
+    grid already owns that domain the controller has no row of its own. This gives each
+    controller a row keyed by its hedge venue, so the perp leg is visible and timed even
+    when it shares a domain with the grid. *)
+let controller_profiler_cache : (string, Latency_profiler.t) Hashtbl.t =
+  Hashtbl.create 8
+;;
+
+let get_controller_profiler ~exchange ~coin =
+  let key = overlay_latency_key ~exchange ~symbol:coin in
+  Mutex.lock profiler_cache_mutex;
+  let p =
+    match Hashtbl.find_opt controller_profiler_cache key with
+    | Some p -> p
+    | None ->
+      let p = Latency_profiler.create ~rolling_windows:8 (coin ^ ":carry") in
+      Hashtbl.replace controller_profiler_cache key p;
+      p
+  in
+  Mutex.unlock profiler_cache_mutex;
+  p
+;;
+
+let get_controller_profiler_snapshots () =
+  Mutex.lock profiler_cache_mutex;
+  let rows =
+    Hashtbl.fold
+      (fun key prof acc -> (key, prof) :: acc)
+      controller_profiler_cache
+      []
+  in
+  Mutex.unlock profiler_cache_mutex;
+  List.map
+    (fun (key, prof) ->
+       let snap = Latency_profiler.published_snapshot prof in
+       key, [ "strategy", snap; "cycle", snap ])
     rows
 ;;
 
@@ -977,9 +1020,9 @@ let asset_domain_worker
        every [latency_window_seconds]; this only limits a busy domain to one reported
        window per interval. *)
     let last_spike_report_time = ref (Unix.gettimeofday ()) in
-    (* Overlay-instance profilers owned by this domain, rolled on the same window cadence so
-       their rows publish alongside the domain's own. Filled once the instances are loaded
-       below; empty for a domain with no overlay. *)
+    (* Overlay-instance and controller profilers owned by this domain, rolled on the same
+       window cadence so their rows publish alongside the domain's own. Filled once the
+       instances are loaded below; empty for a domain with no overlay. *)
     let overlay_window_profs = ref ([] : Latency_profiler.t list) in
     (* Per-cycle GC attribution is captured inline in the loop (two [Gc.quick_stat] reads,
        ~0.3us each; see [gc_monitor]); the window publisher below does not sample GC. *)
@@ -1076,6 +1119,17 @@ let asset_domain_worker
                String.equal x.oc_hedge_exchange c.oc_hedge_exchange)
              (get_overlay_controllers ()))
       | None -> 0
+    in
+    (* The controller needs its own row only when this domain also runs a grid: a domain
+       that exists solely for the hedge already is the perp row. *)
+    let controller_prof =
+      match overlay_controller with
+      | Some c when not (String.equal asset_with_fees.strategy "") ->
+        Some
+          (get_controller_profiler
+             ~exchange:c.oc_hedge_exchange
+             ~coin:c.oc_hedge_coin)
+      | _ -> None
     in
     (* Controller-scoped values the overlay cycle needs every tick. Resolve them once here
        instead of re-normalizing the exchange and splitting the symbol in the loop. *)
@@ -1243,7 +1297,11 @@ let asset_domain_worker
     (* Additional generic overlays owned by this grid entry. They run in the same domain:
        no new process, and grid sell fills are available locally. *)
     let overlay_instances = load_overlay_instances ~owner:asset_with_fees in
-    overlay_window_profs := List.map (fun ov -> ov.oir_prof) overlay_instances;
+    overlay_window_profs :=
+      List.map (fun ov -> ov.oir_prof) overlay_instances
+      @ (match controller_prof with
+         | Some prof -> [ prof ]
+         | None -> []);
     (* Loop-invariant: only a domain that hosts overlay work pays the two extra clock
        reads that split it out of PREP. *)
     let has_overlay_work =
@@ -3265,8 +3323,13 @@ let asset_domain_worker
              pool.pl_own_net
              pool.pl_reserve)
        | _ -> ());
-      (* Generic overlays run on their venue's position/margin changes. A resting entry
-         is a live GTC limit and needs the book to reprice, so subscribe only while one
+      (match controller_prof with
+       | Some prof when latency_this_cycle && t_overlay > 0 ->
+         let ns = Monotonic_clock.now_ns () - t_overlay in
+         if ns > 0 then Latency_profiler.record_ns prof ns
+       | _ -> ());
+      (* Generic overlays run on their venue's position/margin changes. A resting entry is
+         a live GTC limit and needs the book to reprice, so subscribe only while one
          exists; every other tick stays out of the interpreter. *)
       let instance_ns = ref 0 in
       List.iter

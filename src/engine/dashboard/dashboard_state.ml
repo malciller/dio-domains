@@ -412,11 +412,24 @@ let network_entries venue =
     | None -> None)
 ;;
 
+(** Latency row key for a domain. A grid row is keyed by its symbol. A perp-venue domain
+    (a spot grid hedged on a perp, e.g. Kraken ADA/USD on the HL ADA perp) runs no grid of
+    its own, so its row is a venue row keyed like an overlay instance and the dashboard
+    names and colours it by venue instead of showing a grey pair. *)
+let domain_latency_key (tc : Dio_engine.Config.trading_config) =
+  if String.equal tc.strategy ""
+  then
+    Dio_engine.Domain_spawner.overlay_latency_key
+      ~exchange:tc.exchange
+      ~symbol:(Dio_engine.Config.base_coin_of_symbol tc.symbol)
+  else tc.symbol
+;;
+
 (** Merge the per-venue network latency windows into the per-domain latency map under the
     NETWORK-page labels (ws_ping / ws_feed / rest_request / signer), so ENGINE LATENCY
-    rows show each domain venue's network characteristics. Keys match the trading-config
-    symbols the domains are keyed by, case-insensitively. Venues with no network
-    measurement are absent; the NETWORK page renders "--".
+    rows show the network characteristics of the venue each one trades: a grid row under
+    its symbol, a perp or overlay row under its "<venue>:<instrument>" key. Venues with no
+    network measurement are absent; the NETWORK page renders "--".
 
     A venue reached only through an overlay leg (a Lighter long funded by a spot grid on
     another venue) belongs to no domain row, so it gets a row keyed by the venue name. *)
@@ -427,50 +440,58 @@ let merge_network_latencies latencies =
       Hashtbl.replace by_symbol (String.lowercase_ascii symbol) (symbol, json))
     latencies;
   let config = get_config () in
-  let merge_into key venue =
-    match Hashtbl.find_opt by_symbol key with
-    | None -> ()
-    | Some (orig, json) ->
-      let entries = network_entries venue in
-      (match json with
-       | `Assoc l when entries <> [] ->
-         Hashtbl.replace by_symbol key (orig, `Assoc (entries @ l))
-       | _ -> ())
+  let domains = Dio_engine.Config.domain_assets config.trading in
+  let controllers = Dio_engine.Config.get_overlay_controllers () in
+  let instances = Dio_engine.Config.get_overlay_instances () in
+  (* Every row takes the windows of the venue it trades. A row can be reached from more
+     than one source (a controller domain is also a controller), so merge each row once. *)
+  let seen = Hashtbl.create 16 in
+  let covered_venues = Hashtbl.create 8 in
+  let add_row key venue =
+    let key = String.lowercase_ascii key in
+    if not (Hashtbl.mem seen key)
+    then (
+      Hashtbl.replace seen key ();
+      match Hashtbl.find_opt by_symbol key with
+      | None -> ()
+      | Some (orig, json) ->
+        Hashtbl.replace covered_venues (Dio_engine.Config.normalize_exchange venue) ();
+        let entries = network_entries venue in
+        (match json with
+         | `Assoc l when entries <> [] ->
+           Hashtbl.replace by_symbol key (orig, `Assoc (entries @ l))
+         | _ -> ()))
   in
   List.iter
     (fun (tc : Dio_engine.Config.trading_config) ->
-      merge_into (String.lowercase_ascii tc.symbol) tc.exchange)
-    config.trading;
-  let domain_venues =
-    List.map (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange) config.trading
-  in
-  let instances = Dio_engine.Config.get_overlay_instances () in
-  (* An overlay instance's row carries its venue's network windows, so a carry short and a
-     long on different venues stay separate rows instead of sharing one. *)
-  let covered_venues = Hashtbl.create 4 in
+       add_row (domain_latency_key tc) tc.exchange)
+    domains;
+  List.iter
+    (fun (c : Dio_engine.Config.overlay_controller) ->
+       add_row
+         (Dio_engine.Domain_spawner.overlay_latency_key
+            ~exchange:c.oc_hedge_exchange
+            ~symbol:c.oc_hedge_coin)
+         c.oc_hedge_exchange)
+    controllers;
   List.iter
     (fun (o : Dio_engine.Config.overlay_instance) ->
-       let key =
-         Dio_engine.Domain_spawner.overlay_latency_key
-           ~exchange:o.oi_exchange
-           ~symbol:o.oi_symbol
-         |> String.lowercase_ascii
-       in
-       Hashtbl.replace
-         covered_venues
-         (Dio_engine.Config.normalize_exchange o.oi_exchange)
-         ();
-       match Hashtbl.find_opt by_symbol key with
-       | None -> ()
-       | Some (orig, json) ->
-         let entries = network_entries o.oi_exchange in
-         (match json with
-          | `Assoc l when entries <> [] ->
-            Hashtbl.replace by_symbol key (orig, `Assoc (entries @ l))
-          | _ -> ()))
+       add_row
+         (Dio_engine.Domain_spawner.overlay_latency_key
+            ~exchange:o.oi_exchange
+            ~symbol:o.oi_symbol)
+         o.oi_exchange)
     instances;
-  instances
-  |> List.map (fun (o : Dio_engine.Config.overlay_instance) -> o.oi_exchange)
+  let domain_venues =
+    List.map (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange) domains
+  in
+  let venue_sources =
+    List.map
+      (fun (c : Dio_engine.Config.overlay_controller) -> c.oc_hedge_exchange)
+      controllers
+    @ List.map (fun (o : Dio_engine.Config.overlay_instance) -> o.oi_exchange) instances
+  in
+  venue_sources
   |> List.sort_uniq String.compare
   |> List.iter (fun venue ->
     let key = String.lowercase_ascii venue in
@@ -484,47 +505,41 @@ let merge_network_latencies latencies =
 ;;
 
 let json_of_domain_latencies () =
-  let profilers = Dio_engine.Domain_spawner.get_domain_profiler_snapshots () in
-  let latencies =
-    List.map
-      (fun (symbol, snaps) ->
-        ( symbol
-        , `Assoc
-            (List.filter_map
-               (fun (label, snap_opt) ->
-                 match snap_opt with
-                 | Some snap -> Some (label, json_of_latency_snapshot snap)
-                 | None -> None)
-               snaps) ))
-      profilers
-  in
-  (* Overlay instances run inside their owner's domain, so they have no domain row. Give
-     each one a row under its instrument: it nests with the other overlay legs of the same
-     asset, and its STRATEGY cell is that instance's own cycle span. *)
-  let taken = Hashtbl.create 16 in
+  let domain_keys = Hashtbl.create 16 in
   List.iter
-    (fun (symbol, _) -> Hashtbl.replace taken (String.lowercase_ascii symbol) ())
-    latencies;
-  let overlay_rows =
-    Dio_engine.Domain_spawner.get_overlay_profiler_snapshots ()
-    |> List.filter_map (fun (symbol, snaps) ->
-      if Hashtbl.mem taken (String.lowercase_ascii symbol)
-      then None
-      else (
-        Hashtbl.replace taken (String.lowercase_ascii symbol) ();
-        let entries =
-          List.filter_map
-            (fun (label, snap_opt) ->
-               match snap_opt with
-               | Some snap -> Some (label, json_of_latency_snapshot snap)
-               | None -> None)
-            snaps
-        in
-        if entries = [] then None else Some (symbol, `Assoc entries)))
+    (fun (tc : Dio_engine.Config.trading_config) ->
+      Hashtbl.replace domain_keys tc.symbol (domain_latency_key tc))
+    (Dio_engine.Config.domain_assets (get_config ()).trading);
+  (* One row per domain, per carry controller and per overlay instance. Sources can name
+     the same row (a controller domain is also a controller); the first wins, so a domain
+     row with its full segment set beats the controller's single span. *)
+  let taken = Hashtbl.create 16 in
+  let rows_of snapshots =
+    List.filter_map
+      (fun (key, snaps) ->
+         let key = Option.value (Hashtbl.find_opt domain_keys key) ~default:key in
+         let lower = String.lowercase_ascii key in
+         if Hashtbl.mem taken lower
+         then None
+         else (
+           Hashtbl.replace taken lower ();
+           let entries =
+             List.filter_map
+               (fun (label, snap_opt) ->
+                  match snap_opt with
+                  | Some snap -> Some (label, json_of_latency_snapshot snap)
+                  | None -> None)
+               snaps
+           in
+           if entries = [] then None else Some (key, `Assoc entries)))
+      snapshots
   in
-  `Assoc
-    (merge_network_latencies
-       (merge_oracle_asset_latencies (latencies @ overlay_rows)))
+  let rows =
+    rows_of (Dio_engine.Domain_spawner.get_domain_profiler_snapshots ())
+    @ rows_of (Dio_engine.Domain_spawner.get_controller_profiler_snapshots ())
+    @ rows_of (Dio_engine.Domain_spawner.get_overlay_profiler_snapshots ())
+  in
+  `Assoc (merge_network_latencies (merge_oracle_asset_latencies rows))
 ;;
 
 (** Engine-global capital-oracle latency windows (per-pass stages), serialized for the
