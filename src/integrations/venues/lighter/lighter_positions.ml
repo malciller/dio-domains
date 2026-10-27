@@ -85,6 +85,41 @@ let remember_market_coin market_id coin =
 
 let market_coin market_id = Hashtbl.find_opt (Atomic.get market_coins) market_id
 
+(** Last non-flat position per coin: [(signed qty, entry)]. Kept after a position flattens
+    so a close fill prices off the venue's entry basis even when its position frame lands
+    first. Copy-on-write: readers never see a mutated table. *)
+let last_basis : (string, float * float) Hashtbl.t Atomic.t =
+  Atomic.make (Hashtbl.create 16)
+;;
+
+let remember_basis (p : Exchange.Market_context.position) =
+  let qty = p.Exchange.Market_context.qty in
+  let entry = p.Exchange.Market_context.entry in
+  if entry > 0.0 && Float.abs qty > 1e-12
+  then (
+    let rec loop () =
+      let current = Atomic.get last_basis in
+      let copy = Hashtbl.copy current in
+      Hashtbl.replace copy p.Exchange.Market_context.coin (qty, entry);
+      if not (Atomic.compare_and_set last_basis current copy) then loop ()
+    in
+    loop ())
+;;
+
+(** Realized PnL of closing [amount] of [coin] at [price] against the venue's last
+    reported entry basis. [None] when no position of the closing side was ever seen, so an
+    unknown basis leaves the field off the fill instead of reporting zero. *)
+let close_pnl ~coin ~price ~amount ~closing =
+  match Hashtbl.find_opt (Atomic.get last_basis) coin with
+  | Some (qty, entry) when entry > 0.0 ->
+    if String.equal closing "long" && qty > 0.0
+    then Some ((price -. entry) *. amount)
+    else if String.equal closing "short" && qty < 0.0
+    then Some ((entry -. price) *. amount)
+    else None
+  | _ -> None
+;;
+
 let parse_position ~now json =
   let open Yojson.Safe.Util in
   let market_id =
@@ -217,6 +252,7 @@ let apply_positions ~now nodes =
           old.Exchange.Market_context.qty)
     previous;
   Atomic.set last_positions live;
+  List.iter remember_basis live;
   Dio_exchange.Market_context.replace_positions ~exchange ~updated_at:now live;
   List.iter
     (fun p -> Concurrency.Exchange_wakeup.signal ~symbol:p.Exchange.Market_context.coin)

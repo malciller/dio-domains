@@ -278,6 +278,103 @@ let test_fill_intent_position_fallback () =
   check "buy when flat opens long" "open_long" ~is_ask:false 0.0
 ;;
 
+let test_close_fill_realized_pnl () =
+  (* Lighter publishes no per-fill PnL, but its position carries the venue's entry basis.
+     A reduce-only close must be priced off that basis rather than reported blank. *)
+  Lighter.Instruments_feed.initialize [ "EXCLOSE" ];
+  Lighter.Executions_feed.initialize [ "EXCLOSE" ];
+  ignore
+    (Lighter.Positions.process_account_all
+       (`Assoc
+         [ "type", `String "update/account_all"
+         ; ( "account_all"
+           , `Assoc
+               [ ( "positions"
+                 , `Assoc
+                     [ ( "0"
+                       , `Assoc
+                           [ "market_id", `Int 0
+                           ; "symbol", `String "EXCLOSE-USD"
+                           ; "sign", `Int 1
+                           ; "position", `String "1.0"
+                           ; "avg_entry_price", `String "100.0"
+                           ; "position_value", `String "100.0"
+                           ; "unrealized_pnl", `String "0.0"
+                           ] )
+                     ] )
+               ] )
+         ]));
+  let json =
+    `Assoc
+      [ "type", `String "update/account_all_orders"
+      ; ( "account_all_orders"
+        , `Assoc
+            [ ( "0"
+              , `Assoc
+                  [ "order_index", `String "close_1"
+                  ; "market_index", `Int 0
+                  ; "status", `Int 3
+                  ; "is_ask", `Bool true
+                  ; "reduce_only", `Bool true
+                  ; "price", `String "110.0"
+                  ; "initial_base_amount", `String "1.0"
+                  ; "filled_base_amount", `String "1.0"
+                  ; "avg_fill_price", `String "110.0"
+                  ] )
+            ] )
+      ]
+  in
+  Lighter.Executions_feed.process_account_orders_update json;
+  let fills = Concurrency.Fill_event_bus.get_recent_fills () in
+  match
+    List.find_opt
+      (fun (f : Concurrency.Fill_event_bus.fill_event) -> f.order_id = "close_1")
+      fills
+  with
+  | None -> Alcotest.fail "close fill not published"
+  | Some f ->
+    Alcotest.(check string) "closing the long" "close_long" f.intent;
+    Alcotest.(check (option (float 0.000001)))
+      "realized PnL off the venue entry basis"
+      (Some 10.0)
+      f.realized_pnl
+;;
+
+let test_open_fill_has_no_realized_pnl () =
+  Lighter.Instruments_feed.initialize [ "EXOPEN" ];
+  Lighter.Executions_feed.initialize [ "EXOPEN" ];
+  let json =
+    `Assoc
+      [ "type", `String "update/account_all_orders"
+      ; ( "account_all_orders"
+        , `Assoc
+            [ ( "0"
+              , `Assoc
+                  [ "order_index", `String "open_1"
+                  ; "market_index", `Int 0
+                  ; "status", `Int 3
+                  ; "is_ask", `Bool true
+                  ; "reduce_only", `Bool false
+                  ; "price", `String "100.0"
+                  ; "initial_base_amount", `String "1.0"
+                  ; "filled_base_amount", `String "1.0"
+                  ; "avg_fill_price", `String "100.0"
+                  ] )
+            ] )
+      ]
+  in
+  Lighter.Executions_feed.process_account_orders_update json;
+  let fills = Concurrency.Fill_event_bus.get_recent_fills () in
+  match
+    List.find_opt
+      (fun (f : Concurrency.Fill_event_bus.fill_event) -> f.order_id = "open_1")
+      fills
+  with
+  | None -> Alcotest.fail "open fill not published"
+  | Some f ->
+    Alcotest.(check bool) "no PnL on an opening fill" true (f.realized_pnl = None)
+;;
+
 let test_snapshot_missing_order_keeps_tracking () =
   Lighter.Instruments_feed.initialize [ "EXKEEP" ];
   Lighter.Executions_feed.initialize [ "EXKEEP" ];
@@ -330,6 +427,14 @@ let () =
             "snapshot miss keeps tracking"
             `Quick
             test_snapshot_missing_order_keeps_tracking
+        ; Alcotest.test_case
+            "close fill reports venue PnL"
+            `Quick
+            test_close_fill_realized_pnl
+        ; Alcotest.test_case
+            "open fill has no PnL"
+            `Quick
+            test_open_fill_has_no_realized_pnl
         ] )
     ; ( "intent"
       , [ Alcotest.test_case "reduce-only mapping" `Quick test_fill_intent

@@ -888,6 +888,28 @@ let process_account_orders_update json =
                    | None -> 0.0
                  in
                  let fee = fill_value *. maker_fee_rate in
+                 let intent =
+                   fill_intent ~symbol ~is_ask ~reduce_only:(parse_reduce_only order_json)
+                 in
+                 (* Lighter reports no per-fill PnL; price the close off the venue's entry
+                    basis. *)
+                 let realized_pnl =
+                   let coin = Lighter_types.base_coin symbol in
+                   match intent with
+                   | "close_long" ->
+                     Lighter_positions.close_pnl
+                       ~coin
+                       ~price:avg_price
+                       ~amount:filled_base_amount
+                       ~closing:"long"
+                   | "close_short" ->
+                     Lighter_positions.close_pnl
+                       ~coin
+                       ~price:avg_price
+                       ~amount:filled_base_amount
+                       ~closing:"short"
+                   | _ -> None
+                 in
                  Concurrency.Fill_event_bus.publish_fill
                    { venue = "lighter"
                    ; symbol
@@ -900,13 +922,9 @@ let process_account_orders_update json =
                    ; order_id
                    ; trade_id = order_id (* no separate trade id available *)
                    ; market = "perp"
-                   ; intent =
-                       fill_intent
-                         ~symbol
-                         ~is_ask
-                         ~reduce_only:(parse_reduce_only order_json)
+                   ; intent
                    ; strategy = "carry"
-                   ; realized_pnl = None
+                   ; realized_pnl
                    ; note = None
                    };
                  (* Trigger a REST balance refresh after fills. The WS balance channel

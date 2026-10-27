@@ -87,17 +87,24 @@ let domain_profiler_cache : (string, domain_profilers) Hashtbl.t = Hashtbl.creat
 
 (** One generic overlay instance runs inside its owner's domain, so its cycle has no
     domain row of its own. This gives it one: keyed by the instance (stable across domain
-    restarts) and published under its instrument, so the latency table can nest it under
-    the owning asset with the other overlay legs. *)
+    restarts) and published under "<venue>:<instrument>", so the latency table can nest it
+    under the owning asset with the other overlay legs and colour each leg by its venue. *)
 type overlay_profiler =
-  { oip_symbol : string
+  { oip_exchange : string
+  ; oip_symbol : string
   ; oip_prof : Latency_profiler.t
   }
 
 let overlay_profiler_cache : (string, overlay_profiler) Hashtbl.t = Hashtbl.create 8
 let profiler_cache_mutex = Mutex.create ()
 
-let get_overlay_profiler ~owner_exchange ~owner_symbol ~id ~symbol =
+(** Row key for an overlay instance's latency row. One owner can hold the same coin on two
+    venues, so the venue is part of the key. *)
+let overlay_latency_key ~exchange ~symbol =
+  Config.normalize_exchange exchange ^ ":" ^ symbol
+;;
+
+let get_overlay_profiler ~owner_exchange ~owner_symbol ~id ~exchange ~symbol =
   let key = Config.overlay_instance_key ~owner_exchange ~owner_symbol ~id in
   Mutex.lock profiler_cache_mutex;
   let p =
@@ -105,7 +112,8 @@ let get_overlay_profiler ~owner_exchange ~owner_symbol ~id ~symbol =
     | Some p -> p
     | None ->
       let p =
-        { oip_symbol = symbol
+        { oip_exchange = Config.normalize_exchange exchange
+        ; oip_symbol = symbol
         ; oip_prof = Latency_profiler.create ~rolling_windows:8 (symbol ^ ":overlay")
         }
       in
@@ -116,18 +124,20 @@ let get_overlay_profiler ~owner_exchange ~owner_symbol ~id ~symbol =
   p
 ;;
 
+(** Every overlay instance row, keyed by "<venue>:<instrument>". *)
 let get_overlay_profiler_snapshots () =
   Mutex.lock profiler_cache_mutex;
   let rows =
     Hashtbl.fold
-      (fun _ p acc -> (p.oip_symbol, p.oip_prof) :: acc)
+      (fun _ p acc ->
+         (overlay_latency_key ~exchange:p.oip_exchange ~symbol:p.oip_symbol, p.oip_prof)
+         :: acc)
       overlay_profiler_cache
       []
   in
   Mutex.unlock profiler_cache_mutex;
   List.map
-    (fun (symbol, prof) ->
-       symbol, [ "strategy", Latency_profiler.published_snapshot prof ])
+    (fun (key, prof) -> key, [ "strategy", Latency_profiler.published_snapshot prof ])
     rows
 ;;
 
@@ -373,6 +383,7 @@ let load_overlay_instances ~(owner : trading_config) : overlay_instance_rt list 
                  ~owner_exchange:oi.oi_owner_exchange
                  ~owner_symbol:oi.oi_owner_symbol
                  ~id:oi.oi_id
+                 ~exchange:oi.oi_exchange
                  ~symbol:oi.oi_symbol).oip_prof
           }))
 ;;

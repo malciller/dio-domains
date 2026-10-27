@@ -405,25 +405,30 @@ let render_to_text img =
   Buffer.contents buf
 ;;
 
-let contains_sub str sub =
+let count_sub str sub =
   let len_s = String.length str in
   let len_sub = String.length sub in
   if len_sub = 0
-  then true
+  then 0
   else if len_s < len_sub
-  then false
+  then 0
   else (
-    let found = ref false in
+    let found = ref 0 in
     let i = ref 0 in
-    while !i <= len_s - len_sub && not !found do
-      if String.sub str !i len_sub = sub then found := true else incr i
+    while !i <= len_s - len_sub do
+      if String.sub str !i len_sub = sub then incr found;
+      incr i
     done;
     !found)
 ;;
 
+let contains_sub str sub = String.length sub = 0 || count_sub str sub > 0
+
 (* A generic overlay instance builds no domain row (it executes inside its owner's
-   domain), so it publishes its cycle span under its own instrument. It must nest under
-   the asset that owns it instead of floating as a second root row. *)
+   domain), so it publishes its cycle span under "<venue>:<instrument>". It must nest
+   under the asset that owns it instead of floating as a second root row, and two
+   instances of one owner on the same coin at different venues must stay two rows: a carry
+   short on Hyperliquid and a sale-funded long on Lighter are different legs. *)
 let test_overlay_latency_row () =
   let open Dashboard_ui in
   let snap = latency_snapshot () in
@@ -442,7 +447,8 @@ let test_overlay_latency_row () =
                   ; "strategy", snap
                   ; "cycle", snap
                   ] )
-            ; "BTC", `Assoc [ "strategy", snap ]
+            ; "hyperliquid:BTC", `Assoc [ "strategy", snap ]
+            ; "lighter:BTC", `Assoc [ "strategy", snap ]
             ] )
       ]
   in
@@ -450,7 +456,11 @@ let test_overlay_latency_row () =
   Alcotest.(check bool)
     "overlay instance row nests under its owning asset"
     (contains_sub text "\226\134\179BTC")
-    true
+    true;
+  Alcotest.(check int)
+    "both perp legs of one asset keep their own row"
+    (count_sub text "\226\134\179BTC")
+    2
 ;;
 
 (* A venue reached only through an overlay instance (a Lighter perp funded by a spot grid
@@ -473,8 +483,10 @@ let test_footer_overlay_venue () =
                             [ "exchange", `String "lighter"
                             ; "coin", `String "BTC"
                             ; "mark", `Float 100.0
-                            ] ] )
-                  ] ) ] )
+                            ]
+                        ] )
+                  ] )
+            ] )
       ]
   in
   let text = render_to_text (Footer.render_footer 180 (Snapshot.of_json json)) in
@@ -504,11 +516,7 @@ let test_latency_persistence () =
     "idle window persists the last value"
     (contains_sub persisted "5.0ms")
     true;
-  Alcotest.(check bool)
-    "persisted window no longer shows idle"
-    (not (contains_sub persisted "idle"))
-    true;
-  (* A symbol that was never measured still shows idle. *)
+  (* A symbol that was never measured has no value to remember: it shows idle. *)
   let never =
     render_to_text
       (Latencies.render_latencies
@@ -518,6 +526,10 @@ let test_latency_persistence () =
   Alcotest.(check bool)
     "unmeasured symbol still shows idle"
     (contains_sub never "idle")
+    true;
+  Alcotest.(check bool)
+    "unmeasured symbol carries no stale measurement"
+    (not (contains_sub never "5.0ms"))
     true;
   Latencies.set_page 0
 ;;
@@ -580,7 +592,7 @@ let test_parse_long () =
       [ "exchange", `String "hyperliquid"
       ; "strategy", `Assoc [ "type", `String "Ladder" ]
       ; "market", `Assoc []
-      ; "longs"
+      ; ( "longs"
         , `List
             [ `Assoc
                 [ "exchange", `String "lighter"
@@ -592,16 +604,13 @@ let test_parse_long () =
                 ; "unrealized_pnl", `Float 0.18
                 ; "close_price", `Float 78.5
                 ; "close_distance_pct", `Float 0.255
-                ; "close_orders"
+                ; ( "close_orders"
                   , `List
                       [ `Assoc
-                          [ "id", `String "tp"
-                          ; "price", `Float 78.5
-                          ; "qty", `Float 0.6
-                          ]
-                      ]
+                          [ "id", `String "tp"; "price", `Float 78.5; "qty", `Float 0.6 ]
+                      ] )
                 ]
-            ]
+            ] )
       ]
   in
   let s = strategy_of_json json in

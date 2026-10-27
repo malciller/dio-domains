@@ -1540,7 +1540,9 @@ let process_user_events data_json =
                 ; market
                 ; intent
                 ; strategy = (if String.equal market "perp" then "carry" else "grid")
-                ; realized_pnl = closed_pnl
+                ; (* Spot basis is reconstructed, so the venue's [closedPnl] does not
+                     reconcile there; report it for perps only. *)
+                  realized_pnl = (if String.equal market "perp" then closed_pnl else None)
                 ; note
                 })
             else if is_startup_snapshot_done ()

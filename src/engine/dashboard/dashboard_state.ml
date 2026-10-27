@@ -445,21 +445,28 @@ let merge_network_latencies latencies =
     List.map (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange) config.trading
   in
   let instances = Dio_engine.Config.get_overlay_instances () in
-  (* An overlay instance now has its own row keyed by its instrument, and that row carries
-     its venue's network windows. Prefer that over one venue-keyed row: two assets long on
-     the same venue stay separated and nest under their own asset. *)
+  (* An overlay instance's row carries its venue's network windows, so a carry short and a
+     long on different venues stay separate rows instead of sharing one. *)
   let covered_venues = Hashtbl.create 4 in
   List.iter
     (fun (o : Dio_engine.Config.overlay_instance) ->
-       let key = String.lowercase_ascii o.oi_symbol in
+       let key =
+         Dio_engine.Domain_spawner.overlay_latency_key
+           ~exchange:o.oi_exchange
+           ~symbol:o.oi_symbol
+         |> String.lowercase_ascii
+       in
+       Hashtbl.replace
+         covered_venues
+         (Dio_engine.Config.normalize_exchange o.oi_exchange)
+         ();
        match Hashtbl.find_opt by_symbol key with
        | None -> ()
        | Some (orig, json) ->
          let entries = network_entries o.oi_exchange in
          (match json with
           | `Assoc l when entries <> [] ->
-            Hashtbl.replace by_symbol key (orig, `Assoc (entries @ l));
-            Hashtbl.replace covered_venues o.oi_exchange ()
+            Hashtbl.replace by_symbol key (orig, `Assoc (entries @ l))
           | _ -> ()))
     instances;
   instances
@@ -468,7 +475,7 @@ let merge_network_latencies latencies =
   |> List.iter (fun venue ->
     let key = String.lowercase_ascii venue in
     if (not (List.mem venue domain_venues))
-       && (not (Hashtbl.mem covered_venues venue))
+       && (not (Hashtbl.mem covered_venues (Dio_engine.Config.normalize_exchange venue)))
        && not (Hashtbl.mem by_symbol key)
     then (
       let entries = network_entries venue in
