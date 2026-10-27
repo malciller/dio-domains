@@ -100,6 +100,9 @@ type metric_group =
       (own ~5 min cadence, outside the per-cycle span). [orderbook] -> [execution] ->
       [prep] -> [strategy] are the four sequential segments of one cycle; [cycle] is their
       sum. All are in-process work with the same sub-10us target.
+      A generic overlay instance (a perp long on its own venue, executing inside its
+      owner's domain) gets a nested row carrying only [strategy]: that instance's cycle
+      span, kept off the owner's STRATEGY cell so it is not counted twice.
     - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed one-way latency,
       REST round-trip, signer time). These measure exchange round-trips and feed transit,
       not in-process work, and carry their own budgets. *)

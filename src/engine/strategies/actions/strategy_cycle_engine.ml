@@ -1061,6 +1061,59 @@ let order_cancel c ~market ~order_id =
       ignore (Jac.push_order ~now:c.cg_now ~manage_state:false order : bool))
 ;;
 
+(* Open-order scans keyed by the venue's open-orders generation. The carry overlay runs
+   several replaces per book tick and each replace queries both order-book keys; on a perp
+   symbol that read walks the venue's whole order index under two process-wide mutexes.
+   The scan is a pure function of the venue snapshot, so it is cached against the same
+   generation the other read caches use. *)
+type order_row =
+  { oor_id : string
+  ; oor_price : float
+  ; oor_remaining : float
+  ; oor_side : string
+  ; oor_userref : int option
+  }
+
+type order_scan =
+  { osn_gen : int
+  ; osn_rows : order_row array
+  }
+
+let order_scans : ((string * string), order_scan) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:32 ()
+;;
+
+let open_orders_snapshot (module Ex : Dio_exchange.Exchange_intf.S) ~exchange ~symbol =
+  let gen =
+    try Ex.get_open_orders_generation ~symbol with
+    | _ -> -1
+  in
+  match Ds.Cow_table.find_opt order_scans (exchange, symbol) with
+  | Some s when gen >= 0 && s.osn_gen = gen -> s.osn_rows
+  | _ ->
+    let acc = ref [] in
+    (try
+       Ex.iter_open_orders_fast
+         ~symbol
+         (fun id price remaining side userref ->
+            acc
+            := { oor_id = id
+               ; oor_price = price
+               ; oor_remaining = remaining
+               ; oor_side = side
+               ; oor_userref = userref
+               }
+               :: !acc)
+     with
+     | _ -> ());
+    let rows = Array.of_list (List.rev !acc) in
+    (* No generation means the venue cannot report a change, so caching would be
+       unverifiable: skip the publish rather than republishing an unvalidated row set. *)
+    if gen >= 0
+    then Ds.Cow_table.set order_scans (exchange, symbol) { osn_gen = gen; osn_rows = rows };
+    rows
+;;
+
 (** Place or amend the overlay's resting order to the requested price/size. The engine
     consults the venue's open orders, so the strategy file never has to track an order id
     or reissue on a timer: every book event calls this, and it no-ops when the resting
@@ -1155,11 +1208,19 @@ let order_replace
             | Strategy_common.Sell -> "sell"
             | Strategy_common.Buy -> "buy"
           in
-          let consider ~is_perp symbol =
+          (* Same iterator shape as the venue accessor it replaces, so a failed read is
+             still swallowed here rather than aborting the cycle. *)
+          let iter_cached ~symbol f =
             try
-              Ex.iter_open_orders_fast
-                ~symbol
-                (fun oid price _remaining side_str userref ->
+              Array.iter
+                (fun (r : order_row) ->
+                   f r.oor_id r.oor_price r.oor_remaining r.oor_side r.oor_userref)
+                (open_orders_snapshot (module Ex) ~exchange:asset.exchange ~symbol)
+            with
+            | _ -> ()
+          in
+          let consider ~is_perp symbol =
+            iter_cached ~symbol (fun oid price _remaining side_str userref ->
                    (* Venues that do not echo the engine's user reference (Lighter) return
                       [None]/[0]. Match those by the exact target price so an order placed
                       before a restart (or before the tag existed) is adopted and its
@@ -1233,8 +1294,6 @@ let order_replace
                          Hashtbl.replace seen oid ();
                          out := o :: !out
                        | _ -> ())))
-            with
-            | _ -> ()
           in
           if want_perp
           then

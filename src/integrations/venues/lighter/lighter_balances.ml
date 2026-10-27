@@ -82,22 +82,28 @@ module BalanceUpdateEventBus = Concurrency.Event_bus.Make (struct
   end)
 
 let balance_update_event_bus = BalanceUpdateEventBus.create "balance_update"
-let balance_stores : (string, BalanceStore.t) Hashtbl.t = Hashtbl.create 16
-let balance_stores_mutex = Mutex.create ()
+
+(* Read-mostly registry, same reasoning as the Hyperliquid one: the overlay cycle resolves
+   a store per inventory leg on every tick, so a process-wide mutex here serialises every
+   Lighter domain. Shards are published immutably; a read is one [Atomic.get]. *)
+let balance_stores : (string, BalanceStore.t) Ds.Cow_table.t =
+  Ds.Cow_table.create ~shard_count:16 ()
+;;
+
 let is_ready = Atomic.make false
 let ready_condition = Lwt_condition.create ()
 
 let get_balance_store asset =
-  Mutex.lock balance_stores_mutex;
-  Fun.protect
-    ~finally:(fun () -> Mutex.unlock balance_stores_mutex)
-    (fun () ->
-      match Hashtbl.find_opt balance_stores asset with
-      | Some store -> store
-      | None ->
-        let store = BalanceStore.create () in
-        Hashtbl.add balance_stores asset store;
-        store)
+  match Ds.Cow_table.find_opt balance_stores asset with
+  | Some store -> store
+  | None ->
+    let store = BalanceStore.create () in
+    ignore (Ds.Cow_table.add_if_absent balance_stores asset store : bool);
+    (* A racing creator may have won; always hand back the resident store so both callers
+       accumulate into the same balance state. *)
+    (match Ds.Cow_table.find_opt balance_stores asset with
+     | Some resident -> resident
+     | None -> store)
 ;;
 
 let get_balance asset =
@@ -106,14 +112,10 @@ let get_balance asset =
 ;;
 
 let get_all_balances () =
-  Mutex.lock balance_stores_mutex;
-  Fun.protect
-    ~finally:(fun () -> Mutex.unlock balance_stores_mutex)
-    (fun () ->
-      Hashtbl.fold
-        (fun asset store acc -> (asset, BalanceStore.get_balance store) :: acc)
-        balance_stores
-        [])
+  Ds.Cow_table.fold
+    (fun asset store acc -> (asset, BalanceStore.get_balance store) :: acc)
+    balance_stores
+    ~init:[]
 ;;
 
 let get_balance_data asset =
@@ -132,13 +134,7 @@ let has_balance_data asset =
 ;;
 
 let get_all_assets () =
-  Mutex.lock balance_stores_mutex;
-  Fun.protect
-    ~finally:(fun () -> Mutex.unlock balance_stores_mutex)
-    (fun () ->
-      let assets = ref [] in
-      Hashtbl.iter (fun asset _store -> assets := asset :: !assets) balance_stores;
-      !assets)
+  Ds.Cow_table.fold (fun asset _store acc -> asset :: acc) balance_stores ~init:[]
 ;;
 
 let notify_ready () =

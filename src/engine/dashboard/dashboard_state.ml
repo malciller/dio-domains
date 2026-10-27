@@ -444,12 +444,32 @@ let merge_network_latencies latencies =
   let domain_venues =
     List.map (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange) config.trading
   in
-  Dio_engine.Config.get_overlay_instances ()
+  let instances = Dio_engine.Config.get_overlay_instances () in
+  (* An overlay instance now has its own row keyed by its instrument, and that row carries
+     its venue's network windows. Prefer that over one venue-keyed row: two assets long on
+     the same venue stay separated and nest under their own asset. *)
+  let covered_venues = Hashtbl.create 4 in
+  List.iter
+    (fun (o : Dio_engine.Config.overlay_instance) ->
+       let key = String.lowercase_ascii o.oi_symbol in
+       match Hashtbl.find_opt by_symbol key with
+       | None -> ()
+       | Some (orig, json) ->
+         let entries = network_entries o.oi_exchange in
+         (match json with
+          | `Assoc l when entries <> [] ->
+            Hashtbl.replace by_symbol key (orig, `Assoc (entries @ l));
+            Hashtbl.replace covered_venues o.oi_exchange ()
+          | _ -> ()))
+    instances;
+  instances
   |> List.map (fun (o : Dio_engine.Config.overlay_instance) -> o.oi_exchange)
   |> List.sort_uniq String.compare
   |> List.iter (fun venue ->
     let key = String.lowercase_ascii venue in
-    if (not (List.mem venue domain_venues)) && not (Hashtbl.mem by_symbol key)
+    if (not (List.mem venue domain_venues))
+       && (not (Hashtbl.mem covered_venues venue))
+       && not (Hashtbl.mem by_symbol key)
     then (
       let entries = network_entries venue in
       if entries <> [] then Hashtbl.replace by_symbol key (venue, `Assoc entries)));
@@ -471,7 +491,33 @@ let json_of_domain_latencies () =
                snaps) ))
       profilers
   in
-  `Assoc (merge_network_latencies (merge_oracle_asset_latencies latencies))
+  (* Overlay instances run inside their owner's domain, so they have no domain row. Give
+     each one a row under its instrument: it nests with the other overlay legs of the same
+     asset, and its STRATEGY cell is that instance's own cycle span. *)
+  let taken = Hashtbl.create 16 in
+  List.iter
+    (fun (symbol, _) -> Hashtbl.replace taken (String.lowercase_ascii symbol) ())
+    latencies;
+  let overlay_rows =
+    Dio_engine.Domain_spawner.get_overlay_profiler_snapshots ()
+    |> List.filter_map (fun (symbol, snaps) ->
+      if Hashtbl.mem taken (String.lowercase_ascii symbol)
+      then None
+      else (
+        Hashtbl.replace taken (String.lowercase_ascii symbol) ();
+        let entries =
+          List.filter_map
+            (fun (label, snap_opt) ->
+               match snap_opt with
+               | Some snap -> Some (label, json_of_latency_snapshot snap)
+               | None -> None)
+            snaps
+        in
+        if entries = [] then None else Some (symbol, `Assoc entries)))
+  in
+  `Assoc
+    (merge_network_latencies
+       (merge_oracle_asset_latencies (latencies @ overlay_rows)))
 ;;
 
 (** Engine-global capital-oracle latency windows (per-pass stages), serialized for the

@@ -53,33 +53,73 @@ let open_sell_base (module Ex : Exchange.S) ~symbol =
   !total
 ;;
 
-(** Per-leg cache for {!open_sell_base}. The venue's open-orders generation moves only
-    when the book changes, so a quiet pair reuses the last sum instead of walking its
-    resting ladder on every overlay cycle (the hot-read contract reserves O(open-orders)
-    work for reconcile paths). *)
+(** Per-leg cache for the resting-sell view. The venue's open-orders generation moves only
+    when the book changes, so a quiet pair refolds a handful of cached [(price, qty)]
+    pairs instead of walking its resting ladder on every overlay cycle (the hot-read
+    contract reserves O(open-orders) work for reconcile paths). On a perp symbol that walk
+    is not free even when quiet: it re-reads the process-wide order index under two
+    mutexes. *)
 type open_sell_cache =
   { mutable gen : int
-  ; mutable value : float
+  ; mutable value : float (* sum of resting sell base quantity *)
+  ; mutable sells : (float * float) array (* (price, qty) of every priced resting sell *)
   }
 
-let create_open_sell_cache () = { gen = -2; value = 0.0 }
+let create_open_sell_cache () = { gen = -2; value = 0.0; sells = [||] }
 
-let open_sell_base_cached (module Ex : Exchange.S) ~symbol ~(cache : open_sell_cache) =
+(** One venue walk fills both views, so a refresh costs no more than the old base-only
+    scan. *)
+let open_sells (module Ex : Exchange.S) ~symbol =
+  let base = ref 0.0 in
+  let sells = ref [] in
+  (try
+     Ex.iter_open_orders_fast ~symbol (fun _oid price qty side_str _userref ->
+       if qty > 0.0 && String.equal side_str "sell"
+       then (
+         base := !base +. qty;
+         if price > 0.0 then sells := (price, qty) :: !sells))
+   with
+   | _ -> ());
+  !base, Array.of_list (List.rev !sells)
+;;
+
+(** Refresh [cache] when the pair's open-orders generation moved. A generation of [-1]
+    (accessor failure) always rescans, matching the pre-cache behaviour. *)
+let refresh_open_sells (module Ex : Exchange.S) ~symbol ~(cache : open_sell_cache) =
   let gen =
     try Ex.get_open_orders_generation ~symbol with
     | _ -> -1
   in
-  if gen >= 0 && gen = cache.gen
-  then cache.value
-  else (
-    let value = open_sell_base (module Ex) ~symbol in
+  if gen < 0 || gen <> cache.gen
+  then (
+    let base, sells = open_sells (module Ex) ~symbol in
     cache.gen <- gen;
-    cache.value <- value;
-    value)
+    cache.value <- base;
+    cache.sells <- sells);
+  cache
 ;;
 
-(** [(proceeds below price_a, proceeds below price_b)] from one order-book walk. *)
-let open_sell_proceeds_below2 ~exchange ~symbol ~price_a ~price_b =
+let open_sell_base_cached (module Ex : Exchange.S) ~symbol ~cache =
+  (refresh_open_sells (module Ex) ~symbol ~cache).value
+;;
+
+(** Notional of resting sells priced under each cap. [sells] must be the cached array, so
+    the fold is over the resting ladder only - no venue access. *)
+let proceeds_below_2 (sells : (float * float) array) ~cap_a ~cap_b =
+  let a = ref 0.0 in
+  let b = ref 0.0 in
+  Array.iter
+    (fun (price, qty) ->
+      let notional = qty *. price in
+      if cap_a > 0.0 && price < cap_a then a := !a +. notional;
+      if cap_b > 0.0 && price < cap_b then b := !b +. notional)
+    sells;
+  !a, !b
+;;
+
+(** [(proceeds below price_a, proceeds below price_b)]. The caps move every cycle, so only
+    the order set is cached; pass [~cache] on the per-cycle overlay path. *)
+let open_sell_proceeds_below2 ?cache ~exchange ~symbol ~price_a ~price_b () =
   let cap_a = if Float.is_finite price_a && price_a > 0.0 then price_a else 0.0 in
   let cap_b = if Float.is_finite price_b && price_b > 0.0 then price_b else 0.0 in
   if cap_a <= 0.0 && cap_b <= 0.0
@@ -88,39 +128,32 @@ let open_sell_proceeds_below2 ~exchange ~symbol ~price_a ~price_b =
     match get_module exchange with
     | None -> 0.0, 0.0
     | Some (module Ex : Exchange.S) ->
-      let a = ref 0.0 in
-      let b = ref 0.0 in
-      (try
-         Ex.iter_open_orders_fast ~symbol (fun _oid price qty side_str _userref ->
-           if qty > 0.0 && String.equal side_str "sell" && price > 0.0
-           then (
-             let notional = qty *. price in
-             if cap_a > 0.0 && price < cap_a then a := !a +. notional;
-             if cap_b > 0.0 && price < cap_b then b := !b +. notional))
-       with
-       | _ -> ());
-      !a, !b)
+      let sells =
+        match cache with
+        | Some cache -> (refresh_open_sells (module Ex) ~symbol ~cache).sells
+        | None -> snd (open_sells (module Ex) ~symbol)
+      in
+      proceeds_below_2 sells ~cap_a ~cap_b)
 ;;
 
 (** USDC notional of resting sells on [symbol] priced below [max_price] - only those fill
-    before a requirement at that price. Walks the order book. *)
-let open_sell_proceeds_below ~exchange ~symbol ~max_price =
+    before a requirement at that price. Walks the order book unless [~cache] is given. *)
+let open_sell_proceeds_below ?cache ~exchange ~symbol ~max_price () =
   if (not (Float.is_finite max_price)) || max_price <= 0.0
   then 0.0
   else (
     match get_module exchange with
     | None -> 0.0
     | Some (module Ex : Exchange.S) ->
+      let sells =
+        match cache with
+        | Some cache -> (refresh_open_sells (module Ex) ~symbol ~cache).sells
+        | None -> snd (open_sells (module Ex) ~symbol)
+      in
       let total = ref 0.0 in
-      (try
-         Ex.iter_open_orders_fast ~symbol (fun _oid price qty side_str _userref ->
-           if qty > 0.0
-              && String.equal side_str "sell"
-              && price > 0.0
-              && price < max_price
-           then total := !total +. (qty *. price))
-       with
-       | _ -> ());
+      Array.iter
+        (fun (price, qty) -> if price < max_price then total := !total +. (qty *. price))
+        sells;
       !total)
 ;;
 

@@ -84,7 +84,52 @@ type domain_profilers =
   }
 
 let domain_profiler_cache : (string, domain_profilers) Hashtbl.t = Hashtbl.create 8
+
+(** One generic overlay instance runs inside its owner's domain, so its cycle has no
+    domain row of its own. This gives it one: keyed by the instance (stable across domain
+    restarts) and published under its instrument, so the latency table can nest it under
+    the owning asset with the other overlay legs. *)
+type overlay_profiler =
+  { oip_symbol : string
+  ; oip_prof : Latency_profiler.t
+  }
+
+let overlay_profiler_cache : (string, overlay_profiler) Hashtbl.t = Hashtbl.create 8
 let profiler_cache_mutex = Mutex.create ()
+
+let get_overlay_profiler ~owner_exchange ~owner_symbol ~id ~symbol =
+  let key = Config.overlay_instance_key ~owner_exchange ~owner_symbol ~id in
+  Mutex.lock profiler_cache_mutex;
+  let p =
+    match Hashtbl.find_opt overlay_profiler_cache key with
+    | Some p -> p
+    | None ->
+      let p =
+        { oip_symbol = symbol
+        ; oip_prof = Latency_profiler.create ~rolling_windows:8 (symbol ^ ":overlay")
+        }
+      in
+      Hashtbl.replace overlay_profiler_cache key p;
+      p
+  in
+  Mutex.unlock profiler_cache_mutex;
+  p
+;;
+
+let get_overlay_profiler_snapshots () =
+  Mutex.lock profiler_cache_mutex;
+  let rows =
+    Hashtbl.fold
+      (fun _ p acc -> (p.oip_symbol, p.oip_prof) :: acc)
+      overlay_profiler_cache
+      []
+  in
+  Mutex.unlock profiler_cache_mutex;
+  List.map
+    (fun (symbol, prof) ->
+       symbol, [ "strategy", Latency_profiler.published_snapshot prof ])
+    rows
+;;
 
 let get_domain_profilers symbol =
   Mutex.lock profiler_cache_mutex;
@@ -253,6 +298,7 @@ type overlay_instance_rt =
   ; oir_state : Yojson.Basic.t ref
   ; mutable oir_seen_positions_at : float
   ; mutable oir_seen_margin_at : float
+  ; oir_prof : Latency_profiler.t (* this instance's own cycle span *)
   }
 
 (** Load every overlay instance owned by [owner]. A failed instance is logged and skipped;
@@ -322,6 +368,12 @@ let load_overlay_instances ~(owner : trading_config) : overlay_instance_rt list 
           ; oir_state = state
           ; oir_seen_positions_at = -1.0
           ; oir_seen_margin_at = -1.0
+          ; oir_prof =
+              (get_overlay_profiler
+                 ~owner_exchange:oi.oi_owner_exchange
+                 ~owner_symbol:oi.oi_owner_symbol
+                 ~id:oi.oi_id
+                 ~symbol:oi.oi_symbol).oip_prof
           }))
 ;;
 
@@ -914,6 +966,10 @@ let asset_domain_worker
        every [latency_window_seconds]; this only limits a busy domain to one reported
        window per interval. *)
     let last_spike_report_time = ref (Unix.gettimeofday ()) in
+    (* Overlay-instance profilers owned by this domain, rolled on the same window cadence so
+       their rows publish alongside the domain's own. Filled once the instances are loaded
+       below; empty for a domain with no overlay. *)
+    let overlay_window_profs = ref ([] : Latency_profiler.t list) in
     (* Per-cycle GC attribution is captured inline in the loop (two [Gc.quick_stat] reads,
        ~0.3us each; see [gc_monitor]); the window publisher below does not sample GC. *)
     let publish_windows () =
@@ -952,6 +1008,9 @@ let asset_domain_worker
           ~spike_threshold_us:latency_spike_threshold_us
           prof_cycle
       in
+      List.iter
+        (fun prof -> ignore (Latency_profiler.snapshot_and_reset prof))
+        !overlay_window_profs;
       if reports_internal config.latency_spike_report
       then (
         let now = Unix.gettimeofday () in
@@ -1016,9 +1075,11 @@ let asset_domain_worker
     in
     (* Open-sell sums per inventory leg, invalidated by the venue's open-orders
        generation. Without this the overlay walks every resting sell on every tick. *)
+    (* The cache backs the resting-sell snapshot, which [sells_below*] needs on every
+       overlay cycle, not just the accumulated-basis sum. [full_balance_ref] only skips the
+       open-sell base inside [leg_q]; it does not make the snapshot unnecessary. *)
     let overlay_inventory_caches =
       match overlay_controller with
-      | Some c when c.oc_params.full_balance_ref -> None
       | Some c -> Some (Overlay_inventory.create_caches c)
       | None -> None
     in
@@ -1171,7 +1232,19 @@ let asset_domain_worker
     (* Additional generic overlays owned by this grid entry. They run in the same domain:
        no new process, and grid sell fills are available locally. *)
     let overlay_instances = load_overlay_instances ~owner:asset_with_fees in
+    overlay_window_profs := List.map (fun ov -> ov.oir_prof) overlay_instances;
+    (* Loop-invariant: only a domain that hosts overlay work pays the two extra clock
+       reads that split it out of PREP. *)
+    let has_overlay_work =
+      Option.is_some overlay_ctx || (match overlay_instances with [] -> false | _ -> true)
+    in
+    (* Returns this cycle's span in nanoseconds (0 when latency measurement is off) so the
+       owner domain can leave that time off its own STRATEGY span: the instance's row owns
+       it. Fill-driven cycles are measured too, so the row covers the overlay's whole cost,
+       not just the book ticks. *)
     let run_overlay_cycles (ov : overlay_instance_rt) ~now ~price ~events =
+      let measured = !latency_active in
+      let t0 = if measured then Monotonic_clock.now_ns () else 0 in
       let ctx = ov.oir_ctx in
       let asset = ov.oir_asset in
       ctx.cg_asset <- Some asset;
@@ -1208,7 +1281,13 @@ let asset_domain_worker
         ~owner_symbol:ov.oir_config.oi_owner_symbol
         ~id:ov.oir_config.oi_id
         ov.oir_rt
-        ov.oir_state
+        ov.oir_state;
+      if not measured
+      then 0
+      else (
+        let ns = Monotonic_clock.now_ns () - t0 in
+        if ns > 0 then Latency_profiler.record_ns ov.oir_prof ns;
+        ns)
     in
     let overlay_mark (ov : overlay_instance_rt) =
       match
@@ -1226,12 +1305,19 @@ let asset_domain_worker
       with
       | None -> false
       | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+        (* Shares the generation-cached scan with the replace path: on a perp symbol the
+           raw read walks the venue's whole order index under two process-wide mutexes,
+           and this runs for every instance on every book tick. *)
         let found = ref false in
         (try
-           Ex.iter_open_orders_fast
-             ~symbol:ov.oir_config.oi_symbol
-             (fun _ _ remaining side _ ->
-                if remaining > 0.0 && String.equal side "buy" then found := true)
+           Array.iter
+             (fun (r : Dio_strategies.Strategy_cycle_engine.order_row) ->
+                if r.oor_remaining > 0.0 && String.equal r.oor_side "buy"
+                then found := true)
+             (Dio_strategies.Strategy_cycle_engine.open_orders_snapshot
+                (module Ex)
+                ~exchange:ov.oir_config.oi_exchange
+                ~symbol:ov.oir_config.oi_symbol)
          with
          | _ -> ());
         !found
@@ -1256,11 +1342,12 @@ let asset_domain_worker
         then (
           ov.oir_seen_positions_at <- positions_at;
           ov.oir_seen_margin_at <- margin_at;
-          run_overlay_cycles
-            ov
-            ~now
-            ~price:(overlay_mark ov)
-            ~events:[ "book_update", [] ])
+          ignore
+            (run_overlay_cycles
+               ov
+               ~now
+               ~price:(overlay_mark ov)
+               ~events:[ "book_update", [] ]))
     in
     (* Config-driven grid runtime (milestone 3, coarse wrapper; default off). When a
        strategy file is bound to the entry, the loop dispatches to the interpreter whose
@@ -2004,11 +2091,12 @@ let asset_domain_worker
             in
             List.iter
               (fun (ov : overlay_instance_rt) ->
-                 run_overlay_cycles
-                   ov
-                   ~now:now_exec
-                   ~price:event.avg_price
-                   ~events)
+                 ignore
+                   (run_overlay_cycles
+                      ov
+                      ~now:now_exec
+                      ~price:event.avg_price
+                      ~events))
               overlay_instances)
         in
         let new_pos =
@@ -2772,6 +2860,14 @@ let asset_domain_worker
       (* Overlays are event-driven by the domain loop itself: every wakeup is an exchange,
          balance, fill, or oracle event. Run the overlay on each one; its actions are
          idempotent (order replacement no-ops when the resting order already matches). *)
+      (* Overlay work is strategy work, not prep: the carry controller aggregates
+         inventory, re-derives the shared reserve and runs its own interpreter here. Time
+         it so PREP stops absorbing it and STRATEGY is charged for it. Only domains that
+         host an overlay (or an overlay instance) read the clock, so a plain grid domain's
+         PREP measurement is unchanged. *)
+      let t_overlay =
+        if latency_this_cycle && has_overlay_work then Monotonic_clock.now_ns () else 0
+      in
       (match overlay_ctx, overlay_rt, overlay_controller with
        | Some ctx, Some ort, Some controller ->
          let now_ov = Unix.gettimeofday () in
@@ -2910,31 +3006,50 @@ let asset_domain_worker
            then target_leg.mark
            else scheduled
          in
+         (* Each leg's resting-sell view is cached by the venue's open-orders generation,
+            so a quiet pair refolds cached pairs instead of walking the venue book (two
+            process-wide mutexes on a perp symbol) on every overlay tick.
+            [overlay_inventory_caches] is aligned with [controller.oc_legs]. *)
+         let leg_cache i =
+           match overlay_inventory_caches with
+           | Some c when i < Array.length c -> Some (Array.unsafe_get c i)
+           | _ -> None
+         in
          let sells_below max_price =
+           let i = ref 0 in
            List.fold_left
              (fun acc (l : Config.overlay_leg) ->
+               let cache = leg_cache !i in
+               incr i;
                if Config.is_hyperliquid l.ol_exchange
                then
                  acc
                  +. Overlay_inventory.open_sell_proceeds_below
+                      ?cache
                       ~exchange:l.ol_exchange
                       ~symbol:l.ol_symbol
                       ~max_price
+                      ()
                else acc)
              0.0
              controller.oc_legs
          in
          let sells_below2 price_a price_b =
+           let i = ref 0 in
            List.fold_left
              (fun (a, b) (l : Config.overlay_leg) ->
+               let cache = leg_cache !i in
+               incr i;
                if Config.is_hyperliquid l.ol_exchange
                then (
                  let x, y =
                    Overlay_inventory.open_sell_proceeds_below2
+                     ?cache
                      ~exchange:l.ol_exchange
                      ~symbol:l.ol_symbol
                      ~price_a
                      ~price_b
+                     ()
                  in
                  a +. x, b +. y)
                else a, b)
@@ -3142,23 +3257,32 @@ let asset_domain_worker
       (* Generic overlays run on their venue's position/margin changes. A resting entry
          is a live GTC limit and needs the book to reprice, so subscribe only while one
          exists; every other tick stays out of the interpreter. *)
+      let instance_ns = ref 0 in
       List.iter
         (fun (ov : overlay_instance_rt) ->
            let now = Unix.gettimeofday () in
            if overlay_entry_resting ov
            then
-             run_overlay_cycles
-               ov
-               ~now
-               ~price:(overlay_mark ov)
-               ~events:[ "book_update", [] ]
+             instance_ns
+             := !instance_ns
+                + run_overlay_cycles
+                    ov
+                    ~now
+                    ~price:(overlay_mark ov)
+                    ~events:[ "book_update", [] ]
            else overlay_venue_changed ov ~now)
         overlay_instances;
+      (* Controller work stays on this domain's row; instance work is charged to the
+         instance's own row, so the two are not counted twice. *)
+      let overlay_ns =
+        if t_overlay = 0 then 0 else Monotonic_clock.now_ns () - t_overlay - !instance_ns
+      in
       (* PREP/STRATEGY boundary. [t3] ends the exec phase; the block below up to the
          strategy call (oracle apply, halt/reclaim, startup gate, balance reads, F&G
          re-evaluation) is PREP. [t3_strategy] is seeded here so idle cycles still report
          true prep cost. The [should_execute] branch below re-stamps it after the
-         balance/F&G block, so STRAT is the strategy call alone. *)
+         balance/F&G block, so STRAT is the strategy call alone plus the overlay span
+         measured above. *)
       let t3_strategy =
         ref (if latency_this_cycle then Monotonic_clock.now_ns () else t3)
       in
@@ -3510,15 +3634,21 @@ let asset_domain_worker
       let alloc_at_t4 = !alloc_strat_end in
       (* PREP is recorded on every measured cycle: oracle apply / halt / reclaim / gate
          work runs on idle cycles too, and folding it into CYCLE made those cycles
-         unattributable. STRAT is the strategy call alone. *)
+         unattributable. STRAT is the grid strategy call plus the overlay span: the
+         overlay is a second interpreter running on this domain, so charging it to PREP
+         made PREP report work it never did. *)
       if latency_this_cycle
       then (
         (* Never record a zero-span sample: a phase that did no work this cycle must leave
            the window with no sample, so the dashboard keeps the last meaningful value
            instead of resetting the cell to 0. *)
-        if !t3_strategy > t3 then Latency_profiler.record_ns prof_prep (!t3_strategy - t3);
-        if should_execute && t4 > !t3_strategy
-        then Latency_profiler.record_ns prof_strategy (t4 - !t3_strategy));
+        let grid_strat_ns =
+          if should_execute && t4 > !t3_strategy then t4 - !t3_strategy else 0
+        in
+        let prep_ns = !t3_strategy - t3 - overlay_ns in
+        let strat_ns = grid_strat_ns + overlay_ns in
+        if prep_ns > 0 then Latency_profiler.record_ns prof_prep prep_ns;
+        if strat_ns > 0 then Latency_profiler.record_ns prof_strategy strat_ns);
       (* Exec histogram writes deferred from [t3] (see above): now outside both the STRAT
          and CYCLE measured spans. *)
       if exec_per_event_ns > 0
@@ -3754,8 +3884,12 @@ let asset_domain_worker
             if latency_this_cycle
             then (
               (* On idle cycles [strat_end_ns] is never stamped (it is zero), so do not
-                 subtract it from [t1]: STRAT is zero and TOTAL is the PREP span. *)
-              let strat_ns = if should_execute then t4 - !t3_strategy else 0 in
+                 subtract it from [t1]. STRAT still carries the overlay span (a domain can
+                 host an overlay without executing its own grid), and PREP excludes it. *)
+              let strat_ns =
+                (if should_execute then t4 - !t3_strategy else 0) + overlay_ns
+              in
+              let prep_ns = !t3_strategy - t3 - overlay_ns in
               let total_end_ns = if should_execute then t4 else !t3_strategy in
               let total_ns = total_end_ns - t1 in
               base
@@ -3763,7 +3897,7 @@ let asset_domain_worker
                   , Printf.sprintf
                       "ob %s · prep %s · strat %s · total %s"
                       (us (t2 - t1))
-                      (us (!t3_strategy - t3))
+                      (us prep_ns)
                       (us strat_ns)
                       (us total_ns) )
                 ])

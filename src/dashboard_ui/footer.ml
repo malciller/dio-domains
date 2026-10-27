@@ -12,17 +12,24 @@ let render_footer w (snapshot : Snapshot.t) =
      that exchange, else dead (red). Deduplicated, sorted by name. *)
   let exch_connected =
     Hashtbl.clear exch_tbl;
+    let note exch live =
+      if exch <> ""
+      then (
+        let cur =
+          try Hashtbl.find exch_tbl exch with
+          | Not_found -> false
+        in
+        Hashtbl.replace exch_tbl exch (cur || live))
+    in
     List.iter
       (fun (_sym, (s : Snapshot.strategy)) ->
-        let exch = s.exchange in
-        if exch <> ""
-        then (
-          let live = s.market.bid > 0.0 && s.market.ask > 0.0 in
-          let cur =
-            try Hashtbl.find exch_tbl exch with
-            | Not_found -> false
-          in
-          Hashtbl.replace exch_tbl exch (cur || live)))
+        note s.exchange (s.market.bid > 0.0 && s.market.ask > 0.0);
+        (* A venue reached only through an overlay instance (a Lighter perp funded by a
+           spot grid elsewhere) has no strategy row of its own. It is live once its perp
+           mark is flowing. *)
+        List.iter
+          (fun (l : Snapshot.long_position) -> note l.long_venue (l.long_mark > 0.0))
+          s.longs)
       snapshot.strategies;
     let pairs = Hashtbl.fold (fun k v acc -> (k, v) :: acc) exch_tbl [] in
     List.sort (fun (a, _) (b, _) -> String.compare a b) pairs
