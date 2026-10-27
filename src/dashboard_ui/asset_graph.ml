@@ -10,6 +10,7 @@ type price_snapshot =
   ; perp_buy_ps : float list
   ; perp_sell_ps : float list
   ; long_marks : (string * float) list
+  ; long_close_ps : float list
   }
 
 let repeat_utf8 str count =
@@ -155,6 +156,14 @@ let record_all_prices (snapshot : Snapshot.t) =
             s.longs
         | Snapshot.Balance _ -> []
       in
+      let long_close_ps =
+        match a.kind with
+        | Snapshot.Strategy s ->
+          List.concat_map
+            (fun (l : Snapshot.long_position) -> order_prices l.long_close_orders)
+            s.longs
+        | Snapshot.Balance _ -> []
+      in
       if mid > 0.0
       then (
         let q =
@@ -183,6 +192,7 @@ let record_all_prices (snapshot : Snapshot.t) =
             || perp_buy_ps <> last_snap.perp_buy_ps
             || perp_sell_ps <> last_snap.perp_sell_ps
             || long_marks <> last_snap.long_marks
+            || long_close_ps <> last_snap.long_close_ps
         in
         if should_push
         then (
@@ -195,6 +205,7 @@ let record_all_prices (snapshot : Snapshot.t) =
             ; perp_buy_ps
             ; perp_sell_ps
             ; long_marks
+            ; long_close_ps
             }
           in
           Queue.push snap q;
@@ -761,6 +772,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       | Some venue ->
         List.filter_map (fun s -> List.assoc_opt venue s.long_marks) hist_points
     in
+    let hist_long_close_ps = List.concat_map (fun s -> s.long_close_ps) hist_points in
     let current_perp_mark =
       match perp_opt with
       | Some p when p.mark > 0.0 -> Some p.mark
@@ -779,6 +791,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       @ hist_perp_buy_prices
       @ hist_perp_sell_prices
       @ hist_long_marks
+      @ hist_long_close_ps
       @ (match current_perp_mark with
          | Some p -> [ p ]
          | None -> [])
@@ -1250,7 +1263,14 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
          (fun (_, p, _) ->
            let sy = price_to_sub_y p in
            draw_line perp_order_grid 0 sy (sub_w - 1) sy)
-         (perp_buy_orders @ perp_sell_orders)
+         (perp_buy_orders @ perp_sell_orders);
+       List.iter
+         (fun (_, (o : Snapshot.order)) ->
+           if o.price > 0.0 && in_band o.price
+           then (
+             let sy = price_to_sub_y o.price in
+             draw_line long_close_grid 0 sy (sub_w - 1) sy))
+         long_close_orders
      | pts ->
        let t_earliest = (List.hd pts).timestamp in
        let rec mid_at_t target_t = function
@@ -1279,6 +1299,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
        let sell_sub_y_list = Array.make sub_w [] in
        let perp_buy_sub_y_list = Array.make sub_w [] in
        let perp_sell_sub_y_list = Array.make sub_w [] in
+       let long_close_sub_y_list = Array.make sub_w [] in
        let rec perp_at_t target_t = function
          | [] -> current_perp_mark
          | [ s0 ] -> s0.perp_mark
@@ -1353,7 +1374,9 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
              perp_buy_sub_y_list.(sx)
              <- List.filter in_band snap.perp_buy_ps |> List.map price_to_sub_y;
              perp_sell_sub_y_list.(sx)
-             <- List.filter in_band snap.perp_sell_ps |> List.map price_to_sub_y
+             <- List.filter in_band snap.perp_sell_ps |> List.map price_to_sub_y;
+             long_close_sub_y_list.(sx)
+             <- List.filter in_band snap.long_close_ps |> List.map price_to_sub_y
            | None -> ())
        done;
        (* Interpolate the mid price curve across consecutive columns. *)
@@ -1375,7 +1398,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
          connect_pin_traces buy_grid buy_sub_y_list;
          connect_pin_traces sell_grid sell_sub_y_list;
          connect_pin_traces perp_order_grid perp_buy_sub_y_list;
-         connect_pin_traces perp_order_grid perp_sell_sub_y_list);
+         connect_pin_traces perp_order_grid perp_sell_sub_y_list;
+         connect_pin_traces long_close_grid long_close_sub_y_list);
        for sx = 0 to sub_w - 2 do
          let sy0 = perp_sub_y.(sx) in
          let sy1 = perp_sub_y.(sx + 1) in
@@ -1396,14 +1420,6 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
          else if sy1 >= 0
          then draw_line long_mark_grid (sx + 1) sy1 (sx + 1) sy1
        done);
-    (* Resting long close orders are horizontal price levels for their whole life. *)
-    List.iter
-      (fun (_, (o : Snapshot.order)) ->
-        if o.price > 0.0 && in_band o.price
-        then (
-          let sy = price_to_sub_y o.price in
-          draw_line long_close_grid 0 sy (sub_w - 1) sy))
-      long_close_orders;
     let perp_row_opt =
       match current_perp_mark with
       | Some p when p >= min_p && p <= max_p -> Some (price_to_row p)

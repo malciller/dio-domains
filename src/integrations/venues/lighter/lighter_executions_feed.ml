@@ -98,6 +98,10 @@ type store =
   ; changes_overflow : bool Atomic.t
   (** Set when the change log cannot represent the delta (a full clear), forcing the
       consumer to do a full rescan. *)
+  ; missing_since : (string, float) Hashtbl.t
+  (** Order id -> first snapshot time that omitted it. A missing order is cancelled only
+      on a later snapshot, so a transient or partial REST snapshot cannot wipe live
+      tracking. Cleared whenever the order is seen again. *)
   }
 
 let stores = Ds.Cow_table.create ~shard_count:32 ()
@@ -200,6 +204,7 @@ let get_symbol_store symbol =
             ; orders_mutex = Mutex.create ()
             ; changes = Atomic.make []
             ; changes_overflow = Atomic.make false
+            ; missing_since = Hashtbl.create 8
             }
           in
           Ds.Cow_table.set stores symbol store;
@@ -298,6 +303,7 @@ let update_orders_internal store (event : execution_event) =
       if is_terminal
       then (
         Hashtbl.remove store.open_orders event.order_id;
+        Hashtbl.remove store.missing_since event.order_id;
         note_change store event.order_id None;
         publish_open_orders_cache store;
         forget_userref event.order_id;
@@ -332,6 +338,7 @@ let update_orders_internal store (event : execution_event) =
           }
         in
         Hashtbl.replace store.open_orders event.order_id order;
+        Hashtbl.remove store.missing_since event.order_id;
         note_change store event.order_id (Some order);
         publish_open_orders_cache store;
         Mutex.lock initialization_mutex;
@@ -445,6 +452,7 @@ let clear_all_open_orders () =
           let count = Hashtbl.length store.open_orders in
           total_removed := !total_removed + count;
           Hashtbl.clear store.open_orders;
+          Hashtbl.clear store.missing_since;
           Atomic.set store.changes_overflow true;
           publish_open_orders_cache store;
           Atomic.set store.ready false))
@@ -951,115 +959,135 @@ let process_account_orders_update json =
     set_startup_snapshot_done ()
 ;;
 
-(** Reconciles local open orders against a full snapshot: ingests it, then emits
-    [CanceledStatus] for any locally tracked order absent from it. *)
-let handle_snapshot json =
+(** A cached order missing from a snapshot is cancelled only after a later snapshot omits
+    it too, at least this far apart. One transient or partial REST response must not drop
+    live tracking. *)
+let missing_confirmation_s = 30.0
+
+(** Reconciles local open orders against a full snapshot: ingests it, then confirms and
+    emits [CanceledStatus] for tracked orders the venue has stopped reporting. [since] is
+    the time the request started; orders updated after it are not treated as missing. *)
+let handle_snapshot ~since json =
   Logging.debug_f ~section "Processing Lighter execution snapshot...";
   process_account_orders_update json;
   let open Yojson.Safe.Util in
-  let snapshot_order_ids = Hashtbl.create 32 in
-  (try
-     let orders_json =
-       let try_key key =
-         let v = member key json in
-         if v <> `Null then Some v else None
-       in
-       match try_key "account_all_orders" with
-       | Some v -> v
-       | None ->
-         (match try_key "orders" with
-          | Some v -> v
-          | None ->
-            (match try_key "data" with
-             | Some v -> v
-             | None -> `Null))
-     in
-     let orders =
-       match orders_json with
-       | `Assoc pairs ->
-         List.concat_map
-           (fun (_, v) ->
-             match v with
-             | `Assoc _ -> [ v ]
-             | `List items -> items
-             | _ -> [])
-           pairs
-       | `List items -> items
-       | _ -> []
-     in
-     List.iter
-       (fun order_json ->
-         try
-           match order_json with
-           | `Assoc _ ->
-             let order_index = member "order_index" order_json in
-             let order_id =
-               match order_index with
-               | `String s -> s
-               | `Int i -> string_of_int i
-               | _ -> Lighter_types.parse_json_int64 order_index |> Int64.to_string
-             in
-             Hashtbl.replace snapshot_order_ids order_id ()
-           | _ -> ()
-         with
-         | _ -> ())
-       orders
-   with
-   | exn ->
-     Logging.warn_f
-       ~section
-       "Failed to extract IDs for reconcile: %s"
-       (Printexc.to_string exn));
-  (* Emit cancels for cached orders missing from the snapshot. *)
-  let stale_orders = ref [] in
-  Mutex.lock initialization_mutex;
-  let all_symbols =
-    Ds.Cow_table.fold (fun symbol _ acc -> symbol :: acc) stores ~init:[]
+  let try_key key =
+    try
+      let v = member key json in
+      if v <> `Null then Some v else None
+    with
+    | _ -> None
   in
-  Mutex.unlock initialization_mutex;
-  List.iter
-    (fun symbol ->
-      let store = get_symbol_store symbol in
-      Mutex.lock store.orders_mutex;
-      Fun.protect
-        ~finally:(fun () -> Mutex.unlock store.orders_mutex)
-        (fun () ->
-          Hashtbl.iter
-            (fun order_id (cached_order : open_order) ->
-              if not (Hashtbl.mem snapshot_order_ids order_id)
-              then stale_orders := (symbol, store, cached_order) :: !stale_orders)
-            store.open_orders))
-    all_symbols;
-  List.iter
-    (fun (symbol, store, (cached_order : open_order)) ->
-      let event : execution_event =
-        { order_id = cached_order.order_id
-        ; symbol
-        ; order_status = CanceledStatus
-        ; limit_price = cached_order.limit_price
-        ; side = cached_order.side
-        ; order_qty = cached_order.order_qty
-        ; cum_qty = cached_order.cum_qty
-        ; avg_price = cached_order.avg_price
-        ; timestamp = Unix.gettimeofday ()
-        ; is_amended = false
-        ; cl_ord_id = cached_order.cl_ord_id
-        ; user_ref = cached_order.order_userref
-        }
-      in
-      update_orders_internal store event;
+  let orders_json =
+    match try_key "account_all_orders" with
+    | Some v -> Some v
+    | None ->
+      (match try_key "orders" with
+       | Some v -> Some v
+       | None -> try_key "data")
+  in
+  match orders_json with
+  | Some ((`Assoc _ | `List _) as orders_json) ->
+    let now = Unix.gettimeofday () in
+    let snapshot_order_ids = Hashtbl.create 32 in
+    (try
+       let orders =
+         match orders_json with
+         | `Assoc pairs ->
+           List.concat_map
+             (fun (_, v) ->
+               match v with
+               | `Assoc _ -> [ v ]
+               | `List items -> items
+               | _ -> [])
+             pairs
+         | `List items -> items
+         | _ -> []
+       in
+       List.iter
+         (fun order_json ->
+           try
+             match order_json with
+             | `Assoc _ ->
+               let order_index = member "order_index" order_json in
+               let order_id =
+                 match order_index with
+                 | `String s -> s
+                 | `Int i -> string_of_int i
+                 | _ -> Lighter_types.parse_json_int64 order_index |> Int64.to_string
+               in
+               Hashtbl.replace snapshot_order_ids order_id ()
+             | _ -> ()
+           with
+           | _ -> ())
+         orders
+     with
+     | exn ->
+       Logging.warn_f
+         ~section
+         "Failed to extract IDs for reconcile: %s"
+         (Printexc.to_string exn));
+    (* First miss arms the order; a later miss confirms the cancel. *)
+    let stale_orders = ref [] in
+    Mutex.lock initialization_mutex;
+    let all_symbols =
+      Ds.Cow_table.fold (fun symbol _ acc -> symbol :: acc) stores ~init:[]
+    in
+    Mutex.unlock initialization_mutex;
+    List.iter
+      (fun symbol ->
+        let store = get_symbol_store symbol in
+        Mutex.lock store.orders_mutex;
+        Fun.protect
+          ~finally:(fun () -> Mutex.unlock store.orders_mutex)
+          (fun () ->
+            Hashtbl.iter
+              (fun order_id (cached_order : open_order) ->
+                if Hashtbl.mem snapshot_order_ids order_id
+                then Hashtbl.remove store.missing_since order_id
+                else if cached_order.last_updated < since
+                then (
+                  match Hashtbl.find_opt store.missing_since order_id with
+                  | None -> Hashtbl.replace store.missing_since order_id now
+                  | Some first_missing ->
+                    if now -. first_missing >= missing_confirmation_s
+                    then (
+                      Hashtbl.remove store.missing_since order_id;
+                      stale_orders := (symbol, store, cached_order) :: !stale_orders)))
+              store.open_orders))
+      all_symbols;
+    List.iter
+      (fun (symbol, store, (cached_order : open_order)) ->
+        let event : execution_event =
+          { order_id = cached_order.order_id
+          ; symbol
+          ; order_status = CanceledStatus
+          ; limit_price = cached_order.limit_price
+          ; side = cached_order.side
+          ; order_qty = cached_order.order_qty
+          ; cum_qty = cached_order.cum_qty
+          ; avg_price = cached_order.avg_price
+          ; timestamp = Unix.gettimeofday ()
+          ; is_amended = false
+          ; cl_ord_id = cached_order.cl_ord_id
+          ; user_ref = cached_order.order_userref
+          }
+        in
+        update_orders_internal store event;
+        Logging.info_f
+          ~section
+          "Reconciled stale order: emitted CanceledStatus for %s [%s]"
+          cached_order.order_id
+          symbol)
+      !stale_orders;
+    if !stale_orders <> []
+    then
       Logging.info_f
         ~section
-        "Reconciled stale order: emitted CanceledStatus for %s [%s]"
-        cached_order.order_id
-        symbol)
-    !stale_orders;
-  if !stale_orders <> []
-  then
-    Logging.info_f
-      ~section
-      "Reconciled open orders: removed %d stale orders not present in snapshot"
-      (List.length !stale_orders)
+        "Reconciled open orders: removed %d stale orders not present in snapshot"
+        (List.length !stale_orders)
+  | None | Some _ ->
+    Logging.warn_f ~section "Snapshot has no orders list - keeping tracked orders"
 ;;
 
 (** Removes open orders untouched for over 24h and purges orphaned entries from the global

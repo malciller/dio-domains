@@ -86,13 +86,13 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col 3 a_label "ST"
            ; col_right 12 a_label "PRICE"
            ; I.string a_border " │ "
-           ; col 8 a_label "S PNL"
+           ; col 8 a_label "S QTY"
            ; I.string a_border " "
            ; col_right 6 a_label "S CL"
            ; col 9 a_label " DIST"
            ; col_right 6 a_label "L CL"
            ; I.string a_border " "
-           ; col 8 a_label "L PNL"
+           ; col 8 a_label "L QTY"
            ; col_right 11 a_label "BUY @"
            ; col 17 a_label "SPOT DIST"
            ; col_right 11 a_label "SELL @"
@@ -109,13 +109,13 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col 3 a_label "ST"
            ; col_right 12 a_label "PRICE"
            ; I.string a_border " │ "
-           ; col 9 a_label "S PNL"
+           ; col 9 a_label "S QTY"
            ; I.string a_border " "
            ; col_right 7 a_label "S CLOSE"
            ; col 13 a_label " PERP DIST"
            ; col_right 7 a_label "L CLOSE"
            ; I.string a_border " "
-           ; col 9 a_label "L PNL"
+           ; col 9 a_label "L QTY"
            ; col_right 12 a_label "BUY @"
            ; col_right 8 a_label "Δ BUY"
            ; col 17 a_label "SPOT DIST"
@@ -223,9 +223,9 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let long_positions =
       List.filter (fun (l : Snapshot.long_position) -> l.long_has_position) s.longs
     in
-    let long_pnl =
+    let long_qty =
       List.fold_left
-        (fun acc (l : Snapshot.long_position) -> acc +. l.long_unrealized_pnl)
+        (fun acc (l : Snapshot.long_position) -> acc +. abs_float l.long_qty)
         0.0
         long_positions
     in
@@ -288,7 +288,6 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let bg_color = if is_even then c_panel else c_bg in
     let a_text = A.(t.a_text ++ bg bg_color) in
     let a_green = A.(t.a_green ++ bg bg_color) in
-    let a_red = A.(t.a_red ++ bg bg_color) in
     let a_yellow = A.(t.a_yellow ++ bg bg_color) in
     let a_cyan = A.(t.a_cyan ++ bg bg_color) in
     let a_dim = A.(t.a_dim ++ bg bg_color) in
@@ -336,13 +335,12 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       then "⏸", a_yellow
       else "▶", a_green
     in
-    let short_pnl_str, short_pnl_attr =
+    let short_qty_str, short_qty_attr =
       match s.perp with
-      | Some p when p.has_position ->
-        format_pnl p.unrealized_pnl, if p.unrealized_pnl >= 0.0 then a_green else a_red
+      | Some p when p.has_position -> format_qty (abs_float p.abs_qty), a_cyan
       | _ -> "--", a_dim
     in
-    let short_pnl_str = truncate_string 8 short_pnl_str in
+    let short_qty_str = truncate_string 8 short_qty_str in
     let short_dist_str, short_dist_attr =
       match close_dist_pct with
       | None -> "--", a_dim
@@ -362,12 +360,10 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       then A.(t.a_near_fill_green ++ bg c_near_fill)
       else short_dist_attr
     in
-    let long_pnl_str, long_pnl_attr =
+    let long_qty_str, long_qty_attr =
       match long_positions with
       | [] -> "--", a_dim
-      | _ ->
-        ( truncate_string 8 (format_pnl long_pnl)
-        , if long_pnl >= 0.0 then a_green else a_red )
+      | _ -> truncate_string 8 (format_qty long_qty), a_cyan
     in
     let long_dist_str, long_dist_attr =
       match long_dist_pct with
@@ -461,13 +457,13 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; I.hcat [ I.string status_attr status_str; I.string a_text "  " ]
            ; price_cell
            ; I.string a_border " │ "
-           ; col 8 short_pnl_attr short_pnl_str
+           ; col 8 short_qty_attr short_qty_str
            ; I.string a_border " "
            ; col_right 6 short_dist_attr short_dist_str
            ; perp_gauge_img
            ; col_right 6 long_dist_attr long_dist_str
            ; I.string a_border " "
-           ; col 8 long_pnl_attr long_pnl_str
+           ; col 8 long_qty_attr long_qty_str
            ; col_right
                11
                (if flash_grid_buy
@@ -506,13 +502,13 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; I.hcat [ I.string status_attr status_str; I.string a_text "  " ]
            ; price_cell
            ; I.string a_border " │ "
-           ; col 9 short_pnl_attr short_pnl_str
+           ; col 9 short_qty_attr short_qty_str
            ; I.string a_border " "
            ; col_right 7 short_dist_attr short_dist_str
            ; perp_gauge_img
            ; col_right 7 long_dist_attr long_dist_str
            ; I.string a_border " "
-           ; col 9 long_pnl_attr long_pnl_str
+           ; col 9 long_qty_attr long_qty_str
            ; col_right
                12
                (if flash_grid_buy
