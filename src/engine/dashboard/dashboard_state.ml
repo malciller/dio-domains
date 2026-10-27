@@ -384,13 +384,27 @@ let json_of_latency_snapshot (snap : Latency_profiler.snapshot) =
     case-insensitively; the original spelling is preserved. *)
 let merge_oracle_asset_latencies latencies =
   let by_symbol = Hashtbl.create 16 in
+  (* A venue-keyed row ("<venue>:<instrument>") takes an oracle window published under the
+     bare instrument, so a perp that gets its own oracle pass shows it. *)
+  let by_instrument = Hashtbl.create 16 in
   List.iter
     (fun (symbol, json) ->
-      Hashtbl.replace by_symbol (String.lowercase_ascii symbol) (symbol, json))
+      let key = String.lowercase_ascii symbol in
+      Hashtbl.replace by_symbol key (symbol, json);
+      match String.index_opt symbol ':' with
+      | Some i when i > 0 ->
+        let instrument = String.sub symbol (i + 1) (String.length symbol - i - 1) in
+        Hashtbl.replace by_instrument (String.lowercase_ascii instrument) key
+      | _ -> ())
     latencies;
   List.iter
     (fun (symbol, snap_opt) ->
       let key = String.lowercase_ascii symbol in
+      let key =
+        if Hashtbl.mem by_symbol key
+        then key
+        else Option.value (Hashtbl.find_opt by_instrument key) ~default:key
+      in
       match Hashtbl.find_opt by_symbol key, snap_opt with
       | Some (orig, `Assoc l), Some snap ->
         Hashtbl.replace

@@ -92,7 +92,7 @@ let domain_profiler_cache : (string, domain_profilers) Hashtbl.t = Hashtbl.creat
 type overlay_profiler =
   { oip_exchange : string
   ; oip_symbol : string
-  ; oip_prof : Latency_profiler.t
+  ; oip_profs : domain_profilers (* the leg's own phases, same columns as a domain *)
   }
 
 let overlay_profiler_cache : (string, overlay_profiler) Hashtbl.t = Hashtbl.create 8
@@ -111,10 +111,19 @@ let get_overlay_profiler ~owner_exchange ~owner_symbol ~id ~exchange ~symbol =
     match Hashtbl.find_opt overlay_profiler_cache key with
     | Some p -> p
     | None ->
+      let create suffix =
+        Latency_profiler.create ~rolling_windows:8 (symbol ^ ":overlay:" ^ suffix)
+      in
       let p =
         { oip_exchange = Config.normalize_exchange exchange
         ; oip_symbol = symbol
-        ; oip_prof = Latency_profiler.create ~rolling_windows:8 (symbol ^ ":overlay")
+        ; oip_profs =
+            { prof_ob = create "ob"
+            ; prof_exec = create "exec"
+            ; prof_prep = create "prep"
+            ; prof_strategy = create "strategy"
+            ; prof_cycle = create "cycle"
+            }
         }
       in
       Hashtbl.replace overlay_profiler_cache key p;
@@ -130,18 +139,22 @@ let get_overlay_profiler_snapshots () =
   let rows =
     Hashtbl.fold
       (fun _ p acc ->
-         (overlay_latency_key ~exchange:p.oip_exchange ~symbol:p.oip_symbol, p.oip_prof)
+         ( overlay_latency_key ~exchange:p.oip_exchange ~symbol:p.oip_symbol
+         , p.oip_profs )
          :: acc)
       overlay_profiler_cache
       []
   in
   Mutex.unlock profiler_cache_mutex;
   List.map
-    (fun (key, prof) ->
-       (* The instance has no measured sub-segments: its whole cycle span is both its
-          strategy step and its total, so the row fills STRATEGY and TOTAL. *)
-       let snap = Latency_profiler.published_snapshot prof in
-       key, [ "strategy", snap; "cycle", snap ])
+    (fun (key, profs) ->
+       key
+       , [ "orderbook", Latency_profiler.published_snapshot profs.prof_ob
+         ; "execution", Latency_profiler.published_snapshot profs.prof_exec
+         ; "prep", Latency_profiler.published_snapshot profs.prof_prep
+         ; "strategy", Latency_profiler.published_snapshot profs.prof_strategy
+         ; "cycle", Latency_profiler.published_snapshot profs.prof_cycle
+         ])
     rows
 ;;
 
@@ -351,7 +364,7 @@ type overlay_instance_rt =
   ; oir_state : Yojson.Basic.t ref
   ; mutable oir_seen_positions_at : float
   ; mutable oir_seen_margin_at : float
-  ; oir_prof : Latency_profiler.t (* this instance's own cycle span *)
+  ; oir_profs : domain_profilers (* this instance's own phases *)
   }
 
 (** Load every overlay instance owned by [owner]. A failed instance is logged and skipped;
@@ -421,13 +434,13 @@ let load_overlay_instances ~(owner : trading_config) : overlay_instance_rt list 
           ; oir_state = state
           ; oir_seen_positions_at = -1.0
           ; oir_seen_margin_at = -1.0
-          ; oir_prof =
+          ; oir_profs =
               (get_overlay_profiler
                  ~owner_exchange:oi.oi_owner_exchange
                  ~owner_symbol:oi.oi_owner_symbol
                  ~id:oi.oi_id
                  ~exchange:oi.oi_exchange
-                 ~symbol:oi.oi_symbol).oip_prof
+                 ~symbol:oi.oi_symbol).oip_profs
           }))
 ;;
 
@@ -1297,8 +1310,11 @@ let asset_domain_worker
     (* Additional generic overlays owned by this grid entry. They run in the same domain:
        no new process, and grid sell fills are available locally. *)
     let overlay_instances = load_overlay_instances ~owner:asset_with_fees in
+    let profilers_of (p : domain_profilers) =
+      [ p.prof_ob; p.prof_exec; p.prof_prep; p.prof_strategy; p.prof_cycle ]
+    in
     overlay_window_profs :=
-      List.map (fun ov -> ov.oir_prof) overlay_instances
+      List.concat_map (fun ov -> profilers_of ov.oir_profs) overlay_instances
       @ (match controller_prof with
          | Some prof -> [ prof ]
          | None -> []);
@@ -1313,7 +1329,9 @@ let asset_domain_worker
        not just the book ticks. *)
     let run_overlay_cycles (ov : overlay_instance_rt) ~now ~price ~events =
       let measured = !latency_active in
-      let t0 = if measured then Monotonic_clock.now_ns () else 0 in
+      let profs = ov.oir_profs in
+      let now_ns () = Monotonic_clock.now_ns () in
+      let t0 = if measured then now_ns () else 0 in
       let ctx = ov.oir_ctx in
       let asset = ov.oir_asset in
       ctx.cg_asset <- Some asset;
@@ -1335,16 +1353,31 @@ let asset_domain_worker
       ctx.cg_base_age <- None;
       ctx.cg_gen <- 0;
       ctx.cg_profile <- false;
+      let t_prep = if measured then now_ns () else 0 in
       List.iter
         (fun (event_name, fields) ->
+           let t_ev = if measured then now_ns () else 0 in
            Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
              ignore
                (Dio_strategies.Strategy_runtime.run_cycle
                   ov.oir_rt
                   ~price
                   ~now
-                  ~event:(Dio_strategies.Strategy_runtime.make_event event_name fields))))
+                  ~event:(Dio_strategies.Strategy_runtime.make_event event_name fields)));
+           if measured
+           then (
+             let ns = now_ns () - t_ev in
+             (* Charge the reaction to what woke the leg: a book tick is book work, a fill
+                is event work, anything else is strategy work. *)
+             let prof =
+               match event_name with
+               | "book_update" -> profs.prof_ob
+               | "filled" -> profs.prof_exec
+               | _ -> profs.prof_strategy
+             in
+             if ns > 0 then Latency_profiler.record_ns prof ns))
         events;
+      let t_save = if measured then now_ns () else 0 in
       Dio_strategies.Overlay_instance_runtime.save_if_changed
         ~owner_exchange:ov.oir_config.oi_owner_exchange
         ~owner_symbol:ov.oir_config.oi_owner_symbol
@@ -1354,8 +1387,11 @@ let asset_domain_worker
       if not measured
       then 0
       else (
-        let ns = Monotonic_clock.now_ns () - t0 in
-        if ns > 0 then Latency_profiler.record_ns ov.oir_prof ns;
+        let t_end = now_ns () in
+        let prep_ns = t_prep - t0 + (t_end - t_save) in
+        if prep_ns > 0 then Latency_profiler.record_ns profs.prof_prep prep_ns;
+        let ns = t_end - t0 in
+        if ns > 0 then Latency_profiler.record_ns profs.prof_cycle ns;
         ns)
     in
     let overlay_mark (ov : overlay_instance_rt) =
