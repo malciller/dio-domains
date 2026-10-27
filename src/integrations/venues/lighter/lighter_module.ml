@@ -504,8 +504,9 @@ let initialize_instruments ~symbols =
   " Fetches instrument metadata over REST for [symbols] into the instruments feed. "]
 ;;
 
-let fetch_open_orders () =
-  let section = "lighter_startup" in
+let fetch_open_orders ?(quiet = false) () =
+  let section = if quiet then "lighter_resync" else "lighter_startup" in
+  let requested_at = Unix.gettimeofday () in
   let account_index =
     match Sys.getenv_opt "LIGHTER_ACCOUNT_INDEX" |> Option.map String.trim with
     | Some s ->
@@ -559,15 +560,35 @@ let fetch_open_orders () =
                 let trimmed = String.trim body_str in
                 if trimmed = "" || trimmed = "{}" || trimmed = "[]"
                 then (
-                  Logging.info_f ~section "No open orders on Lighter (empty response)";
+                  (if quiet then Logging.debug_f else Logging.info_f)
+                    ~section
+                    "No open orders on Lighter (empty response)";
                   Lighter_executions_feed.set_startup_snapshot_done ();
                   Lwt.return_unit)
                 else (
                   let json = Yojson.Safe.from_string trimmed in
-                  Lighter_executions_feed.handle_snapshot json;
-                  Lighter_executions_feed.set_startup_snapshot_done ();
-                  Logging.debug_f ~section "Fetched and injected open orders";
-                  Lwt.return_unit)))))
+                  let code_ok =
+                    let open Yojson.Safe.Util in
+                    match member "code" json with
+                    | `Null -> true
+                    | `Int n -> n = 200
+                    | `String s ->
+                      (try int_of_string (String.trim s) = 200 with
+                       | _ -> false)
+                    | _ -> true
+                  in
+                  if not code_ok
+                  then (
+                    Logging.error_f
+                      ~section
+                      "openOrders response code is not 200 - keeping tracked orders";
+                    Lighter_executions_feed.set_startup_snapshot_done ();
+                    Lwt.return_unit)
+                  else (
+                    Lighter_executions_feed.handle_snapshot ~since:requested_at json;
+                    Lighter_executions_feed.set_startup_snapshot_done ();
+                    Logging.debug_f ~section "Fetched and injected open orders";
+                    Lwt.return_unit))))))
     (fun exn ->
       Logging.error_f ~section "Failed to fetch open orders: %s" (Printexc.to_string exn);
       Lighter_executions_feed.set_startup_snapshot_done ();
@@ -739,12 +760,15 @@ let fetch_balances ?(quiet = false) () =
 
 (** Periodic REST re-seed of the account snapshot. [account_all] frames are the only live
     position source after startup, so a dropped frame otherwise leaves positions stale
-    until a restart. *)
+    until a restart. Open orders are re-read in the same pass: it both restores a cache
+    lost to a bad snapshot and supplies the second look that confirms a missed order. *)
 let start_account_resync ?(interval_s = 60.0) () =
   let rec loop () =
     Lwt_unix.sleep interval_s
     >>= fun () ->
     fetch_balances ~quiet:true ()
+    >>= fun () ->
+    fetch_open_orders ~quiet:true ()
     >>= fun () ->
     (* Independent next pass: a retained Lwt Forward node per interval would leak. *)
     Lwt.async loop;

@@ -278,6 +278,38 @@ let test_fill_intent_position_fallback () =
   check "buy when flat opens long" "open_long" ~is_ask:false 0.0
 ;;
 
+let test_snapshot_missing_order_keeps_tracking () =
+  Lighter.Instruments_feed.initialize [ "EXKEEP" ];
+  Lighter.Executions_feed.initialize [ "EXKEEP" ];
+  Lighter.Executions_feed.inject_order
+    ~symbol:"EXKEEP"
+    ~order_id:"keep_1"
+    ~side:Lighter.Executions_feed.Buy
+    ~qty:1.0
+    ~price:100.0
+    ();
+  Unix.sleepf 0.01;
+  let since = Unix.gettimeofday () in
+  let empty_snapshot = `Assoc [ "code", `Int 200; "orders", `List [] ] in
+  Lighter.Executions_feed.handle_snapshot ~since empty_snapshot;
+  Alcotest.(check bool)
+    "one miss does not cancel"
+    true
+    (Option.is_some (Lighter.Executions_feed.get_open_order "EXKEEP" "keep_1"));
+  Lighter.Executions_feed.handle_snapshot ~since empty_snapshot;
+  Alcotest.(check bool)
+    "unconfirmed second miss does not cancel"
+    true
+    (Option.is_some (Lighter.Executions_feed.get_open_order "EXKEEP" "keep_1"));
+  Lighter.Executions_feed.handle_snapshot
+    ~since
+    (`Assoc [ "code", `Int 200; "message", `String "no orders field" ]);
+  Alcotest.(check bool)
+    "snapshot without an orders list does not cancel"
+    true
+    (Option.is_some (Lighter.Executions_feed.get_open_order "EXKEEP" "keep_1"))
+;;
+
 let () =
   Alcotest.run
     "Lighter Executions Feed"
@@ -294,6 +326,10 @@ let () =
             "clear resets reconnect state"
             `Quick
             test_clear_all_open_orders_resets_reconnect_state
+        ; Alcotest.test_case
+            "snapshot miss keeps tracking"
+            `Quick
+            test_snapshot_missing_order_keeps_tracking
         ] )
     ; ( "intent"
       , [ Alcotest.test_case "reduce-only mapping" `Quick test_fill_intent
