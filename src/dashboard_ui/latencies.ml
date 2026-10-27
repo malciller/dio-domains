@@ -99,19 +99,19 @@ type metric_group =
     - INTERNAL: per-asset work. [oracle] is the capital-oracle's per-asset analysis pass
       (own ~5 min cadence, outside the per-cycle span). [orderbook] -> [execution] ->
       [prep] -> [strategy] are the four sequential segments of one cycle; [cycle] is their
-      sum. All are in-process work with the same sub-10us target.
-      A generic overlay instance (a perp long on its own venue, executing inside its
-      owner's domain) gets a nested row carrying only [strategy]: that instance's cycle
-      span, kept off the owner's STRATEGY cell so it is not counted twice.
+      sum. All are in-process work with the same sub-10us target. A generic overlay
+      instance (a perp long on its own venue, executing inside its owner's domain) gets a
+      nested row carrying only [strategy]: that instance's cycle span, kept off the
+      owner's STRATEGY cell so it is not counted twice.
     - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed one-way latency,
       REST round-trip, signer time). These measure exchange round-trips and feed transit,
       not in-process work, and carry their own budgets. *)
 let metric_pages =
   [ { page_label = "INTERNAL"
     ; metrics = [ "oracle"; "orderbook"; "execution"; "prep"; "strategy"; "cycle" ]
-    ; trend_metric = "oracle"
-    ; trend_label = "(ORACLE P99)"
-    ; trend_max_us = 10.0
+    ; trend_metric = "cycle"
+    ; trend_label = "(TOTAL P99)"
+    ; trend_max_us = 100.0
     }
   ; { page_label = "NETWORK"
     ; metrics = [ "ws_ping"; "ws_feed"; "rest_request"; "signer" ]
@@ -241,12 +241,22 @@ let render_latencies w (snapshot : Snapshot.t) =
   let sym_to_exch =
     List.map (fun (sym, (s : Snapshot.strategy)) -> sym, s.exchange) snapshot.strategies
   in
-  (* A row key without a '/' is a venue-only row (an overlay venue with no domain of its
-     own), so the key names the exchange to colour it with. *)
-  let exch_of_symbol sym =
-    match List.assoc_opt sym sym_to_exch with
-    | Some e when e <> "" -> e
-    | _ -> if String.contains sym '/' then "" else sym
+  (* An overlay instance row is keyed "<venue>:<instrument>". A bare key with no '/' and
+     no venue is a venue-only row, so the key names the exchange to colour it with. *)
+  let split_row_key key =
+    match String.index_opt key ':' with
+    | Some i when i > 0 ->
+      String.sub key 0 i, String.sub key (i + 1) (String.length key - i - 1)
+    | _ -> "", key
+  in
+  let exch_of_row key =
+    let venue, symbol = split_row_key key in
+    if venue <> ""
+    then venue
+    else (
+      match List.assoc_opt symbol sym_to_exch with
+      | Some e when e <> "" -> e
+      | _ -> if String.contains symbol '/' then "" else symbol)
   in
   (* Keep rows with at least one metric window fresh within its tolerance. A running
      domain publishes a window even with zero samples, so idle-but-running domains stay
@@ -283,7 +293,8 @@ let render_latencies w (snapshot : Snapshot.t) =
   in
   let child_rows = Hashtbl.create 8 in
   List.iter
-    (fun ((symbol, _) as row) ->
+    (fun ((key, _) as row) ->
+      let _, symbol = split_row_key key in
       match parent_of symbol with
       | Some parent ->
         let previous =
@@ -296,29 +307,30 @@ let render_latencies w (snapshot : Snapshot.t) =
   let ordered_rows =
     let emitted = Hashtbl.create 16 in
     let out = ref [] in
-    let add (symbol, metrics) is_child =
-      if not (Hashtbl.mem emitted symbol)
+    let add (key, metrics) is_child =
+      if not (Hashtbl.mem emitted key)
       then (
-        Hashtbl.replace emitted symbol ();
-        out := (symbol, metrics, is_child) :: !out)
+        Hashtbl.replace emitted key ();
+        out := (key, metrics, is_child) :: !out)
     in
     List.iter
-      (fun (symbol, metrics) ->
+      (fun ((key, _) as row) ->
+        let _, symbol = split_row_key key in
         match parent_of symbol with
         | Some _ -> ()
         | None ->
-          add (symbol, metrics) false;
+          add row false;
           (match Hashtbl.find_opt child_rows symbol with
            | Some children ->
              List.iter
-               (fun (csymbol, cmetrics) ->
-                 if not (Hashtbl.mem emitted csymbol) then add (csymbol, cmetrics) true)
+               (fun (ckey, cmetrics) ->
+                 if not (Hashtbl.mem emitted ckey) then add (ckey, cmetrics) true)
                (List.rev children)
            | None -> ()))
       active_lats;
     List.iter
-      (fun (symbol, metrics) ->
-        if not (Hashtbl.mem emitted symbol) then add (symbol, metrics) false)
+      (fun (key, metrics) ->
+        if not (Hashtbl.mem emitted key) then add (key, metrics) false)
       active_lats;
     List.rev !out
   in
@@ -411,7 +423,8 @@ let render_latencies w (snapshot : Snapshot.t) =
     let header = I.vcat [ close_row w header_row1; close_row w header_row2 ] in
     let rows =
       List.mapi
-        (fun i (symbol, metrics, is_child) ->
+        (fun i (key, metrics, is_child) ->
+          let _, symbol = split_row_key key in
           let bg_color = if i mod 2 = 1 then t.c_panel else t.c_bg in
           let a_text = A.(t.a_text ++ bg bg_color) in
           let a_green = A.(t.a_green ++ bg bg_color) in
@@ -472,7 +485,7 @@ let render_latencies w (snapshot : Snapshot.t) =
                 if samples > 0
                 then max worst (severity label p99 samples)
                 else (
-                  match last_value symbol label with
+                  match last_value key label with
                   | Some (_, lp99, _) -> max worst (severity_of_value label lp99)
                   | None -> worst))
               0
@@ -483,11 +496,10 @@ let render_latencies w (snapshot : Snapshot.t) =
             List.mapi
               (fun i label ->
                 let p50, p99, p999, samples = find_metric label in
-                let known = List.mem_assoc label mlist in
                 let img =
                   if samples > 0
                   then (
-                    Hashtbl.replace last_vals (symbol, label) (p50, p99, p999);
+                    Hashtbl.replace last_vals (key, label) (p50, p99, p999);
                     let s50 = severity label p50 samples in
                     let s99 = max s50 (severity label p99 samples) in
                     let s999 = max s99 (severity label p999 samples) in
@@ -506,7 +518,7 @@ let render_latencies w (snapshot : Snapshot.t) =
                           (format_latency_us p999)
                       ])
                   else (
-                    match last_value symbol label with
+                    match last_value key label with
                     | Some (lp50, lp99, lp999) ->
                       let s50 = severity_of_value label lp50 in
                       let s99 = max s50 (severity_of_value label lp99) in
@@ -526,29 +538,31 @@ let render_latencies w (snapshot : Snapshot.t) =
                             (format_latency_us lp999)
                         ]
                     | None ->
+                      (* No window and no remembered value: the row has no data for this
+                         metric (a perp leg has no oracle pass). *)
                       let cell_w = 3 * metric_cell_w in
                       let pad = (cell_w - 4) / 2 in
-                      col
-                        cell_w
-                        a_dim
-                        (String.make pad ' ' ^ if known then "idle" else "--"))
+                      col cell_w a_dim (String.make pad ' ' ^ "idle"))
                 in
                 if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
               page_cols
           in
-          let t_smooth = ema_smooth (hist_of symbol page.trend_metric) ~alpha:0.5 in
+          (* An overlay instance publishes its whole cycle span as [strategy]; plot that
+             when the page's own metric is absent. *)
+          let trend_key =
+            if List.mem_assoc page.trend_metric metrics
+            then page.trend_metric
+            else if List.mem_assoc "strategy" metrics
+            then "strategy"
+            else page.trend_metric
+          in
+          let t_smooth = ema_smooth (hist_of key trend_key) ~alpha:0.5 in
           let trend_spark =
             render_sparkline_local trend_col_w t_smooth page.trend_max_us (fun v ->
-              latency_cell_attr (attr_of_sev (severity_of_value page.trend_metric v)) v)
+              latency_cell_attr (attr_of_sev (severity_of_value trend_key v)) v)
           in
-          let exch = exch_of_symbol symbol in
-          let sym_attr =
-            if is_child
-            then a_dim
-            else if exch <> ""
-            then exch_sym_attr exch
-            else a_bright
-          in
+          let exch = exch_of_row key in
+          let sym_attr = if exch <> "" then exch_sym_attr exch else a_bright in
           let display_symbol =
             if is_child
             then " ↳" ^ truncate_string 8 symbol

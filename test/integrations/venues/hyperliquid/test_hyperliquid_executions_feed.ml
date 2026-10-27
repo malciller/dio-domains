@@ -444,6 +444,50 @@ let test_fill_intent_close_short () =
      | None -> Alcotest.fail "expected direction note")
 ;;
 
+let test_spot_fill_has_no_realized_pnl () =
+  (* Hyperliquid reports [closedPnl] on spot fills too, but our spot basis is a
+     reconstructed average cost, so the venue number does not reconcile. Spot PnL stays
+     off the fill; perps keep the venue's number. *)
+  let coin = "PURR/USDC" in
+  Hyperliquid.Executions_feed.initialize [ coin ];
+  let tid = 987_654_322 in
+  let now_ms = int_of_float (Unix.gettimeofday () *. 1000.0) in
+  let json =
+    `Assoc
+      [ "channel", `String "userFills"
+      ; ( "data"
+        , `Assoc
+            [ ( "fills"
+              , `List
+                  [ `Assoc
+                      [ "coin", `String coin
+                      ; "oid", `Int 999_002
+                      ; "px", `String "0.21"
+                      ; "sz", `String "100.0"
+                      ; "side", `String "A"
+                      ; "time", `Int now_ms
+                      ; "dir", `String "Sell"
+                      ; "closedPnl", `String "3.5"
+                      ; "fee", `String "0.01"
+                      ; "tid", `Int tid
+                      ]
+                  ] )
+            ] )
+      ]
+  in
+  Hyperliquid.Executions_feed.process_market_data json;
+  let fills = Concurrency.Fill_event_bus.get_recent_fills () in
+  match
+    List.find_opt
+      (fun (f : Concurrency.Fill_event_bus.fill_event) -> f.order_id = "999002")
+      fills
+  with
+  | None -> Alcotest.fail "spot fill not published"
+  | Some f ->
+    Alcotest.(check string) "market is spot" "spot" f.market;
+    Alcotest.(check bool) "spot PnL is not reported" true (f.realized_pnl = None)
+;;
+
 let test_open_orders_snapshot_does_not_cancel_newer_local_order () =
   (* A resync snapshot can predate a placement; absence must not cancel an order injected
      after the request. *)
@@ -510,6 +554,10 @@ let () =
             "fill intent: close short"
             `Quick
             test_fill_intent_close_short
+        ; Alcotest.test_case
+            "spot fill reports no PnL"
+            `Quick
+            test_spot_fill_has_no_realized_pnl
         ] )
     ]
 ;;
