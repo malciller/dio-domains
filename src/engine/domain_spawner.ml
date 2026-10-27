@@ -162,7 +162,7 @@ let get_overlay_profiler_snapshots () =
     grid already owns that domain the controller has no row of its own. This gives each
     controller a row keyed by its hedge venue, so the perp leg is visible and timed even
     when it shares a domain with the grid. *)
-let controller_profiler_cache : (string, Latency_profiler.t) Hashtbl.t =
+let controller_profiler_cache : (string, domain_profilers) Hashtbl.t =
   Hashtbl.create 8
 ;;
 
@@ -173,7 +173,17 @@ let get_controller_profiler ~exchange ~coin =
     match Hashtbl.find_opt controller_profiler_cache key with
     | Some p -> p
     | None ->
-      let p = Latency_profiler.create ~rolling_windows:8 (coin ^ ":carry") in
+      let create suffix =
+        Latency_profiler.create ~rolling_windows:8 (coin ^ ":carry:" ^ suffix)
+      in
+      let p =
+        { prof_ob = create "ob"
+        ; prof_exec = create "exec"
+        ; prof_prep = create "prep"
+        ; prof_strategy = create "strategy"
+        ; prof_cycle = create "cycle"
+        }
+      in
       Hashtbl.replace controller_profiler_cache key p;
       p
   in
@@ -185,15 +195,20 @@ let get_controller_profiler_snapshots () =
   Mutex.lock profiler_cache_mutex;
   let rows =
     Hashtbl.fold
-      (fun key prof acc -> (key, prof) :: acc)
+      (fun key profs acc -> (key, profs) :: acc)
       controller_profiler_cache
       []
   in
   Mutex.unlock profiler_cache_mutex;
   List.map
-    (fun (key, prof) ->
-       let snap = Latency_profiler.published_snapshot prof in
-       key, [ "strategy", snap; "cycle", snap ])
+    (fun (key, profs) ->
+       key
+       , [ "orderbook", Latency_profiler.published_snapshot profs.prof_ob
+         ; "execution", Latency_profiler.published_snapshot profs.prof_exec
+         ; "prep", Latency_profiler.published_snapshot profs.prof_prep
+         ; "strategy", Latency_profiler.published_snapshot profs.prof_strategy
+         ; "cycle", Latency_profiler.published_snapshot profs.prof_cycle
+         ])
     rows
 ;;
 
@@ -1135,7 +1150,7 @@ let asset_domain_worker
     in
     (* The controller needs its own row only when this domain also runs a grid: a domain
        that exists solely for the hedge already is the perp row. *)
-    let controller_prof =
+    let controller_profs =
       match overlay_controller with
       | Some c when not (String.equal asset_with_fees.strategy "") ->
         Some
@@ -1315,8 +1330,8 @@ let asset_domain_worker
     in
     overlay_window_profs :=
       List.concat_map (fun ov -> profilers_of ov.oir_profs) overlay_instances
-      @ (match controller_prof with
-         | Some prof -> [ prof ]
+      @ (match controller_profs with
+         | Some profs -> profilers_of profs
          | None -> []);
     (* Loop-invariant: only a domain that hosts overlay work pays the two extra clock
        reads that split it out of PREP. *)
@@ -1366,12 +1381,12 @@ let asset_domain_worker
            if measured
            then (
              let ns = Monotonic_clock.now_ns () - t_ev in
-             (* A fill is execution-event work; everything else is the leg's own decision
-                pass, which is strategy work like a grid's. The leg applies no book frames
-                itself (the host domain does), so its BOOK column stays empty. *)
+             (* Attribute the pass to what woke the leg: a fill is event work, a book tick
+                is book work, anything else is the leg's own strategy pass. *)
              let prof =
                match event_name with
                | "filled" -> profs.prof_exec
+               | "book_update" -> profs.prof_ob
                | _ -> profs.prof_strategy
              in
              if ns > 0 then Latency_profiler.record_ns prof ns))
@@ -3219,6 +3234,9 @@ let asset_domain_worker
          in
          ctx.cg_reserve_share <- share;
          ctx.cg_carry <- Option.map (fun r -> !r) overlay_carry;
+         let t_ctl_prep =
+           if latency_this_cycle && t_overlay > 0 then Monotonic_clock.now_ns () else 0
+         in
          ort.prof_enabled <- false;
          Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
            ignore
@@ -3228,6 +3246,9 @@ let asset_domain_worker
                 ~price:!current_price
                 ~now:now_ov
                 ~event:(Dio_strategies.Strategy_runtime.make_event "book_update" [])));
+         let t_ctl_strat =
+           if latency_this_cycle && t_overlay > 0 then Monotonic_clock.now_ns () else 0
+         in
          (match overlay_carry with
           | Some r ->
             Dio_strategies.Overlay_runtime.save_if_changed
@@ -3356,12 +3377,27 @@ let asset_domain_worker
              pool.pl_margin
              pool.pl_required
              pool.pl_own_net
-             pool.pl_reserve)
-       | _ -> ());
-      (match controller_prof with
-       | Some prof when latency_this_cycle && t_overlay > 0 ->
-         let ns = Monotonic_clock.now_ns () - t_overlay in
-         if ns > 0 then Latency_profiler.record_ns prof ns
+             pool.pl_reserve);
+         (match controller_profs with
+          | Some profs when t_ctl_prep > 0 ->
+            let t_end = Monotonic_clock.now_ns () in
+            (* The reserve/inventory work and persistence are preparation; the interpreter
+               pass is charged to what woke the cycle: execution events, a book tick, or
+               the strategy's own remaining work. *)
+            let prep_ns = t_ctl_prep - t_overlay + (t_end - t_ctl_strat) in
+            if prep_ns > 0 then Latency_profiler.record_ns profs.prof_prep prep_ns;
+            let pass_prof =
+              if !event_count > 0
+              then profs.prof_exec
+              else if did_ob
+              then profs.prof_ob
+              else profs.prof_strategy
+            in
+            let pass_ns = t_ctl_strat - t_ctl_prep in
+            if pass_ns > 0 then Latency_profiler.record_ns pass_prof pass_ns;
+            let cycle_ns = t_end - t_overlay in
+            if cycle_ns > 0 then Latency_profiler.record_ns profs.prof_cycle cycle_ns
+          | _ -> ())
        | _ -> ());
       (* Generic overlays run on their venue's position/margin changes. A resting entry is
          a live GTC limit and needs the book to reprice, so subscribe only while one
