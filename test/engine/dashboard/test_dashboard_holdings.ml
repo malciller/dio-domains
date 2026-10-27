@@ -421,6 +421,69 @@ let contains_sub str sub =
     !found)
 ;;
 
+(* A generic overlay instance builds no domain row (it executes inside its owner's
+   domain), so it publishes its cycle span under its own instrument. It must nest under
+   the asset that owns it instead of floating as a second root row. *)
+let test_overlay_latency_row () =
+  let open Dashboard_ui in
+  let snap = latency_snapshot () in
+  Latencies.set_page 0;
+  let json =
+    `Assoc
+      [ "timestamp", `Float 1000.0
+      ; "strategies", `Assoc [ "BTC/USDC", `Assoc [ "exchange", `String "hyperliquid" ] ]
+      ; ( "latencies"
+        , `Assoc
+            [ ( "BTC/USDC"
+              , `Assoc
+                  [ "orderbook", snap
+                  ; "execution", snap
+                  ; "prep", snap
+                  ; "strategy", snap
+                  ; "cycle", snap
+                  ] )
+            ; "BTC", `Assoc [ "strategy", snap ]
+            ] )
+      ]
+  in
+  let text = render_to_text (Latencies.render_latencies 180 (Snapshot.of_json json)) in
+  Alcotest.(check bool)
+    "overlay instance row nests under its owning asset"
+    (contains_sub text "\226\134\179BTC")
+    true
+;;
+
+(* A venue reached only through an overlay instance (a Lighter perp funded by a spot grid
+   elsewhere) has no strategy row, so it must still surface in the connectivity strip. *)
+let test_footer_overlay_venue () =
+  let open Dashboard_ui in
+  let json =
+    `Assoc
+      [ "timestamp", `Float 1000.0
+      ; "uptime_s", `Float 10.0
+      ; ( "strategies"
+        , `Assoc
+            [ ( "BTC/USDC"
+              , `Assoc
+                  [ "exchange", `String "hyperliquid"
+                  ; "market", `Assoc [ "bid", `Float 100.0; "ask", `Float 101.0 ]
+                  ; ( "longs"
+                    , `List
+                        [ `Assoc
+                            [ "exchange", `String "lighter"
+                            ; "coin", `String "BTC"
+                            ; "mark", `Float 100.0
+                            ] ] )
+                  ] ) ] )
+      ]
+  in
+  let text = render_to_text (Footer.render_footer 180 (Snapshot.of_json json)) in
+  Alcotest.(check bool)
+    "overlay-only venue appears in the connectivity strip"
+    (contains_sub text "lighter")
+    true
+;;
+
 let test_latency_persistence () =
   let open Dashboard_ui in
   Latencies.set_page 1;
@@ -596,6 +659,16 @@ let () =
     ; ( "latency pages"
       , [ Alcotest.test_case "page navigation wraps both ways" `Quick test_latency_pages
         ; Alcotest.test_case "every page renders rows" `Quick test_latency_page_render
+        ; Alcotest.test_case
+            "overlay instance gets a nested row"
+            `Quick
+            test_overlay_latency_row
+        ] )
+    ; ( "footer"
+      , [ Alcotest.test_case
+            "overlay-only venue gets a status icon"
+            `Quick
+            test_footer_overlay_venue
         ] )
     ; ( "network latency"
       , [ Alcotest.test_case
