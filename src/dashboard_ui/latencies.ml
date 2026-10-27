@@ -101,10 +101,10 @@ type metric_group =
       [prep] -> [strategy] are the four sequential segments of one cycle; [cycle] is their
       sum. All are in-process work with the same sub-10us target. A perp leg that runs
       inside its owner's domain (a generic overlay instance, or a carry controller sharing
-      the hedge grid's domain) gets its own nested row keyed by venue, split the same way:
-      [prep] is its setup and persistence, [execution] its fill handling, [strategy] its
-      decision pass. Its time stays off the owner's STRATEGY cell so it is not counted
-      twice.
+      the hedge grid's domain) gets its own nested row keyed by venue. Its passes are
+      charged to what woke them - [orderbook] for a book tick, [execution] for a fill,
+      [strategy] otherwise - with its setup and persistence under [prep]. Its span is
+      charged to the owner's STRATEGY cell, not PREP; the nested row breaks it down.
     - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed one-way latency,
       REST round-trip, signer time). These measure exchange round-trips and feed transit,
       not in-process work, and carry their own budgets. *)
