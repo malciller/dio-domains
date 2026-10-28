@@ -1,8 +1,10 @@
 (* Oracle_core - pure decision core of the capital oracle.
 
    Single source of truth for every emitted quantity:
-   - references: worst peak-to-trough decline (recovery irrelevant), ATH and ATL over the
-     full all-time merged series.
+   - references: worst peak-to-trough decline (recovery irrelevant), high and low over a
+     trailing window of the merged series. [window_days = 0] keeps the whole all-time
+     history; any other value rescans only the newest N calendar days, so the runway
+     follows the current regime instead of a peak the asset may never revisit.
    - runway: realized_dd, runway_pct = mdd * target_survival, floor_price, remaining_drop,
      resolved into Normal / Floor extension / Unprecedented lows.
    - aggressiveness = realized_dd / mdd, biasing parameter selection toward accumulation
@@ -23,17 +25,43 @@
 (* Price-history references *)
 (* ------------------------------------------------------------------ *)
 
-(** Reference quantities derived from an asset's full all-time series. *)
+(** Reference quantities derived from an asset's price series over the lookback window. *)
 type references =
   { max_drawdown_pct : float
-  (** Single worst peak-to-trough percentage decline (0..1); recovery is irrelevant - an
-      unrecovered collapse counts at full depth. Measured from the running peak of closes
-      to the deepest subsequent low. *)
-  ; ath : float (** All-time high price (intrabar high). *)
-  ; atl : float (** All-time low price (intrabar low). *)
+  (** Single worst peak-to-trough percentage decline (0..1) inside the window; recovery is
+      irrelevant - an unrecovered collapse counts at full depth. Measured from the running
+      peak of closes to the deepest subsequent low. *)
+  ; ath : float (** Window high price (intrabar high). *)
+  ; atl : float (** Window low price (intrabar low). *)
+  ; window_days : int (** Trailing window the scan covered; 0 = all time. *)
+  ; bars_used : int
+  (** Bars actually inside the window. Short against [window_days] means the series is
+      younger than the window, so the drawdown is measured over a shorter regime. *)
   }
 
-let references_of ~(bars : Oracle_types.bar array) : references option =
+(** Trailing window over the newest [window_days] calendar days, both ends inclusive. The
+    newest bar is the anchor rather than the wall clock, so a stale cache and a fresh one
+    produce the same window. [window_days <= 0] returns the series unchanged. Calendar
+    days keep the window comparable across crypto (365 sessions) and equity (weekdays). *)
+let window_bars ~(window_days : int) (bars : Oracle_types.bar array)
+  : Oracle_types.bar array
+  =
+  let n = Array.length bars in
+  if window_days <= 0 || n = 0
+  then bars
+  else (
+    let cutoff = Oracle_calendar.add_days bars.(n - 1).date (-(window_days - 1)) in
+    let first = ref n in
+    for i = n - 1 downto 0 do
+      if bars.(i).date >= cutoff then first := i
+    done;
+    if !first >= n then [||] else Array.sub bars !first (n - !first))
+;;
+
+let references_of ~(window_days : int) ~(bars : Oracle_types.bar array)
+  : references option
+  =
+  let bars = window_bars ~window_days bars in
   let n = Array.length bars in
   if n = 0
   then None
@@ -59,7 +87,14 @@ let references_of ~(bars : Oracle_types.bar array) : references option =
     if Float.is_infinite !atl then atl := 0.0;
     if !ath = 0.0
     then None
-    else Some { max_drawdown_pct = Float.min 0.999999 !best_dd; ath = !ath; atl = !atl })
+    else
+      Some
+        { max_drawdown_pct = Float.min 0.999999 !best_dd
+        ; ath = !ath
+        ; atl = !atl
+        ; window_days
+        ; bars_used = n
+        })
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -69,10 +104,10 @@ let references_of ~(bars : Oracle_types.bar array) : references option =
 type regime =
   | Normal (** current > floor_price: the grid funds remaining_drop. *)
   | Floor_extension
-  (** Living at/below the percentage-derived floor: funding extends down to the all-time
-      low price. *)
+  (** Living at/below the percentage-derived floor: funding extends down to the window low
+      price. *)
   | Unprecedented_lows
-  (** Living at the deepest drawdown AND at or below ATL: maximum conservatism
+  (** Living at the deepest drawdown AND at or below the window low: maximum conservatism
       (grid_interval = gi_max, buy_qty = qty). *)
 
 type runway =

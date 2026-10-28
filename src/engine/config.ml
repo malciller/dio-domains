@@ -187,12 +187,20 @@ let known_gc_keys =
     [trading.defaults.oracle] (grouped layout). All optional; absent keys fall back to
     [Oracle_runtime.default_config]. *)
 let known_oracle_keys =
-  [ "qty_cap_mult"; "target_survival"; "min_active_dsurv"; "refresh_seconds"; "assets" ]
+  [ "qty_cap_mult"
+  ; "target_survival"
+  ; "min_active_dsurv"
+  ; "lookback_days"
+  ; "refresh_seconds"
+  ; "assets"
+  ]
 ;;
 
 (** Keys accepted inside each "oracle"."assets" entry (per-asset overrides, keyed by
     symbol). *)
-let known_oracle_asset_keys = [ "target_survival"; "min_active_dsurv"; "qty_cap_mult" ]
+let known_oracle_asset_keys =
+  [ "target_survival"; "min_active_dsurv"; "qty_cap_mult"; "lookback_days" ]
+;;
 
 let known_trading_keys =
   [ "symbol"
@@ -241,7 +249,12 @@ let known_inventory_keys = [ "exchange"; "symbol"; "testnet" ]
 (** Keys of [trading.defaults.oracle]: the global oracle knobs. Per-asset overrides live
     on the asset group, not here. *)
 let known_oracle_default_keys =
-  [ "target_survival"; "min_active_dsurv"; "qty_cap_mult"; "refresh_seconds" ]
+  [ "target_survival"
+  ; "min_active_dsurv"
+  ; "qty_cap_mult"
+  ; "lookback_days"
+  ; "refresh_seconds"
+  ]
 ;;
 
 (** Shallow JSON merge for the grouped layout: objects merge key-by-key, lists and scalars
@@ -1552,9 +1565,16 @@ let asset_overrides_of_json ~context entry =
   let open Yojson.Basic.Util in
   if validate_keys ~context ~allowed:known_oracle_asset_keys entry then exit 1;
   let okey key = entry |> member key |> to_float_opt in
+  let okey_days key =
+    match entry |> member key with
+    | `Int i -> Some i
+    | `Float f -> Some (int_of_float f)
+    | _ -> None
+  in
   ({ target_survival = okey "target_survival"
    ; min_active_dsurv = okey "min_active_dsurv"
    ; qty_cap_mult = okey "qty_cap_mult"
+   ; lookback_days = okey_days "lookback_days"
    }
    : Dio_oracle.Oracle_runtime.asset_overrides)
 ;;
@@ -1636,10 +1656,17 @@ let parse_oracle_config json : Dio_oracle.Oracle_runtime.runtime_config option =
     let opt_float key default =
       defaults_json |> member key |> to_float_opt |> Option.value ~default
     in
+    let opt_days key default =
+      match defaults_json |> member key with
+      | `Int i -> i
+      | `Float f -> int_of_float f
+      | _ -> default
+    in
     Some
       { target_survival = opt_float "target_survival" defaults.target_survival
       ; min_active_dsurv = opt_float "min_active_dsurv" defaults.min_active_dsurv
       ; qty_cap_mult = opt_float "qty_cap_mult" defaults.qty_cap_mult
+      ; lookback_days = opt_days "lookback_days" defaults.lookback_days
       ; refresh_seconds = opt_float "refresh_seconds" defaults.refresh_seconds
       ; assets
       })

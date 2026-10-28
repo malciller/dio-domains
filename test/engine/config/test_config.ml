@@ -348,7 +348,7 @@ let test_read_config_defaults () =
 
 let test_parse_oracle_config_full () =
   let json_str =
-    {|{"oracle": {"qty_cap_mult": 2.0, "target_survival": 0.9, "min_active_dsurv": 0.5, "refresh_seconds": 60.0}}|}
+    {|{"oracle": {"qty_cap_mult": 2.0, "target_survival": 0.9, "min_active_dsurv": 0.5, "lookback_days": 180, "refresh_seconds": 60.0}}|}
   in
   let json = Yojson.Basic.from_string json_str in
   match Dio_engine.Config.parse_oracle_config json with
@@ -357,7 +357,8 @@ let test_parse_oracle_config_full () =
     Alcotest.(check (float 0.0001)) "qty_cap_mult" 2.0 c.qty_cap_mult;
     Alcotest.(check (float 0.0001)) "refresh_seconds" 60.0 c.refresh_seconds;
     Alcotest.(check (float 0.0001)) "target_survival" 0.9 c.target_survival;
-    Alcotest.(check (float 0.0001)) "min_active_dsurv" 0.5 c.min_active_dsurv
+    Alcotest.(check (float 0.0001)) "min_active_dsurv" 0.5 c.min_active_dsurv;
+    Alcotest.(check int) "lookback_days" 180 c.lookback_days
 ;;
 
 let test_parse_oracle_config_partial_defaults () =
@@ -393,13 +394,17 @@ let test_parse_oracle_config_absent () =
 let test_parse_oracle_config_default_qty_cap_mult () =
   (* The spec default caps buy sizing at 1.5x the configured qty. *)
   let d = Dio_oracle.Oracle_runtime.default_config () in
-  Alcotest.(check (float 0.0001)) "qty_cap_mult default" 1.5 d.qty_cap_mult
+  Alcotest.(check (float 0.0001)) "qty_cap_mult default" 1.5 d.qty_cap_mult;
+  (* Two years: long enough that the window still contains the current cycle's high for
+     most assets (a 1y window silently drops it), short enough that a dead cycle no longer
+     sets today's floor. Per-asset overrides go on the asset group. *)
+  Alcotest.(check int) "lookback_days default" 730 d.lookback_days
 ;;
 
 let test_parse_oracle_config_assets () =
   let json_str =
     {|{"oracle": {"target_survival": 0.95, "assets": {
-       "HYPE/USDC": {"target_survival": 0.98, "qty_cap_mult": 3.0},
+       "HYPE/USDC": {"target_survival": 0.98, "qty_cap_mult": 3.0, "lookback_days": 90},
        "QQQ": {"min_active_dsurv": 0.5}}}}|}
   in
   let json = Yojson.Basic.from_string json_str in
@@ -422,6 +427,8 @@ let test_parse_oracle_config_assets () =
       "HYPE min_active_dsurv absent"
       None
       hype.min_active_dsurv;
+    Alcotest.(check (option int)) "HYPE lookback_days" (Some 90) hype.lookback_days;
+    Alcotest.(check (option int)) "QQQ lookback_days absent" None qqq.lookback_days;
     Alcotest.(check (option (float 0.0001)))
       "QQQ min_active_dsurv"
       (Some 0.5)
@@ -429,8 +436,8 @@ let test_parse_oracle_config_assets () =
 ;;
 
 let test_oracle_asset_keys_validation () =
-  (* Asset override entries accept only the three per-asset knobs; global cadence knobs
-     and unknown keys are rejected. *)
+  (* Asset override entries accept only the per-asset knobs; global cadence knobs and
+     unknown keys are rejected. *)
   let allowed = Dio_engine.Config.known_oracle_asset_keys in
   let good = Yojson.Basic.from_string {|{"target_survival": 0.98}|} in
   let bad = Yojson.Basic.from_string {|{"refresh_seconds": 60.0}|} in
@@ -718,7 +725,9 @@ let test_parse_overlay_instances () =
   Dio_engine.Config.parse_overlay_instances
     (Yojson.Basic.from_string (Printf.sprintf {|{"trading":[%s]}|} entry));
   (match
-     Dio_engine.Config.get_overlay_instances_for ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
+     Dio_engine.Config.get_overlay_instances_for
+       ~exchange:"hyperliquid"
+       ~symbol:"BTC/USDC"
    with
    | [ oi ] ->
      Alcotest.(check string)
@@ -766,7 +775,9 @@ let test_parse_overlay_instances_grouped () =
   in
   Dio_engine.Config.parse_overlay_instances json;
   (match
-     Dio_engine.Config.get_overlay_instances_for ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
+     Dio_engine.Config.get_overlay_instances_for
+       ~exchange:"hyperliquid"
+       ~symbol:"BTC/USDC"
    with
    | [ oi ] ->
      Alcotest.(check string)
@@ -782,12 +793,15 @@ let test_parse_overlay_instances_grouped () =
         |> Dio_engine.Config.to_float_opt
         |> Option.value ~default:0.0)
    | _ -> Alcotest.fail "expected one grouped overlay instance");
-  (match
-     Dio_engine.Config.get_overlay_controller ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
-   with
-   | Some c ->
-     Alcotest.(check (float 1e-9)) "controller start ratio" 25.0 c.oc_params.start_ratio_pct
-   | None -> Alcotest.fail "expected the carry controller from the same overlay list")
+  match
+    Dio_engine.Config.get_overlay_controller ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
+  with
+  | Some c ->
+    Alcotest.(check (float 1e-9))
+      "controller start ratio"
+      25.0
+      c.oc_params.start_ratio_pct
+  | None -> Alcotest.fail "expected the carry controller from the same overlay list"
 ;;
 
 let test_parse_overlay_flat_params () =
@@ -860,10 +874,7 @@ let () =
             `Quick
             test_domain_assets_spawns_overlay_only
         ; Alcotest.test_case "inventory formula" `Quick test_inventory_formula
-        ; Alcotest.test_case
-            "instances parse flat"
-            `Quick
-            test_parse_overlay_instances
+        ; Alcotest.test_case "instances parse flat" `Quick test_parse_overlay_instances
         ; Alcotest.test_case
             "instances parse grouped"
             `Quick

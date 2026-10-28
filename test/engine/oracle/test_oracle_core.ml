@@ -14,7 +14,7 @@ let test_references () =
   (* Empty series: no references. *)
   Alcotest.(check bool)
     "empty series has no references"
-    (Dio_oracle.Oracle_core.references_of ~bars:[||] = None)
+    (Dio_oracle.Oracle_core.references_of ~window_days:0 ~bars:[||] = None)
     true;
   (* ATH 100k (intrabar high), ATL 8k (intrabar low), worst peak-to-trough: close-peak
      100k -> low 10k = 90% decline, recovery irrelevant. *)
@@ -25,7 +25,7 @@ let test_references () =
      ; bar ~date:"4" ~high:30.0 ~low:8.0 ~close:25.0
     |]
   in
-  match Dio_oracle.Oracle_core.references_of ~bars with
+  match Dio_oracle.Oracle_core.references_of ~window_days:0 ~bars with
   | None -> Alcotest.fail "expected references"
   | Some r ->
     near "ath is the intrabar high" r.ath 100.0;
@@ -41,11 +41,55 @@ let test_references () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* references_of - lookback window *)
+(* ------------------------------------------------------------------ *)
+
+let test_references_window () =
+  (* A crash that lives just outside a short window must not size today's ladder. *)
+  let bars =
+    [| bar ~date:"2025-01-01" ~high:100.0 ~low:90.0 ~close:95.0
+     ; bar ~date:"2025-01-02" ~high:20.0 ~low:5.0 ~close:10.0
+     ; bar ~date:"2025-01-03" ~high:30.0 ~low:25.0 ~close:28.0
+     ; bar ~date:"2025-01-04" ~high:40.0 ~low:26.0 ~close:35.0
+    |]
+  in
+  let open Dio_oracle.Oracle_core in
+  let all = Option.get (references_of ~window_days:0 ~bars) in
+  near "all-time high" all.ath 100.0;
+  near "all-time low" all.atl 5.0;
+  Alcotest.(check int) "all time scans every bar" 4 all.bars_used;
+  Alcotest.(check int) "all time records window 0" 0 all.window_days;
+  let w = Option.get (references_of ~window_days:2 ~bars) in
+  Alcotest.(check int) "window covers the newest two days" 2 w.bars_used;
+  Alcotest.(check int) "window is recorded" 2 w.window_days;
+  near "window high ignores the old peak" w.ath 40.0;
+  near "window low ignores the old trough" w.atl 25.0;
+  (* Peak close 35 (last bar), trough 26: the older 28->25 fall is shallower. *)
+  near "window drawdown is in-window only" w.max_drawdown_pct (1.0 -. (26.0 /. 35.0));
+  (* A window wider than the series keeps everything. *)
+  let wide = Option.get (references_of ~window_days:3650 ~bars) in
+  Alcotest.(check int) "window wider than history keeps all bars" 4 wide.bars_used;
+  near "wide window high" wide.ath 100.0;
+  (* One day = one bar, but the bar's own intrabar low still counts. *)
+  let one = Option.get (references_of ~window_days:1 ~bars) in
+  Alcotest.(check int) "single-day window" 1 one.bars_used;
+  near
+    "single-day drawdown is the bar's own low"
+    one.max_drawdown_pct
+    (1.0 -. (26.0 /. 35.0))
+;;
+
+(* ------------------------------------------------------------------ *)
 (* runway_of - the spec's worked example *)
 (* ------------------------------------------------------------------ *)
 
 let spec_refs : Dio_oracle.Oracle_core.references =
-  { max_drawdown_pct = 0.92; ath = 100_000.0; atl = 7_000.0 }
+  { max_drawdown_pct = 0.92
+  ; ath = 100_000.0
+  ; atl = 7_000.0
+  ; window_days = 0
+  ; bars_used = 1
+  }
 ;;
 
 let test_runway_worked_example () =
@@ -415,6 +459,7 @@ let test_pipeline_decide () =
           { qty = 0.5; qty_cap_mult = 2.0; gi_min = 1.0; gi_max = 5.0 }
     ; target_survival = 0.8
     ; min_active_dsurv = 0.5
+    ; lookback_days = 0
     ; fees = Dio_oracle.Oracle_core.default_fees
     ; has_resting_buy = false
     }
@@ -458,7 +503,9 @@ let () =
   Alcotest.run
     "oracle_core"
     [ ( "references"
-      , [ Alcotest.test_case "ath/atl/max drawdown from bars" `Quick test_references ] )
+      , [ Alcotest.test_case "ath/atl/max drawdown from bars" `Quick test_references
+        ; Alcotest.test_case "lookback window" `Quick test_references_window
+        ] )
     ; ( "runway"
       , [ Alcotest.test_case "spec worked example" `Quick test_runway_worked_example
         ; Alcotest.test_case "three regimes" `Quick test_regimes

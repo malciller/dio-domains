@@ -99,28 +99,17 @@ let base_asset_of_symbol symbol =
 (** Per-asset effective knobs: the engine config's "oracle" section with its assets
     overrides keyed by symbol (same resolution as the live runtime). *)
 let knobs_for ~(config : Dio_engine.Config.config option) ~(symbol : string)
-  : float * float * float
+  : Dio_oracle.Oracle_runtime.knobs
   =
-  match config with
-  | None ->
-    let d = Dio_oracle.Oracle_runtime.default_config () in
-    d.target_survival, d.min_active_dsurv, d.qty_cap_mult
-  | Some c ->
-    let d =
-      match c.oracle with
-      | Some o -> o
-      | None -> Dio_oracle.Oracle_runtime.default_config ()
-    in
-    let ov =
-      match c.oracle with
-      | Some o ->
-        Option.map snd (List.find_opt (fun (s, _) -> String.equal s symbol) o.assets)
-      | None -> None
-    in
-    let get get_ov default = Option.value (Option.bind ov get_ov) ~default in
-    ( get (fun o -> o.target_survival) d.target_survival
-    , get (fun o -> o.min_active_dsurv) d.min_active_dsurv
-    , get (fun o -> o.qty_cap_mult) d.qty_cap_mult )
+  let config =
+    match config with
+    | None -> Dio_oracle.Oracle_runtime.default_config ()
+    | Some c ->
+      (match c.oracle with
+       | Some o -> o
+       | None -> Dio_oracle.Oracle_runtime.default_config ())
+  in
+  Dio_oracle.Oracle_runtime.effective_knobs ~config ~symbol
 ;;
 
 type row =
@@ -172,16 +161,14 @@ let analyze_one
           ; error = "no usable close in history"
           }
       else (
-        let target_survival, min_active_dsurv, qty_cap_mult =
-          knobs_for ~config ~symbol:tc.symbol
-        in
+        let knobs = knobs_for ~config ~symbol:tc.symbol in
         let qty_raw =
           try Float.of_string tc.qty with
           | _ -> 0.0
         in
         let bounds =
           { Dio_oracle.Oracle_core.qty = Float.max 1e-12 qty_raw
-          ; qty_cap_mult = Float.max 1.0 qty_cap_mult
+          ; qty_cap_mult = Float.max 1.0 knobs.k_qty_cap_mult
           ; gi_min = fst tc.grid_interval
           ; gi_max = snd tc.grid_interval
           }
@@ -202,8 +189,9 @@ let analyze_one
           ; available_quote
           ; sell_qty = available_asset
           ; bounds
-          ; target_survival
-          ; min_active_dsurv
+          ; target_survival = knobs.k_target_survival
+          ; min_active_dsurv = knobs.k_min_active_dsurv
+          ; lookback_days = knobs.k_lookback_days
           ; fees
           ; has_resting_buy = false
           }
@@ -256,7 +244,7 @@ let string_of_outcome (r : row) (o : Dio_oracle.Oracle_pipeline.outcome) =
   in
   Printf.sprintf
     "%-18s %-11s d_surv %.3f exhaust %12.6g | quote %12.6g floor %12.6g ath %12.6g atl \
-     %12.6g mdd %5.1f%%"
+     %12.6g mdd %5.1f%% (%s)"
     (Dio_oracle.Oracle_runtime.string_of_regime o.runway.regime)
     (Dio_oracle.Oracle_runtime.string_of_branch o.resolution.branch)
     o.resolution.d_surv
@@ -266,6 +254,9 @@ let string_of_outcome (r : row) (o : Dio_oracle.Oracle_pipeline.outcome) =
     o.refs.ath
     o.refs.atl
     (o.refs.max_drawdown_pct *. 100.0)
+    (if o.refs.window_days <= 0
+     then "all time"
+     else Printf.sprintf "%dd/%db" o.refs.window_days o.refs.bars_used)
 ;;
 
 let print_table rows args =
@@ -351,6 +342,8 @@ let print_json rows args =
                ; "ath", `Float o.refs.ath
                ; "atl", `Float o.refs.atl
                ; "max_drawdown_pct", `Float o.refs.max_drawdown_pct
+               ; "lookback_days", `Int o.refs.window_days
+               ; "bars_used", `Int o.refs.bars_used
                ]))
       rows
   in
