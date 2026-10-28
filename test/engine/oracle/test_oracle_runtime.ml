@@ -28,12 +28,11 @@ let make_decision ~active ?(buy_qty = 1.0) ?(symbol = "X/USD") () =
 
 let test_effective_knobs_defaults () =
   let c = Dio_oracle.Oracle_runtime.default_config () in
-  let ts, mad, qcm =
-    Dio_oracle.Oracle_runtime.effective_knobs ~config:c ~symbol:"BTC/USDC"
-  in
-  near "default target_survival" ts 0.95;
-  near "default min_active_dsurv" mad 0.0;
-  near "default qty_cap_mult" qcm 1.5
+  let k = Dio_oracle.Oracle_runtime.effective_knobs ~config:c ~symbol:"BTC/USDC" in
+  near "default target_survival" k.k_target_survival 0.95;
+  near "default min_active_dsurv" k.k_min_active_dsurv 0.0;
+  near "default qty_cap_mult" k.k_qty_cap_mult 1.5;
+  Alcotest.(check int) "default lookback_days" 730 k.k_lookback_days
 ;;
 
 let test_effective_knobs_global_override () =
@@ -41,11 +40,13 @@ let test_effective_knobs_global_override () =
     { (Dio_oracle.Oracle_runtime.default_config ()) with
       Dio_oracle.Oracle_runtime.target_survival = 0.8
     ; qty_cap_mult = 2.0
+    ; lookback_days = 90
     }
   in
-  let ts, _, qcm = Dio_oracle.Oracle_runtime.effective_knobs ~config:c ~symbol:"ANY" in
-  near "global target_survival" ts 0.8;
-  near "global qty_cap_mult" qcm 2.0
+  let k = Dio_oracle.Oracle_runtime.effective_knobs ~config:c ~symbol:"ANY" in
+  near "global target_survival" k.k_target_survival 0.8;
+  near "global qty_cap_mult" k.k_qty_cap_mult 2.0;
+  Alcotest.(check int) "global lookback_days" 90 k.k_lookback_days
 ;;
 
 let test_effective_knobs_asset_override () =
@@ -56,20 +57,21 @@ let test_effective_knobs_asset_override () =
           , { Dio_oracle.Oracle_runtime.target_survival = Some 0.99
             ; min_active_dsurv = None
             ; qty_cap_mult = Some 3.0
+            ; lookback_days = Some 30
             } )
         ]
     }
   in
   (* Overridden asset uses its own knobs. *)
-  let ts, mad, qcm =
-    Dio_oracle.Oracle_runtime.effective_knobs ~config:c ~symbol:"BTC/USDC"
-  in
-  near "asset target_survival" ts 0.99;
-  near "asset inherits default min_active_dsurv" mad 0.0;
-  near "asset qty_cap_mult" qcm 3.0;
+  let k = Dio_oracle.Oracle_runtime.effective_knobs ~config:c ~symbol:"BTC/USDC" in
+  near "asset target_survival" k.k_target_survival 0.99;
+  near "asset inherits default min_active_dsurv" k.k_min_active_dsurv 0.0;
+  near "asset qty_cap_mult" k.k_qty_cap_mult 3.0;
+  Alcotest.(check int) "asset lookback_days" 30 k.k_lookback_days;
   (* Untouched asset keeps the globals. *)
-  let ts2, _, _ = Dio_oracle.Oracle_runtime.effective_knobs ~config:c ~symbol:"ETH/USD" in
-  near "other asset keeps global ts" ts2 0.95
+  let k2 = Dio_oracle.Oracle_runtime.effective_knobs ~config:c ~symbol:"ETH/USD" in
+  near "other asset keeps global ts" k2.k_target_survival 0.95;
+  Alcotest.(check int) "other asset keeps global lookback" 730 k2.k_lookback_days
 ;;
 
 (* ------------------------------------------------------------------ *)

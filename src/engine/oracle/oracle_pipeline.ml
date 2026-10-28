@@ -1,6 +1,6 @@
 (* Oracle_pipeline - one asset, one pass.
 
-   Runs the pure core on all-time merged price history: references -> runway -> parameter
+   Runs the pure core on merged price history: windowed references -> runway -> parameter
    search -> decision record. The only path from market data to a [decision]; downstream
    consumers (pools, execution) take the record as-is. *)
 
@@ -8,7 +8,7 @@
 type inputs =
   { exchange : string
   ; symbol : string
-  ; bars : Oracle_types.bar array (** All-time merged history. *)
+  ; bars : Oracle_types.bar array (** Merged history (venue + deep). *)
   ; current_price : float (** Latest trade/quote price. *)
   ; available_quote : float (** Quote pool share allocated to this asset. *)
   ; sell_qty : float
@@ -17,6 +17,7 @@ type inputs =
   ; bounds : Oracle_core.bounds
   ; target_survival : float
   ; min_active_dsurv : float
+  ; lookback_days : int (** Trailing window for the reference scan; 0 = all time. *)
   ; fees : Oracle_core.fee_model
   ; has_resting_buy : bool
   }
@@ -86,7 +87,7 @@ let decide_from_refs ~(refs : Oracle_core.references) ~(inputs : inputs) : outco
 (** One pure pass: history in, decision out. [None] on empty or all-invalid bars (no
     usable history). *)
 let decide ~(inputs : inputs) : outcome option =
-  match Oracle_core.references_of ~bars:inputs.bars with
+  match Oracle_core.references_of ~window_days:inputs.lookback_days ~bars:inputs.bars with
   | None -> None
   | Some refs -> decide_from_refs ~refs ~inputs
 ;;

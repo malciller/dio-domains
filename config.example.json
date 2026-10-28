@@ -59,6 +59,10 @@
         "target_survival": 0.95,
         "min_active_dsurv": 0.0,
         "qty_cap_mult": 1.5,
+        // Trailing calendar-day window for the max-drawdown / high / low scan. 0 uses the
+        // full all-time history. It must still contain the current cycle's high or the
+        // measured drawdown is a fragment. Per-asset override on the asset group.
+        "lookback_days": 730,
         "refresh_seconds": 300
       }
     },
@@ -67,7 +71,9 @@
         "asset": "BTC",
         "oracle": {
           "target_survival": 0.65,
-          "qty_cap_mult": 3.0
+          "qty_cap_mult": 3.0,
+          // Per-asset window override; omit to inherit trading.defaults.oracle.
+          // "lookback_days": 180
         },
         "strategy": {
           "exchange": "hyperliquid",

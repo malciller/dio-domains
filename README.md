@@ -9,9 +9,10 @@ and Alpaca.
 
 Each traded asset runs in its own OCaml domain. Order intents go through a
 lock-free executor, and market data arrives on lock-free ring buffers. A
-capital-survival oracle sizes each position from the asset's all-time drawdown
-history. A terminal dashboard connects to the running engine over a Unix domain
-socket, with latency and log views and an alert popup for warnings and errors.
+capital-survival oracle sizes each position from the asset's drawdown history
+over a configurable lookback window. A terminal dashboard connects to the running
+engine over a Unix domain socket, with latency and log views and an alert popup
+for warnings and errors.
 
 [![ci](https://github.com/malciller/dio-domains/actions/workflows/ci.yml/badge.svg)](https://github.com/malciller/dio-domains/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/malciller/dio-domains)](https://github.com/malciller/dio-domains/releases)

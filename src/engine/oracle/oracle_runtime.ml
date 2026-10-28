@@ -1,6 +1,6 @@
 (* Oracle_runtime - event-driven capital allocation across venues.
 
-   One pass re-resolves every configured asset: all-time merged history -> references ->
+   One pass re-resolves every configured asset: merged history -> windowed references ->
    runway -> survival-replay parameter search -> decision record, sized against per-venue
    pools walked in config presentation order (first = highest priority; capacity passes
    down; a lower-priority strategy is never starved while quote exists). Pools are per
@@ -38,6 +38,7 @@ type asset_overrides =
   { target_survival : float option
   ; min_active_dsurv : float option
   ; qty_cap_mult : float option
+  ; lookback_days : int option
   }
 
 type runtime_config =
@@ -48,6 +49,10 @@ type runtime_config =
   (** Active <=> replayed d_surv >= this, subject to affordability. *)
   ; qty_cap_mult : float
   (** Buy-size upper bound multiplier: buy_qty in [qty, qty * mult]. *)
+  ; lookback_days : int
+  (** Trailing calendar-day window the reference scan covers; 0 = all time. It has to
+      contain the current cycle's high, or the measured drawdown is only a fragment: size
+      it from the age of that high plus at least one prior year. *)
   ; refresh_seconds : float (** Background fallback poll for history and balances. *)
   ; assets : (string * asset_overrides) list
   }
@@ -56,19 +61,34 @@ let default_config () =
   { target_survival = 0.95
   ; min_active_dsurv = 0.0
   ; qty_cap_mult = 1.5
+  ; lookback_days = 730
   ; refresh_seconds = 300.0
   ; assets = []
   }
 ;;
 
-let effective_knobs ~(config : runtime_config) ~(symbol : string) : float * float * float =
+(** The knobs one asset resolves to. *)
+type knobs =
+  { k_target_survival : float
+  ; k_min_active_dsurv : float
+  ; k_qty_cap_mult : float
+  ; k_lookback_days : int
+  }
+
+let effective_knobs ~(config : runtime_config) ~(symbol : string) : knobs =
   let o =
     List.find_opt (fun (s, _) -> String.equal s symbol) config.assets |> Option.map snd
   in
   let or_default opt default = Option.value opt ~default in
-  ( or_default (Option.bind o (fun o -> o.target_survival)) config.target_survival
-  , or_default (Option.bind o (fun o -> o.min_active_dsurv)) config.min_active_dsurv
-  , or_default (Option.bind o (fun o -> o.qty_cap_mult)) config.qty_cap_mult )
+  { k_target_survival =
+      or_default (Option.bind o (fun o -> o.target_survival)) config.target_survival
+  ; k_min_active_dsurv =
+      or_default (Option.bind o (fun o -> o.min_active_dsurv)) config.min_active_dsurv
+  ; k_qty_cap_mult =
+      or_default (Option.bind o (fun o -> o.qty_cap_mult)) config.qty_cap_mult
+  ; k_lookback_days =
+      or_default (Option.bind o (fun o -> o.lookback_days)) config.lookback_days
+  }
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -85,7 +105,8 @@ type decision =
   ; grid_interval : float (** Contract: resolved spacing in %. *)
   ; buy_qty : float (** Contract: buy order size in base units. *)
   ; sell_qty : float (** Contract: sell size from the venue base pool. *)
-  ; max_drawdown_pct : float (** Historical lifetime peak-to-trough max drawdown. *)
+  ; max_drawdown_pct : float
+  (** Historical peak-to-trough max drawdown over the configured lookback window. *)
   ; d_surv : float (** Replayed survival fraction (observability). *)
   ; exhaustion_price : float
   (** The price of the deepest rung fillable with available capital - the point where the
@@ -255,10 +276,11 @@ let get_refresh_generation () = Atomic.get refresh_generation
 let history_changed : bool Atomic.t = Atomic.make false
 let history_cache : (string * string, Oracle_types.series) Hashtbl.t = Hashtbl.create 16
 
-(** References derived from each asset's bars, invalidated only when the merged history
-    actually changes ([refresh_asset_history] below). The O(history_len) reference scan is
-    otherwise invariant across passes. *)
-let references_cache : (string * string, Oracle_core.references) Hashtbl.t =
+(** References derived from each asset's bars, invalidated when the merged history
+    actually changes ([refresh_asset_history] below) or when the configured lookback
+    differs from the one cached. The O(history_len) reference scan is otherwise invariant
+    across passes. Stores the window it was computed with. *)
+let references_cache : (string * string, int * Oracle_core.references) Hashtbl.t =
   Hashtbl.create 16
 ;;
 
@@ -1103,23 +1125,21 @@ let run_account_pass
       List.map
         (fun (t : Oracle_tasks.task) ->
           let summary = open_orders_summary ~exchange:t.exchange ~symbol:t.symbol in
-          let target_survival, min_active_dsurv, qty_cap_mult =
-            effective_knobs ~config ~symbol:t.symbol
-          in
+          let knobs = effective_knobs ~config ~symbol:t.symbol in
           let qty_raw = float_of_string_opt t.config.qty |> Option.value ~default:0.0 in
           let bounds =
             { Oracle_core.qty = Float.max 1e-12 qty_raw
-            ; qty_cap_mult = Float.max 1.0 qty_cap_mult
+            ; qty_cap_mult = Float.max 1.0 knobs.k_qty_cap_mult
             ; gi_min = fst t.config.grid_interval
             ; gi_max = snd t.config.grid_interval
             }
           in
-          t, summary, target_survival, min_active_dsurv, bounds)
+          t, summary, knobs, bounds)
         tasks
     in
     let committed_venue_buys =
       List.fold_left
-        (fun acc (_, (_, committed, _), _, _, _) -> acc +. committed)
+        (fun acc (_, (_, committed, _), _, _) -> acc +. committed)
         0.0
         task_rows
     in
@@ -1131,7 +1151,7 @@ let run_account_pass
        the reclaim logic uses. *)
     let priority_of_key : (string, int) Hashtbl.t = Hashtbl.create 8 in
     List.iteri
-      (fun i ((t : Oracle_tasks.task), _, _, _, _) ->
+      (fun i ((t : Oracle_tasks.task), _, _, _) ->
         Hashtbl.replace priority_of_key (key_of_task t) i)
       task_rows;
     (* Standing reservation for a senior whose cancelled quote is draining: every strategy
@@ -1154,10 +1174,10 @@ let run_account_pass
     let lower_claims =
       let indexed = List.mapi (fun i row -> i, row) task_rows in
       List.map
-        (fun (i, ((t : Oracle_tasks.task), _, _, _, _)) ->
+        (fun (i, ((t : Oracle_tasks.task), _, _, _)) ->
           let claims =
             List.filter_map
-              (fun (j, ((lt : Oracle_tasks.task), (_, lcommitted, _), _, _, _)) ->
+              (fun (j, ((lt : Oracle_tasks.task), (_, lcommitted, _), _, _)) ->
                 if j > i && lcommitted > 0.0
                 then
                   Some
@@ -1188,8 +1208,7 @@ let run_account_pass
     List.iter
       (fun ( (t : Oracle_tasks.task)
            , (resting_buy, committed_buy, resting_sell)
-           , target_survival
-           , min_active_dsurv
+           , knobs
            , bounds ) ->
         let t_asset = Mtime_clock.now_ns () in
         (* No usable data yet: publish nothing rather than a fabricated zero inactive
@@ -1231,19 +1250,27 @@ let run_account_pass
               ; available_quote = effective_quote
               ; sell_qty = 0.0
               ; bounds
-              ; target_survival
-              ; min_active_dsurv
+              ; target_survival = knobs.k_target_survival
+              ; min_active_dsurv = knobs.k_min_active_dsurv
+              ; lookback_days = knobs.k_lookback_days
               ; fees = fees_now t
               ; has_resting_buy = resting_buy
               }
             in
             let refs_opt =
               match Hashtbl.find_opt references_cache (t.exchange, t.symbol) with
-              | Some r -> Some r
-              | None ->
-                (match Oracle_core.references_of ~bars:series.bars with
+              | Some (w, r) when w = knobs.k_lookback_days -> Some r
+              | _ ->
+                (match
+                   Oracle_core.references_of
+                     ~window_days:knobs.k_lookback_days
+                     ~bars:series.bars
+                 with
                  | Some r as some ->
-                   Hashtbl.replace references_cache (t.exchange, t.symbol) r;
+                   Hashtbl.replace
+                     references_cache
+                     (t.exchange, t.symbol)
+                     (knobs.k_lookback_days, r);
                    some
                  | None -> None)
             in
@@ -1264,12 +1291,12 @@ let run_account_pass
               let reason =
                 if o.decision.active
                 then ""
-                else if o.resolution.d_surv < min_active_dsurv
+                else if o.resolution.d_surv < knobs.k_min_active_dsurv
                 then
                   Printf.sprintf
                     "d_surv %.3f below min_active_dsurv %.3f"
                     o.resolution.d_surv
-                    min_active_dsurv
+                    knobs.k_min_active_dsurv
                 else "awaiting reactivation: quote does not cover buy"
               in
               let d : decision =
@@ -1296,7 +1323,7 @@ let run_account_pass
               let need = d.buy_qty *. current in
               let key = key_of_task t in
               let survival_active =
-                o.resolution.d_surv >= min_active_dsurv || resting_buy
+                o.resolution.d_surv >= knobs.k_min_active_dsurv || resting_buy
               in
               let is_reserved_senior =
                 match reserved_senior with
