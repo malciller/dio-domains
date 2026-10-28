@@ -95,7 +95,7 @@ let declarations =
   ; act "quote_reserve" decision [ se "amount" e ]
   ; act "quote_release" decision []
   ; act "reserve_base" decision [ se "qty" e ]
-  ; act "credit_profit" decision [ se "qty" e ]
+  ; act "credit_profit" decision [ se "qty" e; se "seq" e ]
   ; act "mark_stale_cycle" decision []
   ; act "set_gate" decision [ se "name" s; se "value" s ]
   ; act "buy_facts" decision []

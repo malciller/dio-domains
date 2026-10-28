@@ -30,6 +30,7 @@ type t =
   ; pending_gain : float
   ; pending_base_quote : float
   ; pending_base : float
+  ; tp_book_price : float
   ; close_entry : float
   ; close_qty : float
   ; close_started_at : float
@@ -65,6 +66,7 @@ let default =
   ; pending_gain = 0.0
   ; pending_base_quote = 0.0
   ; pending_base = 0.0
+  ; tp_book_price = 0.0
   ; close_entry = 0.0
   ; close_qty = 0.0
   ; close_started_at = 0.0
@@ -149,6 +151,7 @@ let of_json json =
   ; pending_gain = get_float json "pending_gain" 0.0
   ; pending_base_quote = get_float json "pending_base_quote" 0.0
   ; pending_base = get_float json "pending_base" 0.0
+  ; tp_book_price = get_float json "tp_book_price" 0.0
   ; close_entry = get_float json "close_entry" 0.0
   ; close_qty = get_float json "close_qty" 0.0
   ; close_started_at = get_float json "close_started_at" 0.0
@@ -206,6 +209,7 @@ let to_json (x : t) =
      ; "pending_gain", `Float x.pending_gain
      ; "pending_base_quote", `Float x.pending_base_quote
      ; "pending_base", `Float x.pending_base
+     ; "tp_book_price", `Float x.tp_book_price
      ; "close_entry", `Float x.close_entry
      ; "close_qty", `Float x.close_qty
      ; "close_started_at", `Float x.close_started_at

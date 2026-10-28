@@ -170,12 +170,41 @@ let test_apply_sell_fill_fees_reduce_profit () =
 
 (* -- Round-trip serialization + persistence ---------------------------- *)
 
+let test_credit_profit_persists_and_adds () =
+  (* Carry profit is written straight to the parent strategy's entry: additive, signed,
+     deduplicated by recycle sequence, and creates the entry when absent. *)
+  with_hermetic_dir (fun _dir ->
+    let key = "jacobs_ladder:ETH/USD:kraken" in
+    A.save ~key { A.default with A.reserved_base = 0.004; A.accumulated_profit = 0.1 };
+    ignore (A.credit_profit ~key ~seq:1 ~qty:0.25);
+    ignore (A.credit_profit ~key ~seq:1 ~qty:0.25);
+    let t = A.load ~key in
+    Alcotest.(check (float 1e-12)) "same seq credited once" 0.35 t.A.accumulated_profit;
+    ignore (A.credit_profit ~key ~seq:2 ~qty:0.08);
+    ignore (A.credit_profit ~key ~seq:3 ~qty:(-0.03));
+    let t = A.load ~key in
+    Alcotest.(check (float 1e-12)) "profit and loss applied" 0.4 t.A.accumulated_profit;
+    Alcotest.(check int) "highest seq recorded" 3 t.A.carry_credit_seq;
+    ignore (A.credit_profit ~key ~seq:2 ~qty:1.0);
+    Alcotest.(check (float 1e-12))
+      "stale seq ignored"
+      0.4
+      (A.load ~key).A.accumulated_profit;
+    Alcotest.(check (float 1e-12)) "reserved_base untouched" 0.004 t.A.reserved_base;
+    let new_key = "jacobs_ladder:SOL/USD:kraken" in
+    ignore (A.credit_profit ~key:new_key ~seq:1 ~qty:0.3);
+    let fresh = A.load ~key:new_key in
+    Alcotest.(check (float 1e-12)) "entry created" 0.3 fresh.A.accumulated_profit;
+    Alcotest.(check (float 1e-12)) "fresh reserved_base" 0.0 fresh.A.reserved_base)
+;;
+
 let test_accumulation_round_trip () =
   with_hermetic_dir (fun _dir ->
-    let key = A.key_of ~strategy:"Ladder" ~symbol:"BTC/USDC" ~venue:"hyperliquid" in
+    let key = A.key_of ~strategy:"Ladder" ~symbol:"RT/USDC" ~venue:"hyperliquid" in
     let t =
       { A.reserved_base = 1.25
       ; accumulated_profit = 3.75
+      ; carry_credit_seq = 7
       ; last_fill_oid = Some "abc"
       ; last_buy_fill_price = Some 100.0
       ; last_buy_fill_qty = Some 0.5
@@ -190,6 +219,7 @@ let test_accumulation_round_trip () =
       "round-trip accumulated_profit"
       3.75
       loaded.A.accumulated_profit;
+    Alcotest.(check int) "round-trip carry seq" 7 loaded.A.carry_credit_seq;
     Alcotest.(check (option Alcotest.string))
       "round-trip oid"
       (Some "abc")
@@ -411,6 +441,7 @@ let () =
         ; ( "apply_sell_fill fees reduce profit"
           , `Quick
           , test_apply_sell_fill_fees_reduce_profit )
+        ; "credit_profit persists and adds", `Quick, test_credit_profit_persists_and_adds
         ] )
     ; ( "round_trip"
       , [ "accumulation", `Quick, test_accumulation_round_trip

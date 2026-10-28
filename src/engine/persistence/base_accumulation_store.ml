@@ -7,6 +7,7 @@
    Persisted fields (data/accumulation_state.json, keyed by strategy key):
    - reserved_base: base accumulated via sell_mult; excluded from sellable balance
    - accumulated_profit: realized local PnL in quote
+   - carry_credit_seq: newest carry recycle already credited (restart dedup)
    - last_fill_oid / last_buy_fill_* / last_sell_fill_*: most recent fill refs
 
    Crash window: an async save may lose the most recent coalesced write, so
@@ -20,6 +21,9 @@ let section = "base_accumulation_store"
 type t =
   { reserved_base : float
   ; accumulated_profit : float
+  ; carry_credit_seq : int
+  (** Highest carry recycle sequence already credited to [accumulated_profit]. Rides in
+      the same entry as the money so a restart cannot re-credit a close. *)
   ; last_fill_oid : string option
   ; last_buy_fill_price : float option
   ; last_buy_fill_qty : float option
@@ -35,6 +39,7 @@ let key_of ~strategy ~symbol ~venue = Printf.sprintf "%s:%s:%s" strategy symbol 
 let default =
   { reserved_base = 0.0
   ; accumulated_profit = 0.0
+  ; carry_credit_seq = 0
   ; last_fill_oid = None
   ; last_buy_fill_price = None
   ; last_buy_fill_qty = None
@@ -57,6 +62,12 @@ let get_string_opt json field =
   | _ -> None
 ;;
 
+let get_int_opt json field =
+  let open Yojson.Basic.Util in
+  try Some (json |> member field |> to_int) with
+  | _ -> None
+;;
+
 let opt_field name = function
   | Some v -> [ name, `Float v ]
   | None -> []
@@ -70,6 +81,7 @@ let of_json json =
   in
   { reserved_base = f "reserved_base" 0.0
   ; accumulated_profit = f "accumulated_profit" 0.0
+  ; carry_credit_seq = Option.value (get_int_opt json "carry_credit_seq") ~default:0
   ; last_fill_oid = get_string_opt json "last_fill_oid"
   ; last_buy_fill_price = get_float_opt json "last_buy_fill_price"
   ; last_buy_fill_qty = get_float_opt json "last_buy_fill_qty"
@@ -82,6 +94,7 @@ let to_json t =
   `Assoc
     ([ "reserved_base", `Float t.reserved_base
      ; "accumulated_profit", `Float t.accumulated_profit
+     ; "carry_credit_seq", `Int t.carry_credit_seq
      ]
      @ (match t.last_fill_oid with
         | Some oid -> [ "last_fill_oid", `String oid ]
@@ -207,6 +220,28 @@ let resolve_key_for_symbol ~symbol =
 
 let save ~key t = Persistence_orchestrator.put orchestrator ~key t
 let save_async ~key t = Persistence_orchestrator.put_async orchestrator ~key t
+
+(** Adds signed carry PnL to a strategy's persisted [accumulated_profit]. [seq] is the
+    recycle sequence: a credit at or below [carry_credit_seq] is a restart replay and is
+    dropped. Returns whether it was applied, so the caller can gate its live state on the
+    same decision. The strategy's own flush writes the same total, so this cannot
+    double-count. *)
+let credit_profit ~key ~seq ~qty =
+  if Float.is_finite qty && qty <> 0.0
+  then
+    Persistence_orchestrator.update_async orchestrator ~key (fun current ->
+      let t = Option.value current ~default in
+      if seq > 0 && seq <= t.carry_credit_seq
+      then t, false
+      else
+        ( { t with
+            accumulated_profit = t.accumulated_profit +. qty
+          ; carry_credit_seq =
+              (if seq > t.carry_credit_seq then seq else t.carry_credit_seq)
+          }
+        , true ))
+  else false
+;;
 
 (* -- Legacy migration -------------------------------------------------- *)
 

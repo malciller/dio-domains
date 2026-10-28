@@ -46,6 +46,26 @@ let is_crypto_exchange = function
 (** Construct a unique registry key from exchange and symbol. *)
 let domain_key asset = Printf.sprintf "%s/%s" asset.exchange asset.symbol
 
+(** Persisted accumulation entry that owns a carry controller's recycled profit: the leg
+    with a primary strategy. Empty when the controller has no grid leg. *)
+let credit_store_key (c : overlay_controller) =
+  match List.find_opt (fun (l : overlay_leg) -> l.ol_has_grid) c.oc_legs with
+  | None -> ""
+  | Some l ->
+    (match
+       Dio_persistence.Persistence_orchestrator
+       .unique_configured_strategy_for_symbol_and_venue
+         ~symbol:l.ol_symbol
+         ~venue:l.ol_exchange
+     with
+     | Some strategy ->
+       Dio_persistence.Base_accumulation_store.key_of
+         ~strategy
+         ~symbol:l.ol_symbol
+         ~venue:l.ol_exchange
+     | None -> "")
+;;
+
 (** Mutable state tracked per supervised domain. *)
 type domain_state =
   { asset : trading_config
@@ -139,22 +159,21 @@ let get_overlay_profiler_snapshots () =
   let rows =
     Hashtbl.fold
       (fun _ p acc ->
-         ( overlay_latency_key ~exchange:p.oip_exchange ~symbol:p.oip_symbol
-         , p.oip_profs )
-         :: acc)
+        (overlay_latency_key ~exchange:p.oip_exchange ~symbol:p.oip_symbol, p.oip_profs)
+        :: acc)
       overlay_profiler_cache
       []
   in
   Mutex.unlock profiler_cache_mutex;
   List.map
     (fun (key, profs) ->
-       key
-       , [ "orderbook", Latency_profiler.published_snapshot profs.prof_ob
-         ; "execution", Latency_profiler.published_snapshot profs.prof_exec
-         ; "prep", Latency_profiler.published_snapshot profs.prof_prep
-         ; "strategy", Latency_profiler.published_snapshot profs.prof_strategy
-         ; "cycle", Latency_profiler.published_snapshot profs.prof_cycle
-         ])
+      ( key
+      , [ "orderbook", Latency_profiler.published_snapshot profs.prof_ob
+        ; "execution", Latency_profiler.published_snapshot profs.prof_exec
+        ; "prep", Latency_profiler.published_snapshot profs.prof_prep
+        ; "strategy", Latency_profiler.published_snapshot profs.prof_strategy
+        ; "cycle", Latency_profiler.published_snapshot profs.prof_cycle
+        ] ))
     rows
 ;;
 
@@ -162,9 +181,7 @@ let get_overlay_profiler_snapshots () =
     grid already owns that domain the controller has no row of its own. This gives each
     controller a row keyed by its hedge venue, so the perp leg is visible and timed even
     when it shares a domain with the grid. *)
-let controller_profiler_cache : (string, domain_profilers) Hashtbl.t =
-  Hashtbl.create 8
-;;
+let controller_profiler_cache : (string, domain_profilers) Hashtbl.t = Hashtbl.create 8
 
 let get_controller_profiler ~exchange ~coin =
   let key = overlay_latency_key ~exchange ~symbol:coin in
@@ -194,21 +211,18 @@ let get_controller_profiler ~exchange ~coin =
 let get_controller_profiler_snapshots () =
   Mutex.lock profiler_cache_mutex;
   let rows =
-    Hashtbl.fold
-      (fun key profs acc -> (key, profs) :: acc)
-      controller_profiler_cache
-      []
+    Hashtbl.fold (fun key profs acc -> (key, profs) :: acc) controller_profiler_cache []
   in
   Mutex.unlock profiler_cache_mutex;
   List.map
     (fun (key, profs) ->
-       key
-       , [ "orderbook", Latency_profiler.published_snapshot profs.prof_ob
-         ; "execution", Latency_profiler.published_snapshot profs.prof_exec
-         ; "prep", Latency_profiler.published_snapshot profs.prof_prep
-         ; "strategy", Latency_profiler.published_snapshot profs.prof_strategy
-         ; "cycle", Latency_profiler.published_snapshot profs.prof_cycle
-         ])
+      ( key
+      , [ "orderbook", Latency_profiler.published_snapshot profs.prof_ob
+        ; "execution", Latency_profiler.published_snapshot profs.prof_exec
+        ; "prep", Latency_profiler.published_snapshot profs.prof_prep
+        ; "strategy", Latency_profiler.published_snapshot profs.prof_strategy
+        ; "cycle", Latency_profiler.published_snapshot profs.prof_cycle
+        ] ))
     rows
 ;;
 
@@ -347,9 +361,9 @@ let derive_overlay_ladder ?start_ratio ~leverage (p : overlay_params) =
   }
 ;;
 
-(** Maximum venue leverage for an overlay's hedge asset, from startup instrument
-    metadata. Seeds the ladder and take-profit only while no live position supplies the
-    account's actual leverage. *)
+(** Maximum venue leverage for an overlay's hedge asset, from startup instrument metadata.
+    Seeds the ladder and take-profit only while no live position supplies the account's
+    actual leverage. *)
 let overlay_venue_leverage (c : overlay_controller) =
   match Dio_exchange.Exchange_intf.Registry.get_market_context c.oc_hedge_exchange with
   | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
@@ -455,7 +469,8 @@ let load_overlay_instances ~(owner : trading_config) : overlay_instance_rt list 
                  ~owner_symbol:oi.oi_owner_symbol
                  ~id:oi.oi_id
                  ~exchange:oi.oi_exchange
-                 ~symbol:oi.oi_symbol).oip_profs
+                 ~symbol:oi.oi_symbol)
+                .oip_profs
           }))
 ;;
 
@@ -1153,10 +1168,7 @@ let asset_domain_worker
     let controller_profs =
       match overlay_controller with
       | Some c when not (String.equal asset_with_fees.strategy "") ->
-        Some
-          (get_controller_profiler
-             ~exchange:c.oc_hedge_exchange
-             ~coin:c.oc_hedge_coin)
+        Some (get_controller_profiler ~exchange:c.oc_hedge_exchange ~coin:c.oc_hedge_coin)
       | _ -> None
     in
     (* Controller-scoped values the overlay cycle needs every tick. Resolve them once here
@@ -1169,8 +1181,8 @@ let asset_domain_worker
     (* Open-sell sums per inventory leg, invalidated by the venue's open-orders
        generation. Without this the overlay walks every resting sell on every tick. *)
     (* The cache backs the resting-sell snapshot, which [sells_below*] needs on every
-       overlay cycle, not just the accumulated-basis sum. [full_balance_ref] only skips the
-       open-sell base inside [leg_q]; it does not make the snapshot unnecessary. *)
+       overlay cycle, not just the accumulated-basis sum. [full_balance_ref] only skips
+       the open-sell base inside [leg_q]; it does not make the snapshot unnecessary. *)
     let overlay_inventory_caches =
       match overlay_controller with
       | Some c -> Some (Overlay_inventory.create_caches c)
@@ -1250,9 +1262,10 @@ let asset_domain_worker
     let overlay_ctx =
       match overlay_controller with
       | None -> None
-      | Some _ ->
+      | Some c ->
         let ctx = Dio_strategies.Strategy_cycle_engine.create () in
         ctx.cg_symbol <- asset_with_fees.symbol;
+        ctx.cg_credit_store_key <- credit_store_key c;
         Some ctx
     in
     (* Overlay runtime. It runs independently of the grid, including on a domain spawned
@@ -1294,8 +1307,7 @@ let asset_domain_worker
                ; "add_growth", Dio_strategies.Strategy_expr.V_float ladder.ol_add_growth
                ; "max_ratio", Dio_strategies.Strategy_expr.V_float ladder.ol_max_ratio
                ; "num_adds", Dio_strategies.Strategy_expr.V_int ladder.ol_num_rungs
-               ; ( "short_tp_roe"
-                 , Dio_strategies.Strategy_expr.V_float p.short_tp_roe )
+               ; "short_tp_roe", Dio_strategies.Strategy_expr.V_float p.short_tp_roe
                ; ( "recycle_base_share"
                  , Dio_strategies.Strategy_expr.V_float recycle_base_share )
                ; ( "min_entry_margin_ratio"
@@ -1328,20 +1340,25 @@ let asset_domain_worker
     let profilers_of (p : domain_profilers) =
       [ p.prof_ob; p.prof_exec; p.prof_prep; p.prof_strategy; p.prof_cycle ]
     in
-    overlay_window_profs :=
-      List.concat_map (fun ov -> profilers_of ov.oir_profs) overlay_instances
-      @ (match controller_profs with
-         | Some profs -> profilers_of profs
-         | None -> []);
+    (overlay_window_profs
+     := List.concat_map (fun ov -> profilers_of ov.oir_profs) overlay_instances
+        @
+        match controller_profs with
+        | Some profs -> profilers_of profs
+        | None -> []);
     (* Loop-invariant: only a domain that hosts overlay work pays the two extra clock
        reads that split it out of PREP. *)
     let has_overlay_work =
-      Option.is_some overlay_ctx || (match overlay_instances with [] -> false | _ -> true)
+      Option.is_some overlay_ctx
+      ||
+      match overlay_instances with
+      | [] -> false
+      | _ -> true
     in
     (* Returns this cycle's span in nanoseconds (0 when latency measurement is off) so the
        owner domain can leave that time off its own STRATEGY span: the instance's row owns
-       it. Fill-driven cycles are measured too, so the row covers the overlay's whole cost,
-       not just the book ticks. *)
+       it. Fill-driven cycles are measured too, so the row covers the overlay's whole
+       cost, not just the book ticks. *)
     let run_overlay_cycles (ov : overlay_instance_rt) ~now ~price ~events =
       let measured = !latency_active in
       let profs = ov.oir_profs in
@@ -1370,26 +1387,26 @@ let asset_domain_worker
       let t_prep = if measured then Monotonic_clock.now_ns () else 0 in
       List.iter
         (fun (event_name, fields) ->
-           let t_ev = if measured then Monotonic_clock.now_ns () else 0 in
-           Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
-             ignore
-               (Dio_strategies.Strategy_runtime.run_cycle
-                  ov.oir_rt
-                  ~price
-                  ~now
-                  ~event:(Dio_strategies.Strategy_runtime.make_event event_name fields)));
-           if measured
-           then (
-             let ns = Monotonic_clock.now_ns () - t_ev in
-             (* Attribute the pass to what woke the leg: a fill is event work, a book tick
-                is book work, anything else is the leg's own strategy pass. *)
-             let prof =
-               match event_name with
-               | "filled" -> profs.prof_exec
-               | "book_update" -> profs.prof_ob
-               | _ -> profs.prof_strategy
-             in
-             if ns > 0 then Latency_profiler.record_ns prof ns))
+          let t_ev = if measured then Monotonic_clock.now_ns () else 0 in
+          Dio_strategies.Strategy_cycle_engine.with_lock ctx (fun () ->
+            ignore
+              (Dio_strategies.Strategy_runtime.run_cycle
+                 ov.oir_rt
+                 ~price
+                 ~now
+                 ~event:(Dio_strategies.Strategy_runtime.make_event event_name fields)));
+          if measured
+          then (
+            let ns = Monotonic_clock.now_ns () - t_ev in
+            (* Attribute the pass to what woke the leg: a fill is event work, a book tick
+               is book work, anything else is the leg's own strategy pass. *)
+            let prof =
+              match event_name with
+              | "filled" -> profs.prof_exec
+              | "book_update" -> profs.prof_ob
+              | _ -> profs.prof_strategy
+            in
+            if ns > 0 then Latency_profiler.record_ns prof ns))
         events;
       let t_save = if measured then Monotonic_clock.now_ns () else 0 in
       Dio_strategies.Overlay_instance_runtime.save_if_changed
@@ -1431,8 +1448,8 @@ let asset_domain_worker
         (try
            Array.iter
              (fun (r : Dio_strategies.Strategy_cycle_engine.order_row) ->
-                if r.oor_remaining > 0.0 && String.equal r.oor_side "buy"
-                then found := true)
+               if r.oor_remaining > 0.0 && String.equal r.oor_side "buy"
+               then found := true)
              (Dio_strategies.Strategy_cycle_engine.open_orders_snapshot
                 (module Ex)
                 ~exchange:ov.oir_config.oi_exchange
@@ -1447,17 +1464,13 @@ let asset_domain_worker
       with
       | None -> ()
       | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
-        let positions_at =
-          Option.value (Mc.get_positions_updated_at ()) ~default:0.0
-        in
+        let positions_at = Option.value (Mc.get_positions_updated_at ()) ~default:0.0 in
         let margin_at =
           match Mc.get_margin () with
           | Some m -> m.updated_at
           | None -> 0.0
         in
-        if
-          positions_at > ov.oir_seen_positions_at
-          || margin_at > ov.oir_seen_margin_at
+        if positions_at > ov.oir_seen_positions_at || margin_at > ov.oir_seen_margin_at
         then (
           ov.oir_seen_positions_at <- positions_at;
           ov.oir_seen_margin_at <- margin_at;
@@ -1496,19 +1509,25 @@ let asset_domain_worker
           else (
             let ctx = Dio_strategies.Strategy_cycle_engine.create () in
             ctx.cg_symbol <- asset_with_fees.symbol;
-            (* The grid leg of a carry controller drains the overlay's profit credits. *)
+            (* The grid leg of a carry controller drains the overlay's profit credits.
+               Only the leg that owns the durable accumulation entry may drain: with more
+               than one grid leg the destructive drain and the store write would land on
+               different parents and double-count. *)
             (match
                Config.get_overlay_controller
                  ~exchange:asset_with_fees.exchange
                  ~symbol:asset_with_fees.symbol
              with
              | Some c
-               when List.exists
-                      (fun (l : Config.overlay_leg) ->
-                        l.ol_has_grid
-                        && String.equal l.ol_exchange asset_with_fees.exchange
-                        && String.equal l.ol_symbol asset_with_fees.symbol)
-                      c.oc_legs ->
+               when match
+                      List.find_opt
+                        (fun (l : Config.overlay_leg) -> l.ol_has_grid)
+                        c.oc_legs
+                    with
+                    | Some l ->
+                      String.equal l.ol_exchange asset_with_fees.exchange
+                      && String.equal l.ol_symbol asset_with_fees.symbol
+                    | None -> false ->
                ctx.cg_credit_key
                <- Dio_strategies.Accum_credit.key
                     ~exchange:c.oc_hedge_exchange
@@ -2210,12 +2229,8 @@ let asset_domain_worker
             in
             List.iter
               (fun (ov : overlay_instance_rt) ->
-                 ignore
-                   (run_overlay_cycles
-                      ov
-                      ~now:now_exec
-                      ~price:event.avg_price
-                      ~events))
+                ignore
+                  (run_overlay_cycles ov ~now:now_exec ~price:event.avg_price ~events))
               overlay_instances)
         in
         let new_pos =
@@ -3405,17 +3420,17 @@ let asset_domain_worker
       let instance_ns = ref 0 in
       List.iter
         (fun (ov : overlay_instance_rt) ->
-           let now = Unix.gettimeofday () in
-           if overlay_entry_resting ov
-           then
-             instance_ns
-             := !instance_ns
-                + run_overlay_cycles
-                    ov
-                    ~now
-                    ~price:(overlay_mark ov)
-                    ~events:[ "book_update", [] ]
-           else overlay_venue_changed ov ~now)
+          let now = Unix.gettimeofday () in
+          if overlay_entry_resting ov
+          then
+            instance_ns
+            := !instance_ns
+               + run_overlay_cycles
+                   ov
+                   ~now
+                   ~price:(overlay_mark ov)
+                   ~events:[ "book_update", [] ]
+          else overlay_venue_changed ov ~now)
         overlay_instances;
       (* Controller work stays on this domain's row; instance work is charged to the
          instance's own row, so the two are not counted twice. *)

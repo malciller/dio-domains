@@ -228,6 +228,9 @@ type strategy_state =
          halt once the kill events stop. *)
   ; mutable accumulated_profit : float
       (* realized PnL from buy/sell cycles; gates accumulation sell placement *)
+  ; mutable carry_credit_seq : int
+      (* highest carry recycle sequence already applied to [accumulated_profit]; the
+         persistence guard against re-crediting a close after a restart *)
   ; mutable reserved_base : float
       (* base asset held out of selling; staked base backs it first *)
   ; mutable staked_base : float
@@ -573,6 +576,11 @@ let rec get_strategy_state asset_symbol =
       | Some a -> a.Dio_persistence.Base_accumulation_store.accumulated_profit
       | None -> 0.0
     in
+    let persisted_carry_credit_seq =
+      match persisted_accumulation with
+      | Some a -> a.Dio_persistence.Base_accumulation_store.carry_credit_seq
+      | None -> 0
+    in
     let opt f =
       match persisted_accumulation with
       | Some a -> f a
@@ -649,6 +657,7 @@ let rec get_strategy_state asset_symbol =
       ; tif_recovery_since = 0.0
       ; sell_holds_since_balance = []
       ; accumulated_profit = persisted_accumulated_profit
+      ; carry_credit_seq = persisted_carry_credit_seq
       ; reserved_base = persisted_reserved_base
       ; staked_base = 0.0
       ; last_buy_fill_price = persisted_last_buy_fill_price

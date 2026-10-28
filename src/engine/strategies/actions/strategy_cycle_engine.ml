@@ -44,6 +44,9 @@ type ctx =
   (** Controller key ("venue|symbol") whose [accumulated_profit] this domain drains. Empty
       when the domain is not the grid leg of a carry controller. *)
   ; mutable cg_credit_key : string
+  (** Persisted accumulation entry that receives this overlay's recycled profit (the parent
+      grid's "{strategy}:{symbol}:{venue}" key). Empty when there is no parent grid. *)
+  ; mutable cg_credit_store_key : string
   ; mutable cg_quote_stale : bool
   ; mutable cg_oracle_halted : bool
   ; mutable cg_base_age : float option
@@ -93,6 +96,7 @@ let create () =
   ; cg_now = 0.0
   ; cg_cycle = 0
   ; cg_credit_key = ""
+  ; cg_credit_store_key = ""
   ; cg_quote_stale = false
   ; cg_oracle_halted = false
   ; cg_base_age = None
@@ -449,9 +453,34 @@ let early_facts c (t : Strategy_runtime.t) =
   Strategy_runtime.set_platform_bool t Slots.fee_refresh_due (c.cg_cycle land 0x3ff = 0)
 ;;
 
+(** Applies drained credits in order. A credit at or below [carry_credit_seq] was already
+    applied (restart replay) and is dropped. Tail-recursive and allocation-free: this runs
+    from [market_facts] on every overlay tick. *)
+let rec apply_credits (s : Types.strategy_state) applied = function
+  | [] -> applied
+  | (seq, qty) :: rest ->
+    if seq <= 0 || seq > s.carry_credit_seq
+    then (
+      s.accumulated_profit <- s.accumulated_profit +. qty;
+      if seq > s.carry_credit_seq then s.carry_credit_seq <- seq;
+      apply_credits s true rest)
+    else apply_credits s applied rest
+;;
+
+(** Moves pending overlay credits into the grid's state. [Accum_credit.drain] is
+    destructive, so [cycle_facts] and [market_facts] cannot double-count. *)
+let drain_credit c =
+  match c.cg_state with
+  | Some s when c.cg_credit_key <> "" ->
+    if apply_credits s false (Accum_credit.drain ~key:c.cg_credit_key)
+    then s.persistence_dirty <- true
+  | _ -> ()
+;;
+
 (** Fine path step 6a'': publish the raw gate facts the strategy file combines into the
     buy-active condition: the oracle-halt latch and the TIF-recovery latch/timestamp. *)
 let cycle_facts c (t : Strategy_runtime.t) =
+  drain_credit c;
   let state = c.cg_state in
   let pending, since =
     match state with
@@ -503,14 +532,7 @@ let cycle_facts c (t : Strategy_runtime.t) =
     [funding_valid]/[perp_valid] false) so a consumer can gate on validity instead of
     acting on a zero that looks real. *)
 let market_facts c (t : Strategy_runtime.t) =
-  (match c.cg_state with
-   | Some s when c.cg_credit_key <> "" ->
-     let credit = Accum_credit.drain ~key:c.cg_credit_key in
-     if credit > 0.0
-     then (
-       s.accumulated_profit <- s.accumulated_profit +. credit;
-       s.persistence_dirty <- true)
-   | _ -> ());
+  drain_credit c;
   let asset = c.cg_asset in
   let symbol =
     match asset with
@@ -1079,7 +1101,7 @@ type order_scan =
   ; osn_rows : order_row array
   }
 
-let order_scans : ((string * string), order_scan) Ds.Cow_table.t =
+let order_scans : (string * string, order_scan) Ds.Cow_table.t =
   Ds.Cow_table.create ~shard_count:32 ()
 ;;
 
@@ -1093,24 +1115,23 @@ let open_orders_snapshot (module Ex : Dio_exchange.Exchange_intf.S) ~exchange ~s
   | _ ->
     let acc = ref [] in
     (try
-       Ex.iter_open_orders_fast
-         ~symbol
-         (fun id price remaining side userref ->
-            acc
-            := { oor_id = id
-               ; oor_price = price
-               ; oor_remaining = remaining
-               ; oor_side = side
-               ; oor_userref = userref
-               }
-               :: !acc)
+       Ex.iter_open_orders_fast ~symbol (fun id price remaining side userref ->
+         acc
+         := { oor_id = id
+            ; oor_price = price
+            ; oor_remaining = remaining
+            ; oor_side = side
+            ; oor_userref = userref
+            }
+            :: !acc)
      with
      | _ -> ());
     let rows = Array.of_list (List.rev !acc) in
     (* No generation means the venue cannot report a change, so caching would be
        unverifiable: skip the publish rather than republishing an unvalidated row set. *)
     if gen >= 0
-    then Ds.Cow_table.set order_scans (exchange, symbol) { osn_gen = gen; osn_rows = rows };
+    then
+      Ds.Cow_table.set order_scans (exchange, symbol) { osn_gen = gen; osn_rows = rows };
     rows
 ;;
 
@@ -1214,86 +1235,82 @@ let order_replace
             try
               Array.iter
                 (fun (r : order_row) ->
-                   f r.oor_id r.oor_price r.oor_remaining r.oor_side r.oor_userref)
+                  f r.oor_id r.oor_price r.oor_remaining r.oor_side r.oor_userref)
                 (open_orders_snapshot (module Ex) ~exchange:asset.exchange ~symbol)
             with
             | _ -> ()
           in
           let consider ~is_perp symbol =
             iter_cached ~symbol (fun oid price _remaining side_str userref ->
-                   (* Venues that do not echo the engine's user reference (Lighter) return
-                      [None]/[0]. Match those by the exact target price so an order placed
-                      before a restart (or before the tag existed) is adopted and its
-                      duplicates cancelled instead of being layered again. *)
-                   let userref_ok =
-                     match userref with
-                     | Some 0 | None ->
-                       (* Only Lighter drops the tag; other venues' untagged orders are
-                          external and must not be adopted. *)
-                       String.equal (String.lowercase_ascii asset.exchange) "lighter"
-                       && price > 0.0
-                       && Float.abs (price -. rounded)
-                          <= 1e-9 *. Float.max 1.0 (Float.abs rounded)
-                     | Some u -> u = Strategy_common.strategy_userref_carry
-                   in
-                   if userref_ok
-                      && String.equal side_str want_side
-                      && not (Hashtbl.mem seen oid)
-                   then (
-                     (* Both books share one userref. Match instrument class and logical
-                        kind so a spot recycle is never amended as a perp take-profit. The
-                        registry check covers a view that lists an unclassified order. *)
-                     let meta = Strategy_common.lookup_carry_order ~order_id:oid in
-                     let market_ok =
-                       match meta with
-                       | Some m ->
-                         m.Strategy_common.com_market
-                         = Strategy_common.Carry_perp
-                         = want_perp
-                       | None ->
-                         (* No registry entry: the materialized order's own market label
-                            decides, not the store key. *)
-                         true
-                     in
-                     let kind_ok =
-                       (* No registry entry: the carry order's market+side identifies its
-                          kind. Ignoring it strands a live order that the next placement
-                          would duplicate. *)
-                       match order_side, meta with
-                       | Strategy_common.Buy, Some m ->
-                         String.equal m.Strategy_common.com_kind kind_key
-                       | Strategy_common.Buy, None -> true
-                       | Strategy_common.Sell, Some m ->
-                         String.equal m.Strategy_common.com_kind kind_key
-                       | Strategy_common.Sell, None -> true
-                     in
-                     if market_ok && kind_ok
-                     then (
-                       (* The id index may point at the spot pair even when the scan was
-                          keyed by the bare coin. Try the scanned store, then the other
-                          store; querying only the scanned key duplicates every resting
-                          perp order. *)
-                       let materialize store_symbol =
-                         match Ex.get_open_order ~symbol:store_symbol ~order_id:oid with
-                         | Some _ as o -> o
-                         | None -> None
-                       in
-                       let other = if is_perp then asset.symbol else instrument in
-                       let order =
-                         match materialize symbol with
-                         | Some _ as o -> o
-                         | None when not (String.equal other symbol) -> materialize other
-                         | None -> None
-                       in
-                       match order with
-                       | Some (o : Dio_exchange.Exchange_intf.Types.open_order)
-                         when (o.market = want_market
-                               && o.status = Dio_exchange.Exchange_intf.Types.New)
-                              || o.status
-                                 = Dio_exchange.Exchange_intf.Types.PartiallyFilled ->
-                         Hashtbl.replace seen oid ();
-                         out := o :: !out
-                       | _ -> ())))
+              (* Venues that do not echo the engine's user reference (Lighter) return
+                 [None]/[0]. Match those by the exact target price so an order placed
+                 before a restart (or before the tag existed) is adopted and its
+                 duplicates cancelled instead of being layered again. *)
+              let userref_ok =
+                match userref with
+                | Some 0 | None ->
+                  (* Only Lighter drops the tag; other venues' untagged orders are
+                     external and must not be adopted. *)
+                  String.equal (String.lowercase_ascii asset.exchange) "lighter"
+                  && price > 0.0
+                  && Float.abs (price -. rounded)
+                     <= 1e-9 *. Float.max 1.0 (Float.abs rounded)
+                | Some u -> u = Strategy_common.strategy_userref_carry
+              in
+              if userref_ok
+                 && String.equal side_str want_side
+                 && not (Hashtbl.mem seen oid)
+              then (
+                (* Both books share one userref. Match instrument class and logical kind
+                   so a spot recycle is never amended as a perp take-profit. The registry
+                   check covers a view that lists an unclassified order. *)
+                let meta = Strategy_common.lookup_carry_order ~order_id:oid in
+                let market_ok =
+                  match meta with
+                  | Some m ->
+                    m.Strategy_common.com_market = Strategy_common.Carry_perp = want_perp
+                  | None ->
+                    (* No registry entry: the materialized order's own market label
+                       decides, not the store key. *)
+                    true
+                in
+                let kind_ok =
+                  (* No registry entry: the carry order's market+side identifies its kind.
+                     Ignoring it strands a live order that the next placement would
+                     duplicate. *)
+                  match order_side, meta with
+                  | Strategy_common.Buy, Some m ->
+                    String.equal m.Strategy_common.com_kind kind_key
+                  | Strategy_common.Buy, None -> true
+                  | Strategy_common.Sell, Some m ->
+                    String.equal m.Strategy_common.com_kind kind_key
+                  | Strategy_common.Sell, None -> true
+                in
+                if market_ok && kind_ok
+                then (
+                  (* The id index may point at the spot pair even when the scan was keyed
+                     by the bare coin. Try the scanned store, then the other store;
+                     querying only the scanned key duplicates every resting perp order. *)
+                  let materialize store_symbol =
+                    match Ex.get_open_order ~symbol:store_symbol ~order_id:oid with
+                    | Some _ as o -> o
+                    | None -> None
+                  in
+                  let other = if is_perp then asset.symbol else instrument in
+                  let order =
+                    match materialize symbol with
+                    | Some _ as o -> o
+                    | None when not (String.equal other symbol) -> materialize other
+                    | None -> None
+                  in
+                  match order with
+                  | Some (o : Dio_exchange.Exchange_intf.Types.open_order)
+                    when (o.market = want_market
+                          && o.status = Dio_exchange.Exchange_intf.Types.New)
+                         || o.status = Dio_exchange.Exchange_intf.Types.PartiallyFilled ->
+                    Hashtbl.replace seen oid ();
+                    out := o :: !out
+                  | _ -> ())))
           in
           if want_perp
           then
@@ -1519,16 +1536,40 @@ let reserve_base c ~qty =
   | _ -> ()
 ;;
 
-(** Credit realized carry profit to the parent grid's [accumulated_profit]. The grid
-    domain drains it on its next cycle and spends it skimming base on a buy fill. *)
-let credit_profit c ~qty =
-  if Float.is_finite qty && qty > 0.0
+(** Credit realized carry profit to the parent grid's [accumulated_profit].
+
+    The durable write goes straight to the parent's accumulation entry so a recycle
+    survives a restart before the parent's next cycle. When the overlay shares the
+    parent's state (co-located grid), the live state is updated too, so no handoff is
+    queued and the domain flush cannot double-count. Otherwise the credit is also queued
+    in [Accum_credit] for the parent domain to drain on its next cycle. A controller with
+    no parent grid has no ledger to credit, so the credit is dropped. *)
+let credit_profit c ~qty ~seq =
+  if Float.is_finite qty && qty <> 0.0
   then (
     match c.cg_asset with
     | Some asset ->
-      Accum_credit.add
-        ~key:(Accum_credit.key ~exchange:asset.exchange ~symbol:asset.symbol)
-        qty
+      let store_key = c.cg_credit_store_key in
+      if String.equal store_key ""
+      then ()
+      else (
+        let applied =
+          Dio_persistence.Base_accumulation_store.credit_profit ~key:store_key ~seq ~qty
+        in
+        if applied
+        then (
+          match c.cg_state with
+          | Some s when s.persistence_key = Some store_key ->
+            if seq <= 0 || seq > s.carry_credit_seq
+            then (
+              s.accumulated_profit <- s.accumulated_profit +. qty;
+              if seq > s.carry_credit_seq then s.carry_credit_seq <- seq;
+              s.persistence_dirty <- true)
+          | _ ->
+            Accum_credit.add
+              ~key:(Accum_credit.key ~exchange:asset.exchange ~symbol:asset.symbol)
+              ~seq
+              qty))
     | None -> ())
 ;;
 

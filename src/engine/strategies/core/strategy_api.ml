@@ -342,6 +342,7 @@ module Strategy = struct
             ~key
             { Dio_persistence.Base_accumulation_store.reserved_base = state.reserved_base
             ; accumulated_profit = state.accumulated_profit
+            ; carry_credit_seq = state.carry_credit_seq
             ; last_fill_oid = state.last_fill_oid
             ; last_buy_fill_price = state.last_buy_fill_price
             ; last_buy_fill_qty = state.last_buy_fill_qty
