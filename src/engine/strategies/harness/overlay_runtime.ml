@@ -66,6 +66,7 @@ let seed rt (st : Store.t) =
   setf rt "pending_gain" st.pending_gain;
   setf rt "pending_base_quote" st.pending_base_quote;
   setf rt "pending_base" st.pending_base;
+  setf rt "tp_book_price" st.tp_book_price;
   setf rt "close_entry" st.close_entry;
   setf rt "close_qty" st.close_qty;
   setf rt "close_started_at" st.close_started_at;
@@ -98,6 +99,7 @@ let snapshot rt (st : Store.t) ~now =
     ; pending_gain = getf rt "pending_gain" st.pending_gain
     ; pending_base_quote = getf rt "pending_base_quote" st.pending_base_quote
     ; pending_base = getf rt "pending_base" st.pending_base
+    ; tp_book_price = getf rt "tp_book_price" st.tp_book_price
     ; close_entry = getf rt "close_entry" st.close_entry
     ; close_qty = getf rt "close_qty" st.close_qty
     ; close_started_at = getf rt "close_started_at" st.close_started_at

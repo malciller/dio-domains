@@ -250,11 +250,15 @@ let update_entry t key entry_json =
 ;;
 
 (** Parse the whole file into the per-key cache (lazy first read). MUST be called under
-    both mutexes in the caller-chosen order. *)
+    both mutexes in the caller-chosen order. Cached entries win: the cache can be ahead of
+    disk while a coalesced save is still queued, and a stale disk value must not regress
+    it. *)
 let populate_cache_unsafe t =
   let tree = read_file_unsafe t in
   let entries = t.parse tree in
-  List.iter (fun (k, v) -> Hashtbl.replace t.cache k v) entries;
+  List.iter
+    (fun (k, v) -> if not (Hashtbl.mem t.cache k) then Hashtbl.add t.cache k v)
+    entries;
   Logging.info_f
     ~section
     "Loaded %d entr%s for %s from %s"
@@ -429,6 +433,29 @@ let keys t =
   result
 ;;
 
+(** Atomic read-modify-write of one cached entry. [f] runs under [cache_mutex] with the
+    current value, so concurrent writers cannot lose an update. Returns its second
+    component. Publishing is coalesced like [put_async]: the cache is current immediately
+    and the background worker writes it. *)
+let update_async t ~key f =
+  Mutex.lock t.cache_mutex;
+  if not (Hashtbl.mem t.cache key)
+  then (
+    Mutex.unlock t.cache_mutex;
+    Mutex.lock t.file_mutex;
+    Mutex.lock t.cache_mutex;
+    if not (Hashtbl.mem t.cache key) then populate_cache_unsafe t;
+    Mutex.unlock t.file_mutex);
+  let updated, result = f (Hashtbl.find_opt t.cache key) in
+  Hashtbl.replace t.cache key updated;
+  Mutex.unlock t.cache_mutex;
+  Mutex.lock t.save_queue_mutex;
+  Hashtbl.replace t.save_queue key updated;
+  Condition.signal t.save_cond;
+  Mutex.unlock t.save_queue_mutex;
+  result
+;;
+
 (** Configured strategies registered at startup from config.json's trading entries:
     (strategy_name, symbol, venue, base_accumulation, sell_levels). Migration uses this to
     map legacy symbol-keyed entries to full strategy keys when exactly one configured
@@ -456,6 +483,21 @@ let unique_configured_strategy_for_symbol symbol =
   in
   match matches with
   | [ (strategy, _, venue, _, _) ] -> Some (strategy, venue)
+  | _ -> None
+;;
+
+(** The unique configured strategy matching [symbol] on [venue], or [None] for zero or
+    ambiguous matches. Used to resolve a store key when the symbol alone could collide
+    across venues (for example a coin listed on both Kraken and Hyperliquid). *)
+let unique_configured_strategy_for_symbol_and_venue ~symbol ~venue =
+  let norm v = String.lowercase_ascii v in
+  let matches =
+    List.filter
+      (fun (_, sym, ven, _, _) -> sym = symbol && String.equal (norm ven) (norm venue))
+      !configured_strategies
+  in
+  match matches with
+  | [ (strategy, _, _, _, _) ] -> Some strategy
   | _ -> None
 ;;
 
