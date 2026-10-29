@@ -714,6 +714,52 @@ let test_read_config_keeps_last_good () =
     Alcotest.(check int) "complete file replaces the fallback" 4242 recovered.cycle_mod)
 ;;
 
+let test_short_overlay_instance () =
+  let entry =
+    {|{"symbol":"HYPE/USDC","exchange":"hyperliquid","qty":"0.15",
+       "strategy":"jacobs_ladder",
+       "overlay":[{"name":"short_overlay","exchange":"hyperliquid",
+                    "params":{"short_pct":25,"stress_rise":80}}]}|}
+  in
+  ignore (Dio_engine.Config.parse_config (Yojson.Basic.from_string entry));
+  Dio_engine.Config.parse_overlay_instances
+    (Yojson.Basic.from_string (Printf.sprintf {|{"trading":[%s]}|} entry));
+  (match
+     Dio_engine.Config.get_overlay_instances_for
+       ~exchange:"hyperliquid"
+       ~symbol:"HYPE/USDC"
+   with
+   | [ oi ] ->
+     Alcotest.(check string) "strategy" "short_overlay" oi.Dio_engine.Config.oi_strategy;
+     Alcotest.(check string)
+       "overlay venue"
+       "hyperliquid"
+       oi.Dio_engine.Config.oi_exchange;
+     Alcotest.(check string)
+       "symbol defaults to the owner's base coin"
+       "HYPE"
+       oi.Dio_engine.Config.oi_symbol;
+     let open Yojson.Basic.Util in
+     Alcotest.(check (float 1e-9))
+       "short_pct"
+       25.0
+       (oi.Dio_engine.Config.oi_params
+        |> member "short_pct"
+        |> Dio_engine.Config.to_float_opt
+        |> Option.value ~default:0.0)
+   | _ -> Alcotest.fail "expected one short_overlay instance for hyperliquid/HYPE/USDC");
+  Alcotest.(check bool)
+    "short_overlay is not the inventory controller"
+    true
+    (match
+       Dio_engine.Config.get_overlay_controller
+         ~exchange:"hyperliquid"
+         ~symbol:"HYPE/USDC"
+     with
+     | None -> true
+     | Some _ -> false)
+;;
+
 let test_parse_overlay_instances () =
   let entry =
     {|{"symbol":"BTC/USDC","exchange":"hyperliquid","qty":"0.001",
@@ -874,6 +920,10 @@ let () =
             `Quick
             test_domain_assets_spawns_overlay_only
         ; Alcotest.test_case "inventory formula" `Quick test_inventory_formula
+        ; Alcotest.test_case
+            "short_overlay is a generic instance"
+            `Quick
+            test_short_overlay_instance
         ; Alcotest.test_case "instances parse flat" `Quick test_parse_overlay_instances
         ; Alcotest.test_case
             "instances parse grouped"

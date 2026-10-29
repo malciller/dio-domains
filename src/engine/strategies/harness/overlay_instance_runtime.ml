@@ -1,8 +1,8 @@
 (** Generic glue between an overlay strategy's persisted [remembers] and the overlay
     store.
 
-    The private strategy file owns the field names and which fields persist. The engine
-    only maps file state declarations to JSON values. *)
+    The bound strategy file owns the field names and which fields persist. The engine only
+    maps file state declarations to JSON values. *)
 
 module Store = Dio_persistence.Overlay_instance_store
 module Rt = Strategy_runtime

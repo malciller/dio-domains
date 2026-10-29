@@ -212,15 +212,18 @@ let publish_margin ?maintenance inputs =
     }
 ;;
 
-let apply_positions ~now nodes =
-  let live =
+(** Apply a position set. [replace] is true for authoritative snapshots (REST and
+    [snapshot/account_all]); Lighter's [update/account_all] frames carry only the markets
+    that changed, so replacing the whole store from one would clear every other live
+    position. Updates merge: a zero-qty node removes that market, an empty set is a no-op,
+    and untouched markets stay. *)
+let apply_positions ?(replace = true) ~now nodes =
+  let parsed =
     List.filter_map
       (fun json ->
         try
           let p = parse_position ~now json in
-          if Float.abs p.Exchange.Market_context.qty <= 1e-12
-          then None
-          else if p.Exchange.Market_context.coin = ""
+          if p.Exchange.Market_context.coin = ""
           then (
             Logging.warn_f
               ~section
@@ -238,12 +241,31 @@ let apply_positions ~now nodes =
       nodes
   in
   let previous = Atomic.get last_positions in
+  let live_parsed =
+    List.filter (fun p -> Float.abs p.Exchange.Market_context.qty > 1e-12) parsed
+  in
+  let next =
+    if replace
+    then live_parsed
+    else (
+      let by_coin = Hashtbl.create (List.length previous + List.length parsed) in
+      List.iter
+        (fun (p : Exchange.Market_context.position) -> Hashtbl.replace by_coin p.coin p)
+        previous;
+      List.iter
+        (fun (p : Exchange.Market_context.position) ->
+          if Float.abs p.qty <= 1e-12
+          then Hashtbl.remove by_coin p.coin
+          else Hashtbl.replace by_coin p.coin p)
+        parsed;
+      Hashtbl.fold (fun _ p acc -> p :: acc) by_coin [])
+  in
   List.iter
     (fun (old : Exchange.Market_context.position) ->
       if not
            (List.exists
               (fun p -> String.equal p.Exchange.Market_context.coin old.coin)
-              live)
+              next)
       then
         Logging.info_f
           ~section
@@ -251,24 +273,26 @@ let apply_positions ~now nodes =
           old.Exchange.Market_context.coin
           old.Exchange.Market_context.qty)
     previous;
-  Atomic.set last_positions live;
-  List.iter remember_basis live;
-  Dio_exchange.Market_context.replace_positions ~exchange ~updated_at:now live;
+  Atomic.set last_positions next;
+  List.iter remember_basis next;
+  Dio_exchange.Market_context.replace_positions ~exchange ~updated_at:now next;
   List.iter
     (fun p -> Concurrency.Exchange_wakeup.signal ~symbol:p.Exchange.Market_context.coin)
-    live;
+    next;
   match Atomic.get last_margin_inputs with
   | Some inputs -> publish_margin inputs
   | None -> ()
 ;;
 
-(** Applies an [account_all] snapshot. Returns [true] when a position set was present. *)
-let process_account_all json =
+(** Applies an [account_all] frame. [replace] is false for an [update/account_all] delta;
+    snapshots and REST re-seeds pass the default. Returns [true] when a position set was
+    present. *)
+let process_account_all ?(replace = true) json =
   let account = account_node json in
   match position_nodes account with
   | None -> false
   | Some nodes ->
-    apply_positions ~now:(Unix.gettimeofday ()) nodes;
+    apply_positions ~replace ~now:(Unix.gettimeofday ()) nodes;
     true
 ;;
 

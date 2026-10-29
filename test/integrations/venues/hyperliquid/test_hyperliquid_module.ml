@@ -99,6 +99,30 @@ let test_spot_view_excludes_perp () =
   Alcotest.(check bool) "spot iterator skips the perp order" false (List.mem "777" !seen)
 ;;
 
+let test_get_open_order_by_coin () =
+  (* Placement injection stores a perp order under the registered spot pair. Reading it by
+     the bare coin must resolve through the global order index. *)
+  ExecFeed.initialize [ "MODFETCH"; "MODFETCH/USDC" ];
+  ExecFeed.inject_order
+    ~symbol:"MODFETCH"
+    ~order_id:"coin-order"
+    ~side:ExecFeed.Buy
+    ~qty:1.0
+    ~price:100.0
+    ();
+  match
+    Hyperliquid.Module.Hyperliquid_impl.get_open_order
+      ~symbol:"MODFETCH"
+      ~order_id:"coin-order"
+  with
+  | Some o ->
+    Alcotest.(check string)
+      "order id"
+      "coin-order"
+      o.Dio_exchange.Exchange_intf.Types.order_id
+  | None -> Alcotest.fail "bare-coin lookup did not find the pair-keyed order"
+;;
+
 let test_resolve_amend_replacement_from_feed () =
   (* The modify ack has no replacement oid; the order-updates feed links the new leg by
      cloid. Resolution must find it without waiting for a round trip. *)
@@ -140,6 +164,10 @@ let () =
     ; ( "data_access"
       , [ Alcotest.test_case "empty data accessors" `Quick test_data_accessors_empty
         ; Alcotest.test_case "spot view excludes perp" `Quick test_spot_view_excludes_perp
+        ; Alcotest.test_case
+            "open order resolves by bare coin"
+            `Quick
+            test_get_open_order_by_coin
         ] )
     ]
 ;;

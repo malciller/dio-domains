@@ -274,8 +274,7 @@ let log_latency_window ~key ~window_seconds ~threshold_us ~ob ~exec ~prep ~strat
 ;;
 
 (** Path of the strategy file bound to an entry by name convention
-    ([strategies/<name>.strategy] preferred, then .json, then the same pair under
-    `strategies/private/`). *)
+    ([strategies/<name>.strategy] preferred, then .json). *)
 let strategy_file_path (asset : trading_config) =
   match Dio_strategies.Strategy_loader.locate ~name:asset.strategy with
   | Some path -> Some path
@@ -474,6 +473,179 @@ let load_overlay_instances ~(owner : trading_config) : overlay_instance_rt list 
           }))
 ;;
 
+(** Quote reserve a flow-sized short overlay needs on its venue.
+
+    The short_overlay strategy mirrors carry_overlay's starvation contract: publish the
+    gross requirement for the planned short at a stress price, let the venue pool split it
+    with any other reserved book, and return this instance's share. The requirement uses
+    the live position entry when one exists; a pending target starts at the mark so its
+    initial margin is reserved before the first fill. *)
+let overlay_instance_short_reserve_share (ov : overlay_instance_rt) ~now ~expected =
+  if not (String.equal ov.oir_config.oi_strategy short_overlay_strategy)
+  then 0.0
+  else (
+    let exchange = ov.oir_config.oi_exchange in
+    let coin = Config.base_coin_of_symbol ov.oir_config.oi_symbol in
+    (* Publish a zero requirement when flat so the venue pool still counts this book. *)
+    let publish_zero () =
+      Overlay_reserve.update_diag
+        { Overlay_reserve.dg_key =
+            Overlay_reserve.diag_key ~exchange ~symbol:ov.oir_config.oi_symbol
+        ; dg_exchange = exchange
+        ; dg_at = now
+        ; dg_gross = 0.0
+        ; dg_sells = 0.0
+        ; dg_required = 0.0
+        ; dg_margin = 0.0
+        };
+      0.0
+    in
+    let funding_mark =
+      match Dio_exchange.Market_context.get_funding ~exchange ~coin with
+      | Some f when f.mark > 0.0 -> f.mark
+      | _ -> 0.0
+    in
+    let open_short, entry, mark =
+      match Overlay_reserve.pos_leg ~exchange ~coin with
+      | Some leg ->
+        ( Float.max 0.0 (-.leg.Overlay_reserve.qty)
+        , (if leg.Overlay_reserve.entry > 0.0
+           then leg.Overlay_reserve.entry
+           else leg.Overlay_reserve.mark)
+        , leg.Overlay_reserve.mark )
+      | None -> 0.0, funding_mark, funding_mark
+    in
+    let target_base =
+      match Dio_strategies.Strategy_runtime.get_state ov.oir_rt "short_base_target" with
+      | Dio_strategies.Strategy_expr.V_float f when Float.is_finite f -> Float.max 0.0 f
+      | _ -> 0.0
+    in
+    let pending_base =
+      match Dio_strategies.Strategy_runtime.get_state ov.oir_rt "pending_short_base" with
+      | Dio_strategies.Strategy_expr.V_float f when Float.is_finite f -> Float.max 0.0 f
+      | _ -> 0.0
+    in
+    (* Reserve the live short plus the add this cycle can actually place. Before the first
+       book cycle has derived [pending_short_base], fall back to the raw target so a
+       startup buy still reserves its initial margin. *)
+    let total_qty =
+      if open_short > 1e-9 || pending_base > 1e-9
+      then open_short +. pending_base
+      else target_base
+    in
+    if total_qty <= 1e-9 || mark <= 0.0
+    then publish_zero ()
+    else (
+      let position = Dio_exchange.Market_context.get_position ~exchange ~coin in
+      let position_leverage =
+        match position with
+        | Some p -> Option.value p.leverage ~default:0.0
+        | None -> 0.0
+      in
+      let leverage =
+        if position_leverage > 0.0
+        then position_leverage
+        else (
+          match Dio_exchange.Exchange_intf.Registry.get_market_context exchange with
+          | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
+            (match Mc.get_risk ~coin with
+             | Some { Dio_exchange.Exchange_intf.Market_context.max_leverage = Some l; _ }
+               -> l
+             | _ -> 0.0)
+          | None -> 0.0)
+      in
+      if leverage <= 0.0
+      then publish_zero ()
+      else (
+        (* Keep the fallback in sync with short_overlay.strategy's tunable default. *)
+        let stress_rise =
+          match ov.oir_config.oi_params |> Yojson.Basic.Util.member "stress_rise" with
+          | `Float f -> f
+          | `Int i -> float_of_int i
+          | _ -> 80.0
+        in
+        let target_leg : Overlay_reserve.leg =
+          { qty = -.total_qty
+          ; entry = (if entry > 0.0 then entry else mark)
+          ; mark
+          ; maintenance = Overlay_reserve.maintenance_rate ~coin
+          }
+        in
+        let req =
+          Overlay_reserve.compute_requirement
+            ~target:target_leg
+            ~max_qty:total_qty
+            ~leverage
+            ~min_liq_mult:(1.0 +. (stress_rise /. 100.0))
+            ~anchor:target_leg.entry
+            ~max_trail_pct:0.0
+            ~next_add:0.0
+            ~rungs:0
+            ~add_growth:1.0
+            ~sells_top:0.0
+            ~sells_stress:0.0
+        in
+        let quote_asset =
+          match String.index_opt ov.oir_config.oi_symbol '/' with
+          | Some i ->
+            String.sub
+              ov.oir_config.oi_symbol
+              (i + 1)
+              (String.length ov.oir_config.oi_symbol - i - 1)
+          | None -> "USDC"
+        in
+        let free =
+          match Dio_strategies.Strategy_venue.get_exchange_module exchange with
+          | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+            (try Ex.get_tradeable_balance ~asset:quote_asset with
+             | _ -> nan)
+          | None -> nan
+        in
+        let margin = Dio_exchange.Market_context.get_margin ~exchange in
+        let account_margin_used =
+          match margin with
+          | Some m -> m.margin_used
+          | None -> nan
+        in
+        let position_margin_used =
+          match position with
+          | Some p -> p.margin_used
+          | None -> 0.0
+        in
+        Overlay_reserve.update_diag
+          { Overlay_reserve.dg_key =
+              Overlay_reserve.diag_key ~exchange ~symbol:ov.oir_config.oi_symbol
+          ; dg_exchange = exchange
+          ; dg_at = now
+          ; dg_gross = req.Overlay_reserve.rq_gross
+          ; dg_sells = 0.0
+          ; dg_required = req.Overlay_reserve.rq_required
+          ; dg_margin = position_margin_used
+          };
+        if not (Float.is_finite free)
+        then 0.0
+        else (
+          let own_share =
+            if Float.is_finite req.Overlay_reserve.rq_required
+            then
+              Float.min
+                free
+                (Float.max 0.0 (req.Overlay_reserve.rq_required -. position_margin_used))
+            else 0.0
+          in
+          let pool =
+            Overlay_reserve.pool_for
+              ~exchange
+              ~now
+              ~max_age:180.0
+              ~margin_used:account_margin_used
+              ~free
+          in
+          if pool.Overlay_reserve.pl_count >= expected
+          then Overlay_reserve.allocation pool ~gross:req.Overlay_reserve.rq_gross
+          else own_share))))
+;;
+
 (** Rebuild the ladder from the live short instead of persisting it.
 
     A ladder is a deterministic function of its config, its anchor (the price the short
@@ -665,9 +837,8 @@ let asset_domain_worker
   in
   let trace_cycles = ref 0 in
   (* Strategy-file binding (data-driven dispatch): an entry whose [strategy] resolves to a
-     parsable file under `strategies/` or `strategies/private/` is a strategy-file asset.
-     The engine selects the interpreter/handler by the bound file, never by the strategy
-     name. *)
+     parsable file under `strategies/` is a strategy-file asset. The engine selects the
+     interpreter/handler by the bound file, never by the strategy name. *)
   let bound_strategy_file = load_bound_strategy asset_with_fees in
   let is_file_bound_strategy = Option.is_some bound_strategy_file in
   (* Resolves accumulation_buffer from Fear & Greed on every venue (Kraken runs the same
@@ -1153,14 +1324,37 @@ let asset_domain_worker
         ~exchange:asset_with_fees.exchange
         ~symbol:asset_with_fees.symbol
     in
+    (* Count every book that publishes a reserve requirement on a venue: carry controllers
+       plus flow-sized short overlays. The pool uses the count to avoid splitting against
+       a partial diag set at startup. *)
+    let overlay_reserve_expected_cache = Hashtbl.create 8 in
+    let overlay_reserve_expected exchange =
+      let key = Config.normalize_exchange exchange in
+      match Hashtbl.find_opt overlay_reserve_expected_cache key with
+      | Some n -> n
+      | None ->
+        let controllers =
+          List.length
+            (List.filter
+               (fun (x : overlay_controller) ->
+                 String.equal (Config.normalize_exchange x.oc_hedge_exchange) key)
+               (get_overlay_controllers ()))
+        in
+        let shorts =
+          List.length
+            (List.filter
+               (fun (x : Config.overlay_instance) ->
+                 String.equal x.oi_strategy short_overlay_strategy
+                 && String.equal (Config.normalize_exchange x.oi_exchange) key)
+               (Config.get_overlay_instances ()))
+        in
+        let n = controllers + shorts in
+        Hashtbl.add overlay_reserve_expected_cache key n;
+        n
+    in
     let overlay_expected_controllers =
       match overlay_controller with
-      | Some c ->
-        List.length
-          (List.filter
-             (fun (x : overlay_controller) ->
-               String.equal x.oc_hedge_exchange c.oc_hedge_exchange)
-             (get_overlay_controllers ()))
+      | Some c -> overlay_reserve_expected c.oc_hedge_exchange
       | None -> 0
     in
     (* The controller needs its own row only when this domain also runs a grid: a domain
@@ -1365,6 +1559,12 @@ let asset_domain_worker
       let t0 = if measured then Monotonic_clock.now_ns () else 0 in
       let ctx = ov.oir_ctx in
       let asset = ov.oir_asset in
+      let reserve_share =
+        overlay_instance_short_reserve_share
+          ov
+          ~now
+          ~expected:(overlay_reserve_expected ov.oir_config.oi_exchange)
+      in
       ctx.cg_asset <- Some asset;
       ctx.cg_symbol <- asset.symbol;
       ctx.cg_now <- now;
@@ -1377,7 +1577,7 @@ let asset_domain_worker
       ctx.cg_overlay_spot_symbol <- "";
       ctx.cg_carry <- None;
       ctx.cg_state <- None;
-      ctx.cg_reserve_share <- 0.0;
+      ctx.cg_reserve_share <- reserve_share;
       ctx.cg_credit_key <- "";
       ctx.cg_quote_stale <- false;
       ctx.cg_oracle_halted <- false;
@@ -1436,27 +1636,33 @@ let asset_domain_worker
          | None -> 0.0)
     in
     let overlay_entry_resting (ov : overlay_instance_rt) =
-      match
-        Dio_strategies.Strategy_venue.get_exchange_module ov.oir_config.oi_exchange
-      with
-      | None -> false
-      | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
-        (* Shares the generation-cached scan with the replace path: on a perp symbol the
-           raw read walks the venue's whole order index under two process-wide mutexes,
-           and this runs for every instance on every book tick. *)
-        let found = ref false in
-        (try
-           Array.iter
-             (fun (r : Dio_strategies.Strategy_cycle_engine.order_row) ->
-               if r.oor_remaining > 0.0 && String.equal r.oor_side "buy"
-               then found := true)
-             (Dio_strategies.Strategy_cycle_engine.open_orders_snapshot
-                (module Ex)
-                ~exchange:ov.oir_config.oi_exchange
-                ~symbol:ov.oir_config.oi_symbol)
-         with
-         | _ -> ());
-        !found
+      (* short_overlay is flow-sized and publishes a quote reserve that tracks the mark,
+         so it re-evaluates on every book tick. long_overlay only needs the interpreter
+         while its bid entry is resting; its reduce-only take-profit is a fixed price. *)
+      if String.equal ov.oir_config.oi_strategy short_overlay_strategy
+      then true
+      else (
+        match
+          Dio_strategies.Strategy_venue.get_exchange_module ov.oir_config.oi_exchange
+        with
+        | None -> false
+        | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+          (* Shares the generation-cached scan with the replace path: on a perp symbol the
+             raw read walks the venue's whole order index under two process-wide mutexes,
+             and this runs for every instance on every book tick. *)
+          let found = ref false in
+          (try
+             Array.iter
+               (fun (r : Dio_strategies.Strategy_cycle_engine.order_row) ->
+                 if r.oor_remaining > 0.0 && String.equal r.oor_side "buy"
+                 then found := true)
+               (Dio_strategies.Strategy_cycle_engine.open_orders_snapshot
+                  (module Ex)
+                  ~exchange:ov.oir_config.oi_exchange
+                  ~symbol:ov.oir_config.oi_symbol)
+           with
+           | _ -> ());
+          !found)
     in
     let overlay_venue_changed (ov : overlay_instance_rt) ~now =
       match

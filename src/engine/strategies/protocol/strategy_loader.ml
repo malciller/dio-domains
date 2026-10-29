@@ -2,15 +2,14 @@
     parses it into the shared [Strategy_file.t] AST, dispatching on extension.
 
     Binding convention: `config.json` names a strategy (["strategy": "jacobs_ladder"]);
-    the loader tries `strategies/<name>.strategy`, then `.json`, then the same pair under
-    `strategies/private/` for local-only strategies. A mismatch between the filename and
-    the declared name fails in the caller (config load). *)
+    the loader tries `strategies/<name>.strategy`, then `.json`. A mismatch between the
+    filename and the declared name fails in the caller (config load). *)
 
 let strateg_dir = "strategies"
 let private_dir = Filename.concat strateg_dir "private"
 let strateg_exts = [ ".strategy"; ".json" ]
 
-(** Path of the first existing file for [name], public before private. *)
+(** Path of the first existing file for [name] in resolution order. *)
 let locate ~(name : string) : string option =
   let candidates =
     List.concat_map
@@ -35,11 +34,9 @@ let load ~(name : string) : (string * Strategy_file.t, string) result =
   | None ->
     Error
       (Printf.sprintf
-         "no strategy file for %S (tried %s/<name>.strategy|.json and           \
-          %s/<name>.strategy|.json)"
+         "no strategy file for %S (tried %s/<name>.strategy|.json)"
          name
-         strateg_dir
-         private_dir)
+         strateg_dir)
   | Some path ->
     (match parse_file ~path with
      | Ok f -> Ok (path, f)

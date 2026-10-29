@@ -604,7 +604,16 @@ module Hyperliquid_impl = struct
   ;;
 
   let get_open_order ~symbol ~order_id =
-    match Hyperliquid_executions_feed.get_open_order symbol order_id with
+    let found =
+      match Hyperliquid_executions_feed.get_open_order symbol order_id with
+      | Some _ as o -> o
+      | None ->
+        (* The order can be filed under the registered spot pair even when the caller
+           reads it by the bare perp coin (placement injection vs the order-updates feed).
+           Fall back to the global id index so both keys resolve the same order. *)
+        Hyperliquid_executions_feed.find_order_everywhere order_id
+    in
+    match found with
     | Some o ->
       Some
         { Types.order_id = o.order_id

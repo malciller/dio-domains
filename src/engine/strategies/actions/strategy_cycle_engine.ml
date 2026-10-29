@@ -482,6 +482,26 @@ let drain_credit c =
 let cycle_facts c (t : Strategy_runtime.t) =
   drain_credit c;
   let state = c.cg_state in
+  (* The grid's reserve subtraction is [reserved_base - staked_base], so staked base must
+     be refreshed on the grid path too. It used to be set only by [market_facts] (overlay
+     path), leaving the grid with staked=0 and treating an over-reserved book as fully
+     unsellable even when the venue's staked + tradeable holdings covered the reserve. *)
+  (match c.cg_asset, state with
+   | Some asset, Some s ->
+     let base =
+       match String.index_opt asset.symbol '/' with
+       | Some i -> String.sub asset.symbol 0 i
+       | None -> asset.symbol
+     in
+     let staked =
+       match Jac.get_exchange_module asset.exchange with
+       | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+         (try Ex.get_staked_balance ~asset:base with
+          | _ -> 0.0)
+       | None -> 0.0
+     in
+     s.staked_base <- Float.max 0.0 staked
+   | _ -> ());
   let pending, since =
     match state with
     | Some s -> s.tif_recovery_pending, s.tif_recovery_since
