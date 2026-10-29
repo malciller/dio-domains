@@ -21,8 +21,7 @@ Authoring and tooling:
   grammar for syntax highlighting plus a dependency-free LSP client that
   surfaces the same diagnostics `validate` reports.
 - Binding is by convention: `config.json` names a strategy, and the loader tries
-  `strategies/<name>.strategy`, then `.json`, then the same pair under
-  `strategies/private/` for local-only strategies.
+  `strategies/<name>.strategy`, then `.json`.
 
 ## Physical layout
 

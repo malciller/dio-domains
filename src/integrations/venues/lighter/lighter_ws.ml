@@ -507,7 +507,14 @@ let decode_text_frame content : text_frame_kind =
     Atomic.incr msg_counter_account;
     Lighter_executions_feed.process_account_orders_update json;
     Frame_data
-  | "update/account_all" | "snapshot/account_all" | "subscribed/account_all" ->
+  | "update/account_all" ->
+    (* Delta: only the markets that changed are present. Merging keeps every other live
+       position, so a one-market update cannot clear the rest of the book. *)
+    Atomic.incr msg_counter_account;
+    Lighter_balances.process_market_data json;
+    ignore (Lighter_positions.process_account_all ~replace:false json);
+    Frame_data
+  | "snapshot/account_all" | "subscribed/account_all" ->
     Atomic.incr msg_counter_account;
     Lighter_balances.process_market_data json;
     ignore (Lighter_positions.process_account_all json);
@@ -534,9 +541,16 @@ let decode_text_frame content : text_frame_kind =
     let open Yojson.Safe.Util in
     let data = member "data" json in
     let pick f =
-      match f data with
+      (* A successful tx reply often has [data: null] and carries [code] on the envelope.
+         Reading a member of null raises, so fall back instead of failing the whole frame. *)
+      match
+        try f data with
+        | _ -> None
+      with
       | Some v -> Some v
-      | None -> f json
+      | None ->
+        (try f json with
+         | _ -> None)
     in
     let code =
       Option.value (pick (fun j -> to_int_option (member "code" j))) ~default:200

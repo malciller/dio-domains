@@ -687,6 +687,10 @@ let known_overlay_default_keys = [ "exchange"; "symbol"; "inventory"; "params" ]
     [overlay] list is a generic overlay instance. *)
 let controller_overlay_strategy = "carry_overlay"
 
+(** Generic overlay strategy that shares the carry controller's quote-starvation model: it
+    publishes a venue reserve requirement and reserves quote from the grid. *)
+let short_overlay_strategy = "short_overlay"
+
 (** Per-asset carry policy. Percentages are whole numbers in config.json (25, 10, 75, 1,
     50); [min_liq_mult] is a multiple of the mark (2.5), [min_entry_margin_ratio] is a
     margin ratio (2.0). Venue leverage is derived from instrument metadata at startup. *)
@@ -919,6 +923,27 @@ let instance_overlay_json ~context ~name item =
      @ [ "params", overlay_item_params ~context item ])
 ;;
 
+(** Reject the two flow-sized books sharing one perp account: both strategies read and
+    write the net position, so they cannot tell their own leg apart. *)
+let reject_shared_long_short_venue ~context items =
+  let exchange_of name =
+    match List.assoc_opt name items with
+    | Some item ->
+      item
+      |> Yojson.Basic.Util.member "exchange"
+      |> Yojson.Basic.Util.to_string_option
+      |> Option.map normalize_exchange
+    | None -> None
+  in
+  match exchange_of "long_overlay", exchange_of short_overlay_strategy with
+  | Some long_venue, Some short_venue when String.equal long_venue short_venue ->
+    config_error
+      context
+      "long_overlay and short_overlay must use different perp venues; they would share \
+       one net position"
+  | _ -> ()
+;;
+
 (** Pre-list configs put the carry params directly on the overlay object. Hoist them under
     [params] so both spellings keep working. *)
 let hoist_overlay_params item =
@@ -1009,6 +1034,13 @@ let normalize_flat_entry entry =
       ~defaults:(`Assoc [])
       (entry |> Yojson.Basic.Util.member "overlay")
   in
+  if List.exists (fun (name, _) -> String.equal name controller_overlay_strategy) items
+     && List.exists (fun (name, _) -> String.equal name short_overlay_strategy) items
+  then
+    config_error
+      "overlay"
+      "declares both carry_overlay and short_overlay; they would share one perp position";
+  reject_shared_long_short_venue ~context:"overlay" items;
   match items with
   | [] -> entry
   | _ ->
@@ -1142,6 +1174,16 @@ let flatten_grouped_trading json =
         let controller_item =
           overlay_controller_item ~context:overlay_context overlay_items
         in
+        if Option.is_some controller_item
+           && List.exists
+                (fun (name, _) -> String.equal name short_overlay_strategy)
+                overlay_items
+        then
+          config_error
+            overlay_context
+            "declares both carry_overlay and short_overlay; they would share one perp \
+             position";
+        reject_shared_long_short_venue ~context:overlay_context overlay_items;
         let overlay_json =
           match controller_item with
           | Some (name, item) ->
@@ -1783,11 +1825,10 @@ let read_config () : config =
           | None ->
             Logging.critical_f
               ~section
-              "Strategy file for %s/%s does not exist (tried strategies/<name>.strategy, \
-               strategies/<name>.json, strategies/private/<name>.strategy, and \
-               strategies/private/<name>.json). Strategy files must be deployed \
-               alongside config.json (e.g. /app/strategies); refusing to start with no \
-               strategy bound."
+              "Strategy file for %s/%s does not exist (tried strategies/<name>.strategy \
+               and strategies/<name>.json). Strategy files must be deployed alongside \
+               config.json (e.g. /app/strategies); refusing to start with no strategy \
+               bound."
               t.exchange
               t.symbol;
             exit 1
@@ -1824,9 +1865,8 @@ let read_config () : config =
           Logging.critical_f
             ~section
             "Overlay strategy file for %s/%s does not exist (tried \
-             strategies/<name>.strategy, strategies/<name>.json, \
-             strategies/private/<name>.strategy, and strategies/private/<name>.json). \
-             Refusing to start with a half-bound overlay."
+             strategies/<name>.strategy and strategies/<name>.json). Refusing to start \
+             with a half-bound overlay."
             c.oc_hedge_exchange
             c.oc_hedge_symbol;
           exit 1
@@ -1862,9 +1902,8 @@ let read_config () : config =
           Logging.critical_f
             ~section
             "Overlay strategy file for %s/%s (%s) does not exist (tried \
-             strategies/<name>.strategy, strategies/<name>.json, \
-             strategies/private/<name>.strategy, and strategies/private/<name>.json). \
-             Refusing to start with a half-bound overlay."
+             strategies/<name>.strategy and strategies/<name>.json). Refusing to start \
+             with a half-bound overlay."
             o.oi_owner_exchange
             o.oi_owner_symbol
             o.oi_strategy;

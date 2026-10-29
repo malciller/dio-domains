@@ -40,21 +40,6 @@
           "data_feed": "iex"
         }
       },
-      // Overlays are optional and keyed by name. An asset's "overlay" list inherits
-      // the matching block here. carry_overlay is the engine-integrated inventory
-      // hedge; any other name is an additional generic overlay strategy.
-      "overlay": {
-        "carry_overlay": {
-          "exchange": "hyperliquid",
-          "params": {
-            // true: full spot holdings (open-sell base included); false: accumulated basis.
-            "full_balance_ref": false,
-            "min_entry_margin_ratio": 1.0,
-            "min_liq_mult": 1.0,
-            "recycle_base_share_pct": 0
-          }
-        }
-      },
       "oracle": {
         "target_survival": 0.95,
         "min_active_dsurv": 0.0,
@@ -81,22 +66,7 @@
           "qty": "0.0001",
           "grid_interval": [0.1, 0.5],
           "cpu_priority": 10
-        },
-        "overlay": [
-          {
-            "name": "carry_overlay",
-            "params": {
-              "start_ratio_pct": 25,
-              "add_threshold_pct": 10,
-              "max_ratio_pct": 75,
-              "short_tp_roe": 5,
-              "recycle_base_share_pct": 50
-            },
-            "inventory": [
-              { "exchange": "kraken", "symbol": "BTC/USD" }
-            ]
-          }
-        ]
+        }
       },
       {
         "asset": "SPY",

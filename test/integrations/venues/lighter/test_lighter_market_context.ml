@@ -157,7 +157,7 @@ let test_open_orders () =
 
 let test_ws_routing () =
   reset_context ();
-  Lighter.Instruments_feed.initialize [ "TESTROUTE" ];
+  Lighter.Instruments_feed.initialize [ "TESTROUTE"; "TESTOTHER" ];
   ignore
     (Lighter.Ws.decode_text_frame
        (Yojson.Safe.to_string
@@ -169,6 +169,24 @@ let test_ws_routing () =
     true
     (Dio_exchange.Market_context.get_position ~exchange:"lighter" ~coin:"TESTROUTE"
      <> None);
+  (* A delta for another market must not clear TESTROUTE. *)
+  ignore
+    (Lighter.Ws.decode_text_frame
+       (Yojson.Safe.to_string
+          (json
+             {|{"type":"update/account_all","channel":"account_all:1","positions":{"1":{"market_id":1,"symbol":"TESTOTHER","sign":1,"position":"2","avg_entry_price":"20","position_value":"40","allocated_margin":"4"}}}|})));
+  check
+    bool
+    "delta keeps the untouched market"
+    true
+    (Dio_exchange.Market_context.get_position ~exchange:"lighter" ~coin:"TESTROUTE"
+     <> None);
+  check
+    bool
+    "delta adds its own market"
+    true
+    (Dio_exchange.Market_context.get_position ~exchange:"lighter" ~coin:"TESTOTHER"
+     <> None);
   ignore
     (Lighter.Ws.decode_text_frame
        (Yojson.Safe.to_string
@@ -178,7 +196,14 @@ let test_ws_routing () =
     bool
     "funding routed"
     true
-    (Dio_exchange.Market_context.get_funding ~exchange:"lighter" ~coin:"TESTROUTE" <> None)
+    (Dio_exchange.Market_context.get_funding ~exchange:"lighter" ~coin:"TESTROUTE" <> None);
+  (* A successful tx reply can carry [data: null] with the code on the envelope. *)
+  match
+    Lighter.Ws.decode_text_frame
+      {|{"type":"jsonapi/sendtx","data":null,"code":200,"id":"1"}|}
+  with
+  | Lighter.Ws.Frame_tx_ack (200, "") -> ()
+  | _ -> fail "envelope tx code not read"
 ;;
 
 let test_oracle () =
@@ -260,6 +285,60 @@ let test_capabilities () =
   | None -> fail "oracle capability missing"
 ;;
 
+let test_position_delta_merge () =
+  reset_context ();
+  Lighter.Instruments_feed.initialize [ "TESTBTC"; "TESTETH" ];
+  let snapshot =
+    json
+      {|{"channel":"account_all:1","positions":{"0":{"market_id":0,"symbol":"TESTBTC","sign":1,"position":"1","avg_entry_price":"100","position_value":"100","allocated_margin":"10"},"1":{"market_id":1,"symbol":"TESTETH","sign":1,"position":"2","avg_entry_price":"2000","position_value":"4000","allocated_margin":"20"}}}|}
+  in
+  check bool "full snapshot applied" true (Lighter.Positions.process_account_all snapshot);
+  let delta_btc =
+    json
+      {|{"channel":"account_all:1","positions":{"0":{"market_id":0,"symbol":"TESTBTC","sign":1,"position":"1.5","avg_entry_price":"100","position_value":"150","allocated_margin":"15"}}}|}
+  in
+  check
+    bool
+    "BTC delta applied"
+    true
+    (Lighter.Positions.process_account_all ~replace:false delta_btc);
+  (match Dio_exchange.Market_context.get_position ~exchange:"lighter" ~coin:"TESTBTC" with
+   | Some p -> check (float 1e-12) "BTC updated" 1.5 p.qty
+   | None -> fail "BTC delta cleared the position");
+  (match Dio_exchange.Market_context.get_position ~exchange:"lighter" ~coin:"TESTETH" with
+   | Some p -> check (float 1e-12) "ETH retained" 2.0 p.qty
+   | None -> fail "a BTC-only delta cleared ETH");
+  let close_eth =
+    json
+      {|{"channel":"account_all:1","positions":{"1":{"market_id":1,"symbol":"TESTETH","sign":1,"position":"0","avg_entry_price":"2000","position_value":"0","allocated_margin":"0"}}}|}
+  in
+  check
+    bool
+    "ETH close applied"
+    true
+    (Lighter.Positions.process_account_all ~replace:false close_eth);
+  check
+    bool
+    "ETH removed"
+    true
+    (Dio_exchange.Market_context.get_position ~exchange:"lighter" ~coin:"TESTETH" = None);
+  (match Dio_exchange.Market_context.get_position ~exchange:"lighter" ~coin:"TESTBTC" with
+   | Some p -> check (float 1e-12) "BTC retained" 1.5 p.qty
+   | None -> fail "an ETH close cleared BTC");
+  check
+    bool
+    "empty delta is a no-op"
+    true
+    (Lighter.Positions.process_account_all
+       ~replace:false
+       (json {|{"channel":"account_all:1","positions":{}}|}));
+  check
+    bool
+    "BTC survives empty delta"
+    true
+    (Dio_exchange.Market_context.get_position ~exchange:"lighter" ~coin:"TESTBTC" <> None)
+;;
+
 let test_position_retention () =
   reset_context ();
   (* Market 0 only: market 5 is unknown to the instruments feed, so a frame without a
@@ -274,6 +353,7 @@ let test_position_retention () =
           {|{"channel":"account_all:1","positions":{"5":{"market_id":5,"symbol":"TESTBTC","sign":1,"position":"0.5","avg_entry_price":"100","position_value":"50","allocated_margin":"10"}}}|}));
   ignore
     (Lighter.Positions.process_account_all
+       ~replace:false
        (json
           {|{"channel":"account_all:1","positions":{"5":{"market_id":5,"sign":1,"position":"0.5","avg_entry_price":"100","position_value":"50","allocated_margin":"10"}}}|}));
   (match Dio_exchange.Market_context.get_position ~exchange:"lighter" ~coin:"TESTBTC" with
@@ -282,6 +362,7 @@ let test_position_retention () =
   (* An unresolvable node is skipped instead of taking the resolved one with it. *)
   ignore
     (Lighter.Positions.process_account_all
+       ~replace:false
        (json
           {|{"channel":"account_all:1","positions":{"5":{"market_id":5,"sign":1,"position":"0.5"},"9":{"market_id":9,"sign":1,"position":"1"}}}|}));
   check
@@ -299,6 +380,7 @@ let () =
     ; ( "positions"
       , [ test_case "positions and margin" `Quick test_positions_and_margin
         ; test_case "REST snapshot" `Quick test_rest_snapshot
+        ; test_case "position delta merge" `Quick test_position_delta_merge
         ; test_case "position retention" `Quick test_position_retention
         ; test_case "open orders" `Quick test_open_orders
         ; test_case "WS routing" `Quick test_ws_routing

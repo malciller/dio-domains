@@ -109,8 +109,7 @@ COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 # 5b'. Strategy files. The engine resolves each config entry's `strategy` to
-#      strategies/<name>.strategy, then .json, then the same pair under
-#      strategies/private/ for local-only strategies. Baked into the image at
+#      strategies/<name>.strategy, then .json. Baked into the image at
 #      /app/strategies (the engine's cwd).
 COPY --from=builder /app/strategies /app/strategies
 
