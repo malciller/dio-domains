@@ -31,6 +31,15 @@ let is_kraken_rate_limited name reason =
       || contains_substring reason "rate limit")
 ;;
 
+(** A pong proves the transport, not that the venue is still pushing data. Event-driven
+    connections (no data timeout) have no other liveness signal, so they refresh the data
+    heartbeat on a pong; streamed connections keep it honest. *)
+let note_pong conn = if Option.is_none conn.data_timeout_s then update_data_heartbeat conn
+
+(* A connection that holds this long has proven itself; its next failure starts from the
+   bottom of the backoff instead of inheriting earlier flaps. *)
+let reconnect_stability_s = 300.0
+
 let monitor_loop () =
   let cycle_count = ref 0 in
   let last_market_open = ref (Ibkr.Market_hours.is_market_open ()) in
@@ -102,8 +111,18 @@ let monitor_loop () =
                   let last_disconnected = conn.last_disconnected in
                   let last_connecting = conn.last_connecting in
                   let last_data_received = conn.last_data_received in
+                  let last_connected = conn.last_connected in
                   let has_connect_fn = Option.is_some conn.connect_fn in
                   Mutex.unlock conn.mutex;
+                  (match state, last_connected with
+                   | Connected, Some since
+                     when attempts > 0 && current_time -. since >= reconnect_stability_s
+                     ->
+                     Mutex.lock conn.mutex;
+                     if conn.reconnect_attempts = attempts
+                     then conn.reconnect_attempts <- 0;
+                     Mutex.unlock conn.mutex
+                   | _ -> ());
                   match state, has_connect_fn with
                   | Failed reason, true ->
                     Mutex.lock conn.mutex;
@@ -121,7 +140,8 @@ let monitor_loop () =
                         let rate_limited = is_kraken_rate_limited conn.name reason in
                         let max_delay =
                           if String.equal conn.name "ibkr_gateway"
-                             || String.equal conn.name "lighter_ws"
+                             || String.equal conn.name "lighter_public_ws"
+                             || String.equal conn.name "lighter_private_ws"
                           then 300.0
                           else 30.0
                         in
@@ -197,14 +217,20 @@ let monitor_loop () =
                           set_state conn (Failed "Market closed"))
                         else start_async conn))
                   | Connected, _ ->
-                    let data_fresh =
+                    let data_age_s =
                       match last_data_received with
-                      | Some t -> current_time -. t <= 60.0
+                      | Some t -> Some (current_time -. t)
+                      | None -> None
+                    in
+                    let data_fresh =
+                      match data_age_s with
+                      | Some age -> age <= 60.0
                       | None -> false
                     in
                     if String.equal conn.name "kraken_auth_ws"
                        || String.equal conn.name "hyperliquid_ws"
-                       || String.equal conn.name "lighter_ws"
+                       || String.equal conn.name "lighter_public_ws"
+                       || String.equal conn.name "lighter_private_ws"
                        || String.equal conn.name "alpaca_data_ws"
                        || String.equal conn.name "alpaca_trading_ws"
                     then (
@@ -229,7 +255,7 @@ let monitor_loop () =
                                 if response.success
                                 then (
                                   Atomic.set conn.ping_failures 0;
-                                  update_data_heartbeat conn;
+                                  note_pong conn;
                                   Lwt.return_unit)
                                 else (
                                   Logging.warn_f
@@ -258,7 +284,7 @@ let monitor_loop () =
                                 if success
                                 then (
                                   Atomic.set conn.ping_failures 0;
-                                  update_data_heartbeat conn;
+                                  note_pong conn;
                                   Lwt.return_unit)
                                 else (
                                   Logging.warn_f
@@ -276,16 +302,22 @@ let monitor_loop () =
                                   (Printexc.to_string exn);
                                 Atomic.incr conn.ping_failures;
                                 Lwt.return_unit)
-                          else if String.equal conn.name "lighter_ws"
+                          else if String.equal conn.name "lighter_public_ws"
+                                  || String.equal conn.name "lighter_private_ws"
                           then
                             Lwt.catch
                               (fun () ->
-                                Lighter.Ws.send_ping ~req_id ~timeout_ms:5000
+                                let leg : Lighter.Ws.leg =
+                                  if String.equal conn.name "lighter_public_ws"
+                                  then Public
+                                  else Private
+                                in
+                                Lighter.Ws.send_ping ~leg ~req_id ~timeout_ms:5000
                                 >>= fun success ->
                                 if success
                                 then (
                                   Atomic.set conn.ping_failures 0;
-                                  update_data_heartbeat conn;
+                                  note_pong conn;
                                   Lwt.return_unit)
                                 else (
                                   Logging.warn_f
@@ -312,7 +344,7 @@ let monitor_loop () =
                                 if success
                                 then (
                                   Atomic.set conn.ping_failures 0;
-                                  update_data_heartbeat conn;
+                                  note_pong conn;
                                   Lwt.return_unit)
                                 else (
                                   Logging.warn_f
@@ -339,7 +371,7 @@ let monitor_loop () =
                                 if success
                                 then (
                                   Atomic.set conn.ping_failures 0;
-                                  update_data_heartbeat conn;
+                                  note_pong conn;
                                   Lwt.return_unit)
                                 else (
                                   Logging.warn_f
@@ -360,8 +392,11 @@ let monitor_loop () =
                           else Lwt.return_unit));
                       let ping_failures = Atomic.get conn.ping_failures in
                       if ping_failures >= 3
-                      then
-                        if data_fresh
+                      then (
+                        (* Fresh data proves the probe is wrong; a pong-only connection
+                           gets its freshness from [note_pong]. *)
+                        let probe_tolerated = data_fresh in
+                        if probe_tolerated
                         then (
                           Atomic.set conn.ping_failures 0;
                           Logging.debug_f
@@ -377,16 +412,16 @@ let monitor_loop () =
                              connection as failed"
                             conn.name
                             ping_failures;
-                          set_state conn (Failed "ping timeout")));
-                    (match last_data_received with
-                     | Some last_data when current_time -. last_data > 60.0 ->
+                          set_state conn (Failed "ping timeout"))));
+                    (match conn.data_timeout_s, data_age_s with
+                     | Some limit, Some age when age > limit ->
                        if not (String.equal conn.name "ibkr_gateway")
                        then (
                          Logging.warn_f
                            ~section
                            "[%s] No data received for %.0fs, marking connection as failed"
                            conn.name
-                           (current_time -. last_data);
+                           age;
                          set_state conn (Failed "data timeout"))
                      | _ -> ())
                   | _ -> ())

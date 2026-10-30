@@ -19,6 +19,7 @@ module Token_store = Supervisor_connection.Token_store
 
 let register = Supervisor_connection.register
 let register_for_monitoring = Supervisor_connection.register_for_monitoring
+let set_data_timeout = Supervisor_connection.set_data_timeout
 let set_state = Supervisor_connection.set_state
 let get_state = Supervisor_connection.get_state
 let get_uptime = Supervisor_connection.get_uptime

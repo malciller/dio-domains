@@ -202,6 +202,32 @@ module Hyperliquid_impl = struct
     | Error e -> Error e
   ;;
 
+  (** Live order id from an [orderStatus] payload. The WS info envelope nests the REST
+      payload under [data]; the bare REST shape is accepted too. *)
+  let parse_order_status_payload (payload : Yojson.Safe.t) : string option =
+    let open Yojson.Safe.Util in
+    let payload =
+      match payload |> member "data" with
+      | `Null -> payload
+      | data -> data
+    in
+    match payload |> member "status" |> to_string_option with
+    | Some "order" ->
+      let order = payload |> member "order" in
+      (match order |> member "status" |> to_string_option with
+       | Some "open" ->
+         (match
+            order |> member "order" |> member "oid" |> Hyperliquid_actions.to_int64_opt
+          with
+          | Some id -> Some (Int64.to_string id)
+          | None ->
+            (match order |> member "oid" |> Hyperliquid_actions.to_int64_opt with
+             | Some id -> Some (Int64.to_string id)
+             | None -> None))
+       | _ -> None)
+    | _ -> None
+  ;;
+
   (** Resolve the replacement order id for a modify whose acknowledgement carries no oid.
 
       Hyperliquid implements modify as cancel+replace, but the acknowledgement normally
@@ -209,7 +235,7 @@ module Hyperliquid_impl = struct
       are linked by the cloid we supply, and the replacement arrives on the order-updates
       channel. Prefer the local feed (the update usually beats the ack); fall back to an
       authoritative [orderStatus] lookup by cloid when the WS update was dropped. *)
-  let query_order_status_by_cloid_ws cloid =
+  let query_order_status_by_cloid_ws ?(timeout_ms = 3000) cloid =
     match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" |> Option.map String.trim with
     | None | Some "" -> Lwt.return_none
     | Some wallet ->
@@ -235,7 +261,7 @@ module Hyperliquid_impl = struct
         in
         Lwt.catch
           (fun () ->
-            Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:3000
+            Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms
             >>= fun resp_frame ->
             let open Yojson.Safe.Util in
             let payload =
@@ -244,27 +270,7 @@ module Hyperliquid_impl = struct
               with
               | _ -> `Null
             in
-            match payload |> member "status" |> to_string_option with
-            | Some "order" ->
-              let order = payload |> member "order" in
-              (match order |> member "status" |> to_string_option with
-               | Some "open" ->
-                 let oid =
-                   match
-                     order
-                     |> member "order"
-                     |> member "oid"
-                     |> Hyperliquid_actions.to_int64_opt
-                   with
-                   | Some id -> Some (Int64.to_string id)
-                   | None ->
-                     (match order |> member "oid" |> Hyperliquid_actions.to_int64_opt with
-                      | Some id -> Some (Int64.to_string id)
-                      | None -> None)
-                 in
-                 Lwt.return oid
-               | _ -> Lwt.return_none)
-            | _ -> Lwt.return_none)
+            Lwt.return (parse_order_status_payload payload))
           (fun exn ->
             Logging.debug_f
               ~section
@@ -274,24 +280,30 @@ module Hyperliquid_impl = struct
             Lwt.return_none))
   ;;
 
+  (** The cloid links both legs of the cancel-replace; any live order under it that is not
+      the superseded id is the replacement. *)
+  let find_replacement_by_cloid ~cloid ~old_order_id =
+    match Hyperliquid_executions_feed.find_order_by_cloid cloid with
+    | Some o when String.equal o.order_id old_order_id -> None
+    | Some o -> Some o.order_id
+    | None -> None
+  ;;
+
+  (** Poll the lock-free order cache for the replacement. The order-updates push usually
+      wins within a few frames; the authoritative lookup covers a dropped update. Do not
+      wait on a condition variable here: [publish_open_orders_cache] runs under the
+      per-symbol order mutex, and waking an amend continuation from that lock can re-enter
+      [remove_open_order]/[inject_order] on the same thread. *)
   let resolve_amend_replacement ~cloid ~old_order_id =
-    let find () =
-      match Hyperliquid_executions_feed.find_order_by_cloid cloid with
-      | Some o when String.equal o.order_id old_order_id -> None
-      | Some o -> Some o.order_id
-      | None -> None
-    in
     let rec wait remaining =
-      match find () with
+      match find_replacement_by_cloid ~cloid ~old_order_id with
       | Some oid -> Lwt.return (Some oid)
       | None when remaining > 0 -> Lwt_unix.sleep 0.025 >>= fun () -> wait (remaining - 1)
       | None -> Lwt.return_none
     in
-    match find () with
+    match find_replacement_by_cloid ~cloid ~old_order_id with
     | Some oid -> Lwt.return (Some oid)
     | None ->
-      (* Give the order-updates push a brief head start before spending a round trip on
-         the authoritative lookup. *)
       wait 8
       >>= (function
        | Some oid -> Lwt.return (Some oid)

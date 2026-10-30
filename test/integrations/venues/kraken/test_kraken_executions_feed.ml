@@ -305,6 +305,53 @@ let make_open_sell ~id ~symbol ~qty ~price =
   }
 ;;
 
+let make_open_buy ~id ~symbol ~qty ~price =
+  { Kraken.Kraken_executions_feed.order_id = id
+  ; symbol
+  ; exec_type = Kraken.Kraken_executions_feed.Restated
+  ; order_status = Kraken.Kraken_executions_feed.NewStatus
+  ; side = Kraken.Kraken_executions_feed.Buy
+  ; order_qty = qty
+  ; cum_qty = 0.0
+  ; cum_cost = 0.0
+  ; avg_price = price
+  ; limit_price = Some price
+  ; last_qty = None
+  ; last_price = None
+  ; fee = None
+  ; trade_id = None
+  ; order_userref = None
+  ; cl_ord_id = None
+  ; timestamp = Unix.gettimeofday ()
+  ; venue_time = 0.0
+  }
+;;
+
+let test_remove_open_order_releases_quote_hold () =
+  (* Regression: a cancel response must retire the order locally. The quote hold that caps
+     the account's tradeable balance is derived from this cache, so a late or dropped WS
+     canceled echo leaves the freed funds invisible to the capital oracle and the account
+     looks permanently starved. *)
+  let symbol = "REMOVETEST/USD" in
+  Kraken.Kraken_executions_feed.inject_open_orders
+    [ make_open_buy ~id:"remove-test-buy" ~symbol ~qty:50.0 ~price:0.1683 ];
+  let hold_before = Kraken.Kraken_balances_feed.get_pending_buy_quote_value "USD" in
+  Alcotest.(check bool)
+    "resting buy holds quote"
+    true
+    (hold_before >= (50.0 *. 0.1683) -. 1e-9);
+  Kraken.Kraken_executions_feed.remove_open_order ~symbol ~order_id:"remove-test-buy";
+  Alcotest.(check int)
+    "order retired from cache"
+    0
+    (List.length (Kraken.Kraken_executions_feed.get_open_orders symbol));
+  let hold_after = Kraken.Kraken_balances_feed.get_pending_buy_quote_value "USD" in
+  Alcotest.(check bool)
+    "quote hold released"
+    true
+    (hold_after <= hold_before -. (50.0 *. 0.1683) +. 1e-9)
+;;
+
 let test_inject_pre_existing_open_sell () =
   (* Regression: orders existing before process start (or beyond the WS snap_orders cap)
      must be adoptable. The REST /OpenOrders bootstrap injects them into the same cache
@@ -378,6 +425,10 @@ let () =
             "pre-existing open sells can be injected"
             `Quick
             test_inject_pre_existing_open_sell
+        ; Alcotest.test_case
+            "cancel retires the order and releases its quote hold"
+            `Quick
+            test_remove_open_order_releases_quote_hold
         ; Alcotest.test_case
             "snapshot fires the open-orders restore hook"
             `Quick

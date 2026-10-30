@@ -74,6 +74,7 @@ let register ~name ~connect_fn =
     ; circuit_breaker_failures = 0
     ; circuit_breaker_last_failure = None
     ; connect_fn
+    ; data_timeout_s = None
     ; mutex = Mutex.create ()
     }
   in
@@ -105,7 +106,8 @@ let register_for_monitoring ~name =
     ; circuit_breaker_last_failure = None
     ; connect_fn = None
     ; (* [None] disables reconnection. *)
-      mutex = Mutex.create ()
+      data_timeout_s = None
+    ; mutex = Mutex.create ()
     }
   in
   Hashtbl.replace connections name conn;
@@ -127,7 +129,6 @@ let set_state conn new_state =
      conn.last_data_received <- Some (Unix.time ());
      conn.last_ping_sent <- None;
      Atomic.set conn.ping_failures 0;
-     conn.reconnect_attempts <- 0;
      conn.total_connections <- conn.total_connections + 1;
      Logging.info_f
        ~section
@@ -195,6 +196,11 @@ let set_connect_fn conn connect_fn =
   conn.connect_fn <- connect_fn;
   Mutex.unlock conn.mutex
 ;;
+
+(** Sets how long the connection may go without venue data before the monitor fails it.
+    Opt-in: only feeds that expect a continuous stream set this. Must be set before the
+    connection starts. *)
+let set_data_timeout conn timeout_s = conn.data_timeout_s <- timeout_s
 
 (** Records current time as the last data heartbeat for this connection. *)
 let update_data_heartbeat conn =

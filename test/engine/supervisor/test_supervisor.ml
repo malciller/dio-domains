@@ -133,13 +133,13 @@ let test_data_heartbeat () =
 
 let test_connection_metrics () =
   let conn = Supervisor.register_for_monitoring ~name:"metrics_test" in
-  let initial_attempts = conn.reconnect_attempts in
   let initial_total = conn.total_connections in
-  (* Connected transition increments total_connections. *)
+  (* Only a sustained healthy period clears the backoff, so a connect preserves it. *)
+  conn.reconnect_attempts <- 3;
   Supervisor.set_state conn Supervisor_types.Connected;
   Alcotest.(check int)
-    "reconnect attempts unchanged"
-    initial_attempts
+    "reconnect attempts preserved across connect"
+    3
     conn.reconnect_attempts;
   Alcotest.(check int)
     "total connections incremented"

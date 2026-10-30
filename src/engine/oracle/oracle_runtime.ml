@@ -1054,30 +1054,48 @@ let string_of_branch = function
 (** A senior strategy's standing claim on capital being released by a lower-priority
     cancel.
 
-    The reservation is released by the event that decides it: every flagged resting buy
-    leaving the venue's open-order book (cancelled or filled). That is read from the live
-    open-order store on the next pass - no wall clock, no TTL. If the buy is still
-    resting, the capital is still committed and holding the juniors is the correct state. *)
+    The reservation must outlive the cancel ack. The order leaves the exec feed before the
+    balance feed shows the freed quote; releasing on "flagged buy gone" lets a junior
+    re-place into that window and restarts the cascade. The reservation therefore clears
+    only when the senior actually funds (or stops being a survivor), with a TTL as the
+    failure backstop if the freed quote never appears. *)
 type reclaim_reservation =
   { rr_senior : string (** [key_of_task] of the senior awaiting the freed quote. *)
   ; rr_reserved : float (** Quote reserved for it (its next buy's need). *)
   ; rr_cancelled_keys : string list
-  (** Strategies whose resting buys the cascade flagged. The reservation clears when none
-      of them still has a resting buy. *)
+  (** Strategies whose resting buys the cascade flagged (diagnostics). *)
+  ; rr_at : int64 (** Monotonic ns when the reservation was taken, for the TTL. *)
   }
 
-(** Reads the venue's live open-order cache, which is already the allocation input. *)
-let reclaim_claim_released key =
-  match String.split_on_char '|' key with
-  | [ exchange; symbol ] ->
-    let resting_buy, committed, _ = open_orders_summary ~exchange ~symbol in
-    (not resting_buy) || committed <= 1e-9
-  | _ -> true
-;;
+let reclaim_ttl_s = 30.0
+let reclaim_ttl_ns = Int64.of_float (reclaim_ttl_s *. 1e9)
 
 (** Per-account reservation, keyed by [account_id]. Written and read only on the pass
     loop. *)
 let reclaim_reservations : (string, reclaim_reservation) Hashtbl.t = Hashtbl.create 8
+
+(** One retry fiber per account while a reservation is live: the cancel wake can land
+    before the venue's stores drop the freed order. *)
+let reclaim_retrying : (string, unit) Hashtbl.t = Hashtbl.create 8
+
+let rec retry_reclaim acct_id =
+  if Hashtbl.mem reclaim_reservations acct_id
+  then (
+    Lwt_unix.sleep 0.25
+    >>= fun () ->
+    request_pass ();
+    retry_reclaim acct_id)
+  else (
+    Hashtbl.remove reclaim_retrying acct_id;
+    Lwt.return_unit)
+;;
+
+let start_reclaim_retry acct_id =
+  if not (Hashtbl.mem reclaim_retrying acct_id)
+  then (
+    Hashtbl.add reclaim_retrying acct_id ();
+    Lwt.async (fun () -> retry_reclaim acct_id))
+;;
 
 let run_account_pass
   ~(config : runtime_config)
@@ -1107,16 +1125,17 @@ let run_account_pass
       match Hashtbl.find_opt reclaim_reservations acct_id with
       | None -> None
       | Some r ->
-        if List.exists (fun key -> not (reclaim_claim_released key)) r.rr_cancelled_keys
-        then Some r
-        else (
+        if Int64.sub (Mtime_clock.now_ns ()) r.rr_at > reclaim_ttl_ns
+        then (
           Hashtbl.remove reclaim_reservations acct_id;
-          Logging.info_f
+          Logging.warn_f
             ~section
-            "reclaim reservation released for %s: flagged resting buys are gone (%s)"
+            "reclaim reservation expired for %s: %s did not fund within %.0fs"
             acct_id
-            r.rr_senior;
+            r.rr_senior
+            reclaim_ttl_s;
           None)
+        else Some r
     in
     let reserved_senior = Option.map (fun r -> r.rr_senior) reservation in
     (* Open-order summaries and config bounds are invariant across the pass, so resolve
@@ -1397,7 +1416,12 @@ let run_account_pass
                     Hashtbl.replace
                       reclaim_reservations
                       acct_id
-                      { rr_senior = key; rr_reserved = need; rr_cancelled_keys = plan };
+                      { rr_senior = key
+                      ; rr_reserved = need
+                      ; rr_cancelled_keys = plan
+                      ; rr_at = Mtime_clock.now_ns ()
+                      };
+                    start_reclaim_retry acct_id;
                     reserved_priority := Some priority;
                     Logging.info_f
                       ~section

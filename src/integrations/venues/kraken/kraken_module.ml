@@ -215,14 +215,7 @@ module Kraken_impl = struct
   (** Cancel one or more orders via [Kraken_actions.cancel_orders]. Accepts any
       combination of order_ids, cl_ord_ids, or order_userrefs. Returns a list of
       [Types.cancel_order_result] on success. *)
-  let cancel_orders
-    ~token
-    ?order_ids
-    ?cl_ord_ids
-    ?order_userrefs
-    ?symbol:_
-    ?retry_config
-    ()
+  let cancel_orders ~token ?order_ids ?cl_ord_ids ?order_userrefs ?symbol ?retry_config ()
     =
     let actual_retry_config = convert_retry_config retry_config in
     Kraken_actions.cancel_orders
@@ -237,6 +230,16 @@ module Kraken_impl = struct
       let mapped =
         List.map
           (fun (r : Kraken_common_types.cancel_order_result) ->
+            (* Eagerly retire the cancelled order so its quote/base hold stops capping the
+               tradeable balance now, not whenever the executions echo lands. *)
+            (match
+               match Kraken_executions_feed.find_order_everywhere r.order_id with
+               | Some o -> Some o.symbol
+               | None -> symbol
+             with
+             | Some s ->
+               Kraken_executions_feed.remove_open_order ~symbol:s ~order_id:r.order_id
+             | None -> ());
             { Types.order_id = r.order_id; cl_ord_id = r.cl_ord_id })
           res_list
       in

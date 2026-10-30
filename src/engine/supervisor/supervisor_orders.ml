@@ -948,8 +948,9 @@ let order_processing_loop () =
       in
       let is_lighter_connected =
         try
-          let lt_conn = Hashtbl.find connections "lighter_ws" in
-          get_state lt_conn = Connected
+          let pub_conn = Hashtbl.find connections "lighter_public_ws" in
+          let priv_conn = Hashtbl.find connections "lighter_private_ws" in
+          get_state pub_conn = Connected && get_state priv_conn = Connected
         with
         | Not_found -> false
       in

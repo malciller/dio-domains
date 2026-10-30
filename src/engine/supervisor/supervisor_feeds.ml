@@ -256,49 +256,79 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
           | exn -> exn)
         __ppx_lwt_0
         (fun () ->
-          let lt_ws_conn = register ~name:"lighter_ws" ~connect_fn:None in
-          let lt_ws_connect_fn () =
+          let lt_public_conn = register ~name:"lighter_public_ws" ~connect_fn:None in
+          (* Books update sub-second; 30s of silence is already an outage. *)
+          set_data_timeout lt_public_conn (Some 30.0);
+          let lt_private_conn = register ~name:"lighter_private_ws" ~connect_fn:None in
+          (* Account channels are event driven: a quiet account sends nothing for minutes. *)
+          set_data_timeout lt_private_conn None;
+          let lt_account_index =
+            match Sys.getenv_opt "LIGHTER_ACCOUNT_INDEX" |> Option.map String.trim with
+            | Some s ->
+              (try int_of_string s with
+               | _ -> 0)
+            | None -> 0
+          in
+          let lt_auth_token = Lighter.Signer.get_auth_token () in
+          (* Cached before dialling so each leg replays only its own channels. *)
+          Lighter.Ws.configure_subscriptions
+            ~symbols:lighter_symbols
+            ~account_index:lt_account_index
+            ~auth_token:lt_auth_token;
+          let lt_public_connect_fn () =
             Lwt.catch
               (fun () ->
-                let on_failure reason = set_state lt_ws_conn (Failed reason) in
-                let on_heartbeat () = update_data_heartbeat lt_ws_conn in
-                let on_connected () =
-                  set_state lt_ws_conn Connected;
-                  let account_index =
-                    match
-                      Sys.getenv_opt "LIGHTER_ACCOUNT_INDEX" |> Option.map String.trim
-                    with
-                    | Some s ->
-                      (try int_of_string s with
-                       | _ -> 0)
-                    | None -> 0
-                  in
-                  let auth_token = Lighter.Signer.get_auth_token () in
-                  Lwt.async (fun () ->
-                    Lighter.Instruments_feed.wait_until_ready ()
-                    >>= fun () ->
-                    Logging.info_f
-                      ~section
-                      "Lighter WS reconnected \226\128\148 resubscribing and rebuilding \
-                       open-order state";
-                    Lighter.Ws.subscribe_to_feeds
-                      ~symbols:lighter_symbols
-                      ~account_index
-                      ~auth_token
-                    >>= fun () -> Lighter.Module.fetch_open_orders ())
-                in
-                Lighter.Ws.connect_and_monitor ~on_failure ~on_connected ~on_heartbeat)
+                let on_failure reason = set_state lt_public_conn (Failed reason) in
+                let on_heartbeat () = update_data_heartbeat lt_public_conn in
+                let on_connected () = set_state lt_public_conn Connected in
+                Lighter.Ws.connect_public_and_monitor
+                  ~on_failure
+                  ~on_connected
+                  ~on_heartbeat)
               (fun exn ->
                 let error_msg = Printexc.to_string exn in
                 Logging.error_f
                   ~section
                   "[%s] Connection failed: %s"
-                  lt_ws_conn.name
+                  lt_public_conn.name
                   error_msg;
-                set_state lt_ws_conn (Failed error_msg);
+                set_state lt_public_conn (Failed error_msg);
                 Lwt.return_unit)
           in
-          Lwt.async lt_ws_connect_fn;
+          set_connect_fn lt_public_conn (Some lt_public_connect_fn);
+          start_async lt_public_conn;
+          let lt_private_connect_fn () =
+            Lwt.catch
+              (fun () ->
+                let on_failure reason = set_state lt_private_conn (Failed reason) in
+                let on_heartbeat () = update_data_heartbeat lt_private_conn in
+                let on_connected () =
+                  set_state lt_private_conn Connected;
+                  Lwt.async (fun () ->
+                    Lighter.Instruments_feed.wait_until_ready ()
+                    >>= fun () ->
+                    Logging.info_f
+                      ~section
+                      "Lighter private WS connected \226\128\148 rebuilding open-order \
+                       state";
+                    Lighter.Module.fetch_open_orders ())
+                in
+                Lighter.Ws.connect_private_and_monitor
+                  ~on_failure
+                  ~on_connected
+                  ~on_heartbeat)
+              (fun exn ->
+                let error_msg = Printexc.to_string exn in
+                Logging.error_f
+                  ~section
+                  "[%s] Connection failed: %s"
+                  lt_private_conn.name
+                  error_msg;
+                set_state lt_private_conn (Failed error_msg);
+                Lwt.return_unit)
+          in
+          set_connect_fn lt_private_conn (Some lt_private_connect_fn);
+          start_async lt_private_conn;
           Lwt.return_unit))
     else Lwt.return_unit
   in
