@@ -1575,8 +1575,13 @@ let asset_domain_worker
       ctx.cg_overlay_accumulated <- -1.0;
       ctx.cg_overlay_has_spot_leg <- false;
       ctx.cg_overlay_spot_symbol <- "";
-      ctx.cg_carry <- None;
-      ctx.cg_state <- None;
+      (* Credits land on the owner grid's accumulation row, as they do for a co-located
+         carry controller. *)
+      ctx.cg_state <- cached_grid_state;
+      ctx.cg_credit_store_key
+      <- (match cached_grid_state with
+          | Some s -> Option.value s.persistence_key ~default:""
+          | None -> "");
       ctx.cg_reserve_share <- reserve_share;
       ctx.cg_credit_key <- "";
       ctx.cg_quote_stale <- false;
@@ -2375,6 +2380,38 @@ let asset_domain_worker
       then (
         open_orders_dirty := true;
         let now_exec = Unix.gettimeofday () in
+        (* Monotonic per scan: the credit is keyed by it so a replayed fill cannot be
+           applied twice and two partials in one scan stay distinct. *)
+        let overlay_fill_seq = ref (int_of_float (now_exec *. 1e6)) in
+        (* Fee class of the fill for this instance's hedge venue, matching how
+           [record_overlay_fill] books carry closes. *)
+        let overlay_fill_fee (ov : overlay_instance_rt) (event : Types.execution_event) =
+          let exchange = ov.oir_config.oi_exchange in
+          let symbol = ov.oir_config.oi_symbol in
+          let maker =
+            match
+              Dio_strategies.Strategy_common.lookup_carry_order ~order_id:event.order_id
+            with
+            | Some meta -> meta.Dio_strategies.Strategy_common.com_maker
+            | None -> false
+          in
+          let default_maker, default_taker =
+            Dio_oracle.Oracle_fees.default_or_configured_fees
+              ~exchange
+              ~symbol
+              ~configured:None
+          in
+          let rate =
+            Dio_strategies.Strategy_venue.resolve_fee_rate
+              ~configured:None
+              ~cached:
+                (if maker
+                 then Dio_strategies.Fee_cache.get_maker_fee ~exchange ~symbol
+                 else Dio_strategies.Fee_cache.get_taker_fee ~exchange ~symbol)
+              ~current:(if maker then default_maker else default_taker)
+          in
+          event.avg_price *. event.filled_qty *. rate
+        in
         let dispatch_generic_overlay_fill (event : Types.execution_event) =
           if overlay_instances <> [] && event.order_status = Types.Filled
           then (
@@ -2398,9 +2435,15 @@ let asset_domain_worker
                 event.filled_qty
                 event.order_id
                 !startup_replay;
+            let fill_seq =
+              let seq = !overlay_fill_seq in
+              incr overlay_fill_seq;
+              seq
+            in
             let fields =
               [ "now", Dio_strategies.Strategy_expr.V_float now_exec
               ; "order_id", Dio_strategies.Strategy_expr.V_string event.order_id
+              ; "seq", Dio_strategies.Strategy_expr.V_int fill_seq
               ; ( "side"
                 , Dio_strategies.Strategy_expr.V_string
                     (match event.side with
@@ -2435,6 +2478,17 @@ let asset_domain_worker
             in
             List.iter
               (fun (ov : overlay_instance_rt) ->
+                let fee =
+                  Dio_strategies.Strategy_expr.V_float (overlay_fill_fee ov event)
+                in
+                let events =
+                  List.map
+                    (fun (name, fs) ->
+                      if String.equal name "filled"
+                      then name, ("fee", fee) :: fs
+                      else name, fs)
+                    events
+                in
                 ignore
                   (run_overlay_cycles ov ~now:now_exec ~price:event.avg_price ~events))
               overlay_instances)
