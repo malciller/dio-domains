@@ -31,6 +31,8 @@ type connection_state =
   ; connected_wakeup : unit Lwt_condition.t
   ; last_pong_time : float ref
   ; pong_condition : unit Lwt_condition.t
+  ; connected_at : float ref
+  ; frames_since_connect : int ref
   }
 
 let create_connection_state () =
@@ -40,14 +42,37 @@ let create_connection_state () =
   ; connected_wakeup = Lwt_condition.create ()
   ; last_pong_time = ref 0.0
   ; pong_condition = Lwt_condition.create ()
+  ; connected_at = ref 0.0
+  ; frames_since_connect = ref 0
   }
 ;;
 
+(* A leg that has delivered no data this long after connecting lost its subscriptions on
+   the way up; the transport is dropped so the supervisor replays them. *)
+let public_first_frame_grace_s = 20.0
+
+(* Account channels snapshot their state on subscribe, so silence here means the replay
+   did not take; the wider window covers slow account snapshots. *)
+let private_first_frame_grace_s = 60.0
 let public_state = create_connection_state ()
 let private_state = create_connection_state ()
 let public_connected () = Atomic.get public_state.is_connected_ref
 let private_connected () = Atomic.get private_state.is_connected_ref
 let is_connected () = public_connected () && private_connected ()
+
+let note_data_frame state =
+  state.frames_since_connect := !(state.frames_since_connect) + 1
+[@@ocaml.doc
+  " Counts venue data frames only. Control frames (pongs, acks) must not count, or an\n\
+  \    unsubscribed-but-ponging leg would look healthy. "]
+;;
+
+let first_frame_overdue ~now ~connected_at ~frames_since_connect ~grace_s =
+  frames_since_connect = 0 && now -. connected_at > grace_s
+[@@ocaml.doc
+  " True when a connected leg has not produced its first data frame inside the grace\n\
+  \    window. Pure so the boundary stays testable. "]
+;;
 
 let wait_for_connected () =
   let wait_one state =
@@ -65,14 +90,6 @@ let pushers : (Yojson.Safe.t option -> bool) list ref = ref []
 ;;
 
 let pushers_mutex = Mutex.create ()
-
-let ping_failures = Atomic.make 0
-[@@ocaml.doc " Consecutive failed ping count, polled by the supervisor. "]
-;;
-
-let reset_ping_failures () = Atomic.set ping_failures 0
-let get_ping_failures () = Atomic.get ping_failures
-let incr_ping_failures () = Atomic.incr ping_failures
 
 let private_stream_confirmed = Atomic.make false
 [@@ocaml.doc
@@ -277,65 +294,83 @@ let subscribe_public_market_stats ~symbols =
     public_stream
 ;;
 
-let subscribe_to_feeds ~symbols ~account_index ~auth_token =
+let private_subscribe_commands ~account_index ~auth_token =
+  let acct_str = string_of_int account_index in
+  [ `Assoc
+      [ "type", `String "subscribe"
+      ; "channel", `String ("account_all_orders/" ^ acct_str)
+      ; "auth", `String auth_token
+      ]
+  ; `Assoc
+      [ "type", `String "subscribe"
+      ; "channel", `String ("account_all/" ^ acct_str)
+      ; "auth", `String auth_token
+      ]
+  ; `Assoc
+      [ "type", `String "subscribe"
+      ; "channel", `String ("account_all_assets/" ^ acct_str)
+      ; "auth", `String auth_token
+      ]
+  ; `Assoc
+      [ "type", `String "subscribe"
+      ; "channel", `String ("user_stats/" ^ acct_str)
+      ; "auth", `String auth_token
+      ]
+  ]
+;;
+
+let replay_private_subscriptions () =
+  if !subscribed_symbols = []
+  then Lwt.return_unit
+  else (
+    let account_index = !subscribed_account_index in
+    let commands =
+      private_subscribe_commands ~account_index ~auth_token:!subscribed_auth_token
+    in
+    Concurrency.Lwt_util.consume_stream_s
+      (fun cmd -> send_private_json cmd "Private")
+      (Lwt_stream.of_list commands)
+    >>= fun () ->
+    Logging.debug_f
+      ~section
+      "Replayed %d private subscriptions for account %d"
+      (List.length commands)
+      account_index;
+    Lwt.return_unit)
+;;
+
+let replay_public_subscriptions () =
+  let symbols = !subscribed_symbols in
+  if symbols = []
+  then Lwt.return_unit
+  else
+    (* Subscribing needs the market index table; bounded so a failed instruments fetch
+       cannot wedge the leg's watchdog. A timeout leaves it to the next verify window. *)
+    Lwt.catch
+      (fun () ->
+        Lwt_unix.with_timeout 10.0 Lighter_instruments_feed.wait_until_ready
+        >>= fun () ->
+        Lwt.join
+          [ subscribe_public_orderbook ~symbols; subscribe_public_market_stats ~symbols ])
+      (fun _ -> Lwt.return_unit)
+;;
+
+let configure_subscriptions ~symbols ~account_index ~auth_token =
   subscribed_symbols := symbols;
   subscribed_account_index := account_index;
-  subscribed_auth_token := auth_token;
-  let __ppx_lwt_0 =
-    Lwt.join
-      [ subscribe_public_orderbook ~symbols; subscribe_public_market_stats ~symbols ]
-  in
-  Lwt.backtrace_bind
-    "src/integrations/venues/lighter/lighter_ws.ml"
-    203
-    (fun exn ->
-      try Lwt.reraise exn with
-      | exn -> exn)
-    __ppx_lwt_0
-    (fun () ->
-      let acct_str = string_of_int account_index in
-      let private_commands =
-        [ `Assoc
-            [ "type", `String "subscribe"
-            ; "channel", `String ("account_all_orders/" ^ acct_str)
-            ; "auth", `String auth_token
-            ]
-        ; `Assoc
-            [ "type", `String "subscribe"
-            ; "channel", `String ("account_all/" ^ acct_str)
-            ; "auth", `String auth_token
-            ]
-        ; `Assoc
-            [ "type", `String "subscribe"
-            ; "channel", `String ("account_all_assets/" ^ acct_str)
-            ; "auth", `String auth_token
-            ]
-        ; `Assoc
-            [ "type", `String "subscribe"
-            ; "channel", `String ("user_stats/" ^ acct_str)
-            ; "auth", `String auth_token
-            ]
-        ]
-      in
-      let private_stream = Lwt_stream.of_list private_commands in
-      let __ppx_lwt_0 =
-        Concurrency.Lwt_util.consume_stream_s
-          (fun cmd -> send_private_json cmd "Private")
-          private_stream
-      in
-      Lwt.backtrace_bind
-        "src/integrations/venues/lighter/lighter_ws.ml"
-        229
-        (fun exn ->
-          try Lwt.reraise exn with
-          | exn -> exn)
-        __ppx_lwt_0
-        (fun () ->
-          Logging.debug_f ~section "Subscribed to private channels for %s" acct_str;
-          Lwt.return_unit))
+  subscribed_auth_token := auth_token
+[@@ocaml.doc
+  " Caches the subscription targets before the first connect so each leg can replay its\n\
+  \    own channels without waiting for the other leg (and without a duplicate subscribe\n\
+  \    once both are up). "]
+;;
+
+let subscribe_to_feeds ~symbols ~account_index ~auth_token =
+  configure_subscriptions ~symbols ~account_index ~auth_token;
+  Lwt.join [ replay_public_subscriptions (); replay_private_subscriptions () ]
 [@@ocaml.doc
   " Subscribes orderbook channels (public) and account channels (private); caches the\n\
-  \    parameters so reconnect loops can replay them. "]
+  \    parameters so the reconnect loops and the data watchdog can replay them. "]
 ;;
 
 let tx_id_counter = Atomic.make 0
@@ -571,12 +606,15 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
   match frame.Websocket.Frame.opcode with
   | Websocket.Frame.Opcode.Text ->
     Concurrency.Tick_event_bus.publish_tick ();
-    on_heartbeat ();
     if state == private_state && not (Atomic.get private_stream_confirmed)
     then Atomic.set private_stream_confirmed true;
     (try
        (match decode_text_frame frame.Websocket.Frame.content with
-        | Frame_data -> ()
+        | Frame_data ->
+          note_data_frame state;
+          (* Only data proves the subscription is alive; acks and pongs must not feed the
+             supervisor's data timeout. *)
+          on_heartbeat ()
         | Frame_tx_ack (code, message) ->
           if code = 200
           then Logging.debug_f ~section "Tx accepted (code=%d)" code
@@ -601,8 +639,7 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
         | Frame_pong ->
           state.last_pong_time := Unix.gettimeofday ();
           (try Lwt_condition.broadcast state.pong_condition () with
-           | _ -> ());
-          on_heartbeat ()
+           | _ -> ())
         | Frame_unmatched (t, channel) ->
           Atomic.incr msg_counter_other;
           if Atomic.get msg_counter_other <= 5
@@ -627,7 +664,6 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
     state.last_pong_time := Unix.gettimeofday ();
     (try Lwt_condition.broadcast state.pong_condition () with
      | _ -> ());
-    on_heartbeat ();
     Lwt.return_unit
   | Websocket.Frame.Opcode.Close ->
     Logging.debug_f ~section "WebSocket connection closed by server";
@@ -642,6 +678,21 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
 [@@ocaml.doc " Dispatches one WS frame by opcode and message type. "]
 ;;
 
+let close_state state label =
+  Lwt_mutex.with_lock state.connection_mutex (fun () ->
+    match !(state.active_connection) with
+    | None -> Lwt.return None
+    | Some conn ->
+      state.active_connection := None;
+      Atomic.set state.is_connected_ref false;
+      Lwt.return (Some conn))
+  >>= function
+  | None -> Lwt.return_unit
+  | Some conn ->
+    Logging.info_f ~section "Closing %s Lighter WebSocket connection" label;
+    Lwt.catch (fun () -> Ws_lwt.close_transport conn) (fun _ -> Lwt.return_unit)
+;;
+
 let connect_one
   ~state
   ~connect_target
@@ -650,6 +701,7 @@ let connect_one
   ~on_connected
   ~on_heartbeat
   ~label
+  ~first_frame_grace_s
   =
   let connect_host, connect_port = connect_target () in
   let url = ws_url () in
@@ -685,11 +737,32 @@ let connect_one
       Lwt_mutex.with_lock state.connection_mutex (fun () ->
         state.active_connection := Some conn;
         Atomic.set state.is_connected_ref true;
+        state.connected_at := Unix.gettimeofday ();
+        state.frames_since_connect := 0;
         if state == private_state then Atomic.set private_stream_confirmed false;
         Lwt_condition.broadcast state.connected_wakeup ();
         Lwt.return_unit)
       >>= fun () ->
       on_connected ();
+      (* A leg that never produced data is dropped here; the supervisor retries the
+         connect and the replay. *)
+      Lwt.async (fun () ->
+        Lwt_unix.sleep first_frame_grace_s
+        >>= fun () ->
+        if Atomic.get state.is_connected_ref
+           && first_frame_overdue
+                ~now:(Unix.gettimeofday ())
+                ~connected_at:!(state.connected_at)
+                ~frames_since_connect:!(state.frames_since_connect)
+                ~grace_s:first_frame_grace_s
+        then (
+          Logging.error_f
+            ~section
+            "[%s] No data %.0fs after connect \226\128\148 dropping the leg"
+            label
+            first_frame_grace_s;
+          close_state state label)
+        else Lwt.return_unit);
       let stream =
         Lwt_stream.from (fun () ->
           if not (Atomic.get state.is_connected_ref)
@@ -759,273 +832,138 @@ let connect_one
       on_failure error_msg;
       Lwt.return_unit)
 [@@ocaml.doc
-  " Connects one side and reads frames until the transport dies. Raises on failure so the\n\
-  \    [connect_and_monitor] loop can retry; never closes subscriber streams (the other \
-   side\n\
-  \    stays unaffected). "]
+  " Connects one leg and reads frames until the transport dies. Calls [on_failure] before\n\
+  \    returning, so the supervisor owns the retry and backoff. "]
 ;;
 
 let close () : unit Lwt.t =
-  let close_one state label =
-    Lwt_mutex.with_lock state.connection_mutex (fun () ->
-      match !(state.active_connection) with
-      | None -> Lwt.return None
-      | Some conn ->
-        state.active_connection := None;
-        Atomic.set state.is_connected_ref false;
-        Lwt.return (Some conn))
-    >>= function
-    | None -> Lwt.return_unit
-    | Some conn ->
-      Logging.info_f ~section "Closing %s Lighter WebSocket connection" label;
-      Lwt.catch (fun () -> Ws_lwt.close_transport conn) (fun _ -> Lwt.return_unit)
-  in
   close_all_subscribers ();
   signal_new_data ();
-  Lwt.join [ close_one public_state "Public"; close_one private_state "Private" ]
+  Lwt.join [ close_state public_state "Public"; close_state private_state "Private" ]
 ;;
 
-let close_public () : unit Lwt.t =
-  Lwt_mutex.with_lock public_state.connection_mutex (fun () ->
-    match !(public_state.active_connection) with
-    | None -> Lwt.return None
-    | Some conn ->
-      public_state.active_connection := None;
-      Atomic.set public_state.is_connected_ref false;
-      Lwt.return (Some conn))
-  >>= function
-  | None -> Lwt.return_unit
-  | Some conn ->
-    Logging.info ~section "Closing Public Lighter WebSocket connection";
-    Lwt.catch (fun () -> Ws_lwt.close_transport conn) (fun _ -> Lwt.return_unit)
-[@@ocaml.doc
-  " Forcefully terminates the underlying transport for the public WebSocket connection. "]
-;;
-
-let close_private () : unit Lwt.t =
-  Lwt_mutex.with_lock private_state.connection_mutex (fun () ->
-    match !(private_state.active_connection) with
-    | None -> Lwt.return None
-    | Some conn ->
-      private_state.active_connection := None;
-      Atomic.set private_state.is_connected_ref false;
-      Lwt.return (Some conn))
-  >>= function
-  | None -> Lwt.return_unit
-  | Some conn ->
-    Logging.info ~section "Closing Private Lighter WebSocket connection";
-    Lwt.catch (fun () -> Ws_lwt.close_transport conn) (fun _ -> Lwt.return_unit)
-[@@ocaml.doc
-  " Forcefully terminates the underlying transport for the private WebSocket connection. "]
-;;
-
-let connect_and_monitor ~on_failure:_on_failure ~on_connected ~on_heartbeat =
-  let pub_ready = Atomic.make false in
-  let priv_ready = Atomic.make false in
-  let both_ready_fired = Atomic.make false in
-  let check_both_ready () =
-    if Atomic.get pub_ready && Atomic.get priv_ready
-    then
-      if not (Atomic.exchange both_ready_fired true)
-      then (
-        reset_ping_failures ();
-        on_connected ())
-  in
-  let reconnect_loop
+let connect_leg
+  ~state
+  ~label
+  ~connect_target
+  ~ws_url
+  ~on_failure
+  ~on_connected
+  ~on_heartbeat
+  ~replay
+  ~first_frame_grace_s
+  =
+  connect_one
     ~state
     ~connect_target
     ~ws_url
-    ~label
-    ~ready_flag
-    ~other_ready_flag
-    ~on_side_reconnected
-    =
-    let side_on_failure msg =
-      Atomic.set ready_flag false;
-      Atomic.set both_ready_fired false;
-      Logging.warn_f
-        ~section
-        "[%s] Disconnected: %s (reconnecting independently)"
-        label
-        msg;
-      if not (Atomic.get other_ready_flag)
-      then (
-        Logging.error_f
-          ~section
-          "[lighter_ws] Both sides down \226\128\148 internal loops will recover";
-        close_all_subscribers ())
-    in
-    let side_on_connected () =
-      Atomic.set ready_flag true;
+    ~on_failure
+    ~on_connected:(fun () ->
+      on_connected ();
       Lwt.async (fun () ->
-        Lwt.catch
-          (fun () -> on_side_reconnected ())
-          (fun exn ->
-            Logging.error_f
-              ~section
-              "[%s] Error in reconnect callback: %s"
-              label
-              (Printexc.to_string exn);
-            Lwt.return_unit));
-      check_both_ready ()
-    in
-    Concurrency.Lwt_util.run_periodic
-      ~interval:0.5
-      ~stop:(fun () -> false)
-      (fun () ->
-        Lwt.catch
-          (fun () ->
-            connect_one
-              ~state
-              ~connect_target
-              ~ws_url
-              ~on_failure:side_on_failure
-              ~on_connected:side_on_connected
-              ~on_heartbeat
-              ~label)
-          (fun exn ->
-            Logging.debug_f
-              ~section
-              "[%s] connect_one raised: %s"
-              label
-              (Printexc.to_string exn);
-            Lwt.return_unit)
-        >>= fun () ->
-        Atomic.set ready_flag false;
-        Atomic.set both_ready_fired false;
-        Logging.debug_f ~section "[%s] Connection ended, reconnecting in 0.5s" label;
-        Lwt.return_unit)
-  in
-  Lwt.join
-    [ reconnect_loop
-        ~state:public_state
-        ~connect_target:Lighter_endpoints.ws_connect_target
-        ~ws_url:Lighter_endpoints.public_ws_url
-        ~label:"Public"
-        ~ready_flag:pub_ready
-        ~other_ready_flag:priv_ready
-        ~on_side_reconnected:(fun () ->
-          let symbols = !subscribed_symbols in
-          if List.length symbols > 0
-          then (
-            Logging.debug_f
-              ~section
-              "Public WS reconnected \226\128\148 resubscribing %d orderbook channels"
-              (List.length symbols);
-            Lwt.join
-              [ subscribe_public_orderbook ~symbols
-              ; subscribe_public_market_stats ~symbols
-              ])
-          else Lwt.return_unit)
-    ; reconnect_loop
-        ~state:private_state
-        ~connect_target:Lighter_endpoints.private_ws_connect_target
-        ~ws_url:Lighter_endpoints.private_ws_url
-        ~label:"Private"
-        ~ready_flag:priv_ready
-        ~other_ready_flag:pub_ready
-        ~on_side_reconnected:(fun () ->
-          let symbols = !subscribed_symbols in
-          let account_index = !subscribed_account_index in
-          let auth_token = !subscribed_auth_token in
-          if List.length symbols > 0
-          then (
-            Logging.info_f
-              ~section
-              "Private WS reconnected \226\128\148 resubscribing private channels";
-            let acct_str = string_of_int account_index in
-            let private_commands =
-              [ `Assoc
-                  [ "type", `String "subscribe"
-                  ; "channel", `String ("account_all_orders/" ^ acct_str)
-                  ; "auth", `String auth_token
-                  ]
-              ; `Assoc
-                  [ "type", `String "subscribe"
-                  ; "channel", `String ("account_all/" ^ acct_str)
-                  ; "auth", `String auth_token
-                  ]
-              ; `Assoc
-                  [ "type", `String "subscribe"
-                  ; "channel", `String ("account_all_assets/" ^ acct_str)
-                  ; "auth", `String auth_token
-                  ]
-              ; `Assoc
-                  [ "type", `String "subscribe"
-                  ; "channel", `String ("user_stats/" ^ acct_str)
-                  ; "auth", `String auth_token
-                  ]
-              ]
-            in
-            let private_stream = Lwt_stream.of_list private_commands in
-            Concurrency.Lwt_util.consume_stream_s
-              (fun cmd -> send_private_json cmd "Private")
-              private_stream)
-          else Lwt.return_unit)
-    ]
+        Lwt.catch replay (fun exn ->
+          Logging.error_f
+            ~section
+            "[%s] Subscription replay failed: %s"
+            label
+            (Printexc.to_string exn);
+          Lwt.return_unit)))
+    ~on_heartbeat
+    ~label
+    ~first_frame_grace_s
 ;;
 
-let send_ping ~req_id:_ ~timeout_ms =
-  let timeout = float_of_int timeout_ms /. 1000.0 in
-  let ping_one state _label =
-    let send_time = Unix.gettimeofday () in
-    Lwt.catch
-      (fun () ->
-        Lwt_mutex.with_lock state.connection_mutex (fun () ->
-          match !(state.active_connection) with
-          | Some conn ->
-            write_frame_locked
-              state
-              conn
-              (Websocket.Frame.create ~opcode:Websocket.Frame.Opcode.Ping ())
-            >|= fun _ -> ()
-          | None -> Lwt.return_unit)
-        >>= fun () ->
-        Lwt.pick
-          [ (Lwt_condition.wait state.pong_condition
-             >>= fun () ->
-             Network_latency.record_ping_s "lighter" (Unix.gettimeofday () -. send_time);
-             Lwt.return true)
-          ; (Lwt_unix.sleep timeout
-             >>= fun () ->
-             if !(state.last_pong_time) > send_time
-             then (
-               Network_latency.record_ping_s "lighter" (Unix.gettimeofday () -. send_time);
-               Lwt.return true)
-             else Lwt.return false)
-          ])
-      (fun _ -> Lwt.return false)
-  in
-  let priv_p =
+let connect_public_and_monitor ~on_failure ~on_connected ~on_heartbeat =
+  connect_leg
+    ~state:public_state
+    ~label:"Public"
+    ~connect_target:Lighter_endpoints.ws_connect_target
+    ~ws_url:Lighter_endpoints.public_ws_url
+    ~on_failure
+    ~on_connected
+    ~on_heartbeat
+    ~replay:replay_public_subscriptions
+    ~first_frame_grace_s:public_first_frame_grace_s
+[@@ocaml.doc
+  " Connects the market-data leg and reads until it dies. The supervisor restarts it with\n\
+  \    backoff; this function never loops. "]
+;;
+
+let connect_private_and_monitor ~on_failure ~on_connected ~on_heartbeat =
+  connect_leg
+    ~state:private_state
+    ~label:"Private"
+    ~connect_target:Lighter_endpoints.private_ws_connect_target
+    ~ws_url:Lighter_endpoints.private_ws_url
+    ~on_failure
+    ~on_connected
+    ~on_heartbeat
+    ~replay:replay_private_subscriptions
+    ~first_frame_grace_s:private_first_frame_grace_s
+[@@ocaml.doc
+  " Connects the authenticated leg and reads until it dies. The supervisor restarts it\n\
+  \    with backoff. A quiet account stops sending after its snapshot, so the account\n\
+  \    snapshot is the proof that the replay took. "]
+;;
+
+let ping_reply_timeout_s = 5.0
+
+type ping_result =
+  | Ping_ok
+  | Ping_not_sent
+  | Ping_no_reply
+
+type leg =
+  | Public
+  | Private
+
+let ping_side state =
+  let send_time = Unix.gettimeofday () in
+  Lwt_mutex.with_lock state.connection_mutex (fun () ->
+    match !(state.active_connection) with
+    | None -> Lwt.return false
+    | Some conn ->
+      write_frame_locked
+        state
+        conn
+        (Websocket.Frame.create ~opcode:Websocket.Frame.Opcode.Ping ())
+      >|= (function
+       | Ok () -> true
+       | Error _ -> false))
+  >>= fun sent ->
+  if not sent
+  then Lwt.return Ping_not_sent
+  else if !(state.last_pong_time) >= send_time
+  then Lwt.return Ping_ok
+  else
+    (* The reply wait must not hold the write lock: a silent peer would otherwise block
+       order submission on this leg for the whole timeout. *)
+    Lwt.pick
+      [ (Lwt_condition.wait state.pong_condition
+         >|= fun () ->
+         Network_latency.record_ping_s "lighter" (Unix.gettimeofday () -. send_time);
+         Ping_ok)
+      ; (Lwt_unix.sleep ping_reply_timeout_s
+         >|= fun () ->
+         if !(state.last_pong_time) >= send_time
+         then (
+           Network_latency.record_ping_s "lighter" (Unix.gettimeofday () -. send_time);
+           Ping_ok)
+         else Ping_no_reply)
+      ]
+[@@ocaml.doc
+  " Probes one leg and reports whether the probe was answered, never sent (the leg is\n\
+  \    between sockets), or sent and ignored. "]
+;;
+
+let send_ping ~leg ~req_id:_ ~timeout_ms:_ =
+  match leg with
+  | Public -> ping_side public_state >|= fun result -> result = Ping_ok
+  | Private ->
     if not (Atomic.get private_stream_confirmed)
     then Lwt.return true
-    else ping_one private_state "Private"
-  in
-  Lwt.both (ping_one public_state "Public") priv_p
-  >>= fun (pub_ok, priv_ok) ->
-  if pub_ok && priv_ok
-  then (
-    reset_ping_failures ();
-    Lwt.return true)
-  else (
-    Logging.warn_f ~section "Ping failed (pub=%b, priv=%b)" pub_ok priv_ok;
-    incr_ping_failures ();
-    let __ppx_lwt_0 = if not pub_ok then close_public () else Lwt.return_unit in
-    Lwt.backtrace_bind
-      "src/integrations/venues/lighter/lighter_ws.ml"
-      819
-      (fun exn ->
-        try Lwt.reraise exn with
-        | exn -> exn)
-      __ppx_lwt_0
-      (fun () ->
-        let __ppx_lwt_0 = if not priv_ok then close_private () else Lwt.return_unit in
-        Lwt.backtrace_bind
-          "src/integrations/venues/lighter/lighter_ws.ml"
-          820
-          (fun exn ->
-            try Lwt.reraise exn with
-            | exn -> exn)
-          __ppx_lwt_0
-          (fun () -> Lwt.return false)))
+    else ping_side private_state >|= fun result -> result = Ping_ok
+[@@ocaml.doc
+  " One leg's pong verdict for the supervisor. The private probe stays silent until the\n\
+  \    first authenticated frame proves the socket, matching [private_stream_confirmed]. "]
 ;;

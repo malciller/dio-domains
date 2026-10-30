@@ -157,6 +157,38 @@ let test_null_order_book_field () =
   Alcotest.(check bool) "still None" true (Option.is_none result)
 ;;
 
+let test_stale_book_is_rejected () =
+  Lighter.Instruments_feed.initialize [ "OBSTALE" ];
+  Lighter.Orderbook_feed.initialize [ "OBSTALE" ];
+  let snapshot =
+    `Assoc
+      [ "type", `String "snapshot/order_book"
+      ; "channel", `String "order_book:0"
+      ; ( "order_book"
+        , `Assoc
+            [ "b", `List [ `Assoc [ "price", `String "100.0"; "size", `String "10.0" ] ]
+            ; "a", `List [ `Assoc [ "price", `String "101.0"; "size", `String "8.0" ] ]
+            ] )
+      ]
+  in
+  Lighter.Orderbook_feed.process_orderbook_snapshot ~market_index:0 snapshot;
+  Alcotest.(check bool)
+    "fresh book is readable"
+    true
+    (Option.is_some (Lighter.Orderbook_feed.get_best_bid_ask "OBSTALE"));
+  (match Lighter.Orderbook_feed.get_store "OBSTALE" with
+   | Some store -> Atomic.set store.last_publish_ns 1L
+   | None -> Alcotest.fail "store missing");
+  Alcotest.(check bool)
+    "stale book is rejected"
+    false
+    (Option.is_some (Lighter.Orderbook_feed.get_best_bid_ask "OBSTALE"));
+  Alcotest.(check bool)
+    "stale fast accessor is rejected"
+    false
+    (Option.is_some (Lighter.Orderbook_feed.get_best_bid_ask_fast "OBSTALE" ()))
+;;
+
 let () =
   Alcotest.run
     "Lighter Orderbook Feed"
@@ -172,6 +204,7 @@ let () =
     ; ( "state"
       , [ Alcotest.test_case "has_orderbook_data" `Quick test_has_orderbook_data
         ; Alcotest.test_case "unknown symbol" `Quick test_get_best_bid_ask_unknown
+        ; Alcotest.test_case "stale_book_is_rejected" `Quick test_stale_book_is_rejected
         ] )
     ]
 ;;

@@ -302,7 +302,7 @@ These patterns recur across the implementations and are worth copying for a new 
 - **Atomic one-shot guards.** `Atomic.make false` plus `Atomic.exchange` runs feed initialization exactly once.
 - **Fast-path closures.** Every `_fast` function is a plain read of an `Atomic.t` or a mutex-guarded store; nothing blocks.
 - **Inline hot paths.** Order-book read paths are annotated `[@inline always]` and are kept allocation-free.
-- **Supervisor-owned reconnection.** WebSocket feeds do not self-heal; the supervisor reconnects them with exponential backoff (`0/2/4/...` capped at 30 s, or 300 s for `ibkr_gateway` and `lighter_ws`) in `src/engine/supervisor/supervisor_health.ml`. Lighter additionally runs its own fixed 0.5 s reconnect loop. `Error_handling.retry_with_backoff` is used on REST and order-submission paths, not for feed reconnection.
+- **Supervisor-owned reconnection.** WebSocket feeds do not self-heal; the supervisor reconnects them with exponential backoff (`0/2/4/...` capped at 30 s, or 300 s for `ibkr_gateway` and the `lighter_*_ws` legs) in `src/engine/supervisor/supervisor_health.ml`. Each Lighter socket is its own supervised connection. `Error_handling.retry_with_backoff` is used on REST and order-submission paths, not for feed reconnection.
 - **Stale-order cleanup.** `hyperliquid_executions_feed.ml` prunes orders older than 24 hours, amendment-blacklist entries older than 30 seconds, and processed trade IDs older than 10 minutes (per-symbol cap 256), so the store cannot grow without bound.
 
 ---

@@ -242,11 +242,14 @@ let adopt_venue_balance ~state ~snapshot ~allow_drop ~gross_rise =
       <- Float.max 0.0 (state.attributed_balance_increase +. unexplained);
     state.position_base <- snapshot)
   else if allow_drop
-  then
+  then (
     (* A lower tradeable figure is real: base sold, fees, or base moved to staking/earn.
-       The reserve overhang is then simply not sellable; forcing the ledger up to it would
-       keep phantom inventory. *)
-    state.position_base <- snapshot
+       But a same-window buy fill can still sit under it - the venue subtracts the buy fee
+       from the received base, so the figure falls by the fee while gross rose by the
+       whole fill. Retire the credits that gross rise proves, or they stay outstanding
+       forever and keep funding sells that dip into reserved_base. *)
+    if gross_rise > 1e-12 then ignore (consume_buy_credits ~state ~qty:gross_rise);
+    state.position_base <- snapshot)
   else settle_buy_credits ~state ~snapshot
 ;;
 

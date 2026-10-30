@@ -35,6 +35,10 @@ type supervised_connection =
   ; mutable circuit_breaker_last_failure : float option
   ; mutable connect_fn : (unit -> unit Lwt.t) option
   (** [None] for monitoring-only (passive) connections. *)
+  ; mutable data_timeout_s : float option
+  (** Seconds without venue data before the connection is failed. Opt-in: [None] is the
+      default so event-driven streams (account/execution feeds) are never failed for
+      silence. A streamed feed must set it explicitly. *)
   ; mutex : Mutex.t
   }
 

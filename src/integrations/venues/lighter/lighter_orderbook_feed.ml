@@ -36,6 +36,9 @@ type store =
   (** Maintains strictly sorted descending sequence by price coordinate *)
   ; mutable local_asks : (float * float) list
   (** Maintains strictly sorted ascending sequence by price coordinate *)
+  ; last_publish_ns : int64 Atomic.t
+  (** Monotonic publish time of the newest snapshot; drives the read-side staleness guard.
+      A wall clock would let an NTP step serve a frozen book as fresh. *)
   ; ob_mutex : Mutex.t
   }
 
@@ -98,6 +101,7 @@ let flush_to_ring store symbol =
       { price = p; size = s })
   in
   let ob = { symbol; bids; asks; timestamp = Unix.gettimeofday () } in
+  Atomic.set store.last_publish_ns (Mtime_clock.now_ns ());
   RingBuffer.write store.buffer ob;
   notify_ready store;
   Concurrency.Exchange_wakeup.signal ~symbol
@@ -288,31 +292,51 @@ let process_orderbook_update ~market_index json =
       (Printexc.to_string exn)
 ;;
 
+(** Max age of a published book before readers must treat it as absent. Without this a
+    stalled public feed serves its last frame forever, so sizing and the dashboard act on
+    a frozen price. Matches Kraken's [default_max_book_age_s]. *)
+let max_book_age_s = 10.0
+
+let max_book_age_ns = Int64.of_float (max_book_age_s *. 1e9)
+
+let[@inline always] book_age_ns store =
+  Int64.sub (Mtime_clock.now_ns ()) (Atomic.get store.last_publish_ns)
+;;
+
+let[@inline always] fresh_frame store =
+  match RingBuffer.read_latest store.buffer with
+  | Some ({ bids; asks; _ } as ob)
+    when Array.length bids > 0
+         && Array.length asks > 0
+         && Int64.compare (book_age_ns store) max_book_age_ns <= 0 -> Some ob
+  | _ -> None
+;;
+
 let[@inline always] get_latest_orderbook symbol =
   match Ds.Cow_table.find_opt stores symbol with
-  | Some store -> RingBuffer.read_latest store.buffer
+  | Some store -> fresh_frame store
   | None -> None
 ;;
 
 let[@inline always] get_best_bid_ask symbol =
   match get_latest_orderbook symbol with
-  | Some { bids; asks; _ } when Array.length bids > 0 && Array.length asks > 0 ->
+  | Some { bids; asks; _ } ->
     let bid = bids.(0) in
     let ask = asks.(0) in
     Some (bid.price, bid.size, ask.price, ask.size)
-  | _ -> None
+  | None -> None
 ;;
 
 let[@inline always] get_best_bid_ask_fast symbol =
   match get_store symbol with
   | Some store ->
     fun () ->
-      (match RingBuffer.read_latest store.buffer with
-       | Some { bids; asks; _ } when Array.length bids > 0 && Array.length asks > 0 ->
+      (match fresh_frame store with
+       | Some { bids; asks; _ } ->
          let bid = bids.(0) in
          let ask = asks.(0) in
          Some (bid.price, bid.size, ask.price, ask.size)
-       | _ -> None)
+       | None -> None)
   | None -> fun () -> None
 ;;
 
@@ -372,6 +396,7 @@ let initialize symbols =
           ; ready = Atomic.make false
           ; local_bids = []
           ; local_asks = []
+          ; last_publish_ns = Atomic.make 0L
           ; ob_mutex = Mutex.create ()
           }
         in

@@ -458,6 +458,33 @@ let update_open_order_price ~symbol ~order_id ~new_price =
   Mutex.unlock store.orders_mutex
 ;;
 
+(** Eagerly retires an open order after a successful cancel response, closing the window
+    where its hold is still subtracted from the account's tradeable balance before the
+    async WS canceled event arrives. The hold is what caps the capital oracle's pool, so a
+    late or dropped echo leaves the freed quote invisible: a higher-priority strategy
+    keeps seeing the account as starved and re-cascades forever. Mirrors
+    [update_open_order_price] for the amend path. No-op if the order is not tracked. *)
+let remove_open_order ~symbol ~order_id =
+  let store = get_symbol_store symbol in
+  Mutex.lock store.orders_mutex;
+  let was_present =
+    if Hashtbl.mem store.open_orders order_id
+    then (
+      Hashtbl.remove store.open_orders order_id;
+      note_change store order_id None;
+      publish_open_orders_cache store;
+      true)
+    else false
+  in
+  Mutex.unlock store.orders_mutex;
+  if was_present
+  then (
+    Mutex.lock global_orders_mutex;
+    retire_from_order_to_symbol order_id;
+    Mutex.unlock global_orders_mutex;
+    Logging.debug_f ~section "EAGER_REMOVE %s [%s] (cancel response)" order_id symbol)
+;;
+
 (** Returns all symbols with initialized execution stores. *)
 let get_all_symbols () =
   Mutex.lock global_orders_mutex;
@@ -1240,7 +1267,7 @@ let handle_update json on_heartbeat =
                    | Some tid -> Int64.to_string tid
                    | None -> "")
               ; market = "spot"
-              ; intent = if side_str = "buy" then "buy_spot" else "sell_spot"
+              ; intent = (if side_str = "buy" then "buy_spot" else "sell_spot")
               ; strategy = "grid"
               ; realized_pnl = None
               ; note = None

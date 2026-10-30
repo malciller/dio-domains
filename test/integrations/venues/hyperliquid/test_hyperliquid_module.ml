@@ -123,6 +123,37 @@ let test_get_open_order_by_coin () =
   | None -> Alcotest.fail "bare-coin lookup did not find the pair-keyed order"
 ;;
 
+let parse_order_status payload =
+  Hyperliquid.Module.Hyperliquid_impl.parse_order_status_payload
+    (Yojson.Safe.from_string payload)
+;;
+
+let test_parse_order_status_wrapped () =
+  (* WS info responses nest the payload under [data]; missing it leaves every amend on the
+     superseded order id. *)
+  Alcotest.(check (option string))
+    "wrapped open order resolves"
+    (Some "589869635076")
+    (parse_order_status
+       {|{"type":"orderStatus","data":{"status":"order","order":{"order":{"oid":589869635076},"status":"open"}}}|})
+;;
+
+let test_parse_order_status_bare () =
+  Alcotest.(check (option string))
+    "bare REST shape resolves"
+    (Some "42")
+    (parse_order_status
+       {|{"status":"order","order":{"order":{"oid":42},"status":"open"}}|})
+;;
+
+let test_parse_order_status_not_open () =
+  Alcotest.(check (option string))
+    "filled replacement is not treated as live"
+    None
+    (parse_order_status
+       {|{"type":"orderStatus","data":{"status":"order","order":{"order":{"oid":42},"status":"filled"}}}|})
+;;
+
 let test_resolve_amend_replacement_from_feed () =
   (* The modify ack has no replacement oid; the order-updates feed links the new leg by
      cloid. Resolution must find it without waiting for a round trip. *)
@@ -144,6 +175,40 @@ let test_resolve_amend_replacement_from_feed () =
   Alcotest.(check (option string)) "replacement found by cloid" (Some "new-oid") resolved
 ;;
 
+let test_resolve_amend_replacement_wakes_on_push () =
+  (* The replacement only becomes visible on the order-updates push after the resolver has
+     parked; it must be woken by that push rather than run out the budget. *)
+  ExecFeed.initialize [ "AMEND_WAKE/USDC" ];
+  let started = Unix.gettimeofday () in
+  let resolved =
+    Lwt_main.run
+      (let resolve () =
+         Hyperliquid.Module.Hyperliquid_impl.resolve_amend_replacement
+           ~cloid:"0xwake"
+           ~old_order_id:"old-oid"
+       in
+       Lwt.async (fun () ->
+         Lwt.map
+           (fun () ->
+             ExecFeed.inject_order
+               ~symbol:"AMEND_WAKE/USDC"
+               ~order_id:"wake-oid"
+               ~side:ExecFeed.Buy
+               ~qty:1.0
+               ~price:100.0
+               ~cl_ord_id:"0xWAKE"
+               ())
+           (Lwt_unix.sleep 0.02));
+       resolve ())
+  in
+  let elapsed = Unix.gettimeofday () -. started in
+  Alcotest.(check (option string))
+    "push resolves the replacement"
+    (Some "wake-oid")
+    resolved;
+  Alcotest.(check bool) "woken before the budget expired" true (elapsed < 0.25)
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Module"
@@ -160,6 +225,22 @@ let () =
             "resolve replacement from feed"
             `Quick
             test_resolve_amend_replacement_from_feed
+        ; Alcotest.test_case
+            "resolve replacement on push"
+            `Quick
+            test_resolve_amend_replacement_wakes_on_push
+        ; Alcotest.test_case
+            "parse wrapped orderStatus payload"
+            `Quick
+            test_parse_order_status_wrapped
+        ; Alcotest.test_case
+            "parse bare orderStatus payload"
+            `Quick
+            test_parse_order_status_bare
+        ; Alcotest.test_case
+            "ignore non-open orderStatus"
+            `Quick
+            test_parse_order_status_not_open
         ] )
     ; ( "data_access"
       , [ Alcotest.test_case "empty data accessors" `Quick test_data_accessors_empty

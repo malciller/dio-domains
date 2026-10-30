@@ -1614,6 +1614,42 @@ let test_position_ledger_bridges_unreflected_fill () =
   drain ()
 ;;
 
+let test_position_reconcile_fee_drop_still_retires_credit () =
+  (* Regression: on Hyperliquid the buy fee is subtracted from the received base, so the
+     tradeable figure falls by the fee (0.00006 on 0.15) while gross rose by the whole
+     fill. The drop branch used to adopt the lower figure without retiring the credit the
+     gross rise proves, so the credit stayed outstanding and funded an extra sell every
+     cycle - each one dipping into reserved_base. *)
+  let symbol = "LEDGER3/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.position_base <- 0.55409239;
+  state.position_gross <- 1.0;
+  state.balance_uses_gross <- true;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 998.0;
+  state.buy_credits_since_balance <- [ 998.5, 0.14994 ];
+  state.credit_anchor <- state.position_base;
+  state.sell_holds_since_balance <- [];
+  Dio_strategies.Strategy_api.reconcile_position
+    ~asset_gross:(fun () -> Some 1.15)
+    ~state
+    ~now:1000.5
+    ~base_balance_age:(Some 1.5)
+    ~asset_balance:0.55403239;
+  check
+    bool
+    "the fee-sized drop is still adopted"
+    true
+    (abs_float (state.position_base -. 0.55403239) < 1e-12);
+  check
+    bool
+    "a buy fill under a fee-sized drop retires its credit"
+    true
+    (state.buy_credits_since_balance = [])
+;;
+
 let test_position_reconcile_freshness_gate () =
   (* Credits are retired by value, not timestamp: a snapshot at or above position + credit
      proves the venue reflected the fill; a newer snapshot below it does not. *)
@@ -8586,6 +8622,10 @@ let () =
             "position reconciliation is freshness-gated"
             `Quick
             test_position_reconcile_freshness_gate
+        ; test_case
+            "a buy fill under a fee-sized tradeable drop retires its credit"
+            `Quick
+            test_position_reconcile_fee_drop_still_retires_credit
         ; test_case
             "adopted lower venue balance cannot free reserved base"
             `Quick

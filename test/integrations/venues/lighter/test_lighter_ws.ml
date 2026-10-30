@@ -41,15 +41,32 @@ let test_close_unsubscribes () =
   Alcotest.(check int) "no messages after close" 0 (List.length items)
 ;;
 
-let test_ping_failure_counter () =
-  Lighter.Ws.reset_ping_failures ();
-  Alcotest.(check int) "starts at 0" 0 (Lighter.Ws.get_ping_failures ());
-  Lighter.Ws.incr_ping_failures ();
-  Alcotest.(check int) "after incr" 1 (Lighter.Ws.get_ping_failures ());
-  Lighter.Ws.incr_ping_failures ();
-  Alcotest.(check int) "after 2 incr" 2 (Lighter.Ws.get_ping_failures ());
-  Lighter.Ws.reset_ping_failures ();
-  Alcotest.(check int) "after reset" 0 (Lighter.Ws.get_ping_failures ())
+let test_unsent_ping_is_not_sent () =
+  let state = Lighter.Ws.create_connection_state () in
+  let result = Lwt_main.run (Lighter.Ws.ping_side state) in
+  Alcotest.(check bool) "no socket" true (result = Lighter.Ws.Ping_not_sent)
+;;
+
+let test_first_frame_grace () =
+  let overdue ~connected_for ~frames ~grace =
+    Lighter.Ws.first_frame_overdue
+      ~now:100.0
+      ~connected_at:(100.0 -. connected_for)
+      ~frames_since_connect:frames
+      ~grace_s:grace
+  in
+  Alcotest.(check bool)
+    "inside grace"
+    false
+    (overdue ~connected_for:5.0 ~frames:0 ~grace:20.0);
+  Alcotest.(check bool)
+    "frame arrived"
+    false
+    (overdue ~connected_for:60.0 ~frames:1 ~grace:20.0);
+  Alcotest.(check bool)
+    "no frame past grace"
+    true
+    (overdue ~connected_for:21.0 ~frames:0 ~grace:20.0)
 ;;
 
 let test_tx_frame_single () =
@@ -100,6 +117,8 @@ let () =
         ; Alcotest.test_case "batch" `Quick test_tx_frame_batch
         ] )
     ; ( "ping"
-      , [ Alcotest.test_case "ping_failure_counter" `Quick test_ping_failure_counter ] )
+      , [ Alcotest.test_case "unsent_ping_is_not_sent" `Quick test_unsent_ping_is_not_sent
+        ; Alcotest.test_case "first_frame_grace" `Quick test_first_frame_grace
+        ] )
     ]
 ;;
