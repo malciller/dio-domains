@@ -2339,15 +2339,17 @@ let asset_domain_worker
       let wake_baseline = Concurrency.Exchange_wakeup.get_generation_fast wakeup_sync in
       let cycle_events = ref 0 in
       let lifecycle_events = ref 0 in
-      (* Latency safepoint. The EVENTS drain below runs synchronously on this domain
-         thread and allocates; a minor collection triggered inside a multi-event batch
-         would be charged to every event in it. Forcing the domain's pending minor
-         collection here, before any measured span, starts the drain with a free minor
-         heap. The exec position is sampled once and reused by the drain so gate and
-         iteration see the same producer position. *)
+      (* Latency safepoint (profiling builds only). The EVENTS drain below runs
+         synchronously on this domain thread and allocates; a minor collection triggered
+         inside a multi-event batch would be charged to every event in it. Forcing the
+         pending minor collection here, before any measured span, starts the drain with a
+         free minor heap so the allocation counters are attributable. It must never run in
+         the default path: one synchronous collection per exec batch is the largest
+         self-inflicted pause on the trading domain. The exec position is sampled once and
+         reused by the drain so gate and iteration see the same producer position. *)
       let current_pos = get_exec_pos_fn () in
       let did_exec = current_pos <> !exec_read_pos in
-      if did_exec then Gc.minor ();
+      if did_exec && latency_this_cycle then Gc.minor ();
       (* Per-cycle GC counters, captured at cycle start and at the cause site to attribute
          spikes to minor/major collections. The start capture is sampled per
          [gc_sample_mask]; taken before the stage markers so it is not charged to the ob
@@ -2362,7 +2364,7 @@ let asset_domain_worker
         if latency_this_cycle then Monotonic_clock.thread_cpu_ns () else 0
       in
       let alloc_start =
-        if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
+        if latency_this_cycle then Monotonic_clock.minor_words () else 0
       in
       (* Drain lifecycle events queued by the supervisor REST path. All handlers (REST-
          and WS-sourced) run on THIS domain thread at cycle top, so the strategy mutex is
@@ -2470,7 +2472,7 @@ let asset_domain_worker
         | None -> ());
       let t2 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
       let alloc_at_t2 =
-        if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
+        if latency_this_cycle then Monotonic_clock.minor_words () else 0
       in
       if did_ob && latency_this_cycle && t2 > t1
       then Latency_profiler.record_ns prof_ob (t2 - t1);
@@ -2919,7 +2921,7 @@ let asset_domain_worker
       startup_replay := false;
       let t3 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
       let alloc_at_t3 =
-        if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0
+        if latency_this_cycle then Monotonic_clock.minor_words () else 0
       in
       (* Per-event exec histogram writes are deferred until after [t4] so they are not
          charged to STRAT/CYCLE; with N events they would self-inflate the exec-heavy
@@ -3807,7 +3809,7 @@ let asset_domain_worker
         ref (if latency_this_cycle then Monotonic_clock.now_ns () else t3)
       in
       let alloc_at_t3s =
-        ref (if latency_this_cycle then int_of_float (Gc.minor_words ()) else alloc_at_t3)
+        ref (if latency_this_cycle then Monotonic_clock.minor_words () else alloc_at_t3)
       in
       (* Strategy-span end captured before the opt-in trace recorder runs, so enabling
          tracing (config strategy_trace) does not distort STRAT/TOTAL. *)
@@ -3989,7 +3991,7 @@ let asset_domain_worker
         (* PREP/STRATEGY split: work above is charged to [prof_prep]; only the strategy
            call is STRAT. *)
         t3_strategy := if latency_this_cycle then Monotonic_clock.now_ns () else 0;
-        alloc_at_t3s := if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0;
+        alloc_at_t3s := if latency_this_cycle then Monotonic_clock.minor_words () else 0;
         (* Pre-execute domain-provided strategy knobs, recorded as replay inputs (the
            oracle sets these outside the strategy call; the strategy may clear them during
            execute, so the input value must be captured before execute runs). *)
@@ -4074,7 +4076,7 @@ let asset_domain_worker
          | _ -> ());
         strat_end_ns := if latency_this_cycle then Monotonic_clock.now_ns () else 0;
         alloc_strat_end
-        := if latency_this_cycle then int_of_float (Gc.minor_words ()) else 0;
+        := if latency_this_cycle then Monotonic_clock.minor_words () else 0;
         cpu_strat_end
         := if latency_this_cycle then Monotonic_clock.thread_cpu_ns () else 0;
         match trace_recorder with

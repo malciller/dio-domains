@@ -424,20 +424,24 @@ let dont_wait thunk handler =
   | Ok p -> on_any p (fun _ -> ()) handler
 ;;
 
-(* Paused promises are resolved once per engine iteration. *)
-let paused : unit t list ref = ref []
+(* Paused promises are resolved once per engine iteration. The cancelled flag is O(1) to
+   set, so cancelling a paused promise no longer rebuilds the whole list; the sweep that
+   used to happen in the cancel hook is folded into [wakeup_paused], which already walks
+   the list once per iteration. *)
+let paused : (unit t * bool ref) list ref = ref []
 
 let pause () =
   let p = new_task () in
-  paused := p :: !paused;
-  add_cancel_hook p (fun () -> paused := List.filter (fun q -> q != p) !paused);
+  let cancelled = ref false in
+  paused := (p, cancelled) :: !paused;
+  add_cancel_hook p (fun () -> cancelled := true);
   p
 ;;
 
 let wakeup_paused () =
   let ps = List.rev !paused in
   paused := [];
-  List.iter (fun p -> resolve p (Ok ())) ps
+  List.iter (fun (p, cancelled) -> if not !cancelled then resolve p (Ok ())) ps
 ;;
 
 let paused_count () = List.length !paused

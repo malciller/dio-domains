@@ -126,15 +126,26 @@ let read_chunked ic push =
   read_chunk ()
 ;;
 
-let make_body_stream ic oc headers ~is_head ~status_code : Cohttp_lwt.Body.t Lwt.t =
+(* [on_finish] owns connection disposal: the pool returns the channels for reuse, or
+   closes them when the response is not reusable. Every exit path must call it exactly
+   once. *)
+let make_body_stream ic headers ~is_head ~status_code ~reusable ~on_finish
+  : Cohttp_lwt.Body.t Lwt.t
+  =
   let no_body = is_head || status_code < 200 || status_code = 204 || status_code = 304 in
   if no_body
-  then close_both ic oc >|= fun () -> `String ""
+  then (
+    on_finish ~reusable;
+    Lwt.return (`String ""))
   else (
     let stream, push = Lwt_stream.create () in
-    let finish () =
-      push None;
-      close_both ic oc
+    let finished = ref false in
+    let finish ~reusable =
+      if not !finished
+      then (
+        finished := true;
+        push None;
+        on_finish ~reusable)
     in
     let transfer_encoding =
       Cohttp.Header.get headers "transfer-encoding" |> Option.map String.lowercase_ascii
@@ -173,8 +184,99 @@ let make_body_stream ic oc headers ~is_head ~status_code : Cohttp_lwt.Body.t Lwt
          | None -> read_until_eof ic push_chunk)
     in
     Lwt.async (fun () ->
-      Lwt.catch (fun () -> reader () >>= finish) (fun _exn -> finish ()));
+      Lwt.catch
+        (fun () -> reader () >|= fun () -> finish ~reusable)
+        (fun _exn ->
+          finish ~reusable:false;
+          Lwt.return_unit));
     Lwt.return (`Stream stream))
+;;
+
+(* ---- keep-alive pool ------------------------------------------------------
+
+   One idle connection list per authority. All access happens on the Lwt thread (the same
+   one that owns the channels), so no lock is needed; channels are not domain-safe and
+   never cross domains here.
+
+   Policy:
+   - reuse an idle connection only while it is younger than [idle_timeout_s];
+   - at most [max_idle_per_key] idle connections per authority;
+   - a reuse attempt that fails before any response byte arrives is retried exactly once
+     on a fresh connection, which cannot duplicate a request the venue already accepted. *)
+
+let idle_timeout_s = 30.0
+let max_idle_per_key = 4
+
+type pooled =
+  { p_ic : Lwt_io.input_channel
+  ; p_oc : Lwt_io.output_channel
+  ; mutable p_busy : bool
+  ; mutable p_last_used : float
+  }
+
+let pool : (string, pooled list ref) Hashtbl.t = Hashtbl.create 16
+let pool_key ~is_tls ~host ~port = Printf.sprintf "%s|%d|%b" host port is_tls
+let discard conn = Lwt.async (fun () -> close_both conn.p_ic conn.p_oc)
+
+let take key =
+  match Hashtbl.find_opt pool key with
+  | None -> None
+  | Some cell ->
+    let now = Unix.gettimeofday () in
+    let rec pick = function
+      | [] -> None
+      | conn :: rest ->
+        if conn.p_busy
+        then pick rest
+        else if now -. conn.p_last_used > idle_timeout_s
+        then (
+          discard conn;
+          cell := rest;
+          pick rest)
+        else (
+          cell := rest;
+          conn.p_busy <- true;
+          Some conn)
+    in
+    pick !cell
+;;
+
+let give_back key conn ~reusable =
+  if not reusable
+  then (
+    conn.p_busy <- false;
+    discard conn)
+  else (
+    conn.p_busy <- false;
+    conn.p_last_used <- Unix.gettimeofday ();
+    let cell =
+      match Hashtbl.find_opt pool key with
+      | Some cell -> cell
+      | None ->
+        let cell = ref [] in
+        Hashtbl.replace pool key cell;
+        cell
+    in
+    cell := conn :: !cell;
+    let overflow =
+      List.length (List.filter (fun c -> not c.p_busy) !cell) - max_idle_per_key
+    in
+    if overflow > 0
+    then (
+      let seen = ref 0 in
+      cell
+      := List.filter
+           (fun c ->
+             if c.p_busy
+             then true
+             else (
+               incr seen;
+               if !seen > max_idle_per_key
+               then (
+                 discard c;
+                 false)
+               else true))
+           !cell))
 ;;
 
 let request
@@ -198,63 +300,111 @@ let request
   (* Dial target may differ from the URL host: a pinned egress relay answers for the real
      host, so TLS SNI and [Host] stay on [host] while DNS resolves [connect_host]. *)
   let dial_host = Option.value connect_host ~default:host in
-  Lwt_unix.getaddrinfo
-    dial_host
-    (string_of_int port)
-    [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM ]
-  >>= fun addresses ->
-  let ip =
-    match addresses with
-    | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ -> Ipaddr_unix.of_inet_addr addr
-    | _ -> failwith (Printf.sprintf "cannot resolve %s:%d" dial_host port)
+  let key = pool_key ~is_tls ~host ~port in
+  let connect () =
+    Lwt_unix.getaddrinfo
+      dial_host
+      (string_of_int port)
+      [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM ]
+    >>= fun addresses ->
+    let ip =
+      match addresses with
+      | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ ->
+        Ipaddr_unix.of_inet_addr addr
+      | _ -> failwith (Printf.sprintf "cannot resolve %s:%d" dial_host port)
+    in
+    let client : Conduit_lwt_unix.client =
+      if is_tls
+      then `TLS (`Hostname host, `IP ip, `Port port)
+      else `TCP (`IP ip, `Port port)
+    in
+    Conduit_lwt_unix.connect ~ctx:Conduit_lwt_unix.default_ctx client
+    >|= fun (_flow, ic, oc) ->
+    { p_ic = ic; p_oc = oc; p_busy = true; p_last_used = Unix.gettimeofday () }
   in
-  let client : Conduit_lwt_unix.client =
-    if is_tls then `TLS (`Hostname host, `IP ip, `Port port) else `TCP (`IP ip, `Port port)
+  Cohttp_lwt.Body.to_string body
+  >>= fun body_str ->
+  let request_headers =
+    headers
+    |> fun h ->
+    Cohttp.Header.set h "Host" host_header
+    |> fun h ->
+    Cohttp.Header.set h "Connection" "keep-alive"
+    |> fun h ->
+    Cohttp.Header.set h "Content-Length" (string_of_int (String.length body_str))
   in
-  Conduit_lwt_unix.connect ~ctx:Conduit_lwt_unix.default_ctx client
-  >>= fun (_flow, ic, oc) ->
-  Lwt.catch
-    (fun () ->
-      Cohttp_lwt.Body.to_string body
-      >>= fun body_str ->
-      let headers =
-        headers
-        |> fun h ->
-        Cohttp.Header.set h "Host" host_header
-        |> fun h ->
-        Cohttp.Header.set h "Connection" "close"
-        |> fun h ->
-        Cohttp.Header.set h "Content-Length" (string_of_int (String.length body_str))
-      in
-      let request_line =
-        Printf.sprintf
-          "%s %s HTTP/1.1\r\n"
-          (Cohttp.Request.string_of_meth meth)
-          (Uri.path_and_query uri)
-      in
-      Lwt_io.write oc request_line
-      >>= fun () ->
-      Lwt_io.write oc (Cohttp.Header.to_string headers)
-      >>= fun () ->
-      Lwt_io.write oc "\r\n"
-      >>= fun () ->
-      Lwt_io.write oc body_str
-      >>= fun () ->
-      Lwt_io.flush oc
-      >>= fun () ->
-      read_status_line ic
-      >>= fun (version, status) ->
-      read_headers ic
-      >>= fun response_headers ->
-      let response = { Cohttp.Response.status; headers = response_headers; version } in
-      make_body_stream
-        ic
-        oc
-        response_headers
-        ~is_head:(meth = `HEAD)
-        ~status_code:(Cohttp.Code.code_of_status status)
-      >>= fun body -> Lwt.return (response, body))
-    (fun exn -> close_both ic oc >>= fun () -> Lwt.fail exn)
+  let request_line =
+    Printf.sprintf
+      "%s %s HTTP/1.1\r\n"
+      (Cohttp.Request.string_of_meth meth)
+      (Uri.path_and_query uri)
+  in
+  let send conn =
+    Lwt_io.write conn.p_oc request_line
+    >>= fun () ->
+    Lwt_io.write conn.p_oc (Cohttp.Header.to_string request_headers)
+    >>= fun () ->
+    Lwt_io.write conn.p_oc "\r\n"
+    >>= fun () -> Lwt_io.write conn.p_oc body_str >>= fun () -> Lwt_io.flush conn.p_oc
+  in
+  let retried = ref false in
+  let rec exchange conn ~from_pool =
+    let got_response = ref false in
+    Lwt.catch
+      (fun () ->
+        send conn
+        >>= fun () ->
+        read_status_line conn.p_ic
+        >>= fun (version, status) ->
+        got_response := true;
+        read_headers conn.p_ic
+        >>= fun response_headers ->
+        let no_body =
+          meth = `HEAD
+          || Cohttp.Code.code_of_status status < 200
+          || Cohttp.Code.code_of_status status = 204
+          || Cohttp.Code.code_of_status status = 304
+        in
+        let has_framing =
+          no_body
+          || (match Cohttp.Header.get response_headers "transfer-encoding" with
+              | Some te ->
+                let te = String.lowercase_ascii te in
+                String.split_on_char ',' te
+                |> List.exists (fun p -> String.trim p = "chunked")
+              | None -> false)
+          || Cohttp.Header.get response_headers "content-length" <> None
+        in
+        let connection_close =
+          match Cohttp.Header.get response_headers "connection" with
+          | Some value -> String.lowercase_ascii (String.trim value) = "close"
+          | None -> version = `HTTP_1_0
+        in
+        let reusable = (not connection_close) && has_framing in
+        let response = { Cohttp.Response.status; headers = response_headers; version } in
+        make_body_stream
+          conn.p_ic
+          response_headers
+          ~is_head:(meth = `HEAD)
+          ~status_code:(Cohttp.Code.code_of_status status)
+          ~reusable
+          ~on_finish:(fun ~reusable -> give_back key conn ~reusable)
+        >|= fun body -> response, body)
+      (fun exn ->
+        conn.p_busy <- false;
+        discard conn;
+        (* Only a pooled connection that failed before any response byte can be retried: a
+           fresh dial cannot be stale, and a request that produced a status line may
+           already have been accepted. *)
+        if from_pool && (not !got_response) && not !retried
+        then (
+          retried := true;
+          connect () >>= fun fresh -> exchange fresh ~from_pool:false)
+        else Lwt.fail exn)
+  in
+  match take key with
+  | Some conn -> exchange conn ~from_pool:true
+  | None -> connect () >>= fun conn -> exchange conn ~from_pool:false
 ;;
 
 module Client = struct

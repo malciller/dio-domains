@@ -14,6 +14,7 @@ reference/*
 *.sh
 !dio-dash.sh
 !docker-entrypoint.sh
+!docker-sidecar.sh
 !test/engine/perf/sweep_gc_params.sh
 *.csv
 *.txt

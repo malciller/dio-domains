@@ -32,6 +32,13 @@
 
 (executable
  (package dio)
+ (public_name dio-persist)
+ (name dio_persist)
+ (modes exe)
+ (libraries unix dio.persistence))
+
+(executable
+ (package dio)
  (public_name dio-oracle)
  (name oracle)
  (modes exe)

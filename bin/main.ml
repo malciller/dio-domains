@@ -38,6 +38,22 @@ let () =
 
 module Fear_and_greed = Cmc.Fear_and_greed
 
+(* Attach to the out-of-process persistence helper if one is running. Absent a helper,
+   persistence stays in-process exactly as before: the engine must never fail to start
+   because dio-persist is missing. *)
+let () = Dio_persistence.Persist_ipc.init ()
+
+(* Both are invisible at runtime unless logged once at boot. *)
+let () =
+  Logging.info_f ~section:"main" "IO backend: %s" (Lwt_engine.backend ());
+  Logging.info_f
+    ~section:"main"
+    "persistence: %s"
+    (if Dio_persistence.Persist_ipc.is_enabled ()
+     then "out-of-process (dio-persist)"
+     else "in-process")
+;;
+
 (** atexit handler: flush persistence and emit a final log entry on process termination. *)
 let () =
   at_exit (fun () ->

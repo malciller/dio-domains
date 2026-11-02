@@ -31,9 +31,7 @@ let buffer_size channel = Lwt_bytes.length channel.buffer
 
 let copy_bigarray_to_bytes buffer pos len =
   let bytes = Bytes.create len in
-  for i = 0 to len - 1 do
-    Bytes.unsafe_set bytes i (Bigarray.Array1.unsafe_get buffer (pos + i))
-  done;
+  Lwt_bytes.blit_to_bytes buffer pos bytes 0 len;
   bytes
 ;;
 
@@ -108,12 +106,7 @@ let read_into_locked channel bytes offset length =
   else (
     let copy () =
       let n = min length channel.len in
-      for i = 0 to n - 1 do
-        Bytes.unsafe_set
-          bytes
-          (offset + i)
-          (Bigarray.Array1.unsafe_get channel.buffer (channel.pos + i))
-      done;
+      Lwt_bytes.blit_to_bytes channel.buffer channel.pos bytes offset n;
       channel.pos <- channel.pos + n;
       channel.len <- channel.len - n;
       n
@@ -239,12 +232,7 @@ let write_locked channel bytes offset length =
     else (
       let space = buffer_size channel - channel.len in
       let n = min space length in
-      for i = 0 to n - 1 do
-        Bigarray.Array1.unsafe_set
-          channel.buffer
-          (channel.len + i)
-          (Bytes.unsafe_get bytes (offset + i))
-      done;
+      Lwt_bytes.blit_from_bytes bytes offset channel.buffer channel.len n;
       channel.len <- channel.len + n;
       loop (offset + n) (length - n))
   in

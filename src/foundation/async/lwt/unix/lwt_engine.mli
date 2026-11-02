@@ -1,7 +1,10 @@
-(** Minimal select-based event loop for the in-tree promise runtime.
+(** Event loop for the in-tree promise runtime.
 
     Internal to [lwt.unix]: timers, file-descriptor readiness, and a self-pipe used to
-    wake the loop from other system threads. *)
+    wake the loop from other system threads.
+
+    The poller is chosen at startup by [DIO_IO_BACKEND] ([select] or [epoll]); [select] is
+    the reference implementation and the fallback on non-Linux hosts. *)
 
 val on_timer : float -> (unit -> unit) -> int
 val on_readable : Unix.file_descr -> (unit -> unit) -> int
@@ -16,3 +19,6 @@ val iter : bool -> unit
 val enqueue_job : (unit -> unit) -> unit
 
 val wake : unit -> unit
+
+(** Active poller name, ["select"] or ["epoll"] (diagnostics/tests). *)
+val backend : unit -> string

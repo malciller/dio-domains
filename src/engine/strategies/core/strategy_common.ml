@@ -157,12 +157,20 @@ let carry_tracked_ack_grace_s = 15.0
 let has_tracked_carry_order ?(max_age = carry_tracked_ack_grace_s) ~key () =
   let now = Unix.gettimeofday () in
   Mutex.lock carry_registry_mutex;
+  (* Early exit: the fold visits every live carry order, and the common case is a hit. The
+     working set is small, so an index would cost more to keep consistent than the scan it
+     replaces; stopping at the first match removes the tail. *)
   let found =
-    Concurrency.Fifo_index.fold
-      (fun _ meta acc ->
-        acc || (String.equal meta.com_key key && now -. meta.com_at <= max_age))
-      carry_orders
+    try
+      Concurrency.Fifo_index.fold
+        (fun _ meta () ->
+          if String.equal meta.com_key key && now -. meta.com_at <= max_age
+          then raise_notrace Exit)
+        carry_orders
+        ();
       false
+    with
+    | Exit -> true
   in
   Mutex.unlock carry_registry_mutex;
   found
@@ -638,6 +646,29 @@ module InFlightAmendments = struct
   let shard_mutexes : Mutex.t array = Array.init num_shards (fun _ -> Mutex.create ())
   let shard_of key = Hashtbl.hash key land (num_shards - 1)
 
+  (* Reverse index: replacement (new) id -> old id. [is_replacement_target] runs on the
+     order-management path for every extra buy candidate, and the old implementation
+     locked and folded all 64 shards to answer it. This map is keyed by the new id, which
+     is the only thing the caller knows, so it cannot be sharded by the old id; it is one
+     small table behind its own lock.
+
+     Lock order is always shard mutex -> replacement mutex, never the reverse, so the two
+     never deadlock. *)
+  let replacement_index : (string, string) Hashtbl.t = Hashtbl.create 256
+  let replacement_mutex = Mutex.create ()
+
+  let register_replacement ~old_id ~new_id =
+    Mutex.lock replacement_mutex;
+    Hashtbl.replace replacement_index new_id old_id;
+    Mutex.unlock replacement_mutex
+  ;;
+
+  let forget_replacement new_id =
+    Mutex.lock replacement_mutex;
+    Hashtbl.remove replacement_index new_id;
+    Mutex.unlock replacement_mutex
+  ;;
+
   (** Atomically insert [order_id] as [Pending] if absent. Returns true on insertion,
       false if the id is already tracked (any phase - a replaced id stays tracked for the
       cleanup window, so re-amending it is a duplicate). *)
@@ -696,28 +727,10 @@ module InFlightAmendments = struct
       entry of its own (the old id holds the [Replaced] entry), so
       [is_amend_lifecycle_active] alone does not cover it. *)
   let is_replacement_target order_id =
-    let rec scan s =
-      if s >= num_shards
-      then false
-      else (
-        let registry = registries.(s) in
-        let mutex = shard_mutexes.(s) in
-        Mutex.lock mutex;
-        let found =
-          Hashtbl.fold
-            (fun _ (entry : entry) acc ->
-              acc
-              ||
-              match entry.phase with
-              | Replaced new_id -> String.equal new_id order_id
-              | _ -> false)
-            registry
-            false
-        in
-        Mutex.unlock mutex;
-        found || scan (s + 1))
-    in
-    scan 0
+    Mutex.lock replacement_mutex;
+    let found = Hashtbl.mem replacement_index order_id in
+    Mutex.unlock replacement_mutex;
+    found
   ;;
 
   (** Remove [order_id] from the registry (terminal phases, cleanup). Returns true if it
@@ -727,10 +740,18 @@ module InFlightAmendments = struct
     let registry = registries.(shard) in
     let mutex = shard_mutexes.(shard) in
     Mutex.lock mutex;
-    let exists = Hashtbl.mem registry order_id in
-    if exists then Hashtbl.remove registry order_id;
+    let phase =
+      match Hashtbl.find_opt registry order_id with
+      | Some (entry : entry) ->
+        Hashtbl.remove registry order_id;
+        Some entry.phase
+      | None -> None
+    in
     Mutex.unlock mutex;
-    exists
+    (match phase with
+     | Some (Replaced new_id) -> forget_replacement new_id
+     | _ -> ());
+    Option.is_some phase
   ;;
 
   (** The exchange confirmed the amendment. A replace (old_id <> new_id) keeps the old id
@@ -746,12 +767,26 @@ module InFlightAmendments = struct
       let registry = registries.(shard) in
       let mutex = shard_mutexes.(shard) in
       Mutex.lock mutex;
-      (match Hashtbl.find_opt registry old_id with
-       | Some (entry : entry) ->
-         entry.phase <- Replaced new_id;
-         entry.last <- now
-       | None -> Hashtbl.replace registry old_id { phase = Replaced new_id; last = now });
-      Mutex.unlock mutex)
+      let previous =
+        match Hashtbl.find_opt registry old_id with
+        | Some (entry : entry) ->
+          let previous =
+            match entry.phase with
+            | Replaced previous -> Some previous
+            | _ -> None
+          in
+          entry.phase <- Replaced new_id;
+          entry.last <- now;
+          previous
+        | None ->
+          Hashtbl.replace registry old_id { phase = Replaced new_id; last = now };
+          None
+      in
+      Mutex.unlock mutex;
+      (match previous with
+       | Some previous -> forget_replacement previous
+       | None -> ());
+      register_replacement ~old_id ~new_id)
   ;;
 
   (** The exchange rejected the amendment: terminal. The entry is dropped so a follow-up
@@ -794,20 +829,29 @@ module InFlightAmendments = struct
         let mutex = shard_mutexes.(s) in
         Mutex.lock mutex;
         let registry = registries.(s) in
-        let initial_size = Hashtbl.length registry in
-        Hashtbl.filter_map_inplace
-          (fun _ (entry : entry) ->
-            match entry.phase with
-            | Pending ->
-              if now -. entry.last <= pending_max_age_s
-              then Some entry
-              else (
-                incr stale_pending;
-                None)
-            | Replaced _ | Failed _ | Skipped ->
-              if now -. entry.last <= max_age then Some entry else None)
+        let stale = ref [] in
+        Hashtbl.iter
+          (fun key (entry : entry) ->
+            let keep =
+              match entry.phase with
+              | Pending ->
+                if now -. entry.last <= pending_max_age_s
+                then true
+                else (
+                  incr stale_pending;
+                  false)
+              | Replaced _ | Failed _ | Skipped -> now -. entry.last <= max_age
+            in
+            if not keep then stale := (key, entry.phase) :: !stale)
           registry;
-        removed := !removed + (initial_size - Hashtbl.length registry);
+        List.iter
+          (fun (key, phase) ->
+            Hashtbl.remove registry key;
+            incr removed;
+            match phase with
+            | Replaced new_id -> forget_replacement new_id
+            | _ -> ())
+          !stale;
         Mutex.unlock mutex
       done;
       if !stale_pending > 0
@@ -830,10 +874,28 @@ module InFlightAmendments = struct
 end
 
 (** Fixed-size, zero-allocation MPSC ring buffer. Cache-line padding separates producer
-    and consumer indices to prevent false sharing. *)
+    and consumer indices to prevent false sharing.
+
+    Slot protocol (this is what makes [broadcast] safe): a producer advances [tail], then
+    stores the payload, then publishes the slot by setting [state] to {!published}. The
+    consumer only reads a slot whose [state] is {!published}, so it can never observe a
+    torn or half-written payload. Producers must therefore call
+    [OrderSignal.broadcast] *after* [write] returns [Some] — the wakeup is the statement
+    "a published slot is waiting", and reversing that order would reintroduce the
+    lost-wakeup window. *)
 module LockFreeQueue = struct
+  (* 0 = empty, 2 = published. There is no persistent 1 state: the producer claims the
+     slot via the [tail] CAS, so [state] only needs to distinguish published from not. *)
+  let state_empty = 0
+  let state_published = 2
+
+  type 'a slot =
+    { mutable payload : 'a
+    ; state : int Atomic.t
+    }
+
   type 'a t =
-    { array : 'a option Atomic.t array
+    { array : 'a slot array
     ; size : int
     ; mask : int
     ; head : int Atomic.t
@@ -852,7 +914,10 @@ module LockFreeQueue = struct
     let rec next_power_of_2 v p = if p >= v then p else next_power_of_2 v (p * 2) in
     let size = next_power_of_2 size 1 in
     let mask = size - 1 in
-    let array = Array.init size (fun _ -> Atomic.make None) in
+    let array =
+      Array.init size (fun _ ->
+        { payload = Obj.magic 0; state = Atomic.make state_empty })
+    in
     { array
     ; size
     ; mask
@@ -868,7 +933,8 @@ module LockFreeQueue = struct
     }
   ;;
 
-  (** Concurrent enqueue for multiple producers. Returns None if full. *)
+  (** Concurrent enqueue for multiple producers. Returns None if full. Zero allocation:
+      the payload is stored directly, no option wrapper is allocated per push. *)
   let write q v =
     let rec loop () =
       let t = Atomic.get q.tail in
@@ -877,28 +943,34 @@ module LockFreeQueue = struct
       then None (* Queue is full *)
       else if Atomic.compare_and_set q.tail t (t + 1)
       then (
-        Atomic.set q.array.(t land q.mask) (Some v);
+        let slot = q.array.(t land q.mask) in
+        slot.payload <- v;
+        Atomic.set slot.state state_published;
         Some ())
       else loop ()
     in
     loop ()
   ;;
 
-  (** Single consumer dequeue. Non-blocking: returns None if the slot is empty, even if
-      the tail index has been advanced by a producer. This prevents the consumer from
-      spinning if a producer is preempted. *)
+  (** Single consumer dequeue. Non-blocking: returns None if the slot is not yet
+      published, even if the tail index has been advanced by a producer. This prevents the
+      consumer from spinning if a producer is preempted. *)
   let read q =
     let h = Atomic.get q.head in
     if h = Atomic.get q.tail
     then None (* Queue is empty *)
     else (
       let slot = q.array.(h land q.mask) in
-      match Atomic.get slot with
-      | None -> None (* Producer claimed slot but hasn't written yet; don't spin *)
-      | Some v ->
-        Atomic.set slot None;
+      if Atomic.get slot.state <> state_published
+      then None (* Producer claimed the slot but hasn't published it; don't spin *)
+      else (
+        let v = slot.payload in
+        (* Drop the reference so a consumed payload is collectable. Safe because [state]
+           gates every read of [payload]. *)
+        slot.payload <- Obj.magic 0;
+        Atomic.set slot.state state_empty;
         Atomic.set q.head (h + 1);
-        Some v)
+        Some v))
   ;;
 
   (** O(1) size tracking. Safe for hot loops. *)
@@ -942,25 +1014,35 @@ module OrderSignal = struct
   (** Atomic flag to coalesce multiple broadcasts into one pipe write. *)
   let pending = Atomic.make false
 
-  (** Signal from any domain that new orders are available. Safe to call from OCaml 5
-      domain workers, no Lwt internals are touched. *)
-  let broadcast () =
-    if not (Atomic.exchange pending true)
-    then (
-      (* First signaller since last drain; write a single byte to wake Lwt. *)
-      try ignore (Unix.write write_fd (Bytes.make 1 '\x00') 0 1) with
-      | Unix.Unix_error (Unix.EAGAIN, _, _) ->
-        () (* pipe buffer full; Lwt side will drain *)
-      | Unix.Unix_error (Unix.EWOULDBLOCK, _, _) -> ()
-      | _ -> ())
+  (** Single-byte wake payload, allocated once. [broadcast] runs on every trading domain
+      so it must not allocate. *)
+  let wake_byte = Bytes.make 1 '\x00'
+
+  let write_wake_byte () =
+    try ignore (Unix.write write_fd wake_byte 0 1) with
+    | Unix.Unix_error (Unix.EAGAIN, _, _) ->
+      () (* pipe buffer full; Lwt side will drain *)
+    | Unix.Unix_error (Unix.EWOULDBLOCK, _, _) -> ()
+    | _ -> ()
   ;;
 
-  (** Block in the Lwt event loop until the pipe becomes readable (a broadcast arrived).
-      Drains the pipe and clears the pending flag before returning. *)
+  (* Producer/consumer protocol. A producer publishes its queue slot BEFORE calling
+     [broadcast] (see [LockFreeQueue.write] call sites), so the only obligation here is:
+     if the queue may be non-empty, a pipe byte is pending or [pending] is false.
+
+     [wait] clears [pending] BEFORE draining, not after. Draining first is a lost-wakeup
+     bug: a producer that calls [broadcast] in the window between the drain and the clear
+     observes [pending = true], skips its own write, and then the consumer clears the flag
+     and parks forever on an order that was already enqueued. Clearing first means any
+     producer in that window sees [false], writes its byte, and either the drain below
+     consumes it or the next [wait_read] returns immediately. *)
+  let broadcast () = if not (Atomic.exchange pending true) then write_wake_byte ()
+
+  (** Block in the Lwt event loop until the pipe becomes readable (a broadcast arrived). *)
   let wait () =
     Lwt_unix.wait_read lwt_read_fd
     >>= fun () ->
-    (* Drain all accumulated bytes from the pipe. *)
+    Atomic.set pending false;
     let buf = Bytes.create 64 in
     (try
        while true do
@@ -969,7 +1051,6 @@ module OrderSignal = struct
        done
      with
      | _ -> ());
-    Atomic.set pending false;
     Lwt.return_unit
   ;;
 end

@@ -29,9 +29,13 @@ WORKDIR /app
 # 1. Copy the source tree
 COPY --chown=opam:opam . .
 
-# 2. Build native executables in parallel with Dune cache
+# 2. Build native executables in parallel with Dune cache. [dio_persist] is the
+#    out-of-process state writer: keeping it in the same image means the entrypoint
+#    can run it as a sidecar of the engine container (same /app/data mount, same
+#    /tmp for the socket) with no extra service or volume.
 RUN --mount=type=cache,target=/home/opam/.cache/dune,uid=1000,gid=1000 \
-    eval $(opam env) && dune build -j $(nproc) --profile=release bin/main.exe bin/dashboard.exe
+    eval $(opam env) && dune build -j $(nproc) --profile=release \
+      bin/main.exe bin/dashboard.exe bin/dio_persist.exe
 
 # 2a. Record the exact installed opam package set (name, version, license) so the
 #     released image carries a manifest of every OCaml library it links. Copied
@@ -97,6 +101,7 @@ RUN ldconfig
 # 5. Copy compiled binaries from builder
 COPY --from=builder /app/_build/default/bin/main.exe /usr/local/bin/dio
 COPY --from=builder /app/_build/default/bin/dashboard.exe /usr/local/bin/dio-dashboard
+COPY --from=builder /app/_build/default/bin/dio_persist.exe /usr/local/bin/dio-persist
 
 # 5a. Optional Lighter signer shared library (linux/amd64). The directory is
 #     empty unless the image was built with INCLUDE_LIGHTER_SIGNER=1 (see stage
@@ -107,6 +112,11 @@ COPY --from=lighter_signer /app/signer-out/ /opt/lighter-signer/
 #     instead of failing later inside the config parser.
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+
+# Persistence sidecar launcher. Starts [dio-persist] as a child of the engine container
+# (same /app/data mount, same /tmp socket) and then execs the engine.
+COPY docker-sidecar.sh /usr/local/bin/dio-sidecar
+RUN chmod 0755 /usr/local/bin/dio-sidecar
 
 # 5b'. Strategy files. The engine resolves each config entry's `strategy` to
 #      strategies/<name>.strategy, then .json. Baked into the image at

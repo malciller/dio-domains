@@ -576,7 +576,8 @@ let amend_request_of_order (order : strategy_order) target_order_id =
 
 let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
   Lwt.async (fun () ->
-    let __ppx_lwt_0 = Lwt.pause () in
+    (* No pause: it cost a scheduler round-trip before the order could be signed. *)
+    let __ppx_lwt_0 = Lwt.return_unit in
     Lwt.backtrace_bind
       "src/engine/supervisor/supervisor_orders.ml"
       345
@@ -667,7 +668,8 @@ let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
 let dispatch_amend ~auth_token ~orders_placed ~cb (order : strategy_order) target_order_id
   =
   Lwt.async (fun () ->
-    let __ppx_lwt_0 = Lwt.pause () in
+    (* No pause: it cost a scheduler round-trip before the order could be signed. *)
+    let __ppx_lwt_0 = Lwt.return_unit in
     Lwt.backtrace_bind
       "src/engine/supervisor/supervisor_orders.ml"
       421
@@ -784,7 +786,8 @@ let dispatch_cancel
   target_order_id
   =
   Lwt.async (fun () ->
-    let __ppx_lwt_0 = Lwt.pause () in
+    (* No pause: it cost a scheduler round-trip before the order could be signed. *)
+    let __ppx_lwt_0 = Lwt.return_unit in
     Lwt.backtrace_bind
       "src/engine/supervisor/supervisor_orders.ml"
       507

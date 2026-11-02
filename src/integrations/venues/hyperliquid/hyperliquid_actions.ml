@@ -32,18 +32,22 @@ let hl_order_type (ot : ExTypes.order_type) (tif_opt : ExTypes.time_in_force opt
 
 (** Formats a float as a fixed-point string with at most 8 decimal places. Strips trailing
     zeros and the decimal point if unnecessary. Hyperliquid requires normalized numeric
-    strings without trailing zeros. *)
+    strings without trailing zeros.
+
+    Single pass over the formatted digits. The previous recursive [String.sub] allocated
+    one string per stripped zero, so a value like [12345.67000000] allocated seven. *)
 let format_number f =
   let rounded = Printf.sprintf "%.8f" f in
-  let rec strip_zeros s =
-    if String.length s > 1 && s.[String.length s - 1] = '0' && String.contains s '.'
-    then strip_zeros (String.sub s 0 (String.length s - 1))
-    else if String.length s > 1 && s.[String.length s - 1] = '.'
-    then String.sub s 0 (String.length s - 1)
-    else s
-  in
-  let s = strip_zeros rounded in
-  if s = "-0" then "0" else s
+  let n = String.length rounded in
+  let stop = ref n in
+  if String.contains rounded '.'
+  then (
+    while !stop > 1 && rounded.[!stop - 1] = '0' do
+      decr stop
+    done;
+    if !stop > 1 && rounded.[!stop - 1] = '.' then decr stop);
+  let s = String.sub rounded 0 !stop in
+  if String.equal s "-0" then "0" else s
 ;;
 
 (** Constructs an order_wire record from generic order parameters. Maps side to a boolean,
@@ -288,11 +292,15 @@ let place_order
     in
     let tif = Option.value time_in_force ~default:Gtc in
     let ot = Limit { tif } in
+    (* Format once: the msgpack action and the JSON action must agree byte for byte, and
+       [format_number] allocates. *)
+    let p_wire = format_number px in
+    let s_wire = format_number sz in
     let order_wire =
       { a = asset_index
       ; b = is_buy
-      ; p = format_number px
-      ; s = format_number sz
+      ; p = p_wire
+      ; s = s_wire
       ; r = Option.value reduce_only ~default:false
       ; t = ot
       ; c = cl_ord_id
@@ -303,8 +311,8 @@ let place_order
     let order_json =
       [ "a", `Int asset_index
       ; "b", `Bool is_buy
-      ; "p", `String (format_number px)
-      ; "s", `String (format_number sz)
+      ; "p", `String p_wire
+      ; "s", `String s_wire
       ; "r", `Bool (Option.value reduce_only ~default:false)
       ; "t", `Assoc [ "limit", `Assoc [ "tif", `String (tif_to_string tif) ] ]
       ]

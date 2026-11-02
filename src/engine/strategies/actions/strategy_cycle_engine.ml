@@ -1151,6 +1151,19 @@ let order_scans : (string * string, order_scan) Ds.Cow_table.t =
   Ds.Cow_table.create ~shard_count:32 ()
 ;;
 
+(* Reusable dedupe set for [order_replace]'s two-phase carry scan. [order_replace] runs
+   synchronously within one strategy cycle, and each asset cycles on its own domain, so
+   the buffer is per-domain (DLS) rather than module-global: two assets replacing
+   concurrently must not share it. Cleared at entry; removes one hashtable allocation per
+   book tick. *)
+[@@@alert "-unsafe_multidomain"]
+
+let replace_seen_key = Domain.DLS.new_key (fun () -> Hashtbl.create 8)
+let replace_seen () = Domain.DLS.get replace_seen_key
+
+(* Restore the alert beyond the two bindings above. *)
+[@@@alert "+unsafe_multidomain"]
+
 let open_orders_snapshot (module Ex : Dio_exchange.Exchange_intf.S) ~exchange ~symbol =
   let gen =
     try Ex.get_open_orders_generation ~symbol with
@@ -1290,7 +1303,8 @@ let order_replace
              the full [Types.open_order] list for every resting order on every book tick
              was the overlay's dominant allocation (100+ orders per pair, several replaces
              per cycle). *)
-          let seen = Hashtbl.create 4 in
+          let seen = replace_seen () in
+          Hashtbl.clear seen;
           let out = ref [] in
           let want_perp = is_perp in
           let want_side =

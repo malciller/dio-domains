@@ -173,6 +173,11 @@ type store =
 [@@ocaml.doc " Per-symbol execution state container with readiness signalling. "]
 
 let stores = Ds.Cow_table.create ~shard_count:32 ()
+
+(* coin -> registered spot pair. Derived from [stores] at registration and never cleared
+   (stores live for the process lifetime), so [registered_pair_for] is a lock-free lookup
+   instead of an all-stores scan under [initialization_mutex]. *)
+let coin_to_pair = Ds.Cow_table.create ~shard_count:8 ()
 let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
@@ -346,6 +351,9 @@ let get_symbol_store symbol =
           }
         in
         Ds.Cow_table.set stores symbol store;
+        (match String.index_opt symbol '/' with
+         | Some i -> Ds.Cow_table.set coin_to_pair (String.sub symbol 0 i) symbol
+         | None -> ());
         store
     in
     Mutex.unlock initialization_mutex;
@@ -984,17 +992,7 @@ let update_orders_internal ?user_ref store (event : execution_event) =
 
 (** The registered spot pair for a venue coin, when one exists. Kept separate from
     {!find_registered_symbol} so the injection path, defined earlier, can resolve it. *)
-let registered_pair_for coin =
-  let pair = ref None in
-  Mutex.lock initialization_mutex;
-  Ds.Cow_table.iter
-    (fun registered_symbol _ ->
-      if String.starts_with ~prefix:(coin ^ "/") registered_symbol
-      then pair := Some registered_symbol)
-    stores;
-  Mutex.unlock initialization_mutex;
-  !pair
-;;
+let registered_pair_for coin = Ds.Cow_table.find_opt coin_to_pair coin
 
 (** The registered bare-coin store, if any (test harnesses and non-pair venues). *)
 let registered_exact_symbol coin =

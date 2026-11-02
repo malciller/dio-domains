@@ -1,5 +1,5 @@
-(test
- (name test_ws_lwt)
+(tests
+ (names test_ws_lwt test_ws_framing)
  (libraries
   dio.ws_lwt
   dio.websocket
@@ -9,4 +9,5 @@
   dio.lwt.unix
   dio.uri
   dio.digestif
-  dio.base64))
+  dio.base64
+  alcotest))
