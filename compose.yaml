@@ -42,6 +42,11 @@ services:
     environment:
       TERM: xterm-256color
       DIO_CANARY: "0"
+      # The entrypoint starts dio-persist as a sidecar of this container (same /app/data
+      # volume, same /tmp for the socket) so the state-file fsync and rename happen
+      # outside the trading process's OCaml 5 runtime. Set to "0" to run with in-process
+      # persistence, i.e. the previous behaviour.
+      DIO_PERSIST: "1"
     ports:
       - "8080:8080"
     logging:

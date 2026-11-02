@@ -6,6 +6,10 @@
 # the config parser, so this guard turns that into a clear message. The
 # dashboard attaches to a running engine over the Unix domain socket; it reads
 # its theme from the same config, so mount that too (see dio-dash.sh).
+#
+# The engine command is wrapped in [dio-sidecar], which starts the out-of-process
+# persistence helper before exec'ing the engine. Set DIO_PERSIST=0 to disable it
+# and run with in-process persistence.
 set -eu
 
 config_path="${DIO_CONFIG_PATH:-/app/config.json}"
@@ -44,6 +48,10 @@ EOF
     if [ ! -f "$env_path" ]; then
       echo "dio: warning: no $env_path mounted; exchange credentials are unavailable." >&2
     fi
+    # Wrap with the sidecar launcher so [dio-persist] starts *after* the privilege drop
+    # below (both processes must run as uid 1000 to own the state files they write).
+    # The launcher execs the engine, so the engine still receives SIGTERM as PID 1.
+    set -- /usr/local/bin/dio-sidecar "$@"
     ;;
 esac
 

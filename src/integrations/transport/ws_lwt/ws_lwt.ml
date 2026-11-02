@@ -22,6 +22,20 @@ module Io = struct
               count
               max_frame_bytes))
   ;;
+
+  (* Frame reads copy straight into the destination buffer; the old path built an
+     intermediate [Buffer] and then a string. *)
+  let read_into ic buf off len =
+    if len <= max_frame_bytes
+    then Lwt_io.read_into ic buf off len
+    else
+      Lwt.fail
+        (Failure
+           (Printf.sprintf
+              "websocket frame of %d bytes exceeds the %d byte cap"
+              len
+              max_frame_bytes))
+  ;;
 end
 
 module Wire = Websocket.Make (Io)
@@ -131,8 +145,11 @@ let connect
     Buffer.clear out;
     Lwt.wrap2 (Wire.write_frame_to_buf ~mode:(Wire.Client random_string)) out frame
     >>= fun () ->
+    (* [to_bytes] + [write_from_exactly] avoids the string round-trip [Lwt_io.write] adds. *)
     Lwt.catch
-      (fun () -> Lwt_io.write oc (Buffer.contents out) >>= fun () -> Lwt_io.flush oc)
+      (fun () ->
+        Lwt_io.write_from_exactly oc (Buffer.to_bytes out) 0 (Buffer.length out)
+        >>= fun () -> Lwt_io.flush oc)
       (fun exn -> close_channels ic oc >>= fun () -> Lwt.fail exn)
   in
   { input = ic; output = oc; next_frame; send_frame }

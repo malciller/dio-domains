@@ -472,6 +472,15 @@ let format_line level section_name message =
    CRITICAL: drains the async queue first (preserving order), then writes synchronously
    with flush; the one emergency path allowed to block. *)
 
+(* Bounded: an unbounded queue turns a stalled drain thread (or a burst of WARN spam) into
+   an out-of-memory kill of the trading process. Dropping the oldest line keeps the most
+   recent history, which is what an incident actually needs. *)
+let async_capacity = 65_536
+let dropped_async_lines = Atomic.make 0
+
+(** Cumulative lines dropped because the async queue was full. *)
+let dropped_async_line_count () = Atomic.get dropped_async_lines
+
 let async_queue : string Queue.t = Queue.create ()
 let async_mutex = Mutex.create ()
 let async_drain_started = Atomic.make false
@@ -480,9 +489,14 @@ let async_drain_started = Atomic.make false
    drain thread; set by any domain. *)
 let flush_requested = Atomic.make false
 
-(** Push a pre-formatted log line onto the async queue. No I/O. *)
+(** Push a pre-formatted log line onto the async queue. No I/O. Bounded with drop-oldest
+    so a stalled drain cannot grow the queue without limit. *)
 let[@inline always] log_async formatted =
   Mutex.lock async_mutex;
+  if Queue.length async_queue >= async_capacity
+  then (
+    ignore (Queue.pop async_queue);
+    ignore (Atomic.fetch_and_add dropped_async_lines 1));
   Queue.push formatted async_queue;
   Mutex.unlock async_mutex
 ;;

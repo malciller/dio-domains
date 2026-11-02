@@ -46,3 +46,8 @@
  (name test_hot_path_invariants)
  (modules test_hot_path_invariants)
  (libraries dio.strategies dio.engine alcotest))
+
+(test
+ (name test_egress_invariants)
+ (modules test_egress_invariants)
+ (libraries dio.strategies dio.engine alcotest threads))

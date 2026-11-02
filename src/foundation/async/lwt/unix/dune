@@ -3,4 +3,7 @@
  (public_name dio.lwt.unix)
  (synopsis "Unix support for Lwt")
  (wrapped false)
- (libraries bigarray dio.lwt threads unix))
+ (libraries bigarray dio.lwt threads unix)
+ (foreign_stubs
+  (language c)
+  (names epoll_stubs buffer_stubs)))

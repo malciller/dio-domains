@@ -96,6 +96,7 @@ module type IO = sig
   type oc
 
   val read : ic -> int -> string Lwt.t
+  val read_into : ic -> Bytes.t -> int -> int -> int Lwt.t
   val write : oc -> string -> unit Lwt.t
   val flush : oc -> unit Lwt.t
 end
@@ -222,10 +223,10 @@ module Make (IO : IO) = struct
     ;;
   end
 
-  let int_of_be16 s = (Char.code s.[0] lsl 8) lor Char.code s.[1]
+  let int_of_be16 b = (Char.code (Bytes.get b 0) lsl 8) lor Char.code (Bytes.get b 1)
 
-  let int_of_be64 s =
-    let byte i = Int64.of_int (Char.code s.[i]) in
+  let int_of_be64 b =
+    let byte i = Int64.of_int (Char.code (Bytes.get b i)) in
     let v =
       Int64.logor
         (Int64.shift_left (byte 0) 56)
@@ -246,74 +247,86 @@ module Make (IO : IO) = struct
     else Int64.to_int v
   ;;
 
-  let unmask key s =
-    let n = String.length s in
-    let b = Bytes.of_string s in
-    for i = 0 to n - 1 do
-      Bytes.set b i (Char.chr (Char.code (Bytes.get b i) lxor Char.code key.[i mod 4]))
-    done;
-    Bytes.unsafe_to_string b
+  (* RFC 6455 §5.3 masking. XOR eight bytes at a time with the 4-byte key replicated to a
+     word, then finish the [len mod 8] tail byte-wise. The old version did one
+     [Bytes.get]/[Bytes.set] pair and an [i mod 4] per byte. *)
+  let unmask (key : Bytes.t) b off len =
+    if len > 0
+    then (
+      let k =
+        Int64.of_int
+          (Char.code (Bytes.unsafe_get key 0)
+           lor (Char.code (Bytes.unsafe_get key 1) lsl 8)
+           lor (Char.code (Bytes.unsafe_get key 2) lsl 16)
+           lor (Char.code (Bytes.unsafe_get key 3) lsl 24))
+      in
+      let k8 = Int64.logor k (Int64.shift_left k 32) in
+      let stop8 = off + (len land lnot 7) in
+      let i = ref off in
+      while !i < stop8 do
+        Bytes.set_int64_le b !i (Int64.logxor (Bytes.get_int64_le b !i) k8);
+        i := !i + 8
+      done;
+      let stop = off + len in
+      while !i < stop do
+        Bytes.unsafe_set
+          b
+          !i
+          (Char.chr
+             (Char.code (Bytes.unsafe_get b !i)
+              lxor Char.code (Bytes.unsafe_get key ((!i - off) land 3))));
+        incr i
+      done)
+  ;;
+
+  (* Reads exactly [n] bytes into one freshly allocated buffer. Returns [bytes] rather
+     than a string so the frame payload can be unmasked in place and only converted once,
+     instead of Buffer -> string -> Bytes -> string. *)
+  let read_exactly_bytes ic n =
+    let b = Bytes.create n in
+    let rec loop off remaining =
+      if remaining = 0
+      then Lwt.return b
+      else
+        IO.read_into ic b off remaining
+        >>= fun got ->
+        if got = 0 then Lwt.fail End_of_file else loop (off + got) (remaining - got)
+    in
+    loop 0 n
   ;;
 
   let read_exactly ic n =
-    if n <= 0
-    then Lwt.return ""
-    else (
-      let buf = Buffer.create n in
-      let rec loop remaining =
-        if remaining = 0
-        then Lwt.return (Buffer.contents buf)
-        else
-          IO.read ic remaining
-          >>= fun chunk ->
-          let got = String.length chunk in
-          if got = 0
-          then Lwt.fail End_of_file
-          else (
-            Buffer.add_string buf chunk;
-            loop (remaining - got))
-      in
-      loop n)
+    if n <= 0 then Lwt.return "" else read_exactly_bytes ic n >|= Bytes.unsafe_to_string
   ;;
 
   let make_read_frame ?buf:_ ~mode:_ ic _oc () =
-    read_exactly ic 2
+    read_exactly_bytes ic 2
     >>= fun hdr ->
-    if String.length hdr < 2
-    then Lwt.fail End_of_file
-    else (
-      let b0 = Char.code hdr.[0] in
-      let b1 = Char.code hdr.[1] in
-      let final = b0 land 0x80 <> 0 in
-      let extension = (b0 lsr 4) land 0x7 in
-      let opcode = Frame.Opcode.of_enum (b0 land 0xf) in
-      let masked = b1 land 0x80 <> 0 in
-      let len7 = b1 land 0x7f in
-      let read_len () =
-        if len7 < 126
-        then Lwt.return len7
-        else if len7 = 126
-        then read_exactly ic 2 >|= int_of_be16
-        else read_exactly ic 8 >|= int_of_be64
-      in
-      read_len ()
-      >>= fun payload_len ->
-      let read_mask () =
-        if masked then read_exactly ic 4 >|= fun k -> Some k else Lwt.return None
-      in
-      read_mask ()
-      >>= fun key ->
-      let read_payload () =
-        if payload_len = 0 then Lwt.return "" else read_exactly ic payload_len
-      in
-      read_payload ()
-      >|= fun content ->
-      let content =
-        match key with
-        | Some key -> unmask key content
-        | None -> content
-      in
-      { Frame.opcode; extension; final; content })
+    let b0 = Char.code (Bytes.unsafe_get hdr 0) in
+    let b1 = Char.code (Bytes.unsafe_get hdr 1) in
+    let final = b0 land 0x80 <> 0 in
+    let extension = (b0 lsr 4) land 0x7 in
+    let opcode = Frame.Opcode.of_enum (b0 land 0xf) in
+    let masked = b1 land 0x80 <> 0 in
+    let len7 = b1 land 0x7f in
+    let read_len () =
+      if len7 < 126
+      then Lwt.return len7
+      else if len7 = 126
+      then read_exactly_bytes ic 2 >|= int_of_be16
+      else read_exactly_bytes ic 8 >|= int_of_be64
+    in
+    read_len ()
+    >>= fun payload_len ->
+    (if masked then read_exactly_bytes ic 4 else Lwt.return (Bytes.create 0))
+    >>= fun key ->
+    (if payload_len = 0
+     then Lwt.return (Bytes.create 0)
+     else read_exactly_bytes ic payload_len)
+    >|= fun payload ->
+    if masked then unmask key payload 0 payload_len;
+    (* [unsafe_to_string] shares the buffer: it is never written again. *)
+    { Frame.opcode; extension; final; content = Bytes.unsafe_to_string payload }
   ;;
 
   let write_frame_to_buf ~mode buf frame =

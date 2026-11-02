@@ -90,16 +90,22 @@ let truncate_to_depth levels =
 let flush_to_ring store symbol =
   let nb = min (List.length store.local_bids) max_depth in
   let na = min (List.length store.local_asks) max_depth in
-  let bids =
-    Array.init nb (fun i ->
-      let p, s = List.nth store.local_bids i in
-      { price = p; size = s })
+  (* Single pass per side. The old form walked the list with [List.nth] once per output
+     slot, which is O(depth^2) list traversal per publish. *)
+  let take n levels =
+    let arr = Array.make n { price = 0.0; size = 0.0 } in
+    let rec fill i = function
+      | _ when i >= n -> ()
+      | [] -> ()
+      | (p, s) :: rest ->
+        arr.(i) <- { price = p; size = s };
+        fill (i + 1) rest
+    in
+    fill 0 levels;
+    arr
   in
-  let asks =
-    Array.init na (fun i ->
-      let p, s = List.nth store.local_asks i in
-      { price = p; size = s })
-  in
+  let bids = take nb store.local_bids in
+  let asks = take na store.local_asks in
   let ob = { symbol; bids; asks; timestamp = Unix.gettimeofday () } in
   Atomic.set store.last_publish_ns (Mtime_clock.now_ns ());
   RingBuffer.write store.buffer ob;

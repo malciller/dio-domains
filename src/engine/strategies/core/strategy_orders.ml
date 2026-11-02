@@ -12,6 +12,25 @@ let order_buffer = LockFreeQueue.create ()
 (** Accessor for the shared order ringbuffer. *)
 let get_order_buffer () = order_buffer
 
+(** Cumulative orders rejected because the egress ring was full. A full ring is
+    backpressure, not a lost message: the caller gets [false] and the strategy re-emits on
+    a later cycle. Logging is rate-limited by powers of two so sustained overload does not
+    turn the hot path into a log storm. *)
+let dropped_orders = Atomic.make 0
+
+let record_dropped_order ~operation_str (order : strategy_order) =
+  let n = Atomic.fetch_and_add dropped_orders 1 + 1 in
+  if n land (n - 1) = 0
+  then
+    Logging.warn_f
+      ~section
+      "Order ringbuffer full: %d order(s) dropped cumulative (last: %s %s %s)"
+      n
+      operation_str
+      (string_of_order_side order.side)
+      order.symbol
+;;
+
 (** Records an emitted order into the active trace recorder (no-op when tracing is off).
     The observation record is built only when a recorder is registered for the symbol. *)
 let record_emitted (order : strategy_order) =
@@ -248,12 +267,7 @@ let push_order ~now ?state ?(manage_state = true) order =
           emit_flow_order order;
           true
         | None ->
-          Logging.warn_f
-            ~section
-            "Order ringbuffer full, dropped %s %s order for %s"
-            operation_str
-            (string_of_order_side order.side)
-            order.symbol;
+          record_dropped_order ~operation_str order;
           false)
      | None ->
        Logging.warn_f ~section "Cancel operation missing order_id for %s" order.symbol;
@@ -343,11 +357,6 @@ let push_order ~now ?state ?(manage_state = true) order =
             | Some oid -> ignore (InFlightAmendments.remove_in_flight_amendment oid)
             | None -> ())
          | _ -> ());
-        Logging.warn_f
-          ~section
-          "Order ringbuffer full, dropped %s %s order for %s"
-          operation_str
-          (string_of_order_side order.side)
-          order.symbol;
+        record_dropped_order ~operation_str order;
         false)
 ;;

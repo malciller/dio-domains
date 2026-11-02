@@ -70,20 +70,29 @@ let file_path t = Filename.concat (state_dir ()) t.filename
 let write_file_unsafe t tree =
   ensure_dir ();
   let path = file_path t in
-  let tmp = path ^ ".tmp" in
-  let oc = open_out tmp in
-  Fun.protect
-    ~finally:(fun () -> close_out_noerr oc)
-    (fun () ->
-      output_string oc (Yojson.Basic.pretty_to_string tree);
-      output_char oc '\n';
-      flush oc;
-      (* fsync the temp file before rename so a crash after rename cannot leave a
-         truncated/empty target (power-loss durability). *)
-      try Unix.fsync (Unix.descr_of_out_channel oc) with
-      | _ -> ());
-  Sys.rename tmp path;
-  t.file_tree <- Some tree
+  (* The store still builds the JSON either way; what leaves the process is the fsync and
+     the rename, plus the helper's own allocation. The helper terminates the file, so the
+     engine never builds a second copy of the document just to append a newline. *)
+  let contents = Yojson.Basic.pretty_to_string tree in
+  if Persist_ipc.is_enabled ()
+  then (
+    Persist_ipc.send ~filename:path ~contents;
+    t.file_tree <- Some tree)
+  else (
+    let tmp = path ^ ".tmp" in
+    let oc = open_out tmp in
+    Fun.protect
+      ~finally:(fun () -> close_out_noerr oc)
+      (fun () ->
+        output_string oc contents;
+        output_char oc '\n';
+        flush oc;
+        (* fsync the temp file before rename so a crash after rename cannot leave a
+           truncated/empty target (power-loss durability). *)
+        try Unix.fsync (Unix.descr_of_out_channel oc) with
+        | _ -> ());
+    Sys.rename tmp path;
+    t.file_tree <- Some tree)
 ;;
 
 (** Extract every [key : { balanced-object }] pair from [text], tolerating garbage between
@@ -405,8 +414,12 @@ let create ~filename ~parse ~serialize =
 (** Synchronously drain every store's coalesced save queue. Used at shutdown so in-memory
     state (accumulation P&L, reserved_base, last_fill_oid, sell levels) reaches disk
     before exit instead of being dropped by the coalesce window; queued background writes
-    are otherwise lost on SIGTERM/SIGINT. *)
-let flush_all () = List.iter (fun drain -> drain ()) !drainers
+    are otherwise lost on SIGTERM/SIGINT. When the out-of-process helper is attached, the
+    final step waits for it to become durable; with no helper that step is a no-op. *)
+let flush_all () =
+  List.iter (fun drain -> drain ()) !drainers;
+  Persist_ipc.flush ()
+;;
 
 (** All keys currently known to the store (cache + file). *)
 let keys t =

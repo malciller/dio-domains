@@ -150,9 +150,34 @@ let bs_sub_to_string bs ofs len =
     at module load and reused. Signing runs on the single-threaded Lwt scheduler. *)
 let sign_ctx = Secp256k1.Context.create [ Secp256k1.Context.Sign ]
 
+(* Parsed secret keys, keyed by the raw 32-byte secret. [read_sk_exn] validates the key
+   against the group order, which is pure waste on every order: the key is fixed for the
+   process lifetime (it only changes on rotation, at which point a new entry appears).
+   Signing is single-threaded; the mutex only guards the table against a future
+   multi-domain caller. *)
+let key_cache : (string, Secp256k1.Key.secret Secp256k1.Key.t) Hashtbl.t =
+  Hashtbl.create 4
+;;
+
+let key_cache_mutex = Mutex.create ()
+
+let cached_key ~private_key_raw =
+  Mutex.lock key_cache_mutex;
+  let key =
+    match Hashtbl.find_opt key_cache private_key_raw with
+    | Some key -> key
+    | None ->
+      let key = Secp256k1.Key.read_sk_exn sign_ctx (bs_of_string private_key_raw) in
+      Hashtbl.replace key_cache private_key_raw key;
+      key
+  in
+  Mutex.unlock key_cache_mutex;
+  key
+;;
+
 let sign_hash ~private_key_raw ~msg_hash_raw =
   let ctx = sign_ctx in
-  let seckey = Secp256k1.Key.read_sk_exn ctx (bs_of_string private_key_raw) in
+  let seckey = cached_key ~private_key_raw in
   let msg = Secp256k1.Sign.msg_of_bytes_exn (bs_of_string msg_hash_raw) in
   let sig_rec = Secp256k1.Sign.sign_recoverable_exn ctx ~sk:seckey msg in
   let block, v = Secp256k1.Sign.to_bytes_recid ctx sig_rec in

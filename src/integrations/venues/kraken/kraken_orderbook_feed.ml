@@ -901,11 +901,13 @@ let process_book_entry
     let checksum_valid =
       if orderbook_depth >= 10 && store.checksum_tick mod checksum_every_n = 0
       then (
+        (* Reuse the arrays [make_orderbook] already built: same elements, same order, so
+           the checksum input is identical to re-deriving them, without two more full
+           fold+sort passes per checksum tick. Clamped because a thin book yields fewer
+           than ten levels, where [levels_to_array] also returned a short array. *)
+        let top10 a = Array.sub a 0 (min 10 (Array.length a)) in
         let calculated_checksum =
-          calculate_checksum
-            symbol
-            (levels_to_array ~sort_desc:true store.bids 10)
-            (levels_to_array ~sort_desc:false store.asks 10)
+          calculate_checksum symbol (top10 orderbook.bids) (top10 orderbook.asks)
         in
         match orderbook.checksum with
         | Some received_checksum ->
