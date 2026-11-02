@@ -352,6 +352,37 @@ let test_remove_open_order_releases_quote_hold () =
     (hold_after <= hold_before -. (50.0 *. 0.1683) +. 1e-9)
 ;;
 
+let test_cancel_before_new_frame_does_not_resurrect () =
+  (* Regression: the placement ack can be followed by a cancel within ~100ms, before the
+     venue's [new] frame. The cancel retires nothing (the order is not cached yet) and the
+     late [new] frame then inserted a dead order whose hold capped the account's tradeable
+     quote until restart. Placement registration plus the cancel mark must both hold. *)
+  let symbol = "RACETEST/USD" in
+  let order_id = "race-test-buy" in
+  Kraken.Kraken_executions_feed.register_placement
+    ~order_id
+    ~symbol
+    ~side:Kraken.Kraken_executions_feed.Buy;
+  Alcotest.(check bool)
+    "placement is indexed before any frame"
+    true
+    (Kraken.Kraken_executions_feed.find_order_everywhere order_id = None
+     && Kraken.Kraken_executions_feed.is_cancelled order_id = false);
+  (* Cancel ack path: nothing cached, but the id must now be marked. *)
+  Kraken.Kraken_executions_feed.remove_open_order ~symbol ~order_id;
+  Alcotest.(check bool)
+    "cancel is marked even when the order was never cached"
+    true
+    (Kraken.Kraken_executions_feed.is_cancelled order_id);
+  (* Late [new] frame for the same id must not insert a phantom. *)
+  Kraken.Kraken_executions_feed.inject_open_orders
+    [ make_open_buy ~id:order_id ~symbol ~qty:50.0 ~price:0.1683 ];
+  Alcotest.(check int)
+    "late new frame cannot resurrect a cancelled order"
+    0
+    (List.length (Kraken.Kraken_executions_feed.get_open_orders symbol))
+;;
+
 let test_inject_pre_existing_open_sell () =
   (* Regression: orders existing before process start (or beyond the WS snap_orders cap)
      must be adoptable. The REST /OpenOrders bootstrap injects them into the same cache
@@ -429,6 +460,10 @@ let () =
             "cancel retires the order and releases its quote hold"
             `Quick
             test_remove_open_order_releases_quote_hold
+        ; Alcotest.test_case
+            "cancel before the new frame cannot resurrect"
+            `Quick
+            test_cancel_before_new_frame_does_not_resurrect
         ; Alcotest.test_case
             "snapshot fires the open-orders restore hook"
             `Quick

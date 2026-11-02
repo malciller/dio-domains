@@ -189,6 +189,33 @@ let test_tradeable_balance_nets_open_order_holds () =
     (Kraken.Kraken_module.Kraken_impl.get_tradeable_balance ~asset:base)
 ;;
 
+let test_projected_fill_updates_tradeable () =
+  (* Event-sourced figure: a fill lands in the balance store before the venue's frame, is
+     deduped by its id, and the frame supersedes it. *)
+  let asset = "PROJ_TEST" in
+  let store = Kraken.Kraken_balances_feed.get_balance_store asset in
+  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 100.0 "spot" "main" asset;
+  Alcotest.(check (float 1e-6))
+    "frame value"
+    100.0
+    (Kraken.Kraken_module.Kraken_impl.get_tradeable_balance ~asset);
+  Kraken.Kraken_balances_feed.apply_tradeable_delta ~asset ~delta:10.0 ~id:"fill-1";
+  Alcotest.(check (float 1e-6))
+    "projected credit"
+    110.0
+    (Kraken.Kraken_module.Kraken_impl.get_tradeable_balance ~asset);
+  Kraken.Kraken_balances_feed.apply_tradeable_delta ~asset ~delta:10.0 ~id:"fill-1";
+  Alcotest.(check (float 1e-6))
+    "duplicate delivery is ignored"
+    110.0
+    (Kraken.Kraken_module.Kraken_impl.get_tradeable_balance ~asset);
+  Kraken.Kraken_balances_feed.BalanceStore.update_wallet store 110.0 "spot" "main" asset;
+  Alcotest.(check (float 1e-6))
+    "frame supersedes the projection"
+    110.0
+    (Kraken.Kraken_module.Kraken_impl.get_tradeable_balance ~asset)
+;;
+
 let test_staked_balance_is_earn_not_trading () =
   (* Kraken reports earn/vault funds in their own wallets. [total] includes them and
      [trading] excludes them, so [get_staked_balance] must report the difference: the
@@ -301,6 +328,10 @@ let () =
             "open-order holds net out of tradeable balance"
             `Quick
             test_tradeable_balance_nets_open_order_holds
+        ; Alcotest.test_case
+            "projected fill updates the tradeable figure"
+            `Quick
+            test_projected_fill_updates_tradeable
         ] )
     ; ( "staked balance"
       , [ Alcotest.test_case

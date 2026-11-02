@@ -371,6 +371,39 @@ let test_unanswered_amendment_is_age_bounded () =
     still_present
 ;;
 
+let test_reduce_only_room_clamps_to_position () =
+  let module C = Dio_strategies.Strategy_common in
+  let room ~position side qty = C.reduce_only_room ~position ~side ~qty in
+  Alcotest.(check (float 1e-9))
+    "close long is capped at the long"
+    (room ~position:(Some 2.0) C.Sell 5.0)
+    2.0;
+  Alcotest.(check (float 1e-9))
+    "close long may be smaller than the long"
+    (room ~position:(Some 2.0) C.Sell 0.5)
+    0.5;
+  Alcotest.(check (float 1e-9))
+    "a long cannot be closed with a buy"
+    (room ~position:(Some 2.0) C.Buy 5.0)
+    0.0;
+  Alcotest.(check (float 1e-9))
+    "close short is capped at the short"
+    (room ~position:(Some (-2.0)) C.Buy 5.0)
+    2.0;
+  Alcotest.(check (float 1e-9))
+    "a short cannot be closed with a sell"
+    (room ~position:(Some (-2.0)) C.Sell 5.0)
+    0.0;
+  Alcotest.(check (float 1e-9))
+    "flat has no room"
+    (room ~position:(Some 0.0) C.Sell 5.0)
+    0.0;
+  Alcotest.(check (float 1e-9))
+    "unknown position passes through to the venue flag"
+    (room ~position:None C.Sell 5.0)
+    5.0
+;;
+
 let test_placement_backoff_is_bounded () =
   let module C = Dio_strategies.Strategy_common in
   let key = "test:backoff|hyperliquid|TEST" in
@@ -464,6 +497,10 @@ let () =
             "placement backoff is bounded"
             `Quick
             test_placement_backoff_is_bounded
+        ; Alcotest.test_case
+            "reduce-only size is capped at the live position"
+            `Quick
+            test_reduce_only_room_clamps_to_position
         ; Alcotest.test_case
             "only grid-tagged orders are grid-owned"
             `Quick

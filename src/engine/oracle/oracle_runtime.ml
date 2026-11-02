@@ -664,6 +664,7 @@ let apply_fill
   ~(avg_price : float)
   ~(fee : float)
   ~(event_time : float)
+  ~(id : string)
   =
   let base, quote = split_symbol symbol in
   let value = filled_qty *. avg_price in
@@ -672,14 +673,19 @@ let apply_fill
     | Exchange.Types.Buy -> -.(value +. Float.max 0.0 fee), filled_qty
     | Exchange.Types.Sell -> value -. Float.max 0.0 fee, -.filled_qty
   in
-  enqueue_pool_event
-    (account_key_of ~exchange ~testnet ~quote)
-    ~delta_quote:dq
-    ~delta_base:db
-    ~base_asset:base
-    ~quote_updated_at:(tradeable_updated_at ~exchange ~asset:quote)
-    ~event_time
-    "fill"
+  match Exchange.Registry.get_tradeable_projection exchange with
+  | Some (module P) ->
+    P.apply ~asset:quote ~delta:dq ~id;
+    P.apply ~asset:base ~delta:db ~id
+  | None ->
+    enqueue_pool_event
+      (account_key_of ~exchange ~testnet ~quote)
+      ~delta_quote:dq
+      ~delta_base:db
+      ~base_asset:base
+      ~quote_updated_at:(tradeable_updated_at ~exchange ~asset:quote)
+      ~event_time
+      "fill"
 ;;
 
 (** A canceled/rejected/expired order releases committed capital: a canceled BUY returns
@@ -693,17 +699,21 @@ let apply_order_cancel
   ~(value : float)
   ~(event_time : float)
   =
-  let base, quote = split_symbol symbol in
-  if side = Exchange.Types.Buy
-  then
-    enqueue_pool_event
-      (account_key_of ~exchange ~testnet ~quote)
-      ~delta_quote:(Float.max 0.0 value)
-      ~delta_base:0.0
-      ~base_asset:base
-      ~quote_updated_at:(tradeable_updated_at ~exchange ~asset:quote)
-      ~event_time
-      "order_cancel"
+  (* A projecting venue nets holds synchronously in its own store, so a cancel needs no
+     quote delta at all. *)
+  if Exchange.Registry.get_tradeable_projection exchange = None
+  then (
+    let base, quote = split_symbol symbol in
+    if side = Exchange.Types.Buy
+    then
+      enqueue_pool_event
+        (account_key_of ~exchange ~testnet ~quote)
+        ~delta_quote:(Float.max 0.0 value)
+        ~delta_base:0.0
+        ~base_asset:base
+        ~quote_updated_at:(tradeable_updated_at ~exchange ~asset:quote)
+        ~event_time
+        "order_cancel")
 ;;
 
 (** Absolute read position per [(exchange, symbol)] for the execution-ring drain. *)
@@ -762,7 +772,8 @@ let apply_fill_delta
       ~filled_qty:delta_qty
       ~avg_price:e.avg_price
       ~fee:(fee_rate *. delta_qty *. e.avg_price)
-      ~event_time:e.venue_time);
+      ~event_time:e.venue_time
+      ~id:(Printf.sprintf "%s#%.8g" e.order_id e.filled_qty));
   match e.order_status with
   | Exchange.Types.Filled -> Hashtbl.remove exec_fill_cum e.order_id
   | _ -> Hashtbl.replace exec_fill_cum e.order_id e.filled_qty
@@ -963,20 +974,40 @@ let account_snapshot_of (a : account) : account_snapshot option =
 ;;
 
 (** Available quote within a hoisted snapshot: live/cached balance plus the in-process
-    pending deltas the venue has not yet incorporated. Zero network, zero clock. *)
-let available_quote_in (a : account) (acs : account_snapshot) : float =
+    pending deltas the venue has not yet incorporated, minus the quote a resting buy ties
+    before the balance frame nets it. Zero network, zero clock. *)
+let available_quote_in ?(resting_buy_quote = 0.0) (a : account) (acs : account_snapshot)
+  : float
+  =
   let id = account_id a in
   let quote_updated_at = acs.acs_quote_updated_at in
-  let dq, pending = pending_deltas id ~quote_updated_at in
-  if pending <> [] then prune_pending id ~quote_updated_at;
-  let raw =
-    Float.max 0.0 (Oracle_balances.available_quote acs.acs_snap ~quote:a.a_quote +. dq)
+  (* A projecting venue already carries its fills in the store's tradeable figure, so the
+     snapshot needs no delta overlay and no un-netted-hold discount. *)
+  let projected =
+    Dio_exchange.Exchange_intf.Registry.get_tradeable_projection a.a_exchange <> None
   in
+  let dq, pending = if projected then 0.0, [] else pending_deltas id ~quote_updated_at in
+  if pending <> [] then prune_pending id ~quote_updated_at;
+  let snapshot_quote = Oracle_balances.available_quote acs.acs_snap ~quote:a.a_quote in
+  let raw = Float.max 0.0 (snapshot_quote +. dq) in
   (* Senior overlay reservations are not available to the grid. Subtracting them here
      keeps the capital oracle's sizing pool aligned with the execution-side
      [Capital_reservation.available]. With no overlay the total is 0 and this is a no-op. *)
   let reserved = Dio_exchange.Capital_reservation.get_total ~exchange:a.a_exchange in
-  Float.max 0.0 (raw -. reserved)
+  (* A buy placed since the venue's last balance frame is still inside [available] while
+     the exec store already reports it resting; without this the pool overstates free
+     quote for one frame and a senior cascade cancels a hold it never deducted. Read from
+     the same frame as [available], so it clears itself when the hold lands. *)
+  let unnetted =
+    if projected
+    then 0.0
+    else
+      Oracle_pools.unnetted_buy_hold
+        ~available:snapshot_quote
+        ~resting_buy_quote
+        ~total:(Oracle_balances.total_asset acs.acs_snap ~asset:a.a_quote)
+  in
+  Float.max 0.0 (raw -. reserved -. unnetted)
 ;;
 
 (** Available base for one symbol within a hoisted snapshot (same sources), minus nothing:
@@ -986,7 +1017,10 @@ let available_base_in (a : account) ~(symbol : string) (acs : account_snapshot) 
   let id = account_id a in
   let quote_updated_at = acs.acs_quote_updated_at in
   let base, _ = split_symbol symbol in
-  let _, pending = pending_deltas id ~quote_updated_at in
+  let projected =
+    Dio_exchange.Exchange_intf.Registry.get_tradeable_projection a.a_exchange <> None
+  in
+  let _, pending = if projected then 0.0, [] else pending_deltas id ~quote_updated_at in
   let db =
     List.fold_left
       (fun acc (e : pool_event) ->
@@ -1064,11 +1098,64 @@ type reclaim_reservation =
   ; rr_reserved : float (** Quote reserved for it (its next buy's need). *)
   ; rr_cancelled_keys : string list
   (** Strategies whose resting buys the cascade flagged (diagnostics). *)
+  ; rr_pool : float
+  (** The account pool when the cascade was issued: the baseline a cancel's freed quote is
+      measured against. *)
   ; rr_at : int64 (** Monotonic ns when the reservation was taken, for the TTL. *)
+  ; rr_senior_quote : float option
+  (** The senior's availability after every asset ahead of it reserved, sampled on its
+      last evaluation. [None] until the first pass that reaches it. *)
+  ; rr_senior_need : float option
+  (** The senior's need on that same evaluation. The reservation is judged against this,
+      not the need captured when the cascade was issued: the oracle re-sizes the buy as
+      the pool moves, so a stale need makes a fundable reclaim look outranked and vice
+      versa. *)
+  ; rr_ttl_extended : bool
+  (** One extra pass granted when the pool reaches the need at the TTL. The expiry check
+      runs before the sizing loop, so releasing there would throw away the very pass that
+      can now fund the senior. *)
   }
 
 let reclaim_ttl_s = 30.0
 let reclaim_ttl_ns = Int64.of_float (reclaim_ttl_s *. 1e9)
+
+(** A cold start is not a capital event. Until the oracle has been publishing for this
+    long, it sizes and marks survivors but never cancels a junior's resting order: the
+    first pass after a restart sees a half-warmed pool, and a cancel there moves an order
+    the market never asked to move. *)
+let startup_grace_s = 15.0
+
+let startup_until_ns = Atomic.make 0L
+
+let begin_startup_grace () =
+  Atomic.set
+    startup_until_ns
+    (Int64.add (Mtime_clock.now_ns ()) (Int64.of_float (startup_grace_s *. 1e9)))
+;;
+
+let in_startup_grace ~(now : int64) : bool =
+  Int64.compare now (Atomic.get startup_until_ns) < 0
+;;
+
+(** A settle window before a reservation may be judged. The cancels leave the exec store
+    before the venue's balance frame reflects the release, so an earlier verdict would
+    call every healthy reclaim ineffective. *)
+let reclaim_settle_ns = Int64.of_float 1e9
+
+(** A reclaim that provably bought nothing: its cancels landed and the pool did not grow.
+    Re-issuing it cannot fund the senior - the quote it points at is already counted - so
+    every retry only starves the juniors again. Held until the pool moves (the next sell
+    fill is what actually funds the senior) or the backstop elapses. *)
+type ineffective_reclaim =
+  { ir_senior : string
+  ; ir_pool : float
+  (** Pool at the failed attempt; the loop cannot change until it moves. *)
+  ; ir_at : int64
+  }
+
+let reclaim_ineffective : (string, ineffective_reclaim) Hashtbl.t = Hashtbl.create 8
+let reclaim_ineffective_ttl_s = 600.0
+let reclaim_ineffective_ttl_ns = Int64.of_float (reclaim_ineffective_ttl_s *. 1e9)
 
 (** Per-account reservation, keyed by [account_id]. Written and read only on the pass
     loop. *)
@@ -1119,27 +1206,11 @@ let run_account_pass
              tasks)
          (decisions ()))
   | Some acs ->
-    let pool = available_quote_in account acs in
     let acct_id = account_id account in
-    let reservation =
-      match Hashtbl.find_opt reclaim_reservations acct_id with
-      | None -> None
-      | Some r ->
-        if Int64.sub (Mtime_clock.now_ns ()) r.rr_at > reclaim_ttl_ns
-        then (
-          Hashtbl.remove reclaim_reservations acct_id;
-          Logging.warn_f
-            ~section
-            "reclaim reservation expired for %s: %s did not fund within %.0fs"
-            acct_id
-            r.rr_senior
-            reclaim_ttl_s;
-          None)
-        else Some r
-    in
-    let reserved_senior = Option.map (fun r -> r.rr_senior) reservation in
     (* Open-order summaries and config bounds are invariant across the pass, so resolve
-       them once here instead of 2-3x in the sizing loop. *)
+       them once here instead of 2-3x in the sizing loop. The pool is derived from them
+       rather than before them: its resting-buy quote discounts holds the balance frame
+       has not netted yet. *)
     let task_rows =
       List.map
         (fun (t : Oracle_tasks.task) ->
@@ -1162,9 +1233,141 @@ let run_account_pass
         0.0
         task_rows
     in
-    let total_venue_quote = pool +. committed_venue_buys in
+    let pool = available_quote_in ~resting_buy_quote:committed_venue_buys account acs in
     let key_of_task (t : Oracle_tasks.task) =
       Printf.sprintf "%s|%s" t.exchange t.symbol
+    in
+    let now_ns = Mtime_clock.now_ns () in
+    (* A reservation is verified, not just timed: once the venue has had time to reflect
+       the cancels, a pool that did not grow means the cancel freed quote the pool already
+       counted. Holding juniors for that is a pure loss, so the reservation is dropped at
+       once and the reclaim is remembered as ineffective. The exec store is deliberately
+       not consulted: a venue that drops a terminal frame leaves its own phantom order
+       there, which is exactly the case this must still release. *)
+    let reservation =
+      match Hashtbl.find_opt reclaim_reservations acct_id with
+      | None -> None
+      | Some r ->
+        let aged = Int64.sub now_ns r.rr_at in
+        (* The senior's own post-senior availability and need, recorded on its last
+           evaluation. Coverage against the whole pool is irrelevant: more senior assets
+           reserve first, and a reservation must never outrank them. *)
+        let need_now = Option.value r.rr_senior_need ~default:r.rr_reserved in
+        let outranked =
+          match r.rr_senior_quote with
+          | Some q -> not (Oracle_pools.reclaim_covers ~pool_now:q ~reserved:need_now)
+          | None -> false
+        in
+        let freed_enough =
+          Oracle_pools.reclaim_freed_enough
+            ~pool_before:r.rr_pool
+            ~pool_now:pool
+            ~reserved:r.rr_reserved
+        in
+        if aged > reclaim_ttl_ns
+        then
+          (* The pool is the last reading before the loop. If it now covers the need, let
+             this pass fund the senior instead of releasing the juniors on the very pass
+             the quote arrived. One extension only. *)
+          if (not r.rr_ttl_extended)
+             && Oracle_pools.reclaim_covers ~pool_now:pool ~reserved:need_now
+          then (
+            let extended = { r with rr_ttl_extended = true } in
+            Hashtbl.replace reclaim_reservations acct_id extended;
+            Logging.info_f
+              ~section
+              "reclaim funding pass for %s: %s covered at the TTL (pool %.2f, need %.2f)"
+              acct_id
+              r.rr_senior
+              pool
+              need_now;
+            Some extended)
+          else (
+            Hashtbl.remove reclaim_reservations acct_id;
+            (* Expiry releases the juniors, so this pass will let them re-place within
+               milliseconds. Without the verdict the freed quote is never observed by the
+               senior - a junior's hold arrives first - and the cascade re-arms on the
+               next pass for the same nothing. Remember it so the loop cannot sustain
+               itself. *)
+            Hashtbl.replace
+              reclaim_ineffective
+              acct_id
+              { ir_senior = r.rr_senior
+              ; ir_pool = Float.max r.rr_pool pool
+              ; ir_at = now_ns
+              };
+            Logging.warn_f
+              ~section
+              "reclaim expired for %s: %s never funded (pool %.2f, need %.2f); releasing \
+               held strategies and suspending its cascade while the pool is unchanged"
+              acct_id
+              r.rr_senior
+              pool
+              r.rr_reserved;
+            None)
+        else if aged > reclaim_settle_ns && outranked && freed_enough
+        then (
+          (* The cancels freed quote, but it is not the senior's to spend: the assets
+             ahead of it in presentation order reserve first, and their claims now consume
+             it. A junior is only held while its senior could actually be funded, so
+             release it rather than starving it for a buy that cannot be placed. *)
+          Hashtbl.remove reclaim_reservations acct_id;
+          Hashtbl.replace
+            reclaim_ineffective
+            acct_id
+            { ir_senior = r.rr_senior
+            ; ir_pool = Float.max r.rr_pool pool
+            ; ir_at = now_ns
+            };
+          Logging.info_f
+            ~section
+            "reclaim outranked for %s: %s needs %.2f but only %.2f survives the seniors \
+             ahead of it (pool %.2f); releasing held strategies"
+            acct_id
+            r.rr_senior
+            need_now
+            (Option.value r.rr_senior_quote ~default:0.0)
+            pool;
+          None)
+        else if aged > reclaim_settle_ns && not freed_enough
+        then (
+          Hashtbl.remove reclaim_reservations acct_id;
+          (* Baseline the verdict on the higher of the two readings. The pool oscillates
+             around a hold the venue nets and releases (a frame can be a whole order
+             notional apart), so recording only the latest reading would let the very next
+             frame lift the verdict and restart the loop. *)
+          Hashtbl.replace
+            reclaim_ineffective
+            acct_id
+            { ir_senior = r.rr_senior
+            ; ir_pool = Float.max r.rr_pool pool
+            ; ir_at = now_ns
+            };
+          Logging.warn_f
+            ~section
+            "reclaim ineffective for %s: %s cancels landed but the pool did not grow \
+             (%.2f -> %.2f, need %.2f); releasing held strategies"
+            acct_id
+            r.rr_senior
+            r.rr_pool
+            pool
+            r.rr_reserved;
+          None)
+        else Some r
+    in
+    let reserved_senior = Option.map (fun r -> r.rr_senior) reservation in
+    let total_venue_quote = pool +. committed_venue_buys in
+    (* A standing ineffective verdict for this senior suppresses further cascades while
+       the pool has not moved since: the retry could not fund it, and the cancelled
+       juniors would be starved again for the same nothing. The $1 deadband absorbs fee
+       drift; a real fill (a sell) clears it. *)
+    let ineffective_for key =
+      match Hashtbl.find_opt reclaim_ineffective acct_id with
+      | Some ir ->
+        String.equal ir.ir_senior key
+        && Int64.sub now_ns ir.ir_at < reclaim_ineffective_ttl_ns
+        && pool <= ir.ir_pool +. 1.0
+      | None -> false
     in
     (* Account-local priority by key (config presentation order), matching the walk order
        the reclaim logic uses. *)
@@ -1258,8 +1461,26 @@ let run_account_pass
                 ~symbol:t.symbol
                 ~fallback:fallback_close
             in
+            let key = key_of_task t in
+            let is_reserved_senior =
+              match reserved_senior with
+              | Some k -> String.equal k key
+              | None -> false
+            in
+            (* Senior->junior pass-down: every asset ahead of this one has already
+               reserved its piece, so this is exactly what the reclaim can spend. *)
+            let quote_available = !remaining in
+            if is_reserved_senior
+            then (
+              match Hashtbl.find_opt reclaim_reservations acct_id with
+              | Some r ->
+                Hashtbl.replace
+                  reclaim_reservations
+                  acct_id
+                  { r with rr_senior_quote = Some quote_available }
+              | None -> ());
             let effective_quote =
-              if resting_buy then !remaining +. committed_buy else !remaining
+              if resting_buy then quote_available +. committed_buy else quote_available
             in
             let inputs : Oracle_pipeline.inputs =
               { exchange = t.exchange
@@ -1339,16 +1560,39 @@ let run_account_pass
                 ; updated_at = Unix.gettimeofday ()
                 }
               in
-              let need = d.buy_qty *. current in
-              let key = key_of_task t in
               let survival_active =
                 o.resolution.d_surv >= knobs.k_min_active_dsurv || resting_buy
               in
-              let is_reserved_senior =
-                match reserved_senior with
-                | Some k -> String.equal k key
-                | None -> false
+              (* The survival search prices the first rung one grid interval below the
+                 current price, while the activation gate prices the whole buy at the
+                 current price. A reserved senior can therefore resolve a size a few
+                 percent above the quote it just reclaimed and never activate - the
+                 reclaim cancels the junior and buys nothing. Size the reclaimed quote
+                 down to what it can afford, but never below the configured minimum. *)
+              let d : decision =
+                if is_reserved_senior
+                   && (not d.active)
+                   && survival_active
+                   && (not resting_buy)
+                   && current > 0.0
+                   && quote_available >= (bounds.qty *. current) -. 1e-9
+                then
+                  { d with
+                    active = true
+                  ; buy_qty = Float.min d.buy_qty (quote_available /. current *. 0.995)
+                  }
+                else d
               in
+              let need = d.buy_qty *. current in
+              if is_reserved_senior
+              then (
+                match Hashtbl.find_opt reclaim_reservations acct_id with
+                | Some r ->
+                  Hashtbl.replace
+                    reclaim_reservations
+                    acct_id
+                    { r with rr_senior_need = Some need }
+                | None -> ());
               let priority = Hashtbl.find priority_of_key key in
               let d =
                 if Oracle_pools.held_for_reservation
@@ -1373,13 +1617,14 @@ let run_account_pass
                   (* Funded strategies tie their next buy's quote; starved ones pass
                      capacity down. Resting buys are already committed in the pool, so
                      only fresh active placements consume free quote. *)
-                  if (not resting_buy) && need <= !remaining +. 1e-9
-                  then remaining := !remaining -. need;
+                  if (not resting_buy) && need <= quote_available +. 1e-9
+                  then remaining := Float.max 0.0 (!remaining -. need);
                   (* The reserved senior just funded: the reclaim completed, release the
                      cross-pass hold so lower-priority strategies resume normally. *)
                   if is_reserved_senior
                   then (
                     Hashtbl.remove reclaim_reservations acct_id;
+                    Hashtbl.remove reclaim_ineffective acct_id;
                     reserved_priority := None;
                     Logging.info_f
                       ~section
@@ -1389,7 +1634,10 @@ let run_account_pass
                       key
                       (Option.fold ~none:0.0 ~some:(fun r -> r.rr_reserved) reservation));
                   d)
-                else if survival_active && not !reclaim_active
+                else if survival_active
+                        && (not !reclaim_active)
+                        && (not (ineffective_for key))
+                        && not (in_startup_grace ~now:now_ns)
                 then (
                   (* Starved survivor: evaluate lower-priority resting buys and cancel the
                      minimum set that frees this strategy's shortfall. On success the
@@ -1408,18 +1656,26 @@ let run_account_pass
                     reclaim_active := true;
                     flagged := List.rev_append plan !flagged;
                     remaining := 0.0;
+                    (* A fresh attempt supersedes any earlier verdict; it is re-judged on
+                       the pool it produces. *)
+                    Hashtbl.remove reclaim_ineffective acct_id;
                     (* Reserve the freed quote for this senior across passes. The cancel
                        lands on the exec feed before the balance feed reflects the
                        released quote; in that window the senior has no resting buy left
                        to point the cascade at, while lower-priority strategies could
-                       re-fund from the same quote. *)
+                       re-fund from the same quote. [rr_pool] is the baseline the release
+                       is measured against. *)
                     Hashtbl.replace
                       reclaim_reservations
                       acct_id
                       { rr_senior = key
                       ; rr_reserved = need
                       ; rr_cancelled_keys = plan
-                      ; rr_at = Mtime_clock.now_ns ()
+                      ; rr_pool = pool
+                      ; rr_at = now_ns
+                      ; rr_senior_quote = None
+                      ; rr_senior_need = None
+                      ; rr_ttl_extended = false
                       };
                     start_reclaim_retry acct_id;
                     reserved_priority := Some priority;
@@ -1448,6 +1704,7 @@ let run_account_pass
                   if is_reserved_senior && not survival_active
                   then (
                     Hashtbl.remove reclaim_reservations acct_id;
+                    Hashtbl.remove reclaim_ineffective acct_id;
                     reserved_priority := None);
                   d)
               in
@@ -1742,6 +1999,9 @@ let run_loop
   in
   wait_initial_refresh ()
   >>= fun () ->
+  (* The first pass is warm but the pool is not yet trustworthy: hold the cascade through
+     a short settle window so a restart cannot cancel orders that the market did not move. *)
+  begin_startup_grace ();
   (* [run_loop]'s promise is held by the supervisor's [Lwt.pick] for the life of the
      oracle. A recursive [wait_event >>= loop] would therefore pin one Lwt Forward node
      per pass (the head stays reachable from the pick), growing the heap without bound.

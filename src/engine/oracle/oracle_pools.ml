@@ -104,6 +104,40 @@ let held_for_reservation ~(reserved_priority : int option) ~(priority : int) : b
   | Some rp -> priority > rp
 ;;
 
+(** Quote tied in resting buys that the venue balance frame has not netted yet.
+
+    A placement lands in the exec feed's order store before the venue's balance frame
+    moves the quote hold, so in that window the same notional is visible twice: still
+    inside [available] and again in [resting_buy_quote]. [total] is the account's quote
+    total from that same frame, which a hold cannot change, so anything [available] plus
+    [resting_buy_quote] claims beyond it is exactly the un-netted hold. Overlay
+    reservations are virtual and already inside [available], so they play no part here.
+    Derived from one frame every pass, so it cannot drift; a consistent venue yields 0. *)
+let unnetted_buy_hold ~(available : float) ~(resting_buy_quote : float) ~(total : float)
+  : float
+  =
+  if total <= 0.0 then 0.0 else Float.max 0.0 (available +. resting_buy_quote -. total)
+;;
+
+(** Whether a reclaim actually freed quote. A cancel only helps if the pool grows by what
+    it released; a cancel whose quote the pool already counted (the venue nets the hold
+    before the exec feed drops the order, or the cancel lands after the hold was released)
+    frees nothing, and holding juniors for it starves them for no gain. [reserved] is the
+    senior's next-buy need, scaled so a rounding-sized drift does not read as progress. *)
+let reclaim_freed_enough ~(pool_before : float) ~(pool_now : float) ~(reserved : float)
+  : bool
+  =
+  pool_now >= pool_before +. Float.max 1.0 (reserved *. 0.5)
+;;
+
+(** Whether the pool can fund the senior's reserved need right now. Coverage is the only
+    thing that makes a reclaim actionable: a pool that reaches the need funds the senior
+    on the same pass, so releasing on coverage hands the quote back to the juniors it was
+    cancelled from and re-arms the cascade for the same nothing. *)
+let reclaim_covers ~(pool_now : float) ~(reserved : float) : bool =
+  pool_now +. 1e-6 >= reserved
+;;
+
 (** Sell size from the venue base pool: base balance minus reserved_base (already excluded
     by the execution layer's available_trading_balance) minus base tied in resting sells.
     Never capital-gated. *)
