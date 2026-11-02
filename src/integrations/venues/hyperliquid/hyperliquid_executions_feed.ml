@@ -8,6 +8,52 @@ module Types = Dio_exchange.Exchange_intf.Types
 
 let section = "hyperliquid_executions_feed"
 
+(** The account whose fills this feed consumes. A fill carries a [liquidation] object when
+    either side was liquidated; only a matching [liquidatedUser] is our liquidation. *)
+let own_account_address () =
+  match Sys.getenv_opt "HYPERLIQUID_WALLET_ADDRESS" with
+  | Some s -> String.lowercase_ascii (String.trim s)
+  | None -> ""
+;;
+
+let classify_fill_intent ~own_account ~liquidation ~dir ~market ~side_str =
+  let own_account = String.lowercase_ascii (String.trim own_account) in
+  let contains hay needle =
+    let n = String.length needle in
+    let rec go i =
+      i + n <= String.length hay
+      && (String.equal (String.sub hay i n) needle || go (i + 1))
+    in
+    n = 0 || go 0
+  in
+  let d = String.lowercase_ascii dir in
+  let liquidation_is_own =
+    match liquidation with
+    | Some j ->
+      (match Yojson.Safe.Util.member "liquidatedUser" j with
+       | `String u ->
+         let u = String.lowercase_ascii (String.trim u) in
+         u <> "" && String.equal u own_account
+       | _ -> false)
+    | None -> false
+  in
+  if liquidation_is_own
+  then "liquidation"
+  else if contains d "open short"
+  then "open_short"
+  else if contains d "close short"
+  then "close_short"
+  else if contains d "open long"
+  then "open_long"
+  else if contains d "close long"
+  then "close_long"
+  else if String.equal market "perp"
+  then if String.equal side_str "sell" then "open_short" else "close_short"
+  else if String.equal side_str "buy"
+  then "buy_spot"
+  else "sell_spot"
+;;
+
 type exec_type =
   | PendingNew
   | New
@@ -1484,31 +1530,13 @@ let process_user_events data_json =
               let market =
                 if Hyperliquid_instruments_feed.is_perp_coin coin then "perp" else "spot"
               in
-              let contains hay needle =
-                let n = String.length needle in
-                let rec go i =
-                  i + n <= String.length hay
-                  && (String.equal (String.sub hay i n) needle || go (i + 1))
-                in
-                n = 0 || go 0
-              in
-              let d = String.lowercase_ascii dir in
               let intent =
-                if liquidation <> None
-                then "liquidation"
-                else if contains d "open short"
-                then "open_short"
-                else if contains d "close short"
-                then "close_short"
-                else if contains d "open long"
-                then "open_long"
-                else if contains d "close long"
-                then "close_long"
-                else if String.equal market "perp"
-                then if String.equal side_str "sell" then "open_short" else "close_short"
-                else if String.equal side_str "buy"
-                then "buy_spot"
-                else "sell_spot"
+                classify_fill_intent
+                  ~own_account:(own_account_address ())
+                  ~liquidation
+                  ~dir
+                  ~market
+                  ~side_str
               in
               let note =
                 match liquidation with
