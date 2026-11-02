@@ -1257,6 +1257,12 @@ let parse_step_body scope lines i header_indent header_ln =
         | [] -> []
       in
       when_ := Some (parse_condition scope (tp_make (strip_colon cond_toks)));
+      if !then_ <> []
+      then
+        err
+          ~line:l.ln
+          "actions before 'if' are not supported in one step; split them into a separate \
+           step";
       let acts, st, nj = parse_action_lines scope lines (!j + 1) body_indent in
       then_ := List.rev acts;
       if st then stop := true;
