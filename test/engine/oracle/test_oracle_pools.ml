@@ -188,6 +188,105 @@ let test_sell_qty () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* unnetted_buy_hold *)
+(* ------------------------------------------------------------------ *)
+
+let test_unnetted_hold_none_when_frame_is_consistent () =
+  (* Venue already netted the hold: free + tied == total. *)
+  near
+    "consistent frame"
+    (Dio_oracle.Oracle_pools.unnetted_buy_hold
+       ~available:238.93
+       ~resting_buy_quote:13.02
+       ~total:251.95)
+    0.0
+;;
+
+let test_unnetted_hold_is_the_fresh_placement () =
+  (* Live shape: USDC total 251.89, free still 251.89 because the hold is not in this
+     frame, HYPE's fresh 0.15 @ 86.77 resting. Without the discount the senior cascade
+     sees 23.05 available against a 23.21 need and cancels into no progress. *)
+  near
+    "fresh placement"
+    (Dio_oracle.Oracle_pools.unnetted_buy_hold
+       ~available:251.89
+       ~resting_buy_quote:13.02
+       ~total:251.89)
+    13.02
+;;
+
+let test_unnetted_hold_clamps_and_needs_total () =
+  (* Never negative (frames that lag a release), and no total means no claim. *)
+  near
+    "cancelled hold does not subtract"
+    (Dio_oracle.Oracle_pools.unnetted_buy_hold
+       ~available:238.93
+       ~resting_buy_quote:0.0
+       ~total:251.95)
+    0.0;
+  near
+    "no total data"
+    (Dio_oracle.Oracle_pools.unnetted_buy_hold
+       ~available:10.0
+       ~resting_buy_quote:5.0
+       ~total:0.0)
+    0.0
+;;
+
+(* ------------------------------------------------------------------ *)
+(* reclaim_freed_enough *)
+(* ------------------------------------------------------------------ *)
+
+let test_reclaim_freed_enough_growth () =
+  (* Cancels that actually release quote: the pool covers the reservation. *)
+  Alcotest.(check bool)
+    "full release counts"
+    (Dio_oracle.Oracle_pools.reclaim_freed_enough
+       ~pool_before:10.0
+       ~pool_now:33.2
+       ~reserved:23.2)
+    true;
+  Alcotest.(check bool)
+    "nothing moved is not a release"
+    (Dio_oracle.Oracle_pools.reclaim_freed_enough
+       ~pool_before:10.0
+       ~pool_now:10.0
+       ~reserved:23.2)
+    false;
+  Alcotest.(check bool)
+    "dust drift is not a release"
+    (Dio_oracle.Oracle_pools.reclaim_freed_enough
+       ~pool_before:13.59
+       ~pool_now:13.62
+       ~reserved:23.2)
+    false;
+  Alcotest.(check bool)
+    "small reservation still needs a real move"
+    (Dio_oracle.Oracle_pools.reclaim_freed_enough
+       ~pool_before:5.0
+       ~pool_now:6.2
+       ~reserved:0.3)
+    true
+;;
+
+let test_reclaim_covers () =
+  (* Coverage is measured against the quote that survives the assets ahead of the senior,
+     never the whole pool. *)
+  Alcotest.(check bool)
+    "availability above the need covers"
+    (Dio_oracle.Oracle_pools.reclaim_covers ~pool_now:12.10 ~reserved:10.35)
+    true;
+  Alcotest.(check bool)
+    "availability equal to the need covers"
+    (Dio_oracle.Oracle_pools.reclaim_covers ~pool_now:10.35 ~reserved:10.35)
+    true;
+  Alcotest.(check bool)
+    "availability below the need does not cover"
+    (Dio_oracle.Oracle_pools.reclaim_covers ~pool_now:10.34 ~reserved:10.35)
+    false
+;;
+
+(* ------------------------------------------------------------------ *)
 (* simulate_drawdown_survival *)
 (* ------------------------------------------------------------------ *)
 
@@ -294,6 +393,24 @@ let () =
             test_reservation_highest_senior_holds_all_juniors
         ] )
     ; "sell qty", [ Alcotest.test_case "pool arithmetic" `Quick test_sell_qty ]
+    ; ( "reclaim verification"
+      , [ Alcotest.test_case "growth is required" `Quick test_reclaim_freed_enough_growth
+        ; Alcotest.test_case "coverage" `Quick test_reclaim_covers
+        ] )
+    ; ( "unnetted buy hold"
+      , [ Alcotest.test_case
+            "consistent frame yields none"
+            `Quick
+            test_unnetted_hold_none_when_frame_is_consistent
+        ; Alcotest.test_case
+            "fresh placement is discounted"
+            `Quick
+            test_unnetted_hold_is_the_fresh_placement
+        ; Alcotest.test_case
+            "clamps and needs a total"
+            `Quick
+            test_unnetted_hold_clamps_and_needs_total
+        ] )
     ; ( "drawdown sim"
       , [ Alcotest.test_case
             "single-strategy exhaustion price"

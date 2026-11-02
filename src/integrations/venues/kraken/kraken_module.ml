@@ -127,6 +127,19 @@ module Kraken_impl = struct
       ()
     >|= function
     | Ok (res : Kraken_common_types.add_order_result) ->
+      (* Index the id immediately. A cancel can be acked before the venue's [new] frame
+         arrives, and the cancel path resolves its symbol through this index: without the
+         eager entry the cancel is dropped and the order's hold caps the account's
+         tradeable quote until the next process restart. *)
+      let feed_side =
+        if String.equal kraken_side "buy"
+        then Kraken_executions_feed.Buy
+        else Kraken_executions_feed.Sell
+      in
+      Kraken_executions_feed.register_placement
+        ~order_id:res.order_id
+        ~symbol
+        ~side:feed_side;
       Ok
         { Types.order_id = res.order_id
         ; cl_ord_id = res.cl_ord_id
@@ -276,7 +289,11 @@ module Kraken_impl = struct
   (** Returns the current tradeable balance for [asset] from the balances feed cache:
       trading wallets minus open-order holds. *)
   let get_tradeable_balance ~asset =
-    Float.max 0.0 (Kraken_balances_feed.get_balance asset -. open_order_holds asset)
+    Float.max
+      0.0
+      (Kraken_balances_feed.get_balance asset
+       +. Kraken_balances_feed.get_projected asset
+       -. open_order_holds asset)
   ;;
 
   (** Cached tradeable balance. The returned closure is owned by a single asset domain;
@@ -297,7 +314,11 @@ module Kraken_impl = struct
         last_hold
         := Kraken_balances_feed.get_pending_sell_qty asset
            +. Kraken_balances_feed.get_pending_buy_quote_value asset);
-      Float.max 0.0 (Kraken_balances_feed.BalanceStore.get_balance store -. !last_hold)
+      Float.max
+        0.0
+        (Kraken_balances_feed.BalanceStore.get_balance store
+         +. Kraken_balances_feed.BalanceStore.get_projected store
+         -. !last_hold)
   ;;
 
   (* Kraken's tradeable figure is already hold-netted. *)
@@ -651,6 +672,21 @@ let () =
 
 (* Register Kraken_impl into the global exchange registry at load time. *)
 let () = Exchange.Registry.register (module Kraken_impl)
+
+(* Apply execution fills to the balance store so the oracle reads one figure: the venue
+   has no timestamp on its balance frames, so a snapshot-vs-event clock comparison cannot
+   prove incorporation. *)
+module Tradeable_projection_impl : Exchange.Tradeable_projection.S = struct
+  let name = "kraken"
+
+  let apply ~asset ~delta ~id =
+    Kraken_balances_feed.apply_tradeable_delta ~asset ~delta ~id
+  ;;
+end
+
+let () =
+  Exchange.Registry.register_tradeable_projection (module Tradeable_projection_impl)
+;;
 
 (* Register the oracle data-venue adapter (historical bars, fees, balances, instruments
    for the capital oracle) at load time. *)

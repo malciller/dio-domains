@@ -11,6 +11,9 @@ let ring_buffer_size = Kraken_common_types.default_ring_buffer_size_executions
    id). A dropped fill is a silent inventory desync; the count surfaces it in the warn
    lines. *)
 let dropped_execution_frames = Atomic.make 0
+
+(* Non-terminal frames dropped because the order was already cancelled locally. *)
+let resurrected_frames = Atomic.make 0
 let cleanup_handlers_started = Atomic.make false
 
 open Kraken_common_types
@@ -229,6 +232,9 @@ let () =
 
 let order_to_symbol_startup_done = Atomic.make false
 
+(** Mutex protecting the global order-to-symbol index. *)
+let global_orders_mutex = Mutex.create ()
+
 (** Inserts an order ID to symbol mapping, evicting oldest-first past the cap. Caller must
     hold [global_orders_mutex]. *)
 let add_to_order_to_symbol order_id symbol side =
@@ -238,6 +244,44 @@ let add_to_order_to_symbol order_id symbol side =
 (** Retires an order ID. Caller must hold [global_orders_mutex]. *)
 let retire_from_order_to_symbol order_id =
   Concurrency.Fifo_index.remove order_to_symbol order_id
+;;
+
+(** Order IDs whose cancel we already applied locally, bounded and FIFO-evicted.
+
+    A cancel acked over REST can reach us before the venue's own [new]/[amended] frame for
+    the same order. Without this the late insert resurrects an order that no longer
+    exists, and its hold is then subtracted from the tradeable figure forever - a
+    permanent phantom reservation that starves every strategy on the venue. A non-terminal
+    frame for a marked id is therefore dropped instead of inserted. *)
+let cancelled_ids =
+  Concurrency.Fifo_index.create ~label:(section ^ "/cancelled_ids") ~cap:2048 ()
+;;
+
+(** Records that [order_id] was cancelled locally. Thread-safe. *)
+let mark_cancelled order_id =
+  Mutex.lock global_orders_mutex;
+  Concurrency.Fifo_index.set cancelled_ids ~key:order_id ~value:();
+  Mutex.unlock global_orders_mutex
+;;
+
+(** True when [order_id] was cancelled locally. A mark outlives the venue's terminal frame
+    on purpose: an out-of-order [new]/[amended] can still arrive after it, and inserting
+    it would resurrect a dead order. Retired by FIFO eviction or a fresh placement. *)
+let is_cancelled order_id =
+  Mutex.lock global_orders_mutex;
+  let found = Concurrency.Fifo_index.find_opt cancelled_ids order_id <> None in
+  Mutex.unlock global_orders_mutex;
+  found
+;;
+
+(** Registers an order the moment its placement is acked, before any execution frame can
+    arrive. Cancels and amends resolve their symbol through this index; a cancel issued
+    inside that window was previously unattributable and silently dropped. *)
+let register_placement ~order_id ~symbol ~side =
+  Mutex.lock global_orders_mutex;
+  add_to_order_to_symbol order_id symbol side;
+  Concurrency.Fifo_index.remove cancelled_ids order_id;
+  Mutex.unlock global_orders_mutex
 ;;
 
 (** Tunes the cap after the startup snapshot: max(32, observed * 1.5 + 1). Executes once.
@@ -252,9 +296,6 @@ let lock_order_to_symbol_cap () =
       ~observed
       ~floor:Concurrency.Cache_limits.order_index_min_cap)
 ;;
-
-(** Mutex protecting the global order-to-symbol index. *)
-let global_orders_mutex = Mutex.create ()
 
 (** Mutex for symbol_stores table initialization. *)
 let initialization_mutex = Mutex.create ()
@@ -477,12 +518,52 @@ let remove_open_order ~symbol ~order_id =
     else false
   in
   Mutex.unlock store.orders_mutex;
-  if was_present
-  then (
-    Mutex.lock global_orders_mutex;
-    retire_from_order_to_symbol order_id;
-    Mutex.unlock global_orders_mutex;
-    Logging.debug_f ~section "EAGER_REMOVE %s [%s] (cancel response)" order_id symbol)
+  (* The caller's symbol can be stale or absent (a cancel acked before the venue's own
+     frame); sweep the other stores so the hold is released wherever the order landed. *)
+  let swept =
+    if was_present
+    then 0
+    else (
+      let n = ref 0 in
+      let symbols =
+        Mutex.lock global_orders_mutex;
+        let acc = ref [] in
+        Ds.Cow_table.iter
+          (fun s _ -> if not (String.equal s symbol) then acc := s :: !acc)
+          symbol_stores;
+        let r = !acc in
+        Mutex.unlock global_orders_mutex;
+        r
+      in
+      List.iter
+        (fun s ->
+          let st = get_symbol_store s in
+          Mutex.lock st.orders_mutex;
+          if Hashtbl.mem st.open_orders order_id
+          then (
+            Hashtbl.remove st.open_orders order_id;
+            note_change st order_id None;
+            publish_open_orders_cache st;
+            incr n);
+          Mutex.unlock st.orders_mutex)
+        symbols;
+      !n)
+  in
+  (* Marked so a still-in-flight [new]/[amended] frame cannot insert an order the venue
+     already killed. The id stays in [order_to_symbol]: the venue's terminal frame must
+     still resolve its symbol, because that frame also carries any partial fill and is
+     what clears the mark. *)
+  Mutex.lock global_orders_mutex;
+  Concurrency.Fifo_index.set cancelled_ids ~key:order_id ~value:();
+  Mutex.unlock global_orders_mutex;
+  if was_present || swept > 0
+  then
+    Logging.debug_f
+      ~section
+      "EAGER_REMOVE %s [%s] (cancel response, swept=%d)"
+      order_id
+      symbol
+      swept
 ;;
 
 (** Returns all symbols with initialized execution stores. *)
@@ -588,7 +669,7 @@ let[@inline always] get_current_position_fast symbol =
 (** Reconciles the open orders table from an incoming execution event. Logging is deferred
     until after the mutex is released to avoid holding global_orders_mutex while
     contending on the logging output_mutex. *)
-let update_open_orders store (event : execution_event) =
+let update_open_orders_unchecked store (event : execution_event) =
   (* Deferred log signal: captures what to log after mutex release. *)
   let log_action = ref `None in
   let is_terminal_status =
@@ -834,6 +915,40 @@ let update_open_orders store (event : execution_event) =
   | `None -> ()
 ;;
 
+(** Applies one order update, refusing frames that would resurrect an order already
+    cancelled locally. A cancel acked over REST can arrive before the venue's own
+    [new]/[amended] frame; inserting that frame leaves a dead order in the cache whose
+    hold is then subtracted from the tradeable figure forever, starving every strategy on
+    the venue. Fills and terminal frames always pass - they carry inventory and cleanup. *)
+let update_open_orders store (event : execution_event) =
+  let is_terminal_status =
+    match event.order_status with
+    | FilledStatus | CanceledStatus | ExpiredStatus | RejectedStatus -> true
+    | PendingNewStatus | NewStatus | PartiallyFilledStatus | UnknownStatus _ -> false
+  in
+  let resurrects_cancelled =
+    (not is_terminal_status)
+    &&
+    match event.exec_type with
+    | New | PendingNew | Amended | Restated -> is_cancelled event.order_id
+    | Trade | PartiallyFilled | Filled | Canceled | Expired | Rejected | Unknown _ ->
+      false
+  in
+  if resurrects_cancelled
+  then (
+    let n = Atomic.fetch_and_add resurrected_frames 1 + 1 in
+    if n <= 10 || n land (n - 1) = 0
+    then
+      Logging.debug_f
+        ~section
+        "Dropping %s for locally-cancelled order %s [%s] (cumulative drops=%d)"
+        (string_of_exec_type event.exec_type)
+        event.order_id
+        event.symbol
+        n)
+  else update_open_orders_unchecked store event
+;;
+
 (** Parses an optional float from JSON. Delegates to Kraken_common_types. *)
 let parse_float_opt = Kraken_common_types.parse_float_opt
 
@@ -887,6 +1002,16 @@ let parse_execution_event json =
         (match s with
          | Some (sym, side) -> Some (sym, Some side)
          | None ->
+           (* Terminal frame for an id we cannot attribute: record the cancel anyway so a
+              late [new]/[amended] frame cannot insert an order the venue already killed.
+              Its hold would otherwise be subtracted from the tradeable figure forever.
+              Informational frames still fall through to the drop below. *)
+           let terminal =
+             match order_status_of_string order_status_str with
+             | CanceledStatus | RejectedStatus | ExpiredStatus | FilledStatus -> true
+             | _ -> false
+           in
+           if terminal then mark_cancelled order_id;
            (* Skip events with no symbol attribution (typical of pre-startup orders). Warn
               is throttled as the count grows; a persistent flood means order ids are
               evicted from the index while fills still arrive, a silent fill loss. *)
@@ -1052,11 +1177,13 @@ let parse_execution_event json =
           sym
           order_status_str
           exec_type_str;
+      let exec_type = exec_type_of_string exec_type_str in
+      let order_status = order_status_of_string order_status_str in
       Some
         { order_id
         ; symbol = sym
-        ; exec_type = exec_type_of_string exec_type_str
-        ; order_status = order_status_of_string order_status_str
+        ; exec_type
+        ; order_status
         ; side = side_of_string side_str
         ; order_qty
         ; cum_qty

@@ -706,6 +706,22 @@ module Capital_reservation = struct
   end
 end
 
+(** Optional venue-side projection of the tradeable figure.
+
+    A venue that registers this applies execution fills to its own balance store, so the
+    oracle reads one figure instead of reconciling a snapshot against an event clock. The
+    venue owns the reconciliation: a balance frame is absolute truth and clears the
+    projection, and any delta it already contains is not double counted. *)
+module Tradeable_projection = struct
+  module type S = sig
+    val name : string
+
+    (** [asset] is the asset whose tradeable balance moves - the quote for a fill's cash
+        leg, the base for its inventory leg. [id] dedupes a replayed fill. *)
+    val apply : asset:string -> delta:float -> id:string -> unit
+  end
+end
+
 (** Dynamic registry mapping exchange names to their [(module S)] implementations. Backed
     by a [Hashtbl] for O(1) lookup. *)
 module Registry = struct
@@ -748,6 +764,16 @@ module Registry = struct
   ;;
 
   let get_capital_reservation name = Hashtbl.find_opt _capital_reservations name
+
+  let _tradeable_projections : (string, (module Tradeable_projection.S)) Hashtbl.t =
+    Hashtbl.create 4
+  ;;
+
+  let register_tradeable_projection (module M : Tradeable_projection.S) =
+    Hashtbl.replace _tradeable_projections M.name (module M)
+  ;;
+
+  let get_tradeable_projection name = Hashtbl.find_opt _tradeable_projections name
 end
 
 (** Oracle data-venue interface: the contract the capital oracle needs from an exchange

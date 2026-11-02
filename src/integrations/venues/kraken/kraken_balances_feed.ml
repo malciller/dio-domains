@@ -62,6 +62,10 @@ module BalanceStore = struct
     ; trading_balance :
         float Atomic.t (* Cached sum of trading (non-earn) wallet balances. *)
     ; last_updated : float Atomic.t
+    ; projected : float Atomic.t
+        (* Fills applied since the last balance frame, on top of [trading_balance]. *)
+    ; projected_at : float Atomic.t
+    ; applied_ids : unit Concurrency.Fifo_index.t
     }
 
   let create () =
@@ -71,6 +75,10 @@ module BalanceStore = struct
     ; total_balance = Atomic.make 0.0
     ; trading_balance = Atomic.make 0.0
     ; last_updated = Atomic.make 0.0
+    ; projected = Atomic.make 0.0
+    ; projected_at = Atomic.make 0.0
+    ; applied_ids =
+        Concurrency.Fifo_index.create ~label:(section ^ "/applied_ids") ~cap:512 ()
     }
   ;;
 
@@ -146,6 +154,10 @@ module BalanceStore = struct
     Atomic.set store.total_balance total;
     Atomic.set store.trading_balance trading;
     Atomic.set store.last_updated now;
+    (* The frame is the venue's absolute truth for this asset: whatever it already
+       contains, the local projection is superseded. *)
+    Atomic.set store.projected 0.0;
+    Atomic.set store.projected_at 0.0;
     Mutex.unlock store.mutex;
     if trading <> prev_trading then Concurrency.Oracle_wakeup.notify_balance ()
   ;;
@@ -158,6 +170,20 @@ module BalanceStore = struct
   (** Returns the wall-clock timestamp of the last wallet update for this asset (0.0 =
       never updated). Used for balance-snapshot staleness. *)
   let get_last_updated store = Atomic.get store.last_updated
+
+  (** Fills applied since the last balance frame. Zero once the projection is older than
+      the TTL: the venue's frame should have landed by then, and a projection kept past it
+      would double count a fill the frame already carries. *)
+  let projected_ttl_s = 5.0
+
+  let get_projected store =
+    let p = Atomic.get store.projected in
+    if p = 0.0
+    then 0.0
+    else (
+      let at = Atomic.get store.projected_at in
+      if at > 0.0 && Unix.time () -. at <= projected_ttl_s then p else 0.0)
+  ;;
 
   let get_all store =
     { asset = ""
@@ -258,6 +284,29 @@ let[@inline always] get_total_balance asset =
   let store = get_balance_store asset in
   BalanceStore.get_total_balance store
 ;;
+
+(** Applies one execution fill's effect on [asset]'s tradeable figure. The venue's next
+    balance frame supersedes it; [id] dedupes a replayed fill. *)
+let apply_tradeable_delta ~asset ~delta ~id =
+  if Float.is_finite delta && delta <> 0.0
+  then (
+    let store = get_balance_store asset in
+    Mutex.lock store.mutex;
+    let seen =
+      (not (String.equal id ""))
+      && Concurrency.Fifo_index.find_opt store.applied_ids id <> None
+    in
+    if not seen
+    then (
+      if not (String.equal id "")
+      then Concurrency.Fifo_index.set store.applied_ids ~key:id ~value:();
+      Atomic.set store.projected (Atomic.get store.projected +. delta);
+      Atomic.set store.projected_at (Unix.time ()));
+    Mutex.unlock store.mutex;
+    if not seen then Concurrency.Oracle_wakeup.notify_balance ())
+;;
+
+let get_projected asset = BalanceStore.get_projected (get_balance_store asset)
 
 (** Returns the earn/staked balance for [asset]: funds held in earn wallets, which are
     part of the total but not tradeable. Kraken wallet snapshots report gross balances, so

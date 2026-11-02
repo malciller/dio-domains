@@ -104,6 +104,25 @@ let test_sell_qty_of () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* Startup grace *)
+(* ------------------------------------------------------------------ *)
+
+let test_startup_grace_window () =
+  (* A restart must not cancel a junior's resting order on its first pass: the pool is
+     warm but not yet trustworthy, and a cancel there moves an order the market never
+     asked to move. *)
+  Dio_oracle.Oracle_runtime.begin_startup_grace ();
+  Alcotest.(check bool)
+    "inside the window"
+    true
+    (Dio_oracle.Oracle_runtime.in_startup_grace ~now:0L);
+  Alcotest.(check bool)
+    "after the window"
+    false
+    (Dio_oracle.Oracle_runtime.in_startup_grace ~now:Int64.max_int)
+;;
+
+(* ------------------------------------------------------------------ *)
 (* Publish + decision_for *)
 (* ------------------------------------------------------------------ *)
 
@@ -297,6 +316,7 @@ let () =
         ] )
     ; ( "publish"
       , [ Alcotest.test_case "read APIs stable" `Quick test_publish_and_decision_for
+        ; Alcotest.test_case "startup grace window" `Quick test_startup_grace_window
         ; Alcotest.test_case "spec defaults" `Quick test_default_config_spec_values
         ] )
     ]

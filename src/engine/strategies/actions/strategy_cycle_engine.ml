@@ -924,6 +924,29 @@ let order_place
           Jac.round_qty_up qty instrument asset.exchange
         | _ -> qty)
     in
+    let order_side =
+      if String.equal (String.lowercase_ascii side) "sell"
+      then Strategy_common.Sell
+      else Strategy_common.Buy
+    in
+    (* A reduce-only order may only ever shrink the position it names. Clamp to the live
+       position so a stale strategy input or a duplicated close can never open the
+       opposite side. *)
+    let qty =
+      if reduce_only && is_perp
+      then (
+        let position =
+          match
+            Dio_exchange.Market_context.get_position
+              ~exchange:asset.exchange
+              ~coin:instrument
+          with
+          | Some (p : Dio_exchange.Market_context.position) -> Some p.qty
+          | None -> None
+        in
+        Strategy_common.reduce_only_room ~position ~side:order_side ~qty)
+      else qty
+    in
     (* A fresh entry fill can precede the position snapshot; without a grace window the
        overlay sees flat and re-shorts the full target. Hold new entries until the next
        webData2 snapshot (~5s). The fill is already booked. *)
@@ -940,6 +963,13 @@ let order_place
         "Overlay entry held %.2fs for the position snapshot after the entry fill (%s)"
         (c.cg_now -. c.cg_last_entry_fill_at)
         instrument
+    else if reduce_only && is_perp && qty <= 0.0
+    then
+      Logging.debug_f
+        ~section
+        "Overlay reduce-only order skipped: nothing to reduce on %s (%s)"
+        instrument
+        dedup_key
     else if (not (Float.is_finite qty)) || qty <= 0.0
     then
       Logging.warn_f
@@ -948,11 +978,7 @@ let order_place
         qty
         instrument
     else (
-      let side =
-        if String.equal (String.lowercase_ascii side) "sell"
-        then Strategy_common.Sell
-        else Strategy_common.Buy
-      in
+      let side = order_side in
       (* Hyperliquid's $10 floor applies to perps as well as spot. `qty` above is the size
          the venue will accept: untouched when its lot rounding already clears the floor,
          bumped one lot when it would not. A reduce-only close is exempt by the venue's
@@ -1196,6 +1222,29 @@ let order_replace
         then Strategy_common.Sell
         else Strategy_common.Buy
       in
+      (* A reduce-only order may only ever shrink the position it names. Clamp to the live
+         position so a repriced or duplicated close can never open the opposite side; a
+         flat position cancels the leftovers below instead of sending a new one. *)
+      let requested_qty = qty in
+      let qty =
+        if reduce_only && is_perp
+        then (
+          let position =
+            match
+              Dio_exchange.Market_context.get_position
+                ~exchange:asset.exchange
+                ~coin:instrument
+            with
+            | Some (p : Dio_exchange.Market_context.position) -> Some p.qty
+            | None -> None
+          in
+          Strategy_common.reduce_only_room ~position ~side:order_side ~qty)
+        else qty
+      in
+      (* The clamp reached zero from a live request: the strategy asked to close but the
+         position read is already flat. Do not fall through to the qty<=0 branch - that
+         would cancel a healthy take-profit on a single stale frame. *)
+      let clamped_flat = reduce_only && is_perp && requested_qty > 0.0 && qty <= 0.0 in
       (* Buys share the same userref: the spot recycle buy and the perp take-profit are
          both carry buys. Match an existing order only when its booked kind is the same;
          otherwise a spot replace could amend/cancel the take-profit (or vice versa). *)
@@ -1262,75 +1311,94 @@ let order_replace
           in
           let consider ~is_perp symbol =
             iter_cached ~symbol (fun oid price _remaining side_str userref ->
-              (* Venues that do not echo the engine's user reference (Lighter) return
-                 [None]/[0]. Match those by the exact target price so an order placed
-                 before a restart (or before the tag existed) is adopted and its
-                 duplicates cancelled instead of being layered again. *)
-              let userref_ok =
-                match userref with
-                | Some 0 | None ->
-                  (* Only Lighter drops the tag; other venues' untagged orders are
-                     external and must not be adopted. *)
-                  String.equal (String.lowercase_ascii asset.exchange) "lighter"
-                  && price > 0.0
-                  && Float.abs (price -. rounded)
-                     <= 1e-9 *. Float.max 1.0 (Float.abs rounded)
-                | Some u -> u = Strategy_common.strategy_userref_carry
-              in
-              if userref_ok
-                 && String.equal side_str want_side
-                 && not (Hashtbl.mem seen oid)
+              if String.equal side_str want_side && not (Hashtbl.mem seen oid)
               then (
-                (* Both books share one userref. Match instrument class and logical kind
-                   so a spot recycle is never amended as a perp take-profit. The registry
-                   check covers a view that lists an unclassified order. *)
-                let meta = Strategy_common.lookup_carry_order ~order_id:oid in
-                let market_ok =
-                  match meta with
-                  | Some m ->
-                    m.Strategy_common.com_market = Strategy_common.Carry_perp = want_perp
-                  | None ->
-                    (* No registry entry: the materialized order's own market label
-                       decides, not the store key. *)
-                    true
+                (* Only the engine's own carry orders need the registry; untagged orders
+                   on a venue that drops the userref need it to identify themselves.
+                   Looking every grid order up here was the scan's dominant cost. *)
+                let wants_registry =
+                  match userref with
+                  | Some 0 | None ->
+                    String.equal (String.lowercase_ascii asset.exchange) "lighter"
+                  | Some u -> u = Strategy_common.strategy_userref_carry
                 in
-                let kind_ok =
-                  (* No registry entry: the carry order's market+side identifies its kind.
-                     Ignoring it strands a live order that the next placement would
-                     duplicate. *)
-                  match order_side, meta with
-                  | Strategy_common.Buy, Some m ->
-                    String.equal m.Strategy_common.com_kind kind_key
-                  | Strategy_common.Buy, None -> true
-                  | Strategy_common.Sell, Some m ->
-                    String.equal m.Strategy_common.com_kind kind_key
-                  | Strategy_common.Sell, None -> true
-                in
-                if market_ok && kind_ok
+                if wants_registry
                 then (
-                  (* The id index may point at the spot pair even when the scan was keyed
-                     by the bare coin. Try the scanned store, then the other store;
-                     querying only the scanned key duplicates every resting perp order. *)
-                  let materialize store_symbol =
-                    match Ex.get_open_order ~symbol:store_symbol ~order_id:oid with
-                    | Some _ as o -> o
-                    | None -> None
+                  let meta = Strategy_common.lookup_carry_order ~order_id:oid in
+                  (* Venues that do not echo the engine's user reference (Lighter) return
+                     [None]/[0]. The id registry is the stronger identity: an order this
+                     engine booked under this exact kind is ours even after a reprice
+                     moved it off the last target price, so it is amended rather than
+                     layered again. With no registry entry (a restart, or an order placed
+                     before the tag existed) fall back to the exact target price. *)
+                  let userref_ok =
+                    match userref with
+                    | Some 0 | None ->
+                      (* Only Lighter drops the tag; other venues' untagged orders are
+                         external and must not be adopted. *)
+                      (match meta with
+                       | Some m -> String.equal m.Strategy_common.com_kind kind_key
+                       | None ->
+                         price > 0.0
+                         && Float.abs (price -. rounded)
+                            <= 1e-9 *. Float.max 1.0 (Float.abs rounded))
+                    | Some u -> u = Strategy_common.strategy_userref_carry
                   in
-                  let other = if is_perp then asset.symbol else instrument in
-                  let order =
-                    match materialize symbol with
-                    | Some _ as o -> o
-                    | None when not (String.equal other symbol) -> materialize other
-                    | None -> None
-                  in
-                  match order with
-                  | Some (o : Dio_exchange.Exchange_intf.Types.open_order)
-                    when (o.market = want_market
-                          && o.status = Dio_exchange.Exchange_intf.Types.New)
-                         || o.status = Dio_exchange.Exchange_intf.Types.PartiallyFilled ->
-                    Hashtbl.replace seen oid ();
-                    out := o :: !out
-                  | _ -> ())))
+                  if userref_ok
+                  then (
+                    (* Both books share one userref. Match instrument class and logical
+                       kind so a spot recycle is never amended as a perp take-profit. The
+                       registry check covers a view that lists an unclassified order. *)
+                    let market_ok =
+                      match meta with
+                      | Some m ->
+                        m.Strategy_common.com_market
+                        = Strategy_common.Carry_perp
+                        = want_perp
+                      | None ->
+                        (* No registry entry: the materialized order's own market label
+                           decides, not the store key. *)
+                        true
+                    in
+                    let kind_ok =
+                      (* No registry entry: the carry order's market+side identifies its
+                         kind. Ignoring it strands a live order that the next placement
+                         would duplicate. *)
+                      match order_side, meta with
+                      | Strategy_common.Buy, Some m ->
+                        String.equal m.Strategy_common.com_kind kind_key
+                      | Strategy_common.Buy, None -> true
+                      | Strategy_common.Sell, Some m ->
+                        String.equal m.Strategy_common.com_kind kind_key
+                      | Strategy_common.Sell, None -> true
+                    in
+                    if market_ok && kind_ok
+                    then (
+                      (* The id index may point at the spot pair even when the scan was
+                         keyed by the bare coin. Try the scanned store, then the other
+                         store; querying only the scanned key duplicates every resting
+                         perp order. *)
+                      let materialize store_symbol =
+                        match Ex.get_open_order ~symbol:store_symbol ~order_id:oid with
+                        | Some _ as o -> o
+                        | None -> None
+                      in
+                      let other = if is_perp then asset.symbol else instrument in
+                      let order =
+                        match materialize symbol with
+                        | Some _ as o -> o
+                        | None when not (String.equal other symbol) -> materialize other
+                        | None -> None
+                      in
+                      match order with
+                      | Some (o : Dio_exchange.Exchange_intf.Types.open_order)
+                        when (o.market = want_market
+                              && o.status = Dio_exchange.Exchange_intf.Types.New)
+                             || o.status
+                                = Dio_exchange.Exchange_intf.Types.PartiallyFilled ->
+                        Hashtbl.replace seen oid ();
+                        out := o :: !out
+                      | _ -> ())))))
           in
           if want_perp
           then
@@ -1410,7 +1478,7 @@ let order_replace
          both target the same position (the chart then shows one close, not a doubled
          one). *)
       if qty <= 0.0
-      then List.iter (fun o -> cancel_one o) matching
+      then (if not clamped_flat then List.iter (fun o -> cancel_one o) matching)
       else if backoff > 0.0
       then
         Logging.debug_f

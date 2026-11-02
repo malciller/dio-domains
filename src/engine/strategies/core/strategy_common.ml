@@ -339,6 +339,26 @@ let overlay_inflight_key ~dedup_key ~side ~qty ~price ~exchange ~instrument ~red
   base ^ "|" ^ exchange ^ "|" ^ instrument ^ if reduce_only then "|ro" else ""
 ;;
 
+(** Room a reduce-only order has left on [side] in the live position. A reduce-only order
+    may only shrink an existing position: a stale strategy input, a duplicated close, or a
+    position that vanished between the snapshot and the send must never flip the book into
+    the opposite side. Clamped to the position, and zero when the position is flat. An
+    unknown position passes through - the venue's own reduce-only flag is the fallback
+    when no snapshot has landed yet. *)
+let reduce_only_room ~(position : float option) ~(side : order_side) ~(qty : float)
+  : float
+  =
+  match position with
+  | Some p when Float.is_finite p ->
+    let room =
+      match side with
+      | Sell -> Float.max 0.0 p
+      | Buy -> Float.max 0.0 (-.p)
+    in
+    Float.min (Float.max 0.0 qty) room
+  | _ -> Float.max 0.0 qty
+;;
+
 (** Per-symbol strategy order-action counters.
 
     Incremented on each successful push of a place/amend/cancel to a ring buffer. The
