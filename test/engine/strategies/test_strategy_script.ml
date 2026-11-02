@@ -326,6 +326,30 @@ let test_validate_accepts_exponent_literal () =
     Alcotest.(check int) "exponent literal validates" 0 (List.length errors)
 ;;
 
+let test_assign_before_if_rejected () =
+  register ();
+  let s =
+    {|
+strategy pre
+version 1
+remembers:
+  a: float
+when book.updates:
+  s:
+    a = 1.0
+    if a > 0.0:
+      a = 2.0
+|}
+  in
+  match Strategy_script.parse_string s with
+  | Ok _ -> Alcotest.fail "expected assignments-before-if rejection"
+  | Error e ->
+    Alcotest.(check bool)
+      "error tells the author to split the step"
+      true
+      (Str.contains e "split")
+;;
+
 let () =
   Alcotest.run
     "strategy_script"
@@ -334,6 +358,10 @@ let () =
         ; Alcotest.test_case "event expansion" `Quick test_event_expansion
         ; Alcotest.test_case "bare gate assignment" `Quick test_bare_gate_assignment
         ; Alcotest.test_case "if/otherwise" `Quick test_if_otherwise
+        ; Alcotest.test_case
+            "assignments before if rejected"
+            `Quick
+            test_assign_before_if_rejected
         ; Alcotest.test_case "round-trip json" `Quick test_roundtrip_json
         ] )
     ; ( "validate"

@@ -392,8 +392,14 @@ type overlay_instance_rt =
   ; oir_state : Yojson.Basic.t ref
   ; mutable oir_seen_positions_at : float
   ; mutable oir_seen_margin_at : float
+  ; mutable oir_diag_at : float (* blocked-log throttle *)
   ; oir_profs : domain_profilers (* this instance's own phases *)
   }
+
+(** True while a long overlay owes exposure to the sale-funded target. A pending target
+    must keep the book cycle alive: gating it on a resting bid deadlocks the first entry
+    after every spot sale. *)
+let long_overlay_pending ~target ~open_long_base = target > open_long_base +. 1e-9
 
 (** Load every overlay instance owned by [owner]. A failed instance is logged and skipped;
     config validation has already checked the file exists and its name matches. *)
@@ -454,6 +460,16 @@ let load_overlay_instances ~(owner : trading_config) : overlay_instance_rt list 
             file
         in
         Dio_strategies.Overlay_instance_runtime.seed rt !state;
+        Logging.info_f
+          ~section
+          "overlay instance %s|%s: strategy=%s venue=%s/%s owner=%s/%s"
+          oi.oi_owner_symbol
+          oi.oi_id
+          oi.oi_strategy
+          oi.oi_exchange
+          oi.oi_symbol
+          oi.oi_owner_exchange
+          oi.oi_owner_symbol;
         Some
           { oir_config = oi
           ; oir_asset = asset
@@ -462,6 +478,7 @@ let load_overlay_instances ~(owner : trading_config) : overlay_instance_rt list 
           ; oir_state = state
           ; oir_seen_positions_at = -1.0
           ; oir_seen_margin_at = -1.0
+          ; oir_diag_at = 0.0
           ; oir_profs =
               (get_overlay_profiler
                  ~owner_exchange:oi.oi_owner_exchange
@@ -1613,6 +1630,77 @@ let asset_domain_worker
             in
             if ns > 0 then Latency_profiler.record_ns prof ns))
         events;
+      (* A long overlay that owes exposure but cannot size it is otherwise silent: no
+         order is placed, no error is logged. Report the sizing inputs when it is blocked. *)
+      if String.equal ov.oir_config.oi_strategy "long_overlay"
+         && List.exists (fun (name, _) -> String.equal name "book_update") events
+         && now -. ov.oir_diag_at >= 60.0
+      then (
+        ov.oir_diag_at <- now;
+        let f name =
+          match Dio_strategies.Strategy_runtime.get_state ov.oir_rt name with
+          | Dio_strategies.Strategy_expr.V_float v -> v
+          | _ -> Float.nan
+        in
+        let p name =
+          match Dio_strategies.Strategy_runtime.get_platform ov.oir_rt name with
+          | Dio_strategies.Strategy_expr.V_float v -> v
+          | _ -> Float.nan
+        in
+        let pb name =
+          match Dio_strategies.Strategy_runtime.get_platform ov.oir_rt name with
+          | Dio_strategies.Strategy_expr.V_bool v -> v
+          | _ -> false
+        in
+        let b name =
+          match Dio_strategies.Strategy_runtime.get_state ov.oir_rt name with
+          | Dio_strategies.Strategy_expr.V_bool v -> v
+          | _ -> false
+        in
+        let target = f "long_base_target" in
+        let open_long_base = f "last_open_long_base" in
+        let pending = f "pending_long_base" in
+        let max_add = f "long_base_add_max" in
+        let min_base = f "long_min_base" in
+        (* A zero cap with a live position is healthy; a zero cap while flat means the
+           sizing facts are missing. *)
+        let blocked =
+          long_overlay_pending ~target ~open_long_base
+          && ((max_add <= 0.0 && open_long_base <= 1e-12)
+              || (max_add > 0.0 && pending < min_base))
+        in
+        if blocked
+        then
+          Logging.info_f
+            ~section
+            "long_overlay blocked %s|%s: target=%.8g open=%.8g pending=%.8g max=%.8g \
+             denom=%.4f min_base=%.8g equity=%.2f free=%.2f maint=%.4f lev=%.2f \
+             mark=%.4f bid=%.4f ask=%.4f wait=%b entry_pending=%b | perp_valid=%b \
+             perp_qty=%.8g account_value=%.2f withdrawable=%.2f max_lev=%.2f \
+             min_notional=%.4f"
+            ov.oir_config.oi_owner_symbol
+            ov.oir_config.oi_id
+            target
+            open_long_base
+            pending
+            max_add
+            (f "long_cash_denom")
+            min_base
+            (f "long_equity")
+            (f "long_cash_free")
+            (f "long_maintenance")
+            (f "long_leverage")
+            (p "mark")
+            (p "bid")
+            (p "ask")
+            (b "wait_for_sell")
+            (b "entry_pending")
+            (pb "perp_valid")
+            (p "perp_qty")
+            (p "perp_account_value")
+            (p "perp_withdrawable")
+            (p "perp_max_leverage")
+            (p "min_notional"));
       let t_save = if measured then Monotonic_clock.now_ns () else 0 in
       Dio_strategies.Overlay_instance_runtime.save_if_changed
         ~owner_exchange:ov.oir_config.oi_owner_exchange
@@ -1641,11 +1729,23 @@ let asset_domain_worker
          | None -> 0.0)
     in
     let overlay_entry_resting (ov : overlay_instance_rt) =
-      (* short_overlay is flow-sized and publishes a quote reserve that tracks the mark,
-         so it re-evaluates on every book tick. long_overlay only needs the interpreter
-         while its bid entry is resting; its reduce-only take-profit is a fixed price. *)
+      (* short_overlay is flow-sized and tracks the mark, so it re-evaluates on every book
+         tick. long_overlay must also run while it owes exposure; gating it on a resting
+         bid deadlocks the first entry after a sale. *)
       if String.equal ov.oir_config.oi_strategy short_overlay_strategy
       then true
+      else if String.equal ov.oir_config.oi_strategy "long_overlay"
+      then (
+        let f name =
+          match Dio_strategies.Strategy_runtime.get_state ov.oir_rt name with
+          | Dio_strategies.Strategy_expr.V_float v -> v
+          | _ -> 0.0
+        in
+        (* Not gated on the survival cap: the cap is 0 until the venue's margin facts
+           arrive, and a capped run must retry after they do. *)
+        long_overlay_pending
+          ~target:(f "long_base_target")
+          ~open_long_base:(f "last_open_long_base"))
       else (
         match
           Dio_strategies.Strategy_venue.get_exchange_module ov.oir_config.oi_exchange

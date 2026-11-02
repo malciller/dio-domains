@@ -340,6 +340,26 @@ let test_reconstruct_retrace_rearms () =
     seed.ls_next_add
 ;;
 
+let test_long_overlay_pending () =
+  let pending = Dio_engine.Domain_spawner.long_overlay_pending in
+  Alcotest.(check bool)
+    "unfilled target keeps the interpreter running"
+    true
+    (pending ~target:1.0 ~open_long_base:0.0);
+  Alcotest.(check bool)
+    "filled target stops the book cycle"
+    false
+    (pending ~target:1.0 ~open_long_base:1.0);
+  Alcotest.(check bool)
+    "over-filled target is settled"
+    false
+    (pending ~target:0.5 ~open_long_base:1.0);
+  Alcotest.(check bool)
+    "floating dust is settled"
+    false
+    (pending ~target:1.0 ~open_long_base:(1.0 +. 1e-10))
+;;
+
 let () =
   Alcotest.run
     "Domain Spawner"
@@ -347,6 +367,12 @@ let () =
       , [ Alcotest.test_case "basic spawning" `Quick test_spawn_domains_basic
         ; Alcotest.test_case "empty list" `Quick test_spawn_domains_empty
         ; Alcotest.test_case "error handling" `Quick test_domain_error_handling
+        ] )
+    ; ( "overlay"
+      , [ Alcotest.test_case
+            "pending long keeps book cycles alive"
+            `Quick
+            test_long_overlay_pending
         ] )
     ; ( "affinity"
       , [ Alcotest.test_case "cpu priority ordering" `Quick test_order_by_cpu_priority ] )

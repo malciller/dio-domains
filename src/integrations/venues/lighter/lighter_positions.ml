@@ -290,7 +290,16 @@ let apply_positions ?(replace = true) ~now nodes =
 let process_account_all ?(replace = true) json =
   let account = account_node json in
   match position_nodes account with
-  | None -> false
+  | None ->
+    (* An authoritative snapshot with no position set means flat. Mark it fresh: otherwise
+       a flat account never advances the position timestamp and [perp_valid] goes stale
+       after 60s, stopping overlays. Delta frames are not authoritative. *)
+    if replace
+    then
+      Dio_exchange.Market_context.mark_positions_updated
+        ~exchange
+        ~updated_at:(Unix.gettimeofday ());
+    false
   | Some nodes ->
     apply_positions ~replace ~now:(Unix.gettimeofday ()) nodes;
     true
@@ -361,7 +370,9 @@ let process_rest_account json =
   let now = Unix.gettimeofday () in
   (match position_nodes account with
    | Some nodes -> apply_positions ~now nodes
-   | None -> ());
+   | None ->
+     (* REST account snapshots are authoritative; no position set means flat. *)
+     Dio_exchange.Market_context.mark_positions_updated ~exchange ~updated_at:now);
   let get key = float_opt (member key account) in
   let collateral = Option.value (get "collateral") ~default:0.0 in
   let available = Option.value (get "available_balance") ~default:0.0 in

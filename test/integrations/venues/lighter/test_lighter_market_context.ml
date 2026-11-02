@@ -372,6 +372,42 @@ let test_position_retention () =
     (Dio_exchange.Market_context.get_position ~exchange:"lighter" ~coin:"TESTBTC" <> None)
 ;;
 
+let test_flat_snapshot_freshness () =
+  reset_context ();
+  check
+    (option (float 1e-9))
+    "no snapshot before any frame"
+    None
+    (Dio_exchange.Market_context.get_positions_updated_at ~exchange:"lighter");
+  (* An authoritative REST snapshot with no position set means flat, not "feed dead". *)
+  Lighter.Positions.process_rest_account
+    (json
+       {|{"code":200,"accounts":[{"total_asset_value":"100","available_balance":"80","collateral":"90"}]}|});
+  (match Dio_exchange.Market_context.get_positions_updated_at ~exchange:"lighter" with
+   | None -> fail "flat REST snapshot did not mark positions fresh"
+   | Some _ -> ());
+  reset_context ();
+  check
+    bool
+    "flat authoritative account_all is applied"
+    false
+    (Lighter.Positions.process_account_all (json {|{"channel":"account_all:1"}|}));
+  (match Dio_exchange.Market_context.get_positions_updated_at ~exchange:"lighter" with
+   | None -> fail "flat account_all snapshot did not mark positions fresh"
+   | Some _ -> ());
+  (* A delta frame is not authoritative and must not advance the marker. *)
+  reset_context ();
+  ignore
+    (Lighter.Positions.process_account_all
+       ~replace:false
+       (json {|{"channel":"account_all:1"}|}));
+  check
+    (option (float 1e-9))
+    "flat delta does not mark positions fresh"
+    None
+    (Dio_exchange.Market_context.get_positions_updated_at ~exchange:"lighter")
+;;
+
 let () =
   Alcotest.run
     "Lighter Market Context"
@@ -382,6 +418,7 @@ let () =
         ; test_case "REST snapshot" `Quick test_rest_snapshot
         ; test_case "position delta merge" `Quick test_position_delta_merge
         ; test_case "position retention" `Quick test_position_retention
+        ; test_case "flat snapshot freshness" `Quick test_flat_snapshot_freshness
         ; test_case "open orders" `Quick test_open_orders
         ; test_case "WS routing" `Quick test_ws_routing
         ] )
