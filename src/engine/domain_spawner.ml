@@ -1663,11 +1663,11 @@ let asset_domain_worker
         let max_add = f "long_base_add_max" in
         let min_base = f "long_min_base" in
         (* A zero cap with a live position is healthy; a zero cap while flat means the
-           sizing facts are missing. *)
+           sizing facts are missing. A sub-minimum remainder is dust, not a failure. *)
         let blocked =
           long_overlay_pending ~target ~open_long_base
-          && ((max_add <= 0.0 && open_long_base <= 1e-12)
-              || (max_add > 0.0 && pending < min_base))
+          && max_add <= 0.0
+          && open_long_base <= 1e-12
         in
         if blocked
         then

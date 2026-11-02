@@ -444,6 +444,54 @@ let test_fill_intent_close_short () =
      | None -> Alcotest.fail "expected direction note")
 ;;
 
+let test_fill_intent_liquidation_owner () =
+  let classify = Hyperliquid.Executions_feed.classify_fill_intent in
+  let liq user =
+    Some
+      (`Assoc
+        [ "liquidatedUser", `String user
+        ; "markPx", `String "77063.0"
+        ; "method", `String "market"
+        ])
+  in
+  Alcotest.(check string)
+    "counterparty liquidation keeps the direction"
+    "close_short"
+    (classify
+       ~own_account:"0xabc"
+       ~liquidation:(liq "0xdef")
+       ~dir:"Close Short"
+       ~market:"perp"
+       ~side_str:"buy");
+  Alcotest.(check string)
+    "own liquidation is flagged"
+    "liquidation"
+    (classify
+       ~own_account:"0xAbC"
+       ~liquidation:(liq "0xABC")
+       ~dir:"Close Short"
+       ~market:"perp"
+       ~side_str:"buy");
+  Alcotest.(check string)
+    "no liquidation object uses direction"
+    "close_short"
+    (classify
+       ~own_account:"0xabc"
+       ~liquidation:None
+       ~dir:"Close Short"
+       ~market:"perp"
+       ~side_str:"buy");
+  Alcotest.(check string)
+    "unknown account is never a self-liquidation"
+    "close_short"
+    (classify
+       ~own_account:""
+       ~liquidation:(liq "0xabc")
+       ~dir:"Close Short"
+       ~market:"perp"
+       ~side_str:"buy")
+;;
+
 let test_spot_fill_has_no_realized_pnl () =
   (* Hyperliquid reports [closedPnl] on spot fills too, but our spot basis is a
      reconstructed average cost, so the venue number does not reconcile. Spot PnL stays
@@ -554,6 +602,10 @@ let () =
             "fill intent: close short"
             `Quick
             test_fill_intent_close_short
+        ; Alcotest.test_case
+            "fill intent: liquidation owner"
+            `Quick
+            test_fill_intent_liquidation_owner
         ; Alcotest.test_case
             "spot fill reports no PnL"
             `Quick
