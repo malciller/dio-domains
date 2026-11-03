@@ -82,6 +82,46 @@ let test_amend_requires_tracked_order () =
       msg
 ;;
 
+let test_classify_send_tx_reply () =
+  let is_ok = function
+    | Ok () -> true
+    | Error _ -> false
+  in
+  Alcotest.(check bool)
+    "code 200 is success"
+    true
+    (is_ok (Lighter.Actions.classify_send_tx_reply {|{"code":200,"tx_hash":"0xabc"}|}));
+  Alcotest.(check bool)
+    "non-JSON body falls back to the HTTP status"
+    true
+    (is_ok (Lighter.Actions.classify_send_tx_reply "ok"));
+  match
+    Lighter.Actions.classify_send_tx_reply
+      {|{"code":21107,"message":"reduce only would not reduce position"}|}
+  with
+  | Ok () -> Alcotest.fail "venue rejection reported as success"
+  | Error msg ->
+    Alcotest.(check string)
+      "rejection carries the venue reason"
+      "sendTx rejected by the venue (code=21107): reduce only would not reduce position"
+      msg
+;;
+
+let test_resync_guard_bounds_each_step () =
+  (* A hung REST call must cost one pass, not the loop. *)
+  let started = Unix.gettimeofday () in
+  Lwt_main.run
+    (Lighter.Module.with_resync_guard ~timeout_s:0.05 "hang" (fun () -> fst (Lwt.wait ())));
+  let elapsed = Unix.gettimeofday () -. started in
+  Alcotest.(check bool) "returns after the deadline" true (elapsed < 2.0);
+  (* A raising step is reported, never propagated. *)
+  Lwt_main.run
+    (Lighter.Module.with_resync_guard ~timeout_s:1.0 "raise" (fun () ->
+       Lwt.fail (Failure "boom")));
+  Lwt_main.run
+    (Lighter.Module.with_resync_guard ~timeout_s:1.0 "ok" (fun () -> Lwt.return_unit))
+;;
+
 let () =
   Alcotest.run
     "Lighter Module"
@@ -100,6 +140,18 @@ let () =
             "amend requires tracked order"
             `Quick
             test_amend_requires_tracked_order
+        ] )
+    ; ( "actions"
+      , [ Alcotest.test_case
+            "sendTx reply classification"
+            `Quick
+            test_classify_send_tx_reply
+        ] )
+    ; ( "resync"
+      , [ Alcotest.test_case
+            "each step is bounded"
+            `Quick
+            test_resync_guard_bounds_each_step
         ] )
     ]
 ;;

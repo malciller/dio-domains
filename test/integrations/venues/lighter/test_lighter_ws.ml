@@ -97,6 +97,128 @@ let test_tx_frame_batch () =
   Alcotest.(check int) "first info" 1 (member "Index" (List.nth infos 0) |> to_int)
 ;;
 
+let test_parse_tx_ack_single_accepted () =
+  let replies =
+    Lighter.Ws.parse_tx_ack
+      (Yojson.Safe.from_string
+         {|{"type":"jsonapi/sendtx","data":{"id":"1793682004876","code":200,"message":""}}|})
+  in
+  match replies with
+  | [ r ] ->
+    Alcotest.(check string) "id" "1793682004876" r.Lighter.Ws.reply_id;
+    Alcotest.(check int) "code" 200 r.Lighter.Ws.reply_code
+  | _ -> Alcotest.fail "expected exactly one reply"
+;;
+
+let test_parse_tx_ack_single_rejected () =
+  let replies =
+    Lighter.Ws.parse_tx_ack
+      (Yojson.Safe.from_string
+         {|{"type":"jsonapi/sendtx","data":{"id":"7","code":21107,"message":"reduce only would not reduce position"}}|})
+  in
+  match replies with
+  | [ r ] ->
+    Alcotest.(check int) "code" 21107 r.Lighter.Ws.reply_code;
+    Alcotest.(check string)
+      "message"
+      "reduce only would not reduce position"
+      r.Lighter.Ws.reply_message
+  | _ -> Alcotest.fail "expected exactly one reply"
+;;
+
+let test_parse_tx_ack_batch_list () =
+  let replies =
+    Lighter.Ws.parse_tx_ack
+      (Yojson.Safe.from_string
+         {|{"type":"jsonapi/sendtxbatch","data":[{"code":200},{"code":21108,"message":"nope"}]}|})
+  in
+  match replies with
+  | [ first; second ] ->
+    Alcotest.(check int) "first code" 200 first.Lighter.Ws.reply_code;
+    Alcotest.(check int) "second code" 21108 second.Lighter.Ws.reply_code;
+    Alcotest.(check string) "second reason" "nope" second.Lighter.Ws.reply_message
+  | _ -> Alcotest.fail "expected two replies"
+;;
+
+let test_parse_tx_ack_batch_encoded_string () =
+  let replies =
+    Lighter.Ws.parse_tx_ack
+      (Yojson.Safe.from_string
+         {|{"type":"jsonapi/sendtxbatch","data":"[{\"code\":21107,\"message\":\"rejected\"}]"}|})
+  in
+  match replies with
+  | [ r ] ->
+    Alcotest.(check int) "code" 21107 r.Lighter.Ws.reply_code;
+    Alcotest.(check string) "reason" "rejected" r.Lighter.Ws.reply_message
+  | _ -> Alcotest.fail "expected one reply"
+;;
+
+let test_parse_tx_ack_envelope_code () =
+  let replies =
+    Lighter.Ws.parse_tx_ack
+      (Yojson.Safe.from_string
+         {|{"type":"jsonapi/sendtxbatch","data":null,"code":21100,"message":"batch rejected"}|})
+  in
+  match replies with
+  | [ r ] ->
+    Alcotest.(check int) "rejected" 21100 r.Lighter.Ws.reply_code;
+    Alcotest.(check string) "reason" "batch rejected" r.Lighter.Ws.reply_message
+  | _ -> Alcotest.fail "expected one reply"
+;;
+
+let test_parse_tx_ack_without_result_is_empty () =
+  let replies =
+    Lighter.Ws.parse_tx_ack (Yojson.Safe.from_string {|{"type":"jsonapi/sendtx"}|})
+  in
+  Alcotest.(check int) "no attributable result" 0 (List.length replies)
+;;
+
+let test_rejected_create_order_retires_phantom () =
+  let symbol = "WSREJ" in
+  Lighter.Instruments_feed.initialize [ symbol ];
+  Lighter.Executions_feed.initialize [ symbol ];
+  Lighter.Executions_feed.inject_order
+    ~symbol
+    ~order_id:"ws_rej_1"
+    ~side:Lighter.Executions_feed.Sell
+    ~qty:0.44
+    ~price:86.64
+    ();
+  Lighter.Ws.register_create_order_tx ~id:"ws_rej_1";
+  Lighter.Ws.apply_tx_reply
+    { Lighter.Ws.reply_id = "ws_rej_1"
+    ; reply_code = 21107
+    ; reply_message = "reduce only would not reduce position"
+    };
+  Alcotest.(check bool)
+    "placed order dropped"
+    true
+    (Option.is_none (Lighter.Executions_feed.get_open_order symbol "ws_rej_1"))
+;;
+
+let test_rejected_cancel_keeps_live_order () =
+  let symbol = "WSCANCEL" in
+  Lighter.Instruments_feed.initialize [ symbol ];
+  Lighter.Executions_feed.initialize [ symbol ];
+  Lighter.Executions_feed.inject_order
+    ~symbol
+    ~order_id:"ws_cancel_1"
+    ~side:Lighter.Executions_feed.Sell
+    ~qty:0.44
+    ~price:86.64
+    ();
+  (* A rejected cancel targets a live order; only create-order txs may retire it. *)
+  Lighter.Ws.apply_tx_reply
+    { Lighter.Ws.reply_id = "ws_cancel_1"
+    ; reply_code = 21107
+    ; reply_message = "order not found"
+    };
+  Alcotest.(check bool)
+    "live order kept"
+    true
+    (Option.is_some (Lighter.Executions_feed.get_open_order symbol "ws_cancel_1"))
+;;
+
 let () =
   Alcotest.run
     "Lighter WebSocket"
@@ -115,6 +237,28 @@ let () =
     ; ( "tx_frames"
       , [ Alcotest.test_case "single" `Quick test_tx_frame_single
         ; Alcotest.test_case "batch" `Quick test_tx_frame_batch
+        ] )
+    ; ( "tx_acks"
+      , [ Alcotest.test_case "single accepted" `Quick test_parse_tx_ack_single_accepted
+        ; Alcotest.test_case "single rejected" `Quick test_parse_tx_ack_single_rejected
+        ; Alcotest.test_case "batch list" `Quick test_parse_tx_ack_batch_list
+        ; Alcotest.test_case
+            "batch encoded string"
+            `Quick
+            test_parse_tx_ack_batch_encoded_string
+        ; Alcotest.test_case "batch envelope code" `Quick test_parse_tx_ack_envelope_code
+        ; Alcotest.test_case
+            "unparseable ack"
+            `Quick
+            test_parse_tx_ack_without_result_is_empty
+        ; Alcotest.test_case
+            "rejected placement retires order"
+            `Quick
+            test_rejected_create_order_retires_phantom
+        ; Alcotest.test_case
+            "rejected cancel keeps order"
+            `Quick
+            test_rejected_cancel_keeps_live_order
         ] )
     ; ( "ping"
       , [ Alcotest.test_case "unsent_ping_is_not_sent" `Quick test_unsent_ping_is_not_sent

@@ -501,6 +501,38 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?cl_ord_id ?order_userref (
      | None -> "none")
 ;;
 
+(** Removes a locally injected order the venue refused, reporting [RejectedStatus] so a
+    placement that never reached the book stops looking like a resting order. No-op when
+    the order is untracked: the account stream may already have settled it. *)
+let reject_order ~order_id ~reason =
+  match find_order_everywhere order_id with
+  | None -> ()
+  | Some cached ->
+    let store = get_symbol_store cached.symbol in
+    let event : execution_event =
+      { order_id
+      ; symbol = cached.symbol
+      ; order_status = RejectedStatus
+      ; limit_price = cached.limit_price
+      ; side = cached.side
+      ; order_qty = cached.order_qty
+      ; cum_qty = cached.cum_qty
+      ; avg_price = cached.avg_price
+      ; timestamp = Unix.gettimeofday ()
+      ; is_amended = false
+      ; cl_ord_id = cached.cl_ord_id
+      ; user_ref = cached.order_userref
+      }
+    in
+    update_orders_internal store event;
+    Logging.error_f
+      ~section
+      "Order %s [%s] rejected by the venue, dropped from the book: %s"
+      order_id
+      cached.symbol
+      (if String.equal reason "" then "no reason supplied" else reason)
+;;
+
 (** [Some flag] when the order payload carries a reduce-only marker; [None] for venue
     payloads that omit it. Accepts snake/camel spellings and string-encoded booleans. *)
 let parse_reduce_only json =
@@ -808,25 +840,60 @@ let process_account_orders_update json =
                 try member "client_order_id" order_json |> to_string with
                 | _ -> ""
               in
-              let cl_ord_id =
-                if client_order_id <> "" then Some client_order_id else None
+              (* Lighter's first update for a fresh order does not always echo
+                 [client_order_id]. The optimistic copy then stays keyed by our client
+                 index beside the venue id, the engine sees two resting orders for one
+                 kind and cancels one - a cancel/replace loop. Adopt the copy when exactly
+                 one matches on side, size and price. *)
+              let adopted_client_id =
+                if client_order_id <> ""
+                then client_order_id
+                else (
+                  let candidates = ref [] in
+                  Mutex.lock store.orders_mutex;
+                  (try
+                     Hashtbl.iter
+                       (fun id (o : open_order) ->
+                         if (not (String.equal id order_id))
+                            && o.side = side
+                            && o.order_status = NewStatus
+                            && Float.abs (o.order_qty -. base_amount) <= 1e-9
+                            && (match o.limit_price with
+                                | Some p ->
+                                  Float.abs (p -. price) <= 1e-9 *. Float.max 1.0 price
+                                | None -> false)
+                            &&
+                            match o.cl_ord_id with
+                            | Some c -> String.equal c o.order_id
+                            | None -> false
+                         then candidates := (id, o) :: !candidates)
+                       store.open_orders
+                   with
+                   | _ -> ());
+                  Mutex.unlock store.orders_mutex;
+                  match !candidates with
+                  | [ (id, _) ] -> id
+                  | _ -> "")
               in
-              if client_order_id <> "" && client_order_id <> order_id
+              let cl_ord_id =
+                if adopted_client_id <> "" then Some adopted_client_id else None
+              in
+              if adopted_client_id <> "" && adopted_client_id <> order_id
               then (
                 Mutex.lock store.orders_mutex;
-                let had_stale = Hashtbl.mem store.open_orders client_order_id in
-                Hashtbl.remove store.open_orders client_order_id;
-                if had_stale then note_change store client_order_id None;
+                let had_stale = Hashtbl.mem store.open_orders adopted_client_id in
+                Hashtbl.remove store.open_orders adopted_client_id;
+                if had_stale then note_change store adopted_client_id None;
                 Mutex.unlock store.orders_mutex;
                 if had_stale
                 then (
                   Mutex.lock initialization_mutex;
-                  retire_from_order_to_symbol client_order_id;
+                  retire_from_order_to_symbol adopted_client_id;
                   Mutex.unlock initialization_mutex;
                   Logging.info_f
                     ~section
                     "Replaced local order %s with exchange order %s [%s]"
-                    client_order_id
+                    adopted_client_id
                     order_id
                     symbol));
               let event : execution_event =
@@ -982,10 +1049,38 @@ let process_account_orders_update json =
     live tracking. *)
 let missing_confirmation_s = 30.0
 
+(** Hook installed by the venue adapter so a confirmed miss is also cancelled at the
+    venue. Dropping local tracking alone would leave a live order the engine believes is
+    gone: it can still fill, and a reduce-only close left behind blocks every replacement
+    with a position-larger-than-room rejection. *)
+let venue_cancel_hook : (string -> string -> unit) ref = ref (fun _ _ -> ())
+
+let set_venue_cancel_hook f = venue_cancel_hook := f
+
+(** Consecutive reconcile passes, per symbol, that dropped orders the venue stopped
+    reporting. One drop is a lost event; two in a row means placements are being accepted
+    locally but are not resting, which is an error rather than a reconcile detail. *)
+let stale_streaks : (string, int) Hashtbl.t = Hashtbl.create 16
+
+let stale_streaks_mutex = Mutex.create ()
+
+let note_stale_pass ~symbol ~dropped =
+  Mutex.lock stale_streaks_mutex;
+  let streak =
+    if dropped = 0
+    then 0
+    else (Hashtbl.find_opt stale_streaks symbol |> Option.value ~default:0) + 1
+  in
+  Hashtbl.replace stale_streaks symbol streak;
+  Mutex.unlock stale_streaks_mutex;
+  streak
+;;
+
 (** Reconciles local open orders against a full snapshot: ingests it, then confirms and
     emits [CanceledStatus] for tracked orders the venue has stopped reporting. [since] is
-    the time the request started; orders updated after it are not treated as missing. *)
-let handle_snapshot ~since json =
+    the time the request started; orders updated after it are not treated as missing.
+    [now] exists so the confirmation window is testable. *)
+let handle_snapshot ?now ~since json =
   Logging.debug_f ~section "Processing Lighter execution snapshot...";
   process_account_orders_update json;
   let open Yojson.Safe.Util in
@@ -1006,7 +1101,7 @@ let handle_snapshot ~since json =
   in
   match orders_json with
   | Some ((`Assoc _ | `List _) as orders_json) ->
-    let now = Unix.gettimeofday () in
+    let now = Option.value now ~default:(Unix.gettimeofday ()) in
     let snapshot_order_ids = Hashtbl.create 32 in
     (try
        let orders =
@@ -1091,6 +1186,9 @@ let handle_snapshot ~since json =
           ; user_ref = cached_order.order_userref
           }
         in
+        (* The snapshot is only evidence: a partial one leaves the order live, and an
+           orphaned reduce-only close blocks every replacement for that position. *)
+        !venue_cancel_hook symbol cached_order.order_id;
         update_orders_internal store event;
         Logging.info_f
           ~section
@@ -1098,6 +1196,27 @@ let handle_snapshot ~since json =
           cached_order.order_id
           symbol)
       !stale_orders;
+    let dropped_by_symbol = Hashtbl.create 8 in
+    List.iter
+      (fun (symbol, _, _) ->
+        let n = Hashtbl.find_opt dropped_by_symbol symbol |> Option.value ~default:0 in
+        Hashtbl.replace dropped_by_symbol symbol (n + 1))
+      !stale_orders;
+    List.iter
+      (fun symbol ->
+        let dropped =
+          Hashtbl.find_opt dropped_by_symbol symbol |> Option.value ~default:0
+        in
+        let streak = note_stale_pass ~symbol ~dropped in
+        if streak >= 2
+        then
+          Logging.error_f
+            ~section
+            "Reconcile dropped orders on %s in %d consecutive passes: placements are \
+             accepted locally but are not resting on the venue"
+            symbol
+            streak)
+      all_symbols;
     if !stale_orders <> []
     then
       Logging.info_f

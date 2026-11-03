@@ -1237,8 +1237,7 @@ let order_replace
       in
       (* A reduce-only order may only ever shrink the position it names. Clamp to the live
          position so a repriced or duplicated close can never open the opposite side; a
-         flat position cancels the leftovers below instead of sending a new one. *)
-      let requested_qty = qty in
+         flat position leaves any resting close alone (see [protect_close] below). *)
       let qty =
         if reduce_only && is_perp
         then (
@@ -1254,10 +1253,14 @@ let order_replace
           Strategy_common.reduce_only_room ~position ~side:order_side ~qty)
         else qty
       in
-      (* The clamp reached zero from a live request: the strategy asked to close but the
-         position read is already flat. Do not fall through to the qty<=0 branch - that
-         would cancel a healthy take-profit on a single stale frame. *)
-      let clamped_flat = reduce_only && is_perp && requested_qty > 0.0 && qty <= 0.0 in
+      (* A reduce-only perp close is never cancelled by a zero-size request. That request
+         can only come from a position read that says flat, and position snapshots flap
+         (resyncs, partially-delivered account frames). A resting reduce-only order cannot
+         increase exposure, so cancelling it buys nothing and costs the maker slot - and
+         because a cancel retires the carry binding, the next tick re-places it: a
+         cancel-and-replace loop that never leaves a close resting. The venue drops its
+         own close once the position is gone, and the next long amends this one in place. *)
+      let protect_close = reduce_only && is_perp in
       (* Buys share the same userref: the spot recycle buy and the perp take-profit are
          both carry buys. Match an existing order only when its booked kind is the same;
          otherwise a spot replace could amend/cancel the take-profit (or vice versa). *)
@@ -1476,6 +1479,13 @@ let order_replace
           then ()
           else (
             ignore (Strategy_common.InFlightOrders.add_in_flight_order cancel_key);
+            (* A cancel/replace loop is otherwise indistinguishable from progress. *)
+            Logging.info_f
+              ~section
+              "Overlay cancel: %s %s (%s)"
+              instrument
+              o.order_id
+              reason;
             let order =
               Jac.create_cancel_order
                 o.order_id
@@ -1492,7 +1502,7 @@ let order_replace
          both target the same position (the chart then shows one close, not a doubled
          one). *)
       if qty <= 0.0
-      then (if not clamped_flat then List.iter (fun o -> cancel_one o) matching)
+      then (if not protect_close then List.iter (fun o -> cancel_one o) matching)
       else if backoff > 0.0
       then
         Logging.debug_f

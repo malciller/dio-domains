@@ -202,7 +202,7 @@ let test_ws_routing () =
     Lighter.Ws.decode_text_frame
       {|{"type":"jsonapi/sendtx","data":null,"code":200,"id":"1"}|}
   with
-  | Lighter.Ws.Frame_tx_ack (200, "") -> ()
+  | Lighter.Ws.Frame_tx_ack [ { reply_code = 200; reply_message = ""; _ } ] -> ()
   | _ -> fail "envelope tx code not read"
 ;;
 

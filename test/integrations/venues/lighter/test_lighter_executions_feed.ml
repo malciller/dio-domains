@@ -407,6 +407,202 @@ let test_snapshot_missing_order_keeps_tracking () =
     (Option.is_some (Lighter.Executions_feed.get_open_order "EXKEEP" "keep_1"))
 ;;
 
+let test_reject_order_retires_phantom () =
+  let symbol = "EXREJECT" in
+  Lighter.Instruments_feed.initialize [ symbol ];
+  Lighter.Executions_feed.initialize [ symbol ];
+  let pos_before = Lighter.Executions_feed.get_current_position symbol in
+  Lighter.Executions_feed.inject_order
+    ~symbol
+    ~order_id:"rej_1"
+    ~side:Lighter.Executions_feed.Sell
+    ~qty:0.44
+    ~price:86.64
+    ();
+  Alcotest.(check bool)
+    "tracked after injection"
+    true
+    (Option.is_some (Lighter.Executions_feed.get_open_order symbol "rej_1"));
+  Lighter.Executions_feed.reject_order ~order_id:"rej_1" ~reason:"code=21107";
+  Alcotest.(check bool)
+    "dropped after rejection"
+    true
+    (Option.is_none (Lighter.Executions_feed.get_open_order symbol "rej_1"));
+  let rejected =
+    Lighter.Executions_feed.read_execution_events symbol pos_before
+    |> List.filter (fun (e : Lighter.Executions_feed.execution_event) ->
+      String.equal e.order_id "rej_1"
+      && e.order_status = Lighter.Executions_feed.RejectedStatus)
+  in
+  Alcotest.(check int) "rejection event emitted" 1 (List.length rejected)
+;;
+
+let test_snapshot_confirmed_stale_cancels_at_venue () =
+  let symbol = "EXSTALE" in
+  Lighter.Instruments_feed.initialize [ symbol ];
+  Lighter.Executions_feed.initialize [ symbol ];
+  let cancelled = ref [] in
+  Lighter.Executions_feed.set_venue_cancel_hook (fun sym order_id ->
+    cancelled := (sym, order_id) :: !cancelled);
+  Lighter.Executions_feed.inject_order
+    ~symbol
+    ~order_id:"stale_1"
+    ~side:Lighter.Executions_feed.Sell
+    ~qty:0.44
+    ~price:86.64
+    ();
+  let placed_at = Unix.gettimeofday () in
+  Unix.sleepf 0.01;
+  let since = Unix.gettimeofday () in
+  let empty_snapshot = `Assoc [ "code", `Int 200; "orders", `List [] ] in
+  Lighter.Executions_feed.handle_snapshot ~since empty_snapshot;
+  Alcotest.(check bool)
+    "first miss only arms"
+    true
+    (Option.is_some (Lighter.Executions_feed.get_open_order symbol "stale_1"));
+  Alcotest.(check int) "no venue cancel yet" 0 (List.length !cancelled);
+  Lighter.Executions_feed.handle_snapshot ~now:(placed_at +. 60.0) ~since empty_snapshot;
+  Alcotest.(check bool)
+    "confirmed miss drops tracking"
+    true
+    (Option.is_none (Lighter.Executions_feed.get_open_order symbol "stale_1"));
+  Alcotest.(check (list (pair string string)))
+    "confirmed miss cancels at the venue"
+    [ symbol, "stale_1" ]
+    (List.filter (fun (sym, _) -> String.equal sym symbol) (List.rev !cancelled));
+  Lighter.Executions_feed.set_venue_cancel_hook (fun _ _ -> ())
+;;
+
+let test_snapshot_present_order_stays () =
+  let symbol = "EXPRESENT" in
+  Lighter.Instruments_feed.initialize [ symbol ];
+  Lighter.Executions_feed.initialize [ symbol ];
+  let cancelled = ref 0 in
+  Lighter.Executions_feed.set_venue_cancel_hook (fun _ _ -> incr cancelled);
+  Lighter.Executions_feed.inject_order
+    ~symbol
+    ~order_id:"present_1"
+    ~side:Lighter.Executions_feed.Sell
+    ~qty:0.44
+    ~price:86.64
+    ();
+  let placed_at = Unix.gettimeofday () in
+  Unix.sleepf 0.01;
+  let since = Unix.gettimeofday () in
+  let snapshot =
+    `Assoc
+      [ "code", `Int 200
+      ; ( "orders"
+        , `List
+            [ `Assoc
+                [ "order_index", `String "present_1"
+                ; "price", `String "86.64"
+                ; "initial_base_amount", `String "0.44"
+                ; "filled_base_amount", `String "0.0"
+                ; "is_ask", `Bool true
+                ]
+            ] )
+      ]
+  in
+  Lighter.Executions_feed.handle_snapshot ~now:(placed_at +. 60.0) ~since snapshot;
+  Alcotest.(check bool)
+    "reported order kept"
+    true
+    (Option.is_some (Lighter.Executions_feed.get_open_order symbol "present_1"));
+  Alcotest.(check int) "no venue cancel for a reported order" 0 !cancelled;
+  Lighter.Executions_feed.set_venue_cancel_hook (fun _ _ -> ())
+;;
+
+let test_first_update_adopts_optimistic_copy () =
+  let symbol = "EXADOPT" in
+  Lighter.Instruments_feed.initialize [ symbol ];
+  Lighter.Executions_feed.initialize [ symbol ];
+  Lighter.Executions_feed.inject_order
+    ~symbol
+    ~order_id:"client_1"
+    ~side:Lighter.Executions_feed.Sell
+    ~qty:0.45
+    ~price:88.26
+    ~cl_ord_id:"client_1"
+    ();
+  (* Lighter's first update for a fresh order sometimes omits [client_order_id]. The
+     optimistic copy must not survive beside the venue id, or the engine sees two closes
+     for one kind and cancels one of them. *)
+  let json =
+    `Assoc
+      [ "type", `String "update/account_all_orders"
+      ; ( "account_all_orders"
+        , `Assoc
+            [ ( "0"
+              , `Assoc
+                  [ "order_index", `String "venue_1"
+                  ; "market_index", `Int 0
+                  ; "status", `String "Active"
+                  ; "is_ask", `Bool true
+                  ; "price", `String "88.26"
+                  ; "initial_base_amount", `String "0.45"
+                  ; "filled_base_amount", `String "0.0"
+                  ; "avg_fill_price", `String "0.0"
+                  ] )
+            ] )
+      ]
+  in
+  Lighter.Executions_feed.process_account_orders_update json;
+  Alcotest.(check bool)
+    "optimistic copy replaced"
+    true
+    (Option.is_none (Lighter.Executions_feed.get_open_order symbol "client_1"));
+  Alcotest.(check bool)
+    "venue order tracked"
+    true
+    (Option.is_some (Lighter.Executions_feed.get_open_order symbol "venue_1"))
+;;
+
+let test_ambiguous_adoption_is_skipped () =
+  let symbol = "EXAMBIG" in
+  Lighter.Instruments_feed.initialize [ symbol ];
+  Lighter.Executions_feed.initialize [ symbol ];
+  List.iter
+    (fun id ->
+      Lighter.Executions_feed.inject_order
+        ~symbol
+        ~order_id:id
+        ~side:Lighter.Executions_feed.Sell
+        ~qty:0.45
+        ~price:88.26
+        ~cl_ord_id:id
+        ())
+    [ "client_a"; "client_b" ];
+  let json =
+    `Assoc
+      [ "type", `String "update/account_all_orders"
+      ; ( "account_all_orders"
+        , `Assoc
+            [ ( "0"
+              , `Assoc
+                  [ "order_index", `String "venue_2"
+                  ; "market_index", `Int 0
+                  ; "status", `String "Active"
+                  ; "is_ask", `Bool true
+                  ; "price", `String "88.26"
+                  ; "initial_base_amount", `String "0.45"
+                  ; "filled_base_amount", `String "0.0"
+                  ; "avg_fill_price", `String "0.0"
+                  ] )
+            ] )
+      ]
+  in
+  Lighter.Executions_feed.process_account_orders_update json;
+  Alcotest.(check bool)
+    "first candidate kept"
+    true
+    (Option.is_some (Lighter.Executions_feed.get_open_order symbol "client_a"));
+  Alcotest.(check bool)
+    "second candidate kept"
+    true
+    (Option.is_some (Lighter.Executions_feed.get_open_order symbol "client_b"))
+;;
+
 let () =
   Alcotest.run
     "Lighter Executions Feed"
@@ -427,6 +623,26 @@ let () =
             "snapshot miss keeps tracking"
             `Quick
             test_snapshot_missing_order_keeps_tracking
+        ; Alcotest.test_case
+            "snapshot confirmed miss cancels"
+            `Quick
+            test_snapshot_confirmed_stale_cancels_at_venue
+        ; Alcotest.test_case
+            "snapshot reported order stays"
+            `Quick
+            test_snapshot_present_order_stays
+        ; Alcotest.test_case
+            "venue rejection retires order"
+            `Quick
+            test_reject_order_retires_phantom
+        ; Alcotest.test_case
+            "first update adopts optimistic copy"
+            `Quick
+            test_first_update_adopts_optimistic_copy
+        ; Alcotest.test_case
+            "ambiguous adoption is skipped"
+            `Quick
+            test_ambiguous_adoption_is_skipped
         ; Alcotest.test_case
             "close fill reports venue PnL"
             `Quick
