@@ -407,9 +407,184 @@ let tx_frame txs =
   | [] -> `Assoc []
 ;;
 
+(** One submission result from the venue: the id echoed back, the venue's result code and
+    its message. [code] 200 is the only success. *)
+type tx_reply =
+  { reply_id : string
+  ; reply_code : int
+  ; reply_message : string
+  }
+
+let tx_reply_code json =
+  let open Yojson.Safe.Util in
+  let as_int v =
+    match v with
+    | `Int n -> Some n
+    | `Float f -> Some (int_of_float f)
+    | `String s ->
+      (try Some (int_of_string (String.trim s)) with
+       | _ -> None)
+    | _ -> None
+  in
+  try as_int (member "code" json) with
+  | _ -> None
+;;
+
+(** Decodes one reply object. *)
+let tx_reply_of_json json =
+  let open Yojson.Safe.Util in
+  let id =
+    try
+      match member "id" json with
+      | `String s -> s
+      | `Int i -> string_of_int i
+      | _ -> ""
+    with
+    | _ -> ""
+  in
+  let message =
+    try
+      match member "message" json with
+      | `String s -> s
+      | `Null -> ""
+      | v -> Yojson.Safe.to_string v
+    with
+    | _ -> ""
+  in
+  { reply_id = id
+  ; reply_code = Option.value (tx_reply_code json) ~default:200
+  ; reply_message = message
+  }
+;;
+
+(** Parses a submission ack ([jsonapi/sendtx] / [jsonapi/sendtxbatch]) into one reply per
+    transaction. The single form answers under [data]; the batch form answers with a list
+    (occasionally JSON-encoded as a string) or, when the whole batch failed, with a single
+    envelope [code]. Returns [[]] when the frame carries no attributable result at all, so
+    an unrecognised ack shape cannot be mistaken for a rejection. *)
+let parse_tx_ack json =
+  let open Yojson.Safe.Util in
+  let decode_string_payload v =
+    match v with
+    | `String s ->
+      (try
+         match Yojson.Safe.from_string s with
+         | (`List _ | `Assoc _) as parsed -> Some parsed
+         | _ -> None
+       with
+       | _ -> None)
+    | _ -> None
+  in
+  let data =
+    try member "data" json with
+    | _ -> `Null
+  in
+  let data =
+    match decode_string_payload data with
+    | Some v -> v
+    | None -> data
+  in
+  match data with
+  | `List (_ :: _ as items) -> List.map tx_reply_of_json items
+  | `Assoc fields ->
+    (match List.assoc_opt "codes" fields with
+     | Some (`List codes) ->
+       let messages =
+         match List.assoc_opt "messages" fields with
+         | Some (`List ms) ->
+           List.map
+             (function
+               | `String s -> s
+               | _ -> "")
+             ms
+         | _ -> []
+       in
+       List.mapi
+         (fun i code ->
+           let code =
+             match code with
+             | `Int n -> n
+             | `String s ->
+               (try int_of_string (String.trim s) with
+                | _ -> 200)
+             | _ -> 200
+           in
+           { reply_id = ""
+           ; reply_code = code
+           ; reply_message = List.nth_opt messages i |> Option.value ~default:""
+           })
+         codes
+     | _ -> [ tx_reply_of_json data ])
+  | _ ->
+    (* No per-tx payload: a whole-frame result applies to every tx in the frame. *)
+    (match tx_reply_code json with
+     | None -> []
+     | Some code ->
+       let message =
+         try
+           match member "message" json with
+           | `String s -> s
+           | _ -> ""
+         with
+         | _ -> ""
+       in
+       [ { reply_id = ""; reply_code = code; reply_message = message } ])
+;;
+
+(* Create-order submissions only: a rejected cancel targets a live order and must not
+   retire it, so only ids registered here are torn out of the book on rejection. *)
+let create_order_tx_ids : (string, float) Hashtbl.t = Hashtbl.create 64
+let create_order_tx_mutex = Mutex.create ()
+
+let register_create_order_tx ~id =
+  let now = Unix.gettimeofday () in
+  Mutex.lock create_order_tx_mutex;
+  if Hashtbl.length create_order_tx_ids > 256
+  then
+    Hashtbl.filter_map_inplace
+      (fun _ registered_at ->
+        if now -. registered_at < 600.0 then Some registered_at else None)
+      create_order_tx_ids;
+  Hashtbl.replace create_order_tx_ids id now;
+  Mutex.unlock create_order_tx_mutex
+;;
+
+(** True exactly once per registered create-order tx id. *)
+let take_create_order_tx id =
+  Mutex.lock create_order_tx_mutex;
+  let found = Hashtbl.mem create_order_tx_ids id in
+  if found then Hashtbl.remove create_order_tx_ids id;
+  Mutex.unlock create_order_tx_mutex;
+  found
+;;
+
+let tx_reply_error (reply : tx_reply) =
+  if String.equal reply.reply_message ""
+  then Printf.sprintf "tx rejected by venue (code=%d)" reply.reply_code
+  else
+    Printf.sprintf
+      "tx rejected by venue (code=%d): %s"
+      reply.reply_code
+      reply.reply_message
+;;
+
+(** A rejection means the order will never rest: retire the injected copy now so the
+    strategy re-places, instead of a reconcile pass later discovering a phantom. *)
+let apply_tx_reply (reply : tx_reply) =
+  let is_create = take_create_order_tx reply.reply_id in
+  if is_create && reply.reply_code <> 200
+  then
+    Lighter_executions_feed.reject_order
+      ~order_id:reply.reply_id
+      ~reason:(tx_reply_error reply)
+;;
+
 (** [txs] is [(tx_type, tx_info, id)] in nonce order. Both forms are a single frame, so a
-    burst costs one write. Resolves with the id assigned to each tx, in input order. *)
-let send_txs_ws txs =
+    burst costs one write. Resolves once the frame is written: Lighter only confirms
+    execution on the account order stream, and its [jsonapi/sendtx] reply is an
+    after-the-fact verdict handled by {!apply_tx_reply}, so waiting for it here would
+    serialise the outbox writer behind a round-trip it does not need. *)
+let send_txs_ws txs : (string, string) result list Lwt.t =
   let txs =
     List.map
       (fun (tx_type, tx_info, id) ->
@@ -423,10 +598,10 @@ let send_txs_ws txs =
   in
   let frame = tx_frame txs in
   match txs with
-  | [] -> Lwt.return (Ok [])
+  | [] -> Lwt.return []
   | _ ->
     if not (private_connected ())
-    then Lwt.return (Error "lighter private WS not connected")
+    then Lwt.return (List.map (fun _ -> Error "lighter private WS not connected") txs)
     else (
       let ids = List.map (fun (_, _, id) -> id) txs in
       let id_str = String.concat "," ids in
@@ -436,17 +611,21 @@ let send_txs_ws txs =
           >|= function
           | Ok () ->
             Logging.debug_f ~section "tx over WS: n=%d ids=[%s]" (List.length txs) id_str;
-            Ok ids
-          | Error e -> Error (Printf.sprintf "tx over WS failed (ids=[%s]): %s" id_str e))
+            Ok ()
+          | Error e -> Error e)
         (fun exn ->
           let err = Printexc.to_string exn in
-          Logging.error_f ~section "tx over WS failed (ids=[%s]): %s" id_str err;
-          Lwt.return (Error err)))
+          Lwt.return (Error err))
+      >>= function
+      | Error e ->
+        let err = Printf.sprintf "tx over WS failed (ids=[%s]): %s" id_str e in
+        Logging.error_f ~section "%s" err;
+        Lwt.return (List.map (fun _ -> Error err) txs)
+      | Ok () -> Lwt.return (List.map (fun (_, _, id) -> Ok id) txs))
 [@@ocaml.doc
   " Sends signed txs over the private WS ([jsonapi/sendtx] or [jsonapi/sendtxbatch]),\n\
   \    resolving once the frame is written. [Error] means the frame was not written;\n\
-  \    acceptance is confirmed by the account order stream, as the API documents for both\n\
-  \    transports. "]
+  \    acceptance and rejection are reported on the account order stream. "]
 ;;
 
 let record_orderbook_latency json =
@@ -475,7 +654,7 @@ let record_orderbook_latency json =
 type text_frame_kind =
   | Frame_data
   | Frame_pong
-  | Frame_tx_ack of int * string
+  | Frame_tx_ack of tx_reply list
   | Frame_unmatched of string * string
 [@@ocaml.doc " Classification of an inbound text frame. "]
 
@@ -570,30 +749,9 @@ let decode_text_frame content : text_frame_kind =
     Frame_data
   | "pong" -> Frame_pong
   | "jsonapi/sendtx" | "jsonapi/sendtxbatch" ->
-    (* Acceptance reply for a submitted tx. The schema is undocumented beyond "id is
-       returned", so read [code]/[message] from the payload or the envelope and default to
-       accepted. *)
-    let open Yojson.Safe.Util in
-    let data = member "data" json in
-    let pick f =
-      (* A successful tx reply often has [data: null] and carries [code] on the envelope.
-         Reading a member of null raises, so fall back instead of failing the whole frame. *)
-      match
-        try f data with
-        | _ -> None
-      with
-      | Some v -> Some v
-      | None ->
-        (try f json with
-         | _ -> None)
-    in
-    let code =
-      Option.value (pick (fun j -> to_int_option (member "code" j))) ~default:200
-    in
-    let message =
-      Option.value (pick (fun j -> to_string_option (member "message" j))) ~default:""
-    in
-    Frame_tx_ack (code, message)
+    (* Acceptance reply for a submitted tx. The single form answers under [data]; a batch
+       answers with a list, or with one envelope code when the whole batch failed. *)
+    Frame_tx_ack (parse_tx_ack json)
   | t -> Frame_unmatched (t, channel)
 [@@ocaml.doc
   " Pure decode of one inbound text frame: routes market-data and execution frames to the\n\
@@ -615,27 +773,47 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
           (* Only data proves the subscription is alive; acks and pongs must not feed the
              supervisor's data timeout. *)
           on_heartbeat ()
-        | Frame_tx_ack (code, message) ->
-          if code = 200
-          then Logging.debug_f ~section "Tx accepted (code=%d)" code
-          else (
-            Logging.warn_f
-              ~section
-              "Tx rejected by exchange: code=%d message=%s"
-              code
-              message;
-            (* Without this a desync rejects every later tx on this transport. *)
-            if Error_handling.string_contains
-                 (String.lowercase_ascii message)
-                 "invalid nonce"
+        | Frame_tx_ack replies ->
+          if replies = []
+          then (
+            Atomic.incr msg_counter_other;
+            if Atomic.get msg_counter_other <= 5
             then
-              Lwt.async (fun () ->
-                Lighter_signer.initialize_nonce
-                  ~timeout_s:2.0
-                  ~base_url:Lighter_endpoints.api_base_url
-                  ~api_key_index:(Lighter_signer.get_api_key_index ())
-                  ~account_index:(Lighter_signer.get_account_index ())
-                  ()))
+              Logging.debug_f
+                ~section
+                "Submission ack carried no attributable result (len=%d)"
+                (String.length frame.Websocket.Frame.content))
+          else (
+            List.iter
+              (fun (reply : tx_reply) ->
+                if reply.reply_code = 200
+                then
+                  Logging.debug_f
+                    ~section
+                    "Tx accepted (id=%s, code=%d)"
+                    reply.reply_id
+                    reply.reply_code
+                else (
+                  Logging.error_f
+                    ~section
+                    "Tx rejected by exchange (id=%s): code=%d message=%s"
+                    reply.reply_id
+                    reply.reply_code
+                    reply.reply_message;
+                  (* Without this a desync rejects every later tx on this transport. *)
+                  if Error_handling.string_contains
+                       (String.lowercase_ascii reply.reply_message)
+                       "invalid nonce"
+                  then
+                    Lwt.async (fun () ->
+                      Lighter_signer.initialize_nonce
+                        ~timeout_s:2.0
+                        ~base_url:Lighter_endpoints.api_base_url
+                        ~api_key_index:(Lighter_signer.get_api_key_index ())
+                        ~account_index:(Lighter_signer.get_account_index ())
+                        ())))
+              replies;
+            List.iter apply_tx_reply replies)
         | Frame_pong ->
           state.last_pong_time := Unix.gettimeofday ();
           (try Lwt_condition.broadcast state.pong_condition () with

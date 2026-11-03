@@ -758,21 +758,47 @@ let fetch_balances ?(quiet = false) () =
   \    collateral) and split accounts (USDC is in the assets array). "]
 ;;
 
+(** Deadline for one REST call inside a resync pass. A bare [Cohttp_lwt_unix.Client.get]
+    can stay pending forever on a half-open socket; the loop below is the only source of
+    position and open-order truth after startup, so a call that never returns would freeze
+    it for the life of the process. *)
+let resync_call_timeout_s = 20.0
+
+let with_resync_guard ?(timeout_s = resync_call_timeout_s) label f =
+  Lwt.catch
+    (fun () -> Lwt_unix.with_timeout timeout_s f)
+    (fun exn ->
+      let reason =
+        match exn with
+        | Lwt_unix.Timeout -> Printf.sprintf "timed out after %.0fs" timeout_s
+        | exn -> Printexc.to_string exn
+      in
+      Logging.error_f
+        ~section:"lighter_resync"
+        "Lighter resync pass (%s) failed: %s"
+        label
+        reason;
+      Lwt.return_unit)
+[@@ocaml.doc
+  " Runs one bounded resync step. Never raises: the caller must be able to re-arm."]
+;;
+
 (** Periodic REST re-seed of the account snapshot. [account_all] frames are the only live
     position source after startup, so a dropped frame otherwise leaves positions stale
     until a restart. Open orders are re-read in the same pass: it both restores a cache
-    lost to a bad snapshot and supplies the second look that confirms a missed order. *)
+    lost to a bad snapshot and supplies the second look that confirms a missed order.
+
+    The next pass is armed before the current one runs and each call is independently
+    bounded, so a hung request costs one pass instead of the loop. *)
 let start_account_resync ?(interval_s = 60.0) () =
   let rec loop () =
     Lwt_unix.sleep interval_s
     >>= fun () ->
-    fetch_balances ~quiet:true ()
-    >>= fun () ->
-    fetch_open_orders ~quiet:true ()
-    >>= fun () ->
-    (* Independent next pass: a retained Lwt Forward node per interval would leak. *)
+    (* Arm first: nothing below may be able to stop the schedule. *)
     Lwt.async loop;
-    Lwt.return_unit
+    with_resync_guard "balances" (fun () -> fetch_balances ~quiet:true ())
+    >>= fun () ->
+    with_resync_guard "open orders" (fun () -> fetch_open_orders ~quiet:true ())
   in
   Lwt.async loop
 ;;

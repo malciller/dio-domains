@@ -26,6 +26,44 @@ let next_client_order_index () =
   Int64.of_int (Atomic.fetch_and_add client_order_counter 1)
 ;;
 
+(** Lighter answers [sendTx] with HTTP 200 whatever the outcome; the body's [code] is the
+    real result. A non-200 code is a rejection and must not be reported as a placement. *)
+let classify_send_tx_reply body =
+  let code_and_message =
+    try
+      let json = Yojson.Safe.from_string body in
+      let open Yojson.Safe.Util in
+      let code =
+        match member "code" json with
+        | `Int n -> Some n
+        | `Float f -> Some (int_of_float f)
+        | `String s ->
+          (try Some (int_of_string (String.trim s)) with
+           | _ -> None)
+        | _ -> None
+      in
+      let message =
+        match member "message" json with
+        | `String s -> s
+        | _ -> ""
+      in
+      Option.map (fun c -> c, message) code
+    with
+    | _ -> None
+  in
+  match code_and_message with
+  | Some (code, _) when code = 200 -> Ok ()
+  | Some (code, message) ->
+    let err =
+      if String.equal message ""
+      then Printf.sprintf "sendTx rejected by the venue (code=%d)" code
+      else Printf.sprintf "sendTx rejected by the venue (code=%d): %s" code message
+    in
+    Logging.error_f ~section "%s (body=%s)" err body;
+    Error err
+  | None -> Ok ()
+;;
+
 let send_tx ~tx_type ~tx_info =
   let url = Lighter_endpoints.api_base_url ^ "/api/v1/sendTx" in
   Logging.debug_f
@@ -89,7 +127,10 @@ let send_tx ~tx_type ~tx_info =
               if Cohttp.Code.is_success (Cohttp.Code.code_of_status status)
               then (
                 Logging.info_f ~section "REST sendTx success: %s" resp_str;
-                Lwt.return (Ok resp_str))
+                Lwt.return
+                  (match classify_send_tx_reply resp_str with
+                   | Ok () -> Ok resp_str
+                   | Error _ as e -> e))
               else (
                 Logging.error_f
                   ~section
@@ -178,15 +219,17 @@ let dispatch_batch (txs : tx list) =
     let signed = List.map (fun (t : tx) -> t, t.sign ()) txs in
     let frames = List.map (fun ((t : tx), info) -> t.tx_type, info, t.id) signed in
     Lighter_ws.send_txs_ws frames
-    >>= (function
-     | Ok ids -> Lwt.return (List.map (fun id -> Ok id) ids)
-     | Error err when not (Lighter_ws.private_connected ()) ->
-       Logging.warn_f
-         ~section
-         "WS tx frame failed on a dropped socket, falling back to REST: %s"
-         err;
-       rest_all ()
-     | Error err -> Lwt.return (List.map (fun _ -> Error err) signed))
+    >>= fun results ->
+    (* A failed write drops the socket, so a result list carrying errors and no live
+       private leg means the frame never left: replay over REST. A venue *rejection* on a
+       connected socket is final and must not be replayed. *)
+    if (not (Lighter_ws.private_connected ())) && List.exists Result.is_error results
+    then (
+      Logging.warn_f
+        ~section
+        "WS tx frame failed on a dropped socket, falling back to REST";
+      rest_all ())
+    else Lwt.return results
 ;;
 
 let outbox = Lighter_outbox.create ~max_batch:max_tx_batch ~send:dispatch_batch ()
@@ -241,6 +284,9 @@ let place_order
            ~reduce_only
            ~expiry
        in
+       (* Registered before submission so a venue rejection can retire the order locally
+          even when it arrives after this call has returned. *)
+       Lighter_ws.register_create_order_tx ~id:client_order_id;
        submit ~id:client_order_id ~tx_type:Lighter_types.tx_type_create_order ~sign ()
        >>= fun result ->
        (match result with
@@ -292,7 +338,9 @@ let cancel_order ~symbol ~order_id =
   | Some market_index ->
     let order_index = Int64.of_string order_id in
     let sign () = Lighter_signer.sign_cancel_order ~market_index ~order_index in
-    submit ~id:order_id ~tx_type:Lighter_types.tx_type_cancel_order ~sign ()
+    (* Namespaced so a cancel reply can never be mistaken for the create-order tx that
+       shares the order id. *)
+    submit ~id:(order_id ^ ":cancel") ~tx_type:Lighter_types.tx_type_cancel_order ~sign ()
     >>= fun result ->
     (match result with
      | Ok _ ->
@@ -329,7 +377,13 @@ let modify_order ~symbol ~order_id ~new_qty ~new_price =
            ~new_base_amount
            ~new_price:new_price_int
        in
-       submit ~id:order_id ~tx_type:Lighter_types.tx_type_modify_order ~sign ()
+       (* Namespaced so a modify ack is never confused with the create-order tx that
+          shares the order id; only create-order tx ids may retire an order on rejection. *)
+       submit
+         ~id:(order_id ^ ":modify")
+         ~tx_type:Lighter_types.tx_type_modify_order
+         ~sign
+         ()
        >>= fun result ->
        (match result with
         | Ok _ ->
@@ -372,4 +426,28 @@ let cancel_all_orders ~symbol =
 [@@ocaml.doc
   " Cancels all open orders in one market: resolves the market index and submits a signed\n\
   \    cancel-all tx. "]
+;;
+
+(** A snapshot-confirmed miss must be cancelled at the venue, not just dropped from local
+    tracking: if the snapshot was partial the order is still live, and an orphaned
+    reduce-only close blocks every replacement for that position. *)
+let () =
+  Lighter_executions_feed.set_venue_cancel_hook (fun symbol order_id ->
+    Lwt.async (fun () ->
+      cancel_order ~symbol ~order_id
+      >|= fun result ->
+      match result with
+      | Ok _ ->
+        Logging.info_f
+          ~section
+          "Reconcile cancel sent at the venue: %s [%s]"
+          order_id
+          symbol
+      | Error msg ->
+        Logging.warn_f
+          ~section
+          "Reconcile cancel failed at the venue: %s [%s]: %s"
+          order_id
+          symbol
+          msg))
 ;;
