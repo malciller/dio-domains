@@ -173,6 +173,120 @@ let test_parse_tx_ack_without_result_is_empty () =
   Alcotest.(check int) "no attributable result" 0 (List.length replies)
 ;;
 
+let test_batch_ack_attributed_to_tx_ids () =
+  Lighter.Ws.remember_pending_ack [ "batch_a"; "batch_b" ];
+  let replies =
+    Lighter.Ws.parse_tx_ack
+      (Yojson.Safe.from_string
+         {|{"type":"jsonapi/sendtxbatch","data":{"codes":[200,21107],"messages":["","nope"]}}|})
+    |> Lighter.Ws.attribute_ack_ids
+  in
+  match replies with
+  | [ first; second ] ->
+    Alcotest.(check string) "first id" "batch_a" first.Lighter.Ws.reply_id;
+    Alcotest.(check string) "second id" "batch_b" second.Lighter.Ws.reply_id;
+    Alcotest.(check int) "second code" 21107 second.Lighter.Ws.reply_code
+  | _ -> Alcotest.fail "expected two replies"
+;;
+
+let test_echoed_id_ack_consumes_frame () =
+  Lighter.Ws.remember_pending_ack [ "solo" ];
+  ignore
+    (Lighter.Ws.parse_tx_ack
+       (Yojson.Safe.from_string
+          {|{"type":"jsonapi/sendtx","data":{"id":"solo","code":200}}|})
+     |> Lighter.Ws.attribute_ack_ids);
+  (* The answered frame must not linger and capture the next id-less verdict. *)
+  let replies =
+    Lighter.Ws.parse_tx_ack
+      (Yojson.Safe.from_string
+         {|{"type":"jsonapi/sendtxbatch","data":{"codes":[21107],"messages":["nope"]}}|})
+    |> Lighter.Ws.attribute_ack_ids
+  in
+  match replies with
+  | [ r ] -> Alcotest.(check string) "no id" "" r.Lighter.Ws.reply_id
+  | _ -> Alcotest.fail "expected one reply"
+;;
+
+let test_batch_ack_without_ids_is_unattributed () =
+  (* Nothing remembered: a positional verdict must not invent an id. *)
+  let replies =
+    Lighter.Ws.parse_tx_ack
+      (Yojson.Safe.from_string
+         {|{"type":"jsonapi/sendtxbatch","data":{"codes":[21107],"messages":["nope"]}}|})
+    |> Lighter.Ws.attribute_ack_ids
+  in
+  match replies with
+  | [ r ] -> Alcotest.(check string) "no id" "" r.Lighter.Ws.reply_id
+  | _ -> Alcotest.fail "expected one reply"
+;;
+
+let test_rejected_batch_create_order_retires_phantom () =
+  let symbol = "WSBATCH" in
+  Lighter.Instruments_feed.initialize [ symbol ];
+  Lighter.Executions_feed.initialize [ symbol ];
+  List.iter
+    (fun order_id ->
+      Lighter.Executions_feed.inject_order
+        ~symbol
+        ~order_id
+        ~side:Lighter.Executions_feed.Sell
+        ~qty:0.44
+        ~price:86.64
+        ())
+    [ "ws_batch_1"; "ws_batch_2" ];
+  (* Only create-order txs may retire an order on rejection; [place_order] registers the
+     client order index before submitting. *)
+  List.iter
+    (fun id -> Lighter.Ws.register_create_order_tx ~id)
+    [ "ws_batch_1"; "ws_batch_2" ];
+  Lighter.Ws.remember_pending_ack [ "ws_batch_1"; "ws_batch_2" ];
+  Lighter.Ws.parse_tx_ack
+    (Yojson.Safe.from_string
+       {|{"type":"jsonapi/sendtxbatch","data":{"codes":[200,21107],"messages":["","nope"]}}|})
+  |> Lighter.Ws.attribute_ack_ids
+  |> List.iter Lighter.Ws.apply_tx_reply;
+  Alcotest.(check bool)
+    "rejected close dropped"
+    true
+    (Option.is_none (Lighter.Executions_feed.get_open_order symbol "ws_batch_2"))
+;;
+
+let test_rejected_amend_retires_only_missing_order () =
+  let symbol = "WSAMEND" in
+  Lighter.Instruments_feed.initialize [ symbol ];
+  Lighter.Executions_feed.initialize [ symbol ];
+  List.iter
+    (fun order_id ->
+      Lighter.Executions_feed.inject_order
+        ~symbol
+        ~order_id
+        ~side:Lighter.Executions_feed.Sell
+        ~qty:0.44
+        ~price:86.64
+        ())
+    [ "amend_gone"; "amend_live" ];
+  Lighter.Ws.apply_tx_reply
+    { Lighter.Ws.reply_id = "amend_gone:modify"
+    ; reply_code = 21107
+    ; reply_message = "order not found"
+    };
+  Alcotest.(check bool)
+    "missing target dropped"
+    true
+    (Option.is_none (Lighter.Executions_feed.get_open_order symbol "amend_gone"));
+  (* In-place modify: a rejected amend leaves the target resting at its old price. *)
+  Lighter.Ws.apply_tx_reply
+    { Lighter.Ws.reply_id = "amend_live:modify"
+    ; reply_code = 21108
+    ; reply_message = "post only order would cross"
+    };
+  Alcotest.(check bool)
+    "live target kept"
+    true
+    (Option.is_some (Lighter.Executions_feed.get_open_order symbol "amend_live"))
+;;
+
 let test_rejected_create_order_retires_phantom () =
   let symbol = "WSREJ" in
   Lighter.Instruments_feed.initialize [ symbol ];
@@ -251,6 +365,26 @@ let () =
             "unparseable ack"
             `Quick
             test_parse_tx_ack_without_result_is_empty
+        ; Alcotest.test_case
+            "batch ack attributed to tx ids"
+            `Quick
+            test_batch_ack_attributed_to_tx_ids
+        ; Alcotest.test_case
+            "batch ack without ids is unattributed"
+            `Quick
+            test_batch_ack_without_ids_is_unattributed
+        ; Alcotest.test_case
+            "echoed id ack consumes frame"
+            `Quick
+            test_echoed_id_ack_consumes_frame
+        ; Alcotest.test_case
+            "rejected batch placement retires order"
+            `Quick
+            test_rejected_batch_create_order_retires_phantom
+        ; Alcotest.test_case
+            "rejected amend retires only missing order"
+            `Quick
+            test_rejected_amend_retires_only_missing_order
         ; Alcotest.test_case
             "rejected placement retires order"
             `Quick
