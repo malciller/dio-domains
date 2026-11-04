@@ -1352,14 +1352,10 @@ let order_replace
                     && Float.abs (price -. rounded)
                        <= 1e-9 *. Float.max 1.0 (Float.abs rounded)
                   in
-                  (* Venues that do not echo the engine's user reference (Lighter) return
-                     [None]/[0]. The id registry is the stronger identity: an order this
-                     engine booked under this exact kind is ours even after a reprice
-                     moved it off the last target price, so it is amended rather than
-                     layered again. With no registry entry (a restart, or an order placed
-                     before the tag existed) fall back to the exact target price, or - on
-                     a market this overlay owns exclusively - adopt the order by its
-                     venue-side reduce-only flag. *)
+                  (* Venues that drop the engine's userref (Lighter) return [None]/[0].
+                     The id registry is the strongest identity; with none (a restart) fall
+                     back to the exact target price, or - where this overlay owns the
+                     market - to the venue's reduce-only flag. *)
                   let userref_ok =
                     match userref with
                     | Some 0 | None ->
@@ -1422,10 +1418,6 @@ let order_replace
                               && o.status = Dio_exchange.Exchange_intf.Types.New)
                              || o.status
                                 = Dio_exchange.Exchange_intf.Types.PartiallyFilled ->
-                        (* An order adopted by its venue flags must actually be a close
-                           when this kind is one (and an entry when it is not). Without
-                           that check an external non-reduce-only sell could be amended as
-                           a take-profit and later fill as a short. *)
                         (* An echoed userref, or a registry entry, is already proof of
                            ownership; only an untagged, unregistered order needs the venue
                            flag to be adopted. *)
@@ -1445,9 +1437,8 @@ let order_replace
                         in
                         if reduce_only_ok
                         then (
-                          (* Bind the adopted id now so the fill classifier and the next
-                             tick see the correct kind, and a duplicate left by an earlier
-                             restart is amendable rather than layered. *)
+                          (* Bind the id now so fills classify and the next tick amends
+                             rather than layers another close. *)
                           if adopted
                           then (
                             Strategy_common.register_carry_order_id
@@ -1467,8 +1458,6 @@ let order_replace
                                    ~exchange:asset.exchange
                                    ~instrument
                                    ~reduce_only);
-                            (* Restart reconciliation is otherwise invisible: say which
-                               resting order was recognised instead of duplicated. *)
                             Logging.info_f
                               ~section
                               "Overlay adopt: %s %s %s (kind %s, reduce_only=%b)"
@@ -1561,9 +1550,8 @@ let order_replace
             if not pushed
             then ignore (Strategy_common.InFlightOrders.remove_in_flight_order cancel_key)))
       in
-      (* One live order per overlay kind. Keep the copy nearest the target when the scan
-         sees duplicates (a restart or a cancel+replace race), so the rest are the ones
-         swept and the next tick does not immediately amend the keeper. *)
+      (* One live order per overlay kind. Keep the copy nearest the target so sweeping the
+         rest does not leave the keeper needing an immediate amend. *)
       let matching =
         match matching with
         | [] | [ _ ] -> matching
@@ -1589,9 +1577,8 @@ let order_replace
       then
         if protect_close
         then (
-          (* A close that is not being replaced still must not be doubled. Keep one and
-             cancel the extras; the keeper is never cancelled, so this cannot become a
-             cancel/replace loop. *)
+          (* Never cancel the keeper: a cancelled close retires its binding and the next
+             tick re-places it. *)
           match matching with
           | _ :: (_ :: _ as extras) ->
             List.iter (fun o -> cancel_one ~reason:"duplicate" o) extras

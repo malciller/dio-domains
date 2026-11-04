@@ -509,11 +509,9 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                           if has_alpaca then Alpaca.Executions.initialize alpaca_symbols;
                           let __ppx_lwt_0 =
                             let open_orders_p =
-                              (* Both overlay venues must have their resting orders in the
-                                 cache before the strategy domains run. Without this the
-                                 long book (Lighter) starts flat, places a fresh entry/TP
-                                 beside the real ones, and can only reconcile after the
-                                 first private-WS resync. *)
+                              (* Without the snapshot the long book starts flat and places
+                                 a duplicate entry/TP beside the real ones; the 60s resync
+                                 only cancels it afterwards. *)
                               let fetches =
                                 (if has_hyperliquid
                                  then [ Hyperliquid.Module.fetch_open_orders_ws () ]

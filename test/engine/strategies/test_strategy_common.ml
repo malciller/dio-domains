@@ -428,6 +428,10 @@ let test_untagged_order_adoption () =
     false
     (owns ~price_hits:false ~adopt:true ~want:true ~venue:(Some false));
   Alcotest.(check bool)
+    "a stray non-reduce-only sell at the target price is not adopted"
+    false
+    (owns ~price_hits:true ~adopt:true ~want:true ~venue:(Some false));
+  Alcotest.(check bool)
     "an adopted entry needs a non-reduce-only order"
     true
     (owns ~price_hits:false ~adopt:true ~want:false ~venue:(Some false));

@@ -367,17 +367,19 @@ let reduce_only_room ~(position : float option) ~(side : order_side) ~(qty : flo
   | _ -> Float.max 0.0 qty
 ;;
 
-(** Whether an untagged resting order belongs to this logical kind. An order at the exact
-    target price always does. On a venue that drops the userref, adoption by flags is only
-    safe when the venue reports reduce-only and it agrees: otherwise a non-reduce-only
-    sell could be amended as a take-profit and later fill as a short. *)
+(** Whether an untagged resting order belongs to this logical kind. When the venue reports
+    reduce-only it must agree: otherwise a non-reduce-only sell could be amended as a
+    take-profit and later fill as a short. Venues that hide the flag fall back to the
+    exact target price. *)
 let untagged_order_is_own_kind
   ~(price_hits_target : bool)
   ~(adopt_by_flags : bool)
   ~(want_reduce_only : bool)
   ~(venue_reduce_only : bool option)
   =
-  price_hits_target || (adopt_by_flags && venue_reduce_only = Some want_reduce_only)
+  match venue_reduce_only with
+  | Some reported -> reported = want_reduce_only && (price_hits_target || adopt_by_flags)
+  | None -> price_hits_target
 ;;
 
 (** Per-symbol strategy order-action counters.

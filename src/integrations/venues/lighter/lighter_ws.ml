@@ -457,6 +457,75 @@ let tx_reply_of_json json =
   }
 ;;
 
+(* Ids of the txs in each submitted frame, newest first. Lighter's batch ack reports one
+   code per tx positionally and echoes no ids, so a verdict is only attributable through
+   the frame that carried the order. *)
+let pending_ack_ids : string list list ref = ref []
+let pending_ack_mutex = Mutex.create ()
+let pending_ack_cap = 64
+
+let rec take_first n = function
+  | x :: rest when n > 0 -> x :: take_first (n - 1) rest
+  | _ -> []
+;;
+
+let remember_pending_ack ids =
+  Mutex.lock pending_ack_mutex;
+  pending_ack_ids := take_first pending_ack_cap (ids :: !pending_ack_ids);
+  Mutex.unlock pending_ack_mutex
+;;
+
+(** Drops a frame that never reached the socket, so its verdict cannot be attributed to a
+    later frame. Physical equality: two identical id lists are still distinct frames. *)
+let forget_pending_ack ids =
+  Mutex.lock pending_ack_mutex;
+  pending_ack_ids := List.filter (fun frame -> not (frame == ids)) !pending_ack_ids;
+  Mutex.unlock pending_ack_mutex
+;;
+
+let take_pending_ack () =
+  Mutex.lock pending_ack_mutex;
+  let ids =
+    match !pending_ack_ids with
+    | [] -> []
+    | ids :: rest ->
+      pending_ack_ids := rest;
+      ids
+  in
+  Mutex.unlock pending_ack_mutex;
+  ids
+;;
+
+(** Fills in the ids the venue left out. One ack answers one frame, so the oldest frame is
+    consumed even when the reply echoes its id, or the next id-less verdict is attributed
+    to the wrong order. A single id-less reply is a whole-frame verdict and covers every
+    tx in that frame. *)
+let attribute_ack_ids (replies : tx_reply list) =
+  match take_pending_ack () with
+  | [] -> replies
+  | ids ->
+    if not (List.exists (fun (r : tx_reply) -> String.equal r.reply_id "") replies)
+    then replies
+    else (
+      match replies with
+      | [ r ] when String.equal r.reply_id "" && List.length ids > 1 ->
+        List.map (fun id -> { r with reply_id = id }) ids
+      | _ when List.length replies = List.length ids ->
+        List.mapi
+          (fun i (r : tx_reply) ->
+            if not (String.equal r.reply_id "")
+            then r
+            else
+              { r with
+                reply_id =
+                  (match List.nth_opt ids i with
+                   | Some id -> id
+                   | None -> "")
+              })
+          replies
+      | _ -> replies)
+;;
+
 (** Parses a submission ack ([jsonapi/sendtx] / [jsonapi/sendtxbatch]) into one reply per
     transaction. The single form answers under [data]; the batch form answers with a list
     (occasionally JSON-encoded as a string) or, when the whole batch failed, with a single
@@ -568,15 +637,41 @@ let tx_reply_error (reply : tx_reply) =
       reply.reply_message
 ;;
 
+(** Amend txs are namespaced [order_id:modify]; a verdict on one still names its target. *)
+let modify_target_id reply_id =
+  let suffix = ":modify" in
+  let n = String.length reply_id in
+  let m = String.length suffix in
+  if n > m && String.equal (String.sub reply_id (n - m) m) suffix
+  then Some (String.sub reply_id 0 (n - m))
+  else None
+;;
+
+(** The venue says the order is not there at all. Any other rejection leaves an in-place
+    modify's target untouched, so that order stays in the book and is amended again. *)
+let order_is_gone message =
+  let message = String.lowercase_ascii message in
+  List.exists
+    (fun phrase -> Error_handling.string_contains message phrase)
+    [ "not found"; "does not exist"; "no such order"; "unknown order" ]
+;;
+
 (** A rejection means the order will never rest: retire the injected copy now so the
-    strategy re-places, instead of a reconcile pass later discovering a phantom. *)
+    strategy re-places, instead of a reconcile pass later discovering a phantom. An amend
+    only retires its target when the venue reports it missing; otherwise the target is
+    still resting at its old price and must stay. *)
 let apply_tx_reply (reply : tx_reply) =
   let is_create = take_create_order_tx reply.reply_id in
-  if is_create && reply.reply_code <> 200
-  then
-    Lighter_executions_feed.reject_order
-      ~order_id:reply.reply_id
-      ~reason:(tx_reply_error reply)
+  if reply.reply_code <> 200
+  then (
+    let reason = tx_reply_error reply in
+    if is_create
+    then Lighter_executions_feed.reject_order ~order_id:reply.reply_id ~reason
+    else (
+      match modify_target_id reply.reply_id with
+      | Some order_id when order_is_gone reply.reply_message ->
+        Lighter_executions_feed.reject_order ~order_id ~reason
+      | _ -> ()))
 ;;
 
 (** [txs] is [(tx_type, tx_info, id)] in nonce order. Both forms are a single frame, so a
@@ -605,6 +700,9 @@ let send_txs_ws txs : (string, string) result list Lwt.t =
     else (
       let ids = List.map (fun (_, _, id) -> id) txs in
       let id_str = String.concat "," ids in
+      (* Registered before the write so an ack that beats this promise can still be
+         attributed. *)
+      remember_pending_ack ids;
       Lwt.catch
         (fun () ->
           send_private_tx frame
@@ -620,6 +718,7 @@ let send_txs_ws txs : (string, string) result list Lwt.t =
       | Error e ->
         let err = Printf.sprintf "tx over WS failed (ids=[%s]): %s" id_str e in
         Logging.error_f ~section "%s" err;
+        forget_pending_ack ids;
         Lwt.return (List.map (fun _ -> Error err) txs)
       | Ok () -> Lwt.return (List.map (fun (_, _, id) -> Ok id) txs))
 [@@ocaml.doc
@@ -774,6 +873,7 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
              supervisor's data timeout. *)
           on_heartbeat ()
         | Frame_tx_ack replies ->
+          let replies = attribute_ack_ids replies in
           if replies = []
           then (
             Atomic.incr msg_counter_other;

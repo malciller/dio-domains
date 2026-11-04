@@ -8,6 +8,10 @@ open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf
 module Types = Exchange.Types
 
+(* Installed once [fetch_open_orders] exists below: the impl is defined before the REST
+   helpers, and a rejected amend must be able to reach the open-orders snapshot. *)
+let resync_open_orders_hook : (unit -> unit) ref = ref (fun () -> ())
+
 module Lighter_impl = struct
   let name = "lighter"
   let section = "lighter_module"
@@ -221,7 +225,9 @@ module Lighter_impl = struct
   let get_balance_age_fast ~asset:_ () = None
   let get_balance_updated_at ~asset:_ = None
   let get_balance_updated_at_fast ~asset:_ () = None
-  let resync_market_state ~symbol:_ () = ()
+
+  (* Account-wide on Lighter: the open-orders snapshot covers every symbol. *)
+  let resync_market_state ~symbol:_ () = !resync_open_orders_hook ()
   let get_total_balance ~asset = Lighter_balances.get_balance asset
   let get_staked_balance ~asset:_ = 0.0
   let get_all_balances () = Lighter_balances.get_all_balances ()
@@ -784,6 +790,24 @@ let with_resync_guard ?(timeout_s = resync_call_timeout_s) label f =
       Lwt.return_unit)
 [@@ocaml.doc
   " Runs one bounded resync step. Never raises: the caller must be able to re-arm."]
+;;
+
+(* One snapshot at a time: a failed amend nudges this from every tick of every symbol. *)
+let open_orders_resync_running = Atomic.make false
+
+let () =
+  resync_open_orders_hook
+  := fun () ->
+       if not (Atomic.exchange open_orders_resync_running true)
+       then
+         Lwt.async (fun () ->
+           Lwt.finalize
+             (fun () ->
+               with_resync_guard "open orders" (fun () ->
+                 fetch_open_orders ~quiet:true ()))
+             (fun () ->
+               Atomic.set open_orders_resync_running false;
+               Lwt.return_unit))
 ;;
 
 (** Periodic REST re-seed of the account snapshot. [account_all] frames are the only live
