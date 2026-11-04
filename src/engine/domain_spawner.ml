@@ -393,6 +393,9 @@ type overlay_instance_rt =
   ; mutable oir_seen_positions_at : float
   ; mutable oir_seen_margin_at : float
   ; mutable oir_diag_at : float (* blocked-log throttle *)
+  ; oir_adopt_untagged : bool
+  (** This instance owns its venue market exclusively and the venue drops the userref, so
+      a resting order of the matching side and reduce-only flag is this book's own. *)
   ; oir_profs : domain_profilers (* this instance's own phases *)
   }
 
@@ -401,9 +404,67 @@ type overlay_instance_rt =
     after every spot sale. *)
 let long_overlay_pending ~target ~open_long_base = target > open_long_base +. 1e-9
 
+(** Venue market key. Perp coin and spot pair resolve to the same asset so an order routed
+    through either symbol form is treated as one market. *)
+let market_key ~exchange ~symbol =
+  normalize_exchange exchange ^ "|" ^ base_coin_of_symbol symbol
+;;
+
+(** True when no other overlay, controller leg, or grid trades this venue market. On a
+    venue that drops the userref, ownership then has to come from the venue's own flags,
+    which is only safe when the book has the market to itself. *)
+let overlay_market_exclusive
+  ~(all_trading : trading_config list)
+  ~(exchange : string)
+  ~(symbol : string)
+  ~(self : Config.overlay_instance option)
+  =
+  let key = market_key ~exchange ~symbol in
+  let other_overlay =
+    List.exists
+      (fun (x : Config.overlay_instance) ->
+        (match self with
+         | Some oi ->
+           not
+             (String.equal
+                (Config.overlay_instance_key
+                   ~owner_exchange:x.oi_owner_exchange
+                   ~owner_symbol:x.oi_owner_symbol
+                   ~id:x.oi_id)
+                (Config.overlay_instance_key
+                   ~owner_exchange:oi.oi_owner_exchange
+                   ~owner_symbol:oi.oi_owner_symbol
+                   ~id:oi.oi_id))
+         | None -> true)
+        && String.equal (market_key ~exchange:x.oi_exchange ~symbol:x.oi_symbol) key)
+      (Config.get_overlay_instances ())
+  in
+  let controller =
+    List.exists
+      (fun (c : Config.overlay_controller) ->
+        String.equal
+          (market_key ~exchange:c.oc_hedge_exchange ~symbol:c.oc_hedge_symbol)
+          key
+        || List.exists
+             (fun (l : Config.overlay_leg) ->
+               String.equal (market_key ~exchange:l.ol_exchange ~symbol:l.ol_symbol) key)
+             c.oc_legs)
+      (Config.get_overlay_controllers ())
+  in
+  let grid =
+    List.exists
+      (fun (t : trading_config) ->
+        String.equal (market_key ~exchange:t.exchange ~symbol:t.symbol) key)
+      all_trading
+  in
+  not (other_overlay || controller || grid)
+;;
+
 (** Load every overlay instance owned by [owner]. A failed instance is logged and skipped;
     config validation has already checked the file exists and its name matches. *)
-let load_overlay_instances ~(owner : trading_config) : overlay_instance_rt list =
+let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_config list)
+  : overlay_instance_rt list
+  =
   Config.get_overlay_instances_for ~exchange:owner.exchange ~symbol:owner.symbol
   |> List.filter_map (fun (oi : Config.overlay_instance) ->
     match Dio_strategies.Strategy_loader.load ~name:oi.oi_strategy with
@@ -479,6 +540,13 @@ let load_overlay_instances ~(owner : trading_config) : overlay_instance_rt list 
           ; oir_seen_positions_at = -1.0
           ; oir_seen_margin_at = -1.0
           ; oir_diag_at = 0.0
+          ; oir_adopt_untagged =
+              Dio_strategies.Strategy_venue.drops_userref ~exchange:oi.oi_exchange
+              && overlay_market_exclusive
+                   ~all_trading
+                   ~exchange:oi.oi_exchange
+                   ~symbol:oi.oi_symbol
+                   ~self:(Some oi)
           ; oir_profs =
               (get_overlay_profiler
                  ~owner_exchange:oi.oi_owner_exchange
@@ -1477,6 +1545,13 @@ let asset_domain_worker
         let ctx = Dio_strategies.Strategy_cycle_engine.create () in
         ctx.cg_symbol <- asset_with_fees.symbol;
         ctx.cg_credit_store_key <- credit_store_key c;
+        ctx.cg_adopt_untagged_orders
+        <- Dio_strategies.Strategy_venue.drops_userref ~exchange:c.oc_hedge_exchange
+           && overlay_market_exclusive
+                ~all_trading:config.trading
+                ~exchange:c.oc_hedge_exchange
+                ~symbol:c.oc_hedge_symbol
+                ~self:None;
         Some ctx
     in
     (* Overlay runtime. It runs independently of the grid, including on a domain spawned
@@ -1547,7 +1622,9 @@ let asset_domain_worker
     in
     (* Additional generic overlays owned by this grid entry. They run in the same domain:
        no new process, and grid sell fills are available locally. *)
-    let overlay_instances = load_overlay_instances ~owner:asset_with_fees in
+    let overlay_instances =
+      load_overlay_instances ~owner:asset_with_fees ~all_trading:config.trading
+    in
     let profilers_of (p : domain_profilers) =
       [ p.prof_ob; p.prof_exec; p.prof_prep; p.prof_strategy; p.prof_cycle ]
     in
@@ -1584,6 +1661,7 @@ let asset_domain_worker
       in
       ctx.cg_asset <- Some asset;
       ctx.cg_symbol <- asset.symbol;
+      ctx.cg_adopt_untagged_orders <- ov.oir_adopt_untagged;
       ctx.cg_now <- now;
       ctx.cg_cycle <- !cycle_count;
       ctx.cg_price <- price;

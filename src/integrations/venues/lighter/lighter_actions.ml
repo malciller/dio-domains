@@ -312,6 +312,7 @@ let place_order
             ~price
             ~cl_ord_id:order_id
             ?order_userref
+            ~reduce_only
             ();
           Lwt.return
             (Ok { Lighter_types.Types.order_id; cl_ord_id = None; order_userref })

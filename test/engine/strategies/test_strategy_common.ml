@@ -404,6 +404,47 @@ let test_reduce_only_room_clamps_to_position () =
     5.0
 ;;
 
+let test_untagged_order_adoption () =
+  let module C = Dio_strategies.Strategy_common in
+  let owns ~price_hits ~adopt ~want ~venue =
+    C.untagged_order_is_own_kind
+      ~price_hits_target:price_hits
+      ~adopt_by_flags:adopt
+      ~want_reduce_only:want
+      ~venue_reduce_only:venue
+  in
+  (* The old exact-price fallback must keep working even when the venue does not report
+     the flag. *)
+  Alcotest.(check bool)
+    "target price always matches"
+    true
+    (owns ~price_hits:true ~adopt:false ~want:true ~venue:None);
+  Alcotest.(check bool)
+    "an adopted close needs the venue reduce-only flag"
+    true
+    (owns ~price_hits:false ~adopt:true ~want:true ~venue:(Some true));
+  Alcotest.(check bool)
+    "a non-reduce-only sell is never adopted as a take-profit"
+    false
+    (owns ~price_hits:false ~adopt:true ~want:true ~venue:(Some false));
+  Alcotest.(check bool)
+    "an adopted entry needs a non-reduce-only order"
+    true
+    (owns ~price_hits:false ~adopt:true ~want:false ~venue:(Some false));
+  Alcotest.(check bool)
+    "a reduce-only buy is not adopted as an entry"
+    false
+    (owns ~price_hits:false ~adopt:true ~want:false ~venue:(Some true));
+  Alcotest.(check bool)
+    "a venue that hides the flag cannot be adopted"
+    false
+    (owns ~price_hits:false ~adopt:true ~want:true ~venue:None);
+  Alcotest.(check bool)
+    "a shared market is not adopted"
+    false
+    (owns ~price_hits:false ~adopt:false ~want:true ~venue:(Some true))
+;;
+
 let test_placement_backoff_is_bounded () =
   let module C = Dio_strategies.Strategy_common in
   let key = "test:backoff|hyperliquid|TEST" in
@@ -501,6 +542,10 @@ let () =
             "reduce-only size is capped at the live position"
             `Quick
             test_reduce_only_room_clamps_to_position
+        ; Alcotest.test_case
+            "untagged orders adopt only by venue flags"
+            `Quick
+            test_untagged_order_adoption
         ; Alcotest.test_case
             "only grid-tagged orders are grid-owned"
             `Quick

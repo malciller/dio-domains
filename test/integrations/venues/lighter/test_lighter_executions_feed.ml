@@ -144,6 +144,47 @@ let test_userref_lookup () =
   | None -> Alcotest.fail "order not parsed"
 ;;
 
+let test_reduce_only_flag_tracked () =
+  Lighter.Instruments_feed.initialize [ "EXRO" ];
+  Lighter.Executions_feed.initialize [ "EXRO" ];
+  Lighter.Executions_feed.inject_order
+    ~symbol:"EXRO"
+    ~order_id:"ro_1"
+    ~side:Lighter.Executions_feed.Sell
+    ~qty:1.0
+    ~price:100.0
+    ~reduce_only:true
+    ();
+  let flag () =
+    match Lighter.Executions_feed.get_open_order "EXRO" "ro_1" with
+    | Some o -> o.order_reduce_only
+    | None -> None
+  in
+  Alcotest.(check (option bool)) "injected close carries its flag" (Some true) (flag ());
+  (* A delta update can omit the field; the last known flag must survive so a close never
+     turns into an entry after the first partial. *)
+  let json =
+    `Assoc
+      [ "type", `String "update/account_all_orders"
+      ; ( "account_all_orders"
+        , `Assoc
+            [ ( "0"
+              , `Assoc
+                  [ "order_index", `String "ro_1"
+                  ; "market_index", `Int 0
+                  ; "status", `Int 2
+                  ; "is_ask", `Bool true
+                  ; "price", `String "101.0"
+                  ; "initial_base_amount", `String "1.0"
+                  ; "filled_base_amount", `String "0.0"
+                  ] )
+            ] )
+      ]
+  in
+  Lighter.Executions_feed.process_account_orders_update json;
+  Alcotest.(check (option bool)) "delta keeps the flag" (Some true) (flag ())
+;;
+
 let test_startup_snapshot_done () =
   Lighter.Executions_feed.initialize [ "EXSNAP" ];
   Lighter.Executions_feed.set_startup_snapshot_done ();
@@ -660,6 +701,10 @@ let () =
     ; ( "state"
       , [ Alcotest.test_case "startup_snapshot_done" `Quick test_startup_snapshot_done
         ; Alcotest.test_case "has_execution_data" `Quick test_has_execution_data
+        ; Alcotest.test_case
+            "reduce_only flag tracked"
+            `Quick
+            test_reduce_only_flag_tracked
         ] )
     ; ( "ring_buffer"
       , [ Alcotest.test_case "execution events" `Quick test_execution_events_ring_buffer ]

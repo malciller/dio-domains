@@ -794,7 +794,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
     (fun exn ->
       Atomic.set sse_active false;
       let err = Printexc.to_string exn in
-      Logging.error_f ~section "Alpaca trade events stream disconnected: %s" err;
+      Logging.debug_f ~section "Alpaca trade events stream disconnected: %s" err;
       on_failure err;
       Lwt.return_unit)
 ;;

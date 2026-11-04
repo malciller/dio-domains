@@ -384,6 +384,7 @@ module Ibkr_impl = struct
         ; limit_price = oo.oo_limit_price
         ; status = Ibkr_types.to_exchange_order_status oo.oo_status
         ; user_ref = None
+        ; reduce_only = None
         ; cl_ord_id = None
         }
     | None -> None
@@ -402,6 +403,7 @@ module Ibkr_impl = struct
         ; limit_price = oo.oo_limit_price
         ; status = Ibkr_types.to_exchange_order_status oo.oo_status
         ; user_ref = None
+        ; reduce_only = None
         ; cl_ord_id = None
         })
       (Ibkr_executions_feed.get_open_orders symbol)
@@ -536,6 +538,7 @@ module Ibkr_impl = struct
           ; limit_price = oo.oo_limit_price
           ; status = Ibkr_types.to_exchange_order_status oo.oo_status
           ; user_ref = None
+          ; reduce_only = None
           ; cl_ord_id = None
           })
   ;;

@@ -638,6 +638,7 @@ module Hyperliquid_impl = struct
         ; limit_price = o.limit_price
         ; status = status_of_hyperliquid_status o.order_status
         ; user_ref = o.order_userref
+        ; reduce_only = None
         ; cl_ord_id = o.cl_ord_id
         }
     | None -> None
@@ -673,6 +674,7 @@ module Hyperliquid_impl = struct
         ; limit_price = o.limit_price
         ; status = status_of_hyperliquid_status o.order_status
         ; user_ref = o.order_userref
+        ; reduce_only = None
         ; cl_ord_id = o.cl_ord_id
         })
       orders
@@ -702,6 +704,7 @@ module Hyperliquid_impl = struct
           ; limit_price = o.limit_price
           ; status = status_of_hyperliquid_status o.order_status
           ; user_ref = o.order_userref
+          ; reduce_only = None
           ; cl_ord_id = o.cl_ord_id
           })
   ;;

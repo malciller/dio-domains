@@ -904,7 +904,9 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
         (fun () -> done_p)
         (function
           | End_of_file ->
-            Logging.warn ~section "WebSocket connection closed unexpectedly (End_of_file)";
+            Logging.debug_f
+              ~section
+              "WebSocket connection closed unexpectedly (End_of_file)";
             Lwt_mutex.with_lock connection_mutex (fun () ->
               active_connection := None;
               Atomic.set is_connected_ref false;
@@ -914,7 +916,10 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
             close_all_subscribers ();
             Lwt.fail_with "Connection closed unexpectedly (End_of_file)"
           | exn ->
-            Logging.error_f ~section "WebSocket read error: %s" (Printexc.to_string exn);
+            Logging.debug_f
+              ~section
+              "WebSocket read error: %s"
+              (Printexc.to_string exn);
             Lwt_mutex.with_lock connection_mutex (fun () ->
               active_connection := None;
               Atomic.set is_connected_ref false;
@@ -934,7 +939,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
       Lwt.fail_with "WebSocket closed by server")
     (fun exn ->
       let error_msg = Printexc.to_string exn in
-      Logging.error_f ~section "WebSocket connection error: %s" error_msg;
+      Logging.debug_f ~section "WebSocket connection error: %s" error_msg;
       Atomic.set is_connected_ref false;
       fail_all_pending error_msg;
       close_all_subscribers ();

@@ -211,7 +211,7 @@ let connect t =
       Logging.info ~section "Handshake complete, awaiting nextValidId";
       Lwt.return_unit)
     (fun exn ->
-      Logging.error_f ~section "Connection failed: %s" (Printexc.to_string exn);
+      Logging.debug_f ~section "Connection failed: %s" (Printexc.to_string exn);
       Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit)
       >>= fun () ->
       t.socket <- None;
@@ -307,7 +307,7 @@ let start_reader t ~on_message ~on_disconnect =
           on_disconnect "Connection closed by gateway (EOF)";
           Lwt.return_unit)
         (fun exn ->
-          Logging.error_f ~section "Reader error: %s" (Printexc.to_string exn);
+          Logging.debug_f ~section "Reader error: %s" (Printexc.to_string exn);
           Atomic.set t.connected false;
           on_disconnect (Printf.sprintf "Reader error: %s" (Printexc.to_string exn));
           Lwt.return_unit))
@@ -322,7 +322,7 @@ let connect_with_retry t ~max_attempts =
   let rec attempt n delay =
     if n > max_attempts
     then (
-      Logging.error_f ~section "Failed to connect after %d attempts" max_attempts;
+      Logging.warn_f ~section "Failed to connect after %d attempts" max_attempts;
       Lwt.fail_with "Max reconnection attempts exceeded")
     else (
       Logging.info_f ~section "Connection attempt %d/%d" n max_attempts;

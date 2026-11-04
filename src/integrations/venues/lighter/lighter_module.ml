@@ -240,6 +240,7 @@ module Lighter_impl = struct
         ; limit_price = o.limit_price
         ; status = status_of_lighter_status o.order_status
         ; user_ref = o.order_userref
+        ; reduce_only = o.order_reduce_only
         ; cl_ord_id = o.cl_ord_id
         }
     | None -> None
@@ -259,6 +260,7 @@ module Lighter_impl = struct
         ; limit_price = o.limit_price
         ; status = status_of_lighter_status o.order_status
         ; user_ref = o.order_userref
+        ; reduce_only = o.order_reduce_only
         ; cl_ord_id = o.cl_ord_id
         })
       orders
@@ -291,6 +293,7 @@ module Lighter_impl = struct
           ; limit_price = o.limit_price
           ; status = status_of_lighter_status o.order_status
           ; user_ref = o.order_userref
+          ; reduce_only = o.order_reduce_only
           ; cl_ord_id = o.cl_ord_id
           })
   ;;

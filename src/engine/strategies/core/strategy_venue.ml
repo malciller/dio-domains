@@ -300,6 +300,12 @@ let venue_lot_qty grid_qty exchange state =
   | _ -> grid_qty
 ;;
 
+(** Venues whose order feed does not echo the strategy userref. On these, a resting
+    order's identity must come from its venue-side flags (market, side, reduce-only). *)
+let drops_userref ~exchange =
+  String.equal (String.lowercase_ascii (String.trim exchange)) "lighter"
+;;
+
 let parse_config_float config value_name default exchange symbol =
   try float_of_string config with
   | Failure _ ->

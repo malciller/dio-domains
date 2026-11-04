@@ -35,6 +35,7 @@ let order_of_feed (o : Feed.open_order) : Exchange.Types.open_order =
   ; limit_price = o.limit_price
   ; status = status_of o.order_status
   ; user_ref = o.order_userref
+  ; reduce_only = None
   ; cl_ord_id = o.cl_ord_id
   }
 ;;

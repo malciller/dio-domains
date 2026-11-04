@@ -76,6 +76,10 @@ type ctx =
   ; mutable cg_profile : bool
   ; mutable cg_sell_pre : Jac.sell_pre option
   ; mutable cg_symbol : string
+  ; mutable cg_adopt_untagged_orders : bool
+  (** True for an overlay whose market no other strategy trades on a venue that drops the
+      userref. A same-side order with a matching venue reduce-only flag is then this
+      book's own resting order, adopted rather than duplicated after a restart. *)
   }
 
 let create () =
@@ -124,6 +128,7 @@ let create () =
   ; cg_profile = false
   ; cg_sell_pre = None
   ; cg_symbol = ""
+  ; cg_adopt_untagged_orders = false
   }
 ;;
 
@@ -1326,6 +1331,7 @@ let order_replace
             with
             | _ -> ()
           in
+          let drops_userref = Strategy_venue.drops_userref ~exchange:asset.exchange in
           let consider ~is_perp symbol =
             iter_cached ~symbol (fun oid price _remaining side_str userref ->
               if String.equal side_str want_side && not (Hashtbl.mem seen oid)
@@ -1335,30 +1341,33 @@ let order_replace
                    Looking every grid order up here was the scan's dominant cost. *)
                 let wants_registry =
                   match userref with
-                  | Some 0 | None ->
-                    String.equal (String.lowercase_ascii asset.exchange) "lighter"
+                  | Some 0 | None -> drops_userref
                   | Some u -> u = Strategy_common.strategy_userref_carry
                 in
                 if wants_registry
                 then (
                   let meta = Strategy_common.lookup_carry_order ~order_id:oid in
+                  let price_hits_target =
+                    price > 0.0
+                    && Float.abs (price -. rounded)
+                       <= 1e-9 *. Float.max 1.0 (Float.abs rounded)
+                  in
                   (* Venues that do not echo the engine's user reference (Lighter) return
                      [None]/[0]. The id registry is the stronger identity: an order this
                      engine booked under this exact kind is ours even after a reprice
                      moved it off the last target price, so it is amended rather than
                      layered again. With no registry entry (a restart, or an order placed
-                     before the tag existed) fall back to the exact target price. *)
+                     before the tag existed) fall back to the exact target price, or - on
+                     a market this overlay owns exclusively - adopt the order by its
+                     venue-side reduce-only flag. *)
                   let userref_ok =
                     match userref with
                     | Some 0 | None ->
-                      (* Only Lighter drops the tag; other venues' untagged orders are
-                         external and must not be adopted. *)
+                      (* Only a venue that drops the tag can be adopted this way; other
+                         venues' untagged orders are external. *)
                       (match meta with
                        | Some m -> String.equal m.Strategy_common.com_kind kind_key
-                       | None ->
-                         price > 0.0
-                         && Float.abs (price -. rounded)
-                            <= 1e-9 *. Float.max 1.0 (Float.abs rounded))
+                       | None -> price_hits_target || c.cg_adopt_untagged_orders)
                     | Some u -> u = Strategy_common.strategy_userref_carry
                   in
                   if userref_ok
@@ -1413,8 +1422,63 @@ let order_replace
                               && o.status = Dio_exchange.Exchange_intf.Types.New)
                              || o.status
                                 = Dio_exchange.Exchange_intf.Types.PartiallyFilled ->
-                        Hashtbl.replace seen oid ();
-                        out := o :: !out
+                        (* An order adopted by its venue flags must actually be a close
+                           when this kind is one (and an entry when it is not). Without
+                           that check an external non-reduce-only sell could be amended as
+                           a take-profit and later fill as a short. *)
+                        (* An echoed userref, or a registry entry, is already proof of
+                           ownership; only an untagged, unregistered order needs the venue
+                           flag to be adopted. *)
+                        let identity_known =
+                          match userref with
+                          | Some 0 | None -> Option.is_some meta
+                          | Some _ -> true
+                        in
+                        let adopted = (not identity_known) && not price_hits_target in
+                        let reduce_only_ok =
+                          identity_known
+                          || Strategy_common.untagged_order_is_own_kind
+                               ~price_hits_target
+                               ~adopt_by_flags:c.cg_adopt_untagged_orders
+                               ~want_reduce_only:reduce_only
+                               ~venue_reduce_only:o.reduce_only
+                        in
+                        if reduce_only_ok
+                        then (
+                          (* Bind the adopted id now so the fill classifier and the next
+                             tick see the correct kind, and a duplicate left by an earlier
+                             restart is amendable rather than layered. *)
+                          if adopted
+                          then (
+                            Strategy_common.register_carry_order_id
+                              ~order_id:oid
+                              ~market:
+                                (if is_perp
+                                 then Strategy_common.Carry_perp
+                                 else Strategy_common.Carry_spot)
+                              ~maker:post_only
+                              ~kind:kind_key
+                              ~key:
+                                (overlay_inflight_key
+                                   ~dedup_key
+                                   ~side:(Strategy_common.string_of_order_side order_side)
+                                   ~qty
+                                   ~price:(Some rounded)
+                                   ~exchange:asset.exchange
+                                   ~instrument
+                                   ~reduce_only);
+                            (* Restart reconciliation is otherwise invisible: say which
+                               resting order was recognised instead of duplicated. *)
+                            Logging.info_f
+                              ~section
+                              "Overlay adopt: %s %s %s (kind %s, reduce_only=%b)"
+                              instrument
+                              oid
+                              (Strategy_common.string_of_order_side order_side)
+                              kind_key
+                              reduce_only);
+                          Hashtbl.replace seen oid ();
+                          out := o :: !out)
                       | _ -> ())))))
           in
           if want_perp
@@ -1497,12 +1561,42 @@ let order_replace
             if not pushed
             then ignore (Strategy_common.InFlightOrders.remove_in_flight_order cancel_key)))
       in
-      (* One live order per overlay kind. A process restart or a cancel+replace race can
-         leave a duplicate; keep the first and cancel the rest so two take-profits cannot
-         both target the same position (the chart then shows one close, not a doubled
-         one). *)
+      (* One live order per overlay kind. Keep the copy nearest the target when the scan
+         sees duplicates (a restart or a cancel+replace race), so the rest are the ones
+         swept and the next tick does not immediately amend the keeper. *)
+      let matching =
+        match matching with
+        | [] | [ _ ] -> matching
+        | first :: rest ->
+          let distance (o : Dio_exchange.Exchange_intf.Types.open_order) =
+            match o.limit_price with
+            | Some p -> Float.abs (p -. rounded)
+            | None -> Float.infinity
+          in
+          let best =
+            List.fold_left
+              (fun a o -> if distance o < distance a then o else a)
+              first
+              rest
+          in
+          best
+          :: List.filter
+               (fun (o : Dio_exchange.Exchange_intf.Types.open_order) ->
+                 not (String.equal o.order_id best.order_id))
+               matching
+      in
       if qty <= 0.0
-      then (if not protect_close then List.iter (fun o -> cancel_one o) matching)
+      then
+        if protect_close
+        then (
+          (* A close that is not being replaced still must not be doubled. Keep one and
+             cancel the extras; the keeper is never cancelled, so this cannot become a
+             cancel/replace loop. *)
+          match matching with
+          | _ :: (_ :: _ as extras) ->
+            List.iter (fun o -> cancel_one ~reason:"duplicate" o) extras
+          | _ -> ())
+        else List.iter (fun o -> cancel_one o) matching
       else if backoff > 0.0
       then
         Logging.debug_f

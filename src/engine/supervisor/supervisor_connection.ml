@@ -6,6 +6,10 @@ open Supervisor_types
 
 let section = "supervisor"
 
+(* Attempts increment on both dispatch ([start_async]) and failure ([set_state]), so this
+   is roughly five failed reconnect cycles. Past it the retry loop itself is the problem. *)
+let max_reconnect_warn_attempts = 10
+
 (* Atomic shutdown flag and condition variable for graceful termination. *)
 let shutdown_requested = Atomic.make false
 let shutdown_mutex = Mutex.create ()
@@ -150,12 +154,33 @@ let set_state conn new_state =
      conn.last_disconnected <- Some (Unix.time ());
      conn.last_connecting <- None;
      conn.reconnect_attempts <- conn.reconnect_attempts + 1;
-     Logging.error_f
-       ~section
-       "[%s] Connection failed: %s (attempt #%d)"
-       conn.name
-       reason
-       conn.reconnect_attempts);
+     let attempts = conn.reconnect_attempts in
+     (* WARN while the supervisor can still repair. ERROR only when repair is impossible
+        (no connect function or an open breaker) or the retry loop keeps failing. *)
+     if Option.is_some conn.connect_fn && conn.circuit_breaker <> Open
+     then
+       if attempts <= max_reconnect_warn_attempts
+       then
+         Logging.warn_f
+           ~section
+           "[%s] Connection lost: %s (attempt #%d, reconnecting)"
+           conn.name
+           reason
+           attempts
+       else
+         Logging.error_f
+           ~section
+           "[%s] Connection lost: %s (attempt #%d, reconnection not recovering)"
+           conn.name
+           reason
+           attempts
+     else
+       Logging.error_f
+         ~section
+         "[%s] Connection failed: %s (attempt #%d, cannot reconnect)"
+         conn.name
+         reason
+         attempts);
   Mutex.unlock conn.mutex;
   if old_state <> new_state
   then (
@@ -285,13 +310,9 @@ let start_async conn =
           conn.reconnect_attempts <- conn.reconnect_attempts + 1;
           let attempt_num = conn.reconnect_attempts in
           Mutex.unlock conn.mutex;
-          Logging.warn_f
-            ~section
-            "[%s] Circuit breaker blocks connection attempt"
-            conn.name;
           Logging.error_f
             ~section
-            "[%s] Connection failed: Circuit breaker open (attempt #%d)"
+            "[%s] Reconnect blocked: circuit breaker open (attempt #%d)"
             conn.name
             attempt_num;
           false, None)
@@ -340,7 +361,7 @@ let start_async conn =
             Mutex.unlock conn.mutex;
             if (not already_failed) && latest_attempt = attempt_num
             then (
-              Logging.warn_f
+              Logging.debug_f
                 ~section
                 "[%s] Connection function completed unexpectedly"
                 conn.name;
@@ -353,9 +374,9 @@ let start_async conn =
             Mutex.unlock conn.mutex;
             if latest_attempt = attempt_num
             then (
-              Logging.error_f
+              Logging.debug_f
                 ~section
-                "[%s] Unexpected error in connection function: %s"
+                "[%s] Error in connection function: %s"
                 conn.name
                 error_msg;
               set_state conn (Failed error_msg))
