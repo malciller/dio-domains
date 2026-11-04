@@ -1615,7 +1615,7 @@ let start_message_handler ~my_gen conn symbols on_failure on_heartbeat =
         match exn with
         | Failure msg when msg = "Connection closed by server" -> Lwt.return_unit
         | _ ->
-          Logging.error_f
+          Logging.debug_f
             ~section
             "Orderbook WebSocket error during read: %s"
             (Printexc.to_string exn);

@@ -108,6 +108,9 @@ module Types = struct
     ; limit_price : float option (** Limit price, if applicable. *)
     ; status : order_status (** Current order lifecycle status. *)
     ; user_ref : int option (** User reference integer, if set. *)
+    ; reduce_only : bool option
+    (** Venue-side reduce-only flag, or [None] when the venue does not report it. On a
+        venue that drops the strategy userref this separates a close from an entry. *)
     ; cl_ord_id : string option (** Client order identifier, if set. *)
     }
 

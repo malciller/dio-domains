@@ -70,6 +70,7 @@ module Fake_perp_context : Dio_exchange.Exchange_intf.Market_context.S = struct
       ; limit_price = Some 95.0
       ; status = Dio_exchange.Exchange_intf.Types.New
       ; user_ref = Some 3
+      ; reduce_only = None
       ; cl_ord_id = None
       }
     ]

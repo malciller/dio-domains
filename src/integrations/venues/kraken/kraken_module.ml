@@ -384,6 +384,7 @@ module Kraken_impl = struct
         ; limit_price = o.limit_price
         ; status = status_of_kraken_status o.order_status
         ; user_ref = o.order_userref
+        ; reduce_only = None
         ; cl_ord_id = o.cl_ord_id
         }
     | None -> None
@@ -405,6 +406,7 @@ module Kraken_impl = struct
         ; limit_price = o.limit_price
         ; status = status_of_kraken_status o.order_status
         ; user_ref = o.order_userref
+        ; reduce_only = None
         ; cl_ord_id = o.cl_ord_id
         })
       orders
@@ -571,6 +573,7 @@ module Kraken_impl = struct
           ; limit_price = o.limit_price
           ; status = status_of_kraken_status o.order_status
           ; user_ref = o.order_userref
+          ; reduce_only = None
           ; cl_ord_id = o.cl_ord_id
           })
   ;;

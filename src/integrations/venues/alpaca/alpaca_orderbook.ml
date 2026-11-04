@@ -692,7 +692,7 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
           connect_and_monitor ~on_failure ~on_connected ~on_heartbeat)
         else (
           let err = Printexc.to_string exn in
-          Logging.error_f ~section "Alpaca data WS disconnected: %s" err;
+          Logging.debug_f ~section "Alpaca data WS disconnected: %s" err;
           on_failure err;
           Lwt.return_unit)))
 ;;

@@ -237,7 +237,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
             ~on_heartbeat)
         (fun exn ->
           let error_msg = Printexc.to_string exn in
-          Logging.error_f ~section "[%s] Connection failed: %s" hl_ws_conn.name error_msg;
+          Logging.debug_f ~section "[%s] Connection failed: %s" hl_ws_conn.name error_msg;
           set_state hl_ws_conn (Failed error_msg);
           Lwt.return_unit)
     in
@@ -287,7 +287,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                   ~on_heartbeat)
               (fun exn ->
                 let error_msg = Printexc.to_string exn in
-                Logging.error_f
+                Logging.debug_f
                   ~section
                   "[%s] Connection failed: %s"
                   lt_public_conn.name
@@ -319,7 +319,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                   ~on_heartbeat)
               (fun exn ->
                 let error_msg = Printexc.to_string exn in
-                Logging.error_f
+                Logging.debug_f
                   ~section
                   "[%s] Connection failed: %s"
                   lt_private_conn.name
@@ -509,14 +509,27 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                           if has_alpaca then Alpaca.Executions.initialize alpaca_symbols;
                           let __ppx_lwt_0 =
                             let open_orders_p =
-                              if has_hyperliquid
-                              then
+                              (* Both overlay venues must have their resting orders in the
+                                 cache before the strategy domains run. Without this the
+                                 long book (Lighter) starts flat, places a fresh entry/TP
+                                 beside the real ones, and can only reconcile after the
+                                 first private-WS resync. *)
+                              let fetches =
+                                (if has_hyperliquid
+                                 then [ Hyperliquid.Module.fetch_open_orders_ws () ]
+                                 else [])
+                                @
+                                if has_lighter
+                                then [ Lighter.Module.fetch_open_orders () ]
+                                else []
+                              in
+                              if fetches = []
+                              then Lwt.return `Ok
+                              else
                                 Lwt.pick
-                                  [ (Hyperliquid.Module.fetch_open_orders_ws ()
-                                     >|= fun () -> `Ok)
+                                  [ (Lwt.join fetches >|= fun () -> `Ok)
                                   ; (Lwt_unix.sleep 10.0 >|= fun () -> `Timed_out)
                                   ]
-                              else Lwt.return `Ok
                             in
                             Lwt.backtrace_try_bind
                               "src/engine/supervisor/supervisor_feeds.ml"
@@ -530,7 +543,8 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                                 | `Timed_out ->
                                   Logging.warn_f
                                     ~section
-                                    "Hyperliquid open-orders fetch timed out after 10s";
+                                    "Startup open-orders fetch timed out after 10s; \
+                                     strategies may run before resting orders are known";
                                   Lwt.return_unit)
                               (function
                                 | exn -> Lwt.reraise exn)
@@ -673,7 +687,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                                               >>= fun () -> Lwt.return_unit)
                                             (fun exn ->
                                               let error_msg = Printexc.to_string exn in
-                                              Logging.error_f
+                                              Logging.debug_f
                                                 ~section
                                                 "[%s] Connection failed during \
                                                  establishment: %s"
@@ -743,7 +757,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                                               >>= fun () -> Lwt.return_unit)
                                             (fun exn ->
                                               let error_msg = Printexc.to_string exn in
-                                              Logging.error_f
+                                              Logging.debug_f
                                                 ~section
                                                 "[%s] Connection failed during \
                                                  establishment: %s"
@@ -1195,7 +1209,7 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                                                                 Lwt.return_unit))))))
                                             (fun exn ->
                                               let error_msg = Printexc.to_string exn in
-                                              Logging.error_f
+                                              Logging.debug_f
                                                 ~section
                                                 "[ibkr_gateway] Connection failed: %s"
                                                 error_msg;

@@ -356,6 +356,7 @@ module Alpaca_impl = struct
         ; limit_price = o.limit_price
         ; status = o.status
         ; user_ref = o.user_ref
+        ; reduce_only = None
         ; cl_ord_id = o.cl_ord_id
         }
     | None -> None
@@ -375,6 +376,7 @@ module Alpaca_impl = struct
         ; limit_price = o.limit_price
         ; status = o.status
         ; user_ref = o.user_ref
+        ; reduce_only = None
         ; cl_ord_id = o.cl_ord_id
         })
       orders
@@ -478,6 +480,7 @@ module Alpaca_impl = struct
           ; limit_price = o.limit_price
           ; status = o.status
           ; user_ref = o.user_ref
+          ; reduce_only = None
           ; cl_ord_id = o.cl_ord_id
           })
   ;;

@@ -30,6 +30,7 @@ type open_order =
   ; avg_price : float
   ; order_status : order_status
   ; order_userref : int option
+  ; order_reduce_only : bool option
   ; cl_ord_id : string option
   ; last_updated : float
   ; order_expiry : float option
@@ -48,6 +49,7 @@ type execution_event =
   ; is_amended : bool
   ; cl_ord_id : string option
   ; user_ref : int option
+  ; reduce_only : bool option
   }
 
 (** The Lighter signed order has no user-reference field, so the exchange never echoes the
@@ -321,6 +323,16 @@ let update_orders_internal store (event : execution_event) =
           | Some o -> o.order_expiry
           | None -> None
         in
+        (* Delta updates may omit reduce_only; keep the last known flag so a close never
+           loses its identity mid-life. *)
+        let order_reduce_only =
+          match event.reduce_only with
+          | Some _ -> event.reduce_only
+          | None ->
+            (match existing_opt with
+             | Some o -> o.order_reduce_only
+             | None -> None)
+        in
         let order : open_order =
           { order_id = event.order_id
           ; symbol = event.symbol
@@ -332,6 +344,7 @@ let update_orders_internal store (event : execution_event) =
           ; avg_price = event.avg_price
           ; order_status = event.order_status
           ; order_userref = event.user_ref
+          ; order_reduce_only
           ; cl_ord_id = resolved_cl_ord_id
           ; last_updated = now
           ; order_expiry = preserved_expiry
@@ -469,7 +482,17 @@ let clear_all_open_orders () =
 
 (** Pre-registers a locally placed order before exchange confirmation arrives, so
     strategies see it immediately. *)
-let inject_order ~symbol ~order_id ~side ~qty ~price ?cl_ord_id ?order_userref () =
+let inject_order
+  ~symbol
+  ~order_id
+  ~side
+  ~qty
+  ~price
+  ?cl_ord_id
+  ?order_userref
+  ?reduce_only
+  ()
+  =
   let store = get_symbol_store symbol in
   let now = Unix.gettimeofday () in
   let event : execution_event =
@@ -485,6 +508,7 @@ let inject_order ~symbol ~order_id ~side ~qty ~price ?cl_ord_id ?order_userref (
     ; is_amended = false
     ; cl_ord_id
     ; user_ref = order_userref
+    ; reduce_only
     }
   in
   update_orders_internal store event;
@@ -522,6 +546,7 @@ let reject_order ~order_id ~reason =
       ; is_amended = false
       ; cl_ord_id = cached.cl_ord_id
       ; user_ref = cached.order_userref
+      ; reduce_only = cached.order_reduce_only
       }
     in
     update_orders_internal store event;
@@ -915,6 +940,7 @@ let process_account_orders_update json =
                      with
                      | 0 -> lookup_userref client_order_id
                      | n -> Some n)
+                ; reduce_only = parse_reduce_only order_json
                 }
               in
               update_orders_internal store event;
@@ -1184,6 +1210,7 @@ let handle_snapshot ?now ~since json =
           ; is_amended = false
           ; cl_ord_id = cached_order.cl_ord_id
           ; user_ref = cached_order.order_userref
+          ; reduce_only = cached_order.order_reduce_only
           }
         in
         (* The snapshot is only evidence: a partial one leaves the order live, and an

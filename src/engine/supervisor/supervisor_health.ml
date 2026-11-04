@@ -192,7 +192,7 @@ let monitor_loop () =
                     in
                     if stuck_time > 120.0
                     then (
-                      Logging.error_f
+                      Logging.warn_f
                         ~section
                         "[%s] Connection stuck in 'Connecting' state for %.0fs, \
                          restarting..."
@@ -406,7 +406,7 @@ let monitor_loop () =
                             conn.name
                             ping_failures)
                         else (
-                          Logging.error_f
+                          Logging.warn_f
                             ~section
                             "[%s] Ping failed %d times and no data received, marking \
                              connection as failed"
