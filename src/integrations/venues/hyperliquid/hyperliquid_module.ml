@@ -541,24 +541,17 @@ module Hyperliquid_impl = struct
 
   let has_orderbook_data ~symbol = Hyperliquid_orderbook_feed.has_orderbook_data symbol
 
-  (* Event-sourced: gross spot total minus our own resting-buy holds, plus projected
-     fills. The venue's netted available only moves on the next spotState frame. *)
-  let get_tradeable_balance ~asset = Hyperliquid_balances.tradeable asset
+  (* The strategy-facing figure stays the venue's netted base: the fills projection is the
+     oracle's pool view, and folding it in here double counts a fill the venue's own frame
+     already carries. *)
+  let get_tradeable_balance ~asset = Hyperliquid_balances.get_balance asset
 
   let get_tradeable_balance_fast ~asset =
     let store = Hyperliquid_balances.get_balance_store asset in
-    let last_gen = ref (-1) in
-    let last_held = ref None in
-    fun () ->
-      let gen = Hyperliquid_executions_feed.get_orders_generation () in
-      if gen <> !last_gen
-      then (
-        last_gen := gen;
-        last_held := Hyperliquid_executions_feed.open_buy_quote ~quote:asset);
-      Hyperliquid_balances.tradeable_of_store store ~held:!last_held
+    fun () -> Hyperliquid_balances.BalanceStore.get_balance store
   ;;
 
-  (* The figure already nets the holds we placed, so it is the sellable guard too. *)
+  (* Hyperliquid's tradeable figure is already hold-netted. *)
   let get_available_balance_fast = get_tradeable_balance_fast
 
   (** Age in seconds of the balance snapshot for [asset], or [None] before the first

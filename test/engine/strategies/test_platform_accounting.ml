@@ -275,6 +275,30 @@ let test_ghost_buy () =
        ~last_buy_ack_ts:80.0)
 ;;
 
+let test_reserved_headroom () =
+  (* A ledger surplus can outrun the venue: the reserve is only backed once the venue's
+     free base covers it, so the headroom is what the venue actually holds above it. *)
+  Alcotest.(check (float 0.000001))
+    "venue free above the reserve"
+    0.30764165
+    (Platform_accounting.reserved_headroom
+       ~venue_free:0.83151659
+       ~reserved:0.52387494);
+  (* Live shape: HYPE free 0.38151659 against a 0.52387494 reserve - nothing is sellable,
+     whatever the ledger says. *)
+  Alcotest.(check (float 0.000001))
+    "venue free below the reserve is zero"
+    0.0
+    (Platform_accounting.reserved_headroom
+       ~venue_free:0.38151659
+       ~reserved:0.52387494);
+  Alcotest.(check bool)
+    "no comparable venue figure does not bound"
+    true
+    (Float.is_infinite
+       (Platform_accounting.reserved_headroom ~venue_free:Float.nan ~reserved:1.0))
+;;
+
 let () =
   Alcotest.run
     "platform_accounting"
@@ -304,6 +328,9 @@ let () =
       , [ Alcotest.test_case "matching helpers" `Quick test_persisted_levels ] )
     ; ( "reserved_atomic"
       , [ Alcotest.test_case "atomic registry" `Quick test_reserved_atomic ] )
+    ; ( "reserved_headroom"
+      , [ Alcotest.test_case "venue free bounds the reserve" `Quick test_reserved_headroom
+        ] )
     ; "ghost_buy", [ Alcotest.test_case "grace predicate" `Quick test_ghost_buy ]
     ]
 ;;

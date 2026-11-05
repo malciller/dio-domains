@@ -233,6 +233,20 @@ let available_base
   else ledger_balance -. reserved_base -. committed_sell
 ;;
 
+(** Base the reserve leaves sellable, bounded by the venue's own free figure.
+
+    The reserve is only backed once the venue's free base covers it. A local ledger can
+    over-track after a fill/hold race, and on hold-netted venues the committed-sell
+    deduction collapses to the short un-netted overlay, so nothing else bounds it: a
+    ledger surplus would offer base the venue does not have and dip into the reserve. A
+    NaN venue figure means no comparable reading; the caller's NaN gate already blocks
+    placement. *)
+let reserved_headroom ~(venue_free : float) ~(reserved : float) : float =
+  if Float.is_nan venue_free
+  then Float.infinity
+  else Float.max 0.0 (venue_free -. reserved)
+;;
+
 (** Persisted-sell-level matching. Pure helpers shared by the grid's [sync_open_orders]
     and [evaluate_sell_leg] reconciles. *)
 
