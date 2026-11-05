@@ -903,6 +903,7 @@ type sell_pre =
   ; sp_unnetted_hold : float
   ; sp_unreflected_credit : float
   ; sp_reserve_headroom : float
+  ; sp_reservation_headroom : float
   ; sp_inventory_basis : float
   ; sp_inventory_ok : bool
   ; sp_min_notional : float
@@ -974,6 +975,14 @@ let sell_leg_prepare
      amount above the staked balance reduces the tradeable float. *)
   let staked = Float.max 0.0 state.staked_base in
   let reserved_tradeable = Float.max 0.0 (state.reserved_base -. staked) in
+  (* Hard bound on anything the reserve leaves sellable: the venue's own free base. A
+     local ledger can outrun it after a fill/hold race, and a reservation is only real
+     once the venue's free base covers it. *)
+  let reservation_headroom =
+    Platform_accounting.reserved_headroom
+      ~venue_free:(asset_balance +. unreflected_credit)
+      ~reserved:reserved_tradeable
+  in
   (* Alpaca's sellable base: venue [qty_available] (free of resting holds) plus un-polled
      buy credits, minus the reserve. Moved to Platform_accounting (milestone 2). *)
   let alpaca_available =
@@ -1101,7 +1110,10 @@ let sell_leg_prepare
     if Float.is_nan asset_balance
     then 0.0
     else if is_accumulation_basis
-    then ledger_balance -. reserved_tradeable -. committed_sell
+    then
+      Float.min
+        (ledger_balance -. reserved_tradeable -. committed_sell)
+        reservation_headroom
     else available_base
   in
   (* Inventory gate for sell placement: available non-accrued inventory must cover the
@@ -1237,6 +1249,7 @@ let sell_leg_prepare
   ; sp_unnetted_hold = unnetted_hold
   ; sp_unreflected_credit = unreflected_credit
   ; sp_reserve_headroom = reserve_headroom
+  ; sp_reservation_headroom = reservation_headroom
   ; sp_inventory_basis = inventory_basis
   ; sp_inventory_ok = inventory_ok
   ; sp_min_notional = min_notional
@@ -1373,12 +1386,21 @@ let sell_place_body
      so it can never be offered again - not even when the venue reports a gross figure or
      its open-order feed momentarily drops a live order. Alpaca uses the venue's own
      [qty_available], which is already free of resting holds. *)
+  (* Same venue bound the gate uses: a reservation is only backed once the venue's free
+     base covers it, whatever the local ledger says. *)
+  let reservation_headroom = pre.sp_reservation_headroom in
   let available =
     if is_accumulation
-    then Float.max 0.0 (asset_bal -. reserved_tradeable -. committed_sell)
+    then
+      Float.min
+        (Float.max 0.0 (asset_bal -. reserved_tradeable -. committed_sell))
+        reservation_headroom
     else if is_alpaca
     then alpaca_available
-    else Float.max 0.0 (asset_bal -. reserved_tradeable -. committed_sell)
+    else
+      Float.min
+        (Float.max 0.0 (asset_bal -. reserved_tradeable -. committed_sell))
+        reservation_headroom
   in
   let target_q = round_qty sell_qty asset.symbol asset.exchange in
   let effective_sell_qty, balance_ok =
@@ -1737,7 +1759,9 @@ let sell_excess_sweep_phase ~state ~now ~(asset : trading_config) ~pre ~ecfg =
   let reserve_headroom = pre.sp_reserve_headroom in
   let sweep_available =
     let venue = Float.max 0.0 available_base in
-    if is_alpaca then Float.min venue reserve_headroom else venue
+    if is_alpaca
+    then Float.min venue reserve_headroom
+    else Float.min venue pre.sp_reservation_headroom
   in
   evaluate_excess_sweep ~state ~now ~asset ~available:sweep_available ~min_notional ~ecfg
 ;;

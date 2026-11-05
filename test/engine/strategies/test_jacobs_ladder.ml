@@ -8377,6 +8377,108 @@ let test_venue_round_qty_lot_epsilon () =
     (sol_min *. 108.165 >= 10.0 -. 1e-9)
 ;;
 
+(* The reserved base is only real once the venue's free base covers it. A local ledger can
+   outrun the venue after a fill/hold race (Hyperliquid's spotState lag), and sizing off
+   that surplus offers base the venue does not hold: the observed 0.30 sell against a
+   0.5239 reserve while the venue's free base was 0.3815. *)
+let test_sell_blocked_when_venue_free_is_under_the_reserve () =
+  let symbol = "VENBOUND/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:2;
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.15;
+  state.maker_fee <- 0.0004;
+  state.cached_sell_mult <- 1.0;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_venue_min_notional <- 10.0;
+  state.reserved_base <- 0.52387494;
+  state.accumulated_profit <- 0.0;
+  state.position_initialized <- true;
+  state.position_base <- 0.83151659;
+  Sell_orders.clear state.open_sell_orders;
+  state.inflight_sell <- false;
+  state.asset_low <- false;
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 79.0;
+  state.last_buy_fill_qty <- Some 0.15;
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "hyperliquid"
+    ; symbol
+    ; qty = "0.15"
+    ; grid_interval = 0.35
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0004
+    ; taker_fee = None
+    ; accumulation_buffer = 0.25
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "hyperliquid" in
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  let placed_qty ~asset_balance =
+    Dio_strategies.Strategy_api.evaluate_sell_leg
+      ~persisted_reconcile:
+        (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
+      ~state
+      ~now:100.0
+      ~asset
+      ~bid_price:79.0
+      ~ask_price:79.1
+      ~asset_balance
+      ~buy_attempted:false
+      ~oracle_halted:false
+      ~ecfg
+      ~locked_in_sells:0.0
+      ~base_balance_age:(Some 0.1);
+    let pending = Dio_strategies.Strategy_api.get_pending_orders 100 in
+    let qty =
+      List.fold_left
+        (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+          match o.operation, o.side with
+          | Place, Sell -> acc +. o.qty
+          | _ -> acc)
+        0.0
+        pending
+    in
+    drain ();
+    qty
+  in
+  (* Venue free base (0.3815) sits under the reserve (0.5239): the ledger's 0.3076 surplus
+     is not the venue's to spend. *)
+  check
+    (float 1e-9)
+    "venue free under the reserve places nothing"
+    0.0
+    (placed_qty ~asset_balance:0.38151659);
+  check
+    (float 1e-9)
+    "reserved_base is untouched"
+    0.52387494
+    state.reserved_base;
+  (* Venue free base covers the reserve plus the owed 0.15: the sell is placed. *)
+  state.just_filled_buy <- true;
+  state.inflight_sell <- false;
+  ignore
+    (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+       state.duplicate_key_sell);
+  let backed_qty = placed_qty ~asset_balance:0.83151659 in
+  check bool "a backed reserve still sells" true (backed_qty > 0.0);
+  check
+    bool
+    "the sell never exceeds the venue free base above the reserve"
+    true
+    (backed_qty <= 0.30764166)
+;;
+
+
 let () =
   run
     "Jacobs Ladder"
@@ -8578,6 +8680,10 @@ let () =
             "unnetted sell hold gates second sizing in the netting window"
             `Quick
             test_unnetted_sell_hold_gates_second_sizing
+        ; test_case
+            "sell blocked when the venue free base is under the reserve"
+            `Quick
+            test_sell_blocked_when_venue_free_is_under_the_reserve
         ; test_case
             "stale unnetted sell hold decays after the grace"
             `Quick
