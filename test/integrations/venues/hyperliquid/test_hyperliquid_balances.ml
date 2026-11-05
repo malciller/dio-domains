@@ -258,11 +258,11 @@ let spot_state_json coins =
                   , `List
                       (List.map
                          (fun (coin, total, hold) ->
-                            `Assoc
-                              [ "coin", `String coin
-                              ; "total", `String total
-                              ; "hold", `String hold
-                              ])
+                           `Assoc
+                             [ "coin", `String coin
+                             ; "total", `String total
+                             ; "hold", `String hold
+                             ])
                          coins) )
                 ] )
           ] )
@@ -270,9 +270,9 @@ let spot_state_json coins =
 ;;
 
 let test_spot_state_full_vs_delta () =
-  (* The first spotState frame after subscribe is the full set; later frames are deltas.
-     A balance that reaches zero is omitted from the full frame, so the store must clear
-     it or the grid offers phantom base. *)
+  (* The first spotState frame after subscribe is the full set; later frames are deltas. A
+     balance that reaches zero is omitted from the full frame, so the store must clear it
+     or the grid offers phantom base. *)
   Hyperliquid.Balances.expect_full_spot_snapshot ();
   Hyperliquid.Balances.process_market_data
     (spot_state_json [ "ZEROED/USDC", "2.5", "0.5"; "USDC", "100", "0" ]);
@@ -301,6 +301,51 @@ let test_spot_state_full_vs_delta () =
     "present asset is untouched"
     90.0
     (Hyperliquid.Balances.get_balance "USDC")
+;;
+
+let test_composed_tradeable_nets_our_holds () =
+  (* The venue's netted available lags a cancel by seconds. The gross spendable total
+     minus our own holds is ordered by our feeds: cancelling the buy releases it now. *)
+  let asset = "COMPOSE/USDC" in
+  let store = Hyperliquid.Balances.get_balance_store asset in
+  Hyperliquid.Balances.BalanceStore.update_wallet
+    store
+    ~available:88.13
+    ~total:100.0
+    "spot"
+    "account";
+  let composed ~held =
+    Hyperliquid.Balances.tradeable_of_store ~holds_known:true store ~held
+  in
+  Alcotest.(check (float 0.000001))
+    "a resting buy is netted from the gross total"
+    88.13
+    (composed ~held:(Some 11.87));
+  Alcotest.(check (float 0.000001))
+    "a cancelled buy releases quote before the venue frame"
+    100.0
+    (composed ~held:(Some 0.0));
+  Alcotest.(check (float 0.000001))
+    "a non-quote asset keeps the venue figure"
+    88.13
+    (composed ~held:None)
+;;
+
+let test_composed_tradeable_falls_back_before_the_order_snapshot () =
+  (* Until the open-orders snapshot lands our hold set is incomplete, so the venue's
+     netted figure is the only safe one: it cannot overstate buy capacity. *)
+  let asset = "COMPOSE2/USDC" in
+  let store = Hyperliquid.Balances.get_balance_store asset in
+  Hyperliquid.Balances.BalanceStore.update_wallet
+    store
+    ~available:80.0
+    ~total:100.0
+    "spot"
+    "account";
+  Alcotest.(check (float 0.000001))
+    "falls back to the venue figure"
+    80.0
+    (Hyperliquid.Balances.tradeable_of_store ~holds_known:false store ~held:(Some 11.87))
 ;;
 
 let () =
@@ -336,6 +381,14 @@ let () =
             "spotState full snapshot vs delta"
             `Quick
             test_spot_state_full_vs_delta
+        ; Alcotest.test_case
+            "composed tradeable nets our holds"
+            `Quick
+            test_composed_tradeable_nets_our_holds
+        ; Alcotest.test_case
+            "composed tradeable falls back before the order snapshot"
+            `Quick
+            test_composed_tradeable_falls_back_before_the_order_snapshot
         ] )
     ]
 ;;

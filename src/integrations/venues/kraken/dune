@@ -17,6 +17,7 @@
   dio.mtime.clock.os
   concurrency
   dio.exchange
+  dio.projected_balance
   dio.error_handling
   dio.json_scan
   dio.latency_profiling))

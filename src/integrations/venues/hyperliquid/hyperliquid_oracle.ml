@@ -480,11 +480,20 @@ let fetch_balances ~testnet : ((string * float * float) list, string) result Lwt
     [spotState] frame), so the runtime falls back to REST rather than sizing against a
     fabricated zero. Once populated this is authoritative and no HTTP round-trip is made,
     which also removes the dependency on the REST balance cache that could pin the pool to
-    a startup snapshot. *)
+    a startup snapshot.
+
+    The available figure is event-sourced ([Hyperliquid_balances.tradeable]): the spot
+    total minus our own resting-buy holds plus projected fills, so a cancel releases quote
+    on the ack rather than on the venue's next frame. *)
 let live_balances () : (string * float * float) list option =
   match Hyperliquid_balances.spot_balances () with
   | [] -> None
-  | balances -> Some balances
+  | balances ->
+    Some
+      (List.map
+         (fun (asset, _available, total) ->
+           asset, Hyperliquid_balances.tradeable asset, total)
+         balances)
 ;;
 
 let default_quote = "USDC"

@@ -22,6 +22,8 @@
 
 (subdir integrations/venues/alpaca)
 
+(subdir integrations/venues/common)
+
 (subdir integrations/venues/hyperliquid)
 
 (subdir integrations/venues/lighter)
