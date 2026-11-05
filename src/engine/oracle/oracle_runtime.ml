@@ -1584,6 +1584,16 @@ let run_account_pass
                 else d
               in
               let need = d.buy_qty *. current in
+              (* A resting buy is placed one grid interval below the anchor, so its
+                 committed quote is [need] less that interval. Anything at or above that
+                 is the rung already standing: cancelling a junior for it frees quote
+                 nothing can place. *)
+              let resting_buy_covers =
+                resting_buy
+                && committed_buy
+                   >= need *. (1.0 -. (Float.max 0.0 d.grid_interval /. 100.0))
+                      -. 1e-9
+              in
               if is_reserved_senior
               then (
                 match Hashtbl.find_opt reclaim_reservations acct_id with
@@ -1637,13 +1647,17 @@ let run_account_pass
                 else if survival_active
                         && (not !reclaim_active)
                         && (not (ineffective_for key))
+                        && (not resting_buy_covers)
                         && not (in_startup_grace ~now:now_ns)
                 then (
                   (* Starved survivor: evaluate lower-priority resting buys and cancel the
                      minimum set that frees this strategy's shortfall. On success the
                      freed quote is reserved for this strategy, lower-priority strategies
                      are held inactive for the rest of the pass, and the cancel event
-                     wakes the next pass to fund it - no timed run required. *)
+                     wakes the next pass to fund it - no timed run required.
+
+                     Only a strategy whose rung is not already standing can spend the
+                     freed quote. *)
                   let claims =
                     Option.value (List.assoc_opt key lower_claims) ~default:[]
                   in

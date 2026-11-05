@@ -186,6 +186,20 @@ let tradeable asset =
   tradeable_of_store
     (get_balance_store asset)
     ~held:(Hyperliquid_executions_feed.open_buy_quote ~quote:asset)
+
+(** Strategy-facing tradeable figure: event-sourced for a quote asset, the venue figure
+    for anything else.
+
+    A quote asset has no local ledger to reconcile against, so the filled/cancelled holds
+    must leave the figure on the ack - otherwise a freed hold is still "spent" by the venue
+    when the next buy tries to place. A base asset keeps the venue figure: the strategy
+    books its own fills, and a projection here double counts one the venue's frame already
+    carries. *)
+let tradeable_quote asset =
+  let store = get_balance_store asset in
+  match Hyperliquid_executions_feed.open_buy_quote ~quote:asset with
+  | Some held -> tradeable_of_store store ~held:(Some held)
+  | None -> BalanceStore.get_balance store
 (* Spot-only [(available, total)] for [asset], or [None] until the first spot snapshot.
    In a unified/portfolio account the spot USDC total is the perp collateral, so the margin
    feed reads this rather than the per-DEX perp summary. *)
