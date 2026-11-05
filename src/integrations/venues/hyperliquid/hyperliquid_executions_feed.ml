@@ -636,6 +636,31 @@ let get_all_symbols () =
 [@@ocaml.doc " Return all symbols that have initialized execution stores. "]
 ;;
 
+(** Quote tied in our own live spot buys for [quote], or [None] when no registered symbol
+    quotes it (so the caller knows it is not a quote asset). Spot only: a perp order keyed
+    under the spot pair reserves margin, not the spot wallet. *)
+let open_buy_quote ~quote =
+  let suffix = "/" ^ String.uppercase_ascii quote in
+  let quoting =
+    List.filter (fun symbol -> String.ends_with ~suffix symbol) (get_all_symbols ())
+  in
+  if quoting = []
+  then None
+  else
+    Some
+      (List.fold_left
+         (fun acc symbol ->
+           List.fold_left
+             (fun acc (o : open_order) ->
+               if is_live_order o && o.side = Buy
+               then acc +. (o.remaining_qty *. Option.value o.limit_price ~default:0.0)
+               else acc)
+             acc
+             (get_spot_open_orders symbol))
+         0.0
+         quoting)
+;;
+
 let cleanup_stale_orders () =
   let now = Unix.gettimeofday () in
   let stale_threshold = 24.0 *. 3600.0 in

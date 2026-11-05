@@ -202,7 +202,7 @@ let () = ignore Alpaca.Module.Alpaca_impl.name
 ### Hyperliquid (`hyperliquid.xyz/`, `dio.hyperliquid`)
 
 - Spot and perpetuals, with EIP-712 structured-data signing (`hyperliquid_signer.ml`).
-- Live tradeable balance comes from the WebSocket store (`webData2` / `spotState`). Perp clearinghouse USDC (`perp/account`) and delegated stake (`staking/*`) live in separate, excluded wallets, so the store's spot view matches REST `spotClearinghouseState` (spot capital only, hold-netted). The oracle serves `live_balances` from it, and `fetch_balances` (REST) remains the cold-start fallback for the brief window before the first `spotState` frame.
+- Live tradeable balance comes from the WebSocket store (`webData2` / `spotState`). Perp clearinghouse USDC (`perp/account`) and delegated stake (`staking/*`) live in separate, excluded wallets, so the store's spot view is spot capital only. The available figure is event-sourced: the spot total minus the holds in our own open-orders store plus projected fills (`tradeable_projection`), so a cancel releases quote on its ack instead of on the venue's next `spotState` frame. The oracle serves `live_balances` from it, and `fetch_balances` (REST) remains the cold-start fallback for the brief window before the first `spotState` frame.
 - `default_fees`: for spot symbols (containing `/`) `0.0` maker / `0.001` taker; for perps `0.0002` / `0.0005`. Live fees via `/info` with `userFees`.
 - `default_quote`: `USDC`. `min_notional`: `10.0` for spot and perps alike (`MinTradeNtl` / `MinTradeSpotNtl`); an exact reduce-only close is exempt.
 - Oracle adapter: `/info` with `candleSnapshot` at interval `1d`, resolving spot versus perp through `spotMeta`. A `/` symbol with no matching Hyperliquid spot pair returns no bars (the asset is inactive) and is never silently substituted with perpetual data.
@@ -269,7 +269,7 @@ Implementation notes:
 
 - `fetch_bars` returns raw source rows in any order. The oracle sorts, de-duplicates, and normalizes centrally (`Oracle_calendar.normalize_bars`) on every fetch and cache read, so a source emitting placeholder rows (for example, fabricated pre-listing candles) yields an inactive asset rather than a bad decision. Implementations may pre-clean, since normalization is idempotent.
 - `fetch_balances` returns already-normalized `(asset, available, total)` triples (for example `XXBT -> BTC`, `UBTC -> BTC`).
-- `live_balances` is the venue's answer to whether its live balance store is equivalent to REST for oracle sizing. Kraken, Alpaca, and Hyperliquid return their spot stores; a venue returns `None` while its store holds no data yet, so the runtime falls back to `fetch_balances` rather than sizing against a fabricated zero.
+- `live_balances` is the venue's answer to whether its live balance store is equivalent to REST for oracle sizing. Kraken, Alpaca, and Hyperliquid return their spot stores; a venue returns `None` while its store holds no data yet, so the runtime falls back to `fetch_balances` rather than sizing against a fabricated zero. A venue that registers `Tradeable_projection` applies fills to its store, so the oracle adds no pending deltas and reads one event-ordered figure.
 - `calendar_kind` drives gap detection: crypto gaps are missing calendar days; equity gaps are weekdays missing from the venue calendar (holidays).
 - `default_quote` is used when a symbol is written without an explicit quote (`BTC` -> `USDC` on Hyperliquid, `USD` on Kraken/Alpaca).
 

@@ -20,5 +20,6 @@
   concurrency
   dio.persistence
   dio.exchange
+  dio.projected_balance
   dio.error_handling
   dio.latency_profiling))

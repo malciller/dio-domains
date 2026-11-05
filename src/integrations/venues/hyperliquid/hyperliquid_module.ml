@@ -540,14 +540,25 @@ module Hyperliquid_impl = struct
   ;;
 
   let has_orderbook_data ~symbol = Hyperliquid_orderbook_feed.has_orderbook_data symbol
-  let get_tradeable_balance ~asset = Hyperliquid_balances.get_balance asset
+
+  (* Event-sourced: gross spot total minus our own resting-buy holds, plus projected
+     fills. The venue's netted available only moves on the next spotState frame. *)
+  let get_tradeable_balance ~asset = Hyperliquid_balances.tradeable asset
 
   let get_tradeable_balance_fast ~asset =
     let store = Hyperliquid_balances.get_balance_store asset in
-    fun () -> Hyperliquid_balances.BalanceStore.get_balance store
+    let last_gen = ref (-1) in
+    let last_held = ref None in
+    fun () ->
+      let gen = Hyperliquid_executions_feed.get_orders_generation () in
+      if gen <> !last_gen
+      then (
+        last_gen := gen;
+        last_held := Hyperliquid_executions_feed.open_buy_quote ~quote:asset);
+      Hyperliquid_balances.tradeable_of_store store ~held:!last_held
   ;;
 
-  (* Hyperliquid's tradeable figure is already hold-netted. *)
+  (* The figure already nets the holds we placed, so it is the sellable guard too. *)
   let get_available_balance_fast = get_tradeable_balance_fast
 
   (** Age in seconds of the balance snapshot for [asset], or [None] before the first
@@ -1553,4 +1564,17 @@ let () =
     ~section:"hyperliquid_module"
     "registered market-context/capital-reservation capabilities and started \
      asset-context/position feeds"
+;;
+
+(** Fills move the tradeable figure ahead of the venue's next [spotState] frame. *)
+module Tradeable_projection_impl : Exchange.Tradeable_projection.S = struct
+  let name = "hyperliquid"
+
+  let apply ~asset ~delta ~id =
+    Hyperliquid_balances.apply_tradeable_delta ~asset ~delta ~id
+  ;;
+end
+
+let () =
+  Exchange.Registry.register_tradeable_projection (module Tradeable_projection_impl)
 ;;

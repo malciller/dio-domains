@@ -1,0 +1,4 @@
+(test
+ (name test_projected_balance)
+ (modules test_projected_balance)
+ (libraries dio.projected_balance alcotest))

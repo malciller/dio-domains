@@ -28,6 +28,10 @@ module BalanceStore =
       mutex: Mutex.t ;
       total_balance: float Atomic.t ;
       trading_balance: float Atomic.t ;
+      (* Gross total of the non-excluded wallets: what our own open-order holds are
+         netted from. *)
+      spendable_total: float Atomic.t ;
+      projection: Projected_balance.t ;
       staked_balance: float Atomic.t ;
       last_updated: float Atomic.t ;
       spendable_last_updated: float Atomic.t
@@ -39,6 +43,8 @@ module BalanceStore =
         mutex = (Mutex.create ());
         total_balance = (Atomic.make 0.0);
         trading_balance = (Atomic.make 0.0);
+        spendable_total = (Atomic.make 0.0);
+        projection = (Projected_balance.create ~label:(section ^ "/projected") ());
         staked_balance = (Atomic.make 0.0);
         last_updated = (Atomic.make 0.0);
         spendable_last_updated = (Atomic.make 0.0)
@@ -80,6 +86,12 @@ module BalanceStore =
                if wallet.wallet_type = "staking"
                then acc +. wallet.total
                else acc) store.wallets 0.0 in
+        let spendable_total =
+          Hashtbl.fold
+            (fun _ wallet acc ->
+               if is_excluded_wallet wallet.wallet_type
+               then acc
+               else acc +. wallet.total) store.wallets 0.0 in
         let spendable_last_updated =
           Hashtbl.fold
             (fun _ w acc ->
@@ -88,13 +100,22 @@ module BalanceStore =
                else Float.max acc w.last_updated) store.wallets 0.0 in
         Atomic.set store.total_balance total;
         Atomic.set store.trading_balance trading;
+        Atomic.set store.spendable_total spendable_total;
+        (* A spendable frame is absolute truth for this asset: whatever it already
+           holds, the projection is superseded. Excluded wallets cannot move the
+           tradeable figure, so the ~10s staking poll must not clear a fill credit the
+           spot frame has not reported yet. *)
+        if not (is_excluded_wallet wallet_type)
+        then Projected_balance.clear store.projection;
         Atomic.set store.staked_balance staked;
         Atomic.set store.last_updated now;
         Atomic.set store.spendable_last_updated spendable_last_updated;
         Mutex.unlock store.mutex))
     let get_balance store = Atomic.get store.trading_balance
     let get_total_balance store = Atomic.get store.total_balance
+    let get_spendable_total store = Atomic.get store.spendable_total
     let get_staked_balance store = Atomic.get store.staked_balance
+    let get_projected ?now store = Projected_balance.get ?now store.projection
     let get_last_updated store = Atomic.get store.last_updated[@@ocaml.doc
                                                                 " Wall-clock timestamp of the last wallet update for this asset (0.0 = never updated).\n      Used for balance-snapshot staleness. "]
     let get_spendable_last_updated store =
@@ -130,6 +151,41 @@ let get_total_balance asset =
 let get_staked_balance asset =
   let store = get_balance_store asset in
   BalanceStore.get_staked_balance store
+let get_projected ?now asset =
+  let store = get_balance_store asset in
+  BalanceStore.get_projected ?now store
+
+(** Applies one execution fill's effect on [asset]'s tradeable figure. The venue's next
+    spendable frame supersedes it; [id] dedupes a replayed fill. *)
+let apply_tradeable_delta ~asset ~delta ~id =
+  Projected_balance.apply (get_balance_store asset).projection ~delta ~id
+
+(** Event-sourced tradeable figure.
+
+    A hold-netted venue figure only moves on the next [spotState] frame, so a cancelled
+    or filled buy keeps its quote counted for seconds. The gross spendable total minus our
+    own open-order holds is ordered by our feeds instead.
+
+    [held] is [None] for an asset no symbol quotes; the venue figure already nets resting
+    sell inventory there. Before the open-orders snapshot our hold set is incomplete, so
+    the venue figure is the only safe one. *)
+let tradeable_of_store
+      ?(holds_known = Hyperliquid_executions_feed.is_startup_snapshot_done ())
+      store ~held
+  =
+  let venue = BalanceStore.get_balance store in
+  let projected = BalanceStore.get_projected store in
+  match held with
+  | Some held when holds_known ->
+    Projected_balance.compose
+      ~total:(BalanceStore.get_spendable_total store)
+      ~projected
+      ~held
+  | _ -> Float.max 0.0 (venue +. projected)
+let tradeable asset =
+  tradeable_of_store
+    (get_balance_store asset)
+    ~held:(Hyperliquid_executions_feed.open_buy_quote ~quote:asset)
 (* Spot-only [(available, total)] for [asset], or [None] until the first spot snapshot.
    In a unified/portfolio account the spot USDC total is the perp collateral, so the margin
    feed reads this rather than the per-DEX perp summary. *)
