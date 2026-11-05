@@ -34,6 +34,13 @@ type ctx =
       arrive before the position snapshot reflects it; [order_place] holds a new entry for
       a short grace window so the cycle cannot re-short the full target. *)
   ; mutable cg_last_entry_fill_at : float
+  (** Arrival time of the last perp execution whose effect the venue position snapshot has
+      not yet absorbed, or 0.0. While set, [order_place]/[order_replace] hold reduce-only
+      orders: the facts are still computed from the pre-fill position, so a take-profit
+      that just closed the short would be re-sent at full size into a flat position (the
+      venue rejects it with "Reduce only order would increase position"). The hold lifts
+      as soon as a position snapshot newer than the fill is published - never by a clock. *)
+  ; mutable cg_perp_fill_at : float
   ; mutable cg_price : float
   ; mutable cg_bid : float
   ; mutable cg_ask : float
@@ -92,6 +99,7 @@ let create () =
   ; cg_overlay_spot_symbol = ""
   ; cg_last_leverage = 0.0
   ; cg_last_entry_fill_at = 0.0
+  ; cg_perp_fill_at = 0.0
   ; cg_price = nan
   ; cg_bid = nan
   ; cg_ask = nan
@@ -884,6 +892,18 @@ let dry_run () = overlay_dry_run
     {!Strategy_common.overlay_inflight_key}). *)
 let overlay_inflight_key = Strategy_common.overlay_inflight_key
 
+(** Whether the venue's position snapshot still predates the last perp fill. Event-driven:
+    the hold lifts as soon as a snapshot newer than the fill is published, so no clock is
+    involved. While it holds, a reduce-only order would be sized from the pre-fill
+    position and, for a close that just filled, would be re-sent into a flat book. *)
+let position_behind_fill c ~exchange =
+  c.cg_perp_fill_at > 0.0
+  &&
+  match Dio_exchange.Market_context.get_positions_updated_at ~exchange with
+  | Some ts -> ts <= c.cg_perp_fill_at
+  | None -> true
+;;
+
 (** Generic order placement for overlays. The engine knows nothing about carry policy: the
     strategy file chooses the market, side, size, price, TIF, and reduce-only flag. *)
 let order_place
@@ -961,7 +981,15 @@ let order_place
       && c.cg_last_entry_fill_at > 0.0
       && c.cg_now -. c.cg_last_entry_fill_at <= 6.0
     in
-    if entry_grace
+    if reduce_only && is_perp && position_behind_fill c ~exchange:asset.exchange
+    then
+      Logging.debug_f
+        ~section
+        "Overlay reduce-only order held until the position snapshot reflects the last \
+         fill: %s (%s)"
+        instrument
+        dedup_key
+    else if entry_grace
     then
       Logging.debug_f
         ~section
@@ -1203,7 +1231,7 @@ let open_orders_snapshot (module Ex : Dio_exchange.Exchange_intf.S) ~exchange ~s
     consults the venue's open orders, so the strategy file never has to track an order id
     or reissue on a timer: every book event calls this, and it no-ops when the resting
     order already matches. *)
-let order_replace
+let order_replace_body
   c
   ~symbol
   ~market
@@ -1682,6 +1710,50 @@ let order_replace
               ~dedup_key))
   | _ ->
     order_place
+      c
+      ~symbol
+      ~market
+      ~side
+      ~qty
+      ~price
+      ~tif
+      ~reduce_only
+      ~post_only
+      ~dedup_key
+;;
+
+(** {!order_replace_body}, held while the venue position snapshot still predates the last
+    perp fill (see [cg_perp_fill_at]). The close that would be re-placed or resized here
+    is the one that just filled, so the only thing a stale position can produce is a
+    reduce-only order sized against a book the venue no longer has. The snapshot-driven
+    cycle re-derives it from the live position. *)
+let order_replace
+  c
+  ~symbol
+  ~market
+  ~side
+  ~qty
+  ~price
+  ~tif
+  ~reduce_only
+  ~post_only
+  ~dedup_key
+  =
+  let behind =
+    match c.cg_asset with
+    | Some asset -> position_behind_fill c ~exchange:asset.exchange
+    | None -> false
+  in
+  if reduce_only && String.equal market "perp" && behind
+  then
+    Logging.debug_f
+      ~section
+      "Overlay reduce-only replace held until the position snapshot reflects the last \
+       fill: %s (%s)"
+      c.cg_symbol
+      dedup_key
+  else
+    order_replace_body
       c
       ~symbol
       ~market

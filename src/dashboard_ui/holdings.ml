@@ -34,9 +34,9 @@ let accum_qty_of ~staked ~pending ~available base =
 (** Mark-to-close distance that counts as "about to execute" for the row flash. *)
 let perp_close_flash_pct = 0.25
 
-(** Nearest perp exit (the side that reduces the position) as a percentage of the perp
-    mark. Negative when a short's close sits below the mark, positive for a long's above. *)
-let perp_close_dist_pct (p : Snapshot.perp) =
+(** Nearest perp exit (the side that reduces the position) as a price. A short exits on
+    its buys, a long on its sells; the order closest to the mark wins. *)
+let perp_close_price (p : Snapshot.perp) =
   if (not p.has_position) || p.mark <= 0.0
   then None
   else (
@@ -54,7 +54,15 @@ let perp_close_dist_pct (p : Snapshot.perp) =
           first
           rest
       in
-      Some ((nearest.price -. p.mark) /. p.mark *. 100.0))
+      Some nearest.price)
+;;
+
+(** Nearest perp exit as a percentage of the perp mark. Negative when a short's close sits
+    below the mark, positive for a long's above. *)
+let perp_close_dist_pct (p : Snapshot.perp) =
+  match perp_close_price p with
+  | Some price -> Some ((price -. p.mark) /. p.mark *. 100.0)
+  | None -> None
 ;;
 
 let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
@@ -73,7 +81,18 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
   let c_near_sell = t.c_near_sell in
   let strats = snapshot.strategies in
   let all_balances = snapshot.balances in
-  let is_compact = w < 120 in
+  (* Fixed column widths total [base_w]; compact drops the spot deltas and narrows the
+     perp cells. Any spare viewport width goes to the holdings columns so the table
+     reaches the right edge instead of leaving a gutter. The compact threshold is the full
+     layout's width: below it, the full row would be cropped. *)
+  let full_base_w = 200 in
+  let is_compact = w - 2 < full_base_w in
+  let base_w = if is_compact then 172 else full_base_w in
+  let extra = max 0 (w - 2 - base_w) in
+  let w_hold_qty = (if is_compact then 10 else 12) + (extra / 4) in
+  let w_hold_val = 10 + ((extra + 1) / 4) in
+  let w_accum_qty = (if is_compact then 10 else 12) + ((extra + 2) / 4) in
+  let w_accum_val = 10 + ((extra + 3) / 4) in
   (* Column header row; compact layout omits the spot deltas and narrows the perp cells. *)
   let header =
     close_row
@@ -88,19 +107,20 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; I.string a_border " │ "
            ; col 8 a_label "S QTY"
            ; I.string a_border " "
-           ; col_right 6 a_label "S CL"
-           ; col 9 a_label " DIST"
-           ; col_right 6 a_label "L CL"
+           ; col_right 12 a_label "S CLOSE @"
+           ; col_right 6 a_label "Δ S"
+           ; col_right 6 a_label "Δ L"
+           ; col_right 12 a_label "L CLOSE @"
            ; I.string a_border " "
            ; col 8 a_label "L QTY"
            ; col_right 11 a_label "BUY @"
            ; col 17 a_label "SPOT DIST"
            ; col_right 11 a_label "SELL @"
            ; I.string a_border " │ "
-           ; col_right 10 a_label "HOLD QTY"
-           ; col_right 10 a_label "HOLD VAL"
-           ; col_right 10 a_label "ACCUM QTY"
-           ; col_right 10 a_label "ACCUM VAL"
+           ; col_right w_hold_qty a_label "HOLD QTY"
+           ; col_right w_hold_val a_label "HOLD VAL"
+           ; col_right w_accum_qty a_label "ACCUM QTY"
+           ; col_right w_accum_val a_label "ACCUM VAL"
            ]
        else
          I.hcat
@@ -111,9 +131,10 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; I.string a_border " │ "
            ; col 9 a_label "S QTY"
            ; I.string a_border " "
-           ; col_right 7 a_label "S CLOSE"
-           ; col 13 a_label " PERP DIST"
-           ; col_right 7 a_label "L CLOSE"
+           ; col_right 12 a_label "S CLOSE @"
+           ; col_right 7 a_label "Δ S"
+           ; col_right 7 a_label "Δ L"
+           ; col_right 12 a_label "L CLOSE @"
            ; I.string a_border " "
            ; col 9 a_label "L QTY"
            ; col_right 12 a_label "BUY @"
@@ -122,10 +143,10 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col_right 8 a_label "Δ SELL"
            ; col_right 12 a_label "SELL @"
            ; I.string a_border " │ "
-           ; col_right 12 a_label "HOLD QTY"
-           ; col_right 10 a_label "HOLD VAL"
-           ; col_right 12 a_label "ACCUM QTY"
-           ; col_right 10 a_label "ACCUM VAL"
+           ; col_right w_hold_qty a_label "HOLD QTY"
+           ; col_right w_hold_val a_label "HOLD VAL"
+           ; col_right w_accum_qty a_label "ACCUM QTY"
+           ; col_right w_accum_val a_label "ACCUM VAL"
            ])
   in
   let build_strategy_row ?(is_selected = false) is_even (symbol, (s : Snapshot.strategy)) =
@@ -155,7 +176,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let pending_sell_qty =
       List.fold_left
         (fun qty_acc (o : Snapshot.order) ->
-           if o.price > 0.0 && o.qty > 0.0 then qty_acc +. o.qty else qty_acc)
+          if o.price > 0.0 && o.qty > 0.0 then qty_acc +. o.qty else qty_acc)
         0.0
         sell_orders
     in
@@ -215,6 +236,11 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       | false, Some _ -> Some 100.0
       | _ -> None
     in
+    let close_price_opt =
+      match s.perp with
+      | Some p -> perp_close_price p
+      | None -> None
+    in
     let close_dist_pct =
       match s.perp with
       | Some p -> perp_close_dist_pct p
@@ -229,19 +255,29 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         0.0
         long_positions
     in
+    (* The displayed long close is the one nearest the mark, matching its distance. *)
+    let nearest_long =
+      List.fold_left
+        (fun (best : Snapshot.long_position option) (l : Snapshot.long_position) ->
+          match best with
+          | None -> Some l
+          | Some b ->
+            (match b.long_close_distance_pct, l.long_close_distance_pct with
+             | Some bd, Some ld -> if abs_float ld < abs_float bd then Some l else best
+             | None, Some _ -> Some l
+             | _ -> best))
+        None
+        long_positions
+    in
     let long_dist_pct =
-      match
-        List.filter_map
-          (fun (l : Snapshot.long_position) -> l.long_close_distance_pct)
-          long_positions
-      with
-      | [] -> None
-      | p :: ps ->
-        Some
-          (List.fold_left
-             (fun best x -> if abs_float x < abs_float best then x else best)
-             p
-             ps)
+      match nearest_long with
+      | Some l -> l.long_close_distance_pct
+      | None -> None
+    in
+    let long_close_price_opt =
+      match nearest_long with
+      | Some l -> l.long_close_price
+      | None -> None
     in
     let near_buy, near_sell =
       let cap_pct_thresh = 0.25 in
@@ -305,27 +341,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       else I.string a_border_outer " │"
     in
     let gauge_img =
-      render_proximity_slider
-        ~has_buy
-        ~has_sell
-        17
-        execution_proximity_opt
-    in
-    let perp_far_pct =
-      match List.filter_map (fun d -> d) [ close_dist_pct; long_dist_pct ] with
-      | [] -> far_thresh
-      | ds ->
-        let max_d =
-          List.fold_left (fun acc d -> max acc (abs_float d)) 0.0 ds
-        in
-        max 0.10 (max_d *. 1.1)
-    in
-    let perp_gauge_img =
-      Theme.render_perp_distance_slider
-        (if is_compact then 9 else 13)
-        ~short_dist:close_dist_pct
-        ~long_dist:long_dist_pct
-        ~far_pct:perp_far_pct
+      render_proximity_slider ~has_buy ~has_sell 17 execution_proximity_opt
     in
     let market_is_closed = s.market_is_closed in
     let oracle_paused = oracle_inactive s in
@@ -341,6 +357,11 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       | _ -> "--", a_dim
     in
     let short_qty_str = truncate_string 8 short_qty_str in
+    let short_close_str, short_close_attr =
+      match close_price_opt with
+      | Some p -> format_price p, if flash_short_close then a_near_fill_green else a_green
+      | None -> "--", a_dim
+    in
     let short_dist_str, short_dist_attr =
       match close_dist_pct with
       | None -> "--", a_dim
@@ -365,6 +386,11 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       | [] -> "--", a_dim
       | _ -> truncate_string 8 (format_qty long_qty), a_cyan
     in
+    let long_close_str, long_close_attr =
+      match long_close_price_opt with
+      | Some p -> format_price p, if flash_long_close then a_near_sell_red else a_yellow
+      | None -> "--", a_dim
+    in
     let long_dist_str, long_dist_attr =
       match long_dist_pct with
       | None -> "--", a_dim
@@ -380,9 +406,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         format_pct d, attr
     in
     let long_dist_attr =
-      if flash_long_close
-      then A.(t.a_near_sell_red ++ bg c_near_sell)
-      else long_dist_attr
+      if flash_long_close then A.(t.a_near_sell_red ++ bg c_near_sell) else long_dist_attr
     in
     let exch_tag = exch_tag_of exchange in
     let buy_dist_str, buy_dist_attr =
@@ -400,9 +424,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         format_pct d, attr
     in
     let buy_dist_attr =
-      if flash_grid_buy
-      then A.(t.a_near_fill_green ++ bg c_near_fill)
-      else buy_dist_attr
+      if flash_grid_buy then A.(t.a_near_fill_green ++ bg c_near_fill) else buy_dist_attr
     in
     let sell_dist_str, sell_dist_attr =
       match closest_sell_dist_pct with
@@ -419,9 +441,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         format_pct d, attr
     in
     let sell_dist_attr =
-      if flash_grid_sell
-      then A.(t.a_near_sell_red ++ bg c_near_sell)
-      else sell_dist_attr
+      if flash_grid_sell then A.(t.a_near_sell_red ++ bg c_near_sell) else sell_dist_attr
     in
     let sell_price_str, sell_price_attr =
       match closest_sell_price_opt with
@@ -459,9 +479,10 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; I.string a_border " │ "
            ; col 8 short_qty_attr short_qty_str
            ; I.string a_border " "
+           ; col_right 12 short_close_attr short_close_str
            ; col_right 6 short_dist_attr short_dist_str
-           ; perp_gauge_img
            ; col_right 6 long_dist_attr long_dist_str
+           ; col_right 12 long_close_attr long_close_str
            ; I.string a_border " "
            ; col 8 long_qty_attr long_qty_str
            ; col_right
@@ -475,17 +496,20 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; gauge_img
            ; col_right 11 sell_price_attr sell_price_str
            ; I.string a_border " │ "
-           ; col_right 10 row_text (if base_bal > 0.0 then format_qty base_bal else "0")
            ; col_right
-               10
+               w_hold_qty
+               row_text
+               (if base_bal > 0.0 then format_qty base_bal else "0")
+           ; col_right
+               w_hold_val
                row_text
                (if hold_value > 0.01 then format_usd hold_value else "--")
            ; col_right
-               10
+               w_accum_qty
                row_text
                (if accum_holding > 0.0001 then format_qty accum_holding else "0")
            ; col_right
-               10
+               w_accum_val
                row_text
                (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--")
            ])
@@ -504,9 +528,10 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; I.string a_border " │ "
            ; col 9 short_qty_attr short_qty_str
            ; I.string a_border " "
+           ; col_right 12 short_close_attr short_close_str
            ; col_right 7 short_dist_attr short_dist_str
-           ; perp_gauge_img
            ; col_right 7 long_dist_attr long_dist_str
+           ; col_right 12 long_close_attr long_close_str
            ; I.string a_border " "
            ; col 9 long_qty_attr long_qty_str
            ; col_right
@@ -522,17 +547,20 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col_right 8 sell_dist_attr sell_dist_str
            ; col_right 12 sell_price_attr sell_price_str
            ; I.string a_border " │ "
-           ; col_right 12 row_text (if base_bal > 0.0 then format_qty base_bal else "0")
            ; col_right
-               10
+               w_hold_qty
+               row_text
+               (if base_bal > 0.0 then format_qty base_bal else "0")
+           ; col_right
+               w_hold_val
                row_text
                (if hold_value > 0.01 then format_usd hold_value else "--")
            ; col_right
-               12
+               w_accum_qty
                row_text
                (if accum_holding > 0.0001 then format_qty accum_holding else "0")
            ; col_right
-               10
+               w_accum_val
                row_text
                (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--")
            ])
@@ -552,7 +580,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let pending_sell_qty =
       List.fold_left
         (fun qty_acc (o : Snapshot.order) ->
-           if o.price > 0.0 && o.qty > 0.0 then qty_acc +. o.qty else qty_acc)
+          if o.price > 0.0 && o.qty > 0.0 then qty_acc +. o.qty else qty_acc)
         0.0
         sell_orders
     in
@@ -688,13 +716,6 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         ]
     in
     let gauge_img = render_gauge None closest_sell_dist_pct in
-    let empty_perp_gauge =
-      Theme.render_perp_distance_slider
-        (if is_compact then 9 else 13)
-        ~short_dist:None
-        ~long_dist:None
-        ~far_pct:1.0
-    in
     let status_str, status_attr = if is_quote then "$", a_green else "⏹", a_red in
     let p_fg =
       match closest_sell_dist_pct with
@@ -723,26 +744,27 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; I.string a_border " │ "
            ; col 8 a_dim "--"
            ; I.string a_border " "
+           ; col_right 12 a_dim "--"
            ; col_right 6 a_dim "--"
-           ; empty_perp_gauge
            ; col_right 6 a_dim "--"
+           ; col_right 12 a_dim "--"
            ; I.string a_border " "
            ; col 8 a_dim "--"
            ; col_right 11 a_dim "--"
            ; gauge_img
            ; col_right 11 sell_price_attr sell_price_str
            ; I.string a_border " │ "
-           ; col_right 10 row_text (format_qty balance)
+           ; col_right w_hold_qty row_text (format_qty balance)
            ; col_right
-               10
+               w_hold_val
                row_text
                (if hold_value > 0.01 then format_usd hold_value else "--")
            ; col_right
-               10
+               w_accum_qty
                row_text
                (if accum_holding > 0.0001 then format_qty accum_holding else "0")
            ; col_right
-               10
+               w_accum_val
                row_text
                (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--")
            ])
@@ -758,9 +780,10 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; I.string a_border " │ "
            ; col 9 a_dim "--"
            ; I.string a_border " "
+           ; col_right 12 a_dim "--"
            ; col_right 7 a_dim "--"
-           ; empty_perp_gauge
            ; col_right 7 a_dim "--"
+           ; col_right 12 a_dim "--"
            ; I.string a_border " "
            ; col 9 a_dim "--"
            ; col_right 12 a_dim "--"
@@ -769,17 +792,17 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ; col_right 8 sell_dist_attr sell_dist_str
            ; col_right 12 sell_price_attr sell_price_str
            ; I.string a_border " │ "
-           ; col_right 12 row_text (format_qty balance)
+           ; col_right w_hold_qty row_text (format_qty balance)
            ; col_right
-               10
+               w_hold_val
                row_text
                (if hold_value > 0.01 then format_usd hold_value else "--")
            ; col_right
-               12
+               w_accum_qty
                row_text
                (if accum_holding > 0.0001 then format_qty accum_holding else "0")
            ; col_right
-               10
+               w_accum_val
                row_text
                (if accum_hold_value > 0.01 then format_usd accum_hold_value else "--")
            ])
