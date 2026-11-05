@@ -33,9 +33,35 @@ COPY --chown=opam:opam . .
 #    out-of-process state writer: keeping it in the same image means the entrypoint
 #    can run it as a sidecar of the engine container (same /app/data mount, same
 #    /tmp for the socket) with no extra service or volume.
+#
+#    Dune's shared cache is OFF by default, which made the cache mount below a no-op:
+#    every deploy threw away this layer's _build tree and recompiled the whole in-tree
+#    library set under flambda -O3 from scratch. Enable it so a cold _build can be
+#    refilled from the cache, and keep _build itself in a second cache mount so the
+#    common case (one changed module) is a true incremental dune build rather than a
+#    full artifact restore. [direct] writes through to the mount instead of spawning
+#    the cache daemon, which needs a runtime dir this stage lacks.
+ENV DUNE_CACHE=enabled
+ENV DUNE_CACHE_TRANSPORT=direct
+
+# Cap the compiler's parallelism by memory, not core count. flambda2 -O3 holds a large
+# working set per [ocamlopt]; on the deploy host 16 jobs on 8 GB of free RAM swap and
+# the build takes minutes instead of seconds. Override with
+#   docker build --build-arg DIO_BUILD_JOBS=<n> ...
+ARG DIO_BUILD_JOBS=8
+
+# The cache mounts are only visible inside this RUN, so stage the executables somewhere
+# the runtime stage can COPY from.
 RUN --mount=type=cache,target=/home/opam/.cache/dune,uid=1000,gid=1000 \
-    eval $(opam env) && dune build -j $(nproc) --profile=release \
-      bin/main.exe bin/dashboard.exe bin/dio_persist.exe
+    --mount=type=cache,target=/app/_build,uid=1000,gid=1000 \
+    eval $(opam env) \
+    && dune build -j "$DIO_BUILD_JOBS" --profile=release \
+         bin/main.exe bin/dashboard.exe bin/dio_persist.exe \
+    && mkdir -p /app/out \
+    && cp _build/default/bin/main.exe \
+          _build/default/bin/dashboard.exe \
+          _build/default/bin/dio_persist.exe \
+          /app/out/
 
 # 2a. Record the exact installed opam package set (name, version, license) so the
 #     released image carries a manifest of every OCaml library it links. Copied
@@ -99,9 +125,9 @@ COPY --from=builder /usr/local/lib/libsecp256k1* /usr/local/lib/
 RUN ldconfig
 
 # 5. Copy compiled binaries from builder
-COPY --from=builder /app/_build/default/bin/main.exe /usr/local/bin/dio
-COPY --from=builder /app/_build/default/bin/dashboard.exe /usr/local/bin/dio-dashboard
-COPY --from=builder /app/_build/default/bin/dio_persist.exe /usr/local/bin/dio-persist
+COPY --from=builder /app/out/main.exe /usr/local/bin/dio
+COPY --from=builder /app/out/dashboard.exe /usr/local/bin/dio-dashboard
+COPY --from=builder /app/out/dio_persist.exe /usr/local/bin/dio-persist
 
 # 5a. Optional Lighter signer shared library (linux/amd64). The directory is
 #     empty unless the image was built with INCLUDE_LIGHTER_SIGNER=1 (see stage

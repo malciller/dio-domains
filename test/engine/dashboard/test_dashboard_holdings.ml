@@ -551,6 +551,7 @@ let perp_json ?(qty = -1.0) ?(mark = 100.0) ?(buys = []) ?(sells = []) () =
 let test_perp_close_distance () =
   let parse = Dashboard_ui.Snapshot.parse_perp in
   let dist p = Dashboard_ui.Holdings.perp_close_dist_pct p in
+  let price p = Dashboard_ui.Holdings.perp_close_price p in
   let short =
     parse
       (perp_json
@@ -558,6 +559,9 @@ let test_perp_close_distance () =
          ~sells:[ order_json "s1" 101.0 1.0 ]
          ())
   in
+  (match price short with
+   | Some v -> Alcotest.(check (float 1e-9)) "short exits on the nearest buy" 99.5 v
+   | None -> Alcotest.fail "expected a short close price");
   (match dist short with
    | Some v -> Alcotest.(check (float 1e-9)) "short exits on the nearest buy" (-0.5) v
    | None -> Alcotest.fail "expected a short close distance");
@@ -569,6 +573,9 @@ let test_perp_close_distance () =
          ~sells:[ order_json "s1" 101.0 1.0 ]
          ())
   in
+  (match price long with
+   | Some v -> Alcotest.(check (float 1e-9)) "long exits on the nearest sell" 101.0 v
+   | None -> Alcotest.fail "expected a long close price");
   (match dist long with
    | Some v -> Alcotest.(check (float 1e-9)) "long exits on the nearest sell" 1.0 v
    | None -> Alcotest.fail "expected a long close distance");

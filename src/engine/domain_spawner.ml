@@ -2773,6 +2773,22 @@ let asset_domain_worker
                      ()
                | Types.Filled ->
                  should_execute_strategy := true;
+                 (* The venue position snapshot trails the execution. Close the
+                    reduce-only hold so this fill's cycle does not re-send the take-profit
+                    it just filled; the next snapshot (strictly newer than this fill)
+                    opens it and the position-driven cycle re-derives the close from the
+                    venue book. *)
+                 if event.market = Types.Perp && event.filled_qty > 0.0
+                 then (
+                   (match overlay_ctx with
+                    | Some ctx ->
+                      ctx.Dio_strategies.Strategy_cycle_engine.cg_perp_fill_at <- now_exec
+                    | None -> ());
+                   List.iter
+                     (fun (ov : overlay_instance_rt) ->
+                       ov.oir_ctx.Dio_strategies.Strategy_cycle_engine.cg_perp_fill_at
+                       <- now_exec)
+                     overlay_instances);
                  dispatch_generic_overlay_fill event;
                  (* The feed publishes fills to the oracle's ring directly. *)
                  let side =
