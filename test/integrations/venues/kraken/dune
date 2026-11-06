@@ -28,7 +28,7 @@
 
 (test
  (name test_kraken_orderbook_feed)
- (libraries dio.kraken alcotest))
+ (libraries dio.kraken dio.mtime.clock.os alcotest))
 
 (test
  (name test_kraken_span_orderbook)

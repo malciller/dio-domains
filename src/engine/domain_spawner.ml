@@ -1684,6 +1684,27 @@ let asset_domain_worker
       ctx.cg_base_age <- None;
       ctx.cg_gen <- 0;
       ctx.cg_profile <- false;
+      (* Parent funding state for the short overlay's unfunded fallback. The decision is
+         published lock-free, but hashing its (exchange, symbol) key allocates, so refresh
+         only when the oracle publishes (one atomic read per cycle otherwise). *)
+      if String.equal ov.oir_config.oi_strategy short_overlay_strategy
+      then (
+        let gen = Oracle_runtime.get_publish_generation () in
+        if gen <> ctx.cg_parent_gen
+        then (
+          ctx.cg_parent_gen <- gen;
+          match
+            Oracle_runtime.decision_for
+              ~exchange:ov.oir_config.oi_owner_exchange
+              ~symbol:ov.oir_config.oi_owner_symbol
+          with
+          | Some d ->
+            ctx.cg_parent_unfunded <- not d.active;
+            ctx.cg_parent_order_qty
+            <- (if Float.is_finite d.buy_qty then Float.max 0.0 d.buy_qty else 0.0)
+          | None ->
+            ctx.cg_parent_unfunded <- false;
+            ctx.cg_parent_order_qty <- 0.0));
       let t_prep = if measured then Monotonic_clock.now_ns () else 0 in
       List.iter
         (fun (event_name, fields) ->

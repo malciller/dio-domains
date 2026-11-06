@@ -49,6 +49,29 @@ let default_max_resubscribe_attempts = 8
     Guards against an unsub/resub hot-loop when validation persistently fails. *)
 let default_resubscribe_cooldown_s = 5.0
 
+(** Seconds of total silence on the book channel before the supervisor fails and
+    reconnects the whole orderbook connection. Kraken pushes updates for at least one
+    subscribed symbol several times a second, so this much silence across every symbol is
+    a dead channel rather than a quiet market. The reconnect clears stores and
+    resubscribes every symbol. *)
+let default_book_connection_timeout_s = 30.0
+
+(** Seconds of silence for a single symbol before the feed requests a targeted
+    resubscribe. Set above [default_max_book_age_s] so the read path has already rejected
+    the frame; this heals a partial stall without dropping the connection. Thin books can
+    legitimately go quiet, hence the wider window. *)
+let default_book_stale_resubscribe_s = 15.0
+
+(** Minimum seconds between staleness-triggered resubscribes for the same symbol. A
+    venue-side stall persists, so a faster retry would churn unsubscribe/subscribe traffic
+    (and risk the venue's subscription rate limit) for as long as it lasts. *)
+let default_book_stale_resubscribe_cooldown_s = 30.0
+
+(** Minimum interval between event-driven staleness scans. The scan is triggered by
+    inbound frames, not a timer; this bounds it to one O(subscribed symbols) pass per
+    interval. *)
+let default_book_staleness_scan_interval_s = 1.0
+
 (** Quote currencies permanently tracked by the balances feed regardless of configured
     trading pairs. *)
 let default_configured_currencies = [ "USD"; "EUR"; "USDT"; "USDC" ]
