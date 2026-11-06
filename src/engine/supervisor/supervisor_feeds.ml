@@ -663,6 +663,20 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                                             ~name:"kraken_orderbook_ws"
                                             ~connect_fn:None
                                         in
+                                        (* Book-only data timeout: [on_heartbeat] fires on
+                                           a successful book write, never on
+                                           ping/heartbeat frames, so 30s of silence here
+                                           means the book channel is dead even though the
+                                           socket answers. The health monitor then fails
+                                           and reconnects the connection, which clears
+                                           every store and resubscribes all symbols. *)
+                                        let book_timeout_s =
+                                          Kraken.Kraken_common_types
+                                          .default_book_connection_timeout_s
+                                        in
+                                        set_data_timeout
+                                          orderbook_conn
+                                          (Some book_timeout_s);
                                         let orderbook_connect_fn () =
                                           Kraken.Kraken_orderbook_feed.clear_all_stores ();
                                           Lwt.catch
@@ -674,7 +688,13 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                                                 update_data_heartbeat orderbook_conn
                                               in
                                               let on_connected () =
-                                                set_state orderbook_conn Connected
+                                                set_state orderbook_conn Connected;
+                                                (* Start the book-only data clock at
+                                                   connect, so a subscription that never
+                                                   produces a first frame still trips the
+                                                   timeout (an unseeded heartbeat is
+                                                   [None] and can never age). *)
+                                                update_data_heartbeat orderbook_conn
                                               in
                                               Kraken.Kraken_orderbook_feed
                                               .connect_and_subscribe

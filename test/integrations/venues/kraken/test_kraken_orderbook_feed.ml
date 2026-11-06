@@ -264,6 +264,90 @@ let test_get_top_levels () =
     (Array.length asks)
 ;;
 
+(* ---- Liveness: data heartbeat and staleness -------------------------------- *)
+
+let live_symbol_counter = ref 0
+
+let live_symbol tag =
+  incr live_symbol_counter;
+  Printf.sprintf "%s_%d/USD" tag !live_symbol_counter
+;;
+
+let book_snapshot ~symbol ~seq =
+  Printf.sprintf
+    "{\"channel\":\"book\",\"type\":\"snapshot\",\"data\":[{\"symbol\":\"%s\",\"sequence\":%d,\"bids\":[{\"price\":100.0,\"qty\":1.0}],\"asks\":[{\"price\":101.0,\"qty\":1.0}],\"checksum\":0}]}"
+    symbol
+    seq
+;;
+
+let pending_resubscribes () = Atomic.get Kraken.Kraken_orderbook_feed.pending_resubscribes
+
+(* The supervisor's data timeout must measure data, not socket noise: a heartbeat frame
+   keeps the connection open but must not refresh the heartbeat, while a book write must. *)
+let test_heartbeat_frames_are_not_data () =
+  Kraken.Kraken_orderbook_feed.clear_all_stores ();
+  let beats = ref 0 in
+  let on_heartbeat () = incr beats in
+  Kraken.Kraken_orderbook_feed.handle_message "{\"channel\":\"heartbeat\"}" on_heartbeat;
+  Kraken.Kraken_orderbook_feed.process_parse_domain_frame "{\"channel\":\"heartbeat\"}";
+  Alcotest.(check int) "heartbeat frames do not refresh the data heartbeat" 0 !beats;
+  let symbol = live_symbol "HB" in
+  Kraken.Kraken_orderbook_feed.handle_message (book_snapshot ~symbol ~seq:1) on_heartbeat;
+  Alcotest.(check int) "a book write refreshes the data heartbeat" 1 !beats
+;;
+
+(* A symbol whose last frame is older than the staleness budget must enqueue a targeted
+   resubscribe; a fresh symbol must not, and repeats are collapsed by the cooldown. *)
+let test_stale_symbol_requests_resubscribe () =
+  Kraken.Kraken_orderbook_feed.clear_all_stores ();
+  let symbol = live_symbol "STALE" in
+  ignore (Kraken.Kraken_orderbook_feed.add_subscribed_symbols [ symbol ]);
+  let store = Kraken.Kraken_orderbook_feed.ensure_store symbol in
+  Hashtbl.remove Kraken.Kraken_orderbook_feed.stale_resubscribe_cooldown symbol;
+  Atomic.set Kraken.Kraken_orderbook_feed.pending_resubscribes [];
+  let now = Mtime_clock.now_ns () in
+  Kraken.Kraken_orderbook_feed.check_book_staleness ~now_ns:now;
+  Alcotest.(check bool)
+    "fresh book does not request a resubscribe"
+    false
+    (List.mem symbol (pending_resubscribes ()));
+  Atomic.set
+    store.Kraken.Kraken_orderbook_feed.last_update_ns
+    (Int64.sub now (Int64.of_float 60.0e9));
+  Kraken.Kraken_orderbook_feed.check_book_staleness ~now_ns:now;
+  Alcotest.(check bool)
+    "silent book requests a resubscribe"
+    true
+    (List.mem symbol (pending_resubscribes ()));
+  let after_first = pending_resubscribes () in
+  Kraken.Kraken_orderbook_feed.check_book_staleness ~now_ns:now;
+  Alcotest.(check int)
+    "resubscribe cooldown collapses the duplicate request"
+    (List.length after_first)
+    (List.length (pending_resubscribes ()));
+  Atomic.set Kraken.Kraken_orderbook_feed.pending_resubscribes [];
+  Hashtbl.remove Kraken.Kraken_orderbook_feed.stale_resubscribe_cooldown symbol
+;;
+
+(* The scan is driven by inbound frames, so it must be throttled: the first call arms the
+   next deadline and a second call in the same instant must not scan again. *)
+let test_staleness_scan_is_throttled () =
+  Kraken.Kraken_orderbook_feed.clear_all_stores ();
+  Atomic.set Kraken.Kraken_orderbook_feed.next_staleness_scan_ns 0L;
+  Kraken.Kraken_orderbook_feed.maybe_check_book_staleness ();
+  let armed = Atomic.get Kraken.Kraken_orderbook_feed.next_staleness_scan_ns in
+  Alcotest.(check bool)
+    "first call arms the next scan deadline"
+    true
+    (Int64.compare armed 0L > 0);
+  Kraken.Kraken_orderbook_feed.maybe_check_book_staleness ();
+  Alcotest.(check int64)
+    "second call inside the interval does not scan"
+    armed
+    (Atomic.get Kraken.Kraken_orderbook_feed.next_staleness_scan_ns);
+  Atomic.set Kraken.Kraken_orderbook_feed.next_staleness_scan_ns 0L
+;;
+
 let () =
   Alcotest.run
     "Kraken Orderbook Feed"
@@ -287,6 +371,20 @@ let () =
     ; ( "constants and helpers"
       , [ Alcotest.test_case "constants" `Quick test_constants
         ; Alcotest.test_case "json_parsing_helpers" `Quick test_json_parsing_helpers
+        ] )
+    ; ( "liveness"
+      , [ Alcotest.test_case
+            "heartbeat_frames_are_not_data"
+            `Quick
+            test_heartbeat_frames_are_not_data
+        ; Alcotest.test_case
+            "stale_symbol_requests_resubscribe"
+            `Quick
+            test_stale_symbol_requests_resubscribe
+        ; Alcotest.test_case
+            "staleness_scan_is_throttled"
+            `Quick
+            test_staleness_scan_is_throttled
         ] )
     ; ( "checksum"
       , [ Alcotest.test_case

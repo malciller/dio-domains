@@ -199,6 +199,45 @@ let test_ladder_sell_count_uses_ledger () =
   | _ -> Alcotest.fail "missing sell_orders"
 ;;
 
+let overlay ?(strategy = "long_overlay") ~exchange ~symbol ()
+  : Dio_engine.Config.overlay_instance
+  =
+  { oi_id = strategy ^ ":" ^ symbol
+  ; oi_strategy = strategy
+  ; oi_exchange = exchange
+  ; oi_symbol = symbol
+  ; oi_owner_exchange = "kraken"
+  ; oi_owner_symbol = "ETH/USD"
+  ; oi_params = `Assoc []
+  }
+;;
+
+(* The short overlay owns the row's short book on a hedge venue, while the long overlay
+   may sit on a third venue. Resolving the perp on the grid's venue reports a null perp
+   and hides an open short; feeding the short instance into the long columns shows the
+   short as a long instead. *)
+let test_short_book_resolution () =
+  let instances =
+    [ overlay ~exchange:"lighter" ~symbol:"ETH/USD" ()
+    ; overlay ~strategy:"short_overlay" ~exchange:"hyperliquid" ~symbol:"ETH" ()
+    ]
+  in
+  (match Dio_dashboard.Dashboard_state.short_overlay_perp instances with
+   | Some (exchange, coin) ->
+     Alcotest.(check string) "short book venue" "hyperliquid" exchange;
+     Alcotest.(check string) "short book coin" "ETH" coin
+   | None -> Alcotest.fail "expected the short overlay venue");
+  Alcotest.(check int)
+    "long book excludes the short instance"
+    1
+    (List.length (Dio_dashboard.Dashboard_state.long_overlay_instances instances));
+  Alcotest.(check (option (pair string string)))
+    "no short book without a short instance"
+    None
+    (Dio_dashboard.Dashboard_state.short_overlay_perp
+       (Dio_dashboard.Dashboard_state.long_overlay_instances instances))
+;;
+
 let () =
   Alcotest.run
     "dashboard_state"
@@ -213,6 +252,10 @@ let () =
             "ladder SELLS count includes the in-flight ledger"
             `Quick
             test_ladder_sell_count_uses_ledger
+        ; Alcotest.test_case
+            "short book resolves to the overlay hedge venue"
+            `Quick
+            test_short_book_resolution
         ] )
     ]
 ;;

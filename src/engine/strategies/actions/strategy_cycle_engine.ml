@@ -24,6 +24,14 @@ type ctx =
   (** Aggregate hedgeable inventory across every leg of this controller. [< 0] means "not
       an overlay controller"; [market_facts] then falls back to the local venue figure. *)
   ; mutable cg_overlay_accumulated : float
+  (** Oracle publish generation [cg_parent_*] were read at. The parent decision is a
+      lock-free hashtable read but hashing the (exchange, symbol) key allocates, so the
+      overlay refreshes at most once per oracle pass instead of once per cycle. *)
+  ; mutable cg_parent_gen : int
+  (** Parent grid cannot place its next buy (capital oracle INACTIVE). *)
+  ; mutable cg_parent_unfunded : bool
+  (** Parent's next buy size in base units, inherited verbatim by the outlier fallback. *)
+  ; mutable cg_parent_order_qty : float
   (** True when the controller has a Hyperliquid spot leg, so the recycle base buy is
       active. When false the recycle stays 100% quote. *)
   ; mutable cg_overlay_has_spot_leg : bool
@@ -95,6 +103,9 @@ let create () =
   ; cg_carry = None
   ; cg_reserve_share = 0.0
   ; cg_overlay_accumulated = -1.0
+  ; cg_parent_gen = -1
+  ; cg_parent_unfunded = false
+  ; cg_parent_order_qty = 0.0
   ; cg_overlay_has_spot_leg = false
   ; cg_overlay_spot_symbol = ""
   ; cg_last_leverage = 0.0
@@ -727,6 +738,8 @@ let market_facts c (t : Strategy_runtime.t) =
   setf Slots.overlay_reserved reserved;
   setf Slots.min_notional (Strategy_venue.get_min_notional_val symbol exchange);
   setf Slots.reserve_share c.cg_reserve_share;
+  setb Slots.parent_unfunded c.cg_parent_unfunded;
+  setf Slots.parent_order_qty c.cg_parent_order_qty;
   (match c.cg_carry with
    | Some cs ->
      let close_price, close_kind, close_realized, close_qty =

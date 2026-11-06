@@ -79,6 +79,7 @@ let perp_maintenance = platform "perp_maintenance"
     config constants. [perp_maintenance_frac] is per unit notional; [perp_max_leverage] is
     the venue maximum for this instrument. *)
 let perp_maintenance_frac = platform "perp_maintenance_frac"
+
 let perp_max_leverage = platform "perp_max_leverage"
 
 (** Quote the venue will let us deploy now: account equity minus margin already used.
@@ -93,6 +94,13 @@ let usdc_free = platform "usdc_free"
 let overlay_reserved = platform "overlay_reserved"
 let min_notional = platform "min_notional"
 let reserve_share = platform "reserve_share"
+
+(** Parent grid state for the short overlay's unfunded fallback. [parent_unfunded] is the
+    capital oracle's verdict that the parent cannot place its next buy; [parent_order_qty]
+    is that buy's base size, which the fallback holds as a short. *)
+let parent_unfunded = platform "parent_unfunded"
+
+let parent_order_qty = platform "parent_order_qty"
 
 (* Carry overlay actual-fill facts. Published from the durable carry state, never derived
    from the trigger mark. *)

@@ -525,8 +525,8 @@ let test_router_smoke () =
     (f "update" "{\"price\":45000.5,\"qty\":2.5}" "{\"price\":45002.0,\"qty\":0}" "2" "0");
   Atomic.set Kraken.Kraken_orderbook_feed.current_on_heartbeat None;
   Alcotest.(check int)
-    "heartbeat frames + book entries routed to on_heartbeat"
-    4
+    "book entries refresh the data heartbeat; heartbeat frames do not"
+    2
     !hb_count;
   match Kraken.Kraken_orderbook_feed.get_best_bid_ask sym with
   | Some (bp, bs, ap, as_) ->

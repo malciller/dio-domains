@@ -280,6 +280,11 @@ let all_subscribed_symbols : string list ref = ref []
 
 let subscribed_mutex = Mutex.create ()
 
+(** Lock-free copy of [all_subscribed_symbols] for the parse-domain staleness scan, which
+    must not take [subscribed_mutex] on the frame path. Republished only when the symbol
+    set changes (startup and dynamic subscriptions), not per frame. *)
+let subscribed_snapshot : string array Atomic.t = Atomic.make [||]
+
 let get_all_subscribed_symbols () =
   Mutex.lock subscribed_mutex;
   let syms = !all_subscribed_symbols in
@@ -294,6 +299,7 @@ let add_subscribed_symbols symbols =
   in
   all_subscribed_symbols := !all_subscribed_symbols @ new_syms;
   let total = !all_subscribed_symbols in
+  if new_syms <> [] then Atomic.set subscribed_snapshot (Array.of_list total);
   Mutex.unlock subscribed_mutex;
   total
 ;;
@@ -417,6 +423,78 @@ let ensure_store symbol =
 ;;
 
 let store_opt symbol = Ds.Cow_table.find_opt stores symbol
+
+(** Per-symbol silence budget before a targeted resubscribe. Above [max_book_age] so the
+    read path has already rejected the frame by then. *)
+let book_stale_resubscribe_s = Kraken_common_types.default_book_stale_resubscribe_s
+
+(* Staleness-triggered resubscribe cooldown, separate from the checksum one: a venue-side
+   stall persists, so retrying every few seconds would churn unsubscribe/subscribe
+   messages for hours. Parse-domain state, no lock. *)
+let stale_resubscribe_cooldown : (string, float) Hashtbl.t = Hashtbl.create 8
+
+let stale_resubscribe_cooldown_s =
+  Kraken_common_types.default_book_stale_resubscribe_cooldown_s
+;;
+
+let staleness_scan_interval_ns =
+  Int64.of_float (Kraken_common_types.default_book_staleness_scan_interval_s *. 1e9)
+;;
+
+(** Next permitted scan, monotonic ns. The scan is event-driven (every inbound frame calls
+    [maybe_check_book_staleness]) but throttled here, so the O(subscribed symbols) pass
+    runs at most once per [default_book_staleness_scan_interval_s] no matter the frame
+    rate. *)
+let next_staleness_scan_ns : int64 Atomic.t = Atomic.make 0L
+
+(** Scans subscribed symbols and requests a resubscribe for any whose last book write is
+    older than [book_stale_resubscribe_s]. Runs on the parse domain: [request_resubscribe]
+    is a CAS on [pending_resubscribes], drained by the Lwt watcher, and
+    [resubscribe_cooldown] is parse-domain state (the checksum path writes it from the
+    same domain). A symbol that has not yet received a snapshot is left alone until the
+    next full reconnect: [ensure_store] seeds [last_update_ns], so a fresh subscription
+    never trips this immediately. *)
+let check_book_staleness ~now_ns =
+  Array.iter
+    (fun symbol ->
+      match store_opt symbol with
+      | None -> ()
+      | Some store ->
+        let age_s =
+          Int64.to_float (Int64.sub now_ns (Atomic.get store.last_update_ns)) /. 1e9
+        in
+        if age_s > book_stale_resubscribe_s
+        then (
+          let now = Unix.gettimeofday () in
+          let last =
+            match Hashtbl.find_opt stale_resubscribe_cooldown symbol with
+            | Some t -> t
+            | None -> 0.0
+          in
+          if now -. last >= stale_resubscribe_cooldown_s
+          then (
+            Hashtbl.replace stale_resubscribe_cooldown symbol now;
+            Logging.warn_f
+              ~section
+              "Orderbook for %s silent for %.1fs (last frame age exceeds %.1fs) - \
+               requesting resubscribe"
+              symbol
+              age_s
+              book_stale_resubscribe_s;
+            request_resubscribe symbol)))
+    (Atomic.get subscribed_snapshot)
+;;
+
+let[@inline] maybe_check_book_staleness () =
+  let now_ns = Mtime_clock.now_ns () in
+  let due = Atomic.get next_staleness_scan_ns in
+  if Int64.compare now_ns due >= 0
+     && Atomic.compare_and_set
+          next_staleness_scan_ns
+          due
+          (Int64.add now_ns staleness_scan_interval_ns)
+  then check_book_staleness ~now_ns
+;;
 
 let notify_ready ~symbol store =
   if not (Atomic.get store.ready)
@@ -1361,8 +1439,11 @@ let handle_dispatch json on_heartbeat =
   let msg_type = member "type" json |> to_string_option in
   let method_type = member "method" json |> to_string_option in
   match channel, msg_type, method_type with
-  | Some "heartbeat", _, _ -> on_heartbeat ()
-  | _, _, Some "heartbeat" -> on_heartbeat ()
+  (* Heartbeats keep the socket alive but prove nothing about the book: [on_heartbeat] is
+     reserved for frames that actually wrote a book, so the supervisor's data timeout
+     measures data, not socket noise. *)
+  | Some "heartbeat", _, _ -> ()
+  | _, _, Some "heartbeat" -> ()
   | Some "book", Some "snapshot", _ ->
     record_book_latency json;
     ignore (process_orderbook_message ~reset:true json on_heartbeat)
@@ -1447,10 +1528,15 @@ let handle_dispatch json on_heartbeat =
 (** Parse-domain body: parse + dispatch without publishing a tick (the WS fiber owns tick
     accounting) and with the connection's current heartbeat. Shared by the legacy
     "kraken_ob" handler and the uniform venue decoder. Book frames (the hot path) are read
-    with the allocation-light scan; heartbeats are answered without a DOM; everything else
-    (subscribe/unsubscribe/status/control) falls back to the DOM [handle_dispatch]. *)
+    with the allocation-light scan; heartbeats carry no data and do not refresh the data
+    heartbeat; everything else (subscribe/unsubscribe/status/control) falls back to the
+    DOM [handle_dispatch]. *)
 let process_parse_domain_frame message =
   try
+    (* Every inbound frame is the event that drives the staleness scan; the scan itself is
+       throttled inside [maybe_check_book_staleness], so this is one atomic read and one
+       clock read per frame. *)
+    maybe_check_book_staleness ();
     let on_heartbeat =
       match Atomic.get current_on_heartbeat with
       | Some f -> f
@@ -1469,7 +1555,8 @@ let process_parse_domain_frame message =
     let msg_type = top_level_field "type" in
     let method_type = top_level_field "method" in
     match channel, msg_type, method_type with
-    | "heartbeat", _, _ | _, _, "heartbeat" -> on_heartbeat ()
+    (* Liveness is book-only: a heartbeat frame is not a data point. *)
+    | "heartbeat", _, _ | _, _, "heartbeat" -> ()
     | "book", "snapshot", _ ->
       record_book_latency_span message;
       ignore (process_orderbook_message_span ~reset:true message on_heartbeat)
@@ -1492,12 +1579,12 @@ let process_parse_domain_frame message =
 let () = Concurrency.Parse_worker.register "kraken_ob" process_parse_domain_frame
 
 (** Synchronous path: parse + dispatch inline on the calling thread. Used as the overload
-    fallback and by tests. *)
+    fallback and by tests. Book frames refresh the heartbeat from [process_book_entry];
+    frames that only keep the socket alive must not. *)
 let handle_message message on_heartbeat =
   Concurrency.Tick_event_bus.publish_tick ();
   try
     let json = Yojson.Safe.from_string message in
-    on_heartbeat ();
     handle_dispatch json on_heartbeat
   with
   | exn ->
@@ -1754,7 +1841,10 @@ and resubscribe_symbol symbol =
        Hashtbl.clear store.asks;
        RingBuffer.clear store.buffer;
        Atomic.set store.has_snapshot false;
-       Atomic.set store.last_sequence None
+       Atomic.set store.last_sequence None;
+       (* Restart the staleness clock: the new subscription owns the next deadline, so the
+          scan does not re-fire against data we just discarded. *)
+       Atomic.set store.last_update_ns (Mtime_clock.now_ns ())
      | None -> ());
     Ws_lwt.write conn (Websocket.Frame.create ~content:msg_str ())
     >>= fun () -> Lwt_unix.sleep 0.25 >>= fun () -> subscribe_symbols [ symbol ]
