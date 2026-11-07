@@ -809,6 +809,22 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
               forever (the retained stale sell / negative closest-sell distance, and the
               under-counted sellable balance that then re-buys). Partial fills arrive as
               [PartiallyFilled] and never reach this handler. *)
+           (* Kraken drops the order's hold before the wallet total, so the composed
+              figure rises by the filled base and the sell leg re-offers it. Hold it until
+              the total drops; the commitment's remaining qty is what filled. *)
+           (match Hashtbl.find_opt state.sell_commitments order_id with
+            | Some c ->
+              Strategy_lifecycle.arm_sell_fill_hold
+                ~state
+                ~ecfg:state.cached_ecfg
+                ~qty:c.sc_qty
+                ~now
+            | None ->
+              Strategy_lifecycle.arm_sell_fill_hold
+                ~state
+                ~ecfg:state.cached_ecfg
+                ~qty:acc_qty
+                ~now);
            remove_sell_commitment ~state ~id:order_id;
            let known_open_sell =
              Sell_orders.find_first state.open_sell_orders (fun oid _ _ -> oid = order_id)

@@ -143,6 +143,18 @@ let arm_sell_hold ~state ~qty ~now =
   <- Platform_accounting.arm_sell_hold ~holds:state.sell_holds_since_balance ~qty ~now
 ;;
 
+(** Kraken releases a filled sell's hold before its wallet total drops, so the composed
+    tradeable figure rises by the sold base and the sell leg re-offers it each tick under
+    capital_low. Hold that base like a placement hold until a balance drop or the grace
+    retires it. *)
+let arm_sell_fill_hold ~state ~(ecfg : Strategy_state.exchange_config) ~qty ~now =
+  if qty > 1e-12
+     && ecfg.use_unnetted_sell_hold
+     && ecfg.balance_nets_open_order_holds
+     && not ecfg.hold_netted_from_venue_state
+  then arm_sell_hold ~state ~qty ~now
+;;
+
 (** Surfaces a sell-placement blocker at warn level. The same blocker re-fires every
     strategy tick (dust persisted level below the venue notional floor, a wiped position
     snapshot, a latched flag); deduplicated per reason with a 60s repeat window, and a
@@ -794,6 +806,11 @@ let apply_open_order_delta ~state ~now_time ~ecfg ~changes =
             Hashtbl.replace state.feed_sell_index oid (price, qty);
             Sell_orders.push state.cached_feed_sell_orders oid price qty;
             state.cached_feed_total <- state.cached_feed_total +. qty;
+            (match Hashtbl.find_opt state.sell_commitments oid with
+             | Some c when c.sc_qty > qty +. 1e-12 ->
+               (* A partial fill: the venue released the hold before the total caught up. *)
+               arm_sell_fill_hold ~state ~ecfg ~qty:(c.sc_qty -. qty) ~now:now_time
+             | _ -> ());
             upsert_sell_commitment ~state ~id:oid ~price ~qty ~seen:true ~acked:true;
             (* A newly-added sell at a price below the cached closest must become the
                cached closest immediately. The post-loop [valid] check only detects the
@@ -1011,6 +1028,12 @@ let sync_open_orders
           (* A snapshot lists each order id at most once, so accumulate directly;
              [upsert_sell_commitment] flips [sc_listed] for the reconcile below. *)
           feed_total := !feed_total +. qty;
+          (* A remaining-qty shrink between snapshots is a partial fill; hold the released
+             base. *)
+          (match Hashtbl.find_opt state.sell_commitments oid with
+           | Some c when c.sc_qty > qty +. 1e-12 ->
+             arm_sell_fill_hold ~state ~ecfg ~qty:(c.sc_qty -. qty) ~now:now_time
+           | _ -> ());
           (* Refresh the in-flight ledger with the venue's live remaining qty; a sell
              adopted straight from the feed (no prior local arm) is entered here so it is
              reserved from now on. *)

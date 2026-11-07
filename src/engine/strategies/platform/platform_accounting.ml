@@ -57,22 +57,24 @@ let sweep_max_balance_age_s = 10.0
 (* Shared results for the empty case: returning a freshly-built [(holds, sum)] tuple on
    every no-op call allocated 3 words per cycle; these constants are reused instead. *)
 
-(** Portion of placed-sell base the balance feed may not yet be netting. Applies to every
-    accumulation venue (Hyperliquid, Kraken, IBKR, Lighter): all report a tradeable figure
-    with open-order holds removed, and that figure trails a placement (or the adopting
-    balance message trails the order feed), so sizing against it can dip into
+(** Portion of placed- or filled-sell base the balance feed may not yet be netting.
+    Applies to every accumulation venue (Hyperliquid, Kraken, IBKR, Lighter): all report a
+    tradeable figure with open-order holds removed, and that figure trails a placement (or
+    the adopting balance message trails the order feed), so sizing against it can dip into
     reserved_base. Gating on [track_pending_sells = false] (Hyperliquid only) left the
     others exposed: under a burst several sells ack before the balance adopts the hold and
-    each sizes against a stale-high tradeable.
+    each sizes against a stale-high tradeable. On Kraken a fill releases the hold before
+    the total drops, so the filled base is held too
+    ([Strategy_lifecycle.arm_sell_fill_hold]).
 
     A hold is outstanding only while the newest balance message for this asset still
-    predates its placement. A message generated after the placement retires it only when
-    it did not raise the tradeable figure ([last_balance_delta <= 0]): a buy fill raises
-    the figure and bumps the same per-asset freshness timestamp without netting a sell
-    hold, so trusting a positive delta re-offered committed base as free and produced an
-    oversized sell the venue rejected. Positive-delta messages keep the hold until a
-    flat/down message or the grace retires it. The caller supplies per-asset freshness: a
-    fill on another coin must not advance this asset's timestamp (see
+    predates its arm (placement or fill). A message generated after the arm retires it
+    only when it did not raise the tradeable figure ([last_balance_delta <= 0]): a buy
+    fill raises the figure and bumps the same per-asset freshness timestamp without
+    netting a sell hold, so trusting a positive delta re-offered committed base as free
+    and produced an oversized sell the venue rejected. Positive-delta messages keep the
+    hold until a flat/down message or the grace retires it. The caller supplies per-asset
+    freshness: a fill on another coin must not advance this asset's timestamp (see
     Hyperliquid_balances.BalanceStore.update_wallet). The grace bounds a dead feed;
     [consume_sell_hold_netting] additionally retires holds on an observed drop.
 

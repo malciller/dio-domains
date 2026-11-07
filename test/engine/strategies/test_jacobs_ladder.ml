@@ -4383,6 +4383,125 @@ let test_burst_tracked_venue_no_reserved_dip () =
     (qty2 <= 1e-9)
 ;;
 
+let test_kraken_sell_fill_never_reoffers_reserved_base () =
+  (* Kraken composes its tradeable figure from the wallet total (balances channel) and the
+     open-order holds (executions channel). A sell fill drops the hold at once but the
+     total on a later frame, so the composed figure rises by the sold base and the leg
+     re-sold it into reserved_base every tick under capital_low until a balance drop. *)
+  let symbol = "KR_FILL_RESERVE/XMR/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "kraken";
+  state.grid_qty <- 3.0;
+  state.maker_fee <- 0.0026;
+  state.cached_sell_mult <- 0.99;
+  state.cached_qty_increment <- 0.01;
+  state.cached_price_increment <- 0.01;
+  state.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+  state.cached_venue_min_qty <- 0.01;
+  state.cached_venue_min_notional <- 0.0;
+  (* total 10, resting sell 3 -> tradeable 7; reserved 5 -> free excess 2. *)
+  state.reserved_base <- 5.0;
+  state.accumulated_profit <- 0.0;
+  state.position_base <- 7.0;
+  state.position_initialized <- true;
+  state.position_venue_ts <- 99.0;
+  state.last_seen_asset_balance <- 7.0;
+  state.open_sell_orders <- Sell_orders.of_list [ "V1", 100.0, 3.0 ];
+  set_sell_commitments state.sell_commitments [ "V1", 100.0, 3.0, true, true, 0.0 ];
+  state.feed_locked_sell_base <- 3.0;
+  state.sell_holds_since_balance <- [];
+  state.buy_credits_since_balance <- [];
+  state.attributed_balance_increase <- 0.0;
+  state.sell_commitments_clean <- true;
+  state.just_filled_buy <- false;
+  state.last_buy_fill_price <- Some 100.0;
+  state.last_buy_fill_qty <- Some 3.0;
+  state.capital_low <- true;
+  state.asset_low <- false;
+  state.inflight_sell <- false;
+  state.persisted_sell_levels <- [];
+  state.startup_replay <- false;
+  ignore
+    (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
+       state.duplicate_key_sell);
+  let drain () =
+    let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
+    let rec go () =
+      match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+      | Some _ -> go ()
+      | None -> ()
+    in
+    go ()
+  in
+  drain ();
+  Dio_strategies.Strategy_api.handle_order_filled
+    ~now:100.0
+    symbol
+    "V1"
+    Dio_strategies.Strategy_common.Sell
+    ~fill_price:100.0
+    ~fill_qty:3.0
+    None;
+  (* Hold released, total not yet dropped: the composed figure is 10 - 0. *)
+  Dio_strategies.Strategy_api.reconcile_position
+    ~state
+    ~now:100.4
+    ~base_balance_age:(Some 0.1)
+    ~asset_balance:10.0
+    ~asset_gross:(fun () -> None);
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "kraken"
+    ; symbol
+    ; qty = "3.0"
+    ; grid_interval = 5.0
+    ; sell_mult = "0.99"
+    ; strategy = "jacobs_ladder"
+    ; maker_fee = Some 0.0026
+    ; taker_fee = None
+    ; accumulation_buffer = 0.05
+    ; base_accumulation = true
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
+  Dio_strategies.Strategy_api.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.5
+    ~asset
+    ~bid_price:99.9
+    ~ask_price:100.0
+    ~asset_balance:10.0
+    ~buy_attempted:false
+    ~oracle_halted:false
+    ~ecfg
+    ~locked_in_sells:(Dio_strategies.Strategy_api.committed_sell_base state)
+    ~base_balance_age:(Some 0.2);
+  let qty =
+    List.fold_left
+      (fun acc (o : Dio_strategies.Strategy_common.strategy_order) ->
+        match o.operation, o.side with
+        | Place, Sell when o.symbol = symbol -> acc +. o.qty
+        | _ -> acc)
+      0.0
+      (Dio_strategies.Strategy_api.get_pending_orders 100)
+  in
+  check
+    bool
+    "the sell never offers base inside reserved_base after a fill"
+    true
+    (qty <= 2.0 +. 1e-6);
+  check (float 1e-9) "reserved_base is untouched" 5.0 state.reserved_base;
+  check
+    bool
+    "the sold base stays un-netted until the wallet total catches up"
+    true
+    (state.sell_holds_since_balance <> []);
+  drain ()
+;;
+
 let test_sell_ack_releases_inflight_latch () =
   (* A sell placement's in-flight marker is released on ACK, not left latched while the
      sell rests. has_active_sell then means only "a sell placement is in flight", so a
@@ -8458,11 +8577,7 @@ let test_sell_blocked_when_venue_free_is_under_the_reserve () =
     "venue free under the reserve places nothing"
     0.0
     (placed_qty ~asset_balance:0.38151659);
-  check
-    (float 1e-9)
-    "reserved_base is untouched"
-    0.52387494
-    state.reserved_base;
+  check (float 1e-9) "reserved_base is untouched" 0.52387494 state.reserved_base;
   (* Venue free base covers the reserve plus the owed 0.15: the sell is placed. *)
   state.just_filled_buy <- true;
   state.inflight_sell <- false;
@@ -8477,7 +8592,6 @@ let test_sell_blocked_when_venue_free_is_under_the_reserve () =
     true
     (backed_qty <= 0.30764166)
 ;;
-
 
 let () =
   run
@@ -8620,6 +8734,10 @@ let () =
             "burst on a tracked accumulation venue never dips into reserved_base"
             `Quick
             test_burst_tracked_venue_no_reserved_dip
+        ; test_case
+            "a Kraken sell fill never re-offers the filled base into reserved_base"
+            `Quick
+            test_kraken_sell_fill_never_reoffers_reserved_base
         ; test_case
             "sell ack releases the in-flight latch (multi-sell ladder)"
             `Quick
