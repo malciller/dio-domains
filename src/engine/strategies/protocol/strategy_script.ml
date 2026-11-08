@@ -1384,6 +1384,27 @@ let parse_program (lines : lline array) : t =
   in
   let state = ref []
   and params = ref [] in
+  let capabilities =
+    if !i < n && lines.(!i).indent = 0 && first_word lines.(!i) = Some "capabilities"
+    then (
+      let line = lines.(!i).ln in
+      let caps =
+        List.filter_map
+          (fun t ->
+            match t.t with
+            | T_ident s -> Some (String.lowercase_ascii s)
+            | _ -> None)
+          (List.tl lines.(!i).toks)
+      in
+      List.iter
+        (fun capability ->
+          if not (is_known_capability capability)
+          then err ~line ("unknown capability: " ^ capability))
+        caps;
+      incr i;
+      caps)
+    else []
+  in
   if !i < n && lines.(!i).indent = 0 && first_word lines.(!i) = Some "remembers"
   then (
     let decls, nj =
@@ -1422,6 +1443,7 @@ let parse_program (lines : lline array) : t =
   done;
   { name
   ; version
+  ; capabilities
   ; triggers = !trigger_groups
   ; params = !params
   ; state = !state

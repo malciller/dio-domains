@@ -340,8 +340,8 @@ let test_reconstruct_retrace_rearms () =
     seed.ls_next_add
 ;;
 
-let test_long_overlay_pending () =
-  let pending = Dio_engine.Domain_spawner.long_overlay_pending in
+let test_sale_funded_pending () =
+  let pending = Dio_engine.Domain_spawner.sale_funded_pending in
   Alcotest.(check bool)
     "unfilled target keeps the interpreter running"
     true
@@ -370,9 +370,9 @@ let () =
         ] )
     ; ( "overlay"
       , [ Alcotest.test_case
-            "pending long keeps book cycles alive"
+            "pending sale-funded target keeps book cycles alive"
             `Quick
-            test_long_overlay_pending
+            test_sale_funded_pending
         ] )
     ; ( "affinity"
       , [ Alcotest.test_case "cpu priority ordering" `Quick test_order_by_cpu_priority ] )

@@ -478,23 +478,23 @@ let merge_network_latencies latencies =
   in
   List.iter
     (fun (tc : Dio_engine.Config.trading_config) ->
-       add_row (domain_latency_key tc) tc.exchange)
+      add_row (domain_latency_key tc) tc.exchange)
     domains;
   List.iter
     (fun (c : Dio_engine.Config.overlay_controller) ->
-       add_row
-         (Dio_engine.Domain_spawner.overlay_latency_key
-            ~exchange:c.oc_hedge_exchange
-            ~symbol:c.oc_hedge_coin)
-         c.oc_hedge_exchange)
+      add_row
+        (Dio_engine.Domain_spawner.overlay_latency_key
+           ~exchange:c.oc_hedge_exchange
+           ~symbol:c.oc_hedge_coin)
+        c.oc_hedge_exchange)
     controllers;
   List.iter
     (fun (o : Dio_engine.Config.overlay_instance) ->
-       add_row
-         (Dio_engine.Domain_spawner.overlay_latency_key
-            ~exchange:o.oi_exchange
-            ~symbol:o.oi_symbol)
-         o.oi_exchange)
+      add_row
+        (Dio_engine.Domain_spawner.overlay_latency_key
+           ~exchange:o.oi_exchange
+           ~symbol:o.oi_symbol)
+        o.oi_exchange)
     instances;
   let domain_venues =
     List.map (fun (tc : Dio_engine.Config.trading_config) -> tc.exchange) domains
@@ -531,21 +531,21 @@ let json_of_domain_latencies () =
   let rows_of snapshots =
     List.filter_map
       (fun (key, snaps) ->
-         let key = Option.value (Hashtbl.find_opt domain_keys key) ~default:key in
-         let lower = String.lowercase_ascii key in
-         if Hashtbl.mem taken lower
-         then None
-         else (
-           Hashtbl.replace taken lower ();
-           let entries =
-             List.filter_map
-               (fun (label, snap_opt) ->
-                  match snap_opt with
-                  | Some snap -> Some (label, json_of_latency_snapshot snap)
-                  | None -> None)
-               snaps
-           in
-           if entries = [] then None else Some (key, `Assoc entries)))
+        let key = Option.value (Hashtbl.find_opt domain_keys key) ~default:key in
+        let lower = String.lowercase_ascii key in
+        if Hashtbl.mem taken lower
+        then None
+        else (
+          Hashtbl.replace taken lower ();
+          let entries =
+            List.filter_map
+              (fun (label, snap_opt) ->
+                match snap_opt with
+                | Some snap -> Some (label, json_of_latency_snapshot snap)
+                | None -> None)
+              snaps
+          in
+          if entries = [] then None else Some (key, `Assoc entries)))
       snapshots
   in
   let rows =
@@ -837,23 +837,23 @@ let json_of_perp ~exchange ~coin =
       ]
 ;;
 
-(** The owner's long book only. [get_overlay_instances_for] returns every instance under
-    the owner, including the short_overlay; its negative perp position would otherwise be
-    rendered in the long columns (and its entry sells as long closes). *)
-let long_overlay_instances instances =
+(** The owner's sale-funded long book only. [get_overlay_instances_for] returns every
+    instance under the owner, including the flow short; its negative perp position would
+    otherwise be rendered in the long columns (and its entry sells as long closes). *)
+let sale_funded_instances instances =
   List.filter
     (fun (o : Dio_engine.Config.overlay_instance) ->
-      String.equal o.oi_strategy "long_overlay")
+      List.mem "sale_funded_long" o.oi_capabilities)
     instances
 ;;
 
-(** Venue and coin for the leg's short book. The flow short overlay runs on a hedge venue
-    (a Kraken grid is hedged on Hyperliquid), so resolving the perp on the grid's own
-    venue finds no market context and reports a null perp, which hides an open short. *)
-let short_overlay_perp instances =
+(** Venue and coin for the leg's short book. A flow short runs on a hedge venue (a Kraken
+    grid is hedged on Hyperliquid), so resolving the perp on the grid's own venue finds no
+    market context and reports a null perp, which hides an open short. *)
+let flow_short_perp instances =
   List.find_map
     (fun (o : Dio_engine.Config.overlay_instance) ->
-      if String.equal o.oi_strategy "short_overlay"
+      if List.mem "flow_short" o.oi_capabilities
       then Some (o.oi_exchange, Dio_engine.Config.base_coin_of_symbol o.oi_symbol)
       else None)
     instances
@@ -1131,12 +1131,12 @@ let build_snapshot () =
           match overlay with
           | Some c -> c.oc_hedge_exchange, c.oc_hedge_coin
           | None ->
-            (match short_overlay_perp owner_instances with
+            (match flow_short_perp owner_instances with
              | Some venue -> venue
              | None -> tc.exchange, base_asset)
         in
         let longs =
-          owner_instances |> long_overlay_instances |> List.filter_map json_of_overlay_long
+          owner_instances |> sale_funded_instances |> List.filter_map json_of_overlay_long
         in
         ( tc.symbol
         , `Assoc

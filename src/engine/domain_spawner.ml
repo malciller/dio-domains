@@ -393,6 +393,8 @@ type overlay_instance_rt =
   ; mutable oir_seen_positions_at : float
   ; mutable oir_seen_margin_at : float
   ; mutable oir_diag_at : float (* blocked-log throttle *)
+  (** Capabilities declared by the strategy file; selects engine integration. *)
+  ; oir_capabilities : string list
   (** Balance-only inventory legs the hedge sums into its accumulated basis: the owner
       entry first, then every [inventory] leg declared on the overlay. *)
   ; oir_inventory_legs : (string * string) list
@@ -404,10 +406,10 @@ type overlay_instance_rt =
   ; oir_profs : domain_profilers (* this instance's own phases *)
   }
 
-(** True while a long overlay owes exposure to the sale-funded target. A pending target
-    must keep the book cycle alive: gating it on a resting bid deadlocks the first entry
-    after every spot sale. *)
-let long_overlay_pending ~target ~open_long_base = target > open_long_base +. 1e-9
+(** True while a sale-funded overlay owes exposure to its target. A pending target must
+    keep the book cycle alive: gating it on a resting bid deadlocks the first entry after
+    every spot sale. *)
+let sale_funded_pending ~target ~open_long_base = target > open_long_base +. 1e-9
 
 (** Venue market key. Perp coin and spot pair resolve to the same asset so an order routed
     through either symbol form is treated as one market. *)
@@ -508,9 +510,9 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
           }
         in
         let inventory_legs =
-          if not (String.equal oi.oi_strategy short_overlay_strategy)
-          then []
-          else (
+          match oi.oi_inventory_legs with
+          | [] -> []
+          | declared ->
             let key exchange symbol =
               Config.normalize_exchange exchange ^ "|" ^ Config.base_coin_of_symbol symbol
             in
@@ -523,7 +525,7 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
                 else (
                   Hashtbl.add seen k ();
                   true))
-              ((oi.oi_owner_exchange, oi.oi_owner_symbol) :: oi.oi_inventory_legs))
+              ((oi.oi_owner_exchange, oi.oi_owner_symbol) :: declared)
         in
         let inventory_caches =
           Array.init (List.length inventory_legs) (fun _ ->
@@ -567,6 +569,7 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
           ; oir_seen_positions_at = -1.0
           ; oir_seen_margin_at = -1.0
           ; oir_diag_at = 0.0
+          ; oir_capabilities = oi.oi_capabilities
           ; oir_inventory_legs = inventory_legs
           ; oir_inventory_caches = inventory_caches
           ; oir_adopt_untagged =
@@ -589,13 +592,13 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
 
 (** Quote reserve a flow-sized short overlay needs on its venue.
 
-    The short_overlay strategy mirrors carry_overlay's starvation contract: publish the
+    The flow_short role mirrors the inventory hedge's starvation contract: publish the
     gross requirement for the planned short at a stress price, let the venue pool split it
     with any other reserved book, and return this instance's share. The requirement uses
     the live position entry when one exists; a pending target starts at the mark so its
     initial margin is reserved before the first fill. *)
 let overlay_instance_short_reserve_share (ov : overlay_instance_rt) ~now ~expected =
-  if not (String.equal ov.oir_config.oi_strategy short_overlay_strategy)
+  if not (List.mem "flow_short" ov.oir_capabilities)
   then 0.0
   else (
     let exchange = ov.oir_config.oi_exchange in
@@ -671,7 +674,7 @@ let overlay_instance_short_reserve_share (ov : overlay_instance_rt) ~now ~expect
       if leverage <= 0.0
       then publish_zero ()
       else (
-        (* Keep the fallback in sync with short_overlay.strategy's tunable default. *)
+        (* Keep the fallback in sync with the flow-short strategy's tunable default. *)
         let stress_rise =
           match ov.oir_config.oi_params |> Yojson.Basic.Util.member "stress_rise" with
           | `Float f -> f
@@ -1458,7 +1461,7 @@ let asset_domain_worker
           List.length
             (List.filter
                (fun (x : Config.overlay_instance) ->
-                 String.equal x.oi_strategy short_overlay_strategy
+                 List.mem "flow_short" x.oi_capabilities
                  && String.equal (Config.normalize_exchange x.oi_exchange) key)
                (Config.get_overlay_instances ()))
         in
@@ -1732,7 +1735,7 @@ let asset_domain_worker
       (* Parent funding state for the short overlay's unfunded fallback. The decision is
          published lock-free, but hashing its (exchange, symbol) key allocates, so refresh
          only when the oracle publishes (one atomic read per cycle otherwise). *)
-      if String.equal ov.oir_config.oi_strategy short_overlay_strategy
+      if List.mem "flow_short" ov.oir_capabilities
       then (
         let gen = Oracle_runtime.get_publish_generation () in
         if gen <> ctx.cg_parent_gen
@@ -1776,7 +1779,7 @@ let asset_domain_worker
         events;
       (* A long overlay that owes exposure but cannot size it is otherwise silent: no
          order is placed, no error is logged. Report the sizing inputs when it is blocked. *)
-      if String.equal ov.oir_config.oi_strategy "long_overlay"
+      if List.mem "sale_funded_long" ov.oir_capabilities
          && List.exists (fun (name, _) -> String.equal name "book_update") events
          && now -. ov.oir_diag_at >= 60.0
       then (
@@ -1809,7 +1812,7 @@ let asset_domain_worker
         (* A zero cap with a live position is healthy; a zero cap while flat means the
            sizing facts are missing. A sub-minimum remainder is dust, not a failure. *)
         let blocked =
-          long_overlay_pending ~target ~open_long_base
+          sale_funded_pending ~target ~open_long_base
           && max_add <= 0.0
           && open_long_base <= 1e-12
         in
@@ -1817,11 +1820,12 @@ let asset_domain_worker
         then
           Logging.info_f
             ~section
-            "long_overlay blocked %s|%s: target=%.8g open=%.8g pending=%.8g max=%.8g \
+            "overlay %s blocked %s|%s: target=%.8g open=%.8g pending=%.8g max=%.8g \
              denom=%.4f min_base=%.8g equity=%.2f free=%.2f maint=%.4f lev=%.2f \
              mark=%.4f bid=%.4f ask=%.4f wait=%b entry_pending=%b | perp_valid=%b \
              perp_qty=%.8g account_value=%.2f withdrawable=%.2f max_lev=%.2f \
              min_notional=%.4f"
+            ov.oir_config.oi_strategy
             ov.oir_config.oi_owner_symbol
             ov.oir_config.oi_id
             target
@@ -1873,12 +1877,12 @@ let asset_domain_worker
          | None -> 0.0)
     in
     let overlay_entry_resting (ov : overlay_instance_rt) =
-      (* short_overlay is flow-sized and tracks the mark, so it re-evaluates on every book
-         tick. long_overlay must also run while it owes exposure; gating it on a resting
-         bid deadlocks the first entry after a sale. *)
-      if String.equal ov.oir_config.oi_strategy short_overlay_strategy
+      (* A flow-short book tracks the mark and re-evaluates every tick. A sale-funded book
+         must also run while it owes exposure; gating it on a resting bid deadlocks the
+         first entry after a sale. *)
+      if List.mem "flow_short" ov.oir_capabilities
       then true
-      else if String.equal ov.oir_config.oi_strategy "long_overlay"
+      else if List.mem "sale_funded_long" ov.oir_capabilities
       then (
         let f name =
           match Dio_strategies.Strategy_runtime.get_state ov.oir_rt name with
@@ -1887,7 +1891,7 @@ let asset_domain_worker
         in
         (* Not gated on the survival cap: the cap is 0 until the venue's margin facts
            arrive, and a capped run must retry after they do. *)
-        long_overlay_pending
+        sale_funded_pending
           ~target:(f "long_base_target")
           ~open_long_base:(f "last_open_long_base"))
       else (

@@ -70,6 +70,48 @@ let test_parse_mini () =
       f.triggers
 ;;
 
+let test_capabilities_header () =
+  register ();
+  let s =
+    {|
+strategy caps
+version 1
+capabilities: flow_short, sale_funded_long
+when book.updates:
+  noop:
+    stop
+|}
+  in
+  match Strategy_script.parse_string s with
+  | Error e -> Alcotest.failf "parse error: %s" e
+  | Ok f ->
+    Alcotest.(check (list string))
+      "capabilities"
+      [ "flow_short"; "sale_funded_long" ]
+      f.capabilities
+;;
+
+let test_unknown_capability_rejected () =
+  register ();
+  let s =
+    {|
+strategy bad
+version 1
+capabilities: not_a_capability
+when book.updates:
+  noop:
+    stop
+|}
+  in
+  match Strategy_script.parse_string s with
+  | Ok _ -> Alcotest.fail "expected an unknown-capability rejection"
+  | Error e ->
+    Alcotest.(check bool)
+      "error names the capability"
+      true
+      (Str.contains e "unknown capability")
+;;
+
 let test_roundtrip_json () =
   register ();
   match Strategy_script.parse_string mini_str with
@@ -355,6 +397,11 @@ let () =
     "strategy_script"
     [ ( "parse"
       , [ Alcotest.test_case "mini script" `Quick test_parse_mini
+        ; Alcotest.test_case "capabilities header" `Quick test_capabilities_header
+        ; Alcotest.test_case
+            "unknown capability rejected"
+            `Quick
+            test_unknown_capability_rejected
         ; Alcotest.test_case "event expansion" `Quick test_event_expansion
         ; Alcotest.test_case "bare gate assignment" `Quick test_bare_gate_assignment
         ; Alcotest.test_case "if/otherwise" `Quick test_if_otherwise

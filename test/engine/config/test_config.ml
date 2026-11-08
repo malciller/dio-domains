@@ -48,7 +48,7 @@ let test_parse_overlays () =
     Yojson.Basic.from_string
       {|{"trading":[
         {"symbol":"BTC/USDC","exchange":"hyperliquid","overlay":{
-          "strategy":"carry_overlay",
+          "strategy":"hedge",
           "params":{"start_ratio_pct":30,"add_threshold_pct":8,"max_ratio_pct":80,
                     "short_tp_roe":3,"recycle_base_share_pct":60,
                     "min_entry_margin_ratio":2.5,"min_liq_mult":3.0,
@@ -58,7 +58,7 @@ let test_parse_overlays () =
   Dio_engine.Config.parse_overlays json;
   Alcotest.(check (option string))
     "overlay bound to its owning entry"
-    (Some "carry_overlay")
+    (Some "hedge")
     (Dio_engine.Config.get_overlay_strategy ~exchange:"hyperliquid" ~symbol:"BTC/USDC");
   Alcotest.(check (option string))
     "entry without overlay unbound"
@@ -83,7 +83,7 @@ let test_parse_overlay_params_defaults () =
   let json =
     Yojson.Basic.from_string
       {|{"trading":[{"symbol":"ETH/USDC","exchange":"hyperliquid",
-        "overlay":{"strategy":"carry_overlay"}}]}|}
+        "overlay":{"strategy":"hedge"}}]}|}
   in
   Dio_engine.Config.parse_overlays json;
   let p =
@@ -109,12 +109,12 @@ let test_parse_overlay_accepts_repeated_owner () =
   let json =
     Yojson.Basic.from_string
       {|{"trading":[{"symbol":"SOL/USD","exchange":"hyperliquid",
-        "overlay":{"strategy":"carry_overlay","exchange":"hyperliquid","symbol":"SOL/USD"}}]}|}
+        "overlay":{"strategy":"hedge","exchange":"hyperliquid","symbol":"SOL/USD"}}]}|}
   in
   Dio_engine.Config.parse_overlays json;
   Alcotest.(check (option string))
     "explicit owner matches"
-    (Some "carry_overlay")
+    (Some "hedge")
     (Dio_engine.Config.get_overlay_strategy ~exchange:"hyperliquid" ~symbol:"SOL/USD");
   Alcotest.(check (option string))
     "no binding under the overlay's absent symbol elsewhere"
@@ -133,11 +133,11 @@ let grouped_json =
                   "accumulation_buffer":[0.05,0.4],"testnet":true,
                   "sell_levels":true,"data_feed":"iex"}
       },
-      "overlay":{"carry_overlay":{"exchange":"hyperliquid",
+      "overlay":{"hedge":{"exchange":"hyperliquid",
                                   "params":{"min_entry_margin_ratio":1.0,
                                             "min_liq_mult":1.0,
                                             "recycle_base_share_pct":0}},
-                 "long_overlay":{"exchange":"lighter",
+                 "sale_funded":{"exchange":"lighter",
                                  "params":{"stress_drop":0.8}}},
       "oracle":{"target_survival":0.95,"min_active_dsurv":0.0,
                 "qty_cap_mult":1.5,"refresh_seconds":300}
@@ -148,22 +148,21 @@ let grouped_json =
        "strategy":{"exchange":"hyperliquid","symbol":"BTC/USDC","qty":"0.0003",
                    "grid_interval":[0.15,0.18],
                    "accumulation_buffer":[0.04,0.35],"cpu_priority":10},
-       "overlay":[
-         {"name":"carry_overlay",
+       "overlay":{"name":"hedge",
           "params":{"start_ratio_pct":25,"add_threshold_pct":5,
                     "max_ratio_pct":75,"short_tp_roe":5,
                     "recycle_base_share_pct":50},
           "inventory":[{"exchange":"kraken","symbol":"BTC/USD"}]},
-         {"name":"long_overlay","symbol":"BTC",
+       "overlays":[
+         {"name":"sale_funded","symbol":"BTC",
           "params":{"stress_drop":80}}]},
       {"asset":"ETH",
        "strategy":{"exchange":"kraken","symbol":"ETH/USD","qty":"0.0045",
                    "grid_interval":[2.5,10.0]},
-       "overlay":[
-         {"name":"carry_overlay",
+       "overlay":{"name":"hedge",
           "params":{"start_ratio_pct":40,"add_threshold_pct":5,
                     "max_ratio_pct":75,"short_tp_roe":5},
-          "inventory":[{"exchange":"hyperliquid","symbol":"ETH/USDC"}]}]},
+          "inventory":[{"exchange":"hyperliquid","symbol":"ETH/USDC"}]}},
       {"asset":"BOTZ",
        "oracle":{"target_survival":0.7,"qty_cap_mult":2.0},
        "strategy":{"exchange":"alpaca","symbol":"BOTZ","qty":"0.28",
@@ -237,7 +236,7 @@ let test_grouped_trading_flattens_and_merges () =
      Alcotest.(check bool) "hl inventory leg" true c.oc_has_hl_spot_leg);
   Alcotest.(check (option string))
     "cross-venue leg resolves its controller"
-    (Some "carry_overlay")
+    (Some "hedge")
     (Dio_engine.Config.get_overlay_strategy ~exchange:"kraken" ~symbol:"BTC/USD")
 ;;
 
@@ -522,7 +521,7 @@ let test_parse_trading_config_overlay_key () =
     Dio_engine.Config.parse_config
       (Yojson.Basic.from_string
          {|{"symbol": "BTC/USDC", "exchange": "hyperliquid", "qty": "1",
-            "strategy": "Ladder", "overlay": {"strategy": "carry_overlay"}}|})
+            "strategy": "Ladder", "overlay": {"strategy": "hedge" }}|})
   in
   Alcotest.(check string) "symbol" "BTC/USDC" config.symbol;
   Alcotest.(check string) "strategy" "Ladder" config.strategy
@@ -531,7 +530,7 @@ let test_parse_trading_config_overlay_key () =
 let cross_venue_json =
   {|{"trading":[
     {"symbol":"BTC/USD","exchange":"Kraken","overlay":{
-      "strategy":"carry_overlay","exchange":"hyperliquid",
+      "strategy":"hedge","exchange":"hyperliquid",
       "params":{"start_ratio_pct":25,"add_threshold_pct":7.5,"max_ratio_pct":75,
                 "short_tp_roe":1.5,"recycle_base_share_pct":50,
                 "min_entry_margin_ratio":2.0,"min_liq_mult":2.5}}}]}|}
@@ -565,7 +564,7 @@ let test_overlay_cross_venue () =
        (Dio_engine.Config.get_overlay_controller ~exchange:"kraken" ~symbol:"BTC/USD"));
   Alcotest.(check (option string))
     "strategy resolves through the leg"
-    (Some "carry_overlay")
+    (Some "hedge")
     (Dio_engine.Config.get_overlay_strategy ~exchange:"kraken" ~symbol:"BTC/USD");
   Alcotest.(check (float 1e-9))
     "params resolve through the hedge"
@@ -584,10 +583,10 @@ let test_overlay_merges_legs () =
     Yojson.Basic.from_string
       {|{"trading":[
         {"symbol":"BTC/USD","exchange":"kraken","overlay":{
-          "strategy":"carry_overlay","exchange":"hyperliquid",
+          "strategy":"hedge","exchange":"hyperliquid",
           "params":{"start_ratio_pct":25,"max_ratio_pct":75}}},
         {"symbol":"BTC/USDC","exchange":"hyperliquid","strategy":"jacobs_ladder",
-         "overlay":{"strategy":"carry_overlay","exchange":"hyperliquid",
+         "overlay":{"strategy":"hedge","exchange":"hyperliquid",
           "params":{"start_ratio_pct":25,"max_ratio_pct":75}}}]}|}
   in
   Dio_engine.Config.parse_overlays json;
@@ -660,10 +659,10 @@ let test_inventory_only_hedge_venue_leg () =
     Yojson.Basic.from_string
       {|{"trading":[
         {"symbol":"ETH/USD","exchange":"kraken","strategy":"jacobs_ladder","overlay":{
-          "strategy":"carry_overlay","exchange":"hyperliquid",
+          "strategy":"hedge","exchange":"hyperliquid",
           "params":{"start_ratio_pct":40,"max_ratio_pct":75}}},
         {"symbol":"ETH/USDC","exchange":"hyperliquid","overlay":{
-          "strategy":"carry_overlay","exchange":"hyperliquid",
+          "strategy":"hedge","exchange":"hyperliquid",
           "params":{"start_ratio_pct":40,"max_ratio_pct":75}}}]}|}
   in
   Dio_engine.Config.parse_overlays json;
@@ -714,11 +713,11 @@ let test_read_config_keeps_last_good () =
     Alcotest.(check int) "complete file replaces the fallback" 4242 recovered.cycle_mod)
 ;;
 
-let test_short_overlay_instance () =
+let test_flow_short_instance () =
   let entry =
     {|{"symbol":"HYPE/USDC","exchange":"hyperliquid","qty":"0.15",
        "strategy":"jacobs_ladder",
-       "overlay":[{"name":"short_overlay","exchange":"hyperliquid",
+       "overlay":[{"name":"flow_short","exchange":"hyperliquid",
                     "params":{"short_pct":25,"stress_rise":80}}]}|}
   in
   ignore (Dio_engine.Config.parse_config (Yojson.Basic.from_string entry));
@@ -730,7 +729,7 @@ let test_short_overlay_instance () =
        ~symbol:"HYPE/USDC"
    with
    | [ oi ] ->
-     Alcotest.(check string) "strategy" "short_overlay" oi.Dio_engine.Config.oi_strategy;
+     Alcotest.(check string) "strategy" "flow_short" oi.Dio_engine.Config.oi_strategy;
      Alcotest.(check string)
        "overlay venue"
        "hyperliquid"
@@ -747,9 +746,9 @@ let test_short_overlay_instance () =
         |> member "short_pct"
         |> Dio_engine.Config.to_float_opt
         |> Option.value ~default:0.0)
-   | _ -> Alcotest.fail "expected one short_overlay instance for hyperliquid/HYPE/USDC");
+   | _ -> Alcotest.fail "expected one flow-short instance for hyperliquid/HYPE/USDC");
   Alcotest.(check bool)
-    "short_overlay is not the inventory controller"
+    "flow-short is not the inventory controller"
     true
     (match
        Dio_engine.Config.get_overlay_controller
@@ -760,14 +759,14 @@ let test_short_overlay_instance () =
      | Some _ -> false)
 ;;
 
-let test_short_overlay_inventory_legs () =
+let test_flow_short_inventory_legs () =
   let json =
     Yojson.Basic.from_string
       {|{"trading":{"assets":[
         {"asset":"BTC",
          "strategy":{"exchange":"hyperliquid","symbol":"BTC/USDC","qty":"0.001",
                      "name":"jacobs_ladder"},
-         "overlay":[{"name":"short_overlay","exchange":"hyperliquid",
+         "overlay":[{"name":"flow_short","exchange":"hyperliquid",
                      "params":{"short_pct":25},
                      "inventory":[{"exchange":"kraken","symbol":"BTC/USD"}]}]}
       ]}}|}
@@ -807,7 +806,7 @@ let test_short_overlay_inventory_legs () =
        "declared inventory legs"
        [ "kraken", "BTC/USD" ]
        oi.Dio_engine.Config.oi_inventory_legs
-   | _ -> Alcotest.fail "expected one short_overlay instance for the owner");
+   | _ -> Alcotest.fail "expected one flow-short instance for the owner");
   Alcotest.(check int)
     "the inventory leg spawns no second instance"
     0
@@ -819,7 +818,7 @@ let test_parse_overlay_instances () =
   let entry =
     {|{"symbol":"BTC/USDC","exchange":"hyperliquid","qty":"0.001",
        "strategy":"jacobs_ladder",
-       "overlays":[{"name":"long_overlay","exchange":"lighter",
+       "overlays":[{"name":"sale_funded","exchange":"lighter",
                     "params":{"long_pct":0.25,"stress_drop":0.8}}]}|}
   in
   ignore (Dio_engine.Config.parse_config (Yojson.Basic.from_string entry));
@@ -833,9 +832,9 @@ let test_parse_overlay_instances () =
    | [ oi ] ->
      Alcotest.(check string)
        "id defaults to the strategy name"
-       "long_overlay"
+       "sale_funded"
        oi.Dio_engine.Config.oi_id;
-     Alcotest.(check string) "strategy" "long_overlay" oi.Dio_engine.Config.oi_strategy;
+     Alcotest.(check string) "strategy" "sale_funded" oi.Dio_engine.Config.oi_strategy;
      Alcotest.(check string) "overlay venue" "lighter" oi.Dio_engine.Config.oi_exchange;
      Alcotest.(check string)
        "symbol defaults to the owner's base coin"
@@ -868,10 +867,10 @@ let test_parse_overlay_instances_grouped () =
         "assets":[{"asset":"BTC",
           "strategy":{"exchange":"hyperliquid","symbol":"BTC/USDC","qty":"0.001",
                       "grid_interval":[0.1,0.2]},
-          "overlay":[
-            {"name":"carry_overlay","exchange":"hyperliquid",
+          "overlay":{"name":"hedge","exchange":"hyperliquid",
              "params":{"start_ratio_pct":25}},
-            {"name":"long_overlay","exchange":"lighter",
+          "overlays":[
+            {"name":"sale_funded","exchange":"lighter",
              "params":{"stress_drop":0.8}}]}]}}|}
   in
   Dio_engine.Config.parse_overlays json;
@@ -911,7 +910,7 @@ let test_parse_overlay_flat_params () =
   let json =
     Yojson.Basic.from_string
       {|{"trading":[{"symbol":"BTC/USD","exchange":"kraken",
-         "overlay":{"name":"carry_overlay","exchange":"hyperliquid",
+         "overlay":{"name":"hedge","exchange":"hyperliquid",
                     "start_ratio_pct":25}}]}|}
   in
   Dio_engine.Config.parse_overlays json;
@@ -977,13 +976,13 @@ let () =
             test_domain_assets_spawns_overlay_only
         ; Alcotest.test_case "inventory formula" `Quick test_inventory_formula
         ; Alcotest.test_case
-            "short_overlay is a generic instance"
+            "flow-short is a generic instance"
             `Quick
-            test_short_overlay_instance
+            test_flow_short_instance
         ; Alcotest.test_case
-            "short_overlay inventory legs"
+            "flow-short inventory legs"
             `Quick
-            test_short_overlay_inventory_legs
+            test_flow_short_inventory_legs
         ; Alcotest.test_case "instances parse flat" `Quick test_parse_overlay_instances
         ; Alcotest.test_case
             "instances parse grouped"

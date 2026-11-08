@@ -169,7 +169,9 @@ let label_matches (id : string) (norm : string) : bool =
 (** Locate the source line whose step label corresponds to [id]. Returns the 0-based line
     and the label width, if found. *)
 let find_step_line (id : string) (text : string) : (int * int) option =
-  let header_words = [ "strategy"; "version"; "remembers"; "tunable"; "when" ] in
+  let header_words =
+    [ "strategy"; "version"; "capabilities"; "remembers"; "tunable"; "when" ]
+  in
   let candidate (line : string) : int option =
     let line = String.trim (strip_comment line) in
     let n = String.length line in

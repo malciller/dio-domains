@@ -297,7 +297,7 @@ let string_of_strategy_id = function
   | Ladder -> "jacobs_ladder"
   | MM -> "market_maker"
   | Hedger -> "Hedger"
-  | Carry -> "carry_overlay"
+  | Carry -> "inventory_hedge"
 ;;
 
 (** Unified order record emitted by all strategies. *)

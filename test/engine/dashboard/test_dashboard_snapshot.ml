@@ -171,7 +171,7 @@ let test_perp_orders_parsing () =
       [ ( "BTC/USDC"
         , `Assoc
             [ "exchange", `String "hyperliquid"
-            ; "strategy", `Assoc [ "type", `String "carry_overlay" ]
+            ; "strategy", `Assoc [ "type", `String "hedge" ]
             ; "market", `Assoc [ "bid", `Float 100.0; "ask", `Float 101.0 ]
             ; "perp", perp
             ] )
@@ -226,7 +226,7 @@ let test_asset_chart_renders_perp_orders () =
       [ ( "BTC/USDC"
         , `Assoc
             [ "exchange", `String "hyperliquid"
-            ; "strategy", `Assoc [ "type", `String "carry_overlay" ]
+            ; "strategy", `Assoc [ "type", `String "hedge" ]
             ; ( "market"
               , `Assoc
                   [ "bid", `Float 100.0

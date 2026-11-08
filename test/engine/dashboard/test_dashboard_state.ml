@@ -199,7 +199,7 @@ let test_ladder_sell_count_uses_ledger () =
   | _ -> Alcotest.fail "missing sell_orders"
 ;;
 
-let overlay ?(strategy = "long_overlay") ~exchange ~symbol ()
+let overlay ?(strategy = "sale_funded") ?(capabilities = []) ~exchange ~symbol ()
   : Dio_engine.Config.overlay_instance
   =
   { oi_id = strategy ^ ":" ^ symbol
@@ -209,21 +209,31 @@ let overlay ?(strategy = "long_overlay") ~exchange ~symbol ()
   ; oi_owner_exchange = "kraken"
   ; oi_owner_symbol = "ETH/USD"
   ; oi_params = `Assoc []
+  ; oi_capabilities = capabilities
   ; oi_inventory_legs = []
   }
 ;;
 
-(* The short overlay owns the row's short book on a hedge venue, while the long overlay
+(* The flow short owns the row's short book on a hedge venue, while the sale-funded long
    may sit on a third venue. Resolving the perp on the grid's venue reports a null perp
    and hides an open short; feeding the short instance into the long columns shows the
    short as a long instead. *)
 let test_short_book_resolution () =
   let instances =
-    [ overlay ~exchange:"lighter" ~symbol:"ETH/USD" ()
-    ; overlay ~strategy:"short_overlay" ~exchange:"hyperliquid" ~symbol:"ETH" ()
+    [ overlay
+        ~capabilities:[ "sale_funded_long" ]
+        ~exchange:"lighter"
+        ~symbol:"ETH/USD"
+        ()
+    ; overlay
+        ~strategy:"flow_short"
+        ~capabilities:[ "flow_short" ]
+        ~exchange:"hyperliquid"
+        ~symbol:"ETH"
+        ()
     ]
   in
-  (match Dio_dashboard.Dashboard_state.short_overlay_perp instances with
+  (match Dio_dashboard.Dashboard_state.flow_short_perp instances with
    | Some (exchange, coin) ->
      Alcotest.(check string) "short book venue" "hyperliquid" exchange;
      Alcotest.(check string) "short book coin" "ETH" coin
@@ -231,12 +241,12 @@ let test_short_book_resolution () =
   Alcotest.(check int)
     "long book excludes the short instance"
     1
-    (List.length (Dio_dashboard.Dashboard_state.long_overlay_instances instances));
+    (List.length (Dio_dashboard.Dashboard_state.sale_funded_instances instances));
   Alcotest.(check (option (pair string string)))
     "no short book without a short instance"
     None
-    (Dio_dashboard.Dashboard_state.short_overlay_perp
-       (Dio_dashboard.Dashboard_state.long_overlay_instances instances))
+    (Dio_dashboard.Dashboard_state.flow_short_perp
+       (Dio_dashboard.Dashboard_state.sale_funded_instances instances))
 ;;
 
 let () =

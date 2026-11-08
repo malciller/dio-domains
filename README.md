@@ -70,7 +70,7 @@ balance-only inventory legs:
     "strategy": {
       "hyperliquid": { "name": "jacobs_ladder", "sell_mult": "0.98" }
     },
-    "overlay": { "name": "overlay", "exchange": "hyperliquid" },
+    "overlay": { "flow_short": { "exchange": "hyperliquid" } },
     "oracle": { "target_survival": 0.95, "qty_cap_mult": 1.5 }
   },
   "assets": [
@@ -82,21 +82,26 @@ balance-only inventory legs:
         "symbol": "BTC/USDC",
         "qty": "0.0003"
       },
-      "overlay": {
-        "leverage": 20,
-        "inventory": [{ "exchange": "kraken", "symbol": "BTC/USD" }]
-      }
+      "overlay": [
+        {
+          "name": "flow_short",
+          "inventory": [{ "exchange": "kraken", "symbol": "BTC/USD" }]
+        }
+      ]
     }
   ]
 }
 ```
 
 - `defaults.strategy.<exchange>` merges into each asset's `strategy` section for
-  that venue; `defaults.overlay` merges into every `overlay`. Objects merge key
-  by key; a list or scalar replaces the default. `defaults.oracle` sets the
-  global oracle knobs.
+  that venue; `defaults.overlay.<name>` merges into the matching overlay.
+  Objects merge key by key; a list or scalar replaces the default.
+  `defaults.oracle` sets the global oracle knobs.
 - In the grouped layout the strategy file name is `strategy.name`. The legacy
   flat `trading` array is still accepted; there the file name is `strategy`.
+- `overlay` takes a list of instances. Engine behaviour comes from the strategy
+  file's `capabilities:` header, so the configured name is only a key for
+  params, state, and persistence.
 - An asset needs a `strategy`, an `overlay`, or both. An `oracle` override
   requires a `strategy`, because overrides are keyed by its symbol.
 - `overlay.inventory` adds balance-only legs to the same hedge.

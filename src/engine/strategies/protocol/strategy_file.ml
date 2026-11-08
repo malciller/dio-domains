@@ -75,11 +75,18 @@ type step =
 type t =
   { name : string
   ; version : int
+  ; capabilities : string list
   ; triggers : string list
   ; params : param list
   ; state : state_decl list
   ; steps : step list
   }
+
+(** Engine integration capabilities a strategy file may declare. A typo would otherwise
+    silently disable its hooks, so both parsers reject unknown names. *)
+let known_capabilities = [ "inventory_hedge"; "flow_short"; "sale_funded_long" ]
+
+let is_known_capability name = List.mem name known_capabilities
 
 let get (o : Yojson.Basic.t) k =
   match o with
@@ -265,6 +272,16 @@ let parse (j : Yojson.Basic.t) : t =
     | Some v -> List.map as_string (as_list v)
     | None -> []
   in
+  let capabilities =
+    match get j "capabilities" with
+    | Some v -> List.map (fun s -> String.lowercase_ascii (as_string s)) (as_list v)
+    | None -> []
+  in
+  List.iter
+    (fun capability ->
+      if not (is_known_capability capability)
+      then raise (Parse_error ("unknown capability: " ^ capability)))
+    capabilities;
   let params =
     match get j "params" with
     | Some v -> parse_map parse_param v
@@ -280,7 +297,7 @@ let parse (j : Yojson.Basic.t) : t =
     | Some v -> List.map parse_step (as_list v)
     | None -> []
   in
-  { name; version; triggers; params; state; steps }
+  { name; version; capabilities; triggers; params; state; steps }
 ;;
 
 let parse_string (s : string) : (t, string) result =
@@ -408,6 +425,7 @@ let to_json (t : t) : Yojson.Basic.t =
   `Assoc
     [ "name", `String t.name
     ; "version", `Int t.version
+    ; "capabilities", `List (List.map (fun x -> `String x) t.capabilities)
     ; "triggers", `List (List.map (fun x -> `String x) t.triggers)
     ; "params", `Assoc (List.map (fun p -> p.p_name, param_to_json p) t.params)
     ; ( "state"
