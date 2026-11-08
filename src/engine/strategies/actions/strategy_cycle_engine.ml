@@ -24,6 +24,10 @@ type ctx =
   (** Aggregate hedgeable inventory across every leg of this controller. [< 0] means "not
       an overlay controller"; [market_facts] then falls back to the local venue figure. *)
   ; mutable cg_overlay_accumulated : float
+  (** Accumulated inventory for a generic overlay instance: its owner leg plus any
+      declared [inventory] legs, measured with the same [Overlay_inventory] rule a carry
+      controller uses. [-1] means unset. *)
+  ; mutable cg_inventory_override : float
   (** Oracle publish generation [cg_parent_*] were read at. The parent decision is a
       lock-free hashtable read but hashing the (exchange, symbol) key allocates, so the
       overlay refreshes at most once per oracle pass instead of once per cycle. *)
@@ -103,6 +107,7 @@ let create () =
   ; cg_carry = None
   ; cg_reserve_share = 0.0
   ; cg_overlay_accumulated = -1.0
+  ; cg_inventory_override = -1.0
   ; cg_parent_gen = -1
   ; cg_parent_unfunded = false
   ; cg_parent_order_qty = 0.0
@@ -806,11 +811,15 @@ let market_facts c (t : Strategy_runtime.t) =
     let hedge_base =
       if live_base > 0.0 && live_base < ledger_base then live_base else ledger_base
     in
-    (* A carry controller supplies the aggregate across all inventory legs. Without a
-       controller (plain grid domain) keep the local-venue figure. *)
+    (* A carry controller supplies its aggregate; a generic overlay instance supplies the
+       same rule over its owner and inventory legs. A plain grid keeps the local figure. *)
     setf
       Slots.accumulated_balance
-      (if c.cg_overlay_accumulated >= 0.0 then c.cg_overlay_accumulated else hedge_base);
+      (if c.cg_overlay_accumulated >= 0.0
+       then c.cg_overlay_accumulated
+       else if c.cg_inventory_override >= 0.0
+       then c.cg_inventory_override
+       else hedge_base);
     setf Slots.spot_base_total spot_total;
     setf
       Slots.usdc_free

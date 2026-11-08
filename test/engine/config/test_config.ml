@@ -760,6 +760,61 @@ let test_short_overlay_instance () =
      | Some _ -> false)
 ;;
 
+let test_short_overlay_inventory_legs () =
+  let json =
+    Yojson.Basic.from_string
+      {|{"trading":{"assets":[
+        {"asset":"BTC",
+         "strategy":{"exchange":"hyperliquid","symbol":"BTC/USDC","qty":"0.001",
+                     "name":"jacobs_ladder"},
+         "overlay":[{"name":"short_overlay","exchange":"hyperliquid",
+                     "params":{"short_pct":25},
+                     "inventory":[{"exchange":"kraken","symbol":"BTC/USD"}]}]}
+      ]}}|}
+  in
+  let entries =
+    match Dio_engine.Config.trading_entries_json json with
+    | `List es -> List.map Dio_engine.Config.parse_config es
+    | _ -> Alcotest.fail "expected a flattened trading list"
+  in
+  Alcotest.(check int) "owner plus inventory leg" 2 (List.length entries);
+  let inv =
+    List.find
+      (fun (t : Dio_engine.Config.trading_config) -> String.equal t.symbol "BTC/USD")
+      entries
+  in
+  Alcotest.(check string) "inventory leg has no strategy" "" inv.strategy;
+  Dio_engine.Config.parse_overlays json;
+  Alcotest.(check bool)
+    "the short inventory leg is balance-only"
+    true
+    (Dio_engine.Config.is_inventory_only ~exchange:"kraken" ~symbol:"BTC/USD");
+  Alcotest.(check bool)
+    "no carry controller is synthesized"
+    true
+    (Option.is_none
+       (Dio_engine.Config.get_overlay_controller
+          ~exchange:"hyperliquid"
+          ~symbol:"BTC/USDC"));
+  Dio_engine.Config.parse_overlay_instances json;
+  (match
+     Dio_engine.Config.get_overlay_instances_for
+       ~exchange:"hyperliquid"
+       ~symbol:"BTC/USDC"
+   with
+   | [ oi ] ->
+     Alcotest.(check (list (pair string string)))
+       "declared inventory legs"
+       [ "kraken", "BTC/USD" ]
+       oi.Dio_engine.Config.oi_inventory_legs
+   | _ -> Alcotest.fail "expected one short_overlay instance for the owner");
+  Alcotest.(check int)
+    "the inventory leg spawns no second instance"
+    0
+    (List.length
+       (Dio_engine.Config.get_overlay_instances_for ~exchange:"kraken" ~symbol:"BTC/USD"))
+;;
+
 let test_parse_overlay_instances () =
   let entry =
     {|{"symbol":"BTC/USDC","exchange":"hyperliquid","qty":"0.001",
@@ -819,6 +874,7 @@ let test_parse_overlay_instances_grouped () =
             {"name":"long_overlay","exchange":"lighter",
              "params":{"stress_drop":0.8}}]}]}}|}
   in
+  Dio_engine.Config.parse_overlays json;
   Dio_engine.Config.parse_overlay_instances json;
   (match
      Dio_engine.Config.get_overlay_instances_for
@@ -924,6 +980,10 @@ let () =
             "short_overlay is a generic instance"
             `Quick
             test_short_overlay_instance
+        ; Alcotest.test_case
+            "short_overlay inventory legs"
+            `Quick
+            test_short_overlay_inventory_legs
         ; Alcotest.test_case "instances parse flat" `Quick test_parse_overlay_instances
         ; Alcotest.test_case
             "instances parse grouped"

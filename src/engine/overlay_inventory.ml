@@ -175,11 +175,13 @@ let q_of_balances ~full_balance_ref ~free ~total ~open_sell_base =
     free +. staked)
 ;;
 
-let leg_q ?cache ?(full_balance_ref = false) (leg : Config.overlay_leg) =
-  match get_module leg.ol_exchange with
+(** [leg_q] from primitives, so a generic overlay can price a leg without materializing a
+    [Config.overlay_leg]. *)
+let leg_q_of ?cache ?(full_balance_ref = false) ~exchange ~symbol () =
+  match get_module exchange with
   | None -> 0.0
   | Some (module Ex : Exchange.S) ->
-    let base = base_coin_of_symbol leg.ol_symbol in
+    let base = base_coin_of_symbol symbol in
     let total =
       try sanitize (Ex.get_total_balance ~asset:base) with
       | _ -> 0.0
@@ -193,10 +195,14 @@ let leg_q ?cache ?(full_balance_ref = false) (leg : Config.overlay_leg) =
       in
       let open_sell =
         match cache with
-        | Some c -> open_sell_base_cached (module Ex) ~symbol:leg.ol_symbol ~cache:c
-        | None -> open_sell_base (module Ex) ~symbol:leg.ol_symbol
+        | Some c -> open_sell_base_cached (module Ex) ~symbol ~cache:c
+        | None -> open_sell_base (module Ex) ~symbol
       in
       q_of_balances ~full_balance_ref ~free ~total ~open_sell_base:open_sell)
+;;
+
+let leg_q ?cache ?full_balance_ref (leg : Config.overlay_leg) =
+  leg_q_of ?cache ?full_balance_ref ~exchange:leg.ol_exchange ~symbol:leg.ol_symbol ()
 ;;
 
 (** Per-leg caches aligned with [controller.oc_legs]. *)

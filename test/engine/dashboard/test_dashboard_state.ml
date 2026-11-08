@@ -209,6 +209,7 @@ let overlay ?(strategy = "long_overlay") ~exchange ~symbol ()
   ; oi_owner_exchange = "kraken"
   ; oi_owner_symbol = "ETH/USD"
   ; oi_params = `Assoc []
+  ; oi_inventory_legs = []
   }
 ;;
 

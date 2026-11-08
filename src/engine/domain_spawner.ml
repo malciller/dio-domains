@@ -393,6 +393,11 @@ type overlay_instance_rt =
   ; mutable oir_seen_positions_at : float
   ; mutable oir_seen_margin_at : float
   ; mutable oir_diag_at : float (* blocked-log throttle *)
+  (** Balance-only inventory legs the hedge sums into its accumulated basis: the owner
+      entry first, then every [inventory] leg declared on the overlay. *)
+  ; oir_inventory_legs : (string * string) list
+  (** Resting-sell caches aligned with [oir_inventory_legs]. *)
+  ; oir_inventory_caches : Overlay_inventory.open_sell_cache array
   ; oir_adopt_untagged : bool
   (** This instance owns its venue market exclusively and the venue drops the userref, so
       a resting order of the matching side and reduce-only flag is this book's own. *)
@@ -502,6 +507,28 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
           ; sell_levels_persistence = owner.sell_levels
           }
         in
+        let inventory_legs =
+          if not (String.equal oi.oi_strategy short_overlay_strategy)
+          then []
+          else (
+            let key exchange symbol =
+              Config.normalize_exchange exchange ^ "|" ^ Config.base_coin_of_symbol symbol
+            in
+            let seen = Hashtbl.create 8 in
+            List.filter
+              (fun (exchange, symbol) ->
+                let k = key exchange symbol in
+                if Hashtbl.mem seen k
+                then false
+                else (
+                  Hashtbl.add seen k ();
+                  true))
+              ((oi.oi_owner_exchange, oi.oi_owner_symbol) :: oi.oi_inventory_legs))
+        in
+        let inventory_caches =
+          Array.init (List.length inventory_legs) (fun _ ->
+            Overlay_inventory.create_open_sell_cache ())
+        in
         let ctx = Dio_strategies.Strategy_cycle_engine.create () in
         ctx.cg_symbol <- oi.oi_symbol;
         let state =
@@ -540,6 +567,8 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
           ; oir_seen_positions_at = -1.0
           ; oir_seen_margin_at = -1.0
           ; oir_diag_at = 0.0
+          ; oir_inventory_legs = inventory_legs
+          ; oir_inventory_caches = inventory_caches
           ; oir_adopt_untagged =
               Dio_strategies.Strategy_venue.drops_userref ~exchange:oi.oi_exchange
               && overlay_market_exclusive
@@ -1668,6 +1697,22 @@ let asset_domain_worker
       ctx.cg_bid <- price;
       ctx.cg_ask <- price;
       ctx.cg_overlay_accumulated <- -1.0;
+      (* A generic overlay instance has no controller, so [market_facts] would otherwise
+         publish the grid's [reserved_base + staked] ledger as [accumulated_balance]. Sum
+         the owner and declared inventory legs with the rule carry uses, on their own
+         venues, so the short cap sees the spot that actually backs the short. *)
+      ctx.cg_inventory_override
+      <- (if List.is_empty ov.oir_inventory_legs
+          then -1.0
+          else (
+            let i = ref 0 in
+            List.fold_left
+              (fun acc (exchange, symbol) ->
+                let cache = Array.unsafe_get ov.oir_inventory_caches !i in
+                incr i;
+                acc +. Overlay_inventory.leg_q_of ~cache ~exchange ~symbol ())
+              0.0
+              ov.oir_inventory_legs));
       ctx.cg_overlay_has_spot_leg <- false;
       ctx.cg_overlay_spot_symbol <- "";
       (* Credits land on the owner grid's accumulation row, as they do for a co-located
