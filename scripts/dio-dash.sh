@@ -14,11 +14,11 @@ set -euo pipefail
 # clients). Detach with ctrl-p ctrl-q and re-attach from any SSH session.
 #
 # Usage:
-#   ./dio-dash.sh                 # attach (starts the detached container if needed)
-#   ./dio-dash.sh stop            # remove the container
-#   ./dio-dash.sh restart         # recreate the container, then attach
-#   ./dio-dash.sh status          # container state
-#   ./dio-dash.sh --theme <id>    # pass flags through to dio-dashboard
+#   ./scripts/dio-dash.sh                 # attach (starts the detached container if needed)
+#   ./scripts/dio-dash.sh stop            # remove the container
+#   ./scripts/dio-dash.sh restart         # recreate the container, then attach
+#   ./scripts/dio-dash.sh status          # container state
+#   ./scripts/dio-dash.sh --theme <id>    # pass flags through to dio-dashboard
 ################################################################################
 
 IMAGE="dio"

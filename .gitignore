@@ -1,6 +1,6 @@
 .ruff_cache/
 reference/*
-
+.prod_snapshot.json
 *.annot
 *.cmo
 *.cma
@@ -12,9 +12,7 @@ reference/*
 *.cmxa
 *.log
 *.sh
-!dio-dash.sh
-!docker-entrypoint.sh
-!docker-sidecar.sh
+!scripts/*.sh
 !test/engine/perf/sweep_gc_params.sh
 *.csv
 *.txt

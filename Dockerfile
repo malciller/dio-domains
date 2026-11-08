@@ -136,12 +136,12 @@ COPY --from=lighter_signer /app/signer-out/ /opt/lighter-signer/
 
 # 5b. Entrypoint guard. Refuses to start the engine when no config is mounted,
 #     instead of failing later inside the config parser.
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 # Persistence sidecar launcher. Starts [dio-persist] as a child of the engine container
 # (same /app/data mount, same /tmp socket) and then execs the engine.
-COPY docker-sidecar.sh /usr/local/bin/dio-sidecar
+COPY scripts/docker-sidecar.sh /usr/local/bin/dio-sidecar
 RUN chmod 0755 /usr/local/bin/dio-sidecar
 
 # 5b'. Strategy files. The engine resolves each config entry's `strategy` to
