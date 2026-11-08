@@ -60,6 +60,6 @@ let diff_to_string start_stats end_stats =
       major_words
       minor
   else if minor > 0
-  then Printf.sprintf " (GC: minor=%d)" minor
+  then Printf.sprintf " (GC: minor=%d prom=%dw)" minor promoted
   else ""
 ;;

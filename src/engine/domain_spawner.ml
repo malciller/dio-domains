@@ -26,8 +26,8 @@ let trading_cpu_alloc = Thread_affinity.make_allocator ()
 
 (** Sampling mask for the per-cycle [Gc.quick_stat] capture, which allocates ~24 words and
     costs ~0.3us. Sampling every cycle was pure per-cycle overhead on the hot path; sample
-    1-in-64 instead so the GC cause is still attributed when it matters. *)
-let gc_sample_mask = 0x3F
+    1-in-4 so a PREP tail spike is still attributed to a minor/major collection. *)
+let gc_sample_mask = 0x3
 
 (** Quote-balance age, in seconds, above which a snapshot is not authoritative. Stale
     snapshot: an under-funded buy is still attempted (the exchange's verdict rules). Fresh
@@ -2427,6 +2427,23 @@ let asset_domain_worker
       | Some ("1" | "true" | "on" | "yes") -> true
       | _ -> false
     in
+    (* Minor-GC safepoint. The collector fires when the domain's minor heap fills, which
+       can land inside PREP or STRATEGY. Draining it once a quarter of the heap is used,
+       at the loop bottom, keeps three quarters of a heap of headroom for the next busy
+       cycle
+       - far more than one cycle allocates - so the next collection also happens at a safe
+         point instead of mid-cycle, and each collection promotes a smaller survivor set.
+         Production measurement (2026-11-07): quarter-heap beat half-heap and full-heap on
+         p50/p90/max with unchanged CPU (~4%). Overridable for A/B testing; 0 disables. *)
+    let gc_safepoint_words =
+      let quarter = max 1 (Gc.get ()).minor_heap_size / 4 in
+      match Sys.getenv_opt "DIO_GC_SAFEPOINT_WORDS" with
+      | Some s ->
+        (try int_of_string (String.trim s) with
+         | _ -> quarter)
+      | None -> quarter
+    in
+    let minor_words_at_gc = ref (Monotonic_clock.minor_words ()) in
     while Atomic.get state.is_running do
       let latency_this_cycle = !latency_active in
       if !cycle_count = 0 then Logging.debug_f ~section "First cycle for %s" key;
@@ -2448,7 +2465,15 @@ let asset_domain_worker
          reused by the drain so gate and iteration see the same producer position. *)
       let current_pos = get_exec_pos_fn () in
       let did_exec = current_pos <> !exec_read_pos in
-      if did_exec && latency_this_cycle then Gc.minor ();
+      (* Only drain here if the bottom-of-cycle safepoint could not (e.g. the heap filled
+         during a long busy run). Normally it is a no-op: the safepoint keeps at least
+         half a heap of headroom, far more than one cycle allocates. *)
+      if did_exec
+         && latency_this_cycle
+         && Monotonic_clock.minor_words () - !minor_words_at_gc >= gc_safepoint_words
+      then (
+        Gc.minor ();
+        minor_words_at_gc := Monotonic_clock.minor_words ());
       (* Per-cycle GC counters, captured at cycle start and at the cause site to attribute
          spikes to minor/major collections. The start capture is sampled per
          [gc_sample_mask]; taken before the stage markers so it is not charged to the ob
@@ -4539,6 +4564,15 @@ let asset_domain_worker
                       (us total_ns) )
                 ])
             else base));
+      (* Drain a quarter-full minor heap here, between cycles, so the collector does not
+         fire inside the next cycle's PREP or STRATEGY span. *)
+      if gc_safepoint_words > 0
+      then (
+        let mw = Monotonic_clock.minor_words () in
+        if mw - !minor_words_at_gc >= gc_safepoint_words
+        then (
+          Gc.minor ();
+          minor_words_at_gc := Monotonic_clock.minor_words ()));
       (* Blocks until a producer signals new data or data is ready. Uses the cached
          has_exec_fn closure to avoid a Hashtbl lookup. [wait_since] returns immediately
          if a producer signalled while this cycle ran, so a racing signal is not lost to

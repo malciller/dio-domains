@@ -14,6 +14,10 @@
  (libraries dio.latency_profiling dio.mtime unix))
 
 (executable
+ (name gc_tail)
+ (libraries dio.mtime.clock.os unix))
+
+(executable
  (name sync_alloc_profile)
  (libraries dio.strategies unix))
 
