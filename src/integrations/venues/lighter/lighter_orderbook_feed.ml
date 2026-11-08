@@ -43,17 +43,11 @@ type store =
   }
 
 let stores = Ds.Cow_table.create ~shard_count:32 ()
-let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 let get_store symbol = Ds.Cow_table.find_opt stores symbol
 
-let notify_ready store =
-  if not (Atomic.get store.ready)
-  then (
-    Atomic.set store.ready true;
-    try Lwt_condition.broadcast ready_condition () with
-    | _ -> ())
-;;
+(* Atomic flag only: this runs on the venue's parse domain, which must not touch Lwt. *)
+let notify_ready store = Atomic.set store.ready true
 
 (** Merges one price level update into a sorted list. Size zero removes the level;
     otherwise upserts or inserts in sort order (single pass, tail shared on update, no
@@ -115,6 +109,51 @@ let flush_to_ring store symbol =
 
 let first_snapshot_logged = Atomic.make false
 
+let symbol_of_market market_index =
+  match Lighter_instruments_feed.get_symbol ~market_index with
+  | Some s -> s
+  | None -> string_of_int market_index
+;;
+
+(** Replace the book from a parsed snapshot, publish it, and log the depth. *)
+let apply_snapshot store ~symbol bids asks =
+  Mutex.lock store.ob_mutex;
+  store.local_bids
+  <- truncate_to_depth (List.sort (fun (a, _) (b, _) -> compare b a) bids);
+  store.local_asks
+  <- truncate_to_depth (List.sort (fun (a, _) (b, _) -> compare a b) asks);
+  flush_to_ring store symbol;
+  Mutex.unlock store.ob_mutex;
+  Logging.debug_f
+    ~section
+    "Orderbook snapshot for %s: bids=%d asks=%d"
+    symbol
+    (List.length bids)
+    (List.length asks)
+;;
+
+(** Apply parsed deltas to one side, trimming after every [max_depth] inserts. The caller
+    holds [store.ob_mutex]. *)
+let apply_deltas store ~is_bid levels =
+  let len = ref (List.length (if is_bid then store.local_bids else store.local_asks)) in
+  List.iter
+    (fun (price, size) ->
+      if is_bid
+      then store.local_bids <- apply_delta store.local_bids price size ~is_bid:true
+      else store.local_asks <- apply_delta store.local_asks price size ~is_bid:false;
+      incr len;
+      if !len >= max_depth * 2
+      then (
+        if is_bid
+        then store.local_bids <- truncate_to_depth store.local_bids
+        else store.local_asks <- truncate_to_depth store.local_asks;
+        len := max_depth))
+    levels;
+  if is_bid
+  then store.local_bids <- truncate_to_depth store.local_bids
+  else store.local_asks <- truncate_to_depth store.local_asks
+;;
+
 let get_list_field ob_data key1 key2 =
   let open Yojson.Safe.Util in
   let v = member key1 ob_data in
@@ -133,11 +172,7 @@ let get_list_field ob_data key1 key2 =
 
 let process_orderbook_snapshot ~market_index json =
   let open Yojson.Safe.Util in
-  let symbol =
-    match Lighter_instruments_feed.get_symbol ~market_index with
-    | Some s -> s
-    | None -> string_of_int market_index
-  in
+  let symbol = symbol_of_market market_index in
   try
     (* Lighter nests the payload under [order_book], not [data]. *)
     let ob_data = member "order_book" json in
@@ -193,20 +228,7 @@ let process_orderbook_snapshot ~market_index json =
       match get_store symbol with
       | None ->
         Logging.warn_f ~section "Orderbook snapshot for uninitialized symbol: %s" symbol
-      | Some store ->
-        Mutex.lock store.ob_mutex;
-        store.local_bids
-        <- truncate_to_depth (List.sort (fun (a, _) (b, _) -> compare b a) bids);
-        store.local_asks
-        <- truncate_to_depth (List.sort (fun (a, _) (b, _) -> compare a b) asks);
-        flush_to_ring store symbol;
-        Mutex.unlock store.ob_mutex;
-        Logging.debug_f
-          ~section
-          "Orderbook snapshot for %s: bids=%d asks=%d"
-          symbol
-          (List.length bids)
-          (List.length asks))
+      | Some store -> apply_snapshot store ~symbol bids asks)
   with
   | exn ->
     Logging.warn_f
@@ -220,11 +242,7 @@ let process_orderbook_snapshot ~market_index json =
     ring buffer. *)
 let process_orderbook_update ~market_index json =
   let open Yojson.Safe.Util in
-  let symbol =
-    match Lighter_instruments_feed.get_symbol ~market_index with
-    | Some s -> s
-    | None -> string_of_int market_index
-  in
+  let symbol = symbol_of_market market_index in
   try
     (* Lighter nests the payload under [order_book], not [data]. *)
     let ob_data = member "order_book" json in
@@ -236,7 +254,6 @@ let process_orderbook_update ~market_index json =
       match get_store symbol with
       | None -> ()
       | Some store ->
-        Mutex.lock store.ob_mutex;
         let parse_level_opt level =
           match level with
           | `List [ price_json; size_json ] ->
@@ -253,34 +270,12 @@ let process_orderbook_update ~market_index json =
             Some (price, size)
           | _ -> None
         in
-        let b_len = ref (List.length store.local_bids) in
-        List.iter
-          (fun level ->
-            match parse_level_opt level with
-            | Some (price, size) ->
-              store.local_bids <- apply_delta store.local_bids price size ~is_bid:true;
-              incr b_len;
-              if !b_len >= max_depth * 2
-              then (
-                store.local_bids <- truncate_to_depth store.local_bids;
-                b_len := max_depth)
-            | None -> ())
-          bids_json;
-        store.local_bids <- truncate_to_depth store.local_bids;
-        let a_len = ref (List.length store.local_asks) in
-        List.iter
-          (fun level ->
-            match parse_level_opt level with
-            | Some (price, size) ->
-              store.local_asks <- apply_delta store.local_asks price size ~is_bid:false;
-              incr a_len;
-              if !a_len >= max_depth * 2
-              then (
-                store.local_asks <- truncate_to_depth store.local_asks;
-                a_len := max_depth)
-            | None -> ())
-          asks_json;
-        store.local_asks <- truncate_to_depth store.local_asks;
+        let parse_levels levels_json = List.filter_map parse_level_opt levels_json in
+        let bids = parse_levels bids_json in
+        let asks = parse_levels asks_json in
+        Mutex.lock store.ob_mutex;
+        apply_deltas store ~is_bid:true bids;
+        apply_deltas store ~is_bid:false asks;
         flush_to_ring store symbol;
         Mutex.unlock store.ob_mutex;
         Logging.debug_f
@@ -289,6 +284,122 @@ let process_orderbook_update ~market_index json =
           symbol
           (List.length bids_json)
           (List.length asks_json))
+  with
+  | exn ->
+    Logging.warn_f
+      ~section
+      "Failed to parse orderbook update for market %d: %s"
+      market_index
+      (Printexc.to_string exn)
+;;
+
+(** Span decoders for L2 frames: no [Yojson.Safe.t] is built. Levels may be [price, size]
+    arrays or objects with [price]/[size]; numbers may be quoted. *)
+let level_of_span s i j =
+  if i < j && s.[i] = '{'
+  then (
+    let lo, hi = Json_scan.object_interior s i j in
+    match Json_scan.find_field s lo hi "price", Json_scan.find_field s lo hi "size" with
+    | Some (pl, ph), Some (sl, sh) ->
+      Some (Json_scan.float_of_span_any s pl ph, Json_scan.float_of_span_any s sl sh)
+    | _ -> None)
+  else if i < j && s.[i] = '['
+  then (
+    let lo, hi = Json_scan.array_interior s i j in
+    match Json_scan.array_two_spans s lo hi with
+    | Some ((pl, ph), (sl, sh)) ->
+      Some (Json_scan.float_of_span_any s pl ph, Json_scan.float_of_span_any s sl sh)
+    | None -> None)
+  else None
+;;
+
+let levels_of_span s lo hi =
+  let acc = ref [] in
+  Json_scan.array_iter s lo hi (fun e0 e1 ->
+    match level_of_span s e0 e1 with
+    | Some lvl -> acc := lvl :: !acc
+    | None -> ());
+  List.rev !acc
+;;
+
+(** Span of [primary], or of [fallback] when [primary] is absent. *)
+let levels_span s lo hi primary fallback = exclave_
+  match Json_scan.find_field s lo hi primary with
+  | Some span -> Some span
+  | None -> Json_scan.find_field s lo hi fallback
+;;
+
+let levels_at message i j =
+  if i < j && message.[i] = '['
+  then (
+    let lo, hi = Json_scan.array_interior message i j in
+    levels_of_span message lo hi)
+  else []
+;;
+
+let process_orderbook_snapshot_span ~market_index message =
+  let symbol = symbol_of_market market_index in
+  try
+    let len = String.length message in
+    match Json_scan.find_field message 1 (max 0 (len - 1)) "order_book" with
+    | Some (oi, oj) when oi < oj && message.[oi] = '{' ->
+      let lo, hi = Json_scan.object_interior message oi oj in
+      let bids =
+        match levels_span message lo hi "b" "bids" with
+        | Some (i, j) -> levels_at message i j
+        | None -> []
+      in
+      let asks =
+        match levels_span message lo hi "a" "asks" with
+        | Some (i, j) -> levels_at message i j
+        | None -> []
+      in
+      (match get_store symbol with
+       | None ->
+         Logging.warn_f ~section "Orderbook snapshot for uninitialized symbol: %s" symbol
+       | Some store -> apply_snapshot store ~symbol bids asks)
+    | _ -> ()
+  with
+  | exn ->
+    Logging.warn_f
+      ~section
+      "Failed to parse orderbook snapshot for market %d: %s"
+      market_index
+      (Printexc.to_string exn)
+;;
+
+let process_orderbook_update_span ~market_index message =
+  let symbol = symbol_of_market market_index in
+  try
+    let len = String.length message in
+    match Json_scan.find_field message 1 (max 0 (len - 1)) "order_book" with
+    | Some (oi, oj) when oi < oj && message.[oi] = '{' ->
+      let lo, hi = Json_scan.object_interior message oi oj in
+      let bids =
+        match levels_span message lo hi "b" "bids" with
+        | Some (i, j) -> levels_at message i j
+        | None -> []
+      in
+      let asks =
+        match levels_span message lo hi "a" "asks" with
+        | Some (i, j) -> levels_at message i j
+        | None -> []
+      in
+      (match get_store symbol with
+       | None -> ()
+       | Some store ->
+         Mutex.lock store.ob_mutex;
+         apply_deltas store ~is_bid:true bids;
+         apply_deltas store ~is_bid:false asks;
+         flush_to_ring store symbol;
+         Mutex.unlock store.ob_mutex;
+         Logging.debug_f
+           ~section
+           "Orderbook delta for %s: %d bid updates, %d ask updates"
+           symbol
+           (List.length bids)
+           (List.length asks))
+    | _ -> ()
   with
   | exn ->
     Logging.warn_f
@@ -381,10 +492,17 @@ let has_orderbook_data symbol =
 ;;
 
 let wait_for_orderbook_data symbols timeout_seconds =
-  Concurrency.Lwt_util.poll_until
-    ~timeout:timeout_seconds
-    ~wait_signal:(fun () -> Lwt_condition.wait ready_condition)
-    ~check:(fun () -> List.for_all has_orderbook_data symbols)
+  let start_time = Unix.gettimeofday () in
+  let rec wait_loop () =
+    if List.for_all has_orderbook_data symbols
+    then Lwt.return_true
+    else if Unix.gettimeofday () -. start_time >= timeout_seconds
+    then Lwt.return_false
+    else
+      let open Lwt.Infix in
+      Lwt_unix.sleep 0.025 >>= wait_loop
+  in
+  wait_loop ()
 ;;
 
 let initialize symbols =

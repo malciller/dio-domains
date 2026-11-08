@@ -378,6 +378,7 @@ let () =
      initializers, which run after [Canary.start], so an env kill switch in .env was
      ignored. Never overwrites an already-set variable. *)
   Logging.load_dotenv ~path:".env" ();
+  Concurrency.Exchange_wakeup.configure ();
   (* Load engine configuration from config.json. *)
   let config = Dio_engine.Config.read_config () in
   (* Apply log level and section filters from configuration. *)

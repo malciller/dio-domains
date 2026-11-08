@@ -2427,9 +2427,8 @@ let asset_domain_worker
        until the next timed pass. *)
     let overlay_last_reserve_share = ref nan in
     (* M1 event ownership: route an execution event through the interpreter when the entry
-       is file-bound, else call the reference handler directly. The reference handler
-       locks state.mutex itself, so the interpreter path must run outside the book-cycle
-       lock. *)
+       is file-bound, else call the reference handler directly. Both run on the owning
+       asset domain. *)
     let route_exec
       ~kind
       ~now
@@ -2542,15 +2541,13 @@ let asset_domain_worker
         if latency_this_cycle then Monotonic_clock.minor_words () else 0
       in
       (* Drain lifecycle events queued by the supervisor REST path. All handlers (REST-
-         and WS-sourced) run on THIS domain thread at cycle top, so the strategy mutex is
-         never contended across threads. Runs unconditionally; the queue is empty on the
-         common cycle. *)
+         and WS-sourced) run on THIS domain thread at cycle top, so strategy state stays
+         single-writer. Runs unconditionally; the queue is empty on the common cycle. *)
       if is_grid_strategy
       then (
         (* M1 event ownership: a file-bound asset routes lifecycle events through the
            interpreter (the strategy file owns the event surface); the reference path
-           dispatches directly. The reference handlers lock state.mutex themselves, so
-           this runs OUTSIDE the interpreter's book-cycle lock. *)
+           dispatches directly. Both run on the owning asset domain. *)
         match config_grid with
         | Some (ctx, rt) ->
           let now_ev = Unix.gettimeofday () in
@@ -3248,9 +3245,9 @@ let asset_domain_worker
            then Printf.sprintf "%.8g" d.buy_qty
            else asset_with_fees.qty
          in
+         let st = Dio_strategies.Strategy_api.get_strategy_state asset_with_fees.symbol in
          grid_strategy_asset_ref
          := Some (grid_asset_of ~qty:qty_str ~grid_interval:d.grid_interval ());
-         let st = Dio_strategies.Strategy_api.get_strategy_state asset_with_fees.symbol in
          (try st.grid_qty <- float_of_string qty_str with
           | Failure _ -> ());
          (* Re-check any resting buy against the decision's spacing: it amends DOWN only
@@ -3376,7 +3373,7 @@ let asset_domain_worker
          release capital. The cancel is pushed through the grid's order buffer into the
          supervisor pipeline (supervisor_orders dispatch_cancel -> Order_executor ->
          dashboard/order tracking), guarded like the grid's own excess-buy cancel
-         (strategy mutex held, mid-amendment buys skipped because Hyperliquid rejects
+         (single-writer domain, mid-amendment buys skipped because Hyperliquid rejects
          canceling an order being amended). SELF-HEALING: the cancel is latched, not
          re-issued every cycle, but retried while the decision persists and eligible buys
          remain; the latch re-arms when the store shows no eligible buy or the decision
@@ -3386,81 +3383,74 @@ let asset_domain_worker
       (match oracle_decision with
        | Some d when d.cancel_resting_buys ->
          let now = Unix.gettimeofday () in
-         let st = Dio_strategies.Strategy_api.get_strategy_state asset_with_fees.symbol in
-         Mutex.lock st.mutex;
-         Fun.protect
-           ~finally:(fun () -> Mutex.unlock st.mutex)
-           (fun () ->
-             (* Eligible = cancellable resting buys (not mid-amendment). [any_buy]
-                distinguishes "store clean" from "only buys stuck mid-amendment": a
-                mid-amend buy cannot be cancelled and is expected to resolve into a
-                cancellable replacement. *)
-             let eligible = ref 0 in
-             let any_buy = ref false in
-             (* Allocation-free: primitives only, no [Types.open_order] record. *)
-             Ex.iter_open_orders_fast
-               ~symbol:asset_with_fees.symbol
-               (fun oid _price qty side_str userref ->
-                  if qty > 0.0
-                     && side_str = "buy"
-                     && Dio_strategies.Strategy_common.is_grid_order userref
-                  then (
-                    any_buy := true;
-                    if not
+         (* Eligible = cancellable resting buys (not mid-amendment). [any_buy]
+            distinguishes "store clean" from "only buys stuck mid-amendment": a mid-amend
+            buy cannot be cancelled and is expected to resolve into a cancellable
+            replacement. *)
+         let eligible = ref 0 in
+         let any_buy = ref false in
+         (* Allocation-free: primitives only, no [Types.open_order] record. *)
+         Ex.iter_open_orders_fast
+           ~symbol:asset_with_fees.symbol
+           (fun oid _price qty side_str userref ->
+              if qty > 0.0
+                 && side_str = "buy"
+                 && Dio_strategies.Strategy_common.is_grid_order userref
+              then (
+                any_buy := true;
+                if not
+                     (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight oid)
+                then incr eligible));
+         (match
+            Dio_strategies.Strategy_api.reclaim_step
+              ~now
+              ~retry_seconds:reclaim_retry_seconds
+              ~issued:!reclaim_cancel_issued
+              ~issued_at:!reclaim_cancel_at
+              ~eligible:!eligible
+              ~any_buy:!any_buy
+          with
+          | Dio_strategies.Strategy_api.Reclaim_rearm ->
+            (* No buy remains: the cancel(s) landed or were never needed. Re-arm the latch
+               so a later reclaim re-triggers cleanly, and wake the oracle so it re-sizes
+               with the released capital. *)
+            reclaim_cancel_issued := false;
+            reclaim_cancel_at := 0.0;
+            Oracle_runtime.request_pass ()
+          | Dio_strategies.Strategy_api.Reclaim_cancel _ ->
+            let n = ref 0 in
+            Ex.iter_open_orders_fast
+              ~symbol:asset_with_fees.symbol
+              (fun oid _price qty side_str userref ->
+                 if qty > 0.0
+                    && side_str = "buy"
+                    && Dio_strategies.Strategy_common.is_grid_order userref
+                    && not
                          (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight
                             oid)
-                    then incr eligible));
-             match
-               Dio_strategies.Strategy_api.reclaim_step
-                 ~now
-                 ~retry_seconds:reclaim_retry_seconds
-                 ~issued:!reclaim_cancel_issued
-                 ~issued_at:!reclaim_cancel_at
-                 ~eligible:!eligible
-                 ~any_buy:!any_buy
-             with
-             | Dio_strategies.Strategy_api.Reclaim_rearm ->
-               (* No buy remains: the cancel(s) landed or were never needed. Re-arm the
-                  latch so a later reclaim re-triggers cleanly, and wake the oracle so it
-                  re-sizes with the released capital. *)
-               reclaim_cancel_issued := false;
-               reclaim_cancel_at := 0.0;
-               Oracle_runtime.request_pass ()
-             | Dio_strategies.Strategy_api.Reclaim_cancel _ ->
-               let n = ref 0 in
-               Ex.iter_open_orders_fast
-                 ~symbol:asset_with_fees.symbol
-                 (fun oid _price qty side_str userref ->
-                    if qty > 0.0
-                       && side_str = "buy"
-                       && Dio_strategies.Strategy_common.is_grid_order userref
-                       && not
-                            (Dio_strategies.Strategy_common.InFlightAmendments
-                             .is_in_flight
-                               oid)
-                    then (
-                      let cancel =
-                        Dio_strategies.Strategy_api.create_cancel_order
-                          oid
-                          asset_with_fees.symbol
-                          Dio_strategies.Strategy_common.Ladder
-                          asset_with_fees.exchange
-                      in
-                      ignore (Dio_strategies.Strategy_api.push_order ~now cancel);
-                      incr n));
-               reclaim_cancel_issued := true;
-               reclaim_cancel_at := now;
-               (* Wake the capital oracle so it re-sizes as soon as the release lands; the
-                  reclaim cycle does not depend on the exchange WS cancel event. *)
-               Oracle_runtime.request_pass ();
-               Logging.warn_f
-                 ~section
-                 "[%s/%s] Capital oracle cancellation cascade: canceling %d resting \
-                  buy(s) to free quote for a higher-priority strategy"
-                 asset_with_fees.exchange
-                 asset_with_fees.symbol
-                 !n
-             | Dio_strategies.Strategy_api.Reclaim_deferred -> ())
+                 then (
+                   let cancel =
+                     Dio_strategies.Strategy_api.create_cancel_order
+                       oid
+                       asset_with_fees.symbol
+                       Dio_strategies.Strategy_common.Ladder
+                       asset_with_fees.exchange
+                   in
+                   ignore (Dio_strategies.Strategy_api.push_order ~now cancel);
+                   incr n));
+            reclaim_cancel_issued := true;
+            reclaim_cancel_at := now;
+            (* Wake the capital oracle so it re-sizes as soon as the release lands; the
+               reclaim cycle does not depend on the exchange WS cancel event. *)
+            Oracle_runtime.request_pass ();
+            Logging.warn_f
+              ~section
+              "[%s/%s] Capital oracle cancellation cascade: canceling %d resting buy(s) \
+               to free quote for a higher-priority strategy"
+              asset_with_fees.exchange
+              asset_with_fees.symbol
+              !n
+          | Dio_strategies.Strategy_api.Reclaim_deferred -> ())
        | _ ->
          reclaim_cancel_issued := false;
          reclaim_cancel_at := 0.0);
@@ -4375,8 +4365,7 @@ let asset_domain_worker
       (* Flush deferred accumulation persistence outside the strategy hot path; file I/O
          only when the dirty flag was set during execute_strategy. Gate on the cached
          state ref so a clean cycle does not pay [get_strategy_state]'s registry lock +
-         string lookup every cycle; [flush_persistence] re-checks the flag under the
-         mutex. *)
+         string lookup every cycle; [flush_persistence] re-checks the flag. *)
       if should_execute
       then
         if is_grid_strategy
@@ -5031,25 +5020,33 @@ let stop_all_domains () =
   (* Poll until all domains have stopped or timeout expires *)
   let rec wait_for_stop max_wait =
     if max_wait <= 0.0
-    then Logging.warn ~section "Timeout waiting for domains to stop"
+    then (
+      Logging.warn ~section "Timeout waiting for domains to stop";
+      false)
     else (
       let all_stopped =
         List.for_all (fun state -> not (Atomic.get state.is_running)) all_states
       in
       if all_stopped
-      then Logging.info ~section "All domains stopped successfully"
+      then (
+        Logging.info ~section "All domains stopped successfully";
+        true)
       else (
         Thread.delay 0.1;
         wait_for_stop (max_wait -. 0.1)))
   in
-  wait_for_stop 10.0;
-  (* Final persistence flush. [flush_persistence] only runs inside the domain cycle, so
-     state dirtied in the last cycles before shutdown (accumulation P&L, last_fill_oid,
-     sell levels) would never reach the save queue; at_exit [flush_all] drains only what
-     is queued. Domains are stopped, so this cannot race a cycle. *)
-  List.iter
-    (fun state ->
-      if is_strategy_file_asset state.asset
-      then Dio_strategies.Strategy_api.Strategy.flush_persistence state.asset.symbol)
-    all_states
+  let all_stopped = wait_for_stop 10.0 in
+  (* Final persistence flush. Each asset domain is the sole writer of its state, so the
+     flush must not run while one is still alive: a wedged domain would race it. *)
+  if all_stopped
+  then
+    List.iter
+      (fun state ->
+        if is_strategy_file_asset state.asset
+        then Dio_strategies.Strategy_api.Strategy.flush_persistence state.asset.symbol)
+      all_states
+  else
+    Logging.warn
+      ~section
+      "Skipping final persistence flush: a domain did not stop within 10s"
 ;;

@@ -102,15 +102,31 @@ let () =
         in
         fun f -> List.iter (fun (id, p, q, s, u) -> f id p q s u) orders);
     (* Representative delta: one same-price sell amend per cycle, no overflow, so the
-       measured cycle is the production incremental path rather than a full rescan. *)
+       measured cycle is the production incremental path rather than a full rescan.
+       DIO_BENCH_QUIET=1 measures the quiet steady state (no order changes). *)
+    let quiet = Sys.getenv_opt "DIO_BENCH_QUIET" = Some "1" in
+    let legacy = Sys.getenv_opt "DIO_BENCH_LEGACY" = Some "1" in
     ctx.cg_drain
-    <- (fun ~symbol:_ -> [ "sell-0", Some (Some 100.0, 1.0, "sell", None) ], false);
+    <- (if quiet
+        then fun ~symbol:_ -> [], false
+        else fun ~symbol:_ -> [ "sell-0", Some (Some 100.0, 1.0, "sell", None) ], false);
     let module H = SA.Make (SCE) in
     let rt = SR.create ~handlers:(H.handler ctx) file in
     let event = SR.make_event "book_update" [] in
     let run i =
-      ctx.cg_gen <- i;
-      ignore (SR.run_cycle ~collect:false rt ~price:100.0 ~now:(float i) ~event)
+      if legacy
+      then (
+        ctx.cg_gen <- i;
+        ignore (SR.run_cycle ~collect:false rt ~price:100.0 ~now:(float i) ~event))
+      else (
+        if not quiet then ctx.cg_gen <- i;
+        (* 0.1 ms per simulated cycle, with the balance snapshot timestamped at t=0:
+           [venue_ts] stays constant, so a quiet cycle pays no balance-adoption work. This
+           matches production, where messages arrive far less often than cycles. *)
+        let now = float i *. 0.0001 in
+        ctx.cg_cycle <- i;
+        ctx.cg_base_age <- Some now;
+        ignore (SR.run_cycle ~collect:false rt ~price:100.0 ~now ~event))
     in
     (* Warm up so platform facts, caches and the ledger reach steady state. *)
     for i = 1 to 2000 do
@@ -204,6 +220,29 @@ let () =
       "  sell-plan sub-timers: overlays=%dus reconcile=%dus\n%!"
       (state.time_splan_overlays_ns / 1000)
       (state.time_splan_reconcile_ns / 1000);
+    if Sys.getenv_opt "DIO_BENCH_SUB" = Some "1"
+    then (
+      let n = 50_000 in
+      let meas name f =
+        let b = Gc.minor_words () in
+        for _ = 1 to n do
+          f ()
+        done;
+        Printf.printf "  sub %-22s %8.2f w\n%!" name ((Gc.minor_words () -. b) /. float n)
+      in
+      meas "prepare_init" (fun () -> SCE.prepare_init ctx);
+      meas "prepare_recovery" (fun () -> SCE.prepare_recovery ctx);
+      meas "resolve_book" (fun () -> ignore (SCE.resolve_book ctx));
+      meas "sell_prepare" (fun () -> SCE.sell_prepare ctx);
+      meas "venue_lot_qty" (fun () ->
+        ignore (SG.venue_lot_qty state.grid_qty asset.exchange state));
+      meas "unnetted_hold" (fun () ->
+        ignore
+          (SG.unnetted_sell_hold
+             ~state
+             ~ecfg:state.cached_ecfg
+             ~now:0.0
+             ~base_balance_age:None)));
     (* Populated interpreter-only cycle: the real file + real facts/state, but a no-op
        action handler, so the words are guard eval + arg eval + step plumbing exactly as
        the live loop pays them (no body work, no I/O). This is the metric to optimize. *)

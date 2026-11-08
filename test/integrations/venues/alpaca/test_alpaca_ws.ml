@@ -144,6 +144,17 @@ let test_sse_stream_parses_frames () =
     (Alpaca.Executions.consume_event_stream
        ~on_heartbeat:(fun () -> incr heartbeats)
        body);
+  (* Trade events are parsed on the venue's parse domain; wait for both to land. *)
+  let rec wait n =
+    if Alpaca.Executions.get_current_position symbol = 2
+    then ()
+    else if n <= 0
+    then Alcotest.fail "trade frames were not processed"
+    else (
+      Unix.sleepf 0.01;
+      wait (n - 1))
+  in
+  wait 200;
   Alcotest.(check int)
     "both frames appended to the exec store"
     2

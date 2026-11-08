@@ -26,15 +26,24 @@ module InFlightAmendments = Dio_strategies.Strategy_common.InFlightAmendments
 
 module StringMap = Map.Make (String)
 
-let profilers : Latency_profiler.t StringMap.t Atomic.t = Atomic.make StringMap.empty
+type profiler_kind =
+  | Place
+  | Amend
+  | Cancel
+
+type symbol_profilers =
+  { place : Latency_profiler.t
+  ; amend : Latency_profiler.t
+  ; cancel : Latency_profiler.t
+  }
+
+let profilers : symbol_profilers StringMap.t Atomic.t = Atomic.make StringMap.empty
 let profilers_mutex = Mutex.create ()
 
-(** Hard cap on the profiler cache. [snapshot_symbol_profilers] creates three profilers
-    ("place"/"amend"/"cancel") per symbol, so without a bound the map grows for every
-    symbol a domain is ever spawned for. On overflow the least-sampled entry is evicted,
-    keeping telemetry for the hottest symbols (the pre-Atomic implementation applied the
-    same cap). *)
-let max_profilers = 64
+(** Hard cap on the symbol cache. Each entry holds three profilers (place/amend/cancel),
+    so this is ~[3 * max_profiler_symbols] profilers. On overflow the least-sampled symbol
+    is evicted, keeping telemetry for the hottest symbols. *)
+let max_profiler_symbols = 21
 
 let profiler_samples (p : Latency_profiler.t) =
   match Latency_profiler.published_snapshot p with
@@ -42,11 +51,15 @@ let profiler_samples (p : Latency_profiler.t) =
   | None -> 0
 ;;
 
+let entry_samples e =
+  profiler_samples e.place + profiler_samples e.amend + profiler_samples e.cancel
+;;
+
 let evict_least_sampled map =
   match
     StringMap.fold
-      (fun key p best ->
-        let count = profiler_samples p in
+      (fun key e best ->
+        let count = entry_samples e in
         match best with
         | None -> Some (key, count)
         | Some (_, min_count) when count < min_count -> Some (key, count)
@@ -58,54 +71,72 @@ let evict_least_sampled map =
   | Some (key, _) ->
     Logging.warn_f
       ~section
-      "profilers table at capacity (%d); evicting least-sampled entry '%s'"
-      max_profilers
+      "profilers table at capacity (%d symbols); evicting least-sampled entry '%s'"
+      max_profiler_symbols
       key;
     StringMap.remove key map
 ;;
 
-let get_profiler symbol operation =
-  let key = symbol ^ ":" ^ operation in
+let make_profilers symbol =
+  let create op =
+    Latency_profiler.create ~bucket_us:1000 ~max_latency_us:2_000_000 (symbol ^ ":" ^ op)
+  in
+  { place = create "place"; amend = create "amend"; cancel = create "cancel" }
+;;
+
+(** One map lookup per order instead of building a ["symbol:operation"] key. *)
+let get_symbol_profilers symbol =
   let current = Atomic.get profilers in
-  match StringMap.find_opt key current with
-  | Some p -> p
+  match StringMap.find_opt symbol current with
+  | Some e -> e
   | None ->
     Mutex.lock profilers_mutex;
     let map = Atomic.get profilers in
-    let p =
-      match StringMap.find_opt key map with
-      | Some p -> p
+    let e =
+      match StringMap.find_opt symbol map with
+      | Some e -> e
       | None ->
-        let p = Latency_profiler.create ~bucket_us:1000 ~max_latency_us:2_000_000 key in
+        let e = make_profilers symbol in
         let map =
-          if StringMap.cardinal map >= max_profilers then evict_least_sampled map else map
+          if StringMap.cardinal map >= max_profiler_symbols
+          then evict_least_sampled map
+          else map
         in
-        Atomic.set profilers (StringMap.add key p map);
-        p
+        Atomic.set profilers (StringMap.add symbol e map);
+        e
     in
     Mutex.unlock profilers_mutex;
-    p
+    e
+;;
+
+let get_profiler symbol = function
+  | Place -> (get_symbol_profilers symbol).place
+  | Amend -> (get_symbol_profilers symbol).amend
+  | Cancel -> (get_symbol_profilers symbol).cancel
+;;
+
+let snapshot_profiler profiler =
+  let snap = Latency_profiler.snapshot_and_reset profiler in
+  if snap.Latency_profiler.samples > 0
+  then
+    Logging.debug_f
+      ~section
+      "Latency [%s]: samples=%d p50=%s p99=%s overflow=%d"
+      snap.Latency_profiler.name
+      snap.Latency_profiler.samples
+      (Latency_profiler.format_us snap.Latency_profiler.p50)
+      (Latency_profiler.format_us snap.Latency_profiler.p99)
+      snap.Latency_profiler.overflow
 ;;
 
 (* Window-cadence snapshot+reset of this symbol's place/amend/cancel profilers. Called by
    the domain worker's rolling-window publish; keeps the snapshot/sort/log work out of the
    order hot path. *)
 let snapshot_symbol_profilers symbol =
-  List.iter
-    (fun op ->
-      let profiler = get_profiler symbol op in
-      let snap = Latency_profiler.snapshot_and_reset profiler in
-      if snap.Latency_profiler.samples > 0
-      then
-        Logging.debug_f
-          ~section
-          "Latency [%s]: samples=%d p50=%s p99=%s overflow=%d"
-          snap.Latency_profiler.name
-          snap.Latency_profiler.samples
-          (Latency_profiler.format_us snap.Latency_profiler.p50)
-          (Latency_profiler.format_us snap.Latency_profiler.p99)
-          snap.Latency_profiler.overflow)
-    [ "place"; "amend"; "cancel" ]
+  let p = get_symbol_profilers symbol in
+  snapshot_profiler p.place;
+  snapshot_profiler p.amend;
+  snapshot_profiler p.cancel
 ;;
 
 module Exchange = Dio_exchange.Exchange_intf
@@ -325,17 +356,19 @@ let place_order ~token ?retry_config ?(check_duplicate = true) (request : order_
           Logging.warn_f ~section "%s" err;
           Lwt.return (Error err))
         else (
-          Logging.debug_f
-            ~section
-            "Placing %s order on %s: %s %s %f @ %s"
-            request.side
-            request.exchange
-            request.symbol
-            request.order_type
-            request.quantity
-            (match request.limit_price with
-             | Some p -> Printf.sprintf "%.2f" p
-             | None -> "market");
+          if Logging.will_log Logging.DEBUG section
+          then
+            Logging.debug_f
+              ~section
+              "Placing %s order on %s: %s %s %f @ %s"
+              request.side
+              request.exchange
+              request.symbol
+              request.order_type
+              request.quantity
+              (match request.limit_price with
+               | Some p -> Printf.sprintf "%.2f" p
+               | None -> "market");
           match get_exchange request.exchange with
           | Error e ->
             let _ = InFlightOrders.remove_in_flight_order request.duplicate_key in
@@ -345,7 +378,7 @@ let place_order ~token ?retry_config ?(check_duplicate = true) (request : order_
             let ex_retry_config = retry_config in
             (* Token semantics are exchange-dependent; each module interprets the value
                per its authentication mechanism. *)
-            let profiler = get_profiler request.symbol "place" in
+            let profiler = get_profiler request.symbol Place in
             let start_time = Mtime_clock.now_ns () in
             Lwt.catch
               (fun () ->
@@ -371,8 +404,9 @@ let place_order ~token ?retry_config ?(check_duplicate = true) (request : order_
                 Lwt.fail exn)
             >>= fun result ->
             let stop_time = Mtime_clock.now_ns () in
-            let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
-            Latency_profiler.record profiler span;
+            Latency_profiler.record_ns
+              profiler
+              (Int64.to_int (Int64.sub stop_time start_time));
             Lwt.return result))
 ;;
 
@@ -494,8 +528,8 @@ let amend_order ~token ?retry_config (request : amend_request) =
              let ex_retry_config = retry_config in
              let profiler =
                match request.symbol with
-               | Some sym -> get_profiler sym "amend"
-               | None -> get_profiler "unknown" "amend"
+               | Some sym -> get_profiler sym Amend
+               | None -> get_profiler "unknown" Amend
              in
              let start_time = Mtime_clock.now_ns () in
              Lwt.catch
@@ -522,8 +556,9 @@ let amend_order ~token ?retry_config (request : amend_request) =
                  Lwt.fail exn)
              >>= fun result ->
              let stop_time = Mtime_clock.now_ns () in
-             let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
-             Latency_profiler.record profiler span;
+             Latency_profiler.record_ns
+               profiler
+               (Int64.to_int (Int64.sub stop_time start_time));
              (* Resolve the amend lifecycle with the exchange's verdict: a same-id amend
                 (Kraken) drops the entry; a replace (Hyperliquid/Alpaca cancel+create)
                 keeps the OLD id registered as [Replaced] for the cleanup window, so a
@@ -568,8 +603,8 @@ let cancel_orders ~token ?retry_config (request : cancel_request) =
          let ex_retry_config = retry_config in
          let profiler =
            match request.symbol with
-           | Some sym -> get_profiler sym "cancel"
-           | None -> get_profiler request.exchange "cancel"
+           | Some sym -> get_profiler sym Cancel
+           | None -> get_profiler request.exchange Cancel
          in
          let start_time = Mtime_clock.now_ns () in
          Ex.cancel_orders
@@ -582,8 +617,9 @@ let cancel_orders ~token ?retry_config (request : cancel_request) =
            ()
          >>= fun result ->
          let stop_time = Mtime_clock.now_ns () in
-         let span = Mtime.Span.of_uint64_ns (Int64.sub stop_time start_time) in
-         Latency_profiler.record profiler span;
+         Latency_profiler.record_ns
+           profiler
+           (Int64.to_int (Int64.sub stop_time start_time));
          Lwt.return result))
 ;;
 

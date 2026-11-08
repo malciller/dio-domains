@@ -202,16 +202,17 @@ let write_frame_locked state conn frame =
       >>= fun () -> Lwt.return (Error (Printexc.to_string exn)))
 ;;
 
-let send_json_on state json label =
+let send_raw_on state msg label =
   Lwt_mutex.with_lock state.connection_mutex (fun () ->
     match !(state.active_connection) with
     | Some conn ->
-      let msg = Yojson.Safe.to_string json in
-      Logging.debug_f
-        ~section
-        "[%s] Sending WS message: %s"
-        label
-        (if String.length msg > 500 then String.sub msg 0 500 ^ "..." else msg);
+      if Logging.will_log Logging.DEBUG section
+      then
+        Logging.debug_f
+          ~section
+          "[%s] Sending WS message: %s"
+          label
+          (if String.length msg > 500 then String.sub msg 0 500 ^ "..." else msg);
       write_frame_locked state conn (Websocket.Frame.create ~content:msg ())
       >>= (function
        | Ok () -> Lwt.return (Ok ())
@@ -222,16 +223,18 @@ let send_json_on state json label =
       Logging.warn_f ~section "[%s] Cannot send: WebSocket not connected" label;
       Lwt.return (Error "WebSocket not connected"))
 [@@ocaml.doc
-  " Serializes and sends a JSON payload on the given connection under its lock, reporting\n\
+  " Sends a pre-serialized JSON frame on the given connection under its lock, reporting\n\
   \    whether the frame reached the socket. "]
 ;;
 
+let send_json_on state json label = send_raw_on state (Yojson.Safe.to_string json) label
 let send_public_json json label = send_json_on public_state json label >|= fun _ -> ()
 let send_private_json json label = send_json_on private_state json label >|= fun _ -> ()
 
 (* Tx submission needs the failure, not just the log line: a silently dropped order is
    worse than a reported one. *)
 let send_private_tx json = send_json_on private_state json "Private"
+let send_private_tx_raw msg = send_raw_on private_state msg "Private"
 
 let subscribe_public_orderbook ~symbols =
   let public_stream = Lwt_stream.of_list symbols in
@@ -405,6 +408,47 @@ let tx_frame txs =
             ] )
       ]
   | [] -> `Assoc []
+;;
+
+(** Raw-string equivalent of {!tx_frame}: the signed tx JSON is embedded directly, so the
+    hot path never parses it into a [Yojson] AST and re-serializes the frame. *)
+let tx_frame_string txs =
+  let buf = Buffer.create 512 in
+  (match txs with
+   | [ (tx_type, tx_info, id) ] ->
+     Buffer.add_string buf "{\"type\":\"jsonapi/sendtx\",\"data\":{\"id\":";
+     Json_writer.add_string buf id;
+     Buffer.add_string buf ",\"tx_type\":";
+     Buffer.add_string buf (string_of_int tx_type);
+     Buffer.add_string buf ",\"tx_info\":";
+     Buffer.add_string buf tx_info;
+     Buffer.add_string buf "}}"
+   | (_, _, first_id) :: _ as many ->
+     let types = Buffer.create 64 in
+     Buffer.add_char types '[';
+     List.iteri
+       (fun i (t, _, _) ->
+         if i > 0 then Buffer.add_char types ',';
+         Buffer.add_string types (string_of_int t))
+       many;
+     Buffer.add_char types ']';
+     let infos = Buffer.create 512 in
+     Buffer.add_char infos '[';
+     List.iteri
+       (fun i (_, info, _) ->
+         if i > 0 then Buffer.add_char infos ',';
+         Buffer.add_string infos info)
+       many;
+     Buffer.add_char infos ']';
+     Buffer.add_string buf "{\"type\":\"jsonapi/sendtxbatch\",\"data\":{\"id\":";
+     Json_writer.add_string buf first_id;
+     Buffer.add_string buf ",\"tx_types\":";
+     Json_writer.add_string buf (Buffer.contents types);
+     Buffer.add_string buf ",\"tx_infos\":";
+     Json_writer.add_string buf (Buffer.contents infos);
+     Buffer.add_string buf "}}"
+   | [] -> Buffer.add_string buf "{}");
+  Buffer.contents buf
 ;;
 
 (** One submission result from the venue: the id echoed back, the venue's result code and
@@ -691,7 +735,7 @@ let send_txs_ws txs : (string, string) result list Lwt.t =
         tx_type, tx_info, id)
       txs
   in
-  let frame = tx_frame txs in
+  let frame = tx_frame_string txs in
   match txs with
   | [] -> Lwt.return []
   | _ ->
@@ -705,7 +749,7 @@ let send_txs_ws txs : (string, string) result list Lwt.t =
       remember_pending_ack ids;
       Lwt.catch
         (fun () ->
-          send_private_tx frame
+          send_private_tx_raw frame
           >|= function
           | Ok () ->
             Logging.debug_f ~section "tx over WS: n=%d ids=[%s]" (List.length txs) id_str;
@@ -757,7 +801,66 @@ type text_frame_kind =
   | Frame_unmatched of string * string
 [@@ocaml.doc " Classification of an inbound text frame. "]
 
-let decode_text_frame content : text_frame_kind =
+let record_orderbook_latency_span content =
+  let len = String.length content in
+  match Json_scan.find_field content 1 (max 0 (len - 1)) "timestamp" with
+  | Some (i, j) ->
+    (* [float_of_span_any] returns 0 for a null/absent payload; a bogus 0 would read as an
+       epoch-sized latency spike. Only numeric spans are recorded. *)
+    let i = Json_scan.skip_ws content i j in
+    let quoted_digit =
+      i + 1 < j && content.[i] = '"' && (content.[i + 1] = '-' || content.[i + 1] >= '0')
+    in
+    let digit =
+      i < j && (content.[i] = '-' || (content.[i] >= '0' && content.[i] <= '9'))
+    in
+    if quoted_digit || digit
+    then
+      Network_latency.record_feed_event_ms
+        "lighter"
+        ~event_ms:(Json_scan.float_of_span_any content i j)
+        ()
+  | None -> ()
+;;
+
+let rec span_is_digits s i j =
+  i >= j || ((s.[i] >= '0' && s.[i] <= '9') && span_is_digits s (i + 1) j)
+;;
+
+(** [Some] when [content] is an order-book snapshot or update. Reads only the two
+    top-level discriminator fields, so the frame never becomes a DOM. *)
+let orderbook_frame content =
+  let len = String.length content in
+  let top = max 0 (len - 1) in
+  match
+    ( Json_scan.find_field content 1 top "channel"
+    , Json_scan.find_field content 1 top "type" )
+  with
+  | Some (ci, cj), Some (ti, tj) when Json_scan.value_is_string content ci ->
+    let prefix = "order_book" in
+    let sep = ci + 1 + String.length prefix in
+    if not
+         (Json_scan.span_starts_with content ci cj prefix
+          && sep < cj
+          && (content.[sep] = ':' || content.[sep] = '/'))
+    then None
+    else (
+      let mi_lo = sep + 1
+      and mi_hi = cj - 1 in
+      if mi_lo >= mi_hi || not (span_is_digits content mi_lo mi_hi)
+      then None
+      else (
+        let mi = Json_scan.int_of_span content mi_lo mi_hi in
+        if Json_scan.span_equals_literal content ti tj "snapshot"
+           || Json_scan.span_equals_literal content ti tj "subscribed"
+        then Some (`Snapshot, mi)
+        else if Json_scan.span_equals_literal content ti tj "update"
+        then Some (`Update, mi)
+        else None))
+  | _ -> None
+;;
+
+let decode_text_frame_dom content : text_frame_kind =
   let json = Yojson.Safe.from_string content in
   let channel =
     let open Yojson.Safe.Util in
@@ -859,6 +962,42 @@ let decode_text_frame content : text_frame_kind =
   \    no Lwt and no connection state. "]
 ;;
 
+(** Order-book frames take the span path; every other frame keeps the DOM router. *)
+let decode_text_frame content : text_frame_kind =
+  match orderbook_frame content with
+  | Some (`Snapshot, mi) ->
+    Atomic.incr msg_counter_orderbook;
+    record_orderbook_latency_span content;
+    Lighter_orderbook_feed.process_orderbook_snapshot_span ~market_index:mi content;
+    Frame_data
+  | Some (`Update, mi) ->
+    Atomic.incr msg_counter_orderbook;
+    record_orderbook_latency_span content;
+    Lighter_orderbook_feed.process_orderbook_update_span ~market_index:mi content;
+    Frame_data
+  | None -> decode_text_frame_dom content
+;;
+
+(** [true] for market-data and account frames, which only update stores. Control frames
+    (pong, sendtx acks) stay on the Lwt side. *)
+let data_frame content =
+  match orderbook_frame content with
+  | Some _ -> true
+  | None ->
+    let len = String.length content in
+    (match Json_scan.find_field content 1 (max 0 (len - 1)) "type" with
+     | Some (i, j) ->
+       let word w = Json_scan.span_equals_literal content i j w in
+       let pref p = Json_scan.span_starts_with content i j p in
+       word "update"
+       || word "snapshot"
+       || word "subscribed"
+       || pref "update/"
+       || pref "snapshot/"
+       || pref "subscribed/"
+     | None -> false)
+;;
+
 let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
   match frame.Websocket.Frame.opcode with
   | Websocket.Frame.Opcode.Text ->
@@ -866,68 +1005,79 @@ let handle_frame ~state ~on_heartbeat (frame : Websocket.Frame.t) =
     if state == private_state && not (Atomic.get private_stream_confirmed)
     then Atomic.set private_stream_confirmed true;
     (try
-       (match decode_text_frame frame.Websocket.Frame.content with
-        | Frame_data ->
-          note_data_frame state;
-          (* Only data proves the subscription is alive; acks and pongs must not feed the
-             supervisor's data timeout. *)
-          on_heartbeat ()
-        | Frame_tx_ack replies ->
-          let replies = attribute_ack_ids replies in
-          if replies = []
-          then (
-            Atomic.incr msg_counter_other;
-            if Atomic.get msg_counter_other <= 5
-            then
-              Logging.debug_f
-                ~section
-                "Submission ack carried no attributable result (len=%d)"
-                (String.length frame.Websocket.Frame.content))
-          else (
-            List.iter
-              (fun (reply : tx_reply) ->
-                if reply.reply_code = 200
-                then
-                  Logging.debug_f
-                    ~section
-                    "Tx accepted (id=%s, code=%d)"
-                    reply.reply_id
-                    reply.reply_code
-                else (
-                  Logging.error_f
-                    ~section
-                    "Tx rejected by exchange (id=%s): code=%d message=%s"
-                    reply.reply_id
-                    reply.reply_code
-                    reply.reply_message;
-                  (* Without this a desync rejects every later tx on this transport. *)
-                  if Error_handling.string_contains
-                       (String.lowercase_ascii reply.reply_message)
-                       "invalid nonce"
-                  then
-                    Lwt.async (fun () ->
-                      Lighter_signer.initialize_nonce
-                        ~timeout_s:2.0
-                        ~base_url:Lighter_endpoints.api_base_url
-                        ~api_key_index:(Lighter_signer.get_api_key_index ())
-                        ~account_index:(Lighter_signer.get_account_index ())
-                        ())))
-              replies;
-            List.iter apply_tx_reply replies)
-        | Frame_pong ->
-          state.last_pong_time := Unix.gettimeofday ();
-          (try Lwt_condition.broadcast state.pong_condition () with
-           | _ -> ())
-        | Frame_unmatched (t, channel) ->
-          Atomic.incr msg_counter_other;
-          if Atomic.get msg_counter_other <= 5
-          then
-            Logging.debug_f
-              ~section
-              "Unmatched WS message type: '%s' channel='%s' (len=%d)"
-              t
-              channel
-              (String.length frame.Websocket.Frame.content));
+       let content = frame.Websocket.Frame.content in
+       let queued =
+         if data_frame content
+         then Concurrency.Parse_worker.submit_frame "lighter" content
+         else false
+       in
+       if queued
+       then (
+         note_data_frame state;
+         on_heartbeat ())
+       else (
+         match decode_text_frame content with
+         | Frame_data ->
+           note_data_frame state;
+           (* Only data proves the subscription is alive; acks and pongs must not feed the
+              supervisor's data timeout. *)
+           on_heartbeat ()
+         | Frame_tx_ack replies ->
+           let replies = attribute_ack_ids replies in
+           if replies = []
+           then (
+             Atomic.incr msg_counter_other;
+             if Atomic.get msg_counter_other <= 5
+             then
+               Logging.debug_f
+                 ~section
+                 "Submission ack carried no attributable result (len=%d)"
+                 (String.length frame.Websocket.Frame.content))
+           else (
+             List.iter
+               (fun (reply : tx_reply) ->
+                 if reply.reply_code = 200
+                 then
+                   Logging.debug_f
+                     ~section
+                     "Tx accepted (id=%s, code=%d)"
+                     reply.reply_id
+                     reply.reply_code
+                 else (
+                   Logging.error_f
+                     ~section
+                     "Tx rejected by exchange (id=%s): code=%d message=%s"
+                     reply.reply_id
+                     reply.reply_code
+                     reply.reply_message;
+                   (* Without this a desync rejects every later tx on this transport. *)
+                   if Error_handling.string_contains
+                        (String.lowercase_ascii reply.reply_message)
+                        "invalid nonce"
+                   then
+                     Lwt.async (fun () ->
+                       Lighter_signer.initialize_nonce
+                         ~timeout_s:2.0
+                         ~base_url:Lighter_endpoints.api_base_url
+                         ~api_key_index:(Lighter_signer.get_api_key_index ())
+                         ~account_index:(Lighter_signer.get_account_index ())
+                         ())))
+               replies;
+             List.iter apply_tx_reply replies)
+         | Frame_pong ->
+           state.last_pong_time := Unix.gettimeofday ();
+           (try Lwt_condition.broadcast state.pong_condition () with
+            | _ -> ())
+         | Frame_unmatched (t, channel) ->
+           Atomic.incr msg_counter_other;
+           if Atomic.get msg_counter_other <= 5
+           then
+             Logging.debug_f
+               ~section
+               "Unmatched WS message type: '%s' channel='%s' (len=%d)"
+               t
+               channel
+               (String.length frame.Websocket.Frame.content));
        Atomic.incr msg_counter_total
      with
      | exn ->

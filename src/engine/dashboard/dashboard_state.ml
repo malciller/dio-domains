@@ -80,15 +80,14 @@ let json_of_domains () =
 
 (* Strategy state: Grid *)
 
-(* Concurrency: this encoder reads grid strategy state without state.mutex, from the
-   dashboard server (main domain), while the symbol's asset domain mutates it. Benign
-   under OCaml 5: every field read is a word-sized slot swapped atomically (boxed
-   immutable floats, pointer options/strings) or an immutable list replaced wholesale, so
-   a reader sees the old or new value, never a torn mix; no update can be lost (readers do
-   no read-modify-write). Only the symbol's domain thread mutates this state (writers from
-   other threads were removed by the lifecycle event queues, grid H3 / MM R2). Do not add
-   locking here unless the domain's whole-cycle critical section also shrinks; blocking
-   the dashboard on a full strategy cycle trades a cosmetic race for a real stall. *)
+(* Concurrency: this encoder reads grid strategy state without a lock, from the dashboard
+   server (main domain), while the symbol's asset domain mutates it. The asset domain is
+   the sole writer (order callbacks are queued lifecycle events). Benign under OCaml 5:
+   every field read is a word-sized slot swapped atomically (boxed immutable floats,
+   pointer options/strings) or an immutable list replaced wholesale, so a reader sees the
+   old or new value, never a torn mix; no update can be lost (readers do no
+   read-modify-write). Do not add locking here: blocking the dashboard on a full strategy
+   cycle trades a cosmetic race for a real stall. *)
 let json_of_grid_strategy exchange symbol =
   let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   let exch = Exchange.Types.exchange_of_string exchange in

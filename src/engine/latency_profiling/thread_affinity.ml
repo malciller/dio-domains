@@ -209,6 +209,25 @@ let background_alloc = make_background_allocator ()
     trading cycle. *)
 let pin_self_background () = pin_self (background_alloc ())
 
+(** Dedicated parse CPUs: [DIO_PARSE_CPUS]. Parsing is on the feed critical path, so an
+    operator who supplies P-cores here gets one shard per core. Unset leaves the scheduler
+    in charge. Read at spawn, after dotenv. *)
+let parse_cpus () =
+  match Sys.getenv_opt "DIO_PARSE_CPUS" with
+  | Some s -> parse_cpu_list s
+  | None -> []
+;;
+
+let parse_cursor = Atomic.make 0
+
+let pin_self_parse () =
+  match parse_cpus () with
+  | [] -> ()
+  | cpus ->
+    let i = Atomic.fetch_and_add parse_cursor 1 in
+    pin_self (List.nth cpus (i mod List.length cpus))
+;;
+
 (** Pin the calling domain to a fixed background range [lo, hi] (best-effort). Used to
     keep the busy-spin canary and other polling work off the trading cores. *)
 let pin_self_to_range lo hi =

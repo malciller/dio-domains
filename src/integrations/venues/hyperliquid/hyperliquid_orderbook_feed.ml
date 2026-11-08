@@ -2,8 +2,6 @@
   " Hyperliquid L2 orderbook feed. Subscribes to WebSocket depth updates and stores\n\
   \    snapshots in per-symbol lock-free ring buffers. "]
 
-open Lwt.Infix
-
 let section = "hyperliquid_orderbook"
 let ring_buffer_size = 64
 
@@ -43,7 +41,6 @@ type store =
   }
 
 let stores = Ds.Cow_table.create ~shard_count:32 ()
-let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
 let coin_to_symbol : (string, string) Ds.Cow_table.t =
@@ -82,13 +79,9 @@ let ensure_store symbol =
   \    via [initialization_mutex] for thread safety. "]
 ;;
 
-let notify_ready store =
-  if not (Atomic.get store.ready)
-  then (
-    Atomic.set store.ready true;
-    try Lwt_condition.broadcast ready_condition () with
-    | _ -> ())
-;;
+(* Atomic flag only: book frames are decoded on the parse domain, which must not touch
+   Lwt. The startup waiter polls. *)
+let notify_ready store = Atomic.set store.ready true
 
 let find_registered_symbol coin =
   match Ds.Cow_table.find_opt coin_to_symbol coin with
@@ -443,24 +436,17 @@ let has_orderbook_data symbol =
 ;;
 
 let wait_for_orderbook_data symbols timeout_seconds =
-  let deadline = Unix.gettimeofday () +. timeout_seconds in
-  let rec loop () =
+  let start_time = Unix.gettimeofday () in
+  let rec wait_loop () =
     if List.for_all has_orderbook_data symbols
     then Lwt.return_true
-    else (
-      let remaining = deadline -. Unix.gettimeofday () in
-      if remaining <= 0.0
-      then Lwt.return_false
-      else
-        Lwt.pick
-          [ (Lwt_condition.wait ready_condition >|= fun () -> `Again)
-          ; (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
-          ]
-        >>= function
-        | `Again -> loop ()
-        | `Timeout -> Lwt.return (List.for_all has_orderbook_data symbols))
+    else if Unix.gettimeofday () -. start_time >= timeout_seconds
+    then Lwt.return_false
+    else
+      let open Lwt.Infix in
+      Lwt_unix.sleep 0.025 >>= wait_loop
   in
-  loop ()
+  wait_loop ()
 ;;
 
 let _processor_task =

@@ -2,3 +2,8 @@
  (name json_scan)
  (public_name dio.json_scan)
  (modules Json_scan))
+
+(library
+ (name json_writer)
+ (public_name dio.json_writer)
+ (modules Json_writer))

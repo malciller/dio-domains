@@ -68,6 +68,86 @@ let tpsl_to_string = function
   | Sl -> "sl"
 ;;
 
+(* JSON action encoding. The order path writes the signed action straight into the request
+   buffer instead of building a [Yojson] AST and serializing it per order. *)
+
+(** Append [s] as a JSON string, escaping quotes, backslashes and control characters. *)
+let add_json_string = Json_writer.add_string
+
+let add_json_bool = Json_writer.add_bool
+
+(** Append an [order_wire] in the API's JSON shape. *)
+let add_order_json buf (ow : order_wire) =
+  Buffer.add_string buf "{\"a\":";
+  Buffer.add_string buf (string_of_int ow.a);
+  Buffer.add_string buf ",\"b\":";
+  add_json_bool buf ow.b;
+  Buffer.add_string buf ",\"p\":";
+  add_json_string buf ow.p;
+  Buffer.add_string buf ",\"s\":";
+  add_json_string buf ow.s;
+  Buffer.add_string buf ",\"r\":";
+  add_json_bool buf ow.r;
+  Buffer.add_string buf ",\"t\":";
+  (match ow.t with
+   | Limit l ->
+     Buffer.add_string buf "{\"limit\":{\"tif\":";
+     add_json_string buf (tif_to_string l.tif);
+     Buffer.add_string buf "}}"
+   | Trigger t ->
+     Buffer.add_string buf "{\"trigger\":{\"isMarket\":";
+     add_json_bool buf t.isMarket;
+     Buffer.add_string buf ",\"triggerPx\":";
+     add_json_string buf t.triggerPx;
+     Buffer.add_string buf ",\"tpsl\":";
+     add_json_string buf (tpsl_to_string t.tpsl);
+     Buffer.add_string buf "}}");
+  (match ow.c with
+   | Some cloid ->
+     Buffer.add_string buf ",\"c\":";
+     add_json_string buf cloid
+   | None -> ());
+  Buffer.add_char buf '}'
+;;
+
+(** Append a batch order placement action. *)
+let add_order_action_json buf ~orders ~grouping =
+  Buffer.add_string buf "{\"type\":\"order\",\"orders\":[";
+  List.iteri
+    (fun i ow ->
+      if i > 0 then Buffer.add_char buf ',';
+      add_order_json buf ow)
+    orders;
+  Buffer.add_string buf "],\"grouping\":";
+  add_json_string buf grouping;
+  Buffer.add_char buf '}'
+;;
+
+(** Append a single order modification action. *)
+let add_modify_action_json buf ~oid ~order =
+  Buffer.add_string buf "{\"type\":\"modify\",\"oid\":";
+  Buffer.add_string buf (Int64.to_string oid);
+  Buffer.add_string buf ",\"order\":";
+  add_order_json buf order;
+  Buffer.add_char buf '}'
+;;
+
+(** Append a cancel action for exchange-assigned order IDs. *)
+let add_cancel_action_json buf ~asset_index ~order_ids =
+  Buffer.add_string buf "{\"type\":\"cancel\",\"cancels\":[";
+  List.iteri
+    (fun i oid ->
+      if i > 0 then Buffer.add_char buf ',';
+      Buffer.add_string buf "{\"a\":";
+      Buffer.add_string buf (string_of_int asset_index);
+      Buffer.add_string buf ",\"o\":";
+      Buffer.add_string buf (Int64.to_string oid);
+      Buffer.add_char buf '}')
+    order_ids;
+  Buffer.add_string buf "]";
+  Buffer.add_char buf '}'
+;;
+
 (** Pack a numeric ID using the most compact MsgPack integer tag. Falls back to Int64
     encoding if the value exceeds OCaml int range. *)
 let pack_id id =

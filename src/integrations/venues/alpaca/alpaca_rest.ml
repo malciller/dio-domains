@@ -183,7 +183,70 @@ let round_limit_price (price : float) =
   else Float.round (price *. 10000.0) /. 10000.0
 ;;
 
-let limit_price_json (p : float) = `String (Printf.sprintf "%.4f" (round_limit_price p))
+(** Order body written straight to a buffer: no [Yojson] AST and serializer per order. *)
+let order_body
+  ~symbol
+  ~qty
+  ~side_str
+  ~type_str
+  ~tif_str
+  ~mark_extended
+  ~limit_price
+  ~cl_ord_id
+  =
+  let buf = Buffer.create 256 in
+  Buffer.add_string buf "{\"symbol\":";
+  Json_writer.add_string buf symbol;
+  Buffer.add_string buf ",\"qty\":";
+  Json_writer.add_string buf (Printf.sprintf "%.9f" qty);
+  Buffer.add_string buf ",\"side\":";
+  Json_writer.add_string buf side_str;
+  Buffer.add_string buf ",\"type\":";
+  Json_writer.add_string buf type_str;
+  Buffer.add_string buf ",\"time_in_force\":";
+  Json_writer.add_string buf tif_str;
+  if mark_extended then Buffer.add_string buf ",\"extended_hours\":true";
+  (match limit_price with
+   | Some p ->
+     Buffer.add_string buf ",\"limit_price\":";
+     Json_writer.add_string buf (Printf.sprintf "%.4f" (round_limit_price p))
+   | None -> ());
+  (match cl_ord_id with
+   | Some cid ->
+     Buffer.add_string buf ",\"client_order_id\":";
+     Json_writer.add_string buf cid
+   | None -> ());
+  Buffer.add_char buf '}';
+  Buffer.contents buf
+;;
+
+(** Amend body: only the fields actually being changed are sent. *)
+let amend_body ~qty ~limit_price ~cl_ord_id =
+  let buf = Buffer.create 128 in
+  Buffer.add_char buf '{';
+  let first = ref true in
+  let sep () = if !first then first := false else Buffer.add_char buf ',' in
+  (match qty with
+   | Some q when Float.floor q = q ->
+     sep ();
+     Buffer.add_string buf "\"qty\":";
+     Json_writer.add_string buf (Printf.sprintf "%.9f" q)
+   | _ -> ());
+  (match limit_price with
+   | Some p ->
+     sep ();
+     Buffer.add_string buf "\"limit_price\":";
+     Json_writer.add_string buf (Printf.sprintf "%.4f" (round_limit_price p))
+   | None -> ());
+  (match cl_ord_id with
+   | Some cid ->
+     sep ();
+     Buffer.add_string buf "\"client_order_id\":";
+     Json_writer.add_string buf cid
+   | None -> ());
+  Buffer.add_char buf '}';
+  Buffer.contents buf
+;;
 
 let place_order
   ~symbol
@@ -229,26 +292,17 @@ let place_order
     | "limit" -> "limit"
     | _ -> "market"
   in
-  let assoc =
-    [ "symbol", `String symbol
-    ; "qty", `String (Printf.sprintf "%.9f" qty)
-    ; "side", `String side_str
-    ; "type", `String type_str
-    ; "time_in_force", `String tif_str
-    ]
+  let req_body =
+    order_body
+      ~symbol
+      ~qty
+      ~side_str
+      ~type_str
+      ~tif_str
+      ~mark_extended
+      ~limit_price
+      ~cl_ord_id
   in
-  let assoc = if mark_extended then ("extended_hours", `Bool true) :: assoc else assoc in
-  let assoc =
-    match limit_price with
-    | Some p -> ("limit_price", limit_price_json p) :: assoc
-    | None -> assoc
-  in
-  let assoc =
-    match cl_ord_id with
-    | Some cid -> ("client_order_id", `String cid) :: assoc
-    | None -> assoc
-  in
-  let req_body = `Assoc assoc |> Yojson.Safe.to_string in
   let headers = make_headers () in
   Logging.debug_f
     ~section
@@ -331,23 +385,7 @@ let place_order
 let amend_order ~order_id ?qty ?limit_price ?cl_ord_id () =
   let base_url = Config.rest_base_url () in
   let url = Uri.of_string (Printf.sprintf "%s/v2/orders/%s" base_url order_id) in
-  let assoc = [] in
-  let assoc =
-    match qty with
-    | Some q when Float.floor q = q -> ("qty", `String (Printf.sprintf "%.9f" q)) :: assoc
-    | _ -> assoc
-  in
-  let assoc =
-    match limit_price with
-    | Some p -> ("limit_price", limit_price_json p) :: assoc
-    | None -> assoc
-  in
-  let assoc =
-    match cl_ord_id with
-    | Some cid -> ("client_order_id", `String cid) :: assoc
-    | None -> assoc
-  in
-  let req_body = `Assoc assoc |> Yojson.Safe.to_string in
+  let req_body = amend_body ~qty ~limit_price ~cl_ord_id in
   let headers = make_headers () in
   Logging.debug_f ~section "Amending Alpaca order %s" order_id;
   retry_http_exceptions ~f:(fun () ->

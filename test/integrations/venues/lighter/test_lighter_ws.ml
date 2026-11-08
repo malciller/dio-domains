@@ -97,6 +97,23 @@ let test_tx_frame_batch () =
   Alcotest.(check int) "first info" 1 (member "Index" (List.nth infos 0) |> to_int)
 ;;
 
+let test_tx_frame_string_matches_ast () =
+  let cases =
+    [ []
+    ; [ 1, {|{"Index":42}|}, "id-1" ]
+    ; [ 1, {|{"Index":1,"Hex":"0xab"}|}, "id-1"; 2, {|{"Index":2}|}, "id-2" ]
+    ; [ 3, {|{"Nested":{"q":"a\"b"}}|}, "id\"x" ]
+    ]
+  in
+  List.iter
+    (fun txs ->
+      Alcotest.(check string)
+        "raw frame equals serialized AST"
+        (Yojson.Safe.to_string (Lighter.Ws.tx_frame txs))
+        (Lighter.Ws.tx_frame_string txs))
+    cases
+;;
+
 let test_parse_tx_ack_single_accepted () =
   let replies =
     Lighter.Ws.parse_tx_ack
@@ -333,11 +350,33 @@ let test_rejected_cancel_keeps_live_order () =
     (Option.is_some (Lighter.Executions_feed.get_open_order symbol "ws_cancel_1"))
 ;;
 
+let test_decode_orderbook_frame_uses_span_path () =
+  Lighter.Instruments_feed.initialize [ "OBWSPAN" ];
+  Lighter.Orderbook_feed.initialize [ "OBWSPAN" ];
+  let content =
+    {|{"type":"snapshot","channel":"order_book:0","order_book":{"b":[{"price":"100.0","size":"2.0"}],"a":[{"price":"101.0","size":"3.0"}]}}|}
+  in
+  (match Lighter.Ws.decode_text_frame content with
+   | Lighter.Ws.Frame_data -> ()
+   | _ -> Alcotest.fail "order-book frame should decode as Frame_data");
+  match Lighter.Orderbook_feed.get_best_bid_ask "OBWSPAN" with
+  | Some (bid, _, ask, _) ->
+    Alcotest.(check (float 0.000001)) "bid" 100.0 bid;
+    Alcotest.(check (float 0.000001)) "ask" 101.0 ask
+  | None -> Alcotest.fail "span path did not publish a book"
+;;
+
 let () =
   Alcotest.run
     "Lighter WebSocket"
     [ ( "state"
       , [ Alcotest.test_case "initial_state" `Quick test_connection_state_initially_false
+        ] )
+    ; ( "orderbook"
+      , [ Alcotest.test_case
+            "decode uses span path"
+            `Quick
+            test_decode_orderbook_frame_uses_span_path
         ] )
     ; ( "pubsub"
       , [ Alcotest.test_case "subscribe_market_data" `Quick test_subscribe_market_data
@@ -351,6 +390,10 @@ let () =
     ; ( "tx_frames"
       , [ Alcotest.test_case "single" `Quick test_tx_frame_single
         ; Alcotest.test_case "batch" `Quick test_tx_frame_batch
+        ; Alcotest.test_case
+            "raw frame matches AST"
+            `Quick
+            test_tx_frame_string_matches_ast
         ] )
     ; ( "tx_acks"
       , [ Alcotest.test_case "single accepted" `Quick test_parse_tx_ack_single_accepted

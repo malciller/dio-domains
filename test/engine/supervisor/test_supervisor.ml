@@ -452,6 +452,34 @@ let test_inflight_stale_detection () =
   Alcotest.(check int) "removed key is no longer reported" 0 after
 ;;
 
+let test_send_pipeline_serializes_per_symbol () =
+  let events = ref [] in
+  let push e = events := e :: !events in
+  let task name () =
+    push (name ^ ":start");
+    Lwt.bind (Lwt.pause ()) (fun () ->
+      push (name ^ ":end");
+      Lwt.return_unit)
+  in
+  Supervisor_orders.enqueue_send ("pipeline", "sym") (task "a");
+  Supervisor_orders.enqueue_send ("pipeline", "sym") (task "b");
+  Lwt_main.run (Lwt_unix.sleep 0.02);
+  let order = List.rev !events in
+  let pos e =
+    let rec go i = function
+      | [] -> -1
+      | x :: _ when x = e -> i
+      | _ :: rest -> go (i + 1) rest
+    in
+    go 0 order
+  in
+  Alcotest.(check int) "both tasks completed" 4 (List.length order);
+  Alcotest.(check bool)
+    "same-symbol tasks are serialized"
+    true
+    (pos "a:end" >= 0 && pos "b:start" > pos "a:end")
+;;
+
 let () =
   Alcotest.run
     "Supervisor"
@@ -517,6 +545,12 @@ let () =
             "stale in-flight keys are detected"
             `Quick
             test_inflight_stale_detection
+        ] )
+    ; ( "send_pipeline"
+      , [ Alcotest.test_case
+            "same-symbol sends are serialized"
+            `Quick
+            test_send_pipeline_serializes_per_symbol
         ] )
     ]
 ;;

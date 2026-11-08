@@ -215,7 +215,7 @@ let next_ws_req_id () =
 (** Submits a signed action via the WebSocket "post" channel. Returns [Error] immediately
     when disconnected. Extracts data.response.payload to match the REST response shape for
     shared parsing. *)
-let post_exchange_ws ~testnet:_ ~action_json ~action_msgpack ~is_mainnet =
+let post_exchange_ws ~testnet:_ ~write_action ~action_msgpack ~is_mainnet =
   if not (Hyperliquid_ws.is_connected ())
   then Lwt.return (Error "Hyperliquid WS not connected - order rejected")
   else (
@@ -231,36 +231,39 @@ let post_exchange_ws ~testnet:_ ~action_json ~action_msgpack ~is_mainnet =
         ()
     in
     let req_id = next_ws_req_id () in
-    let ws_frame =
-      `Assoc
-        [ "method", `String "post"
-        ; "id", `Int req_id
-        ; ( "request"
-          , `Assoc
-              [ "type", `String "action"
-              ; ( "payload"
-                , `Assoc
-                    [ "action", action_json
-                    ; "nonce", `Intlit (Int64.to_string nonce)
-                    ; "signature", `Assoc [ "r", `String r; "s", `String s; "v", `Int v ]
-                    ] )
-              ] )
-        ]
-    in
+    (* Pre-serialize the envelope: the order path must not build a second Yojson AST (and
+       its serializer) just to wrap the action. *)
+    let buf = Buffer.create 512 in
+    Buffer.add_string buf "{\"method\":\"post\",\"id\":";
+    Buffer.add_string buf (string_of_int req_id);
+    Buffer.add_string buf ",\"request\":{\"type\":\"action\",\"payload\":{\"action\":";
+    write_action buf;
+    Buffer.add_string buf ",\"nonce\":";
+    Buffer.add_string buf (Int64.to_string nonce);
+    Buffer.add_string buf ",\"signature\":{\"r\":\"";
+    Buffer.add_string buf r;
+    Buffer.add_string buf "\",\"s\":\"";
+    Buffer.add_string buf s;
+    Buffer.add_string buf "\",\"v\":";
+    Buffer.add_string buf (string_of_int v);
+    Buffer.add_string buf "}}}}";
+    let body = Buffer.contents buf in
     Logging.debug_f ~section "Sending WS post action: req_id=%d" req_id;
     Lwt.catch
       (fun () ->
-        Hyperliquid_ws.send_request ~json:ws_frame ~req_id ~timeout_ms:10000
+        Hyperliquid_ws.send_request_raw ~body ~req_id ~timeout_ms:10000
         >>= fun resp ->
         let open Yojson.Safe.Util in
         let payload =
           try resp |> member "data" |> member "response" |> member "payload" with
           | _ -> resp
         in
-        Logging.debug_f
-          ~section
-          "Hyperliquid order raw WS response: %s"
-          (Yojson.Safe.to_string payload);
+        if Logging.will_log Logging.DEBUG section
+        then
+          Logging.debug_f
+            ~section
+            "Hyperliquid order raw WS response: %s"
+            (Yojson.Safe.to_string payload);
         Lwt.return (Ok payload))
       (fun exn ->
         let err = Printexc.to_string exn in
@@ -308,29 +311,11 @@ let place_order
     in
     let action = pack_order_action ~orders:[ order_wire ] ~grouping:"na" in
     let action_msgpack = serialize_action action in
-    let order_json =
-      [ "a", `Int asset_index
-      ; "b", `Bool is_buy
-      ; "p", `String p_wire
-      ; "s", `String s_wire
-      ; "r", `Bool (Option.value reduce_only ~default:false)
-      ; "t", `Assoc [ "limit", `Assoc [ "tif", `String (tif_to_string tif) ] ]
-      ]
-    in
-    let order_json =
-      match cl_ord_id with
-      | Some c -> order_json @ [ "c", `String c ]
-      | None -> order_json
-    in
-    let action_json =
-      `Assoc
-        [ "type", `String "order"
-        ; "orders", `List [ `Assoc order_json ]
-        ; "grouping", `String "na"
-        ]
+    let write_action buf =
+      add_order_action_json buf ~orders:[ order_wire ] ~grouping:"na"
     in
     let is_mainnet = not testnet in
-    post_exchange_ws ~testnet ~action_json ~action_msgpack ~is_mainnet
+    post_exchange_ws ~testnet ~write_action ~action_msgpack ~is_mainnet
     >>= function
     | Ok res ->
       let open Yojson.Safe.Util in
@@ -483,11 +468,13 @@ let amend_order
       | Some idx -> idx
       | None -> failwith (Printf.sprintf "Unknown symbol: %s" symbol)
     in
+    let p_wire = format_number px in
+    let s_wire = format_number sz in
     let order_wire =
       { a = asset_index
       ; b = is_buy
-      ; p = format_number px
-      ; s = format_number sz
+      ; p = p_wire
+      ; s = s_wire
       ; r = reduce_only
       ; t = Limit { tif }
       ; c = cl_ord_id
@@ -495,29 +482,9 @@ let amend_order
     in
     let action = pack_modify_action ~oid:order_id ~order:order_wire in
     let action_msgpack = serialize_action action in
-    let order_json =
-      [ "a", `Int asset_index
-      ; "b", `Bool is_buy
-      ; "p", `String (format_number px)
-      ; "s", `String (format_number sz)
-      ; "r", `Bool reduce_only
-      ; "t", `Assoc [ "limit", `Assoc [ "tif", `String (tif_to_string tif) ] ]
-      ]
-    in
-    let order_json =
-      match cl_ord_id with
-      | Some c -> order_json @ [ "c", `String c ]
-      | None -> order_json
-    in
-    let action_json =
-      `Assoc
-        [ "type", `String "modify"
-        ; "oid", `Intlit (Int64.to_string order_id)
-        ; "order", `Assoc order_json
-        ]
-    in
+    let write_action buf = add_modify_action_json buf ~oid:order_id ~order:order_wire in
     let is_mainnet = not testnet in
-    post_exchange_ws ~testnet ~action_json ~action_msgpack ~is_mainnet
+    post_exchange_ws ~testnet ~write_action ~action_msgpack ~is_mainnet
     >>= function
     | Ok res -> Lwt.return (parse_amend_response ~order_id res)
     | Error e -> Lwt.return (Error e)
@@ -543,19 +510,9 @@ let cancel_orders ~symbol ~order_ids ~testnet =
         ~cancels:(List.map (fun oid -> { a = asset_index; o = oid }) order_ids)
     in
     let action_msgpack = serialize_action action in
-    let action_json =
-      `Assoc
-        [ "type", `String "cancel"
-        ; ( "cancels"
-          , `List
-              (List.map
-                 (fun oid ->
-                   `Assoc [ "a", `Int asset_index; "o", `Intlit (Int64.to_string oid) ])
-                 order_ids) )
-        ]
-    in
+    let write_action buf = add_cancel_action_json buf ~asset_index ~order_ids in
     let is_mainnet = not testnet in
-    post_exchange_ws ~testnet ~action_json ~action_msgpack ~is_mainnet
+    post_exchange_ws ~testnet ~write_action ~action_msgpack ~is_mainnet
     >>= function
     | Ok _ -> Lwt.return (Ok ())
     | Error e -> Lwt.return (Error e)

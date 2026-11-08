@@ -18,4 +18,5 @@
   dio.exchange
   dio.error_handling
   dio.json_scan
+  dio.json_writer
   dio.latency_profiling))

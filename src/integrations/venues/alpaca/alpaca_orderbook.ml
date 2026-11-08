@@ -292,6 +292,17 @@ let json_float_of_span s i j =
   else Json_scan.float_of_span s i j
 ;;
 
+(** True for quote/trade frames ([T] is ["q"] or ["t"]). Control frames carry
+    auth/subscription callbacks and must stay on the Lwt domain. *)
+let is_market_data content =
+  let len = String.length content in
+  match Json_scan.find_field content 1 (max 0 (len - 1)) "T" with
+  | Some (i, j) ->
+    Json_scan.span_equals_literal content i j "q"
+    || Json_scan.span_equals_literal content i j "t"
+  | None -> false
+;;
+
 let handle_message_str ?on_auth_success ?on_auth_error content =
   let trimmed = String.trim content in
   if trimmed <> ""
@@ -637,7 +648,11 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
                 | _ ->
                   let content = String.trim frame.Websocket.Frame.content in
                   if content <> ""
-                  then handle_message_str ~on_auth_success ~on_auth_error content;
+                  then
+                    if not
+                         (is_market_data content
+                          && Concurrency.Parse_worker.submit_frame "alpaca" content)
+                    then handle_message_str ~on_auth_success ~on_auth_error content;
                   (match !auth_failure_reason with
                    | Some reason -> Lwt.fail (Failure reason)
                    | None -> Lwt.return_unit)))

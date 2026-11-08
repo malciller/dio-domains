@@ -111,6 +111,8 @@ let evaluate_sell_leg = Strategy_decision.evaluate_sell_leg
 type sell_pre = Strategy_decision.sell_pre
 
 let sell_leg_prepare = Strategy_decision.sell_leg_prepare
+let sell_leg_prepare_into = Strategy_decision.sell_leg_prepare_into
+let fresh_sell_pre = Strategy_decision.fresh_sell_pre
 let sell_leg_place = Strategy_decision.sell_leg_place
 let sell_place_should = Strategy_decision.sell_place_should
 let sell_place_body = Strategy_decision.sell_place_body
@@ -297,7 +299,6 @@ module Strategy = struct
   (** Clears the startup_replay flag so subsequent fills are processed normally. *)
   let set_startup_replay_done symbol =
     let state = get_strategy_state symbol in
-    Mutex.lock state.mutex;
     if state.startup_replay
     then (
       state.startup_replay <- false;
@@ -361,7 +362,6 @@ module Strategy = struct
       state.inflight_buy <- false;
       state.recently_injected_sells <- [];
       ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_sell);
-      ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_buy));
-    Mutex.unlock state.mutex
+      ignore (InFlightOrders.remove_in_flight_order state.duplicate_key_buy))
   ;;
 end

@@ -4,6 +4,8 @@
  (libraries
   dio.data_structures
   dio.yojson
+  dio.json_scan
+  dio.json_writer
   dio.lwt
   dio.lwt.unix
   logging

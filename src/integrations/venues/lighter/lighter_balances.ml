@@ -91,7 +91,6 @@ let balance_stores : (string, BalanceStore.t) Ds.Cow_table.t =
 ;;
 
 let is_ready = Atomic.make false
-let ready_condition = Lwt_condition.create ()
 
 let get_balance_store asset =
   match Ds.Cow_table.find_opt balance_stores asset with
@@ -137,27 +136,30 @@ let get_all_assets () =
   Ds.Cow_table.fold (fun asset _store acc -> asset :: acc) balance_stores ~init:[]
 ;;
 
-let notify_ready () =
-  if not (Atomic.get is_ready)
-  then (
-    Atomic.set is_ready true;
-    try Lwt_condition.broadcast ready_condition () with
-    | _ -> ())
-;;
+(* Atomic flag only: account frames are decoded on the parse domain, which must not touch
+   Lwt. Startup waiters poll. *)
+let notify_ready () = Atomic.set is_ready true
 
 let wait_for_balance_data_lwt assets timeout_seconds =
-  Concurrency.Lwt_util.poll_until
-    ~timeout:timeout_seconds
-    ~wait_signal:(fun () -> Lwt_condition.wait ready_condition)
-    ~check:(fun () -> List.for_all has_balance_data assets)
+  let start_time = Unix.gettimeofday () in
+  let rec wait_loop () =
+    if List.for_all has_balance_data assets
+    then Lwt.return_true
+    else if Unix.gettimeofday () -. start_time >= timeout_seconds
+    then Lwt.return_false
+    else
+      let open Lwt.Infix in
+      Lwt_unix.sleep 0.025 >>= wait_loop
+  in
+  wait_loop ()
 ;;
 
 let wait_until_ready () =
-  if Atomic.get is_ready
-  then Lwt.return_true
-  else
-    let open Lwt.Infix in
-    Lwt_condition.wait ready_condition >>= fun () -> Lwt.return_true
+  let open Lwt.Infix in
+  let rec wait_loop () =
+    if Atomic.get is_ready then Lwt.return_true else Lwt_unix.sleep 0.01 >>= wait_loop
+  in
+  wait_loop ()
 ;;
 
 let wait_for_balance_data = wait_for_balance_data_lwt
@@ -423,6 +425,156 @@ let last_refresh_request = Atomic.make 0.0
 [@@ocaml.doc " Timestamp of the last balance refresh request (debounce gate). "]
 ;;
 
+let refresh_doorbell = Concurrency.Domain_doorbell.create ()
+let refresh_loop_started = Atomic.make false
+
+let do_balance_refresh () =
+  Lwt.catch
+    (fun () ->
+      let open Lwt.Infix in
+      Lwt_unix.sleep 0.3
+      >>= fun () ->
+      let account_index =
+        match Sys.getenv_opt "LIGHTER_ACCOUNT_INDEX" |> Option.map String.trim with
+        | Some s ->
+          (try int_of_string s with
+           | _ -> 0)
+        | None -> 0
+      in
+      let base_url = Lighter_endpoints.api_base_url in
+      let url =
+        Printf.sprintf "%s/api/v1/account?by=index&value=%d" base_url account_index
+      in
+      let uri = Uri.of_string url in
+      let __ppx_lwt_0 = Cohttp_lwt_unix.Client.get uri in
+      Lwt.backtrace_bind
+        "src/integrations/venues/lighter/lighter_balances.ml"
+        461
+        (fun exn ->
+          try Lwt.reraise exn with
+          | exn -> exn)
+        __ppx_lwt_0
+        (fun (resp, body) ->
+          let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+          let __ppx_lwt_0 = Cohttp_lwt.Body.to_string body in
+          Lwt.backtrace_bind
+            "src/integrations/venues/lighter/lighter_balances.ml"
+            463
+            (fun exn ->
+              try Lwt.reraise exn with
+              | exn -> exn)
+            __ppx_lwt_0
+            (fun body_str ->
+              if status >= 200 && status < 300
+              then (
+                let trimmed = String.trim body_str in
+                if trimmed <> "" && trimmed <> "{}"
+                then (
+                  let json = Yojson.Safe.from_string trimmed in
+                  Lighter_positions.process_rest_account json;
+                  let open Yojson.Safe.Util in
+                  let accounts =
+                    try member "accounts" json |> to_list with
+                    | _ -> []
+                  in
+                  match accounts with
+                  | account :: _ ->
+                    let assets =
+                      try member "assets" account |> to_list with
+                      | _ -> []
+                    in
+                    let assets_assoc =
+                      List.map
+                        (fun asset_json ->
+                          let asset_id =
+                            try
+                              member "asset_id" asset_json |> to_int |> string_of_int
+                            with
+                            | _ -> "?"
+                          in
+                          asset_id, asset_json)
+                        assets
+                    in
+                    let has_usdc_in_assets =
+                      List.exists
+                        (fun (_id, aj) ->
+                          let sym =
+                            try member "symbol" aj |> to_string with
+                            | _ -> ""
+                          in
+                          let bal =
+                            try Lighter_types.parse_json_float (member "balance" aj) with
+                            | _ -> 0.0
+                          in
+                          sym = "USDC" && bal > 0.0)
+                        assets_assoc
+                    in
+                    let final_assets =
+                      if has_usdc_in_assets
+                      then assets_assoc
+                      else (
+                        let collateral =
+                          try
+                            Lighter_types.parse_json_float (member "collateral" account)
+                          with
+                          | _ -> 0.0
+                        in
+                        let available =
+                          try
+                            Lighter_types.parse_json_float
+                              (member "available_balance" account)
+                          with
+                          | _ -> 0.0
+                        in
+                        let usdc_balance = max collateral available in
+                        if usdc_balance > 0.0
+                        then
+                          assets_assoc
+                          @ [ ( "3"
+                              , `Assoc
+                                  [ "symbol", `String "USDC"
+                                  ; "asset_id", `Int 3
+                                  ; ( "balance"
+                                    , `String (Printf.sprintf "%.6f" usdc_balance) )
+                                  ; "locked_balance", `String "0.000000"
+                                  ] )
+                            ]
+                        else assets_assoc)
+                    in
+                    let synthetic_json =
+                      `Assoc
+                        [ "type", `String "snapshot/account_all_assets"
+                        ; ( "channel"
+                          , `String (Printf.sprintf "account_all_assets/%d" account_index)
+                          )
+                        ; "account_all", `Assoc [ "assets", `Assoc final_assets ]
+                        ]
+                    in
+                    process_market_data synthetic_json;
+                    let usdc_bal = get_balance "USDC" in
+                    Logging.info_f ~section "Balance refresh complete: USDC=%.6f" usdc_bal
+                  | [] -> Logging.warn_f ~section "Balance refresh: empty accounts array");
+                Lwt.return_unit)
+              else (
+                Logging.warn_f ~section "Balance refresh failed: HTTP %d" status;
+                Lwt.return_unit))))
+    (fun exn ->
+      Logging.error_f ~section "Balance refresh exception: %s" (Printexc.to_string exn);
+      Lwt.return_unit)
+;;
+
+(** Runs on the Lwt domain. The fill path only rings the doorbell, so it is safe to call
+    from a parse domain; the wake is immediate (no poll interval). *)
+let rec refresh_loop () =
+  let open Lwt.Infix in
+  Concurrency.Domain_doorbell.wait refresh_doorbell
+  >>= fun () -> do_balance_refresh () >>= fun () -> refresh_loop ()
+;;
+
+let start_refresh_loop () =
+  if Atomic.compare_and_set refresh_loop_started false true then Lwt.async refresh_loop
+;;
+
 let request_balance_refresh () =
   let now = Unix.gettimeofday () in
   let last = Atomic.get last_refresh_request in
@@ -430,156 +582,11 @@ let request_balance_refresh () =
   then (
     Atomic.set last_refresh_request now;
     Logging.info_f ~section "Balance refresh requested (fill-triggered)";
-    Lwt.async (fun () ->
-      Lwt.catch
-        (fun () ->
-          let open Lwt.Infix in
-          Lwt_unix.sleep 0.3
-          >>= fun () ->
-          let account_index =
-            match Sys.getenv_opt "LIGHTER_ACCOUNT_INDEX" |> Option.map String.trim with
-            | Some s ->
-              (try int_of_string s with
-               | _ -> 0)
-            | None -> 0
-          in
-          let base_url = Lighter_endpoints.api_base_url in
-          let url =
-            Printf.sprintf "%s/api/v1/account?by=index&value=%d" base_url account_index
-          in
-          let uri = Uri.of_string url in
-          let __ppx_lwt_0 = Cohttp_lwt_unix.Client.get uri in
-          Lwt.backtrace_bind
-            "src/integrations/venues/lighter/lighter_balances.ml"
-            461
-            (fun exn ->
-              try Lwt.reraise exn with
-              | exn -> exn)
-            __ppx_lwt_0
-            (fun (resp, body) ->
-              let status = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-              let __ppx_lwt_0 = Cohttp_lwt.Body.to_string body in
-              Lwt.backtrace_bind
-                "src/integrations/venues/lighter/lighter_balances.ml"
-                463
-                (fun exn ->
-                  try Lwt.reraise exn with
-                  | exn -> exn)
-                __ppx_lwt_0
-                (fun body_str ->
-                  if status >= 200 && status < 300
-                  then (
-                    let trimmed = String.trim body_str in
-                    if trimmed <> "" && trimmed <> "{}"
-                    then (
-                      let json = Yojson.Safe.from_string trimmed in
-                      Lighter_positions.process_rest_account json;
-                      let open Yojson.Safe.Util in
-                      let accounts =
-                        try member "accounts" json |> to_list with
-                        | _ -> []
-                      in
-                      match accounts with
-                      | account :: _ ->
-                        let assets =
-                          try member "assets" account |> to_list with
-                          | _ -> []
-                        in
-                        let assets_assoc =
-                          List.map
-                            (fun asset_json ->
-                              let asset_id =
-                                try
-                                  member "asset_id" asset_json |> to_int |> string_of_int
-                                with
-                                | _ -> "?"
-                              in
-                              asset_id, asset_json)
-                            assets
-                        in
-                        let has_usdc_in_assets =
-                          List.exists
-                            (fun (_id, aj) ->
-                              let sym =
-                                try member "symbol" aj |> to_string with
-                                | _ -> ""
-                              in
-                              let bal =
-                                try
-                                  Lighter_types.parse_json_float (member "balance" aj)
-                                with
-                                | _ -> 0.0
-                              in
-                              sym = "USDC" && bal > 0.0)
-                            assets_assoc
-                        in
-                        let final_assets =
-                          if has_usdc_in_assets
-                          then assets_assoc
-                          else (
-                            let collateral =
-                              try
-                                Lighter_types.parse_json_float
-                                  (member "collateral" account)
-                              with
-                              | _ -> 0.0
-                            in
-                            let available =
-                              try
-                                Lighter_types.parse_json_float
-                                  (member "available_balance" account)
-                              with
-                              | _ -> 0.0
-                            in
-                            let usdc_balance = max collateral available in
-                            if usdc_balance > 0.0
-                            then
-                              assets_assoc
-                              @ [ ( "3"
-                                  , `Assoc
-                                      [ "symbol", `String "USDC"
-                                      ; "asset_id", `Int 3
-                                      ; ( "balance"
-                                        , `String (Printf.sprintf "%.6f" usdc_balance) )
-                                      ; "locked_balance", `String "0.000000"
-                                      ] )
-                                ]
-                            else assets_assoc)
-                        in
-                        let synthetic_json =
-                          `Assoc
-                            [ "type", `String "snapshot/account_all_assets"
-                            ; ( "channel"
-                              , `String
-                                  (Printf.sprintf "account_all_assets/%d" account_index) )
-                            ; "account_all", `Assoc [ "assets", `Assoc final_assets ]
-                            ]
-                        in
-                        process_market_data synthetic_json;
-                        let usdc_bal = get_balance "USDC" in
-                        Logging.info_f
-                          ~section
-                          "Balance refresh complete: USDC=%.6f"
-                          usdc_bal
-                      | [] ->
-                        Logging.warn_f ~section "Balance refresh: empty accounts array");
-                    Lwt.return_unit)
-                  else (
-                    Logging.warn_f ~section "Balance refresh failed: HTTP %d" status;
-                    Lwt.return_unit))))
-        (fun exn ->
-          Logging.error_f
-            ~section
-            "Balance refresh exception: %s"
-            (Printexc.to_string exn);
-          Lwt.return_unit)))
-[@@ocaml.doc
-  " Triggers an asynchronous REST balance fetch to recover stale USDC values. Debounced to\n\
-  \    at most once per 2 seconds to avoid API rate limits. Called when sell fills are\n\
-  \    detected but the WS balance feed has not updated. "]
+    Concurrency.Domain_doorbell.ring refresh_doorbell)
 ;;
 
 let initialize assets =
+  start_refresh_loop ();
   Logging.info_f
     ~section
     "Initializing Lighter balances feed for %d assets"

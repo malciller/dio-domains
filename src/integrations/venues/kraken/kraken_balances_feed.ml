@@ -7,6 +7,10 @@ open Concurrency
 
 let section = "kraken_balances"
 
+(* Per-connection heartbeat closure, published so the parse-domain handler can invoke it
+   from the parse domain. One authenticated connection exists at a time. *)
+let current_on_heartbeat : (unit -> unit) option Atomic.t = Atomic.make None
+
 open Kraken_common_types
 
 (** Normalizes asset names by stripping staking/earn suffixes (e.g. BTC.HOLD -> BTC) and
@@ -193,7 +197,6 @@ let balance_stores : (string, BalanceStore.t) Hashtbl.t = Hashtbl.create 32
 
 let balance_stores_mutex = Mutex.create ()
 let initialized = Atomic.make false
-let ready_condition = Lwt_condition.create ()
 
 (** Tracks the last update timestamp per asset for staleness detection. *)
 let last_balance_update : (string, float) Hashtbl.t = Hashtbl.create 32
@@ -311,33 +314,20 @@ let get_all_assets () =
   !assets
 ;;
 
-(** Broadcasts on [ready_condition] to unblock threads waiting for balance data. *)
-let notify_ready () =
-  try Lwt_condition.broadcast ready_condition () with
-  | Invalid_argument _ ->
-    (* Suppress exceptions from cancelled Lwt threads. *)
-    ()
-;;
-
 (** Blocks until all [assets] have balance data or [timeout_seconds] elapses. Returns true
     if all assets were populated, false on timeout. *)
 let wait_for_balance_data_lwt assets timeout_seconds =
-  let deadline = Unix.gettimeofday () +. timeout_seconds in
+  (* Balances are decoded on the venue's parse domain, which must not touch Lwt, so the
+     readiness flag is polled. Startup-only; bounded by the timeout. *)
+  let start_time = Unix.gettimeofday () in
   let rec loop () =
     if List.for_all has_balance_data assets
     then Lwt.return_true
-    else (
-      let remaining = deadline -. Unix.gettimeofday () in
-      if remaining <= 0.0
-      then Lwt.return_false
-      else
-        Lwt.pick
-          [ (Lwt_condition.wait ready_condition >|= fun () -> `Again)
-          ; (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
-          ]
-        >>= function
-        | `Again -> loop ()
-        | `Timeout -> Lwt.return (List.for_all has_balance_data assets))
+    else if Unix.gettimeofday () -. start_time >= timeout_seconds
+    then Lwt.return_false
+    else
+      let open Lwt.Infix in
+      Lwt_unix.sleep 0.025 >>= loop
   in
   loop ()
 ;;
@@ -462,7 +452,6 @@ let parse_snapshot json on_heartbeat =
                   (Printexc.to_string exn))
             wallets;
           update_balance_timestamp base_asset;
-          notify_ready ();
           let total_balance = BalanceStore.get_balance store in
           Logging.debug_f
             ~section
@@ -495,7 +484,6 @@ let parse_snapshot json on_heartbeat =
             "Balance snapshot: Marked zero-balance asset %s as updated"
             asset))
       all_assets;
-    notify_ready ();
     maybe_cleanup_after_balance_update ();
     Some ()
   with
@@ -525,7 +513,6 @@ let parse_update json on_heartbeat =
           let store = get_balance_store base_asset in
           BalanceStore.update_wallet store balance wallet_type wallet_id asset;
           update_balance_timestamp base_asset;
-          notify_ready ();
           let balance_data = BalanceStore.get_all store in
           let event_data =
             { asset = base_asset
@@ -622,14 +609,21 @@ let handle_message_json json on_heartbeat =
     let method_type = member "method" json |> to_string_option in
     match channel, msg_type, method_type with
     | Some "balances", Some "snapshot", _ ->
-      Logging.debug_f
-        ~section
-        "Balances snapshot received: %s"
-        (Yojson.Safe.to_string json);
+      if Logging.will_log Logging.DEBUG section
+      then
+        Logging.debug_f
+          ~section
+          "Balances snapshot received: %s"
+          (Yojson.Safe.to_string json);
       let _ = parse_snapshot json on_heartbeat in
       ()
     | Some "balances", Some "update", _ ->
-      Logging.debug_f ~section "Balances update received: %s" (Yojson.Safe.to_string json);
+      if Logging.will_log Logging.DEBUG section
+      then
+        Logging.debug_f
+          ~section
+          "Balances update received: %s"
+          (Yojson.Safe.to_string json);
       let _ = parse_update json on_heartbeat in
       ()
     | Some "heartbeat", _, _ -> on_heartbeat ()
@@ -652,11 +646,17 @@ let handle_message_json json on_heartbeat =
 ;;
 
 (** Parse-domain body: parse and dispatch without publishing a tick (the WS fiber owns
-    tick accounting). Used by the uniform venue decoder. *)
+    tick accounting), invoking the connection's current heartbeat. Used by the uniform
+    venue decoder. *)
 let process_parse_domain_frame message =
+  let heartbeat =
+    match Atomic.get current_on_heartbeat with
+    | Some f -> f
+    | None -> fun () -> ()
+  in
   try
     let json = Yojson.Safe.from_string message in
-    handle_message_json json (fun () -> ())
+    handle_message_json json heartbeat
   with
   | exn ->
     Logging.error_f
@@ -850,7 +850,6 @@ let poll_earn_allocations () =
                  "Failed to parse Earn allocation: %s"
                  (Printexc.to_string e))
            allocations_list;
-         notify_ready ();
          Lwt.return_unit
      with
      | exn ->
@@ -874,6 +873,7 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
   Logging.debug
     ~section
     "Registering balances subscription on unified authenticated connection";
+  Atomic.set current_on_heartbeat (Some on_heartbeat);
   let subscribe_msg =
     `Assoc
       [ "method", `String "subscribe"

@@ -892,35 +892,64 @@ let evaluate_excess_sweep
     ([evaluate_sell_leg] below recombines the three phases, so the reference entry point
     is unchanged. The trigger/latch/sizing contract is documented on its sub-phases.) *)
 type sell_pre =
-  { sp_is_alpaca : bool
-  ; sp_venue_balance : float
-  ; sp_base_balance_age : float option
-  ; sp_ledger_balance : float
-  ; sp_alpaca_available : float
-  ; sp_available_base : float
-  ; sp_committed_sell : float
-  ; sp_committed_total : float
-  ; sp_unnetted_hold : float
-  ; sp_unreflected_credit : float
-  ; sp_reserve_headroom : float
-  ; sp_reservation_headroom : float
-  ; sp_inventory_basis : float
-  ; sp_inventory_ok : bool
-  ; sp_min_notional : float
-  ; sp_base_ref_price : float
-  ; sp_capital_exhausted : bool
-  ; sp_halt_inventory_check : bool
-  ; sp_asset_low_residual_ok : bool
-  ; sp_should_trigger_sell : bool
-  ; sp_is_sell_on_cooldown : bool
-  ; sp_missing_after_reconcile : (float * float) list ref
-  ; sp_sell_pushed : bool ref
-  ; sp_nothing_placeable : bool ref
+  { mutable sp_is_alpaca : bool
+  ; mutable sp_venue_balance : float
+  ; mutable sp_base_balance_age : float option
+  ; mutable sp_ledger_balance : float
+  ; mutable sp_alpaca_available : float
+  ; mutable sp_available_base : float
+  ; mutable sp_committed_sell : float
+  ; mutable sp_committed_total : float
+  ; mutable sp_unnetted_hold : float
+  ; mutable sp_unreflected_credit : float
+  ; mutable sp_reserve_headroom : float
+  ; mutable sp_reservation_headroom : float
+  ; mutable sp_inventory_basis : float
+  ; mutable sp_inventory_ok : bool
+  ; mutable sp_min_notional : float
+  ; mutable sp_base_ref_price : float
+  ; mutable sp_capital_exhausted : bool
+  ; mutable sp_halt_inventory_check : bool
+  ; mutable sp_asset_low_residual_ok : bool
+  ; mutable sp_should_trigger_sell : bool
+  ; mutable sp_is_sell_on_cooldown : bool
+  ; mutable sp_missing_after_reconcile : (float * float) list ref
+  ; mutable sp_sell_pushed : bool ref
+  ; mutable sp_nothing_placeable : bool ref
   }
 
 (** Sell leg phase 1: derived sizing/gate facts and the persisted-level reconcile. *)
 
-let sell_leg_prepare
+let fresh_sell_pre () =
+  { sp_is_alpaca = false
+  ; sp_venue_balance = 0.0
+  ; sp_base_balance_age = None
+  ; sp_ledger_balance = 0.0
+  ; sp_alpaca_available = 0.0
+  ; sp_available_base = 0.0
+  ; sp_committed_sell = 0.0
+  ; sp_committed_total = 0.0
+  ; sp_unnetted_hold = 0.0
+  ; sp_unreflected_credit = 0.0
+  ; sp_reserve_headroom = 0.0
+  ; sp_reservation_headroom = 0.0
+  ; sp_inventory_basis = 0.0
+  ; sp_inventory_ok = false
+  ; sp_min_notional = 0.0
+  ; sp_base_ref_price = 0.0
+  ; sp_capital_exhausted = false
+  ; sp_halt_inventory_check = false
+  ; sp_asset_low_residual_ok = false
+  ; sp_should_trigger_sell = false
+  ; sp_is_sell_on_cooldown = false
+  ; sp_missing_after_reconcile = ref []
+  ; sp_sell_pushed = ref false
+  ; sp_nothing_placeable = ref false
+  }
+;;
+
+let sell_leg_prepare_into
+  ~pre
   ~persisted_reconcile
   ~state
   ~now
@@ -934,6 +963,12 @@ let sell_leg_prepare
   ~locked_in_sells
   ~base_balance_age
   =
+  let missing_after_reconcile = pre.sp_missing_after_reconcile in
+  missing_after_reconcile := [];
+  let sell_pushed = pre.sp_sell_pushed in
+  sell_pushed := false;
+  let nothing_placeable = pre.sp_nothing_placeable in
+  nothing_placeable := false;
   let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
   let asset_available = venue_available_base ~asset in
   (* Placed-sell holds the balance feed may not yet be netting: until a balance message
@@ -1022,7 +1057,6 @@ let sell_leg_prepare
      during its scan (each open sell consumes one persisted level), so the missing set
      falls out in O(m). Only direct [evaluate_sell_leg] callers (tests) fall back to the
      partition. *)
-  let missing_after_reconcile = ref [] in
   let pruned_missing = ref [] in
   let _sp_rec = Strategy_state.sub_start state in
   if ecfg.remaintain_expired_sells && state.persisted_sell_levels <> []
@@ -1236,33 +1270,62 @@ let sell_leg_prepare
   (match skip_reason with
    | Some reason -> log_sell_block ~state ~now ~symbol:asset.symbol (fun () -> reason)
    | None -> ());
-  let sell_pushed = ref false in
-  let nothing_placeable = ref false in
-  { sp_is_alpaca = is_alpaca
-  ; sp_venue_balance = asset_balance
-  ; sp_base_balance_age = base_balance_age
-  ; sp_ledger_balance = ledger_balance
-  ; sp_alpaca_available = alpaca_available
-  ; sp_available_base = available_base
-  ; sp_committed_sell = committed_sell
-  ; sp_committed_total = committed_total
-  ; sp_unnetted_hold = unnetted_hold
-  ; sp_unreflected_credit = unreflected_credit
-  ; sp_reserve_headroom = reserve_headroom
-  ; sp_reservation_headroom = reservation_headroom
-  ; sp_inventory_basis = inventory_basis
-  ; sp_inventory_ok = inventory_ok
-  ; sp_min_notional = min_notional
-  ; sp_base_ref_price = base_ref_price
-  ; sp_capital_exhausted = capital_exhausted
-  ; sp_halt_inventory_check = halt_inventory_check
-  ; sp_asset_low_residual_ok = asset_low_residual_ok
-  ; sp_should_trigger_sell = should_trigger_sell
-  ; sp_is_sell_on_cooldown = is_sell_on_cooldown
-  ; sp_missing_after_reconcile = missing_after_reconcile
-  ; sp_sell_pushed = sell_pushed
-  ; sp_nothing_placeable = nothing_placeable
-  }
+  pre.sp_is_alpaca <- is_alpaca;
+  pre.sp_venue_balance <- asset_balance;
+  pre.sp_base_balance_age <- base_balance_age;
+  pre.sp_ledger_balance <- ledger_balance;
+  pre.sp_alpaca_available <- alpaca_available;
+  pre.sp_available_base <- available_base;
+  pre.sp_committed_sell <- committed_sell;
+  pre.sp_committed_total <- committed_total;
+  pre.sp_unnetted_hold <- unnetted_hold;
+  pre.sp_unreflected_credit <- unreflected_credit;
+  pre.sp_reserve_headroom <- reserve_headroom;
+  pre.sp_reservation_headroom <- reservation_headroom;
+  pre.sp_inventory_basis <- inventory_basis;
+  pre.sp_inventory_ok <- inventory_ok;
+  pre.sp_min_notional <- min_notional;
+  pre.sp_base_ref_price <- base_ref_price;
+  pre.sp_capital_exhausted <- capital_exhausted;
+  pre.sp_halt_inventory_check <- halt_inventory_check;
+  pre.sp_asset_low_residual_ok <- asset_low_residual_ok;
+  pre.sp_should_trigger_sell <- should_trigger_sell;
+  pre.sp_is_sell_on_cooldown <- is_sell_on_cooldown;
+  pre.sp_missing_after_reconcile <- missing_after_reconcile;
+  pre.sp_sell_pushed <- sell_pushed;
+  pre.sp_nothing_placeable <- nothing_placeable
+;;
+
+let sell_leg_prepare
+  ~persisted_reconcile
+  ~state
+  ~now
+  ~asset
+  ~bid_price
+  ~ask_price
+  ~asset_balance
+  ~buy_attempted
+  ~oracle_halted
+  ~ecfg
+  ~locked_in_sells
+  ~base_balance_age
+  =
+  let pre = fresh_sell_pre () in
+  sell_leg_prepare_into
+    ~pre
+    ~persisted_reconcile
+    ~state
+    ~now
+    ~asset
+    ~bid_price
+    ~ask_price
+    ~asset_balance
+    ~buy_attempted
+    ~oracle_halted
+    ~ecfg
+    ~locked_in_sells
+    ~base_balance_age;
+  pre
 ;;
 
 (** True when a fresh sell is placeable this cycle. [asset_low] blocks the leg only while
@@ -1929,169 +1992,158 @@ let execute_strategy
   (* Realtime accumulation buffer (fear-and-greed resolved upstream); refreshed every
      cycle so fill-time reserve decisions see the latest value. *)
   state.accumulation_buffer <- asset.accumulation_buffer;
-  Mutex.lock state.mutex;
-  Fun.protect
-    ~finally:(fun () -> Mutex.unlock state.mutex)
-    (fun () ->
-      (* Reset phase attribution so a short-circuit return (NaN price, stale balance)
-         reports zeros rather than the previous execution's values. *)
-      state.time_preamble_ns <- 0;
-      state.time_cleanup_ns <- 0;
-      state.time_sync_ns <- 0;
-      state.time_sync_scan_ns <- 0;
-      state.time_sync_rec_ns <- 0;
-      state.sync_orders_seen <- 0;
-      state.time_buy_ns <- 0;
-      state.time_sell_ns <- 0;
-      let t_preamble_start = Monotonic_clock.now_ns () in
-      let lot_qty = venue_lot_qty state.grid_qty asset.exchange state in
-      let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age in
-      evaluate_asset_low_recovery
+  (* Reset phase attribution so a short-circuit return (NaN price, stale balance) reports
+     zeros rather than the previous execution's values. *)
+  state.time_preamble_ns <- 0;
+  state.time_cleanup_ns <- 0;
+  state.time_sync_ns <- 0;
+  state.time_sync_scan_ns <- 0;
+  state.time_sync_rec_ns <- 0;
+  state.sync_orders_seen <- 0;
+  state.time_buy_ns <- 0;
+  state.time_sell_ns <- 0;
+  let t_preamble_start = Monotonic_clock.now_ns () in
+  let lot_qty = venue_lot_qty state.grid_qty asset.exchange state in
+  let unnetted_hold = unnetted_sell_hold ~state ~ecfg ~now ~base_balance_age in
+  evaluate_asset_low_recovery
+    ~state
+    ~now
+    ~base_balance_age
+    ~ecfg
+    ~asset
+    ~asset_balance
+    ~lot_qty
+    ~unnetted_hold;
+  evaluate_capital_low_recovery ~state ~now ~asset ~quote_balance ~current_price ~lot_qty;
+  if Float.is_nan current_price
+  then (
+    if state.last_cycle <> cycle
+    then
+      Logging.info_f
+        ~section
+        "Waiting for price data for %s (no ticker received yet)"
+        asset.symbol)
+  else (
+    let bid_price, ask_price =
+      if (not (Float.is_nan top_bid))
+         && top_bid > 0.0
+         && (not (Float.is_nan top_ask))
+         && top_ask > 0.0
+      then top_bid, top_ask
+      else current_price, current_price
+    in
+    (* Per-sub-phase attribution: minor-word allocation (cheap [Gc.minor_words] reads) and
+       wall time ([Monotonic_clock], a 0-alloc immediate-int C stub). Read by the domain
+       on its max cycle to localize where a wide-grid STRAT burst is produced. *)
+    state.time_preamble_ns <- Monotonic_clock.now_ns () - t_preamble_start;
+    let a_cleanup_start = Gc.minor_words () in
+    let t_cleanup_start = Monotonic_clock.now_ns () in
+    cleanup_pending_and_cooldowns ~state ~now ~asset;
+    state.alloc_cleanup_words <- int_of_float (Gc.minor_words () -. a_cleanup_start);
+    state.time_cleanup_ns <- Monotonic_clock.now_ns () - t_cleanup_start;
+    let a_sync_start = Gc.minor_words () in
+    let t_sync_start = Monotonic_clock.now_ns () in
+    let ( open_buy_count_from_scan
+        , has_recent_amend_buy
+        , locked_in_buys
+        , locked_in_sells
+        , closest_sell_order
+        , open_persisted_levels
+        , missing_persisted_levels )
+      =
+      sync_open_orders
         ~state
         ~now
-        ~base_balance_age
-        ~ecfg
         ~asset
-        ~asset_balance
+        ~bid_price
         ~lot_qty
-        ~unnetted_hold;
-      evaluate_capital_low_recovery
-        ~state
-        ~now
-        ~asset
-        ~quote_balance
-        ~current_price
-        ~lot_qty;
-      if Float.is_nan current_price
+        ~iter_open_orders
+        ~get_open_orders_generation
+        ~drain_open_order_changes
+        ~ecfg
+    in
+    state.alloc_sync_words <- int_of_float (Gc.minor_words () -. a_sync_start);
+    state.time_sync_ns <- Monotonic_clock.now_ns () - t_sync_start;
+    if state.maker_fee <= 0.0 || cycle land 0x3ff = 0
+    then
+      state.maker_fee
+      <- (match asset.maker_fee with
+          | Some f -> f
+          | None ->
+            (match
+               Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol
+             with
+             | Some cached -> cached
+             | None -> 0.0));
+    let is_stale =
+      ecfg.check_stale_balance
+      && (Float.is_nan asset_balance || Float.is_nan quote_balance)
+    in
+    if is_stale
+    then (
+      state.last_cycle <- cycle;
+      ())
+    else (
+      (* Oracle-halted: no buy placement, no buy trailing/amending - a halted asset must
+         not commit more quote capital. The sell leg still runs (see the [oracle_halted]
+         doc on execute_strategy). Exception - TIF recovery: a TIF/ALO/post-only reject
+         (or a transient placement failure) killed a previously-approved resting buy.
+         Re-attempting it at the fresh price is not a new capital commitment (after a
+         price drop it improves survival margin), and without it the asset sits buyless
+         for the entire oracle-inactive window. The latch expires (900s) so it cannot pin
+         buys through a genuine, persistent capital halt. *)
+      let recovery_expired =
+        state.tif_recovery_pending && now -. state.tif_recovery_since >= 900.0
+      in
+      if recovery_expired
       then (
-        if state.last_cycle <> cycle
-        then
-          Logging.info_f
-            ~section
-            "Waiting for price data for %s (no ticker received yet)"
-            asset.symbol)
-      else (
-        let bid_price, ask_price =
-          if (not (Float.is_nan top_bid))
-             && top_bid > 0.0
-             && (not (Float.is_nan top_ask))
-             && top_ask > 0.0
-          then top_bid, top_ask
-          else current_price, current_price
-        in
-        (* Per-sub-phase attribution: minor-word allocation (cheap [Gc.minor_words] reads)
-           and wall time ([Monotonic_clock], a 0-alloc immediate-int C stub). Read by the
-           domain on its max cycle to localize where a wide-grid STRAT burst is produced. *)
-        state.time_preamble_ns <- Monotonic_clock.now_ns () - t_preamble_start;
-        let a_cleanup_start = Gc.minor_words () in
-        let t_cleanup_start = Monotonic_clock.now_ns () in
-        cleanup_pending_and_cooldowns ~state ~now ~asset;
-        state.alloc_cleanup_words <- int_of_float (Gc.minor_words () -. a_cleanup_start);
-        state.time_cleanup_ns <- Monotonic_clock.now_ns () - t_cleanup_start;
-        let a_sync_start = Gc.minor_words () in
-        let t_sync_start = Monotonic_clock.now_ns () in
-        let ( open_buy_count_from_scan
-            , has_recent_amend_buy
-            , locked_in_buys
-            , locked_in_sells
-            , closest_sell_order
-            , open_persisted_levels
-            , missing_persisted_levels )
-          =
-          sync_open_orders
-            ~state
-            ~now
-            ~asset
-            ~bid_price
-            ~lot_qty
-            ~iter_open_orders
-            ~get_open_orders_generation
-            ~drain_open_order_changes
-            ~ecfg
-        in
-        state.alloc_sync_words <- int_of_float (Gc.minor_words () -. a_sync_start);
-        state.time_sync_ns <- Monotonic_clock.now_ns () - t_sync_start;
-        if state.maker_fee <= 0.0 || cycle land 0x3ff = 0
-        then
-          state.maker_fee
-          <- (match asset.maker_fee with
-              | Some f -> f
-              | None ->
-                (match
-                   Fee_cache.get_maker_fee ~exchange:asset.exchange ~symbol:asset.symbol
-                 with
-                 | Some cached -> cached
-                 | None -> 0.0));
-        let is_stale =
-          ecfg.check_stale_balance
-          && (Float.is_nan asset_balance || Float.is_nan quote_balance)
-        in
-        if is_stale
-        then (
-          state.last_cycle <- cycle;
-          ())
-        else (
-          (* Oracle-halted: no buy placement, no buy trailing/amending - a halted asset
-             must not commit more quote capital. The sell leg still runs (see the
-             [oracle_halted] doc on execute_strategy). Exception - TIF recovery: a
-             TIF/ALO/post-only reject (or a transient placement failure) killed a
-             previously-approved resting buy. Re-attempting it at the fresh price is not a
-             new capital commitment (after a price drop it improves survival margin), and
-             without it the asset sits buyless for the entire oracle-inactive window. The
-             latch expires (900s) so it cannot pin buys through a genuine, persistent
-             capital halt. *)
-          let recovery_expired =
-            state.tif_recovery_pending && now -. state.tif_recovery_since >= 900.0
-          in
-          if recovery_expired
-          then (
-            state.tif_recovery_pending <- false;
-            Logging.info_f
-              ~section
-              "TIF recovery window expired for %s - resuming normal oracle-gated buying"
-              asset.symbol);
-          let tif_recovery_active =
-            state.tif_recovery_pending && now -. state.tif_recovery_since < 900.0
-          in
-          let a_buy_start = Gc.minor_words () in
-          let t_buy_start = Monotonic_clock.now_ns () in
-          let buy_attempted =
-            if oracle_halted && not tif_recovery_active
-            then false
-            else
-              evaluate_buy_leg
-                ~oracle_halted
-                ~state
-                ~now
-                ~asset
-                ~bid_price
-                ~ask_price
-                ~quote_balance
-                ~quote_balance_stale
-                ~cycle
-                ~iter_open_orders
-                ~open_buy_count_from_scan
-                ~has_recent_amend_buy
-                ~locked_in_buys
-                ~closest_sell_order_initial:closest_sell_order
-          in
-          state.alloc_buy_words <- int_of_float (Gc.minor_words () -. a_buy_start);
-          state.time_buy_ns <- Monotonic_clock.now_ns () - t_buy_start;
-          let a_sell_start = Gc.minor_words () in
-          let t_sell_start = Monotonic_clock.now_ns () in
-          evaluate_sell_leg
-            ~persisted_reconcile:(open_persisted_levels, missing_persisted_levels)
+        state.tif_recovery_pending <- false;
+        Logging.info_f
+          ~section
+          "TIF recovery window expired for %s - resuming normal oracle-gated buying"
+          asset.symbol);
+      let tif_recovery_active =
+        state.tif_recovery_pending && now -. state.tif_recovery_since < 900.0
+      in
+      let a_buy_start = Gc.minor_words () in
+      let t_buy_start = Monotonic_clock.now_ns () in
+      let buy_attempted =
+        if oracle_halted && not tif_recovery_active
+        then false
+        else
+          evaluate_buy_leg
+            ~oracle_halted
             ~state
             ~now
             ~asset
             ~bid_price
             ~ask_price
-            ~asset_balance
-            ~buy_attempted
-            ~oracle_halted
-            ~ecfg
-            ~locked_in_sells
-            ~base_balance_age;
-          state.alloc_sell_words <- int_of_float (Gc.minor_words () -. a_sell_start);
-          state.time_sell_ns <- Monotonic_clock.now_ns () - t_sell_start)))
+            ~quote_balance
+            ~quote_balance_stale
+            ~cycle
+            ~iter_open_orders
+            ~open_buy_count_from_scan
+            ~has_recent_amend_buy
+            ~locked_in_buys
+            ~closest_sell_order_initial:closest_sell_order
+      in
+      state.alloc_buy_words <- int_of_float (Gc.minor_words () -. a_buy_start);
+      state.time_buy_ns <- Monotonic_clock.now_ns () - t_buy_start;
+      let a_sell_start = Gc.minor_words () in
+      let t_sell_start = Monotonic_clock.now_ns () in
+      evaluate_sell_leg
+        ~persisted_reconcile:(open_persisted_levels, missing_persisted_levels)
+        ~state
+        ~now
+        ~asset
+        ~bid_price
+        ~ask_price
+        ~asset_balance
+        ~buy_attempted
+        ~oracle_halted
+        ~ecfg
+        ~locked_in_sells
+        ~base_balance_age;
+      state.alloc_sell_words <- int_of_float (Gc.minor_words () -. a_sell_start);
+      state.time_sell_ns <- Monotonic_clock.now_ns () - t_sell_start))
 ;;

@@ -40,11 +40,16 @@ type compiled_arg =
   | AExpr of Strategy_expr.expr
   | ATemplate of string
 
+type gate =
+  | GBool of int * bool
+  | GBoolExpr of int * Strategy_expr.expr
+  | GValue of int * compiled_arg
+
 type compiled_action =
   { ca_name : string
   ; ca_args : (string * compiled_arg) list
   ; ca_bind : (string * string) list
-  ; ca_gate : (int * compiled_arg) option
+  ; ca_gate : gate option
   (* Precompiled ["set_gate"] fast path: [Some (slot, value)] when the gate's ["name"] is
      a literal, so the live path can store the value into its slot without building an
      argument assoc list or dispatching through the handler. [None] for every other action
@@ -96,6 +101,8 @@ and t =
   ; mutable prof_args_ns : int
   ; mutable prof_cpu_ns : int
   ; mutable prof_missing : int
+  ; mutable cycle_calls : action_call list
+  ; mutable cycle_stop : bool
   }
 
 let noop_handler = { run = (fun _ _ _ -> []) }
@@ -276,7 +283,25 @@ let compile_action t (a : Strategy_file.action) : compiled_action =
     if String.equal a.a_name "set_gate" && a.a_bind = []
     then (
       match List.assoc_opt "name" a.a_args, List.assoc_opt "value" a.a_args with
-      | Some (`String k), Some v -> Some (intern_key k, compile_arg t v)
+      | Some (`String k), Some v ->
+        let slot = intern_key k in
+        let arg = compile_arg t v in
+        let kind =
+          match
+            List.find_opt
+              (fun (s : Strategy_file.state_decl) -> String.equal s.s_name k)
+              t.file.state
+          with
+          | Some s -> Some s.s_kind
+          | None -> None
+        in
+        let gate =
+          match kind, arg with
+          | Some Strategy_file.S_bool, ALit (V_bool b) -> GBool (slot, b)
+          | Some Strategy_file.S_bool, AExpr ex -> GBoolExpr (slot, ex)
+          | _ -> GValue (slot, arg)
+        in
+        Some gate
       | _ -> None)
     else None
   in
@@ -339,6 +364,8 @@ let create ?(handlers = noop_handler) ?(params = []) (file : Strategy_file.t) =
     ; prof_args_ns = 0
     ; prof_cpu_ns = 0
     ; prof_missing = 0
+    ; cycle_calls = []
+    ; cycle_stop = false
     }
   in
   List.iter
@@ -401,6 +428,19 @@ let set_state_slot t slot v =
   then (
     bump_gen t;
     t.state <- set_arr t.state slot v)
+;;
+
+(* Shared immutable bool blocks: an unchanged gate stores nothing, and a changed bool
+   reuses one of these instead of allocating a fresh [V_bool]. *)
+let v_true = V_bool true
+let v_false = V_bool false
+
+let[@inline] set_state_bool_slot t slot b =
+  match get_arr t.state slot with
+  | V_bool b0 when Bool.equal b0 b -> ()
+  | _ ->
+    bump_gen t;
+    t.state <- set_arr t.state slot (if b then v_true else v_false)
 ;;
 
 let set_platform_slot t slot v =
@@ -660,7 +700,19 @@ let run_action t (e : env) step_id (ca : compiled_action) : action_call =
     the call list). Keeps the [collect = false] cycle allocation-free for the record. *)
 let run_action_ignore t (e : env) (ca : compiled_action) =
   match ca.ca_gate with
-  | Some (slot, varg) ->
+  | Some (GBool (slot, b)) -> set_state_bool_slot t slot b
+  | Some (GBoolExpr (slot, ex)) ->
+    (* Bool gates are the common case: evaluating unboxed avoids a [V_bool] per gate. *)
+    (match
+       try Some (Strategy_expr.eval_bool e ex) with
+       | Strategy_expr.Eval_error _ -> None
+     with
+     | Some b -> set_state_bool_slot t slot b
+     | None ->
+       (match eval_arg_value e (AExpr ex) with
+        | V_unset -> ()
+        | v -> set_state_slot t slot v))
+  | Some (GValue (slot, varg)) ->
     (* Precompiled ["set_gate"]: no argument assoc list, no handler dispatch, no thunk -
        just evaluate the value and store it into the pre-resolved slot. *)
     (match eval_arg_value e varg with
@@ -681,11 +733,11 @@ let rec iter_ignore t e = function
     iter_ignore t e rest
 ;;
 
-let rec iter_collect t e step_id calls = function
+let rec iter_collect t e step_id = function
   | [] -> ()
   | a :: rest ->
-    calls := run_action t e step_id a :: !calls;
-    iter_collect t e step_id calls rest
+    t.cycle_calls <- run_action t e step_id a :: t.cycle_calls;
+    iter_collect t e step_id rest
 ;;
 
 let rec apply_lets e t = function
@@ -700,10 +752,10 @@ let rec apply_lets e t = function
 (** Top-level step loop: the previous [List.iter (fun cs -> ...)] and the [run_steps]
     dispatch closure both allocated on every cycle. Hoisting the loop removes both; the
     action iterator is chosen by the [collect] flag instead of a closure. *)
-let rec iter_steps t e facts ~prof ~collect calls stop = function
+let rec iter_steps t e facts ~prof ~collect = function
   | [] -> ()
   | (cs : compiled_step) :: rest ->
-    if not !stop
+    if not t.cycle_stop
     then (
       if t.has_lets
       then (
@@ -725,9 +777,9 @@ let rec iter_steps t e facts ~prof ~collect calls stop = function
           r
       in
       let actions = if passed then cs.cs_then else cs.cs_else in
-      if collect then iter_collect t e cs.cs_id calls actions else iter_ignore t e actions;
-      if passed && cs.cs_stop then stop := true);
-    iter_steps t e facts ~prof ~collect calls stop rest
+      if collect then iter_collect t e cs.cs_id actions else iter_ignore t e actions;
+      if passed && cs.cs_stop then t.cycle_stop <- true);
+    iter_steps t e facts ~prof ~collect rest
 ;;
 
 (** Run one cycle for a dispatch kind. The snapshot phase is
@@ -752,9 +804,9 @@ let run_cycle ?(collect = true) t ~(price : float) ~(now : float) ~(event : even
   t.event <- Some event;
   let e = env_cached t in
   let facts = facts_cached t in
-  let calls = ref [] in
-  let stop = ref false in
-  iter_steps t e facts ~prof ~collect calls stop t.compiled;
+  t.cycle_calls <- [];
+  t.cycle_stop <- false;
+  iter_steps t e facts ~prof ~collect t.compiled;
   if prof then t.prof_cpu_ns <- Monotonic_clock.thread_cpu_ns () - cpu0;
-  List.rev !calls
+  List.rev t.cycle_calls
 ;;

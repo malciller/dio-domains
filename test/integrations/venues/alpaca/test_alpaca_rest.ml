@@ -114,6 +114,49 @@ let test_cancel_pending_classification () =
     "{\"code\":42210000,\"message\":\"order is already filled\"}"
 ;;
 
+let test_order_body () =
+  let body =
+    Alpaca.Rest.order_body
+      ~symbol:"AAPL"
+      ~qty:1.5
+      ~side_str:"buy"
+      ~type_str:"limit"
+      ~tif_str:"day"
+      ~mark_extended:true
+      ~limit_price:(Some 100.0)
+      ~cl_ord_id:(Some "cid\"x")
+  in
+  let open Yojson.Safe.Util in
+  let j = Yojson.Safe.from_string body in
+  Alcotest.(check string) "symbol" "AAPL" (member "symbol" j |> to_string);
+  Alcotest.(check string) "qty" "1.500000000" (member "qty" j |> to_string);
+  Alcotest.(check string) "side" "buy" (member "side" j |> to_string);
+  Alcotest.(check string) "type" "limit" (member "type" j |> to_string);
+  Alcotest.(check string) "tif" "day" (member "time_in_force" j |> to_string);
+  Alcotest.(check bool) "extended" true (member "extended_hours" j |> to_bool);
+  Alcotest.(check string) "limit price" "100.0000" (member "limit_price" j |> to_string);
+  Alcotest.(check string) "cloid" "cid\"x" (member "client_order_id" j |> to_string)
+;;
+
+let test_amend_body () =
+  let open Yojson.Safe.Util in
+  let j =
+    Alpaca.Rest.amend_body ~qty:(Some 2.0) ~limit_price:(Some 100.0) ~cl_ord_id:None
+    |> Yojson.Safe.from_string
+  in
+  Alcotest.(check string) "qty" "2.000000000" (member "qty" j |> to_string);
+  Alcotest.(check string) "limit price" "100.0000" (member "limit_price" j |> to_string);
+  Alcotest.(check bool) "no cloid" true (member "client_order_id" j = `Null);
+  (* Fractional quantities are not amendable; the field is omitted as before. *)
+  Alcotest.(check bool)
+    "fractional qty omitted"
+    true
+    (Alpaca.Rest.amend_body ~qty:(Some 2.5) ~limit_price:None ~cl_ord_id:None
+     |> Yojson.Safe.from_string
+     |> member "qty"
+     = `Null)
+;;
+
 let () =
   Alcotest.run
     "alpaca_rest"
@@ -134,6 +177,10 @@ let () =
             "pending cancel is idempotent"
             `Quick
             test_cancel_pending_classification
+        ] )
+    ; ( "order body"
+      , [ Alcotest.test_case "place body" `Quick test_order_body
+        ; Alcotest.test_case "amend body" `Quick test_amend_body
         ] )
     ; ( "retry policy"
       , [ Alcotest.test_case "classification" `Quick test_retriable_classification

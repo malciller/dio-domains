@@ -8,6 +8,12 @@ open Lwt.Infix
 
 let section = "alpaca_balances"
 
+(** Set by the fill path to wake the balance poll immediately. Domain-safe: the fill
+    handler may run on a parse domain, so it only rings the self-pipe doorbell. *)
+let refresh_doorbell = Concurrency.Domain_doorbell.create ()
+
+let request_balance_refresh () = Concurrency.Domain_doorbell.ring refresh_doorbell
+
 (** Published balance snapshots. Never mutated in place after publication. *)
 let balances : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
 
@@ -187,11 +193,17 @@ let update_balances () =
     Lwt.return_unit
 ;;
 
+(** Two-second reconciliation timer, woken early by a fill's doorbell. The timer covers
+    external balance moves (deposits, fees, other sessions); the fill path never waits for
+    it. *)
 let rec poll_loop () =
   update_balances ()
   >>= fun () ->
-  Lwt_unix.sleep 2.0
-  >>= fun () ->
+  Lwt.pick
+    [ (Lwt_unix.sleep 2.0 >>= fun () -> Lwt.return `Timer)
+    ; (Concurrency.Domain_doorbell.wait refresh_doorbell >>= fun () -> Lwt.return `Event)
+    ]
+  >>= fun _ ->
   Lwt.async poll_loop;
   Lwt.return_unit
 ;;

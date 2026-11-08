@@ -341,6 +341,9 @@ let handle_frame frame ~expected_generation =
   if String.starts_with ~prefix:"{\"channel\":\"executions" content
      && Concurrency.Parse_worker.submit "kraken_exec" content
   then Lwt.return_unit
+  else if String.starts_with ~prefix:"{\"channel\":\"balances" content
+          && Concurrency.Parse_worker.submit_frame "kraken" content
+  then Lwt.return_unit
   else
     (try
        let json = Yojson.Safe.from_string content in

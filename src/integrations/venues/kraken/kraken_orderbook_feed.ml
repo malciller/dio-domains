@@ -695,7 +695,7 @@ let parse_and_apply_levels symbol tbl json =
 (** Span analogue of [parse_level]: renders price/qty from their value spans instead of
     JSON values. Same precision lookup and fixed-decimal re-render, so [price_wire]/[size]
     (the checksum inputs) are bit-identical to the DOM path. *)
-let parse_level_from_span symbol s price_span size_span =
+let parse_level_from_span symbol s p_lo p_hi q_lo q_hi =
   let pd, ld =
     match get_precision_from_instruments symbol with
     | Some (price_prec, qty_prec) -> price_prec, qty_prec
@@ -703,8 +703,8 @@ let parse_level_from_span symbol s price_span size_span =
       (try Ds.Cow_table.find decimals_tbl symbol with
        | Not_found -> 8, 8)
   in
-  let price_str_raw = decimal_str_of_span ~dec:pd s (fst price_span) (snd price_span) in
-  let qty_str = decimal_str_of_span ~dec:ld s (fst size_span) (snd size_span) in
+  let price_str_raw = decimal_str_of_span ~dec:pd s p_lo p_hi in
+  let qty_str = decimal_str_of_span ~dec:ld s q_lo q_hi in
   let price_float =
     try float_of_string price_str_raw with
     | _ -> 0.0
@@ -724,28 +724,45 @@ let parse_level_from_span symbol s price_span size_span =
 
 (** Mirror of the DOM level-array patterns `[price; qty]` and `[price; qty; timestamp]`:
     returns the price/qty element spans only when the level array holds exactly 2 or 3
-    elements (fewer or more are skipped, as the DOM pattern match does). *)
-let level_price_qty_spans s i j =
-  let i, j = Json_scan.array_interior s i j in
-  let count = ref 0 in
-  let pspan = ref (0, 0) in
-  let qspan = ref (0, 0) in
-  Json_scan.array_fold s i j () (fun () a b ->
-    (match !count with
-     | 0 -> pspan := a, b
-     | 1 -> qspan := a, b
-     | _ -> ());
-    incr count);
-  match !count with
-  | 2 | 3 -> Some (!pspan, !qspan)
-  | _ -> None
+    elements (fewer or more are skipped, as the DOM pattern match does). Local-returning
+    so the span tuples stay on the caller's stack frame. *)
+let level_price_qty_spans s i j = exclave_
+  let lo, hi = Json_scan.array_interior s i j in
+  let p_lo = Json_scan.skip_ws s lo hi in
+  if p_lo >= hi
+  then None
+  else (
+    let p_hi = Json_scan.skip_value s p_lo hi in
+    let after_p = Json_scan.skip_ws s p_hi hi in
+    if after_p >= hi || s.[after_p] <> ','
+    then None
+    else (
+      let q_lo = Json_scan.skip_ws s (after_p + 1) hi in
+      if q_lo >= hi
+      then None
+      else (
+        let q_hi = Json_scan.skip_value s q_lo hi in
+        let after_q = Json_scan.skip_ws s q_hi hi in
+        if after_q >= hi
+        then Some ((p_lo, p_hi), (q_lo, q_hi))
+        else if s.[after_q] <> ','
+        then None
+        else (
+          let t_lo = Json_scan.skip_ws s (after_q + 1) hi in
+          if t_lo >= hi
+          then Some ((p_lo, p_hi), (q_lo, q_hi))
+          else (
+            let t_hi = Json_scan.skip_value s t_lo hi in
+            let after_t = Json_scan.skip_ws s t_hi hi in
+            if after_t >= hi then Some ((p_lo, p_hi), (q_lo, q_hi)) else None)))))
+[@@zero_alloc]
 ;;
 
 (** Span analogue of [parse_and_apply_levels]: applies a level array (object or
     scalar-pair form) straight into the store's Hashtbl without building a DOM. Non-array
     values (and malformed levels) are ignored exactly as the DOM path ignores non-`List`
     inputs and non-matching entries. *)
-let apply_levels_from_span symbol s tbl (i, j) =
+let apply_levels_from_span symbol s tbl i j =
   if i < j && s.[i] = '['
   then (
     let lo, hi = Json_scan.array_interior s i j in
@@ -757,8 +774,8 @@ let apply_levels_from_span symbol s tbl (i, j) =
         match
           Json_scan.find_field s olo ohi "price", Json_scan.find_field s olo ohi "qty"
         with
-        | Some price_span, Some qty_span ->
-          let lvl = parse_level_from_span symbol s price_span qty_span in
+        | Some (p_lo, p_hi), Some (q_lo, q_hi) ->
+          let lvl = parse_level_from_span symbol s p_lo p_hi q_lo q_hi in
           if is_effectively_zero lvl.size
           then Hashtbl.remove tbl lvl.price
           else Hashtbl.replace tbl lvl.price lvl
@@ -767,8 +784,8 @@ let apply_levels_from_span symbol s tbl (i, j) =
       then (
         (* Array format: [price, qty] or [price, qty, timestamp] *)
         match level_price_qty_spans s e0 e1 with
-        | Some (price_span, qty_span) ->
-          let lvl = parse_level_from_span symbol s price_span qty_span in
+        | Some ((p_lo, p_hi), (q_lo, q_hi)) ->
+          let lvl = parse_level_from_span symbol s p_lo p_hi q_lo q_hi in
           if is_effectively_zero lvl.size
           then Hashtbl.remove tbl lvl.price
           else Hashtbl.replace tbl lvl.price lvl
@@ -1147,10 +1164,10 @@ let process_orderbook_message_span ~reset message on_heartbeat =
               ~checksum
               ~apply_levels:(fun store ->
                 (match bids_span with
-                 | Some bs -> apply_levels_from_span symbol message store.bids bs
+                 | Some (b0, b1) -> apply_levels_from_span symbol message store.bids b0 b1
                  | None -> ());
                 match asks_span with
-                | Some as_ -> apply_levels_from_span symbol message store.asks as_
+                | Some (a0, a1) -> apply_levels_from_span symbol message store.asks a0 a1
                 | None -> ())
               on_heartbeat
               notified_symbols

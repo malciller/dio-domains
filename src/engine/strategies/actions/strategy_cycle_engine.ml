@@ -7,8 +7,9 @@
     is bound to a strategy file; the mutable fields are updated in place each cycle (no
     per-cycle allocation). Shared by the domain loop and the offline candidate replay, so
     the candidate interpreter is exercised on exactly the wiring the live loop uses. The
-    caller holds [state.mutex] for the whole interpreter cycle (see [with_lock]); the
-    sub-functions do not lock. *)
+    caller runs on the symbol's asset domain, which is the sole writer of this state
+    (order callbacks are queued as lifecycle events and drained there); the sub-functions
+    do not lock. *)
 
 module Jac = Strategy_api
 module Types = Strategy_state
@@ -93,8 +94,11 @@ type ctx =
   ; mutable cg_buy_should_cancel : bool
   ; mutable cg_buy_plan : Jac.buy_plan option
   ; mutable cg_profile : bool
-  ; mutable cg_sell_pre : Jac.sell_pre option
+  ; cg_sell_pre : Jac.sell_pre
+  ; mutable cg_sell_pre_valid : bool
   ; mutable cg_symbol : string
+  ; mutable cg_base_symbol : string
+  ; mutable cg_exchange_module : (module Dio_exchange.Exchange_intf.S) option
   ; mutable cg_adopt_untagged_orders : bool
   (** True for an overlay whose market no other strategy trades on a venue that drops the
       userref. A same-side order with a matching venue reduce-only flag is then this
@@ -150,8 +154,11 @@ let create () =
   ; cg_buy_should_cancel = false
   ; cg_buy_plan = None
   ; cg_profile = false
-  ; cg_sell_pre = None
+  ; cg_sell_pre = Jac.fresh_sell_pre ()
+  ; cg_sell_pre_valid = false
   ; cg_symbol = ""
+  ; cg_base_symbol = ""
+  ; cg_exchange_module = None
   ; cg_adopt_untagged_orders = false
   }
 ;;
@@ -216,14 +223,8 @@ let[@inline] measure c (phase : Strategy_actions_cycle.phase) (local_ (f : unit 
          st.time_sell_ns <- st.time_sell_ns + dt))
 ;;
 
-(** Run [f] while holding the strategy-state mutex (no-op when state is absent). *)
-let with_lock ctx f =
-  match ctx.cg_state with
-  | Some state ->
-    Mutex.lock state.mutex;
-    Fun.protect ~finally:(fun () -> Mutex.unlock state.mutex) f
-  | None -> f ()
-;;
+(** The asset domain is the sole writer for its symbol, so the cycle needs no lock. *)
+let with_lock _ctx f = f ()
 
 (** Fine path step 1a: one-time state init (venue config/precision caches) and the
     per-cycle accumulation-buffer refresh. *)
@@ -242,6 +243,11 @@ let prepare_init c =
       state.base_accumulation_enabled <- asset.base_accumulation;
       state.sell_levels_enabled <- asset.sell_levels_persistence;
       state.cached_ecfg <- Jac.get_exchange_config asset.exchange;
+      c.cg_base_symbol
+      <- (match String.index_opt asset.symbol '/' with
+          | Some i -> String.sub asset.symbol 0 i
+          | None -> asset.symbol);
+      c.cg_exchange_module <- Jac.get_exchange_module asset.exchange;
       state.cached_round_price <- Jac.get_round_price_fn asset.symbol asset.exchange;
       state.cached_price_increment <- Jac.get_price_increment asset.symbol asset.exchange;
       state.cached_qty_increment <- Jac.get_qty_increment_val asset.symbol asset.exchange;
@@ -258,7 +264,9 @@ let prepare_init c =
     then
       state.cached_venue_min_notional
       <- Jac.get_min_notional_val asset.symbol asset.exchange;
-    c.cg_ecfg <- Some state.cached_ecfg;
+    (match c.cg_ecfg with
+     | Some e when e == state.cached_ecfg -> ()
+     | _ -> c.cg_ecfg <- Some state.cached_ecfg);
     state.accumulation_buffer <- asset.accumulation_buffer
   | _ -> ()
 ;;
@@ -294,7 +302,9 @@ let prepare_recovery c =
       | Some e -> e
       | None -> state.cached_ecfg
     in
-    c.cg_ecfg <- Some ecfg;
+    (match c.cg_ecfg with
+     | Some e when e == ecfg -> ()
+     | _ -> c.cg_ecfg <- Some ecfg);
     let lot_qty = Jac.venue_lot_qty state.grid_qty asset.exchange state in
     c.cg_lot_qty <- lot_qty;
     let unnetted_hold =
@@ -508,6 +518,11 @@ let drain_credit c =
 
 (** Fine path step 6a'': publish the raw gate facts the strategy file combines into the
     buy-active condition: the oracle-halt latch and the TIF-recovery latch/timestamp. *)
+let rec has_pending_buy = function
+  | [] -> false
+  | (_, side, _, _) :: rest -> side = Strategy_common.Buy || has_pending_buy rest
+;;
+
 let cycle_facts c (t : Strategy_runtime.t) =
   drain_credit c;
   let state = c.cg_state in
@@ -517,13 +532,24 @@ let cycle_facts c (t : Strategy_runtime.t) =
      unsellable even when the venue's staked + tradeable holdings covered the reserve. *)
   (match c.cg_asset, state with
    | Some asset, Some s ->
-     let base =
-       match String.index_opt asset.symbol '/' with
-       | Some i -> String.sub asset.symbol 0 i
-       | None -> asset.symbol
+     (* Cache the base symbol and venue module on first use. [prepare_init] normally does
+        this; direct callers (tests, replay) may call [cycle_facts] without it. *)
+     let base, module_opt =
+       if String.equal c.cg_base_symbol ""
+       then (
+         let base =
+           match String.index_opt asset.symbol '/' with
+           | Some i -> String.sub asset.symbol 0 i
+           | None -> asset.symbol
+         in
+         let module_opt = Jac.get_exchange_module asset.exchange in
+         c.cg_base_symbol <- base;
+         c.cg_exchange_module <- module_opt;
+         base, module_opt)
+       else c.cg_base_symbol, c.cg_exchange_module
      in
      let staked =
-       match Jac.get_exchange_module asset.exchange with
+       match module_opt with
        | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
          (try Ex.get_staked_balance ~asset:base with
           | _ -> 0.0)
@@ -538,8 +564,7 @@ let cycle_facts c (t : Strategy_runtime.t) =
   in
   let has_pending_buy =
     match state with
-    | Some s ->
-      List.exists (fun (_, side, _, _) -> side = Strategy_common.Buy) s.pending_orders
+    | Some s -> has_pending_buy s.pending_orders
     | None -> false
   in
   let has_tracked_buy, inflight_cancel_buy, inflight_amend_buy, maker_fee_set =
@@ -2078,35 +2103,38 @@ let buy_amend c =
 let sell_prepare c =
   match c.cg_state, c.cg_asset, c.cg_ecfg with
   | Some state, Some asset, Some ecfg ->
-    c.cg_sell_pre
-    <- Some
-         (Jac.sell_leg_prepare
-            ~persisted_reconcile:(c.cg_open_persisted, c.cg_missing_persisted)
-            ~state
-            ~now:c.cg_now
-            ~asset
-            ~bid_price:c.cg_bid_r
-            ~ask_price:c.cg_ask_r
-            ~asset_balance:c.cg_abal
-            ~buy_attempted:c.cg_buy_attempted
-            ~oracle_halted:c.cg_oracle_halted
-            ~ecfg
-            ~locked_in_sells:c.cg_locked_in_sells
-            ~base_balance_age:c.cg_base_age)
-  | _ -> c.cg_sell_pre <- None
+    Jac.sell_leg_prepare_into
+      ~pre:c.cg_sell_pre
+      ~persisted_reconcile:(c.cg_open_persisted, c.cg_missing_persisted)
+      ~state
+      ~now:c.cg_now
+      ~asset
+      ~bid_price:c.cg_bid_r
+      ~ask_price:c.cg_ask_r
+      ~asset_balance:c.cg_abal
+      ~buy_attempted:c.cg_buy_attempted
+      ~oracle_halted:c.cg_oracle_halted
+      ~ecfg
+      ~locked_in_sells:c.cg_locked_in_sells
+      ~base_balance_age:c.cg_base_age;
+    c.cg_sell_pre_valid <- true
+  | _ -> c.cg_sell_pre_valid <- false
 ;;
 
 (** Fine path sell phase 2a: whether a fresh sell is placeable this cycle. *)
 let sell_place_should c =
-  match c.cg_state, c.cg_sell_pre with
-  | Some state, Some pre -> Jac.sell_place_should ~state ~asset_balance:c.cg_abal ~pre
+  match c.cg_state with
+  | Some state when c.cg_sell_pre_valid ->
+    let pre = c.cg_sell_pre in
+    Jac.sell_place_should ~state ~asset_balance:c.cg_abal ~pre
   | _ -> false
 ;;
 
 (** Fine path sell phase 2b: place the owed/restored sell. *)
 let sell_place_body c =
-  match c.cg_state, c.cg_asset, c.cg_ecfg, c.cg_sell_pre with
-  | Some state, Some asset, Some ecfg, Some pre ->
+  match c.cg_state, c.cg_asset, c.cg_ecfg with
+  | Some state, Some asset, Some ecfg when c.cg_sell_pre_valid ->
+    let pre = c.cg_sell_pre in
     Jac.sell_place_body
       ~state
       ~now:c.cg_now
@@ -2121,8 +2149,9 @@ let sell_place_body c =
 
 (** Fine path sell phase 2: the gated placement block. *)
 let sell_place c =
-  match c.cg_state, c.cg_asset, c.cg_ecfg, c.cg_sell_pre with
-  | Some state, Some asset, Some ecfg, Some pre ->
+  match c.cg_state, c.cg_asset, c.cg_ecfg with
+  | Some state, Some asset, Some ecfg when c.cg_sell_pre_valid ->
+    let pre = c.cg_sell_pre in
     Jac.sell_leg_place
       ~state
       ~now:c.cg_now
@@ -2138,8 +2167,9 @@ let sell_place c =
 
 (** Fine path sell phase 3 facts: publish the excess-sweep gate. *)
 let sell_finalize_facts c (t : Strategy_runtime.t) =
-  match c.cg_sell_pre with
-  | Some pre ->
+  match c.cg_sell_pre_valid with
+  | true ->
+    let pre = c.cg_sell_pre in
     let remaintain =
       match c.cg_ecfg with
       | Some e -> e.remaintain_expired_sells
@@ -2167,13 +2197,14 @@ let sell_finalize_facts c (t : Strategy_runtime.t) =
     Strategy_runtime.set_platform_bool t Slots.sell_pushed !(pre.sp_sell_pushed);
     Strategy_runtime.set_platform_bool t Slots.has_active_sell active_sell;
     Strategy_runtime.set_platform_bool t Slots.balance_fresh balance_fresh
-  | None -> ()
+  | false -> ()
 ;;
 
 (** Fine path sell phase 3a: retry-latch bookkeeping. *)
 let sell_finalize_latch c =
-  match c.cg_state, c.cg_asset, c.cg_ecfg, c.cg_sell_pre with
-  | Some state, Some asset, Some ecfg, Some pre ->
+  match c.cg_state, c.cg_asset, c.cg_ecfg with
+  | Some state, Some asset, Some ecfg when c.cg_sell_pre_valid ->
+    let pre = c.cg_sell_pre in
     Jac.sell_leg_finalize_latch
       ~state
       ~now:c.cg_now
@@ -2187,8 +2218,9 @@ let sell_finalize_latch c =
 
 (** Fine path sell phase 3b: excess sweep (the file gates when it runs). *)
 let sell_excess_sweep_phase c =
-  match c.cg_state, c.cg_asset, c.cg_ecfg, c.cg_sell_pre with
-  | Some state, Some asset, Some ecfg, Some pre ->
+  match c.cg_state, c.cg_asset, c.cg_ecfg with
+  | Some state, Some asset, Some ecfg when c.cg_sell_pre_valid ->
+    let pre = c.cg_sell_pre in
     Jac.sell_excess_sweep_phase ~state ~now:c.cg_now ~asset ~pre ~ecfg
   | _ -> ()
 ;;
@@ -2202,8 +2234,9 @@ let sell_finalize_end c =
 
 (** Fine path sell phase 3: retry-latch bookkeeping, consumption, excess sweep. *)
 let sell_finalize c =
-  match c.cg_state, c.cg_asset, c.cg_ecfg, c.cg_sell_pre with
-  | Some state, Some asset, Some ecfg, Some pre ->
+  match c.cg_state, c.cg_asset, c.cg_ecfg with
+  | Some state, Some asset, Some ecfg when c.cg_sell_pre_valid ->
+    let pre = c.cg_sell_pre in
     Jac.sell_leg_finalize
       ~state
       ~now:c.cg_now
@@ -2237,8 +2270,8 @@ let value_string_opt = function
 (** Fine path: dispatch an order-lifecycle event to the reference handlers. The
     interpreter routes fill/cancel/ack/amend (and the REST-path variants) through this
     when the entry is file-bound, so the strategy file owns the event surface. The
-    reference handlers remain the bodies; they lock [state.mutex] themselves, so this must
-    run OUTSIDE [with_lock]. *)
+    reference handlers remain the bodies; they mutate the symbol's state directly, so this
+    must run on the owning asset domain. *)
 let on_event c (ev : Strategy_runtime.event) =
   match c.cg_state with
   | Some _ ->

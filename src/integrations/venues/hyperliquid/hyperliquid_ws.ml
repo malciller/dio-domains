@@ -726,7 +726,10 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
      | None -> ());
     if String.starts_with ~prefix:"{\"channel\":\"l2Book\"," content
     then (
-      broadcast_raw_message content;
+      (* Parse on the venue's parse domain; fall back to the raw stream (whose consumer
+         parses inline) when that domain is saturated. *)
+      if not (Concurrency.Parse_worker.submit_frame "hyperliquid" content)
+      then broadcast_raw_message content;
       Lwt.return_unit)
     else (
       (try
@@ -916,10 +919,7 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
             close_all_subscribers ();
             Lwt.fail_with "Connection closed unexpectedly (End_of_file)"
           | exn ->
-            Logging.debug_f
-              ~section
-              "WebSocket read error: %s"
-              (Printexc.to_string exn);
+            Logging.debug_f ~section "WebSocket read error: %s" (Printexc.to_string exn);
             Lwt_mutex.with_lock connection_mutex (fun () ->
               active_connection := None;
               Atomic.set is_connected_ref false;
@@ -975,7 +975,21 @@ let close () : unit Lwt.t =
   \    closes all subscriber streams, and tears down the underlying TLS transport. "]
 ;;
 
-let send_request ~json ~req_id ~timeout_ms =
+(** Send a pre-serialized JSON frame. The order path uses this so it does not build and
+    serialize a second [Yojson] envelope per request. *)
+let subscribe_raw msg =
+  Lwt_mutex.with_lock connection_mutex (fun () ->
+    match !active_connection with
+    | Some conn ->
+      if Logging.will_log Logging.DEBUG section
+      then Logging.debug_f ~section "Sending: %s" msg;
+      Ws_lwt.write conn (Websocket.Frame.create ~content:msg ())
+    | None ->
+      Logging.warn ~section "Cannot subscribe: WebSocket not connected";
+      Lwt.return_unit)
+;;
+
+let request_response ~req_id ~timeout_ms ~send =
   let waiter, wakener = Lwt.wait () in
   Lwt_mutex.with_lock responses_mutex (fun () ->
     let pending_count = Response_table.length responses in
@@ -988,7 +1002,7 @@ let send_request ~json ~req_id ~timeout_ms =
     Response_table.add responses req_id (wakener, Unix.time ());
     Lwt.return_unit)
   >>= fun () ->
-  subscribe json
+  send ()
   >>= fun () ->
   let timeout = float_of_int timeout_ms /. 1000.0 in
   Lwt.pick
@@ -1006,10 +1020,18 @@ let send_request ~json ~req_id ~timeout_ms =
          Lwt.fail_with (Printf.sprintf "Timeout waiting for response to req_id %d" req_id)
        | `Resolved -> waiter)
     ]
+;;
+
+let send_request ~json ~req_id ~timeout_ms =
+  request_response ~req_id ~timeout_ms ~send:(fun () -> subscribe json)
 [@@ocaml.doc
   " Sends a JSON request over the WebSocket and blocks until a response with the matching\n\
   \    [req_id] arrives or [timeout_ms] elapses. Logs a warning when the response table\n\
   \    exceeds 10 pending entries. "]
+;;
+
+let send_request_raw ~body ~req_id ~timeout_ms =
+  request_response ~req_id ~timeout_ms ~send:(fun () -> subscribe_raw body)
 ;;
 
 let send_ping ~req_id:_ ~timeout_ms =

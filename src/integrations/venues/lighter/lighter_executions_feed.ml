@@ -107,7 +107,6 @@ type store =
   }
 
 let stores = Ds.Cow_table.create ~shard_count:32 ()
-let ready_condition = Lwt_condition.create ()
 let initialization_mutex = Mutex.create ()
 
 (* Global order_id -> symbol index, bounded and FIFO-evicted. Backing store for
@@ -273,11 +272,8 @@ let drain_open_order_changes ~symbol =
   | None -> [], true
 ;;
 
-let notify_ready store =
-  if not (Atomic.get store.ready) then Atomic.set store.ready true;
-  try Lwt_condition.broadcast ready_condition () with
-  | _ -> ()
-;;
+(* Atomic flag only: account frames are decoded on the parse domain. *)
+let notify_ready store = Atomic.set store.ready true
 
 (** Applies an execution event to the open-orders table and event buffer: terminal
     statuses remove the order, otherwise it is upserted (preserving cl_ord_id and stored

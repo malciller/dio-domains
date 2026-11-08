@@ -21,4 +21,5 @@
   Fill_event_bus
   Oracle_wakeup
   Parse_worker
-  Main_loop_watchdog))
+  Main_loop_watchdog
+  Domain_doorbell))

@@ -218,6 +218,96 @@ let test_serialize_action () =
   Alcotest.(check bool) "non-empty" true (String.length bytes > 0)
 ;;
 
+let json_of f =
+  let buf = Buffer.create 256 in
+  f buf;
+  Buffer.contents buf
+;;
+
+let limit_order ?cloid ~p ~s () : Hyperliquid.Types.order_wire =
+  { Hyperliquid.Types.a = 7
+  ; b = true
+  ; p
+  ; s
+  ; r = false
+  ; t = Hyperliquid.Types.Limit { tif = Hyperliquid.Types.Gtc }
+  ; c = cloid
+  }
+;;
+
+let test_json_order_action () =
+  let order = limit_order ~p:"100.25" ~s:"2" () in
+  let json =
+    json_of (fun buf ->
+      Hyperliquid.Types.add_order_action_json buf ~orders:[ order ] ~grouping:"na")
+  in
+  Alcotest.(check string)
+    "exact wire"
+    {|{"type":"order","orders":[{"a":7,"b":true,"p":"100.25","s":"2","r":false,"t":{"limit":{"tif":"Gtc"}}}],"grouping":"na"}|}
+    json
+;;
+
+let test_json_order_action_cloid_escapes () =
+  let cloid = "cid\"x\\y\tz" in
+  let order = limit_order ~cloid ~p:"1" ~s:"2" () in
+  let json =
+    json_of (fun buf ->
+      Hyperliquid.Types.add_order_action_json buf ~orders:[ order ] ~grouping:"na")
+  in
+  let open Yojson.Safe.Util in
+  let parsed = Yojson.Safe.from_string json in
+  let c = member "orders" parsed |> to_list |> List.hd |> member "c" |> to_string in
+  Alcotest.(check string) "cloid round-trips through JSON" cloid c
+;;
+
+let test_json_modify_action () =
+  let order = limit_order ~p:"99.5" ~s:"3" () in
+  let json =
+    json_of (fun buf -> Hyperliquid.Types.add_modify_action_json buf ~oid:12345L ~order)
+  in
+  Alcotest.(check string)
+    "exact wire"
+    {|{"type":"modify","oid":12345,"order":{"a":7,"b":true,"p":"99.5","s":"3","r":false,"t":{"limit":{"tif":"Gtc"}}}}|}
+    json
+;;
+
+let test_json_cancel_action () =
+  let json =
+    json_of (fun buf ->
+      Hyperliquid.Types.add_cancel_action_json
+        buf
+        ~asset_index:7
+        ~order_ids:[ 12345L; 67890L ])
+  in
+  Alcotest.(check string)
+    "exact wire"
+    {|{"type":"cancel","cancels":[{"a":7,"o":12345},{"a":7,"o":67890}]}|}
+    json
+;;
+
+let test_json_trigger_order () =
+  let order : Hyperliquid.Types.order_wire =
+    { a = 3
+    ; b = false
+    ; p = "0"
+    ; s = "1"
+    ; r = true
+    ; t =
+        Hyperliquid.Types.Trigger
+          { triggerPx = "100"; isMarket = true; tpsl = Hyperliquid.Types.Sl }
+    ; c = None
+    }
+  in
+  let json =
+    json_of (fun buf ->
+      Hyperliquid.Types.add_order_action_json buf ~orders:[ order ] ~grouping:"na")
+  in
+  Alcotest.(check string)
+    "exact wire"
+    {|{"type":"order","orders":[{"a":3,"b":false,"p":"0","s":"1","r":true,"t":{"trigger":{"isMarket":true,"triggerPx":"100","tpsl":"sl"}}}],"grouping":"na"}|}
+    json
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Types"
@@ -253,6 +343,16 @@ let () =
             `Quick
             test_pack_cancel_by_cloid_action
         ; Alcotest.test_case "serialize_action" `Quick test_serialize_action
+        ] )
+    ; ( "json"
+      , [ Alcotest.test_case "order action" `Quick test_json_order_action
+        ; Alcotest.test_case
+            "order action cloid escaping"
+            `Quick
+            test_json_order_action_cloid_escapes
+        ; Alcotest.test_case "modify action" `Quick test_json_modify_action
+        ; Alcotest.test_case "cancel action" `Quick test_json_cancel_action
+        ; Alcotest.test_case "trigger order" `Quick test_json_trigger_order
         ] )
     ]
 ;;

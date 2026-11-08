@@ -422,6 +422,55 @@ let dispatch_deadline_s = 120.0
   \    open-orders scan. "]
 ;;
 
+(* Per-symbol send pipeline. One drain can emit several operations for a symbol (place
+   then amend, amend then cancel); the venue must see them in that order, and a second
+   request must not overtake the first. One Lwt fiber per symbol drains a FIFO queue, so
+   at most one request is in flight per symbol and a single deadline timer bounds it. *)
+module SymbolKey = struct
+  type t = string * string
+
+  let equal = ( = )
+  let hash = Hashtbl.hash
+end
+
+module SymbolTable = Hashtbl.Make (SymbolKey)
+
+let send_queues : (unit -> unit Lwt.t) Queue.t SymbolTable.t = SymbolTable.create 16
+let send_busy : unit SymbolTable.t = SymbolTable.create 16
+
+let rec drain_send_queue key =
+  let queue = SymbolTable.find send_queues key in
+  if Queue.is_empty queue
+  then (
+    SymbolTable.remove send_busy key;
+    Lwt.return_unit)
+  else (
+    let task = Queue.pop queue in
+    Lwt.catch task (fun exn ->
+      Logging.error_f
+        ~section
+        "Order send pipeline task failed: %s"
+        (Printexc.to_string exn);
+      Lwt.return_unit)
+    >>= fun () -> drain_send_queue key)
+;;
+
+let enqueue_send key task =
+  let queue =
+    match SymbolTable.find_opt send_queues key with
+    | Some queue -> queue
+    | None ->
+      let queue = Queue.create () in
+      SymbolTable.add send_queues key queue;
+      queue
+  in
+  Queue.push task queue;
+  if not (SymbolTable.mem send_busy key)
+  then (
+    SymbolTable.add send_busy key ();
+    Lwt.async (fun () -> drain_send_queue key))
+;;
+
 let once_only resolved f () =
   if Atomic.compare_and_set resolved false true then f () else Lwt.return_unit
 [@@ocaml.doc
@@ -575,7 +624,7 @@ let amend_request_of_order (order : strategy_order) target_order_id =
 ;;
 
 let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
-  Lwt.async (fun () ->
+  enqueue_send (order.exchange, order.symbol) (fun () ->
     (* No pause: it cost a scheduler round-trip before the order could be signed. *)
     let __ppx_lwt_0 = Lwt.return_unit in
     Lwt.backtrace_bind
@@ -667,7 +716,7 @@ let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
 
 let dispatch_amend ~auth_token ~orders_placed ~cb (order : strategy_order) target_order_id
   =
-  Lwt.async (fun () ->
+  enqueue_send (order.exchange, order.symbol) (fun () ->
     (* No pause: it cost a scheduler round-trip before the order could be signed. *)
     let __ppx_lwt_0 = Lwt.return_unit in
     Lwt.backtrace_bind
@@ -785,7 +834,7 @@ let dispatch_cancel
   (order : strategy_order)
   target_order_id
   =
-  Lwt.async (fun () ->
+  enqueue_send (order.exchange, order.symbol) (fun () ->
     (* No pause: it cost a scheduler round-trip before the order could be signed. *)
     let __ppx_lwt_0 = Lwt.return_unit in
     Lwt.backtrace_bind

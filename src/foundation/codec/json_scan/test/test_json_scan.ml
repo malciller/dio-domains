@@ -3,7 +3,7 @@ module J = Json_scan
 (* Interior of a top-level object/array literal (between its braces/brackets). *)
 let interior s = 1, String.length s - 1
 
-let get s key =
+let get s key = exclave_
   let lo, hi = interior s in
   match J.find_field s lo hi key with
   | Some span -> span

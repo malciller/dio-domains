@@ -302,7 +302,7 @@ let get_or_create_store symbol =
    [since_id] with no gap. *)
 let sse_active = Atomic.make false
 let last_activity = ref 0.0
-let last_event_id : string option ref = ref None
+let last_event_id : string option Atomic.t = Atomic.make None
 
 (** Startup backfill window (15 min): the first connect requests events since now - 15min
     so a short restart loses no fills; later reconnects resume from [last_event_id].
@@ -600,14 +600,14 @@ let apply_trade_update json =
         ; order_id = ord.id
         ; trade_id = ord.id
         ; market = "equity"
-        ; intent = if side_str = "buy" then "buy_equity" else "sell_equity"
+        ; intent = (if side_str = "buy" then "buy_equity" else "sell_equity")
         ; strategy = "grid"
         ; realized_pnl = None
         ; note = None
         });
     ());
   if event = "fill" || event = "partial_fill" || event = "canceled" || event = "rejected"
-  then Lwt.async (fun () -> Alpaca_balances.update_balances ())
+  then Alpaca_balances.request_balance_refresh ()
 ;;
 
 (** Entry point for one trade event. The Events API delivers [TradeUpdateEventV2] directly
@@ -618,7 +618,7 @@ let apply_trade_update json =
 let handle_trade_update json =
   let open Yojson.Safe.Util in
   (match json |> member "event_id" with
-   | `String id -> last_event_id := Some id
+   | `String id -> Atomic.set last_event_id (Some id)
    | _ -> ());
   let event = json |> member "event" |> to_string_option |> Option.value ~default:"" in
   if event = "trade_bust" || event = "trade_correct"
@@ -633,8 +633,22 @@ let handle_trade_update json =
        |> to_string_option
        |> Option.value ~default:"")
       (Yojson.Safe.to_string json);
-    Lwt.async (fun () -> Alpaca_balances.update_balances ()))
+    Alpaca_balances.request_balance_refresh ())
   else apply_trade_update json
+;;
+
+(* Parse-domain entry for one SSE event. [handle_trade_update] is Lwt-free now that the
+   balance refresh is a flag the poll loop observes. *)
+let () =
+  Concurrency.Parse_worker.register "alpaca_trade" (fun raw ->
+    match Yojson.Safe.from_string raw with
+    | json -> handle_trade_update json
+    | exception exn ->
+      Logging.error_f
+        ~section
+        "Failed to parse Alpaca trade event: %s (payload: %s)"
+        (Printexc.to_string exn)
+        raw)
 ;;
 
 (* -- Events API (Server-Sent Events) transport ------------------------ *)
@@ -656,7 +670,7 @@ let iso8601_utc (t : float) : string =
     startup backfill. *)
 let events_uri () =
   let base = Uri.of_string (Alpaca_types.Config.trading_events_url ()) in
-  match !last_event_id with
+  match Atomic.get last_event_id with
   | Some id -> Uri.with_query' base [ "since_id", id ]
   | None ->
     Uri.with_query'
@@ -695,15 +709,17 @@ let consume_event_stream ~on_heartbeat body =
     let raw = String.trim (Buffer.contents data_buf) in
     Buffer.clear data_buf;
     if raw <> ""
-    then (
-      match Yojson.Safe.from_string raw with
-      | json -> handle_trade_update json
-      | exception exn ->
-        Logging.error_f
-          ~section
-          "Failed to parse Alpaca trade event: %s (payload: %s)"
-          (Printexc.to_string exn)
-          raw)
+    then
+      if not (Concurrency.Parse_worker.submit "alpaca_trade" raw)
+      then (
+        match Yojson.Safe.from_string raw with
+        | json -> handle_trade_update json
+        | exception exn ->
+          Logging.error_f
+            ~section
+            "Failed to parse Alpaca trade event: %s (payload: %s)"
+            (Printexc.to_string exn)
+            raw)
   in
   let handle_line line =
     last_activity := Unix.gettimeofday ();

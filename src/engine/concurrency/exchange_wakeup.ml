@@ -99,24 +99,50 @@ let signal_all () =
    in the rare race case. *)
 let default_spin_iterations = 100
 
+(** [DIO_BUSY_SPIN=1] keeps the domain spinning on its core instead of parking on the
+    condition variable. A signal always bumps the generation, so shutdown still wakes a
+    busy-spinning domain. Read after dotenv by [configure]. *)
+let spin_config : bool Atomic.t = Atomic.make false
+
+(** Read [DIO_BUSY_SPIN]. Must run after [Logging.load_dotenv]. *)
+let configure () =
+  let busy =
+    match Sys.getenv_opt "DIO_BUSY_SPIN" with
+    | Some s ->
+      (match String.lowercase_ascii (String.trim s) with
+       | "1" | "true" | "on" | "yes" -> true
+       | _ -> false)
+    | None -> false
+  in
+  Atomic.set spin_config busy
+;;
+
 (** Fast-path [wait_since] over a pre-resolved [sync_handle]; avoids map traversal on the
     hot domain cycle. *)
 let wait_since_fast (sync : sync_handle) ~since =
-  let rec spin i =
-    if Atomic.get sync.generation <> since
-    then ()
-    else if i <= 0
-    then (
-      Mutex.lock sync.mutex;
-      Fun.protect
-        ~finally:(fun () -> Mutex.unlock sync.mutex)
-        (fun () ->
-          while Atomic.get sync.generation = since do
-            Condition.wait sync.condition sync.mutex
-          done))
-    else spin (i - 1)
-  in
-  spin default_spin_iterations
+  if Atomic.get spin_config
+  then
+    (* Dedicated-core mode: never park. [signal]/[signal_all] bump the generation, so a
+       stop request still breaks the loop. *)
+    while Atomic.get sync.generation = since do
+      Domain.cpu_relax ()
+    done
+  else (
+    let rec spin i =
+      if Atomic.get sync.generation <> since
+      then ()
+      else if i <= 0
+      then (
+        Mutex.lock sync.mutex;
+        Fun.protect
+          ~finally:(fun () -> Mutex.unlock sync.mutex)
+          (fun () ->
+            while Atomic.get sync.generation = since do
+              Condition.wait sync.condition sync.mutex
+            done))
+      else spin (i - 1)
+    in
+    spin default_spin_iterations)
 ;;
 
 (** Block until the symbol's generation exceeds [since]. Returns immediately without

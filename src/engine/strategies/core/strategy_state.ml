@@ -86,8 +86,8 @@ type trading_config =
 
 (** One in-flight sell's share of the committed-base ledger. Mutable so the per-scan feed
     refresh ([upsert_sell_commitment]) updates price/qty/flags in place instead of
-    allocating on every fill; only a first sighting allocates. Guarded by
-    [strategy_state.mutex]. *)
+    allocating on every fill; only a first sighting allocates. Only the symbol's asset
+    domain mutates it. *)
 type sell_commitment =
   { mutable sc_price : float
   ; mutable sc_qty : float
@@ -95,6 +95,20 @@ type sell_commitment =
   ; mutable sc_acked : bool
   ; mutable sc_listed : bool
   ; sc_armed : float
+  }
+
+(** Reusable accumulation scratch for [sync_open_orders]. The owning asset domain is the
+    sole user, so one record per symbol replaces nine refs allocated every cycle. *)
+type sync_scratch =
+  { mutable ss_best_buy_price : float
+  ; mutable ss_best_buy_id : string
+  ; mutable ss_open_buy_count : int
+  ; mutable ss_has_recent_amend_buy : bool
+  ; mutable ss_locked_in_buys : float
+  ; mutable ss_locked_in_sells : float
+  ; mutable ss_feed_total : float
+  ; mutable ss_closest_sell_id : string
+  ; mutable ss_closest_sell_price : float
   }
 
 (** Mutable per-symbol strategy state. *)
@@ -460,7 +474,7 @@ type strategy_state =
          the pre-fix ghost semantics - purge plus full reset - so the window bounds how
          far back the protection reaches without ever behaving worse than before. *)
   ; tracked_order_ids_queue : string Queue.t
-  ; mutex : Mutex.t (* per-symbol mutex; prevents concurrent strategy execution *)
+  ; sync_scratch : sync_scratch
   }
 
 (** Default exchange configs referenced during state creation before full config load *)
@@ -763,7 +777,17 @@ let rec get_strategy_state asset_symbol =
       ; processed_fills_queue = Queue.create ()
       ; tracked_order_ids = Hashtbl.create 256
       ; tracked_order_ids_queue = Queue.create ()
-      ; mutex = Mutex.create ()
+      ; sync_scratch =
+          { ss_best_buy_price = 0.0
+          ; ss_best_buy_id = ""
+          ; ss_open_buy_count = 0
+          ; ss_has_recent_amend_buy = false
+          ; ss_locked_in_buys = 0.0
+          ; ss_locked_in_sells = 0.0
+          ; ss_feed_total = 0.0
+          ; ss_closest_sell_id = ""
+          ; ss_closest_sell_price = nan
+          }
       }
     in
     if Atomic.compare_and_set
@@ -776,7 +800,7 @@ let rec get_strategy_state asset_symbol =
 
 (** Records a venue order id in the strategy's bounded ever-tracked set. Shared by the
     event handlers (ack/fill/amend) and the open-orders adoption scan; see
-    [strategy_state.tracked_order_ids]. Caller must hold the strategy mutex. *)
+    [strategy_state.tracked_order_ids]. Only the symbol's asset domain mutates it. *)
 let add_tracked_order_id state order_id =
   if not (Hashtbl.mem state.tracked_order_ids order_id)
   then (

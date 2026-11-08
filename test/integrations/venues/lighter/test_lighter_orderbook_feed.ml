@@ -189,6 +189,50 @@ let test_stale_book_is_rejected () =
     (Option.is_some (Lighter.Orderbook_feed.get_best_bid_ask_fast "OBSTALE" ()))
 ;;
 
+let level_obj price size = Printf.sprintf {|{"price":"%s","size":"%s"}|} price size
+
+let book_frame ~mi ~typ bids asks =
+  Printf.sprintf
+    {|{"type":"%s","channel":"order_book:%d","order_book":{"b":[%s],"a":[%s]}}|}
+    typ
+    mi
+    bids
+    asks
+;;
+
+(* The span path must produce the same book as the DOM path for both level encodings. *)
+let test_span_path_parity () =
+  Lighter.Instruments_feed.initialize [ "OBPARITYDOM"; "OBPARITYSPAN" ];
+  Lighter.Orderbook_feed.initialize [ "OBPARITYDOM"; "OBPARITYSPAN" ];
+  let dom_bids = String.concat "," [ level_obj "100.0" "2.0"; level_obj "99.0" "3.0" ] in
+  let dom_asks = String.concat "," [ level_obj "101.0" "1.0"; level_obj "102.0" "4.0" ] in
+  Lighter.Orderbook_feed.process_orderbook_snapshot
+    ~market_index:0
+    (Yojson.Safe.from_string (book_frame ~mi:0 ~typ:"snapshot" dom_bids dom_asks));
+  Lighter.Orderbook_feed.process_orderbook_snapshot_span
+    ~market_index:1
+    (book_frame ~mi:1 ~typ:"snapshot" dom_bids dom_asks);
+  Alcotest.(check bool)
+    "snapshot parity"
+    true
+    (Lighter.Orderbook_feed.get_best_bid_ask "OBPARITYDOM"
+     = Lighter.Orderbook_feed.get_best_bid_ask "OBPARITYSPAN");
+  (* Array-form levels and a removal exercise the other parser shape. *)
+  let dom_bids = {|[["100.0","5.0"],["99.0","0.0"]]|} in
+  let dom_asks = {|[["103.0","2.0"],["102.0","1.0"]]|} in
+  Lighter.Orderbook_feed.process_orderbook_update
+    ~market_index:0
+    (Yojson.Safe.from_string (book_frame ~mi:0 ~typ:"update" dom_bids dom_asks));
+  Lighter.Orderbook_feed.process_orderbook_update_span
+    ~market_index:1
+    (book_frame ~mi:1 ~typ:"update" dom_bids dom_asks);
+  Alcotest.(check bool)
+    "update parity"
+    true
+    (Lighter.Orderbook_feed.get_best_bid_ask "OBPARITYDOM"
+     = Lighter.Orderbook_feed.get_best_bid_ask "OBPARITYSPAN")
+;;
+
 let () =
   Alcotest.run
     "Lighter Orderbook Feed"
@@ -200,6 +244,7 @@ let () =
             `Quick
             test_process_orderbook_delta_remove
         ; Alcotest.test_case "null order_book field" `Quick test_null_order_book_field
+        ; Alcotest.test_case "span path parity" `Quick test_span_path_parity
         ] )
     ; ( "state"
       , [ Alcotest.test_case "has_orderbook_data" `Quick test_has_orderbook_data

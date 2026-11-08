@@ -52,3 +52,7 @@
 (executable
  (name cow_read)
  (libraries dio.concurrency dio.latency_profiling))
+
+(executable
+ (name span_alloc)
+ (libraries dio.kraken dio.json_scan dio.yojson unix))

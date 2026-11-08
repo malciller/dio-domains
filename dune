@@ -2,10 +2,20 @@
 ; Docker/production image). -O3 enables aggressive cross-module inlining,
 ; closure elimination and unboxing, which removes most of the per-event
 ; allocation on the execution-event hot path. It is a no-op on non-flambda
-; compilers, so local `dune build` (the dev profile) is unaffected; the
-; release profile must be built on a flambda switch (see Dockerfile).
+; compilers; the release profile must be built on a flambda switch (see
+; Dockerfile).
+;
+; The dev profile needs -O2 for the same backend reason: without an explicit
+; level the compiler keeps every value of the large [asset_domain_worker]
+; function in its own stack slot, producing a 73KB frame. OxCaml's arm64
+; emitter then prints that frame size with [movz] and the assembler rejects the
+; >16-bit immediate. -O2 coalesces the slots (frame drops to ~3KB) and keeps
+; local builds working; release stays at -O3.
 
 (env
+ (dev
+  (ocamlopt_flags
+   (:standard -O2)))
  (release
   (ocamlopt_flags
    (:standard -O3))))
