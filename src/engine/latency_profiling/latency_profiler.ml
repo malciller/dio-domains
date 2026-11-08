@@ -154,7 +154,7 @@ let create ?(bucket_us = 1) ?(max_latency_us = 10_000) ?(rolling_windows = 0) na
     fine tier; at/above [bucket_us] uses the coarse buckets. Samples above the
     histogram range are clamped to the last coarse bucket and counted as
     overflow. *)
-let[@inline] record_ns t ns =
+let[@inline] [@zero_alloc] record_ns t ns =
   let ns = if ns < 0 then 0 else ns in
   if ns < 1000
   then (
@@ -188,7 +188,7 @@ let[@inline] record t span = record_ns t (Int64.to_int (Span.to_uint64_ns span))
 (** [record_max_ns t ns] behaves as [record_ns] and returns [true] when [ns] set a new
     window maximum, so the caller builds an expensive cause string only on that rare path
     instead of allocating a cause closure per cycle. *)
-let[@inline] record_max_ns t ns =
+let[@inline] [@zero_alloc] record_max_ns t ns =
   let ns = if ns < 0 then 0 else ns in
   if ns < 1000
   then (
@@ -251,7 +251,7 @@ let[@inline] record_with_cause t span cause_thunk =
     [now]. The count and timestamp appear in the next snapshot so consumers can derive an
     executions-per-second rate and last-activity time even when a window has zero latency
     samples. *)
-let tick_exec t ~now =
+let[@zero_alloc] tick_exec t ~now =
   t.executions <- t.executions + 1;
   t.last_exec_time <- now
 ;;

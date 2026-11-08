@@ -51,7 +51,7 @@ module RingBuffer = struct
     { slots; write_pos = Atomic.make 0; size; mask }
   ;;
 
-  let[@inline always] index_of buffer pos =
+  let[@inline always] [@zero_alloc] index_of buffer pos =
     if buffer.mask >= 0 then pos land buffer.mask else pos mod buffer.size
   ;;
 
@@ -60,7 +60,7 @@ module RingBuffer = struct
       synchronization. Zero allocation on the hot path. The sentinel protocol ensures
       [seq] equals a valid position only while [value] holds the complete payload, so a
       concurrent reader cannot observe a half-written slot. *)
-  let[@inline always] write buffer value =
+  let[@inline always] [@zero_alloc] write buffer value =
     let pos = Atomic.get buffer.write_pos in
     let idx = index_of buffer pos in
     let slot = buffer.slots.(idx) in
@@ -107,7 +107,7 @@ module RingBuffer = struct
 
   (** Clamp a consumer cursor to the oldest surviving entry; entries below were evicted by
       the writer lapping the consumer. *)
-  let[@inline always] clamp_start buffer last_pos current =
+  let[@inline always] [@zero_alloc] clamp_start buffer last_pos current =
     let oldest = current - buffer.size in
     if last_pos < oldest then oldest else if last_pos < 0 then 0 else last_pos
   ;;

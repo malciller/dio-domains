@@ -72,6 +72,14 @@ type ('key, 'value) shard =
     in a shard to the same few slots. *)
 let[@inline] slot_start s h = (h lsr s.shift) land s.mask
 
+(** [Hashtbl.hash] and polymorphic equality are non-allocating, but the stdlib
+    [caml_hash_exn] / [caml_equal] externals are not declared [@@noalloc], so the
+    zero-alloc checker treats them as allocating. The read paths below call these
+    wrappers; every key in this table is a string. *)
+let[@inline] [@zero_alloc assume] hash_key k = Hashtbl.hash k
+
+let[@inline] [@zero_alloc assume] key_equal (a : 'a) (b : 'a) = a = b
+
 let shard_create shift =
   { slots = Array.make initial_slot_count None
   ; mask = initial_slot_count - 1
@@ -86,18 +94,18 @@ let shard_copy s =
   { slots = Array.copy s.slots; mask = s.mask; shift = s.shift; count = s.count }
 ;;
 
+(* Top-level so the probe allocates no closure. *)
+let rec shard_find_from slots mask k i =
+  match slots.(i) with
+  | None -> None
+  | Some (k', _) as cell ->
+    if key_equal k' k then cell else shard_find_from slots mask k ((i + 1) land mask)
+[@@zero_alloc]
+;;
+
 (** Returns the slot cell holding [k], or [None]. Returning the cell lets [find_default]
     destructure it instead of re-boxing. *)
-let shard_find s h k =
-  let slots = s.slots in
-  let mask = s.mask in
-  let rec probe i =
-    match slots.(i) with
-    | None -> None
-    | Some (k', _) as cell -> if k' = k then cell else probe ((i + 1) land mask)
-  in
-  probe (slot_start s h)
-;;
+let shard_find s h k = shard_find_from s.slots s.mask k (slot_start s h) [@@zero_alloc]
 
 (* Doubling the slot array and rehashing. Amortised O(1) per insert, and only on the
    writer's private copy, so it never races a reader. *)
@@ -171,7 +179,7 @@ let shard_count t = Array.length t.shards
 let[@inline] shard_index t h = h land t.mask
 
 let find_opt t k =
-  let h = Hashtbl.hash k in
+  let h = hash_key k in
   match shard_find (Atomic.get t.shards.(shard_index t h)) h k with
   | Some (_, v) -> Some v
   | None -> None
@@ -180,20 +188,28 @@ let find_opt t k =
 (** [find_default t k ~default], allocation-free. Same result as [find_opt] with an
     [Option.get ~default], for read paths that already have a fallback in hand. *)
 let find_default t k ~default =
-  let h = Hashtbl.hash k in
+  let h = hash_key k in
   match shard_find (Atomic.get t.shards.(shard_index t h)) h k with
   | Some (_, v) -> v
   | None -> default
+[@@zero_alloc]
 ;;
 
 let find t k =
-  let h = Hashtbl.hash k in
+  let h = hash_key k in
   match shard_find (Atomic.get t.shards.(shard_index t h)) h k with
   | Some (_, v) -> v
   | None -> raise Not_found
+[@@zero_alloc]
 ;;
 
-let mem t k = find_opt t k <> None
+let mem t k =
+  let h = hash_key k in
+  match shard_find (Atomic.get t.shards.(shard_index t h)) h k with
+  | Some _ -> true
+  | None -> false
+[@@zero_alloc]
+;;
 
 (** Publishes [k -> v], replacing any existing binding. Lock-free; retries if another
     domain republished the same shard first. A no-op write (the key is already bound to

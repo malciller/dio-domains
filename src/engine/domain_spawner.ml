@@ -1921,7 +1921,7 @@ let asset_domain_worker
       match
         Dio_exchange.Exchange_intf.Registry.get_market_context ov.oir_config.oi_exchange
       with
-      | None -> ()
+      | None -> 0
       | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
         let positions_at = Option.value (Mc.get_positions_updated_at ()) ~default:0.0 in
         let margin_at =
@@ -1933,12 +1933,14 @@ let asset_domain_worker
         then (
           ov.oir_seen_positions_at <- positions_at;
           ov.oir_seen_margin_at <- margin_at;
-          ignore
-            (run_overlay_cycles
-               ov
-               ~now
-               ~price:(overlay_mark ov)
-               ~events:[ "book_update", [] ]))
+          (* Return the pass so the owner can keep it out of its own PREP: the instance
+             records the same span on its own row. *)
+          run_overlay_cycles
+            ov
+            ~now
+            ~price:(overlay_mark ov)
+            ~events:[ "book_update", [] ])
+        else 0
     in
     (* Config-driven grid runtime (milestone 3, coarse wrapper; default off). When a
        strategy file is bound to the entry, the loop dispatches to the interpreter whose
@@ -3981,10 +3983,12 @@ let asset_domain_worker
                    ~now
                    ~price:(overlay_mark ov)
                    ~events:[ "book_update", [] ]
-          else overlay_venue_changed ov ~now)
+          else instance_ns := !instance_ns + overlay_venue_changed ov ~now)
         overlay_instances;
-      (* Controller work stays on this domain's row; instance work is charged to the
-         instance's own row, so the two are not counted twice. *)
+      (* Controller work stays on this domain's row. Every instance pass is charged to the
+         instance's own row (its prep, event and cycle profilers), so [instance_ns] is
+         removed from PREP below rather than counted on both rows. Only the unmeasured
+         per-instance gate (entry check, timestamp, venue-change probe) stays in PREP. *)
       let overlay_ns =
         if t_overlay = 0 then 0 else Monotonic_clock.now_ns () - t_overlay - !instance_ns
       in
@@ -4345,9 +4349,10 @@ let asset_domain_worker
       let alloc_at_t4 = !alloc_strat_end in
       (* PREP is recorded on every measured cycle: oracle apply / halt / reclaim / gate
          work runs on idle cycles too, and folding it into CYCLE made those cycles
-         unattributable. STRAT is the grid strategy call plus the overlay span: the
-         overlay is a second interpreter running on this domain, so charging it to PREP
-         made PREP report work it never did. *)
+         unattributable. STRAT is the grid strategy call plus the controller overlay span:
+         the controller is a second interpreter running on this domain, so charging it to
+         PREP made PREP report work it never did. Generic instance passes are already on
+         the instance's own rows, so they are removed from PREP here too. *)
       if latency_this_cycle
       then (
         (* Never record a zero-span sample: a phase that did no work this cycle must leave
@@ -4356,7 +4361,7 @@ let asset_domain_worker
         let grid_strat_ns =
           if should_execute && t4 > !t3_strategy then t4 - !t3_strategy else 0
         in
-        let prep_ns = !t3_strategy - t3 - overlay_ns in
+        let prep_ns = !t3_strategy - t3 - overlay_ns - !instance_ns in
         let strat_ns = grid_strat_ns + overlay_ns in
         if prep_ns > 0 then Latency_profiler.record_ns prof_prep prep_ns;
         if strat_ns > 0 then Latency_profiler.record_ns prof_strategy strat_ns);
@@ -4595,12 +4600,13 @@ let asset_domain_worker
             if latency_this_cycle
             then (
               (* On idle cycles [strat_end_ns] is never stamped (it is zero), so do not
-                 subtract it from [t1]. STRAT still carries the overlay span (a domain can
-                 host an overlay without executing its own grid), and PREP excludes it. *)
+                 subtract it from [t1]. STRAT still carries the controller overlay span (a
+                 domain can host an overlay without executing its own grid); PREP excludes
+                 both that span and every generic instance pass. *)
               let strat_ns =
                 (if should_execute then t4 - !t3_strategy else 0) + overlay_ns
               in
-              let prep_ns = !t3_strategy - t3 - overlay_ns in
+              let prep_ns = !t3_strategy - t3 - overlay_ns - !instance_ns in
               let total_end_ns = if should_execute then t4 else !t3_strategy in
               let total_ns = total_end_ns - t1 in
               base
