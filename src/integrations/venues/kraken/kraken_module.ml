@@ -14,6 +14,7 @@ module Types = Exchange.Types
 
 module Kraken_impl = struct
   let name = "kraken"
+  let order_budget_s = Kraken_actions.order_budget_s
   let section = "kraken_module"
 
   (** In-memory cache mapping symbol to (maker_fee, taker_fee). Populated once at startup

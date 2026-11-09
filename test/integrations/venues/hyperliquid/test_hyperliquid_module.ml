@@ -9,6 +9,14 @@ let test_module_registration () =
     Hyperliquid.Module.Hyperliquid_impl.name
 ;;
 
+let test_order_budget_covers_retries () =
+  (* Three attempts at the 10s WS response timeout plus 1s + 2s of backoff. *)
+  Alcotest.(check (float 1e-9))
+    "order budget"
+    33.0
+    Hyperliquid.Module.Hyperliquid_impl.order_budget_s
+;;
+
 let test_type_conversions () =
   let side_buy = Hyperliquid.Module.Hyperliquid_impl.string_of_side Types.Buy in
   Alcotest.(check string) "Buy" "buy" side_buy;
@@ -214,6 +222,10 @@ let () =
     "Hyperliquid Module"
     [ ( "basics"
       , [ Alcotest.test_case "registration" `Quick test_module_registration
+        ; Alcotest.test_case
+            "order budget covers retries"
+            `Quick
+            test_order_budget_covers_retries
         ; Alcotest.test_case "type conversions" `Quick test_type_conversions
         ] )
     ; ( "conversions"

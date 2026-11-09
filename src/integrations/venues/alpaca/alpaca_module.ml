@@ -12,6 +12,7 @@ end
 
 module Alpaca_impl = struct
   let name = "alpaca"
+  let order_budget_s = Alpaca_rest.order_budget_s
   let section = "alpaca_module"
   let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16
 

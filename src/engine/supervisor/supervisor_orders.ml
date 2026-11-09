@@ -406,21 +406,10 @@ let callbacks_for_strategy (order : strategy_order) =
 [@@ocaml.doc " Resolves the callbacks for [order]. "]
 ;;
 
-let dispatch_deadline_s = 120.0
-[@@ocaml.doc
-  " Deadline after which a dispatched Place/Amend that has produced no terminal callback\n\
-  \    is declared failed. Must exceed the worst-case legitimate REST duration including \
-   the\n\
-  \    venue retry budget (3 attempts with up to 30s backoff); 120s keeps the\n\
-  \    zombie-completion window small while guaranteeing in-flight guards cannot wedge\n\
-  \    forever - e.g. the Alpaca placement REST has no HTTP timeout, so a black-holed\n\
-  \    connection produces no terminal event on its own. A REST completion after the \
-   deadline\n\
-  \    fires is a zombie and is suppressed, so exactly one terminal event reaches the\n\
-  \    strategy; a request that landed venue-side before the deadline is adopted by the \
-   next\n\
-  \    open-orders scan. "]
-;;
+(** Deadline for one dispatched order operation, derived from the venue's own worst-case
+    retry budget ([S.order_budget_s]). A single constant cannot cover venues whose request
+    timeouts differ by 3x. *)
+let order_deadline_s = Dio_engine.Order_executor.order_deadline_s
 
 (* Per-symbol send pipeline. One drain can emit several operations for a symbol (place
    then amend, amend then cancel); the venue must see them in that order, and a second
@@ -624,6 +613,10 @@ let amend_request_of_order (order : strategy_order) target_order_id =
 ;;
 
 let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
+  let deadline_s = order_deadline_s order.exchange in
+  let deadline_ns =
+    Int64.add (Mtime_clock.now_ns ()) (Int64.of_float (deadline_s *. 1e9))
+  in
   enqueue_send (order.exchange, order.symbol) (fun () ->
     (* No pause: it cost a scheduler round-trip before the order could be signed. *)
     let __ppx_lwt_0 = Lwt.return_unit in
@@ -635,87 +628,106 @@ let dispatch_place ~auth_token ~orders_placed ~cb (order : strategy_order) =
         | exn -> exn)
       __ppx_lwt_0
       (fun () ->
-        let resolved = Atomic.make false in
-        let rec attempt retries (o : strategy_order) =
-          Dio_engine.Order_executor.place_order
-            ~token:auth_token
-            ~check_duplicate:false
-            (place_request_of_order o)
-          >>= function
-          | Ok result ->
-            once_only
-              resolved
-              (fun () ->
-                Atomic.incr orders_placed;
-                cb.on_place_ok o result.order_id;
-                Lwt.return_unit)
-              ()
-          | Error err ->
-            let retry =
-              if retries < 3 && is_post_only_rejection err
-              then post_only_retry_price ~err o
-              else None
-            in
-            (match retry with
-             | Some px when Some px <> o.price ->
-               Logging.warn_f
-                 ~section
-                 "Carry post-only placement rejected (%s); retrying %s %s %.8f @ %.2f \
-                  (attempt %d/3)"
-                 err
-                 (side_str o)
-                 o.symbol
-                 o.qty
-                 px
-                 (retries + 1);
-               attempt (retries + 1) { o with price = Some px }
-             | _ ->
-               once_only
-                 resolved
-                 (fun () ->
-                   cb.on_place_fail o err;
-                   Lwt.return_unit)
-                 ())
+        let remaining =
+          Int64.to_float (Int64.sub deadline_ns (Mtime_clock.now_ns ())) /. 1e9
         in
-        Lwt.catch
-          (fun () ->
-            Lwt.choose
-              [ attempt 0 order
-              ; (Lwt_unix.sleep dispatch_deadline_s
-                 >>= fun () ->
+        if remaining <= 0.0
+        then (
+          Logging.error_f
+            ~section
+            "\226\143\177 Place dispatch deadline (%.0fs) exceeded for %s %s - \
+             synthesizing terminal failure"
+            deadline_s
+            (side_str order)
+            order.symbol;
+          cb.on_place_fail order "dispatch deadline exceeded";
+          Lwt.return_unit)
+        else (
+          let resolved = Atomic.make false in
+          let rec attempt retries (o : strategy_order) =
+            Dio_engine.Order_executor.place_order
+              ~token:auth_token
+              ~check_duplicate:false
+              (place_request_of_order o)
+            >>= function
+            | Ok result ->
+              once_only
+                resolved
+                (fun () ->
+                  Atomic.incr orders_placed;
+                  cb.on_place_ok o result.order_id;
+                  Lwt.return_unit)
+                ()
+            | Error err ->
+              let retry =
+                if retries < 3 && is_post_only_rejection err
+                then post_only_retry_price ~err o
+                else None
+              in
+              (match retry with
+               | Some px when Some px <> o.price ->
+                 Logging.warn_f
+                   ~section
+                   "Carry post-only placement rejected (%s); retrying %s %s %.8f @ %.2f \
+                    (attempt %d/3)"
+                   err
+                   (side_str o)
+                   o.symbol
+                   o.qty
+                   px
+                   (retries + 1);
+                 attempt (retries + 1) { o with price = Some px }
+               | _ ->
                  once_only
                    resolved
                    (fun () ->
-                     Logging.error_f
-                       ~section
-                       "\226\143\177 Place dispatch deadline (%.0fs) exceeded for %s %s \
-                        - synthesizing terminal failure"
-                       dispatch_deadline_s
-                       (side_str order)
-                       order.symbol;
-                     cb.on_place_fail order "dispatch deadline exceeded";
+                     cb.on_place_fail o err;
                      Lwt.return_unit)
                    ())
-              ])
-          (fun exn ->
-            let err = Printexc.to_string exn in
-            Logging.error_f
-              ~section
-              "\226\156\151 Exception placing order %s %s: %s"
-              (side_str order)
-              order.symbol
-              err;
-            once_only
-              resolved
-              (fun () ->
-                cb.on_place_fail order err;
-                Lwt.return_unit)
-              ())))
+          in
+          Lwt.catch
+            (fun () ->
+              Lwt.choose
+                [ attempt 0 order
+                ; (Lwt_unix.sleep remaining
+                   >>= fun () ->
+                   once_only
+                     resolved
+                     (fun () ->
+                       Logging.error_f
+                         ~section
+                         "\226\143\177 Place dispatch deadline (%.0fs) exceeded for %s \
+                          %s - synthesizing terminal failure"
+                         deadline_s
+                         (side_str order)
+                         order.symbol;
+                       cb.on_place_fail order "dispatch deadline exceeded";
+                       Lwt.return_unit)
+                     ())
+                ])
+            (fun exn ->
+              let err = Printexc.to_string exn in
+              Logging.error_f
+                ~section
+                "\226\156\151 Exception placing order %s %s: %s"
+                (side_str order)
+                order.symbol
+                err;
+              once_only
+                resolved
+                (fun () ->
+                  cb.on_place_fail order err;
+                  Lwt.return_unit)
+                ()))))
 [@@ocaml.doc " Dispatches a Place order asynchronously via Order_executor. "]
 ;;
 
 let dispatch_amend ~auth_token ~orders_placed ~cb (order : strategy_order) target_order_id
   =
+  let deadline_s = order_deadline_s order.exchange in
+  let deadline_ns =
+    Int64.add (Mtime_clock.now_ns ()) (Int64.of_float (deadline_s *. 1e9))
+  in
   enqueue_send (order.exchange, order.symbol) (fun () ->
     (* No pause: it cost a scheduler round-trip before the order could be signed. *)
     let __ppx_lwt_0 = Lwt.return_unit in
@@ -727,103 +739,120 @@ let dispatch_amend ~auth_token ~orders_placed ~cb (order : strategy_order) targe
         | exn -> exn)
       __ppx_lwt_0
       (fun () ->
-        let resolved = Atomic.make false in
-        let rec attempt retries (o : strategy_order) =
-          Dio_engine.Order_executor.amend_order
-            ~token:auth_token
-            (amend_request_of_order o target_order_id)
-          >>= function
-          | Ok result ->
-            if result.Dio_exchange.Exchange_intf.Types.amend_id = Some "skipped_no_change"
-            then
-              once_only
-                resolved
-                (fun () ->
-                  cb.on_amend_skipped o target_order_id;
-                  Lwt.return_unit)
-                ()
-            else
-              once_only
-                resolved
-                (fun () ->
-                  Atomic.incr orders_placed;
-                  let amend_id_str =
-                    match result.Dio_exchange.Exchange_intf.Types.amend_id with
-                    | Some id -> id
-                    | None -> "none"
-                  in
-                  Logging.debug_f
-                    ~section
-                    "\226\156\147 Order amended (Amend ID: %s)"
-                    amend_id_str;
-                  cb.on_amend_ok
-                    o
-                    target_order_id
-                    result.Dio_exchange.Exchange_intf.Types.new_order_id;
-                  Lwt.return_unit)
-                ()
-          | Error err ->
-            let retry =
-              if retries < 3 && is_post_only_rejection err
-              then post_only_retry_price ~err o
-              else None
-            in
-            (match retry with
-             | Some px when Some px <> o.price ->
-               Logging.warn_f
-                 ~section
-                 "Carry post-only amend rejected (%s); retrying %s %s %.8f @ %.2f \
-                  (attempt %d/3)"
-                 err
-                 (side_str o)
-                 o.symbol
-                 o.qty
-                 px
-                 (retries + 1);
-               attempt (retries + 1) { o with price = Some px }
-             | _ ->
-               once_only
-                 resolved
-                 (fun () ->
-                   cb.on_amend_fail o target_order_id err;
-                   Lwt.return_unit)
-                 ())
+        let remaining =
+          Int64.to_float (Int64.sub deadline_ns (Mtime_clock.now_ns ())) /. 1e9
         in
-        Lwt.catch
-          (fun () ->
-            Lwt.choose
-              [ attempt 0 order
-              ; (Lwt_unix.sleep dispatch_deadline_s
-                 >>= fun () ->
+        if remaining <= 0.0
+        then (
+          Logging.error_f
+            ~section
+            "\226\143\177 Amend dispatch deadline (%.0fs) exceeded for %s %s (%s) - \
+             synthesizing terminal failure"
+            deadline_s
+            (side_str order)
+            order.symbol
+            target_order_id;
+          cb.on_amend_fail order target_order_id "dispatch deadline exceeded";
+          Lwt.return_unit)
+        else (
+          let resolved = Atomic.make false in
+          let rec attempt retries (o : strategy_order) =
+            Dio_engine.Order_executor.amend_order
+              ~token:auth_token
+              (amend_request_of_order o target_order_id)
+            >>= function
+            | Ok result ->
+              if result.Dio_exchange.Exchange_intf.Types.amend_id
+                 = Some "skipped_no_change"
+              then
+                once_only
+                  resolved
+                  (fun () ->
+                    cb.on_amend_skipped o target_order_id;
+                    Lwt.return_unit)
+                  ()
+              else
+                once_only
+                  resolved
+                  (fun () ->
+                    Atomic.incr orders_placed;
+                    let amend_id_str =
+                      match result.Dio_exchange.Exchange_intf.Types.amend_id with
+                      | Some id -> id
+                      | None -> "none"
+                    in
+                    Logging.debug_f
+                      ~section
+                      "\226\156\147 Order amended (Amend ID: %s)"
+                      amend_id_str;
+                    cb.on_amend_ok
+                      o
+                      target_order_id
+                      result.Dio_exchange.Exchange_intf.Types.new_order_id;
+                    Lwt.return_unit)
+                  ()
+            | Error err ->
+              let retry =
+                if retries < 3 && is_post_only_rejection err
+                then post_only_retry_price ~err o
+                else None
+              in
+              (match retry with
+               | Some px when Some px <> o.price ->
+                 Logging.warn_f
+                   ~section
+                   "Carry post-only amend rejected (%s); retrying %s %s %.8f @ %.2f \
+                    (attempt %d/3)"
+                   err
+                   (side_str o)
+                   o.symbol
+                   o.qty
+                   px
+                   (retries + 1);
+                 attempt (retries + 1) { o with price = Some px }
+               | _ ->
                  once_only
                    resolved
                    (fun () ->
-                     Logging.error_f
-                       ~section
-                       "\226\143\177 Amend dispatch deadline (%.0fs) exceeded for %s %s \
-                        (%s) - synthesizing terminal failure"
-                       dispatch_deadline_s
-                       (side_str order)
-                       order.symbol
-                       target_order_id;
-                     cb.on_amend_fail order target_order_id "dispatch deadline exceeded";
+                     cb.on_amend_fail o target_order_id err;
                      Lwt.return_unit)
                    ())
-              ])
-          (fun exn ->
-            let err = Printexc.to_string exn in
-            Logging.error_f
-              ~section
-              "\226\156\151 Exception amending order %s %s: %s"
-              (side_str order)
-              order.symbol
-              err;
-            once_only
-              resolved
-              (fun () ->
-                cb.on_amend_fail order target_order_id err;
-                Lwt.return_unit)
-              ())))
+          in
+          Lwt.catch
+            (fun () ->
+              Lwt.choose
+                [ attempt 0 order
+                ; (Lwt_unix.sleep remaining
+                   >>= fun () ->
+                   once_only
+                     resolved
+                     (fun () ->
+                       Logging.error_f
+                         ~section
+                         "\226\143\177 Amend dispatch deadline (%.0fs) exceeded for %s \
+                          %s (%s) - synthesizing terminal failure"
+                         deadline_s
+                         (side_str order)
+                         order.symbol
+                         target_order_id;
+                       cb.on_amend_fail order target_order_id "dispatch deadline exceeded";
+                       Lwt.return_unit)
+                     ())
+                ])
+            (fun exn ->
+              let err = Printexc.to_string exn in
+              Logging.error_f
+                ~section
+                "\226\156\151 Exception amending order %s %s: %s"
+                (side_str order)
+                order.symbol
+                err;
+              once_only
+                resolved
+                (fun () ->
+                  cb.on_amend_fail order target_order_id err;
+                  Lwt.return_unit)
+                ()))))
 [@@ocaml.doc " Dispatches an Amend order asynchronously via Order_executor. "]
 ;;
 
@@ -834,30 +863,43 @@ let dispatch_cancel
   (order : strategy_order)
   target_order_id
   =
+  let deadline_s = order_deadline_s order.exchange in
+  let deadline_ns =
+    Int64.add (Mtime_clock.now_ns ()) (Int64.of_float (deadline_s *. 1e9))
+  in
   enqueue_send (order.exchange, order.symbol) (fun () ->
-    (* No pause: it cost a scheduler round-trip before the order could be signed. *)
-    let __ppx_lwt_0 = Lwt.return_unit in
-    Lwt.backtrace_bind
-      "src/engine/supervisor/supervisor_orders.ml"
-      507
-      (fun exn ->
-        try Lwt.reraise exn with
-        | exn -> exn)
-      __ppx_lwt_0
-      (fun () ->
-        Lwt.catch
-          (fun () ->
-            let request : Dio_engine.Order_executor.cancel_request =
-              { exchange = order.exchange
-              ; order_ids = Some [ target_order_id ]
-              ; cl_ord_ids = None
-              ; order_userrefs = None
-              ; symbol = Some order.symbol
-              }
-            in
-            Dio_engine.Order_executor.cancel_orders ~token:auth_token request
-            >>= function
-            | Ok results ->
+    let remaining =
+      Int64.to_float (Int64.sub deadline_ns (Mtime_clock.now_ns ())) /. 1e9
+    in
+    if remaining <= 0.0
+    then (
+      Logging.error_f
+        ~section
+        "\226\143\177 Cancel dispatch deadline (%.0fs) exceeded for %s %s (%s) - \
+         synthesizing terminal failure"
+        deadline_s
+        (side_str order)
+        order.symbol
+        target_order_id;
+      cb.on_cancel_fail order target_order_id;
+      Lwt.return_unit)
+    else (
+      let resolved = Atomic.make false in
+      let attempt () =
+        let request : Dio_engine.Order_executor.cancel_request =
+          { exchange = order.exchange
+          ; order_ids = Some [ target_order_id ]
+          ; cl_ord_ids = None
+          ; order_userrefs = None
+          ; symbol = Some order.symbol
+          }
+        in
+        Dio_engine.Order_executor.cancel_orders ~token:auth_token request
+        >>= function
+        | Ok results ->
+          once_only
+            resolved
+            (fun () ->
               let count = List.length results in
               Atomic.set orders_placed (Atomic.get orders_placed + count);
               (* An empty result means the venue/local cache no longer held the id. That
@@ -877,8 +919,12 @@ let dispatch_cancel
                   count
                   target_order_id;
               cb.on_cancel_ok order target_order_id;
-              Lwt.return_unit
-            | Error err ->
+              Lwt.return_unit)
+            ()
+        | Error err ->
+          once_only
+            resolved
+            (fun () ->
               Logging.error_f
                 ~section
                 "\226\156\151 Order cancellation failed: %s - %s"
@@ -886,15 +932,47 @@ let dispatch_cancel
                 err;
               cb.on_cancel_fail order target_order_id;
               Lwt.return_unit)
-          (fun exn ->
-            Logging.error_f
-              ~section
-              "\226\156\151 Exception cancelling order %s: %s"
-              target_order_id
-              (Printexc.to_string exn);
-            cb.on_cancel_fail order target_order_id;
-            Lwt.return_unit)))
-[@@ocaml.doc " Dispatches a Cancel order asynchronously via Order_executor. "]
+            ()
+      in
+      Lwt.catch
+        (fun () ->
+          Lwt.choose
+            [ attempt ()
+            ; (Lwt_unix.sleep remaining
+               >>= fun () ->
+               once_only
+                 resolved
+                 (fun () ->
+                   Logging.error_f
+                     ~section
+                     "\226\143\177 Cancel dispatch deadline (%.0fs) exceeded for %s %s \
+                      (%s) - synthesizing terminal failure"
+                     deadline_s
+                     (side_str order)
+                     order.symbol
+                     target_order_id;
+                   cb.on_cancel_fail order target_order_id;
+                   Lwt.return_unit)
+                 ())
+            ])
+        (fun exn ->
+          let err = Printexc.to_string exn in
+          Logging.error_f
+            ~section
+            "\226\156\151 Exception cancelling order %s: %s"
+            target_order_id
+            err;
+          once_only
+            resolved
+            (fun () ->
+              cb.on_cancel_fail order target_order_id;
+              Lwt.return_unit)
+            ())))
+[@@ocaml.doc
+  " Dispatches a Cancel order asynchronously via Order_executor. Bounded by the same\n\
+  \    dispatch deadline as Place/Amend: a hung venue call would otherwise block the\n\
+  \    per-symbol send queue forever, so every later order for that symbol would never\n\
+  \    reach the venue. "]
 ;;
 
 let process_single_order

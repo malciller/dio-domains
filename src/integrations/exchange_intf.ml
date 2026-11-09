@@ -380,6 +380,11 @@ module type S = sig
   (** Human-readable exchange name used as the registry key. *)
   val name : string
 
+  (** Worst-case wall time (seconds) for one place/amend/cancel, including this venue's
+      own request timeout and retry backoff. The supervisor derives its dispatch deadline
+      from it, so it must cover every legitimate retry of the operation. *)
+  val order_budget_s : float
+
   (** Submit a new order to the exchange.
 
       Required parameters: [token] (auth), [order_type], [side], [qty], [symbol]. Optional

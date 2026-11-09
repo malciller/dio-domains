@@ -180,6 +180,13 @@ let resync_nonce () =
     not. *)
 let max_nonce_attempts = 2
 
+(** Worst case for one order operation: the nonce retry loop at the tx timeout. *)
+let order_budget_s =
+  Error_handling.retry_budget_s
+    ~request_timeout_s:tx_timeout_s
+    { Error_handling.default_retry_config with max_attempts = max_nonce_attempts }
+;;
+
 (* Lighter's API reference gives the batch cap as both 15 and 50; stay on the lower bound
    rather than risk 21514 rejecting a whole ladder. *)
 let max_tx_batch = 15

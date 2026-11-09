@@ -8,6 +8,7 @@ module Types = Exchange.Types
 
 module Hyperliquid_impl = struct
   let name = "hyperliquid"
+  let order_budget_s = Hyperliquid_actions.order_budget_s
   let section = "hyperliquid_module"
 
   (* Testnet/mainnet toggle. Atomic for safe concurrent reads from feed threads. Defaults

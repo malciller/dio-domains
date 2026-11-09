@@ -17,6 +17,18 @@ let add_to_assoc (json : Yojson.Safe.t) (key_value_pair : string * Yojson.Safe.t
 
 let section = "kraken_actions"
 
+(** Per-attempt response timeout for place/amend/cancel. *)
+let order_request_timeout_ms = 10000
+
+(** Worst case for one order operation. Amend/cancel retry at this timeout; place is
+    single-attempt (a retried placement could double-fill), so this is the wider of the
+    two. *)
+let order_budget_s =
+  Error_handling.retry_budget_s
+    ~request_timeout_s:(float_of_int order_request_timeout_ms /. 1000.0)
+    Error_handling.default_retry_config
+;;
+
 (** Rounds a price to the instrument's configured decimal precision. *)
 let truncate_price_to_precision price symbol =
   match Kraken_instruments_feed.get_precision_info symbol with
@@ -282,7 +294,7 @@ let place_order
       ~method_:"add_order"
       ~params
       ~req_id
-      ~timeout_ms:10000
+      ~timeout_ms:order_request_timeout_ms
     >>= fun response ->
     if response.success
     then (
@@ -426,7 +438,7 @@ let amend_order
       ~method_:"amend_order"
       ~params
       ~req_id
-      ~timeout_ms:10000
+      ~timeout_ms:order_request_timeout_ms
     >>= fun response ->
     if response.success
     then (
@@ -515,7 +527,7 @@ let cancel_orders ~token ?order_ids ?cl_ord_ids ?order_userrefs ?retry_config ()
         ~method_:"cancel_order"
         ~params
         ~req_id
-        ~timeout_ms:10000
+        ~timeout_ms:order_request_timeout_ms
       >>= fun response ->
       if response.success
       then (

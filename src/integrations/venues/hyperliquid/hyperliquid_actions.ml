@@ -6,6 +6,16 @@ open Lwt.Infix
 
 let section = "hyperliquid_actions"
 
+(** Per-attempt response timeout for place/amend/cancel. *)
+let order_request_timeout_ms = 10000
+
+(** Worst case for one order operation: the venue's retry budget at that timeout. *)
+let order_budget_s =
+  Error_handling.retry_budget_s
+    ~request_timeout_s:(float_of_int order_request_timeout_ms /. 1000.0)
+    Error_handling.default_retry_config
+;;
+
 (** Maps an [ExTypes.order_type] to an [order_type_wire]. Limit orders are always posted
     Alo. [tif] applies only to the catch-all branch for non-standard types; FOK is
     unsupported and degrades to IOC. *)
@@ -251,7 +261,7 @@ let post_exchange_ws ~testnet:_ ~write_action ~action_msgpack ~is_mainnet =
     Logging.debug_f ~section "Sending WS post action: req_id=%d" req_id;
     Lwt.catch
       (fun () ->
-        Hyperliquid_ws.send_request_raw ~body ~req_id ~timeout_ms:10000
+        Hyperliquid_ws.send_request_raw ~body ~req_id ~timeout_ms:order_request_timeout_ms
         >>= fun resp ->
         let open Yojson.Safe.Util in
         let payload =

@@ -78,6 +78,13 @@ let record_rest_span span = Network_latency.record_rest "alpaca" span
     retried by [retry_http_exceptions]. *)
 let rest_timeout_s = 30.0
 
+(** Worst case for one order operation: the venue's retry budget at the REST timeout. *)
+let order_budget_s =
+  Error_handling.retry_budget_s
+    ~request_timeout_s:rest_timeout_s
+    Error_handling.default_retry_config
+;;
+
 let json_to_float = function
   | `Float f -> f
   | `Int i -> float_of_int i

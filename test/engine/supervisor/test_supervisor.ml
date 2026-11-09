@@ -198,6 +198,22 @@ let test_maker_retry_price () =
        ~bbo)
 ;;
 
+let test_retry_budget_covers_every_attempt () =
+  let cfg = Error_handling.default_retry_config in
+  Alcotest.(check (float 1e-9))
+    "3 attempts at a 10s timeout"
+    33.0
+    (Error_handling.retry_budget_s ~request_timeout_s:10.0 cfg);
+  Alcotest.(check (float 1e-9))
+    "3 attempts at a 30s timeout"
+    93.0
+    (Error_handling.retry_budget_s ~request_timeout_s:30.0 cfg);
+  Alcotest.(check (float 1e-9))
+    "single attempt has no backoff"
+    10.0
+    (Error_handling.retry_budget_s ~request_timeout_s:10.0 { cfg with max_attempts = 1 })
+;;
+
 let test_amend_request_preserves_flags () =
   let order =
     { Dio_strategies.Strategy_common.operation = Dio_strategies.Strategy_common.Amend
@@ -519,6 +535,10 @@ let () =
             "amend request preserves flags"
             `Quick
             test_amend_request_preserves_flags
+        ; Alcotest.test_case
+            "retry budget covers every attempt"
+            `Quick
+            test_retry_budget_covers_every_attempt
         ] )
     ; ( "carry_inflight"
       , [ Alcotest.test_case

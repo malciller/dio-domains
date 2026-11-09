@@ -1053,19 +1053,28 @@ module OrderSignal = struct
      consumes it or the next [wait_read] returns immediately. *)
   let broadcast () = if not (Atomic.exchange pending true) then write_wake_byte ()
 
+  let drain_pipe () =
+    let buf = Bytes.create 64 in
+    try
+      while true do
+        let n = Unix.read read_fd buf 0 64 in
+        if n = 0 then raise Exit
+      done
+    with
+    | _ -> ()
+  ;;
+
   (** Block in the Lwt event loop until the pipe becomes readable (a broadcast arrived). *)
   let wait () =
     Lwt_unix.wait_read lwt_read_fd
     >>= fun () ->
     Atomic.set pending false;
-    let buf = Bytes.create 64 in
-    (try
-       while true do
-         let n = Unix.read read_fd buf 0 64 in
-         if n = 0 then raise Exit
-       done
-     with
-     | _ -> ());
+    drain_pipe ();
+    (* A producer that broadcast during the drain flipped [pending] back on and its byte
+       was swept up by that drain. Clear again: its order is already published, and a
+       lingering [pending] would coalesce every later broadcast into a byte never written,
+       parking the order pipeline until restart. *)
+    Atomic.set pending false;
     Lwt.return_unit
   ;;
 end

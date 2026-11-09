@@ -1,3 +1,9 @@
 (test
  (name test_supervisor)
- (libraries dio.engine dio.supervisor dio.strategies dio.lwt.unix alcotest))
+ (libraries
+  dio.engine
+  dio.supervisor
+  dio.strategies
+  dio.lwt.unix
+  dio.error_handling
+  alcotest))

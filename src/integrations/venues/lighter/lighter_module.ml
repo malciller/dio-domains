@@ -14,6 +14,7 @@ let resync_open_orders_hook : (unit -> unit) ref = ref (fun () -> ())
 
 module Lighter_impl = struct
   let name = "lighter"
+  let order_budget_s = Lighter_actions.order_budget_s
   let section = "lighter_module"
   let fee_cache : (string, float * float) Hashtbl.t = Hashtbl.create 16
 

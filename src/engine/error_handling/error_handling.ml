@@ -111,6 +111,25 @@ let default_retry_config =
   }
 ;;
 
+(** Worst-case wall time for one retried operation: every attempt bounded by
+    [request_timeout_s], plus the backoff slept between them. Callers derive dispatch
+    deadlines from this instead of hard-coding one, so a deadline can never be shorter
+    than the retry budget it is supposed to cover. *)
+let retry_budget_s ?(request_timeout_s = 0.0) config =
+  let rec backoff i acc =
+    if i >= config.max_attempts - 1
+    then acc
+    else (
+      let delay =
+        Float.min
+          config.max_delay_ms
+          (config.base_delay_ms *. (config.backoff_factor ** float_of_int i))
+      in
+      backoff (i + 1) (acc +. delay))
+  in
+  (float_of_int config.max_attempts *. request_timeout_s) +. (backoff 0 0.0 /. 1000.0)
+;;
+
 (** Lwt sleep for the given duration in milliseconds. *)
 let sleep_ms ms = Lwt_unix.sleep (ms /. 1000.0)
 

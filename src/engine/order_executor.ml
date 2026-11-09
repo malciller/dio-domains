@@ -291,6 +291,37 @@ let get_exchange name =
   | None -> Error (Printf.sprintf "Exchange '%s' not found in registry" name)
 ;;
 
+(** Keeps a synthetic dispatch deadline strictly after a venue's own retry budget, so a
+    real venue result always wins the terminal race. *)
+let dispatch_margin_s = 1.0
+
+(** Longest a single place/amend/cancel may legitimately take on [exchange]. *)
+let order_deadline_s exchange =
+  match get_exchange exchange with
+  | Ok (module Ex : Exchange.S) -> Ex.order_budget_s +. dispatch_margin_s
+  | Error _ -> dispatch_margin_s
+;;
+
+(** Cadence of the in-flight registry sweep. *)
+let sweep_interval_s = 15.0
+
+(** Longest deadline over the registered venues. *)
+let max_order_deadline_s () =
+  (Exchange.Registry.get_all_names ()
+   |> List.fold_left
+        (fun acc name ->
+          match Exchange.Registry.get name with
+          | Some (module Ex : Exchange.S) -> Float.max acc Ex.order_budget_s
+          | None -> acc)
+        0.0)
+  +. dispatch_margin_s
+;;
+
+(** A latch is released by its terminal callback, well inside [order_deadline_s]. The TTL
+    only catches a key whose callback never fired, so it sits above every legitimate
+    deadline and the sweep cannot preempt one. *)
+let in_flight_ttl_s () = max_order_deadline_s () +. (2.0 *. sweep_interval_s)
+
 (** Parses a string to [Types.order_type]. Unrecognized values map to [Types.Other]. *)
 let parse_order_type = function
   | "limit" -> Types.Limit
@@ -640,7 +671,7 @@ let start_periodic_inflight_cleanup () =
   then
     Lwt.async (fun () ->
       let rec loop () =
-        Lwt_unix.sleep 15.0
+        Lwt_unix.sleep sweep_interval_s
         >>= fun () ->
         if Atomic.get shutdown_requested
         then Lwt.return_unit
@@ -650,7 +681,9 @@ let start_periodic_inflight_cleanup () =
              to prevent would come back. *)
           Lwt.catch
             (fun () ->
-              let _drift1, trimmed1 = InFlightOrders.cleanup () in
+              let _drift1, trimmed1 =
+                InFlightOrders.cleanup ~max_age:(in_flight_ttl_s ()) ()
+              in
               let _drift2, trimmed2 = InFlightAmendments.cleanup () in
               (* Retired carry ids cannot remove their FIFO admission records in O(1);
                  compact them here so the queue tracks the live mapping set instead of
@@ -669,10 +702,11 @@ let start_periodic_inflight_cleanup () =
                   trimmed2
                   trimmed_carry
                   trimmed_backoff;
-              (* A placement key should be released by its ack in well under a second.
-                 Anything held for tens of seconds is wedged and is silently suppressing
-                 every retry for that overlay kind, so surface it once per sweep. *)
-              (match InFlightOrders.stale () with
+              (* A placement key should be released by its ack in well under a second. One
+                 held past every venue's deadline is wedged and is silently suppressing
+                 every retry for that overlay kind, so surface it. *)
+              let stale_after_s = max_order_deadline_s () in
+              (match InFlightOrders.stale ~age:stale_after_s () with
                | 0, _ -> ()
                | count, oldest ->
                  let detail =
@@ -682,7 +716,8 @@ let start_periodic_inflight_cleanup () =
                  in
                  Logging.warn_f
                    ~section
-                   "In-flight order keys held over 30s: %d%s"
+                   "In-flight order keys held over %.0fs: %d%s"
+                   stale_after_s
                    count
                    detail);
               (* Spawn the next sweep independently: this fiber is process-lifetime, and a

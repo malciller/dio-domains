@@ -9,6 +9,10 @@ open Lwt.Infix
 
 let section = "ibkr_actions"
 
+(** The TWS write has no transport timeout, so treat 30s as the liveness bound for one
+    order operation. *)
+let order_budget_s = 30.0
+
 (** Places a new order and returns the assigned order id. Resolves the contract for
     [symbol] before sending. *)
 let place_order

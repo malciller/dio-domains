@@ -115,6 +115,7 @@ let get_conn () =
 
 module Ibkr_impl = struct
   let name = "ibkr"
+  let order_budget_s = Ibkr_actions.order_budget_s
   let section = "ibkr_module"
 
   (* ========================================== *)
