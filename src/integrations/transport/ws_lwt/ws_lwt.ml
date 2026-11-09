@@ -154,3 +154,87 @@ let connect
   in
   { input = ic; output = oc; next_frame; send_frame }
 ;;
+
+(* [getaddrinfo] usually yields several A records and only one may be reachable; dialing
+   just the first turns a rotated or blackholed address into an endless reconnect timeout.
+   Each address gets a bounded slice of one budget, and failures name every one tried. *)
+let connect_failover
+  ?(ctx = resolve_ctx ())
+  ?(timeout_s = 20.0)
+  ?dial_host
+  ~tls_host
+  ~port
+  uri
+  =
+  let dial_host = Option.value dial_host ~default:tls_host in
+  let deadline = Unix.gettimeofday () +. timeout_s in
+  let failf fmt = Printf.ksprintf (fun msg -> Lwt.fail (Failure msg)) fmt in
+  Lwt.catch
+    (fun () ->
+      Lwt_unix.with_timeout timeout_s (fun () ->
+        Lwt_unix.getaddrinfo
+          dial_host
+          (string_of_int port)
+          [ Unix.AI_FAMILY Unix.PF_INET ]))
+    (function
+      | Lwt_unix.Timeout ->
+        failf "connect %s:%d: resolution timed out after %.0fs" dial_host port timeout_s
+      | exn -> Lwt.fail exn)
+  >>= fun addresses ->
+  let ips =
+    List.filter_map
+      (fun { Unix.ai_addr; _ } ->
+        match ai_addr with
+        | Unix.ADDR_INET (addr, _) -> Some addr
+        | Unix.ADDR_UNIX _ -> None)
+      addresses
+    |> List.sort_uniq compare
+  in
+  let total = List.length ips in
+  if total = 0
+  then failf "connect %s:%d: no IPv4 address" dial_host port
+  else (
+    (* A reachable address completes TCP+TLS in well under a second; the cap stops one
+       blackholed address from consuming the whole budget. *)
+    let slice =
+      if total = 1 then timeout_s else Float.min 5.0 (timeout_s /. float_of_int total)
+    in
+    let rec try_ips tried = function
+      | [] ->
+        failf
+          "connect %s:%d failed on all %d address(es) [%s]"
+          dial_host
+          port
+          total
+          (String.concat ", " (List.rev tried))
+      | ip :: rest ->
+        let budget = Float.min slice (deadline -. Unix.gettimeofday ()) in
+        if budget <= 0.0
+        then
+          failf
+            "connect %s:%d: %.0fs budget exhausted, untried [%s]"
+            dial_host
+            port
+            timeout_s
+            (String.concat
+               ", "
+               (List.map (fun a -> Unix.string_of_inet_addr a) (ip :: rest)))
+        else (
+          let client =
+            `TLS (`Hostname tls_host, `IP (Ipaddr_unix.of_inet_addr ip), `Port port)
+          in
+          Lwt.catch
+            (fun () ->
+              Lwt_unix.with_timeout budget (fun () -> connect ~ctx client uri)
+              >>= fun conn -> Lwt.return (conn, Unix.string_of_inet_addr ip))
+            (fun exn ->
+              try_ips
+                (Printf.sprintf
+                   "%s: %s"
+                   (Unix.string_of_inet_addr ip)
+                   (Printexc.to_string exn)
+                 :: tried)
+                rest))
+    in
+    try_ips [] ips)
+;;

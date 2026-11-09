@@ -1147,21 +1147,16 @@ let connect_one
     tls_host;
   Lwt.catch
     (fun () ->
-      Lwt_unix.getaddrinfo
-        connect_host
-        (string_of_int connect_port)
-        [ Unix.AI_FAMILY Unix.PF_INET ]
-      >>= fun addresses ->
-      let ip =
-        match addresses with
-        | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ ->
-          Ipaddr_unix.of_inet_addr addr
-        | _ -> failwith (Printf.sprintf "Failed to resolve %s" connect_host)
-      in
-      let client = `TLS (`Hostname tls_host, `IP ip, `Port connect_port) in
       let ctx = Ws_lwt.resolve_ctx () in
-      Lwt_unix.with_timeout 20.0 (fun () -> Ws_lwt.connect ~ctx client uri)
-      >>= fun conn ->
+      Ws_lwt.connect_failover
+        ~ctx
+        ~timeout_s:20.0
+        ~dial_host:connect_host
+        ~tls_host
+        ~port:connect_port
+        uri
+      >>= fun (conn, dialed_ip) ->
+      Logging.info_f ~section "[%s] WebSocket established via %s" label dialed_ip;
       Lwt_mutex.with_lock state.connection_mutex (fun () ->
         state.active_connection := Some conn;
         Atomic.set state.is_connected_ref true;

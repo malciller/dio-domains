@@ -58,10 +58,16 @@ let chans_of_ssl sock =
   Lwt_ssl.get_fd sock, ic, oc
 ;;
 
+(* A failed dial must not leak the socket: the supervisor retries forever on a dead
+   address, and each timeout would otherwise strand one fd. *)
+let close_quietly fd = Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit)
+
 let tcp_connect ip port =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let addr = Unix.ADDR_INET (Unix.inet_addr_of_string (Ipaddr.to_string ip), port) in
-  Lwt_unix.connect fd addr >|= fun () -> fd
+  Lwt.catch
+    (fun () -> Lwt_unix.connect fd addr >|= fun () -> fd)
+    (fun exn -> close_quietly fd >>= fun () -> Lwt.fail exn)
 ;;
 
 let tls_connect ctx fd hostname =
@@ -83,18 +89,27 @@ let connect ~ctx client =
     TCP { fd; ip; port }, ic, oc
   | `Unix_domain_socket (`File path) ->
     let fd = Lwt_unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
-    Lwt_unix.connect fd (Unix.ADDR_UNIX path)
-    >|= fun () ->
-    let ic = Lwt_io.of_fd ~mode:Lwt_io.Input fd in
-    let oc = Lwt_io.of_fd ~mode:Lwt_io.Output fd in
-    Domain_socket { fd; path }, ic, oc
+    Lwt.catch
+      (fun () ->
+        Lwt_unix.connect fd (Unix.ADDR_UNIX path)
+        >|= fun () ->
+        let ic = Lwt_io.of_fd ~mode:Lwt_io.Input fd in
+        let oc = Lwt_io.of_fd ~mode:Lwt_io.Output fd in
+        Domain_socket { fd; path }, ic, oc)
+      (fun exn -> close_quietly fd >>= fun () -> Lwt.fail exn)
   | `TLS (`Hostname host, `IP ip, `Port port)
   | `TLS_native (`Hostname host, `IP ip, `Port port)
   | `OpenSSL (`Hostname host, `IP ip, `Port port) ->
     tcp_connect ip port
     >>= fun fd ->
-    tls_connect ctx fd host
-    >|= fun sock ->
-    let _, ic, oc = chans_of_ssl sock in
-    TCP { fd; ip; port }, ic, oc
+    let handshake = tls_connect ctx fd host in
+    (* Cancellation bypasses the catch below, and the fd is created above it. *)
+    Lwt.on_cancel handshake (fun () -> Lwt.async (fun () -> close_quietly fd));
+    Lwt.catch
+      (fun () ->
+        handshake
+        >|= fun sock ->
+        let _, ic, oc = chans_of_ssl sock in
+        TCP { fd; ip; port }, ic, oc)
+      (fun exn -> close_quietly fd >>= fun () -> Lwt.fail exn)
 ;;

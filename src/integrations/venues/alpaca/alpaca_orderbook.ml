@@ -562,20 +562,11 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
     let session_switch = ref false in
     Lwt.catch
       (fun () ->
-        Lwt_unix.getaddrinfo host (string_of_int port) [ Unix.AI_FAMILY Unix.PF_INET ]
-        >>= fun addresses ->
-        let ip =
-          match addresses with
-          | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ ->
-            Ipaddr_unix.of_inet_addr addr
-          | _ -> failwith ("Failed to resolve host " ^ host)
-        in
-        let client = `TLS (`Hostname host, `IP ip, `Port port) in
         let ctx = Ws_lwt.resolve_ctx () in
-        (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP connection would
-           otherwise block the reconnect (main Lwt loop) indefinitely. *)
-        Lwt_unix.with_timeout 20.0 (fun () -> Ws_lwt.connect ~ctx client uri)
-        >>= fun conn ->
+        (* Per-address failover; a hung handshake would otherwise block the main loop. *)
+        Ws_lwt.connect_failover ~ctx ~timeout_s:20.0 ~tls_host:host ~port uri
+        >>= fun (conn, dialed_ip) ->
+        Logging.info_f ~section "Alpaca data WS established via %s" dialed_ip;
         if my_gen <> !conn_generation
         then (
           (* A newer incarnation started while this handshake was in flight: publish

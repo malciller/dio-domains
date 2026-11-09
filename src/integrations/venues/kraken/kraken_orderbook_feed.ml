@@ -1948,17 +1948,14 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
   (* Clear after the old socket is gone so no straggler delta can land in a book the new
      snapshot is about to initialise. The supervisor also calls this; idempotent. *)
   clear_all_stores ();
-  Lwt_unix.getaddrinfo "ws.kraken.com" "443" [ Unix.AI_FAMILY Unix.PF_INET ]
-  >>= fun addresses ->
-  let ip =
-    match addresses with
-    | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ -> Ipaddr_unix.of_inet_addr addr
-    | _ -> failwith "Failed to resolve ws.kraken.com"
-  in
-  let client = `TLS (`Hostname "ws.kraken.com", `IP ip, `Port 443) in
   let ctx = get_conduit_ctx () in
-  Lwt_unix.with_timeout ws_connect_timeout_s (fun () -> Ws_lwt.connect ~ctx client uri)
-  >>= fun conn ->
+  Ws_lwt.connect_failover
+    ~ctx
+    ~timeout_s:ws_connect_timeout_s
+    ~tls_host:"ws.kraken.com"
+    ~port:443
+    uri
+  >>= fun (conn, dialed_ip) ->
   if my_gen <> !conn_generation
   then (
     (* Superseded while the handshake was in flight. Publish nothing, and close the socket
@@ -1973,7 +1970,10 @@ let connect_and_subscribe symbols ~on_failure ~on_heartbeat ~on_connected =
       state.active_conn <- Some conn;
       Lwt.return_unit)
     >>= fun () ->
-    Logging.debug_f ~section "Orderbook WebSocket established, subscribing...";
+    Logging.info_f
+      ~section
+      "Orderbook WebSocket established via %s, subscribing..."
+      dialed_ip;
     on_connected ();
     start_message_handler ~my_gen conn all_syms on_failure on_heartbeat
     >>= fun () ->

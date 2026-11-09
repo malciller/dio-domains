@@ -467,21 +467,16 @@ let start_reader conn generation =
 let connect _token : Ws_lwt.conn Lwt.t =
   let uri = Uri.of_string "wss://ws-auth.kraken.com/v2" in
   Logging.debug ~section "Connecting to Kraken authenticated WebSocket for trading...";
-  Lwt_unix.getaddrinfo "ws-auth.kraken.com" "443" [ Unix.AI_FAMILY Unix.PF_INET ]
-  >>= fun addresses ->
-  let ip =
-    match addresses with
-    | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ -> Ipaddr_unix.of_inet_addr addr
-    | _ -> failwith "Failed to resolve ws-auth.kraken.com"
-  in
-  let client = `TLS (`Hostname "ws-auth.kraken.com", `IP ip, `Port 443) in
   let ctx = get_conduit_ctx () in
-  (* Bound the TLS + WebSocket upgrade handshake: a half-open TCP connection during the
-     handshake would otherwise block the reconnect (which runs on the main Lwt loop)
-     indefinitely. *)
-  Lwt_unix.with_timeout 20.0 (fun () -> Ws_lwt.connect ~ctx client uri)
-  >>= fun conn ->
-  Logging.debug ~section "Trading WebSocket connection established";
+  (* Bounded dial across every A record: a half-open handshake would block the main loop. *)
+  Ws_lwt.connect_failover
+    ~ctx
+    ~timeout_s:20.0
+    ~tls_host:"ws-auth.kraken.com"
+    ~port:443
+    uri
+  >>= fun (conn, dialed_ip) ->
+  Logging.info_f ~section "Trading WebSocket connection established via %s" dialed_ip;
   Lwt.return conn
 ;;
 

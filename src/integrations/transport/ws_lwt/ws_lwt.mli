@@ -27,6 +27,21 @@ val connect
   -> Uri.t
   -> conn Lwt.t
 
+(** Like {!connect}, but resolves [dial_host] (default [tls_host]) and dials every
+    returned IPv4 address in turn instead of only the first: one rotated or blackholed A
+    record must not turn every reconnect into a handshake timeout. Resolution and the
+    whole dial are bounded by [timeout_s]. Returns the connection and the address that
+    accepted it; failure names every address tried, or the host when resolution or the
+    budget runs out. *)
+val connect_failover
+  :  ?ctx:Conduit_lwt_unix.ctx
+  -> ?timeout_s:float
+  -> ?dial_host:string
+  -> tls_host:string
+  -> port:int
+  -> Uri.t
+  -> (conn * string) Lwt.t
+
 val read : conn -> Websocket.Frame.t Lwt.t
 val write : conn -> Websocket.Frame.t -> unit Lwt.t
 

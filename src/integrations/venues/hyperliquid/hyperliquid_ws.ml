@@ -851,22 +851,15 @@ let connect_and_monitor ~on_failure ~on_connected ~on_heartbeat ~testnet =
   let uri = Uri.of_string url in
   Lwt.catch
     (fun () ->
-      (* Resolution is inside the timeout on purpose: a wedged resolver otherwise parks
-         this fiber forever with no failure to report, so the supervisor's reconnect never
-         fires and the feed dies silently instead of cycling. *)
-      Lwt_unix.with_timeout ws_connect_timeout_s (fun () ->
-        Lwt_unix.getaddrinfo hostname (string_of_int port) [ Unix.AI_FAMILY Unix.PF_INET ]
-        >>= fun addresses ->
-        let ip =
-          match addresses with
-          | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ ->
-            Ipaddr_unix.of_inet_addr addr
-          | _ -> failwith (Printf.sprintf "Failed to resolve %s" hostname)
-        in
-        let client = `TLS (`Hostname hostname, `IP ip, `Port port) in
-        let ctx = Ws_lwt.resolve_ctx () in
-        Ws_lwt.connect ~ctx client uri)
-      >>= fun conn ->
+      let ctx = Ws_lwt.resolve_ctx () in
+      Ws_lwt.connect_failover
+        ~ctx
+        ~timeout_s:ws_connect_timeout_s
+        ~tls_host:hostname
+        ~port
+        uri
+      >>= fun (conn, dialed_ip) ->
+      Logging.info_f ~section "WebSocket established via %s" dialed_ip;
       Lwt_mutex.with_lock connection_mutex (fun () ->
         active_connection := Some conn;
         Atomic.set is_connected_ref true;
