@@ -152,15 +152,20 @@ jobs:
       # and the pull is denied. `--builder default` shares the daemon's image
       # store (this is also the builder the self-hosted Gitea runner uses, where
       # `setup-buildx-action` is skipped), so the base image resolves on both.
+      #
+      # `--network=host` is deliberate: RUN steps otherwise resolve through
+      # Docker's embedded resolver (127.0.0.11), which has failed on hosted
+      # runners while the daemon itself still reaches the registries. Sharing
+      # the host network namespace makes apt use the host resolver.
       - name: Build engine image
         run: |
-          DOCKER_BUILDKIT=1 docker buildx build --builder default \
+          DOCKER_BUILDKIT=1 docker buildx build --builder default --network=host \
             --progress=plain \
             --build-arg "DIO_BASE_IMAGE=$DIO_BASE_IMAGE" \
             --target builder \
             -t dio-oxcaml-test \
             --load .
-          DOCKER_BUILDKIT=1 docker buildx build --builder default \
+          DOCKER_BUILDKIT=1 docker buildx build --builder default --network=host \
             --build-arg "DIO_BASE_IMAGE=$DIO_BASE_IMAGE" \
             -t dio-oxcaml-app \
             --load .
@@ -354,7 +359,7 @@ jobs:
       # for the full explanation of this split).
       - name: Build and push application image
         run: |
-          DOCKER_BUILDKIT=1 docker buildx build --builder default \
+          DOCKER_BUILDKIT=1 docker buildx build --builder default --network=host \
             --progress=plain \
             --build-arg "DIO_BASE_IMAGE=$DIO_BASE_IMAGE" \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
