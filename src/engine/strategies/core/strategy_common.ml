@@ -95,13 +95,14 @@ type carry_order_meta =
   ; com_maker : bool
   ; com_kind : string
   ; com_key : string
-  (** The full per-instrument in-flight key ([overlay_inflight_key]). The logical
-      [com_kind] alone is shared by every symbol, so tracked-order lookups must match on
-      this key. *)
+  (** The full per-instrument in-flight key ([overlay_inflight_key]). Its suffix is the
+      [|exchange|instrument(|ro)] scope a live-kind lookup matches on; the logical
+      [com_kind] alone is shared by every symbol. *)
   ; com_at : float
-  (** Wall-clock registration time. A venue amend replaces the order id; if the old id's
-      fill/cancel event is lost, its entry would otherwise suppress every later replace
-      for this kind forever. Tracking is bounded by age for that reason. *)
+  (** Registration time. The entry is authoritative until its terminal event, but that
+      event can be lost, and the venue can drop an order without one. The hold is bounded
+      by age so a dead mapping can never suppress placement for the kind indefinitely;
+      releasing early at worst re-sends a close the venue rejects harmlessly. *)
   }
 
 let carry_registry_mutex = Mutex.create ()
@@ -145,16 +146,39 @@ let register_pending_carry_order ~dedup_key ~market ~maker ~kind =
   Mutex.unlock carry_registry_mutex
 ;;
 
-(** Age after which a mapping whose order the venue's open-order scan does not list stops
-    suppressing placement. A resting order is matched by that scan, so this never limits a
-    take-profit's life; it only releases mappings whose terminal event was lost. Matches
-    the grid's ghost-buy grace. *)
-let carry_tracked_ack_grace_s = 15.0
+(** Scope suffix shared by every placement key for one venue, instrument, and close class:
+    {!overlay_inflight_key} ends with [|exchange|instrument], plus [|ro] for a reduce-only
+    close. *)
+let carry_scope ~exchange ~instrument ~reduce_only =
+  "|" ^ exchange ^ "|" ^ instrument ^ if reduce_only then "|ro" else ""
+;;
 
-(** True when a carry order acked within [max_age] for [key] is tracked. Suppresses
-    duplicates while the venue's open-orders scan catches up; only call after a scan
-    failed to find the order. *)
-let has_tracked_carry_order ?(max_age = carry_tracked_ack_grace_s) ~key () =
+(** How long a registered order keeps suppressing placement for its kind when the venue's
+    view no longer lists it. Long enough to cover the ack -> feed gap and the fill ->
+    terminal-event gap (the reason the hold exists), short enough that an order the venue
+    dropped without a terminal event cannot block the kind indefinitely. *)
+let carry_live_release_s = 15.0
+
+(** True when a registered, unterminated order existed recently enough for this logical
+    kind on this instrument.
+
+    The venue's open-orders view is not the order's lifecycle: the feed thread drops a
+    filled order from the cache before the domain drains its execution event, so a scan
+    can miss an order whose terminal event has not been processed yet. Retiring on that
+    absence makes the next cycle re-send the close at full size into a position the venue
+    has already flattened, which it rejects. So absence never authorizes a placement. The
+    release is bounded because a terminal event can be lost (and the venue can silently
+    drop an order): re-sending a close the venue rejects is harmless, while a mapping that
+    suppresses placement forever is not. *)
+let has_live_carry_order
+  ?(max_age = carry_live_release_s)
+  ~kind
+  ~exchange
+  ~instrument
+  ~reduce_only
+  ()
+  =
+  let scope = carry_scope ~exchange ~instrument ~reduce_only in
   let now = Unix.gettimeofday () in
   Mutex.lock carry_registry_mutex;
   (* Early exit: the fold visits every live carry order, and the common case is a hit. The
@@ -164,7 +188,9 @@ let has_tracked_carry_order ?(max_age = carry_tracked_ack_grace_s) ~key () =
     try
       Concurrency.Fifo_index.fold
         (fun _ meta () ->
-          if String.equal meta.com_key key && now -. meta.com_at <= max_age
+          if String.equal meta.com_kind kind
+             && String.ends_with ~suffix:scope meta.com_key
+             && now -. meta.com_at <= max_age
           then raise_notrace Exit)
         carry_orders
         ();

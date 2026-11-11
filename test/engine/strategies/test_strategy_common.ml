@@ -271,49 +271,45 @@ let test_grid_order_ownership () =
   Alcotest.(check string) "owner: unknown tag" "other" (C.order_owner (Some 99))
 ;;
 
-let test_tracked_carry_order_is_ack_age_bounded () =
+let test_live_carry_order_holds_until_terminal () =
   let module C = Dio_strategies.Strategy_common in
-  let key = "test:tracked|hyperliquid|TEST" in
-  let order_id = "oid-tracked-test" in
-  C.register_pending_carry_order
-    ~dedup_key:key
-    ~market:C.Carry_perp
-    ~maker:false
-    ~kind:"carry:entry";
-  C.bind_carry_order ~dedup_key:key ~order_id;
-  Alcotest.(check bool) "acked order is tracked" true (C.has_tracked_carry_order ~key ());
-  let age order_id seconds =
-    Mutex.lock C.carry_registry_mutex;
-    (match Concurrency.Fifo_index.find_opt C.carry_orders order_id with
-     | Some meta ->
-       Concurrency.Fifo_index.set
-         C.carry_orders
-         ~key:order_id
-         ~value:{ meta with C.com_at = Unix.gettimeofday () -. seconds }
-     | None -> ());
-    Mutex.unlock C.carry_registry_mutex
-  in
-  age order_id 5.0;
+  let exchange = "hyperliquid" in
+  let instrument = "TEST" in
+  let kind = "test:tp|ro" in
+  let key = "test:tp|hyperliquid|TEST|ro" in
+  let order_id = "oid-live-test" in
+  Alcotest.(check string)
+    "scope: perp close"
+    "|hyperliquid|TEST|ro"
+    (C.carry_scope ~exchange ~instrument ~reduce_only:true);
+  Alcotest.(check string)
+    "scope: perp entry"
+    "|hyperliquid|TEST"
+    (C.carry_scope ~exchange ~instrument ~reduce_only:false);
+  C.register_carry_order_id ~order_id ~market:C.Carry_perp ~maker:false ~kind ~key;
+  let live () = C.has_live_carry_order ~kind ~exchange ~instrument ~reduce_only:true () in
+  Alcotest.(check bool) "acked close is live" true (live ());
   Alcotest.(check bool)
-    "tracked guard survives the ack window"
-    true
-    (C.has_tracked_carry_order ~key ());
-  (* A lost terminal event plus an absent venue order must not suppress the TP forever. *)
-  age order_id 3600.0;
-  Alcotest.(check bool)
-    "stale mapping cannot suppress a replacement"
+    "another instrument is unaffected"
     false
-    (C.has_tracked_carry_order ~key ());
-  age order_id 0.0;
+    (C.has_live_carry_order ~kind ~exchange ~instrument:"OTHER" ~reduce_only:true ());
   Alcotest.(check bool)
-    "reactivated mapping is tracked"
-    true
-    (C.has_tracked_carry_order ~key ());
+    "another kind is unaffected"
+    false
+    (C.has_live_carry_order ~kind:"test:entry" ~exchange ~instrument ~reduce_only:true ());
+  (* A mapping the venue never retires must stop suppressing placement. *)
+  Mutex.lock C.carry_registry_mutex;
+  (match Concurrency.Fifo_index.find_opt C.carry_orders order_id with
+   | Some meta ->
+     Concurrency.Fifo_index.set
+       C.carry_orders
+       ~key:order_id
+       ~value:{ meta with C.com_at = Unix.gettimeofday () -. 3600.0 }
+   | None -> Alcotest.fail "live close mapping was not registered");
+  Mutex.unlock C.carry_registry_mutex;
+  Alcotest.(check bool) "an unreleased mapping stops suppressing" false (live ());
   C.retire_carry_order ~order_id;
-  Alcotest.(check bool)
-    "terminal retirement clears the guard"
-    false
-    (C.has_tracked_carry_order ~key ())
+  Alcotest.(check bool) "terminal retirement re-arms placement" false (live ())
 ;;
 
 let test_carry_registry_stays_bounded () =
@@ -527,9 +523,9 @@ let () =
             `Quick
             test_carry_order_terminal
         ; Alcotest.test_case
-            "tracked carry order guard is bounded by the ack window"
+            "live carry order holds placement until its terminal event"
             `Quick
-            test_tracked_carry_order_is_ack_age_bounded
+            test_live_carry_order_holds_until_terminal
         ; Alcotest.test_case
             "carry registry queue is compacted and capped"
             `Quick

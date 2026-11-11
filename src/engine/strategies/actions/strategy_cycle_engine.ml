@@ -1724,25 +1724,22 @@ let order_replace_body
             in
             ignore (Jac.push_order ~now:c.cg_now ~manage_state:false order : bool))
         | [] ->
-          (* No open order matched the venue scan. If the order is already tracked (acked
-             but not yet visible), do not place a second one: the grid's [has.tracked.buy]
-             equivalent. The next cycle amends once the scan sees it. *)
-          let tracked_key =
-            overlay_inflight_key
-              ~dedup_key
-              ~side
-              ~qty
-              ~price:(Some px)
-              ~exchange:asset.exchange
-              ~instrument
-              ~reduce_only
-          in
-          if Strategy_common.has_tracked_carry_order ~key:tracked_key ()
+          (* No open order matched the venue scan. A registered order of this kind that
+             has not been retired is still live: the venue's view drops a filled order
+             before the domain drains its terminal event, so placing now would re-send a
+             close into a position the venue already flattened. *)
+          if Strategy_common.has_live_carry_order
+               ~kind:kind_key
+               ~exchange:asset.exchange
+               ~instrument
+               ~reduce_only
+               ()
           then
             Logging.debug_f
               ~section
-              "Overlay placement held: %s already tracked"
-              tracked_key
+              "Overlay placement held: the live %s order on %s is not retired yet"
+              kind_key
+              instrument
           else
             order_place
               c

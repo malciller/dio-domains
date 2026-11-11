@@ -310,8 +310,9 @@ let hedger_callbacks : strategy_callbacks =
           ~order_id;
         Dio_strategies.Strategy_common.Placement_backoff.clear ~key:order.duplicate_key;
         (* Release the placement key on ack, like the grid. The durable duplicate guard is
-           the acked id -> kind mapping in [carry_orders] ([has_tracked_carry_order],
-           bounded by the ack->feed grace), not this short-lived latch. *)
+           the acked id -> kind mapping in [carry_orders] ([has_live_carry_order],
+           released by its terminal event or the ack->feed grace), not this short-lived
+           latch. *)
         ignore
           (Dio_strategies.Strategy_common.InFlightOrders.remove_in_flight_order
              order.duplicate_key))

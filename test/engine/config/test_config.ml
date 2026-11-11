@@ -632,23 +632,38 @@ let test_inventory_formula () =
   Alcotest.(check (float 1e-9))
     "no sells: free + staked"
     10.0
-    (q ~full_balance_ref:false ~free:8.0 ~total:10.0 ~open_sell_base:0.0);
+    (q ~full_balance_ref:false ~free:8.0 ~total:10.0 ~staked:2.0 ~open_sell_base:0.0);
   Alcotest.(check (float 1e-9))
-    "staked backing a pending sell is excluded"
+    "earn backing a pending sell is excluded"
     8.0
-    (q ~full_balance_ref:false ~free:8.0 ~total:10.0 ~open_sell_base:2.0);
+    (q ~full_balance_ref:false ~free:8.0 ~total:10.0 ~staked:2.0 ~open_sell_base:2.0);
   Alcotest.(check (float 1e-9))
-    "sell larger than staked excludes all staked"
+    "sell larger than the earn balance excludes all of it"
     8.0
-    (q ~full_balance_ref:false ~free:8.0 ~total:10.0 ~open_sell_base:9.0);
+    (q ~full_balance_ref:false ~free:8.0 ~total:10.0 ~staked:2.0 ~open_sell_base:9.0);
   Alcotest.(check (float 1e-9))
     "all inventory earn-backed"
     0.0
-    (q ~full_balance_ref:false ~free:0.0 ~total:5.0 ~open_sell_base:5.0);
+    (q ~full_balance_ref:false ~free:0.0 ~total:5.0 ~staked:5.0 ~open_sell_base:5.0);
+  Alcotest.(check (float 1e-9))
+    "a ladder smaller than the locked base charges no staking"
+    3.0
+    (q ~full_balance_ref:false ~free:1.0 ~total:10.0 ~staked:2.0 ~open_sell_base:3.0);
+  (* Delegated HYPE is held inventory: a huge resting ladder is already covered by the
+     spot base locked in those orders, so it must not subtract the staking away. *)
+  Alcotest.(check (float 1e-9))
+    "delegated staking survives a large resting ladder"
+    2.52
+    (q
+       ~full_balance_ref:false
+       ~free:0.05
+       ~total:17.2
+       ~staked:2.5165
+       ~open_sell_base:14.68);
   Alcotest.(check (float 1e-9))
     "full balance ref uses total holdings"
     10.0
-    (q ~full_balance_ref:true ~free:8.0 ~total:10.0 ~open_sell_base:2.0)
+    (q ~full_balance_ref:true ~free:8.0 ~total:10.0 ~staked:2.0 ~open_sell_base:2.0)
 ;;
 
 let test_inventory_only_hedge_venue_leg () =
