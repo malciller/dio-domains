@@ -1,31 +1,40 @@
 (** Per-venue network latency profilers.
 
-    Measure the four NETWORK-page metrics shown under each domain row (the domain's
-    venue):
+    Measure the NETWORK-page metrics shown under each domain row (the domain's venue):
     - ws_ping: venue WebSocket ping/pong round trip
     - ws_feed: clock-corrected one-way latency of market-data feed messages (server event
       timestamp -> local receive)
     - rest_request: HTTP REST round trip (trading actions and oracle fetches)
     - signer: local signature generation time
 
+    The journal also carries the parse pipeline, split out so venue batching and our own
+    backlog cannot be confused:
+    - feed_queue: local receive -> parse-worker dequeue
+    - feed_parse: parse-worker decode + book apply
+
     Profilers are keyed by venue name ("hyperliquid", "kraken", "lighter", "alpaca"), so
     every connection or fetch on a venue feeds one histogram. The dashboard merges these
     windows into the per-symbol latency map via each configured symbol's exchange.
 
-    [start_publisher] publishes (snapshot_and_reset) every ~10s, inside the dashboard's
-    15s freshness tolerance, so the NETWORK page always has a fresh window per metric; an
-    idle venue reads as "idle", not "--". *)
+    [start_publisher] closes and publishes every ~10s, inside the dashboard's 15s
+    freshness tolerance, so the NETWORK page always has a fresh window per metric; an idle
+    venue reads as "idle", not "--". Venue profilers are written from several domains, so
+    recording uses the shared-window barrier and the fold only ever sees a quiescent
+    window. *)
 
 open Lwt.Infix
 
 let section = "network_latency"
 
-(** One venue's four profilers. *)
+(** One venue's profilers. [feed_queue] and [feed_parse] split the parse-domain path: the
+    wait between receive and dequeue, and the handler (decode + book apply) itself. *)
 type t =
   { ping : Latency_profiler.t
   ; feed : Latency_profiler.t
   ; rest : Latency_profiler.t
   ; signer : Latency_profiler.t
+  ; feed_queue : Latency_profiler.t
+  ; feed_parse : Latency_profiler.t
   }
 
 (* Per-venue profiler registry. Insertion was under [mutex] while the 10s publisher and
@@ -46,21 +55,40 @@ let network_max_latency_us = 60_000_000
 let create_venue_profilers venue =
   { ping =
       Latency_profiler.create
+        ~shared:true
         ~bucket_us:network_bucket_us
         ~max_latency_us:network_max_latency_us
         (venue ^ ":ws_ping")
   ; feed =
       Latency_profiler.create
+        ~shared:true
         ~bucket_us:network_bucket_us
         ~max_latency_us:network_max_latency_us
         (venue ^ ":ws_feed")
   ; rest =
       Latency_profiler.create
+        ~shared:true
         ~bucket_us:network_bucket_us
         ~max_latency_us:network_max_latency_us
         (venue ^ ":rest_request")
   ; signer =
-      Latency_profiler.create ~bucket_us:1 ~max_latency_us:100_000 (venue ^ ":signer")
+      Latency_profiler.create
+        ~shared:true
+        ~bucket_us:1
+        ~max_latency_us:100_000
+        (venue ^ ":signer")
+  ; feed_queue =
+      Latency_profiler.create
+        ~shared:true
+        ~bucket_us:1000
+        ~max_latency_us:network_max_latency_us
+        (venue ^ ":feed_queue")
+  ; feed_parse =
+      Latency_profiler.create
+        ~shared:true
+        ~bucket_us:1
+        ~max_latency_us:10_000
+        (venue ^ ":feed_parse")
   }
 ;;
 
@@ -402,12 +430,32 @@ let unix_of_rfc3339 s =
 
 let record_ping venue span =
   observe_rtt venue (Mtime.Span.to_float_ns span /. 1_000_000_000.0);
-  Latency_profiler.record (venue_profilers venue).ping span
+  Latency_profiler.record_shared (venue_profilers venue).ping span
 ;;
 
-let record_feed venue span = Latency_profiler.record (venue_profilers venue).feed span
-let record_rest venue span = Latency_profiler.record (venue_profilers venue).rest span
-let record_signer venue span = Latency_profiler.record (venue_profilers venue).signer span
+let record_feed venue span =
+  Latency_profiler.record_shared (venue_profilers venue).feed span
+;;
+
+let record_rest venue span =
+  Latency_profiler.record_shared (venue_profilers venue).rest span
+;;
+
+let record_signer venue span =
+  Latency_profiler.record_shared (venue_profilers venue).signer span
+;;
+
+(** Queue residency of a feed frame: the producer's receive time to the parse worker's
+    dequeue. *)
+let record_feed_queue_ns venue ns =
+  Latency_profiler.record_shared_ns (venue_profilers venue).feed_queue ns
+;;
+
+(** Time the parse worker spent decoding and applying a frame. *)
+let record_feed_parse_ns venue ns =
+  Latency_profiler.record_shared_ns (venue_profilers venue).feed_parse ns
+;;
+
 let record_ping_s venue s = record_ping venue (span_of_seconds s)
 let record_feed_s venue s = record_feed venue (span_of_seconds s)
 let record_rest_s venue s = record_rest venue (span_of_seconds s)
@@ -440,23 +488,34 @@ let record_feed_event_ms venue ~event_ms ?recv () =
   | None -> ()
 ;;
 
-(** Most recent published windows for [venue], in the label order the dashboard's NETWORK
-    page expects. Empty when the venue has no profilers yet. *)
+(** Dashboard NETWORK-page windows for one venue, in display order. *)
+let windows p =
+  [ "ws_ping", Latency_profiler.published_snapshot p.ping
+  ; "ws_feed", Latency_profiler.published_snapshot p.feed
+  ; "rest_request", Latency_profiler.published_snapshot p.rest
+  ; "signer", Latency_profiler.published_snapshot p.signer
+  ]
+;;
+
+(** Most recent published windows for [venue]. Empty when the venue has no profilers yet. *)
 let snapshots venue =
   match Ds.Cow_table.find_opt profilers venue with
   | None -> []
-  | Some p ->
-    [ "ws_ping", Latency_profiler.published_snapshot p.ping
-    ; "ws_feed", Latency_profiler.published_snapshot p.feed
-    ; "rest_request", Latency_profiler.published_snapshot p.rest
-    ; "signer", Latency_profiler.published_snapshot p.signer
-    ]
+  | Some p -> windows p
 ;;
 
-(** All venues with measured activity: (venue, label windows). *)
+(** Parse-stage windows for the latency journal. Kept out of [snapshots] so the NETWORK
+    page keeps its four labels. *)
+let feed_stage_windows p =
+  [ "feed_queue", Latency_profiler.published_snapshot p.feed_queue
+  ; "feed_parse", Latency_profiler.published_snapshot p.feed_parse
+  ]
+;;
+
+(** All venues with measured activity: (venue, label windows), including the parse stages. *)
 let all_venue_snapshots () =
   Ds.Cow_table.fold
-    (fun venue _ acc -> (venue, snapshots venue) :: acc)
+    (fun venue p acc -> (venue, windows p @ feed_stage_windows p) :: acc)
     profilers
     ~init:[]
 ;;
@@ -465,37 +524,45 @@ let all_venue_snapshots () =
     spike-log window label so the two cannot drift. *)
 let publish_interval_seconds = 10.0
 
-(** Advance every venue profiler's window, publishing an immutable snapshot for the
-    dashboard. Safe from any thread; profilers hold an internal mutex for the atomic
-    publish. When [log_spikes] is set, each venue emits at most one INFO line naming the
-    network metrics with a sample at or above [threshold_us]. Gated by the caller so the
-    network tail can be silenced while internal ops are profiled. *)
+(** Close and publish every venue profiler's window for the dashboard. Rotation waits for
+    in-flight recorders before the fold, so a feed or order thread is never measured while
+    its histogram is being folded or zeroed. When [log_spikes] is set, each venue emits at
+    most one INFO line naming the network metrics with a sample at or above
+    [threshold_us]. Gated by the caller so the network tail can be silenced while internal
+    ops are profiled. *)
 let publish_all ?(log_spikes = false) ?(threshold_us = 10.0) () =
   Ds.Cow_table.iter
     (fun venue p ->
-      let ping =
-        Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.ping
+      let close prof =
+        Latency_profiler.rotate prof;
+        Latency_profiler.drain ~spike_threshold_us:threshold_us prof
       in
-      let feed =
-        Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.feed
-      in
-      let rest =
-        Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.rest
-      in
-      let signer =
-        Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us p.signer
+      let all =
+        [ "WS_PING", p.ping
+        ; "WS_FEED", p.feed
+        ; "REST", p.rest
+        ; "SIGNER", p.signer
+        ; "QUEUE", p.feed_queue
+        ; "PARSE", p.feed_parse
+        ]
       in
       if log_spikes
       then (
+        let stages =
+          List.filter_map
+            (fun (label, prof) -> Option.map (fun snap -> label, snap) (close prof))
+            all
+        in
         match
           Latency_profiler.spike_message
             ~key:venue
             ~window_seconds:publish_interval_seconds
             ~threshold_us
-            [ "WS_PING", ping; "WS_FEED", feed; "REST", rest; "SIGNER", signer ]
+            stages
         with
         | None -> ()
-        | Some msg -> Logging.info_f ~section "%s" msg))
+        | Some msg -> Logging.info_f ~section "%s" msg)
+      else List.iter (fun (_, prof) -> ignore (close prof)) all)
     profilers
 ;;
 

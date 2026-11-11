@@ -154,6 +154,9 @@ Latency and allocation are observable through every phase of the cycle:
 - A busy-spin canary detects process-wide stop-the-world pauses and scheduler
   descheduling that per-domain GC counters miss.
 - Per-cycle GC counters attribute a spike to collector activity or to CPU work.
+- Window publication (histogram fold, percentile scan, spike log) runs on a
+  dedicated background domain: a trading domain only closes its window, so
+  observation never runs inside the cycle it measures.
 - A latency journal appends every published window to JSONL, so a regression can
   be found and compared after the fact instead of only watched live. See the
   [latency journal guide](https://diophantsolutions.com/dio/LATENCY/).

@@ -1,6 +1,10 @@
 open Alcotest
 module LP = Latency_profiler
 
+(* The shared-window test spawns a recording domain, as the network path does. *)
+[@@@alert "-unsafe_multidomain"]
+[@@@alert "-do_not_spawn_domains"]
+
 let test_basic () =
   let t = LP.create "test" in
   (* Fixture: 100 samples at 10us. *)
@@ -57,8 +61,8 @@ let test_overflow () =
   (* 50ms *)
   LP.record t (Mtime.Span.of_uint64_ns 5000L);
   (* 5us normal *)
-  Alcotest.(check int) "overflow count is 1" 1 t.overflow;
-  Alcotest.(check int) "total samples is 2" 2 t.samples
+  Alcotest.(check int) "overflow count is 1" 1 (Atomic.get t.live).overflow;
+  Alcotest.(check int) "total samples is 2" 2 (Atomic.get t.live).samples
 ;;
 
 let test_sub_microsecond_ns () =
@@ -74,7 +78,7 @@ let test_sub_microsecond_ns () =
   Alcotest.(check (float 0.0001)) "p50 is 500ns (0.5us)" 0.5 p50;
   Alcotest.(check (float 0.0001)) "p90 is 500ns (0.5us)" 0.5 p90;
   Alcotest.(check (float 0.0001)) "p999 is 500ns (0.5us)" 0.5 p999;
-  Alcotest.(check int) "sub-us samples counted" 100 t.sub_us_samples
+  Alcotest.(check int) "sub-us samples counted" 100 (Atomic.get t.live).sub_us_samples
 ;;
 
 let test_sub_us_mixed_with_us () =
@@ -123,18 +127,24 @@ let test_us_boundary_exact () =
     LP.record t (Mtime.Span.of_uint64_ns 1000L)
   done;
   Alcotest.(check (float 0.0001)) "p50 is 1us" 1.0 (LP.percentile t 0.50);
-  Alcotest.(check int) "sub-us samples is 0" 0 t.sub_us_samples
+  Alcotest.(check int) "sub-us samples is 0" 0 (Atomic.get t.live).sub_us_samples
 ;;
 
 let test_ns_bucket_routing () =
   let t = LP.create "routing" in
   LP.record t (Mtime.Span.of_uint64_ns 300L);
   LP.record t (Mtime.Span.of_uint64_ns 700L);
-  Alcotest.(check int) "300ns lands in ns bucket 300" 1 t.ns_buckets.(300);
-  Alcotest.(check int) "700ns lands in ns bucket 700" 1 t.ns_buckets.(700);
-  Alcotest.(check int) "sub-us samples is 2" 2 t.sub_us_samples;
-  Alcotest.(check int) "us bucket 0 untouched" 0 t.buckets.(0);
-  Alcotest.(check int) "total samples is 2" 2 t.samples
+  Alcotest.(check int)
+    "300ns lands in ns bucket 300"
+    1
+    (Atomic.get t.live).ns_buckets.(300);
+  Alcotest.(check int)
+    "700ns lands in ns bucket 700"
+    1
+    (Atomic.get t.live).ns_buckets.(700);
+  Alcotest.(check int) "sub-us samples is 2" 2 (Atomic.get t.live).sub_us_samples;
+  Alcotest.(check int) "us bucket 0 untouched" 0 (Atomic.get t.live).buckets.(0);
+  Alcotest.(check int) "total samples is 2" 2 (Atomic.get t.live).samples
 ;;
 
 let test_zero_ns_percentile () =
@@ -161,9 +171,9 @@ let test_record_ns () =
   LP.record_ns t 2500;
   LP.record_ns t 30000;
   LP.record_ns t (-5);
-  Alcotest.(check int) "samples" 4 t.samples;
-  Alcotest.(check int) "sub-us samples" 2 t.sub_us_samples;
-  Alcotest.(check int) "max stays at 30us" 30000 t.max_latency_ns;
+  Alcotest.(check int) "samples" 4 (Atomic.get t.live).samples;
+  Alcotest.(check int) "sub-us samples" 2 (Atomic.get t.live).sub_us_samples;
+  Alcotest.(check int) "max stays at 30us" 30000 (Atomic.get t.live).max_latency_ns;
   Alcotest.(check (float 0.0001)) "p50 is the 500ns sample" 0.5 (LP.percentile t 0.50);
   Alcotest.(check (float 0.0001)) "p99 is 30us" 30.0 (LP.percentile t 0.99)
 ;;
@@ -176,8 +186,14 @@ let test_record_ns_matches_record () =
     LP.record a (Mtime.Span.of_uint64_ns (Int64.of_int ns));
     LP.record_ns b ns
   done;
-  Alcotest.(check int) "same samples" a.samples b.samples;
-  Alcotest.(check int) "same max" a.max_latency_ns b.max_latency_ns;
+  Alcotest.(check int)
+    "same samples"
+    (Atomic.get a.live).samples
+    (Atomic.get b.live).samples;
+  Alcotest.(check int)
+    "same max"
+    (Atomic.get a.live).max_latency_ns
+    (Atomic.get b.live).max_latency_ns;
   Alcotest.(check (float 0.0001)) "same p99" (LP.percentile a 0.99) (LP.percentile b 0.99)
 ;;
 
@@ -215,8 +231,14 @@ let test_snapshot_sub_us () =
   Alcotest.(check int) "snapshot sub-us samples" 10 snap.sub_us_samples;
   Alcotest.(check int) "snapshot samples" 15 snap.samples;
   (* Window reset: the ns tier must be cleared for the next window. *)
-  Alcotest.(check int) "ns tier cleared after reset" 0 t.ns_buckets.(250);
-  Alcotest.(check int) "sub-us counter cleared after reset" 0 t.sub_us_samples
+  Alcotest.(check int)
+    "ns tier cleared after reset"
+    0
+    (Atomic.get t.live).ns_buckets.(250);
+  Alcotest.(check int)
+    "sub-us counter cleared after reset"
+    0
+    (Atomic.get t.live).sub_us_samples
 ;;
 
 let test_coarse_bucket_low_range () =
@@ -255,12 +277,12 @@ let test_fine_tier_routing () =
   (* 10us -> coarse bucket 1 *)
   LP.record t (Mtime.Span.of_uint64_ns 1000L);
   (* 1us -> fine bucket 0 *)
-  Alcotest.(check int) "1us in fine bucket 0" 1 t.us_buckets.(0);
-  Alcotest.(check int) "5us in fine bucket 4" 1 t.us_buckets.(4);
-  Alcotest.(check int) "9us in fine bucket 8" 1 t.us_buckets.(8);
-  Alcotest.(check int) "10us in coarse bucket 1" 1 t.buckets.(1);
-  Alcotest.(check int) "coarse bucket 0 untouched" 0 t.buckets.(0);
-  Alcotest.(check int) "total samples" 4 t.samples;
+  Alcotest.(check int) "1us in fine bucket 0" 1 (Atomic.get t.live).us_buckets.(0);
+  Alcotest.(check int) "5us in fine bucket 4" 1 (Atomic.get t.live).us_buckets.(4);
+  Alcotest.(check int) "9us in fine bucket 8" 1 (Atomic.get t.live).us_buckets.(8);
+  Alcotest.(check int) "10us in coarse bucket 1" 1 (Atomic.get t.live).buckets.(1);
+  Alcotest.(check int) "coarse bucket 0 untouched" 0 (Atomic.get t.live).buckets.(0);
+  Alcotest.(check int) "total samples" 4 (Atomic.get t.live).samples;
   (* p50 = ceil(4*0.5) = 2nd sample = 5us *)
   Alcotest.(check (float 0.0001)) "p50 is 5us" 5.0 (LP.percentile t 0.50);
   (* p90 = ceil(4*0.9) = 4th sample = 10us (coarse) *)
@@ -379,6 +401,7 @@ let snap
   ; sub_us_samples = 0
   ; overflow = 0
   ; max_us
+  ; max_time = 0.0
   ; over_threshold
   ; max_cause
   ; executions = 0
@@ -470,6 +493,111 @@ let test_rolling_aggregates_windows () =
   Alcotest.(check (float 0.1)) "window 4 p50 evicts the oldest" 20.0 s4.p50
 ;;
 
+let test_rolling_peak_time_identifies_window () =
+  let t = LP.create ~rolling_windows:3 "peak-time" in
+  LP.record t (Mtime.Span.of_uint64_ns 50_000L);
+  let s1 = LP.snapshot_and_reset t in
+  Alcotest.(check bool) "a fresh peak carries a window time" true (s1.max_time > 0.0);
+  (* A later, smaller sample must not re-date the peak: the union still points at the
+     window that produced it, which is how a reader tells a carried-forward maximum from a
+     new one. *)
+  LP.record t (Mtime.Span.of_uint64_ns 10_000L);
+  let s2 = LP.snapshot_and_reset t in
+  Alcotest.(check (float 0.001)) "union keeps the peak" 50.0 s2.max_us;
+  Alcotest.(check (float 0.0001))
+    "carried peak keeps its own window time"
+    s1.max_time
+    s2.max_time;
+  (* A larger sample in a later window re-dates the peak. *)
+  LP.record t (Mtime.Span.of_uint64_ns 80_000L);
+  let s3 = LP.snapshot_and_reset t in
+  Alcotest.(check (float 0.001)) "new peak wins" 80.0 s3.max_us;
+  Alcotest.(check bool) "new peak is re-dated" true (s3.max_time >= s2.max_time)
+;;
+
+let test_rotate_defers_publication () =
+  let t = LP.create ~rolling_windows:3 "handoff" in
+  for _ = 1 to 10 do
+    LP.record t (Mtime.Span.of_uint64_ns 10_000L)
+  done;
+  Alcotest.(check bool)
+    "recording alone publishes nothing"
+    true
+    (LP.published_snapshot t = None);
+  LP.rotate t;
+  Alcotest.(check bool)
+    "rotation alone publishes nothing"
+    true
+    (LP.published_snapshot t = None);
+  (match LP.drain t with
+   | None -> Alcotest.fail "the rotated window should be waiting"
+   | Some snap -> Alcotest.(check int) "drain publishes the closed window" 10 snap.samples);
+  (* Samples recorded after the rotation belong to the next window and are not published
+     by a drain that finds nothing pending. *)
+  LP.record t (Mtime.Span.of_uint64_ns 20_000L);
+  Alcotest.(check bool) "nothing pending" true (LP.drain t = None);
+  Alcotest.(check int)
+    "the live window was not dragged into the published one"
+    10
+    (match LP.published_snapshot t with
+     | Some s -> s.samples
+     | None -> -1);
+  LP.rotate t;
+  match LP.drain t with
+  | None -> Alcotest.fail "the second window should be waiting"
+  | Some snap -> Alcotest.(check int) "second window has the late sample" 1 snap.samples
+;;
+
+let test_rotate_merges_when_publisher_lags () =
+  let t = LP.create "lag" in
+  LP.record t (Mtime.Span.of_uint64_ns 10_000L);
+  LP.rotate t;
+  (* The publisher has not drained yet, so the next rotation must keep accumulating
+     instead of overwriting the pending window. *)
+  LP.record t (Mtime.Span.of_uint64_ns 20_000L);
+  LP.record t (Mtime.Span.of_uint64_ns 20_000L);
+  LP.rotate t;
+  (match LP.drain t with
+   | None -> Alcotest.fail "the first window should still be waiting"
+   | Some snap -> Alcotest.(check int) "first window intact" 1 snap.samples);
+  LP.rotate t;
+  match LP.drain t with
+  | None -> Alcotest.fail "the merged window should be waiting after the spare returns"
+  | Some snap ->
+    Alcotest.(check int) "no sample lost while the publisher lagged" 2 snap.samples
+;;
+
+let test_shared_rotation_loses_nothing () =
+  let t = LP.create ~shared:true "shared" in
+  let stop = Atomic.make false in
+  let written = Atomic.make 0 in
+  let writer =
+    Domain.spawn (fun () ->
+      while not (Atomic.get stop) do
+        LP.record_shared t (Mtime.Span.of_uint64_ns 5_000L);
+        ignore (Atomic.fetch_and_add written 1)
+      done)
+  in
+  let published = ref 0 in
+  let drain_once () =
+    LP.rotate t;
+    match LP.drain t with
+    | Some snap -> published := !published + snap.samples
+    | None -> ()
+  in
+  for _ = 1 to 200 do
+    drain_once ();
+    Domain.cpu_relax ()
+  done;
+  Atomic.set stop true;
+  Domain.join writer;
+  drain_once ();
+  Alcotest.(check int)
+    "every sample is published exactly once"
+    (Atomic.get written)
+    !published
+;;
+
 let test_rolling_off_is_per_window () =
   let t = LP.create "plain" in
   for _ = 1 to 10 do
@@ -532,8 +660,26 @@ let () =
         ; test_case "reports breaching stages" `Quick test_spike_message_reports_breaches
         ; test_case "omits cause line when absent" `Quick test_spike_message_without_cause
         ] )
+    ; ( "handoff"
+      , [ test_case
+            "rotation defers publication to the drain"
+            `Quick
+            test_rotate_defers_publication
+        ; test_case
+            "a lagging publisher merges windows"
+            `Quick
+            test_rotate_merges_when_publisher_lags
+        ; test_case
+            "a shared window loses nothing under rotation"
+            `Quick
+            test_shared_rotation_loses_nothing
+        ] )
     ; ( "rolling window"
       , [ test_case "aggregates and evicts windows" `Quick test_rolling_aggregates_windows
+        ; test_case
+            "peak time names the window that holds it"
+            `Quick
+            test_rolling_peak_time_identifies_window
         ; test_case
             "disabled keeps per-window semantics"
             `Quick

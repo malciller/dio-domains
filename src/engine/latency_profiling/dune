@@ -20,6 +20,7 @@
   Monotonic_clock
   Network_latency
   Canary
+  Latency_publisher
   Thread_affinity
   Leak_probe
   Disk_space

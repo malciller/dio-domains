@@ -130,28 +130,11 @@ let all_profiler_snapshots () =
     []
 ;;
 
-let snapshot_profiler profiler =
-  let snap = Latency_profiler.snapshot_and_reset profiler in
-  if snap.Latency_profiler.samples > 0
-  then
-    Logging.debug_f
-      ~section
-      "Latency [%s]: samples=%d p50=%s p99=%s overflow=%d"
-      snap.Latency_profiler.name
-      snap.Latency_profiler.samples
-      (Latency_profiler.format_us snap.Latency_profiler.p50)
-      (Latency_profiler.format_us snap.Latency_profiler.p99)
-      snap.Latency_profiler.overflow
-;;
-
-(* Window-cadence snapshot+reset of this symbol's place/amend/cancel profilers. Called by
-   the domain worker's rolling-window publish; keeps the snapshot/sort/log work out of the
-   order hot path. *)
-let snapshot_symbol_profilers symbol =
+(** This symbol's place/amend/cancel profilers, for the background publisher. Creates them
+    on first use, like an order operation would. *)
+let symbol_profilers symbol =
   let p = get_symbol_profilers symbol in
-  snapshot_profiler p.place;
-  snapshot_profiler p.amend;
-  snapshot_profiler p.cancel
+  [ p.place; p.amend; p.cancel ]
 ;;
 
 module Exchange = Dio_exchange.Exchange_intf

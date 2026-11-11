@@ -184,7 +184,13 @@ let timestamp_slug () =
 
 (** One JSONL record. Deliberately narrow: p90/p95 are dropped because a reader comparing
     runs needs p50/p99/p999 and the max, and bytes are the binding constraint on the prod
-    data directory. [w] is the profiler window end, used to ignore re-sampled windows. *)
+    data directory. [w] is the profiler window end, used to ignore re-sampled windows.
+
+    [mx] is the maximum of the profiler's retained window union, so one spike stays
+    visible for every window in the union and would otherwise read as a fresh spike per
+    row. [mt] is the end (Unix ms) of the window that holds it: rows sharing an [mt] are
+    the same event, so readers dedupe on it and never mistake a carried-forward maximum
+    for a new one. *)
 let json_of_row ~(now : float) ~(sha : string) (r : row) =
   let s = r.snap in
   let fields =
@@ -196,6 +202,10 @@ let json_of_row ~(now : float) ~(sha : string) (r : row) =
     ; "p99", `Float s.Latency_profiler.p99
     ; "p999", `Float s.Latency_profiler.p999
     ; "mx", `Float s.Latency_profiler.max_us
+    ; ( "mt"
+      , if s.Latency_profiler.max_time > 0.0
+        then `Int (int_of_float (s.Latency_profiler.max_time *. 1000.0))
+        else `Null )
     ; "ov", `Int s.Latency_profiler.overflow
     ; "w", `Float s.Latency_profiler.window_end
     ; ( "c"

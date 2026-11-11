@@ -12,6 +12,8 @@
     - the capital oracle's engine-global passes, domain [_oracle];
     - per-venue network windows: [ws_ping], [ws_feed], [rest_request], [signer], keyed by
       venue;
+    - per-venue parse pipeline: [feed_queue] (receive -> dequeue) and [feed_parse]
+      (decode + book apply), keyed by venue;
     - order-operation windows per symbol: [place], [amend], [cancel];
     - the stop-the-world canary, domain [_engine], stage [canary].
 
@@ -34,6 +36,7 @@ let canary_snapshot () =
   ; sub_us_samples = 0
   ; overflow = 0
   ; max_us
+  ; max_time = now
   ; over_threshold = 0
   ; max_cause = None
   ; executions = 0

@@ -240,6 +240,64 @@ let test_parse_worker_uniform_route () =
   Alcotest.(check string) "payload delivered to venue decoder" "uniform-frame" !last
 ;;
 
+let test_parse_worker_records_feed_stages () =
+  let venue = "instr" in
+  let hits = Atomic.make 0 in
+  let saw_recv = Atomic.make false in
+  Concurrency.Parse_worker.register venue (fun _payload ->
+    (match Concurrency.Parse_worker.current_recv_wall () with
+     | Some _ -> Atomic.set saw_recv true
+     | None -> ());
+    ignore (Atomic.fetch_and_add hits 1));
+  Alcotest.(check bool) "queued ok" true (Concurrency.Parse_worker.submit venue "frame");
+  let rec poll n =
+    if Atomic.get hits > 0
+    then ()
+    else if n <= 0
+    then Alcotest.fail "handler never ran"
+    else (
+      Thread.delay 0.01;
+      poll (n - 1))
+  in
+  poll 500;
+  Alcotest.(check bool)
+    "handler sees the producer's receive time"
+    true
+    (Atomic.get saw_recv);
+  (* The parse sample is recorded after the handler returns, so republish until both
+     stages have a window instead of racing the worker. *)
+  let samples stage =
+    match List.assoc_opt venue (Network_latency.all_venue_snapshots ()) with
+    | None -> -1
+    | Some stages ->
+      (match List.assoc_opt stage stages with
+       | Some (Some (snap : Latency_profiler.snapshot)) -> snap.samples
+       | _ -> -1)
+  in
+  let rec wait n =
+    Network_latency.publish_all ();
+    if samples "feed_queue" >= 1 && samples "feed_parse" >= 1
+    then ()
+    else if n <= 0
+    then Alcotest.fail "feed stages never recorded"
+    else (
+      Thread.delay 0.01;
+      wait (n - 1))
+  in
+  wait 50;
+  Alcotest.(check bool) "queue wait recorded" true (samples "feed_queue" >= 1);
+  Alcotest.(check bool) "parse time recorded" true (samples "feed_parse" >= 1);
+  match
+    List.find_opt
+      (fun (name, _, _) -> String.equal name venue)
+      (Concurrency.Parse_worker.handler_stats_snapshot ())
+  with
+  | Some (_, frames, seconds) ->
+    Alcotest.(check bool) "handler frames counted" true (frames >= 1);
+    Alcotest.(check bool) "handler time counted" true (seconds >= 0.0)
+  | None -> Alcotest.fail "handler stats missing"
+;;
+
 let test_watchdog_staleness () =
   let open Concurrency.Main_loop_watchdog in
   (* A fresh beat survives many beat intervals without tripping. *)
@@ -296,6 +354,10 @@ let () =
     ; ( "parse_worker"
       , [ Alcotest.test_case "roundtrip" `Quick test_parse_worker_roundtrip
         ; Alcotest.test_case "uniform_route" `Quick test_parse_worker_uniform_route
+        ; Alcotest.test_case
+            "feed stages recorded"
+            `Quick
+            test_parse_worker_records_feed_stages
         ] )
     ; ( "main_loop_watchdog"
       , [ Alcotest.test_case "stall threshold" `Quick test_watchdog_staleness ] )

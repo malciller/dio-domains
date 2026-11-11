@@ -23,6 +23,8 @@ type sample =
   ; p99 : float
   ; p999 : float
   ; mx : float
+  ; mt : float
+      (* End of the window holding [mx], or 0.0 for rows written before [mt] existed. *)
   ; cause : string option
   ; g : string option
   }
@@ -71,6 +73,7 @@ let parse_line line =
            ; p99 = num j "p99"
            ; p999 = num j "p999"
            ; mx = num j "mx"
+           ; mt = float_of_int (int_of_json j "mt") /. 1000.0
            ; cause = string_of_json j "c"
            ; g = string_of_json j "g"
            }
@@ -229,6 +232,12 @@ let human_duration s =
   else Printf.sprintf "%.0fs" s
 ;;
 
+(** A wall-clock time for humans. *)
+let clock_of_unix t =
+  let tm = Unix.localtime t in
+  Printf.sprintf "%02d:%02d:%02d" tm.Unix.tm_hour tm.Unix.tm_min tm.Unix.tm_sec
+;;
+
 let header cols widths =
   String.concat "  " (List.map2 (fun c w -> pad_right c w) cols widths)
 ;;
@@ -298,12 +307,12 @@ let tail ~(c : common) =
     Printf.printf
       "%s\n"
       (header
-         [ "domain"; "stage"; "n"; "p50"; "p99"; "p999"; "max"; "cause" ]
-         [ wd; ws; 7; 9; 9; 9; 9; 0 ]);
+         [ "domain"; "stage"; "n"; "p50"; "p99"; "p999"; "max"; "max at"; "cause" ]
+         [ wd; ws; 7; 9; 9; 9; 9; 8; 0 ]);
     List.iter
       (fun (d, s, (v : sample)) ->
         Printf.printf
-          "%s  %s  %s  %s  %s  %s  %s  %s\n"
+          "%s  %s  %s  %s  %s  %s  %s  %s  %s\n"
           (pad_right d wd)
           (pad_right s ws)
           (pad_left (string_of_int v.n) 7)
@@ -311,6 +320,7 @@ let tail ~(c : common) =
           (pad_left (Latency_profiler.format_us v.p99) 9)
           (pad_left (Latency_profiler.format_us v.p999) 9)
           (pad_left (Latency_profiler.format_us v.mx) 9)
+          (pad_left (if v.mt > 0.0 then clock_of_unix v.mt else "-") 8)
           (Option.value v.cause ~default:""))
       entries;
     0)

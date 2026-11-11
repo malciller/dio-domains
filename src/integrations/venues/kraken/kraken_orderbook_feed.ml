@@ -1406,9 +1406,15 @@ let record_book_latency json =
 ;;
 
 (** Span analogue of [record_book_latency]: extracts each data entry's [timestamp] string
-    directly from the frame with no DOM. *)
+    directly from the frame with no DOM. The parse worker's receive time is used, so the
+    one-way latency excludes parse-domain queueing. *)
 let record_book_latency_span message =
   let dlen = String.length message in
+  let recv =
+    match Concurrency.Parse_worker.current_recv_wall () with
+    | Some t -> t
+    | None -> Unix.gettimeofday ()
+  in
   match Json_scan.find_field message 1 (max 0 (dlen - 1)) "data" with
   | Some (di, dj) when di < dj && message.[di] = '[' ->
     let ilo, ihi = Json_scan.array_interior message di dj in
@@ -1421,7 +1427,7 @@ let record_book_latency_span message =
           (match
              Network_latency.unix_of_rfc3339 (Json_scan.string_of_span message ti tj)
            with
-           | Some event -> Network_latency.record_feed_event_s "kraken" ~event ()
+           | Some event -> Network_latency.record_feed_event_s "kraken" ~event ~recv ()
            | None -> ())
         | _ -> ())
       else ())

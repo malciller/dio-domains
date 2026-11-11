@@ -257,22 +257,6 @@ let get_domain_profilers symbol =
   profs
 ;;
 
-(** Emits at most one INFO line per completed internal latency window, and only when a
-    stage recorded a sample at or above [threshold_us]. [cycle]'s cause is appended to the
-    [Latency_profiler.spike_message] output as the worst-cycle continuation line. *)
-let log_latency_window ~key ~window_seconds ~threshold_us ~ob ~exec ~prep ~strategy ~cycle
-  =
-  match
-    Latency_profiler.spike_message
-      ~key
-      ~window_seconds
-      ~threshold_us
-      [ "BOOK", ob; "EVENTS", exec; "PREP", prep; "STRATEGY", strategy; "TOTAL", cycle ]
-  with
-  | None -> ()
-  | Some msg -> Logging.info_f ~section "%s" msg
-;;
-
 (** Path of the strategy file bound to an entry by name convention
     ([strategies/<name>.strategy] preferred, then .json). *)
 let strategy_file_path (asset : trading_config) =
@@ -1347,70 +1331,39 @@ let asset_domain_worker
     let latency_spike_threshold_us = config.latency_spike_threshold_us in
     let latency_spike_report_seconds = config.latency_spike_report_seconds in
     let last_window_time = ref (Unix.gettimeofday ()) in
-    (* Wall-clock throttle for internal spike INFO lines. Percentile windows still publish
-       every [latency_window_seconds]; this only limits a busy domain to one reported
-       window per interval. *)
-    let last_spike_report_time = ref (Unix.gettimeofday ()) in
     (* Overlay-instance and controller profilers owned by this domain, rolled on the same
        window cadence so their rows publish alongside the domain's own. Filled once the
        instances are loaded below; empty for a domain with no overlay. *)
     let overlay_window_profs = ref ([] : Latency_profiler.t list) in
-    (* Per-cycle GC attribution is captured inline in the loop (two [Gc.quick_stat] reads,
-       ~0.3us each; see [gc_monitor]); the window publisher below does not sample GC. *)
+    (* The cycle only closes windows; the background publisher folds and logs them. *)
+    let latency_group =
+      Latency_publisher.register
+        { Latency_publisher.key
+        ; window_seconds = latency_window_seconds
+        ; threshold_us = latency_spike_threshold_us
+        ; report_seconds = latency_spike_report_seconds
+        ; report = reports_internal config.latency_spike_report
+        ; stages =
+            [ "BOOK", prof_ob
+            ; "EVENTS", prof_exec
+            ; "PREP", prof_prep
+            ; "STRATEGY", prof_strategy
+            ; "TOTAL", prof_cycle
+            ]
+        ; silent = Atomic.make (Order_executor.symbol_profilers asset_with_fees.symbol)
+        ; last_report = 0.0
+        }
+    in
     let publish_windows () =
-      let ob =
-        Latency_profiler.snapshot_and_reset
-          ~spike_threshold_us:latency_spike_threshold_us
-          prof_ob
-      in
-      let exec =
-        Latency_profiler.snapshot_and_reset
-          ~spike_threshold_us:latency_spike_threshold_us
-          prof_exec
-      in
-      (* Snapshot+reset this symbol's place/amend/cancel profilers on the window cadence;
-         their per-op [report] calls no longer run on the order hot path. *)
-      Order_executor.snapshot_symbol_profilers asset_with_fees.symbol;
       (* The strategy window's execution count is the number of order actions pushed in
          the window (place/amend/cancel), so the dashboard's STRAT/S reports real order
-         activity, not strategy-invocation cycles. *)
+         activity, not strategy-invocation cycles. Read before the window closes so it
+         lands in the window being rotated out. *)
       Latency_profiler.set_executions
         prof_strategy
         (Dio_strategies.Strategy_common.Order_actions.snapshot_and_reset
            asset_with_fees.symbol);
-      let prep =
-        Latency_profiler.snapshot_and_reset
-          ~spike_threshold_us:latency_spike_threshold_us
-          prof_prep
-      in
-      let strategy =
-        Latency_profiler.snapshot_and_reset
-          ~spike_threshold_us:latency_spike_threshold_us
-          prof_strategy
-      in
-      let cycle =
-        Latency_profiler.snapshot_and_reset
-          ~spike_threshold_us:latency_spike_threshold_us
-          prof_cycle
-      in
-      List.iter
-        (fun prof -> ignore (Latency_profiler.snapshot_and_reset prof))
-        !overlay_window_profs;
-      if reports_internal config.latency_spike_report
-      then (
-        let now = Unix.gettimeofday () in
-        if now -. !last_spike_report_time >= latency_spike_report_seconds
-        then (
-          last_spike_report_time := now;
-          log_latency_window
-            ~key
-            ~window_seconds:latency_window_seconds
-            ~threshold_us:latency_spike_threshold_us
-            ~ob
-            ~exec
-            ~prep
-            ~strategy
-            ~cycle))
+      Latency_publisher.rotate latency_group
     in
     (* Publish an initial empty window so the dashboard renders this domain as idle
        immediately, and clear any stale snapshot from a previous incarnation. *)
@@ -1666,8 +1619,8 @@ let asset_domain_worker
         match controller_profs with
         | Some profs -> profilers_of profs
         | None -> []);
-    (* Loop-invariant: only a domain that hosts overlay work pays the two extra clock
-       reads that split it out of PREP. *)
+    (* These publish on this domain's cadence but never appear in its spike log line. *)
+    Latency_publisher.add_silent latency_group !overlay_window_profs;
     let has_overlay_work =
       Option.is_some overlay_ctx
       ||

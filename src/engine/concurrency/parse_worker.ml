@@ -32,12 +32,16 @@
 [@@@alert "-unsafe_multidomain"]
 [@@@alert "-do_not_spawn_domains"]
 
+(** A frame handler. Handlers run on the shard's domain; the frame's receive time is
+    available through {!current_recv_wall}. *)
 type handler = string -> unit
 
 module StringMap = Map.Make (String)
 
 type shard =
-  { queue : (string * string) Queue.t
+  { name : string (* Handler namespace; the venue for every production handler. *)
+  ; queue : (string * string * float) Queue.t
+      (* Handler name, payload, receive time (Unix seconds). *)
   ; mutex : Mutex.t
   ; condition : Condition.t
   ; started : bool Atomic.t
@@ -63,7 +67,8 @@ let get_shard name =
     | Some shard -> shard
     | None ->
       let shard =
-        { queue = Queue.create ()
+        { name
+        ; queue = Queue.create ()
         ; mutex = Mutex.create ()
         ; condition = Condition.create ()
         ; started = Atomic.make false
@@ -77,26 +82,30 @@ let get_shard name =
   shard
 ;;
 
-(** Registered handler and the shard its frames are queued on. *)
-let handlers : (shard * handler) StringMap.t Atomic.t = Atomic.make StringMap.empty
+(** Per-handler frame count and cumulative handler time, updated with atomics so the
+    recording path takes no shared lock. *)
+type handler_stats =
+  { frames : int Atomic.t
+  ; total_ns : int Atomic.t
+  }
 
-(* Per-handler frame count and cumulative parse time. Each shard's worker is the only
-   writer for its own handlers; the mutex only contends across shards on snapshot. *)
-let handler_stats : (string, int * float) Hashtbl.t = Hashtbl.create 8
-let handler_stats_mutex = Mutex.create ()
+let make_handler_stats () = { frames = Atomic.make 0; total_ns = Atomic.make 0 }
+
+(** Registered handler, its shard, and its diagnostics counters. *)
+let handlers : (shard * handler * handler_stats) StringMap.t Atomic.t =
+  Atomic.make StringMap.empty
+;;
 
 (** Register [handler] under [name]. Call during module/startup init, before any frame can
-    arrive. The handler is wrapped to record per-name frame count and cumulative wall time
-    for diagnostics. *)
+    arrive. The handler is wrapped to record per-name frame count and cumulative time for
+    diagnostics. *)
 let register name handler =
+  let stats = make_handler_stats () in
   let wrapped payload =
-    let t0 = Unix.gettimeofday () in
+    let t0 = Monotonic_clock.now_ns () in
     handler payload;
-    let dt = Unix.gettimeofday () -. t0 in
-    Mutex.lock handler_stats_mutex;
-    let n, total = Option.value (Hashtbl.find_opt handler_stats name) ~default:(0, 0.0) in
-    Hashtbl.replace handler_stats name (n + 1, total +. dt);
-    Mutex.unlock handler_stats_mutex
+    ignore (Atomic.fetch_and_add stats.frames 1);
+    ignore (Atomic.fetch_and_add stats.total_ns (Monotonic_clock.now_ns () - t0))
   in
   let shard = get_shard (shard_of_name name) in
   let rec loop () =
@@ -104,7 +113,7 @@ let register name handler =
     if Atomic.compare_and_set
          handlers
          current
-         (StringMap.add name (shard, wrapped) current)
+         (StringMap.add name (shard, wrapped, stats) current)
     then ()
     else loop ()
   in
@@ -113,14 +122,15 @@ let register name handler =
 
 (** Per-handler [name, frames, cumulative_seconds] snapshot (diagnostics). *)
 let handler_stats_snapshot () =
-  Mutex.lock handler_stats_mutex;
-  let l = Hashtbl.fold (fun k (n, t) acc -> (k, n, t) :: acc) handler_stats [] in
-  Mutex.unlock handler_stats_mutex;
-  l
+  StringMap.bindings (Atomic.get handlers)
+  |> List.map (fun (name, (_, _, stats)) ->
+    ( name
+    , Atomic.get stats.frames
+    , Int64.to_float (Int64.of_int (Atomic.get stats.total_ns)) /. 1_000_000_000.0 ))
 ;;
 
-(* Per-shard work queue: (handler name, raw frame). Bounded; overflow is reported via
-   [submit] -> false, so no frame is dropped silently. *)
+(* Per-shard work queue: (handler name, raw frame, receive time in Unix seconds). Bounded;
+   overflow is reported via [submit] -> false, so no frame is dropped silently. *)
 let queue_capacity = 65536
 
 (* Observability counters for diagnostics/dashboards. [submit_fallbacks] counts [submit]
@@ -139,6 +149,17 @@ let update_max cell v =
     if v <= cur then () else if Atomic.compare_and_set cell cur v then () else loop ()
   in
   loop ()
+;;
+
+(** Receive time (Unix seconds) of the frame the current shard is handling. Handlers run
+    on the shard's own domain, so a venue can read it without threading a parameter
+    through [decode_frame]. [None] outside a parse domain (inline fallback). *)
+let recv_wall_key = Domain.DLS.new_key (fun () -> 0.0)
+
+let current_recv_wall () =
+  match Domain.DLS.get recv_wall_key with
+  | 0.0 -> None
+  | t -> Some t
 ;;
 
 (** Worker body for one shard: block until signalled, drain up to [max_batch] frames,
@@ -162,16 +183,24 @@ let worker_loop shard =
     Mutex.unlock shard.mutex;
     (* Execute handlers outside any lock. *)
     Queue.iter
-      (fun (name, payload) ->
+      (fun (name, payload, recv) ->
         match StringMap.find_opt name (Atomic.get handlers) with
-        | Some (_, handler) ->
+        | Some (_, handler, _) ->
+          let start_ns = Monotonic_clock.now_ns () in
+          Network_latency.record_feed_queue_ns
+            shard.name
+            (int_of_float ((Unix.gettimeofday () -. recv) *. 1_000_000_000.));
+          Domain.DLS.set recv_wall_key recv;
           (try handler payload with
            | exn ->
              Logging.error_f
                ~section:"parse_worker"
                "Handler '%s' failed: %s"
                name
-               (Printexc.to_string exn))
+               (Printexc.to_string exn));
+          Network_latency.record_feed_parse_ns
+            shard.name
+            (Monotonic_clock.now_ns () - start_ns)
         | None ->
           Logging.warn_f
             ~section:"parse_worker"
@@ -202,11 +231,13 @@ let ensure_worker shard =
       [true] if queued, [false] if the queue is full or [handler] is not registered (the
       caller must then process synchronously). *)
 let submit handler payload =
+  (* Receive time before any queueing, so one-way feed latency excludes our backlog. *)
+  let recv = Unix.gettimeofday () in
   match StringMap.find_opt handler (Atomic.get handlers) with
   | None ->
     ignore (Atomic.fetch_and_add submit_fallbacks 1);
     false
-  | Some (shard, _) ->
+  | Some (shard, _, _) ->
     ensure_worker shard;
     ignore (Atomic.fetch_and_add frames_submitted 1);
     Mutex.lock shard.mutex;
@@ -215,7 +246,7 @@ let submit handler payload =
       if depth >= queue_capacity
       then false
       else (
-        Queue.push (handler, payload) shard.queue;
+        Queue.push (handler, payload, recv) shard.queue;
         true)
     in
     if ok then Condition.signal shard.condition;

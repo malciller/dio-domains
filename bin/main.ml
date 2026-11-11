@@ -443,6 +443,10 @@ let () =
      event-driven wakeups don't pay C-state/frequency exit latency. Disable with
      DIO_CANARY=0. *)
   Canary.start ();
+  (* Drain trading-domain latency windows on a background domain: the recording domains
+     only close a window (O(1)); the fold, percentile scan and spike log run there.
+     Started before the journal so its first tick sees published snapshots. *)
+  Latency_publisher.start ();
   (* Start the latency journal after the canary, so the canary row has a value on the
      first tick. Its interval is clamped to at least the per-domain publish window: a
      profiler publishes only its newest window, so sampling faster would journal

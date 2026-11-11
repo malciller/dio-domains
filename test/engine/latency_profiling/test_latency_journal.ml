@@ -159,6 +159,23 @@ let test_tick_writes_and_dedupes () =
   rm_rf dir
 ;;
 
+let test_tick_records_peak_time () =
+  let dir = fresh_dir () in
+  let snap = snapshot ~samples:10 ~p99_us:50.0 "prep" in
+  let t = make_journal ~dir [ row snap ] in
+  J.tick t;
+  (match rows_in dir with
+   | [ r ] ->
+     check bool "the peak time is journalled" true (r.R.mt > 0.0);
+     check
+       (float 0.001)
+       "the peak time is the window that holds it"
+       snap.Latency_profiler.window_end
+       r.R.mt
+   | rows -> Alcotest.failf "expected one row, got %d" (List.length rows));
+  rm_rf dir
+;;
+
 let test_tick_skips_idle () =
   let dir = fresh_dir () in
   let idle = snapshot ~samples:0 "prep" in
@@ -326,6 +343,7 @@ let () =
         ] )
     ; ( "writer"
       , [ test_case "tick writes once per window" `Quick test_tick_writes_and_dedupes
+        ; test_case "peak time is journalled" `Quick test_tick_records_peak_time
         ; test_case "idle window is skipped" `Quick test_tick_skips_idle
         ; test_case "truncated line tolerated" `Quick test_truncated_line_tolerated
         ] )
