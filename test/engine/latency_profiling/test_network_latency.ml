@@ -74,7 +74,9 @@ let test_window_eviction_adapts () =
     get_some (Network_latency.corrected_one_way ~now:0.0 venue ~recv:0.0 ~event:0.0)
   in
   check_float "outlier reads the floor" 0.05 l0;
-  (* t=400 > window: the t=0 outlier is evicted, min_d re-anchors to 1.0. *)
+  (* t=400 > window: a live probe refreshes the RTT floor, while the t=0 d outlier is
+     evicted and min_d re-anchors to 1.0. *)
+  Network_latency.observe_rtt ~now:400.0 venue 0.100;
   let l1 =
     get_some (Network_latency.corrected_one_way ~now:400.0 venue ~recv:400.0 ~event:399.0)
   in
@@ -83,6 +85,30 @@ let test_window_eviction_adapts () =
     "not biased by the stale minimum"
     true
     (abs_float (l1 -. 1.05) > 0.5)
+;;
+
+(* A dead ping probe must not leave the one-way metric reporting jitter: without an RTT
+   inside the freshness bound the sample is dropped, not silently re-based. *)
+let test_stale_rtt_suspends_feed () =
+  let venue = "stale-rtt-test" in
+  let t0 = Unix.gettimeofday () in
+  Network_latency.observe_rtt ~now:t0 venue 0.100;
+  let at dt =
+    Network_latency.corrected_one_way
+      ~now:(t0 +. dt)
+      venue
+      ~recv:(t0 +. dt)
+      ~event:(t0 +. dt -. 0.1)
+  in
+  Alcotest.(check bool) "fresh RTT records" true (Option.is_some (at 10.0));
+  Alcotest.(check bool)
+    "stale RTT drops the sample"
+    true
+    (at (Network_latency.rtt_stale_after_s +. 1.0) = None);
+  Alcotest.(check bool)
+    "clock age is exposed"
+    true
+    (Option.is_some (Network_latency.clock_age_s venue))
 ;;
 
 (* A feed that keeps re-sending the same event timestamp while local time advances is
@@ -167,6 +193,10 @@ let () =
             "stale feed rejected by freshness gate"
             `Quick
             test_stale_feed_rejected
+        ; Alcotest.test_case
+            "stale RTT suspends the feed metric"
+            `Quick
+            test_stale_rtt_suspends_feed
         ; Alcotest.test_case "live feed accepted" `Quick test_live_feed_accepted
         ; Alcotest.test_case
             "large latency not clamped"

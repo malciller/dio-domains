@@ -26,6 +26,10 @@ type supervised_connection =
   (** Data freshness timestamp; drives heartbeat timeout detection. *)
   ; mutable last_ping_sent : float option
   (** Timestamp of the last ping; drives ping/pong liveness. *)
+  ; mutable last_pong_ok : float option
+  (** Timestamp of the last successful ping/pong; [None] until the first success. *)
+  ; mutable last_ping_warn : float
+  (** Last time a silent-probe warning was logged, to throttle it. *)
   ; ping_failures : int Atomic.t (** Atomic counter of consecutive ping failures. *)
   ; mutable reconnect_attempts : int
   ; mutable total_connections : int

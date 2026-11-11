@@ -34,7 +34,17 @@ let is_kraken_rate_limited name reason =
 (** A pong proves the transport, not that the venue is still pushing data. Event-driven
     connections (no data timeout) have no other liveness signal, so they refresh the data
     heartbeat on a pong; streamed connections keep it honest. *)
-let note_pong conn = if Option.is_none conn.data_timeout_s then update_data_heartbeat conn
+let note_pong conn =
+  Mutex.lock conn.mutex;
+  conn.last_pong_ok <- Some (Unix.time ());
+  Mutex.unlock conn.mutex;
+  if Option.is_none conn.data_timeout_s then update_data_heartbeat conn
+;;
+
+(* A connected venue should answer within a few ping intervals; past this the probe is
+   effectively dead even if the data stream still flows. *)
+let ping_silence_warn_s = 120.0
+let ping_warn_interval_s = 300.0
 
 (* A connection that holds this long has proven itself; its next failure starts from the
    bottom of the backoff instead of inheriting earlier flaps. *)
@@ -112,6 +122,8 @@ let monitor_loop () =
                   let last_connecting = conn.last_connecting in
                   let last_data_received = conn.last_data_received in
                   let last_connected = conn.last_connected in
+                  let last_pong_ok = conn.last_pong_ok in
+                  let last_ping_warn = conn.last_ping_warn in
                   let has_connect_fn = Option.is_some conn.connect_fn in
                   Mutex.unlock conn.mutex;
                   (match state, last_connected with
@@ -234,6 +246,23 @@ let monitor_loop () =
                        || String.equal conn.name "alpaca_data_ws"
                        || String.equal conn.name "alpaca_trading_ws"
                     then (
+                      (* A probe that stops answering while data flows would otherwise go
+                         unnoticed: the failure path tolerates a broken probe. *)
+                      let probe_since =
+                        match last_pong_ok with
+                        | Some t -> t
+                        | None -> Option.value last_connected ~default:current_time
+                      in
+                      if current_time -. probe_since > ping_silence_warn_s
+                         && current_time -. last_ping_warn >= ping_warn_interval_s
+                      then (
+                        conn.last_ping_warn <- current_time;
+                        Logging.warn_f
+                          ~section
+                          "[%s] ping probe silent for %.0fs while data flows; one-way \
+                           latency will age out"
+                          conn.name
+                          (current_time -. probe_since));
                       let should_ping =
                         match conn.last_ping_sent with
                         | None -> true

@@ -228,6 +228,14 @@ end
     the network floor, short enough to track clock drift/steps. *)
 let offset_window_s = 300.0
 
+(** A one-way estimate needs a ping RTT from the recent past; without one the clock offset
+    is unknown and the sample is dropped instead of silently reading as jitter. Eight
+    supervisor ping intervals. *)
+let rtt_stale_after_s = 120.0
+
+(** Minimum spacing between "feed latency suspended" warnings per venue. *)
+let stale_warn_interval_s = 60.0
+
 let offset_max_len = 20_000
 
 (** A feed sample is stale/out-of-order (not transit delay) when its server event time
@@ -297,6 +305,8 @@ type offset_state =
   { d : Window_min.t (* min (recv - event) *)
   ; rtt : Window_min.t (* min ping RTT *)
   ; mutable max_event : float (* newest server event time seen *)
+  ; mutable last_rtt : float (* Unix time of the newest RTT sample; -inf = never *)
+  ; mutable last_stale_warn : float
   ; fresh : Feed_freshness.t
   }
 
@@ -313,6 +323,8 @@ let offset_state venue =
         { d = Window_min.create ~window_s:offset_window_s ~max_len:offset_max_len
         ; rtt = Window_min.create ~window_s:offset_window_s ~max_len:offset_max_len
         ; max_event = neg_infinity
+        ; last_rtt = neg_infinity
+        ; last_stale_warn = neg_infinity
         ; fresh = Feed_freshness.create ()
         }
       in
@@ -337,15 +349,17 @@ let observe_rtt ?now venue rtt =
     Mutex.lock offsets_mutex;
     Window_min.push st.rtt ~time:now ~value:rtt;
     Window_min.evict st.rtt ~now;
+    st.last_rtt <- now;
     Mutex.unlock offsets_mutex)
 ;;
 
-(** [corrected_one_way ?now venue ~recv ~event] returns the clock-offset- corrected
-    one-way latency in seconds for a fresh feed message whose server event time is [event]
-    (Unix seconds) and which was read locally at [recv] (Unix seconds), or [None] when the
-    sample is stale/out-of-order (see [Feed_freshness] and [stale_event_tolerance_s]).
-    [now] defaults to [recv] and drives window eviction. Fresh samples are folded into the
-    venue's sliding-window minimum. *)
+(** [corrected_one_way ?now venue ~recv ~event] returns the clock-offset-corrected one-way
+    latency in seconds for a fresh feed message whose server event time is [event] (Unix
+    seconds) and which was read locally at [recv] (Unix seconds), or [None] when the
+    sample is stale/out-of-order (see [Feed_freshness] and [stale_event_tolerance_s]) or
+    when no recent ping RTT is available to anchor the clock offset. [now] defaults to
+    [recv] and drives window eviction. Fresh samples are folded into the venue's
+    sliding-window minimum. *)
 let corrected_one_way ?now venue ~recv ~event =
   let now =
     match now with
@@ -358,23 +372,55 @@ let corrected_one_way ?now venue ~recv ~event =
   let live = Feed_freshness.is_live st.fresh ~now in
   let ordered = event >= st.max_event -. stale_event_tolerance_s in
   if event > st.max_event then st.max_event <- event;
-  let result =
+  let result, warn =
     if not (live && ordered)
-    then None
+    then None, None
     else (
       let d = recv -. event in
       Window_min.push st.d ~time:recv ~value:d;
       Window_min.evict st.d ~now;
-      let offset =
-        match Window_min.min_opt st.d, Window_min.min_opt st.rtt with
-        | Some dm, Some rm -> dm -. (rm /. 2.0)
-        | Some dm, None -> dm
-        | None, _ -> 0.0
+      Window_min.evict st.rtt ~now;
+      let rtt_fresh =
+        Float.is_finite st.last_rtt && now -. st.last_rtt <= rtt_stale_after_s
       in
-      Some (max 0.0 (d -. offset)))
+      match Window_min.min_opt st.d, Window_min.min_opt st.rtt with
+      | Some dm, Some rm when rtt_fresh ->
+        let offset = dm -. (rm /. 2.0) in
+        Some (max 0.0 (d -. offset)), None
+      | _ ->
+        (* Without a recent RTT the clock offset is unknown; jitter is not latency. *)
+        let warn =
+          if now -. st.last_stale_warn >= stale_warn_interval_s
+          then (
+            st.last_stale_warn <- now;
+            Some
+              (Printf.sprintf
+                 "one-way feed latency suspended for %s: no ping RTT within %.0fs"
+                 venue
+                 rtt_stale_after_s))
+          else None
+        in
+        None, warn)
   in
   Mutex.unlock offsets_mutex;
+  (match warn with
+   | Some msg -> Logging.warn_f ~section "%s" msg
+   | None -> ());
   result
+;;
+
+(** Seconds since [venue]'s newest ping RTT sample, or [None] when none has arrived. Past
+    [rtt_stale_after_s] the one-way feed metric is suspended. *)
+let clock_age_s venue =
+  let now = Unix.gettimeofday () in
+  Mutex.lock offsets_mutex;
+  let age =
+    match Hashtbl.find_opt offsets venue with
+    | Some st when Float.is_finite st.last_rtt -> Some (now -. st.last_rtt)
+    | _ -> None
+  in
+  Mutex.unlock offsets_mutex;
+  age
 ;;
 
 (** Parse an RFC3339 / ISO8601 timestamp (e.g. "2025-01-14T16:05:51.872012Z") into Unix

@@ -71,6 +71,8 @@ let register ~name ~connect_fn =
       last_connecting = None
     ; last_data_received = None
     ; last_ping_sent = None
+    ; last_pong_ok = None
+    ; last_ping_warn = 0.0
     ; ping_failures = Atomic.make 0
     ; reconnect_attempts = 0
     ; total_connections = 0
@@ -102,6 +104,8 @@ let register_for_monitoring ~name =
     ; last_data_received = Some (Unix.time ())
     ; (* Seed heartbeat timestamp *)
       last_ping_sent = None
+    ; last_pong_ok = None
+    ; last_ping_warn = 0.0
     ; ping_failures = Atomic.make 0
     ; reconnect_attempts = 0
     ; total_connections = 1
@@ -132,6 +136,8 @@ let set_state conn new_state =
      conn.last_connecting <- None;
      conn.last_data_received <- Some (Unix.time ());
      conn.last_ping_sent <- None;
+     conn.last_pong_ok <- None;
+     conn.last_ping_warn <- 0.0;
      Atomic.set conn.ping_failures 0;
      conn.total_connections <- conn.total_connections + 1;
      Logging.info_f
