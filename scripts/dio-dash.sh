@@ -25,7 +25,7 @@ IMAGE="dio"
 NAME="dio_dashboard"
 SOCK_VOL="dio-sock"
 LIFECYCLE_LABEL='"dio.lifecycle":"detached"'
-# Engine config (holds the "theme" field). deploy keeps it in the persistent
+# Engine config (holds the "theme" field). The engine reads it from its persistent
 # data dir; override with DIO_DATA_DIR when it lives elsewhere.
 CONFIG_FILE="${DIO_DATA_DIR:-${HOME}/dio-data}/config.json"
 
@@ -56,8 +56,8 @@ start_container() {
     if ! is_managed; then
       echo "ERROR: ${NAME} exists but was started by the old pty-attached dio-dash.sh." >&2
       echo "       Refusing to remove it here: a pty whose owner is gone can wedge the" >&2
-      echo "       containerd shim. Run deploy (it renames the legacy container) or" >&2
-      echo "       remove it from a live session with: timeout 10 docker rm -f ${NAME}" >&2
+      echo "       containerd shim. Recreate the container from a live session:" >&2
+      echo "       timeout 10 docker rm -f ${NAME}" >&2
       return 1
     fi
     if is_running; then

@@ -1,7 +1,7 @@
 (** Reader and CLI for the latency journal written by {!Latency_journal}.
 
-    Three verbs, all read-only and usable on the prod host against the bind-mounted data
-    directory (`$the data directory/latency`) as well as on a copied file:
+    Three verbs, all read-only. They read journal files without booting the engine, so
+    they run inside the engine container or against a copy of the files anywhere:
 
     - [tail] current value per stage, from the newest samples in a time window.
     - [best] minimum p99 ever recorded per stage, with when it happened. Observability

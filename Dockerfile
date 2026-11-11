@@ -94,7 +94,7 @@ RUN mkdir -p /app/signer-out \
 # old base packages (glibc 2.35, perl 5.34, tar 1.34, pcre2 10.39, zstd 1.4.8,
 # ncurses 6.3, systemd 249, shadow 4.8, gcc-12). 24.04 ships the patched versions
 # and keeps a shell + coreutils, which the documented `--entrypoint cp` config
-# extraction and deploy rely on (a distroless base would drop those).
+# extraction relies on (a distroless base would drop those).
 FROM ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254 AS runtime
 
 # 3. Runtime shared libraries only. Kept to what the engine actually links:

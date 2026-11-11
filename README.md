@@ -133,7 +133,6 @@ container walkthrough.
 | `licenses/` | Third-party notices and provenance, including the native-library licenses. |
 | `bin/` | The `dio`, `dio-dashboard`, and `dio-oracle` executables. |
 | `scripts/` | Operational shell scripts: the dashboard client (`dio-dash.sh`) and the container entrypoint/sidecar launchers. |
-| `deploy`, `config update` | Deploy and config-update entry points, kept at the repository root. |
 | `test/` | Test suites mirroring `src/`. |
 | `strategies/` | Strategy scripts loaded by name from `config.json`. |
 | `editors/` | Editor support for the strategy language: VS Code (`vscode-strategy`), Zed (`zed-strategy`), and the shared tree-sitter grammar. |

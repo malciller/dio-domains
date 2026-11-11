@@ -7,8 +7,8 @@ let public_ws_url () = Printf.sprintf "wss://%s/stream?readonly=true" hostname
 
 (** Dial target for the authenticated socket only: Lighter's ingress geo-blocks the
     private WebSocket from US addresses while public data and REST answer normally, so
-    this one socket is pinned through the non-US egress relay (/etc/hosts on production)
-    instead of dragging the public feed and REST calls along with it.
+    this one socket is pinned through a non-US egress relay (/etc/hosts) instead of
+    dragging the public feed and REST calls along with it.
 
     Deliberately outside DNS: an unpinned host fails to resolve rather than silently
     falling back to a blocked direct connection. TLS still validates [hostname] — see

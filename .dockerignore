@@ -46,4 +46,3 @@ node_modules
 # Docker
 Dockerfile
 .dockerignore
-deploy

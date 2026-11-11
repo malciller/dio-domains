@@ -1,5 +1,5 @@
 (* Tail-latency harness for the per-cycle allocation burst (the PREP phase). Models the
-   live shape measured on production:
+   live shape measured in production:
    - a large retained major-heap live set (default 180 MB total across domains),
    - N trading domains each allocating a ~4.6 kword burst per cycle,
    - an event-driven cycle rate (~350/s) with the domain idle between bursts.
