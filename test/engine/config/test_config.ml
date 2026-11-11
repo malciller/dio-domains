@@ -337,6 +337,42 @@ let test_parse_flow_log_config () =
     absent.enabled
 ;;
 
+let test_parse_latency_journal_config () =
+  let json =
+    Yojson.Basic.from_string
+      {|{"latency_journal": {"enabled": false, "interval_s": 45, "retain_days": 3, "max_total_mb": 16, "min_free_mb": 2048}}|}
+  in
+  let c = Dio_engine.Config.parse_latency_journal_config json in
+  Alcotest.(check bool) "enabled" false c.journal_enabled;
+  Alcotest.(check (float 0.0001)) "interval" 45.0 c.journal_interval_s;
+  Alcotest.(check int) "retain_days" 3 c.journal_retain_days;
+  Alcotest.(check int) "max_total_mb" 16 c.journal_max_total_mb;
+  Alcotest.(check int) "min_free_mb" 2048 c.journal_min_free_mb;
+  (* An absent section is enabled by default: the journal is a permanent observation tool,
+     not a debug flag. The env switch can still turn it off. *)
+  let absent =
+    Dio_engine.Config.parse_latency_journal_config (Yojson.Basic.from_string "{}")
+  in
+  Alcotest.(check bool)
+    "absent follows env switch"
+    (Dio_engine.Config.journal_env_enabled ())
+    absent.journal_enabled;
+  Alcotest.(check bool)
+    "absent interval is 30s"
+    true
+    (Float.equal absent.journal_interval_s 30.0);
+  (* A sub-5s interval is clamped: sampling faster than the publish window would journal
+     duplicate windows. *)
+  let aggressive =
+    Dio_engine.Config.parse_latency_journal_config
+      (Yojson.Basic.from_string {|{"latency_journal": {"interval_s": 0.5}}|})
+  in
+  Alcotest.(check bool)
+    "interval clamped to the 5s floor"
+    true
+    (Float.equal aggressive.journal_interval_s 5.0)
+;;
+
 let test_read_config_defaults () =
   (* Precondition: config.json absent. *)
   let config = Dio_engine.Config.read_config () in
@@ -1045,6 +1081,10 @@ let () =
             "float config fields accept int JSON literals"
             `Quick
             test_to_float_opt_accepts_int
+        ; Alcotest.test_case
+            "latency journal defaults, overrides and interval floor"
+            `Quick
+            test_parse_latency_journal_config
         ] )
     ; ( "file_handling"
       , [ Alcotest.test_case "config defaults" `Quick test_read_config_defaults

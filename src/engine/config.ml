@@ -51,6 +51,26 @@ type gc_config =
   ; major_heap_increment : int
   }
 
+(** Optional top-level "latency_journal" section: an append-only JSONL record of every
+    published per-stage latency window, with bounded retention.
+
+    The journal exists so percentile regressions are visible after the fact instead of
+    only in a live dashboard. It runs on its own detached domain, reads the published
+    snapshots that the trading domains already maintain, and never blocks or aborts them:
+    low disk space or a failed write stops the journal, not the engine.
+
+    [journal_interval_s] is clamped to at least 5s and to at least
+    [latency_window_seconds], because a profiler publishes only its most recent window;
+    sampling faster would journal duplicates. *)
+type latency_journal_config =
+  { journal_enabled : bool
+  ; journal_interval_s : float
+  ; journal_dir : string
+  ; journal_retain_days : int
+  ; journal_max_total_mb : int
+  ; journal_min_free_mb : int
+  }
+
 (** Latency families that emit spike logs. [Spike_report_internal] covers the per-domain
     pipeline stages (OB/EXEC/PREP/STRAT/CYCLE); [Spike_report_network] covers per-venue
     ws_ping/ws_feed/rest_request/signer windows. Separate so the network tail can be
@@ -74,6 +94,8 @@ type config =
   ; latency_window_seconds : float
   (** Per-domain latency accumulation window, in seconds: the histogram is snapshotted and
       reset each window. Shorter = faster dashboard movement, fewer samples per window. *)
+  ; latency_journal : latency_journal_config
+  (** Append-only per-stage latency journal. Enabled by default. *)
   ; latency_spike_threshold_us : float
   (** Per-stage latency ceiling, in microseconds. A window with samples above it emits one
       INFO line naming offending stages, worst spike, and breach count. Target: 10us. *)
@@ -97,6 +119,10 @@ type config =
 
 (** Logging section identifier for this module. *)
 let section = "config"
+
+(** Base data directory: [/app/data] in the Docker image, [./data] locally. Single
+    definition lives in {!Ds.Paths} so every writer agrees. *)
+let data_dir () = Ds.Paths.data_dir ()
 
 (** Accepts [Int] and [Float] JSON numbers; all else (including [Null]) is [None].
     Yojson's [to_float_option] raises on [Int], which aborts startup with an uncaught
@@ -166,6 +192,7 @@ let known_top_level_keys =
   ; "theme"
   ; "strategy_trace"
   ; "flow_log"
+  ; "latency_journal"
   ; "alert_level"
   ]
 ;;
@@ -177,6 +204,10 @@ let known_flow_log_keys =
   ; "pulse_seconds"
   ; "price_ticks"
   ]
+;;
+
+let known_latency_journal_keys =
+  [ "enabled"; "interval_s"; "dir"; "retain_days"; "max_total_mb"; "min_free_mb" ]
 ;;
 
 let known_gc_keys =
@@ -593,6 +624,67 @@ let parse_flow_log_config json : flow_log_config =
     ; pulse_seconds = optf "pulse_seconds" 5.0
     ; price_ticks =
         f |> member "price_ticks" |> to_bool_option |> Option.value ~default:true
+    }
+;;
+
+(** [DIO_LATENCY_JOURNAL] env kill switch. Absent = enabled, because the journal is a
+    permanent observation tool; the switch exists so a constrained box can turn it off
+    without editing config.json. *)
+let journal_env_enabled () =
+  match Sys.getenv_opt "DIO_LATENCY_JOURNAL" with
+  | Some s ->
+    (match String.lowercase_ascii (String.trim s) with
+     | "0" | "false" | "off" | "no" -> false
+     | _ -> true)
+  | None -> true
+;;
+
+(** Parses the optional "latency_journal" object. Absent = enabled with defaults.
+    [DIO_LATENCY_DIR] overrides the directory (tests and sidecars). [interval_s] is
+    clamped to at least 5s; the caller additionally clamps it to [latency_window_seconds].
+    Exits on unknown sub-keys. *)
+let parse_latency_journal_config json : latency_journal_config =
+  let open Yojson.Basic.Util in
+  let default_dir = Filename.concat (data_dir ()) "latency" in
+  let resolve_dir j =
+    match Sys.getenv_opt "DIO_LATENCY_DIR" with
+    | Some d when String.trim d <> "" -> String.trim d
+    | _ ->
+      (match j |> member "dir" |> to_string_option with
+       | Some d when String.trim d <> "" -> String.trim d
+       | _ -> default_dir)
+  in
+  match json |> member "latency_journal" with
+  | `Null ->
+    { journal_enabled = journal_env_enabled ()
+    ; journal_interval_s = 30.0
+    ; journal_dir = resolve_dir (`Assoc [])
+    ; journal_retain_days = 14
+    ; journal_max_total_mb = 128
+    ; journal_min_free_mb = 1024
+    }
+  | j ->
+    if validate_keys ~context:"latency_journal" ~allowed:known_latency_journal_keys j
+    then exit 1;
+    let optf key default = j |> member key |> to_float_opt |> Option.value ~default in
+    let opti key default = j |> member key |> to_int_option |> Option.value ~default in
+    let interval = optf "interval_s" 30.0 in
+    if interval < 5.0
+    then
+      Logging.warn_f
+        ~section
+        "latency_journal.interval_s %.1f is below the 5s floor; using 5s"
+        interval;
+    { journal_enabled =
+        j
+        |> member "enabled"
+        |> to_bool_option
+        |> Option.value ~default:(journal_env_enabled ())
+    ; journal_interval_s = Float.max 5.0 interval
+    ; journal_dir = resolve_dir j
+    ; journal_retain_days = max 1 (opti "retain_days" 14)
+    ; journal_max_total_mb = max 1 (opti "max_total_mb" 128)
+    ; journal_min_free_mb = max 0 (opti "min_free_mb" 1024)
     }
 ;;
 
@@ -1865,6 +1957,7 @@ let read_config () : config =
     in
     let logging = parse_logging_config json in
     let flow_log = parse_flow_log_config json in
+    let latency_journal = parse_latency_journal_config json in
     let gc = parse_gc_config json in
     let oracle = parse_oracle_config json in
     let trading_json = trading_entries_json json in
@@ -2133,6 +2226,7 @@ let read_config () : config =
       ; trading
       ; fng_check_threshold
       ; latency_window_seconds
+      ; latency_journal
       ; latency_spike_threshold_us
       ; latency_spike_report
       ; latency_spike_report_seconds
@@ -2174,6 +2268,14 @@ let read_config () : config =
        ; trading = []
        ; fng_check_threshold = 1.5
        ; latency_window_seconds = 5.0
+       ; latency_journal =
+           { journal_enabled = journal_env_enabled ()
+           ; journal_interval_s = 30.0
+           ; journal_dir = Filename.concat (data_dir ()) "latency"
+           ; journal_retain_days = 14
+           ; journal_max_total_mb = 128
+           ; journal_min_free_mb = 1024
+           }
        ; latency_spike_threshold_us = 10.0
        ; latency_spike_report = Spike_report_internal
        ; latency_spike_report_seconds = 30.0

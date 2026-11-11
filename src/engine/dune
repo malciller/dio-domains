@@ -23,6 +23,7 @@
  (modules
   Config
   Domain_spawner
+  Latency_rows
   Order_executor
   Strategy_replay
   Overlay_reserve

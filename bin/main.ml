@@ -349,6 +349,11 @@ let emit_flow_pulse ~window_seconds =
 ;;
 
 let () =
+  (* Offline tooling runs without booting the engine: `dio latency ...` reads journal
+     files, so it must work on the prod host and on a copied file. *)
+  (match Array.to_list Sys.argv with
+   | _ :: "latency" :: rest -> exit (Latency_report.run rest)
+   | _ -> ());
   (* Strategy-file tooling (e.g. `dio strategy validate <file>`) runs without booting the
      engine. `replay` needs the engine (config + venue registry), so it is handled here. *)
   (match Array.to_list Sys.argv with
@@ -438,6 +443,21 @@ let () =
      event-driven wakeups don't pay C-state/frequency exit latency. Disable with
      DIO_CANARY=0. *)
   Canary.start ();
+  (* Start the latency journal after the canary, so the canary row has a value on the
+     first tick. Its interval is clamped to at least the per-domain publish window: a
+     profiler publishes only its newest window, so sampling faster would journal
+     duplicates. The journal degrades to off on its own (missing directory, low disk) and
+     never blocks a trading domain. *)
+  let journal_cfg = config.latency_journal in
+  Latency_journal.start
+    { Latency_journal.enabled = journal_cfg.journal_enabled
+    ; interval_s = Float.max journal_cfg.journal_interval_s config.latency_window_seconds
+    ; dir = journal_cfg.journal_dir
+    ; retain_days = journal_cfg.journal_retain_days
+    ; max_total_mb = journal_cfg.journal_max_total_mb
+    ; min_free_mb = journal_cfg.journal_min_free_mb
+    }
+    ~produce:Dio_engine.Latency_rows.all;
   Logging.info_f ~section:"main" "%s" (Thread_affinity.describe ());
   (* Periodic memory reporter on an Lwt timer (600s interval). Runs in the main domain
      scheduler, avoiding the prior Gc.create_alarm approach: alarm callbacks run in GC

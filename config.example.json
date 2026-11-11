@@ -9,6 +9,25 @@
     "pulse_seconds": 5.0,
     "price_ticks": true
   },
+  // Append-only record of every per-stage latency window, so a percentile regression is
+  // visible after the fact instead of only in the live dashboard. On by default; it runs
+  // on its own background domain and stops itself rather than risk the data directory
+  // (which holds position state) running out of space. Query with:
+  //   dio latency tail
+  //   dio latency best
+  //   dio latency compare <old> <new> --gate
+  "latency_journal": {
+    "enabled": true,
+    // Clamped to at least 5s and to at least latency_window_seconds: a profiler
+    // publishes only its newest window, so faster sampling would journal duplicates.
+    "interval_s": 30,
+    // Empty = <data dir>/latency (/app/data/latency in Docker, ./data/latency locally).
+    "dir": "",
+    "retain_days": 14,
+    "max_total_mb": 128,
+    // Stop journalling below this much free space on the data filesystem.
+    "min_free_mb": 1024
+  },
   "gc": {
     "minor_heap_size": 1048576,
     "space_overhead": 120,

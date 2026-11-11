@@ -18,13 +18,9 @@ open Lwt.Infix
 
 let section = "oracle_cache"
 
-(** Base history directory: /app/data in Docker, ./data locally. v2 stores raw bars with
-    read-time normalization. *)
-let cache_dir =
-  if Sys.file_exists "/app"
-  then "/app/data/oracle_history/v2"
-  else "data/oracle_history/v2"
-;;
+(** Base history directory: [/app/data] in Docker, [./data] locally. v2 stores raw bars
+    with read-time normalization. *)
+let cache_dir = Ds.Paths.subdir "oracle_history/v2"
 
 (* Mutex guarding all file I/O (shared with other modules' threads). *)
 let file_mutex = Mutex.create ()

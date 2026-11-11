@@ -115,6 +115,21 @@ let get_profiler symbol = function
   | Cancel -> (get_symbol_profilers symbol).cancel
 ;;
 
+(** Every symbol's published order-operation windows (lock-free map read), for the latency
+    journal. Naming a symbol here does not allocate a profiler. *)
+let all_profiler_snapshots () =
+  StringMap.fold
+    (fun symbol e acc ->
+      ( symbol
+      , [ "place", Latency_profiler.published_snapshot e.place
+        ; "amend", Latency_profiler.published_snapshot e.amend
+        ; "cancel", Latency_profiler.published_snapshot e.cancel
+        ] )
+      :: acc)
+    (Atomic.get profilers)
+    []
+;;
+
 let snapshot_profiler profiler =
   let snap = Latency_profiler.snapshot_and_reset profiler in
   if snap.Latency_profiler.samples > 0

@@ -4,6 +4,7 @@
  (wrapped false)
  (libraries
   dio.data_structures
+  dio.yojson
   logging
   dio.mtime
   dio.mtime.clock.os
@@ -12,7 +13,7 @@
   dio.gc_config)
  (foreign_stubs
   (language c)
-  (names monotonic_clock_stubs thread_affinity_stubs))
+  (names monotonic_clock_stubs thread_affinity_stubs disk_space_stubs))
  (modules
   Latency_profiler
   Gc_monitor
@@ -20,4 +21,7 @@
   Network_latency
   Canary
   Thread_affinity
-  Leak_probe))
+  Leak_probe
+  Disk_space
+  Latency_journal
+  Latency_report))

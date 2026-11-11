@@ -15,4 +15,4 @@
  (name ds)
  (public_name dio.data_structures)
  ; the wrapped alias module is `Ds`, so call sites read `Ds.Cow_table` / `Ds.Id_table`
- (modules Cow_table Id_table))
+ (modules Cow_table Id_table Paths))

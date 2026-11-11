@@ -59,6 +59,14 @@ let test_spawn_domains_basic () =
     ; oracle = None
     ; trading = assets
     ; latency_window_seconds = 5.0
+    ; latency_journal =
+        { Dio_engine.Config.journal_enabled = false
+        ; journal_interval_s = 30.0
+        ; journal_dir = Filename.concat (Dio_engine.Config.data_dir ()) "latency"
+        ; journal_retain_days = 14
+        ; journal_max_total_mb = 128
+        ; journal_min_free_mb = 1024
+        }
     ; latency_spike_threshold_us = 10.0
     ; latency_spike_report = Dio_engine.Config.Spike_report_internal
     ; latency_spike_report_seconds = 30.0
@@ -98,6 +106,14 @@ let test_spawn_domains_empty () =
     ; oracle = None
     ; trading = []
     ; latency_window_seconds = 5.0
+    ; latency_journal =
+        { Dio_engine.Config.journal_enabled = false
+        ; journal_interval_s = 30.0
+        ; journal_dir = Filename.concat (Dio_engine.Config.data_dir ()) "latency"
+        ; journal_retain_days = 14
+        ; journal_max_total_mb = 128
+        ; journal_min_free_mb = 1024
+        }
     ; latency_spike_threshold_us = 10.0
     ; latency_spike_report = Dio_engine.Config.Spike_report_internal
     ; latency_spike_report_seconds = 30.0
@@ -194,6 +210,14 @@ let test_domain_error_handling () =
     ; oracle = None
     ; trading = [ failing_asset ]
     ; latency_window_seconds = 5.0
+    ; latency_journal =
+        { Dio_engine.Config.journal_enabled = false
+        ; journal_interval_s = 30.0
+        ; journal_dir = Filename.concat (Dio_engine.Config.data_dir ()) "latency"
+        ; journal_retain_days = 14
+        ; journal_max_total_mb = 128
+        ; journal_min_free_mb = 1024
+        }
     ; latency_spike_threshold_us = 10.0
     ; latency_spike_report = Dio_engine.Config.Spike_report_internal
     ; latency_spike_report_seconds = 30.0
@@ -304,8 +328,8 @@ let test_reconstruct_fresh () =
 ;;
 
 let test_reconstruct_catches_up () =
-  (* Five rungs on the book, price now at rung 8: rungs 6-7 move into the carry, the
-     index stops at rung 7 so the next arm places 6-8 at the current mark. *)
+  (* Five rungs on the book, price now at rung 8: rungs 6-7 move into the carry, the index
+     stops at rung 7 so the next arm places 6-8 at the current mark. *)
   let l = test_ladder () in
   let anchor = 80_000.0 in
   let size k = l.ol_add_first *. (l.ol_add_growth ** float_of_int k) in

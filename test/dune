@@ -1,5 +1,7 @@
 (subdir engine/concurrency)
 
+(subdir engine/latency_profiling)
+
 (subdir engine/logging)
 
 (subdir engine/order_executor)

@@ -155,6 +155,9 @@ Latency and allocation are observable through every phase of the cycle:
 - A busy-spin canary detects process-wide stop-the-world pauses and scheduler
   descheduling that per-domain GC counters miss.
 - Per-cycle GC counters attribute a spike to collector activity or to CPU work.
+- A latency journal appends every published window to JSONL, so a regression can
+  be found and compared after the fact instead of only watched live. See the
+  [latency journal guide](https://diophantsolutions.com/dio/LATENCY/).
 
 ## Dependencies
 
@@ -197,6 +200,7 @@ All documentation lives at **<https://diophantsolutions.com/dio/>**:
 [configuration](https://diophantsolutions.com/dio/CONFIGURATION/),
 [strategy scripts](https://diophantsolutions.com/dio/STRATEGY/),
 [capital oracle](https://diophantsolutions.com/dio/ORACLE/),
+[latency journal](https://diophantsolutions.com/dio/LATENCY/),
 [risk and terms](https://diophantsolutions.com/dio/RISK/), and the
 [specification](https://diophantsolutions.com/dio/SPEC/).
 
