@@ -245,7 +245,6 @@ let engine_phases =
    ; "sell_finalize"
    ; "sell_finalize_facts"
    ; "sell_finalize_latch"
-   ; "sell_excess_sweep_phase"
    ; "sell_finalize_end"
   |]
 ;;

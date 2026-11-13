@@ -219,10 +219,7 @@ let test_sample_column () =
     "123+"
     (Latencies.format_samples ~overflow:1 1234);
   Alcotest.(check string) "wide counts collapse" "12k" (Latencies.format_samples 12_345);
-  Alcotest.(check int)
-    "p999 is gated at 1000 samples"
-    1000
-    Latencies.p999_min_samples
+  Alcotest.(check int) "p999 is gated at 1000 samples" 1000 Latencies.p999_min_samples
 ;;
 
 (** One latency window fixture (fresh relative to the snapshot timestamp). *)
@@ -271,24 +268,19 @@ let latency_json () =
 
 let test_latency_pages () =
   let open Dashboard_ui in
-  (* Default view is the INTERNAL page; the section has room for the future network
-     metrics without widening the table. *)
+  (* Default view is the INTERNAL page; the venue waits are the last tab. *)
   Alcotest.(check int) "starts on INTERNAL page" 0 (Latencies.current_page_index ());
   Alcotest.(check int) "three latency pages" 3 (Latencies.page_count ());
-  (* INTERNAL lists the separate oracle-pass metric first, then the per-cycle segments in
-     pipeline order, then the whole-cycle total. *)
+  (* INTERNAL is the per-cycle pipeline in execution order, total last; the off-cycle
+     oracle pass trails it. Both internal pages come before the venue page. *)
   Alcotest.(check (list string))
     "INTERNAL columns"
-    [ "oracle"; "orderbook"; "execution"; "prep"; "strategy"; "cycle" ]
+    [ "orderbook"; "execution"; "prep"; "strategy"; "cycle"; "oracle" ]
     (Latencies.page_metrics 0);
-  let net = Latencies.page_metrics 1 in
-  Alcotest.(check bool)
-    "NETWORK carries network labels"
-    (List.mem "ws_ping" net
-     && List.mem "ws_feed" net
-     && List.mem "rest_request" net
-     && List.mem "signer" net)
-    true;
+  Alcotest.(check (list string))
+    "DECISION columns"
+    [ "wake"; "gate"; "native_res"; "native_bridge"; "native_run"; "native_actions" ]
+    (Latencies.page_metrics 1);
   (* Every page's trend header must fit the trend column. A longer label would silently
      overrun the fixed-width column and shift every border to its right out of alignment
      (regression: "(ORACLE P99)" is 12 chars in an 11-wide column). *)
@@ -298,26 +290,20 @@ let test_latency_pages () =
       (String.length (Latencies.page_trend_label i) <= Latencies.trend_col_w)
       true
   done;
-  let native = Latencies.page_metrics 2 in
-  Alcotest.(check bool)
-    "NATIVE carries the compiled strategy split"
-    (List.mem "native_bridge" native
-     && List.mem "native_run" native
-     && List.mem "native_actions" native)
-    true;
-  (* The book-read -> strategy-call segment moved off INTERNAL so that page fits six
-     columns, and TOTAL stays on it: truncation must never drop the column the trend
-     plots. *)
-  Alcotest.(check bool) "GATE rides on NATIVE" (List.mem "gate" native) true;
-  (* Navigation wraps in both directions. *)
+  let external_ = Latencies.page_metrics 2 in
+  Alcotest.(check (list string))
+    "EXTERNAL columns, venue waits and the reaction span"
+    [ "ws_feed"; "ws_ping"; "rest_request"; "signer"; "e2e" ]
+    external_;
+  (* Navigation wraps in both directions, so EXTERNAL is always reached last. *)
   Latencies.next_page ();
-  Alcotest.(check int) "next -> NETWORK" 1 (Latencies.current_page_index ());
+  Alcotest.(check int) "next -> DECISION" 1 (Latencies.current_page_index ());
   Latencies.next_page ();
-  Alcotest.(check int) "next -> NATIVE" 2 (Latencies.current_page_index ());
+  Alcotest.(check int) "next -> EXTERNAL" 2 (Latencies.current_page_index ());
   Latencies.next_page ();
   Alcotest.(check int) "next wraps to INTERNAL" 0 (Latencies.current_page_index ());
   Latencies.prev_page ();
-  Alcotest.(check int) "prev wraps to NATIVE" 2 (Latencies.current_page_index ());
+  Alcotest.(check int) "prev wraps to EXTERNAL" 2 (Latencies.current_page_index ());
   Latencies.set_page 0
 ;;
 
@@ -325,7 +311,7 @@ let test_latency_page_render () =
   let open Dashboard_ui in
   let json = latency_json () in
   (* Rows stay visible across pages (freshness is checked across all pages), so the
-     not-yet-instrumented NETWORK page still renders cleanly instead of blanking out. *)
+     not-yet-instrumented EXTERNAL page still renders cleanly instead of blanking out. *)
   Latencies.set_page 0;
   Alcotest.(check bool)
     "INTERNAL page renders"
@@ -339,7 +325,13 @@ let test_latency_page_render () =
     true;
   Latencies.set_page 1;
   Alcotest.(check bool)
-    "NETWORK page renders"
+    "DECISION page renders"
+    (Notty.I.height (Latencies.render_latencies 180 (Dashboard_ui.Snapshot.of_json json))
+     > 0)
+    true;
+  Latencies.set_page 2;
+  Alcotest.(check bool)
+    "EXTERNAL page renders"
     (Notty.I.height (Latencies.render_latencies 180 (Dashboard_ui.Snapshot.of_json json))
      > 0)
     true;
@@ -356,7 +348,7 @@ let test_latency_page_render () =
 ;;
 
 let test_network_latency () =
-  (* Recording network measurements and publishing windows produces the NETWORK-page
+  (* Recording network measurements and publishing windows produces the EXTERNAL-page
      labels (ws_ping / ws_feed / rest_request / signer) with the recorded distributions. *)
   Network_latency.record_ping_s "kraken" 0.005;
   Network_latency.record_ping_s "kraken" 0.009;
@@ -498,8 +490,8 @@ let test_overlay_latency_row () =
 ;;
 
 (** The p999 cell is a percentile only once its basis holds 1000 samples. Below that the
-    number is arithmetically the window maximum, so it must not be drawn; the count is shown
-    instead, and the overflow marker flags samples past the histogram ceiling. *)
+    number is arithmetically the window maximum, so it must not be drawn; the count is
+    shown instead, and the overflow marker flags samples past the histogram ceiling. *)
 let test_latency_sample_gate () =
   let open Dashboard_ui in
   let window ~union_samples ~overflow =
@@ -527,8 +519,10 @@ let test_latency_sample_gate () =
     let json =
       `Assoc
         [ "timestamp", `Float 1000.0
-        ; "strategies", `Assoc [ "BTC/USDC", `Assoc [ "exchange", `String "hyperliquid" ] ]
-        ; "latencies", `Assoc [ "BTC/USDC", `Assoc [ "oracle", snap ] ]
+        ; ( "strategies"
+          , `Assoc [ "BTC/USDC", `Assoc [ "exchange", `String "hyperliquid" ] ] )
+        ; (* The measured column must survive INTERNAL truncation: BOOK is first. *)
+          "latencies", `Assoc [ "BTC/USDC", `Assoc [ "orderbook", snap ] ]
         ]
     in
     Latencies.set_page page;
@@ -542,12 +536,19 @@ let test_latency_sample_gate () =
   Alcotest.(check bool) "count still drawn" (contains_sub deep "5000") true;
   let over = render 40 7 in
   Alcotest.(check bool) "overflow marked in the count" (contains_sub over "40+") true;
-  (* Six columns on INTERNAL, and the TOTAL column must survive truncation because it is
-     what the trend plots. The gate segment lives on NATIVE. *)
-  Alcotest.(check bool) "INTERNAL keeps TOTAL" (contains_sub thin "TOTAL") true;
-  Alcotest.(check bool) "INTERNAL has no GATE column" (contains_sub thin "GATE") false;
-  let native_page = render ~page:2 40 0 in
-  Alcotest.(check bool) "GATE column moved to NATIVE" (contains_sub native_page "GATE") true;
+  (* INTERNAL carries six columns; TOTAL must survive truncation because it is what the
+     trend plots, and it is not on DECISION. *)
+  let internal_page = render ~page:0 40 0 in
+  Alcotest.(check bool) "INTERNAL keeps TOTAL" (contains_sub internal_page "TOTAL") true;
+  Alcotest.(check bool)
+    "INTERNAL has no GATE column"
+    (contains_sub internal_page "GATE")
+    false;
+  let decision_page = render ~page:1 40 0 in
+  Alcotest.(check bool)
+    "GATE column is on DECISION"
+    (contains_sub decision_page "GATE")
+    true;
   Latencies.set_page 0
 ;;
 
@@ -586,7 +587,8 @@ let test_footer_overlay_venue () =
 
 let test_latency_persistence () =
   let open Dashboard_ui in
-  Latencies.set_page 1;
+  (* The network windows live on the last page, EXTERNAL. *)
+  Latencies.set_page 2;
   (* Fresh window populates the persistence cache. *)
   ignore
     (Latencies.render_latencies
@@ -760,7 +762,10 @@ let () =
             `Quick
             test_latency_format
         ; Alcotest.test_case "sample column format" `Quick test_sample_column
-        ; Alcotest.test_case "p999 gated on the sample basis" `Quick test_latency_sample_gate
+        ; Alcotest.test_case
+            "p999 gated on the sample basis"
+            `Quick
+            test_latency_sample_gate
         ] )
     ; ( "latency pages"
       , [ Alcotest.test_case "page navigation wraps both ways" `Quick test_latency_pages
@@ -778,7 +783,7 @@ let () =
         ] )
     ; ( "network latency"
       , [ Alcotest.test_case
-            "network windows publish under the NETWORK-page labels"
+            "network windows publish under the EXTERNAL-page labels"
             `Quick
             test_network_latency
         ] )

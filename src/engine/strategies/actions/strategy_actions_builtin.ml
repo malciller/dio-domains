@@ -117,7 +117,6 @@ let declarations =
   ; act "sell_finalize" decision []
   ; act "sell_finalize_facts" read []
   ; act "sell_finalize_latch" decision []
-  ; act "sell_excess_sweep_phase" decision []
   ; act "sell_finalize_end" decision []
   ; act "apply_order_event" decision []
   ; act "compute_sell_price" decision [ se "base" e; se "mult" e ]

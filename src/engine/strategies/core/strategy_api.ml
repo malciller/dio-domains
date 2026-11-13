@@ -118,7 +118,6 @@ let sell_place_should = Strategy_decision.sell_place_should
 let sell_place_body = Strategy_decision.sell_place_body
 let sell_leg_finalize = Strategy_decision.sell_leg_finalize
 let sell_leg_finalize_latch = Strategy_decision.sell_leg_finalize_latch
-let sell_excess_sweep_phase = Strategy_decision.sell_excess_sweep_phase
 let sell_finalize_end = Strategy_decision.sell_finalize_end
 let evaluate_buy_leg = Strategy_decision.evaluate_buy_leg
 let buy_leg_facts = Strategy_decision.buy_leg_facts

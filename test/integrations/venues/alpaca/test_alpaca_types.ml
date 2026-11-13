@@ -210,8 +210,10 @@ let test_regular_session_default_whole () =
   Alcotest.(check bool) "regular whole no extended flag" false ext
 ;;
 
-(* No virtual-GTC: the requested TIF passes through in extended sessions too; acceptance
-   is the account's GTC-for-extended setting, not a silent rewrite here. *)
+(* No virtual-GTC: in an extended session the requested TIF passes through too; acceptance
+   is the account's GTC-for-extended setting, not a silent rewrite here. Fractional orders
+   are the exception: the venue only takes their GTC with extended_hours, so the cases
+   below cover the fallback to day. *)
 let test_extended_session_gtc_preserved () =
   let tif_str, ext = tif ~in_extended:true () in
   Alcotest.(check string) "extended GTC preserved" "gtc" tif_str;
@@ -234,6 +236,49 @@ let test_extended_session_day () =
   let tif_str, ext = tif ~in_extended:true ~time_in_force:(Some "DAY") () in
   Alcotest.(check string) "extended DAY stays day" "day" tif_str;
   Alcotest.(check bool) "extended DAY marked extended" true ext
+;;
+
+(* Fractional equities keep gtc only where the venue allows it: an extended-hours eligible
+   limit order. Everywhere else - regular hours, market orders, extended trading turned
+   off - they are day. *)
+let test_extended_session_fractional_gtc () =
+  let tif_str, ext = tif ~fractional:true ~in_extended:true () in
+  Alcotest.(check string) "extended fractional GTC stays gtc" "gtc" tif_str;
+  Alcotest.(check bool) "extended fractional marked extended" true ext
+;;
+
+let test_extended_session_fractional_default () =
+  let tif_str, ext = tif ~fractional:true ~time_in_force:None ~in_extended:true () in
+  Alcotest.(check string) "extended fractional default gtc" "gtc" tif_str;
+  Alcotest.(check bool) "extended fractional default marked extended" true ext
+;;
+
+let test_extended_session_fractional_day () =
+  let tif_str, ext =
+    tif ~fractional:true ~time_in_force:(Some "DAY") ~in_extended:true ()
+  in
+  Alcotest.(check string) "extended fractional DAY stays day" "day" tif_str;
+  Alcotest.(check bool) "extended fractional DAY marked extended" true ext
+;;
+
+let test_extended_session_fractional_ioc () =
+  let tif_str, _ext =
+    tif ~fractional:true ~time_in_force:(Some "IOC") ~in_extended:true ()
+  in
+  Alcotest.(check string) "extended fractional IOC is day" "day" tif_str
+;;
+
+let test_extended_session_fractional_market_day () =
+  (* Market orders are never extended-eligible, so fractional gtc is not accepted. *)
+  let tif_str, ext = tif ~fractional:true ~order_type:"market" ~in_extended:true () in
+  Alcotest.(check string) "extended fractional market is day" "day" tif_str;
+  Alcotest.(check bool) "extended fractional market not marked" false ext
+;;
+
+let test_extended_session_fractional_disabled_day () =
+  let tif_str, ext = tif ~fractional:true ~in_extended:true ~use_extended:false () in
+  Alcotest.(check string) "fractional without extended hours is day" "day" tif_str;
+  Alcotest.(check bool) "fractional without extended hours not marked" false ext
 ;;
 
 let test_extended_session_market_order_not_marked () =
@@ -307,6 +352,30 @@ let () =
             "regular default whole"
             `Quick
             test_regular_session_default_whole
+        ; Alcotest.test_case
+            "extended fractional GTC"
+            `Quick
+            test_extended_session_fractional_gtc
+        ; Alcotest.test_case
+            "extended fractional default"
+            `Quick
+            test_extended_session_fractional_default
+        ; Alcotest.test_case
+            "extended fractional DAY"
+            `Quick
+            test_extended_session_fractional_day
+        ; Alcotest.test_case
+            "extended fractional IOC"
+            `Quick
+            test_extended_session_fractional_ioc
+        ; Alcotest.test_case
+            "extended fractional market"
+            `Quick
+            test_extended_session_fractional_market_day
+        ; Alcotest.test_case
+            "extended fractional disabled"
+            `Quick
+            test_extended_session_fractional_disabled_day
         ; Alcotest.test_case
             "extended GTC preserved"
             `Quick

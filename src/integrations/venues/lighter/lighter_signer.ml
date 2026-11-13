@@ -353,7 +353,7 @@ let time_signer f =
   r
 [@@ocaml.doc
   " Times a signing operation and records it in the \"lighter\" signer profiler: local FFI\n\
-  \    work (hash + ECDSA over the nonce) shown on the dashboard's NETWORK page. "]
+  \    work (hash + ECDSA over the nonce) shown on the dashboard's EXTERNAL page. "]
 ;;
 
 let sign_create_order

@@ -1,6 +1,6 @@
 (** Per-venue network latency profilers.
 
-    Measure the NETWORK-page metrics shown under each domain row (the domain's venue):
+    Measure the EXTERNAL-page metrics shown under each domain row (the domain's venue):
     - ws_ping: venue WebSocket ping/pong round trip
     - ws_feed: clock-corrected one-way latency of market-data feed messages (server event
       timestamp -> local receive)
@@ -17,10 +17,10 @@
     windows into the per-symbol latency map via each configured symbol's exchange.
 
     [start_publisher] closes and publishes every ~10s, inside the dashboard's 15s
-    freshness tolerance, so the NETWORK page always has a fresh window per metric; an idle
-    venue reads as "idle", not "--". Venue profilers are written from several domains, so
-    recording uses the shared-window barrier and the fold only ever sees a quiescent
-    window. *)
+    freshness tolerance, so the EXTERNAL page always has a fresh window per metric; an
+    idle venue reads as "idle", not "--". Venue profilers are written from several
+    domains, so recording uses the shared-window barrier and the fold only ever sees a
+    quiescent window. *)
 
 open Lwt.Infix
 
@@ -534,7 +534,7 @@ let record_feed_event_ms venue ~event_ms ?recv () =
   | None -> ()
 ;;
 
-(** Dashboard NETWORK-page windows for one venue, in display order. *)
+(** Dashboard EXTERNAL-page windows for one venue, in display order. *)
 let windows p =
   [ "ws_ping", Latency_profiler.published_snapshot p.ping
   ; "ws_feed", Latency_profiler.published_snapshot p.feed
@@ -613,7 +613,7 @@ let publish_all ?(log_spikes = false) ?(threshold_us = 10.0) () =
 ;;
 
 (** Background publisher: advance all venue windows every [publish_interval_seconds] so
-    the dashboard always has a fresh NETWORK page. Runs as an Lwt fiber; call once at
+    the dashboard always has a fresh EXTERNAL page. Runs as an Lwt fiber; call once at
     engine startup. [log_spikes] controls whether windows also emit spike logs (see
     [publish_all]). *)
 let start_publisher ?(log_spikes = false) ?(threshold_us = 10.0) () =

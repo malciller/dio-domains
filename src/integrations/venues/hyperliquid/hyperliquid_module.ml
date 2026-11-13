@@ -54,9 +54,11 @@ module Hyperliquid_impl = struct
     Printf.sprintf "0x%032Lx" low64
   ;;
 
-  (* Per-symbol fee cache. Maps symbol to (perp_maker, perp_taker, spot_maker,
-     spot_taker). Populated once during initialize_fees and read on every get_fees call. *)
-  let fee_cache : (string, float * float * float * float) Hashtbl.t = Hashtbl.create 16
+  (* Hyperliquid's per-user rates live in the oracle adapter
+     ([Hyperliquid_oracle.fetch_fees]) and are cached per symbol by the engine, which is
+     the rate strategies quote against. This synchronous accessor cannot fetch, so it
+     reports the venue's base-tier rate for [symbol] (builder-dex adjusted) rather than
+     pretending the fee is zero. *)
 
   (* Type conversion helpers: Hyperliquid-specific variants to Exchange_intf.Types *)
   let string_of_order_type = function
@@ -885,32 +887,8 @@ module Hyperliquid_impl = struct
   ;;
 
   let get_fees ~symbol =
-    match Hashtbl.find_opt fee_cache symbol with
-    | Some (pm, pt, _sm, _st) -> Some pm, Some pt
-    | None -> None, None
-  ;;
-
-  let get_spot_fees ~symbol =
-    match Hashtbl.find_opt fee_cache symbol with
-    | Some (_pm, _pt, sm, st) -> Some sm, Some st
-    | None -> None, None
-  ;;
-
-  let initialize_fees symbols =
-    if symbols = []
-    then Lwt.return_unit
-    else
-      Hyperliquid_get_fee.get_fee_info ~testnet:(Atomic.get is_testnet) ()
-      >|= function
-      | Some info ->
-        let maker = Option.value info.maker_fee ~default:0.0 in
-        let taker = Option.value info.taker_fee ~default:0.0 in
-        let spot_m = Option.value info.spot_maker_fee ~default:0.0 in
-        let spot_t = Option.value info.spot_taker_fee ~default:0.0 in
-        List.iter
-          (fun symbol -> Hashtbl.replace fee_cache symbol (maker, taker, spot_m, spot_t))
-          symbols
-      | None -> ()
+    let maker, taker = Hyperliquid_oracle.default_fees ~symbol in
+    Some maker, Some taker
   ;;
 
   (** Transfer USDC between spot and perp sub-accounts *)

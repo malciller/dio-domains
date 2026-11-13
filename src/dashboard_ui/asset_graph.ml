@@ -473,10 +473,10 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
           ; I.string a_text (format_usd quote_bal)
           ]
     in
-    (* Latency row: the asset's own INTERNAL (in-process) and NETWORK (exchange
-       round-trip) windows, keyed per-symbol in the snapshot's [latencies]. Shows the p99
-       of the headline metrics with the same warn/crit coloring as the ENGINE LATENCY
-       table ([latencies.ml]). *)
+    (* Latency row: the asset's own INTERNAL (in-process) and EXTERNAL (venue) windows,
+       keyed per-symbol in the snapshot's [latencies]. Shows the p99 of the headline
+       metrics with the same warn/crit coloring as the ENGINE LATENCY table
+       ([latencies.ml]). *)
     let latency_row =
       let lat_metrics =
         Option.value ~default:[] (List.assoc_opt a.symbol snapshot.latencies)

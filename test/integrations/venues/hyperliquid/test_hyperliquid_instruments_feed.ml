@@ -132,6 +132,55 @@ let test_round_price_for_symbol () =
   Alcotest.(check (float 0.000001)) "negative" (-5.0) neg
 ;;
 
+let test_deployer_fee_scaling () =
+  (* Builder-dex fees are per asset: [deployerFeeScale] adds the deployer's cut on top of
+     the protocol rate (or multiplies both above 1), and growth mode cuts the protocol
+     part by 90%. A rebate is only split between the two, never scaled. *)
+  let asset name scale ~growth =
+    `Assoc
+      ([ "name", `String name
+       ; "szDecimals", `Int 2
+       ; "maxLeverage", `Int 10
+       ; "deployerFeeScale", `String scale
+       ]
+       @ if growth then [ "growthMode", `String "enabled" ] else [])
+  in
+  Hyperliquid.Instruments_feed.process_builder_dex_meta
+    ~dex_index:2
+    ~dex_name:"tstfee"
+    (`Assoc
+      [ ( "universe"
+        , `List
+            [ asset "GROWTH" "1.0" ~growth:true
+            ; asset "FULL" "1.0" ~growth:false
+            ; asset "CHEAP" "0.1111" ~growth:false
+            ; asset "RICH" "3.0" ~growth:false
+            ] )
+      ]);
+  let fee name rate =
+    Hyperliquid.Instruments_feed.apply_deployer_fee ~symbol:("tstfee:" ^ name) rate
+  in
+  Alcotest.(check (float 0.0000001)) "growth mode pays 0.2x" 0.0001 (fee "GROWTH" 0.0005);
+  Alcotest.(check (float 0.0000001)) "scale 1 charges 2x" 0.001 (fee "FULL" 0.0005);
+  Alcotest.(check (float 0.0000001))
+    "sub-1 scale charges 1 + scale"
+    (0.0005 *. 1.1111)
+    (fee "CHEAP" 0.0005);
+  Alcotest.(check (float 0.0000001)) "scale 3 charges 6x" 0.003 (fee "RICH" 0.0005);
+  Alcotest.(check (float 0.0000001))
+    "a rebate is split, not scaled"
+    (-0.0002)
+    (fee "RICH" (-0.0002));
+  Alcotest.(check (float 0.0000001))
+    "growth mode also cuts rebates"
+    (-0.00002)
+    (fee "GROWTH" (-0.0002));
+  Alcotest.(check (float 0.0000001))
+    "main dex passes through"
+    0.0005
+    (Hyperliquid.Instruments_feed.apply_deployer_fee ~symbol:"BTC" 0.0005)
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Instruments Feed"
@@ -146,6 +195,7 @@ let () =
         ; Alcotest.test_case "lookup_info" `Quick test_lookup_info
         ; Alcotest.test_case "get_qty_increment" `Quick test_get_qty_increment
         ; Alcotest.test_case "get_price_increment" `Quick test_get_price_increment
+        ; Alcotest.test_case "deployer fee scaling" `Quick test_deployer_fee_scaling
         ] )
     ]
 ;;

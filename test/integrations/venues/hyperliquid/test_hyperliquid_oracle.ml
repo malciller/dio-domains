@@ -201,6 +201,32 @@ let test_venue_contract () =
     has_contract
 ;;
 
+let test_default_fees_apply_builder_scale () =
+  (* The oracle's fallback rate is what a failed live fetch settles on, so it must carry
+     the same builder-dex adjustment as a fetched rate. *)
+  Hyperliquid.Instruments_feed.process_builder_dex_meta
+    ~dex_index:3
+    ~dex_name:"tsto"
+    (`Assoc
+      [ ( "universe"
+        , `List
+            [ `Assoc
+                [ "name", `String "GROWTH"
+                ; "szDecimals", `Int 2
+                ; "maxLeverage", `Int 10
+                ; "deployerFeeScale", `String "1.0"
+                ; "growthMode", `String "enabled"
+                ]
+            ] )
+      ]);
+  let maker, taker = Hyperliquid.Hyperliquid_oracle.default_fees ~symbol:"tsto:GROWTH" in
+  Alcotest.(check (float 0.0000001)) "growth maker is 0.2x" 0.00004 maker;
+  Alcotest.(check (float 0.0000001)) "growth taker is 0.2x" 0.0001 taker;
+  let maker, taker = Hyperliquid.Hyperliquid_oracle.default_fees ~symbol:"HYPE" in
+  Alcotest.(check (float 0.0000001)) "main dex maker unchanged" 0.0002 maker;
+  Alcotest.(check (float 0.0000001)) "main dex taker unchanged" 0.0005 taker
+;;
+
 let () =
   Alcotest.run
     "hyperliquid_oracle"
@@ -232,6 +258,12 @@ let () =
             "min_notional / default_quote / live_balances"
             `Quick
             test_venue_contract
+        ] )
+    ; ( "fees"
+      , [ Alcotest.test_case
+            "default fees carry the builder-dex scale"
+            `Quick
+            test_default_fees_apply_builder_scale
         ] )
     ]
 ;;

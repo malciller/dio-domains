@@ -43,11 +43,10 @@ let ghost_buy_evict_ttl_s = 86_400.0
     would read as an "increase" and wedge an outstanding sell hold. *)
 let balance_delta_epsilon = 1e-9
 
-(** Max base-balance snapshot age for the excess sweep to run. The sweep sizes against the
-    venue's [qty_available]; while a poll is hung (REST timeout) or the venue is still
-    reconstructing an amend's hold, that figure is stale-HIGH and the sweep ratchets the
-    top rung past [reserved_base]. A hung poll ages the snapshot past this bound and the
-    sweep waits it out. *)
+(** Max base-balance snapshot age for a fresh balance verdict. Sizing reads the venue's
+    [qty_available]; while a poll is hung (REST timeout) or the venue is still
+    reconstructing an amend's hold, that figure is stale-HIGH. A hung poll ages the
+    snapshot past this bound and the balance-dependent paths wait it out. *)
 let sweep_max_balance_age_s = 10.0
 
 (** Sell-hold overlays, parameterized over the hold list and the last balance delta so

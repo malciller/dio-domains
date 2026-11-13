@@ -1,8 +1,9 @@
 (* Strategy decision procedures (strategy-agnostic).
 
    Owed-sell pricing and the buy leg (fact computation, excess cancel, initial placement,
-   trailing amend, excess sweep). Extracted from jacobs_ladder_execution; the grid and the
-   config interpreter both call these. Policy here is to be ported into the strategy file. *)
+   trailing amend), plus the sell leg's place/restore phases. Extracted from
+   jacobs_ladder_execution; the grid and the config interpreter both call these. Policy
+   here is to be ported into the strategy file. *)
 
 open Strategy_common
 open Strategy_state
@@ -98,7 +99,7 @@ let buy_cancel_excess
      racing the amend (the amend then fails "order not found") and leaving buy tracking
      pointed at a dead order. Track what we actually cancelled so tracking is only cleared
      for orders that really left the book. *)
-  (* Backstop for the same race: keep the old/replacement pair out of the excess sweep
+  (* Backstop for the same race: keep the old/replacement pair out of the rung reconcile
      while the tracked buy is inside its amend cooldown, even if the registry mapping
      lags. *)
   let tracked_recently_amended =
@@ -861,95 +862,6 @@ let evaluate_buy_leg
     false)
 ;;
 
-(** Alpaca excess-inventory sweep.
-
-    The persisted sell-level file is the ladder of record: missing rungs are restored at
-    their recorded price/qty first. Only once the ladder is complete (caller gates on no
-    missing rungs, no owed sell, nothing in flight) is the remaining sellable base excess.
-    Rather than leaving it idle or dumping the whole balance into one order, the excess
-    routes to the top of the ladder: the highest-priced rung absorbs it, so surplus is
-    offered only at the best price.
-
-    [reserved_base] is never part of the sweep: [available] already excludes it (the
-    caller passes the min of the venue free figure and the local ledger headroom
-    [position_total - reserved_base - committed_sell_base]).
-
-    The top rung is amended to a larger quantity (qty-only at the same price, so its fill
-    anchor is unchanged). The amend's delta is armed into the un-netted-hold overlay so a
-    stale venue snapshot cannot authorize the next sweep against base the venue has not
-    yet netted. *)
-let evaluate_excess_sweep
-  ~state
-  ~now
-  ~(asset : trading_config)
-  ~(available : float)
-  ~(min_notional : float)
-  ~(ecfg : exchange_config)
-  =
-  match state.persisted_sell_levels with
-  | (top_price, _) :: _ when top_price > 0.0 ->
-    let min_order_size =
-      if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
-    in
-    (* The whole sellable excess routes to the top rung in one amend. There is
-       deliberately no per-invocation lot cap: [available] is already the
-       reserve-excluded, ledger-headroom-capped sellable base (see the caller), so the
-       rung it grows to can never include [reserved_base], and routing it in one pass
-       avoids the slow per-cycle ratchet that concentrated the book over many executions. *)
-    let excess = Float.max 0.0 available in
-    if excess >= min_order_size -. 1e-9
-    then (
-      let top_open =
-        Sell_orders.find_first state.open_sell_orders (fun oid p _q ->
-          (not (String.starts_with ~prefix:"pending" oid))
-          && (abs_float (p -. top_price) <= top_price *. 0.0001
-              || abs_float (p -. top_price) <= 1e-4))
-      in
-      match top_open with
-      | None -> ()
-      | Some (oid, top_open_price, top_open_qty) ->
-        let target_q = round_qty (top_open_qty +. excess) asset.symbol asset.exchange in
-        let delta = target_q -. top_open_qty in
-        if delta > 1e-9
-           && delta >= min_order_size -. 1e-9
-           && (min_notional <= 0.0 || delta *. top_open_price >= min_notional -. 1e-9)
-           && (not (InFlightAmendments.is_in_flight oid))
-           && (not (Hashtbl.mem state.amend_cooldowns oid))
-           && not (has_active_sell state)
-        then (
-          let order =
-            create_amend_order
-              oid
-              asset.symbol
-              Sell
-              target_q
-              (Some top_open_price)
-              true
-              Ladder
-              asset.exchange
-          in
-          let pushed = push_order ~now ~state order in
-          if pushed && ecfg.use_unnetted_sell_hold && delta > 0.0
-          then arm_sell_hold ~state ~qty:delta ~now;
-          (* A real qty increase is a meaningful execution event; a rounding-dust sweep
-             that leaves the top rung unchanged is internal churn and belongs at DEBUG,
-             not in the INFO stream. When the flow layer is on, [push_order] already
-             emitted the AMEND block for this sweep. *)
-          if Flow_log.enabled ()
-          then ()
-          else
-            (if delta > 1e-9 then Logging.info_f else Logging.debug_f)
-              ~section
-              "Excess inventory sweep for %s: amended top rung @ %.4f %.8f -> %.8f \
-               (+%.8f excess)"
-              asset.symbol
-              top_open_price
-              top_open_qty
-              target_q
-              delta))
-  | _ -> ()
-;;
-
 (** Derived sell-leg state shared between the prepare/place/finalize phases.
     ([evaluate_sell_leg] below recombines the three phases, so the reference entry point
     is unchanged. The trigger/latch/sizing contract is documented on its sub-phases.) *)
@@ -964,20 +876,19 @@ type sell_pre =
   ; mutable sp_committed_total : float
   ; mutable sp_unnetted_hold : float
   ; mutable sp_unreflected_credit : float
-  ; mutable sp_reserve_headroom : float
   ; mutable sp_reservation_headroom : float
   ; mutable sp_inventory_basis : float
   ; mutable sp_inventory_ok : bool
   ; mutable sp_min_notional : float
   ; mutable sp_base_ref_price : float
   ; mutable sp_capital_exhausted : bool
-  ; mutable sp_halt_inventory_check : bool
   ; mutable sp_asset_low_residual_ok : bool
   ; mutable sp_should_trigger_sell : bool
   ; mutable sp_is_sell_on_cooldown : bool
   ; mutable sp_missing_after_reconcile : (float * float) list ref
   ; mutable sp_sell_pushed : bool ref
   ; mutable sp_nothing_placeable : bool ref
+  ; mutable sp_sell_owed : bool
   }
 
 (** Sell leg phase 1: derived sizing/gate facts and the persisted-level reconcile. *)
@@ -993,20 +904,19 @@ let fresh_sell_pre () =
   ; sp_committed_total = 0.0
   ; sp_unnetted_hold = 0.0
   ; sp_unreflected_credit = 0.0
-  ; sp_reserve_headroom = 0.0
   ; sp_reservation_headroom = 0.0
   ; sp_inventory_basis = 0.0
   ; sp_inventory_ok = false
   ; sp_min_notional = 0.0
   ; sp_base_ref_price = 0.0
   ; sp_capital_exhausted = false
-  ; sp_halt_inventory_check = false
   ; sp_asset_low_residual_ok = false
   ; sp_should_trigger_sell = false
   ; sp_is_sell_on_cooldown = false
   ; sp_missing_after_reconcile = ref []
   ; sp_sell_pushed = ref false
   ; sp_nothing_placeable = ref false
+  ; sp_sell_owed = false
   }
 ;;
 
@@ -1143,8 +1053,12 @@ let sell_leg_prepare_into
       let rem_avail = ref available_for_missing_sells in
       let kept_missing = ref [] in
       let pruned = ref [] in
+      (* Top-down, as the file records the ladder: the highest rung is re-placed first, and
+         once the sellable inventory is spent every rung below it is removed. A level left
+         recorded without base behind it is re-tried forever and reports inventory the
+         account does not hold. *)
       List.iter
-        (fun ((target_p, target_q) as level) ->
+        (fun ((_target_p, target_q) as level) ->
           let min_order_size =
             if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
           in
@@ -1154,18 +1068,6 @@ let sell_leg_prepare_into
           then (
             kept_missing := level :: !kept_missing;
             rem_avail := max 0.0 (!rem_avail -. target_q))
-          else if (* Under-funded but still fundable: re-place the rung for the available
-                     remainder instead of pruning it. Headroom is the local ledger's
-                     [position - reserved_base - committed], so an offline FILL (base
-                     actually gone) leaves ~no headroom and still prunes, while a
-                     cancelled or partially-filled rung restores the remaining sellable
-                     base - including when the only shortfall was [reserved_base]. *)
-                  is_alpaca
-                  && target_q >= min_order_size -. 1e-9
-                  && !rem_avail >= min_order_size -. 1e-9
-          then (
-            kept_missing := (target_p, !rem_avail) :: !kept_missing;
-            rem_avail := 0.0)
           else pruned := level :: !pruned)
         missing_desc;
       let new_persisted = open_levels @ List.rev !kept_missing in
@@ -1186,12 +1088,11 @@ let sell_leg_prepare_into
       (fun (p, q) ->
         Logging.info_f
           ~section
-          "Reconciled offline sell fill for %s @ %.4f (qty %.8f) - balance consumed \
-           while offline"
+          "Pruned un-fundable ladder rung for %s @ %.4f (qty %.8f): the account no \
+           longer holds base for it (cancelled rung, or sold before the restore)"
           asset.symbol
           p
-          q;
-        state.last_sell_fill_price <- Some p)
+          q)
       !pruned_missing);
   Strategy_state.sub_stop state Strategy_state.Splan_reconcile _sp_rec;
   (* Balance basis per venue: [locked_in_sells] (the in-flight sell ledger total) is
@@ -1296,12 +1197,26 @@ let sell_leg_prepare_into
      non-reserved base, so it can never dip into reserved_base. *)
   let capital_exhausted = oracle_halted || state.capital_low in
   let halt_inventory_check = capital_exhausted && inventory_ok in
+  (* Whether a fresh buy fill / placement still owes its own ladder rung. Captured here,
+     before [sell_leg_finalize_latch] consumes [just_filled_buy], so the restore branch
+     cannot take over the fill's rung in the same cycle. *)
+  let sell_owed =
+    state.just_filled_buy
+    || buy_attempted
+    || state.resuming_after_balance_flag
+    || halt_inventory_check
+    || (Sell_orders.is_empty state.open_sell_orders
+        && Option.is_some state.last_buy_fill_price)
+  in
+  (* A rejected sell placement leaves its base free at the venue for the cooldown window
+     (and latches [asset_low] when the venue says the base is not available). That base is
+     still owed its rung: the sell leg retries it once the cooldown clears. *)
+  let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Sell" in
   let should_trigger_sell =
     if ecfg.remaintain_expired_sells
     then missing_alpaca_sell_grid || halt_inventory_check
     else state.just_filled_buy || buy_attempted || halt_inventory_check
   in
-  let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Sell" in
   (* Surface every path that ends a triggered sell leg without placing, so sell placement
      cannot stay silently wedged (dust persisted levels, wiped position snapshots) while
      buys keep flowing.
@@ -1342,20 +1257,19 @@ let sell_leg_prepare_into
   pre.sp_committed_total <- committed_total;
   pre.sp_unnetted_hold <- unnetted_hold;
   pre.sp_unreflected_credit <- unreflected_credit;
-  pre.sp_reserve_headroom <- reserve_headroom;
   pre.sp_reservation_headroom <- reservation_headroom;
   pre.sp_inventory_basis <- inventory_basis;
   pre.sp_inventory_ok <- inventory_ok;
   pre.sp_min_notional <- min_notional;
   pre.sp_base_ref_price <- base_ref_price;
   pre.sp_capital_exhausted <- capital_exhausted;
-  pre.sp_halt_inventory_check <- halt_inventory_check;
   pre.sp_asset_low_residual_ok <- asset_low_residual_ok;
   pre.sp_should_trigger_sell <- should_trigger_sell;
   pre.sp_is_sell_on_cooldown <- is_sell_on_cooldown;
   pre.sp_missing_after_reconcile <- missing_after_reconcile;
   pre.sp_sell_pushed <- sell_pushed;
-  pre.sp_nothing_placeable <- nothing_placeable
+  pre.sp_nothing_placeable <- nothing_placeable;
+  pre.sp_sell_owed <- sell_owed
 ;;
 
 let sell_leg_prepare
@@ -1401,16 +1315,10 @@ let sell_place_should ~state ~asset_balance ~pre =
   && not pre.sp_is_sell_on_cooldown
 ;;
 
-(** Branch: place the owed or restored sell. *)
-let sell_place_body
-  ~buy_attempted
-  ~state
-  ~now
-  ~(asset : trading_config)
-  ~bid_price
-  ~ask_price
-  ~ecfg
-  ~pre
+(** Branch: place the owed or restored sell. The owed/restore choice is decided in
+    [sell_leg_prepare_into] ([pre.sp_sell_owed]) so a fresh fill's rung always wins over a
+    restore in the same cycle. *)
+let sell_place_body ~state ~now ~(asset : trading_config) ~bid_price ~ask_price ~ecfg ~pre
   =
   let is_alpaca = pre.sp_is_alpaca in
   (* The grid's own instrument class, printed on every placement so a spot rung can never
@@ -1423,7 +1331,6 @@ let sell_place_body
   let unnetted_hold = pre.sp_unnetted_hold in
   let unreflected_credit = pre.sp_unreflected_credit in
   let capital_exhausted = pre.sp_capital_exhausted in
-  let halt_inventory_check = pre.sp_halt_inventory_check in
   let missing_after_reconcile = pre.sp_missing_after_reconcile in
   let sell_pushed = pre.sp_sell_pushed in
   let nothing_placeable = pre.sp_nothing_placeable in
@@ -1441,19 +1348,13 @@ let sell_place_body
      fallback) is strategy-sized on every venue: price anchored on the last buy fill +
      grid interval, qty 1:1 with the fill, clamped to sellable inventory. The persisted
      level file never dictates the price or sizing of a new sell. Its only role is
-     restoration: re-placing a rung the venue dropped (Alpaca fractional orders are forced
-     to day TIF, so resting rungs die at the session boundary) at its recorded price/qty.
-     Restoration is selected only when no new sell is owed, so the two obligations cannot
-     hijack each other; a restoration level below the venue's real minimum is pruned at
-     the venue-minimum gate below instead of wedging the maintenance path. *)
-  let new_sell_owed =
-    state.just_filled_buy
-    || buy_attempted
-    || state.resuming_after_balance_flag
-    || halt_inventory_check
-    || (Sell_orders.is_empty state.open_sell_orders
-        && Option.is_some state.last_buy_fill_price)
-  in
+     restoration: re-placing a rung the venue dropped (Alpaca fractional orders are [day]
+     during regular hours, and its fractional GTC is cancelled at 8 PM ET, so resting
+     rungs still die at a session boundary) at its recorded price/qty. Restoration is
+     selected only when no new sell is owed, so the two obligations cannot hijack each
+     other; a restoration level below the venue's real minimum is pruned at the
+     venue-minimum gate below instead of wedging the maintenance path. *)
+  let new_sell_owed = pre.sp_sell_owed in
   let target_sell_price_opt, target_sell_qty_override =
     if ecfg.remaintain_expired_sells
        && (not new_sell_owed)
@@ -1464,10 +1365,9 @@ let sell_place_body
       in
       match missing_sorted_desc with
       | (tp, tq) :: _ when tq > 0.0 ->
-        (* A missing rung is restored at its OWN recorded price/qty. Excess inventory is
-           never folded into a restore: it is swept to the top of the ladder only once
-           every rung is back (see [evaluate_excess_sweep]), so a restore can never
-           resurrect a dust level or balloon a rung into the whole balance. *)
+        (* A missing rung is restored at its OWN recorded price/qty, one per cycle. A
+           restore never absorbs other base, so it cannot resurrect a dust level or
+           balloon a rung into the whole balance. *)
         Some tp, Some tq
       | _ -> None, None)
     else None, None
@@ -1829,12 +1729,12 @@ let sell_leg_place
   ~bid_price
   ~ask_price
   ~asset_balance
-  ~buy_attempted
+  ~buy_attempted:_
   ~ecfg
   ~pre
   =
   if sell_place_should ~state ~asset_balance ~pre
-  then sell_place_body ~state ~now ~asset ~bid_price ~ask_price ~buy_attempted ~ecfg ~pre
+  then sell_place_body ~state ~now ~asset ~bid_price ~ask_price ~ecfg ~pre
 ;;
 
 (** Sell finalize phase 1: retry-latch / nothing-to-sell bookkeeping. *)
@@ -1875,26 +1775,10 @@ let sell_leg_finalize_latch
       base_ref_price)
 ;;
 
-(** Sell finalize phase 2: Alpaca excess-inventory sweep onto the top rung. The file gates
-    when this runs; this only performs the sweep. *)
-let sell_excess_sweep_phase ~state ~now ~(asset : trading_config) ~pre ~ecfg =
-  let is_alpaca = pre.sp_is_alpaca in
-  let min_notional = pre.sp_min_notional in
-  let available_base = pre.sp_available_base in
-  let reserve_headroom = pre.sp_reserve_headroom in
-  let sweep_available =
-    let venue = Float.max 0.0 available_base in
-    if is_alpaca
-    then Float.min venue reserve_headroom
-    else Float.min venue pre.sp_reservation_headroom
-  in
-  evaluate_excess_sweep ~state ~now ~asset ~available:sweep_available ~min_notional ~ecfg
-;;
-
 (** Sell finalize phase 3: clear the one-cycle resume marker. *)
 let sell_finalize_end ~state = state.resuming_after_balance_flag <- false
 
-(** Sell finalize: retry-latch bookkeeping, excess sweep, resume-marker clear. Reference
+(** Sell finalize: retry-latch bookkeeping and resume-marker clear. Reference
     recombination. *)
 let sell_leg_finalize
   ~state
@@ -1903,25 +1787,10 @@ let sell_leg_finalize
   ~asset_balance
   ~buy_attempted
   ~ecfg
-  ~base_balance_age
+  ~base_balance_age:_
   ~pre
   =
   sell_leg_finalize_latch ~state ~now ~asset ~asset_balance ~buy_attempted ~ecfg ~pre;
-  let missing_after_reconcile = pre.sp_missing_after_reconcile in
-  let sell_pushed = pre.sp_sell_pushed in
-  if ecfg.remaintain_expired_sells
-     && !missing_after_reconcile = []
-     && (not state.just_filled_buy)
-     && (not state.resuming_after_balance_flag)
-     && (not buy_attempted)
-     && (not !sell_pushed)
-     && (not (has_active_sell state))
-     && (not (Float.is_nan asset_balance))
-     &&
-     match base_balance_age with
-     | Some age -> age <= sweep_max_balance_age_s
-     | None -> true
-  then sell_excess_sweep_phase ~state ~now ~asset ~pre ~ecfg;
   sell_finalize_end ~state
 ;;
 

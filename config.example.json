@@ -52,7 +52,7 @@
         },
         "alpaca": {
           "name": "jacobs_ladder",
-          "sell_mult": "0.999",
+          "sell_mult": "0.99",
           "accumulation_buffer": [0.1, 0.5],
           "testnet": true,
           "sell_levels": true,

@@ -5587,64 +5587,6 @@ let test_alpaca_excess_refills_before_dumping () =
   | None -> failwith "expected the missing top rung to be restored"
 ;;
 
-let test_alpaca_excess_amends_open_top_rung () =
-  (* Ladder fully resting [101 x1; 99 x1] (2.0 committed) with 1.0 more sellable. The
-     sweep amends the top order to 2.0 (+1.0), leaving the lower rung alone, rather than
-     placing a separate sell. *)
-  let symbol = "ALPACA_EXCESS_AMEND/USD" in
-  let state = reset_alpaca_excess_state symbol in
-  state.persisted_sell_levels <- [ 101.0, 1.0; 99.0, 1.0 ];
-  state.open_sell_orders
-  <- Sell_orders.of_list [ "top-oid", 101.0, 1.0; "low-oid", 99.0, 1.0 ];
-  let asset = alpaca_excess_asset ~symbol in
-  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
-  Dio_strategies.Strategy_api.evaluate_sell_leg
-    ~persisted_reconcile:
-      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
-    ~state
-    ~now:100.0
-    ~asset
-    ~bid_price:100.0
-    ~ask_price:100.1
-    ~asset_balance:3.0
-    ~buy_attempted:false
-    ~ecfg
-    ~locked_in_sells:2.0
-    ~base_balance_age:None
-    ~oracle_halted:false;
-  let amends =
-    List.filter
-      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
-        o.operation = Dio_strategies.Strategy_common.Amend
-        && o.side = Dio_strategies.Strategy_common.Sell
-        && o.symbol = symbol)
-      (Dio_strategies.Strategy_api.get_pending_orders 100)
-  in
-  match amends with
-  | [ o ] ->
-    check
-      (option string)
-      "excess amend targets the top rung's order id"
-      (Some "top-oid")
-      o.order_id;
-    check
-      (float 0.005)
-      "excess amend keeps the top rung price"
-      101.0
-      (Option.value o.price ~default:0.0);
-    check (float 1e-6) "excess amend grows the top rung by the excess" 2.0 o.qty;
-    check
-      bool
-      "excess amend stays pending (covers the rung until the venue answers)"
-      true
-      (List.exists
-         (fun (id, side, p, _ts) ->
-           String.starts_with ~prefix:"pending_amend_" id
-           && side = Dio_strategies.Strategy_common.Sell
-           && abs_float (p -. 101.0) < 1e-6)
-         state.pending_orders)
-  | _ -> failwith "expected exactly one sell amend on the top rung"
-;;
 
 let test_alpaca_inflight_amend_rung_not_restored () =
   (* Regression: an Alpaca fractional amend is cancel+replace. The old order leaves the
@@ -5717,41 +5659,6 @@ let test_alpaca_inflight_amend_rung_not_restored () =
   | None -> failwith "expected the dropped rung to be restored once the amend resolved"
 ;;
 
-let test_alpaca_excess_excludes_reserved_base () =
-  (* reserved_base is not sellable: balance 3.0 with 2.0 reserved and 1.0 committed to the
-     resting top rung leaves no excess, so the top rung is not amended. A reserved_base
-     leak would grow it by 1.0. *)
-  let symbol = "ALPACA_EXCESS_RESERVED/USD" in
-  let state = reset_alpaca_excess_state symbol in
-  state.reserved_base <- 2.0;
-  state.persisted_sell_levels <- [ 101.0, 1.0 ];
-  state.open_sell_orders <- Sell_orders.of_list [ "top-oid", 101.0, 1.0 ];
-  let asset = alpaca_excess_asset ~symbol in
-  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
-  Dio_strategies.Strategy_api.evaluate_sell_leg
-    ~persisted_reconcile:
-      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
-    ~state
-    ~now:100.0
-    ~asset
-    ~bid_price:100.0
-    ~ask_price:100.1
-    ~asset_balance:3.0
-    ~buy_attempted:false
-    ~ecfg
-    ~locked_in_sells:1.0
-    ~base_balance_age:None
-    ~oracle_halted:false;
-  let amends =
-    List.filter
-      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
-        o.operation = Dio_strategies.Strategy_common.Amend
-        && o.side = Dio_strategies.Strategy_common.Sell
-        && o.symbol = symbol)
-      (Dio_strategies.Strategy_api.get_pending_orders 100)
-  in
-  check bool "reserved_base is excluded from the excess (no amend)" true (amends = [])
-;;
 
 let test_alpaca_venue_available_blocks_reserve_dip () =
   (* The venue's own free figure is authoritative. The account shows gross 3.0 but only
@@ -5791,16 +5698,18 @@ let test_alpaca_venue_available_blocks_reserve_dip () =
     (pushed_sell_for symbol = None)
 ;;
 
-let test_alpaca_excess_sweep_takes_full_excess () =
-  (* The sweep routes the WHOLE sellable excess onto the top rung in one amend (there is
-     deliberately no per-invocation lot cap). The allowance is bounded by the
-     reserve-excluded ledger headroom, so it can never include reserved_base. Ladder 101x1
-     resting (1.0 committed), asset 6.0, lot 1.0: the top rung ends at 6.0 (the entire
-     position), not 2.0. *)
-  let symbol = "ALPACA_SWEEP_FULL/USD" in
+
+let test_alpaca_restore_prunes_unfundable_rung () =
+  (* The file is the ladder of record, so a cancelled rung stays recorded and is re-placed
+     top-down at its recorded price/qty. When the account can no longer back it (here:
+     1.0 held, 0.1 of it reserved, so only 0.9 is sellable against a recorded 1.0) the rung
+     is REMOVED instead of being clamped to the remainder: an un-restable level left in the
+     file reports inventory that is not there and re-tries forever. *)
+  let symbol = "ALPACA_RESTORE_UNFUNDED/USD" in
   let state = reset_alpaca_excess_state symbol in
+  state.reserved_base <- 0.1;
   state.persisted_sell_levels <- [ 101.0, 1.0 ];
-  state.open_sell_orders <- Sell_orders.of_list [ "full-top-oid", 101.0, 1.0 ];
+  Sell_orders.clear state.open_sell_orders;
   let asset = alpaca_excess_asset ~symbol in
   let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
   Dio_strategies.Strategy_api.evaluate_sell_leg
@@ -5811,44 +5720,34 @@ let test_alpaca_excess_sweep_takes_full_excess () =
     ~asset
     ~bid_price:100.0
     ~ask_price:100.1
-    ~asset_balance:6.0
+    ~asset_balance:1.0
     ~buy_attempted:false
     ~ecfg
-    ~locked_in_sells:1.0
+    ~locked_in_sells:0.0
     ~base_balance_age:None
     ~oracle_halted:false;
-  let amends =
-    List.filter
-      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
-        o.operation = Dio_strategies.Strategy_common.Amend
-        && o.side = Dio_strategies.Strategy_common.Sell
-        && o.symbol = symbol)
-      (Dio_strategies.Strategy_api.get_pending_orders 100)
-  in
-  match amends with
-  | [ o ] ->
-    check
-      (float 1e-6)
-      "excess sweep routes the full sellable excess onto the top rung"
-      6.0
-      o.qty
-  | _ ->
-    failwith
-      (Printf.sprintf
-         "expected exactly one full-excess sell amend on the top rung, got %d"
-         (List.length amends))
+  check
+    bool
+    "an un-fundable rung is not re-placed for a partial qty"
+    true
+    (pushed_sell_for symbol = None);
+  check
+    bool
+    "the un-fundable rung is removed from the ladder of record"
+    true
+    (not
+       (List.exists
+          (fun (p, _) -> abs_float (p -. 101.0) < 1e-6)
+          state.persisted_sell_levels))
 ;;
 
-let test_alpaca_restore_excludes_reserved_base () =
-  (* A manually cancelled resting rung is restored - but for [target_q - reserved_base],
-     never re-committing the reserve. Account holds 1.0 with 0.1 reserved; the sole
-     persisted rung (1.0 @ 101) has no live order. The fundable headroom is
-     [position - reserved_base - committed] = 0.9, so the replacement places 0.9 and the
-     persisted rung is clamped to match. *)
-  let symbol = "ALPACA_RESTORE_RESERVED/USD" in
+let test_alpaca_restore_replaces_top_down_and_prunes_the_bottom () =
+  (* Cancelled rungs come back top-down at their recorded price/qty so the best profit is
+     locked in first. Here the account holds only enough for the TOP rung, so the bottom
+     one is dropped from the file - it was never placed. *)
+  let symbol = "ALPACA_RESTORE_TOPDOWN/USD" in
   let state = reset_alpaca_excess_state symbol in
-  state.reserved_base <- 0.1;
-  state.persisted_sell_levels <- [ 101.0, 1.0 ];
+  state.persisted_sell_levels <- [ 101.0, 1.0; 99.0, 1.0 ];
   Sell_orders.clear state.open_sell_orders;
   let asset = alpaca_excess_asset ~symbol in
   let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
@@ -5870,42 +5769,156 @@ let test_alpaca_restore_excludes_reserved_base () =
    | Some o ->
      check
        (float 0.005)
-       "cancelled rung restored at its recorded price"
+       "the highest-priced rung is replaced first"
        101.0
        (Option.value o.price ~default:0.0);
-     check
-       (float 1e-6)
-       "restored rung qty is the recorded qty minus reserved_base"
-       0.9
-       o.qty
-   | None -> failwith "expected the cancelled rung to be restored");
+     check (float 1e-6) "the replacement keeps its recorded qty" 1.0 o.qty
+   | None -> failwith "expected the top rung to be replaced");
   check
     bool
-    "persisted rung clamped to the reserve-excluded qty"
+    "the bottom rung that could not be backed is dropped from the file"
     true
-    (List.exists
-       (fun (p, q) -> p = 101.0 && abs_float (q -. 0.9) < 1e-6)
-       state.persisted_sell_levels)
+    (not
+       (List.exists
+          (fun (p, _) -> abs_float (p -. 99.0) < 1e-6)
+          state.persisted_sell_levels))
 ;;
 
-let test_alpaca_restore_partial_headroom_clamped () =
-  (* A cancelled rung larger than the free headroom is restored for what IS fundable, not
-     pruned. Account holds 1.0 with 0.1 reserved; the persisted rung is 2.0 @ 101.
-     Headroom is 0.9, so the shortfall (1.1) exceeds reserved_base - the old rule pruned
-     the rung here and stranded the base. The rung must be re-placed at 0.9. *)
-  let symbol = "ALPACA_RESTORE_PARTIAL/USD" in
-  let state = reset_alpaca_excess_state symbol in
-  state.reserved_base <- 0.1;
-  state.persisted_sell_levels <- [ 101.0, 2.0 ];
+(* Alpaca sells 1:1 ([sell_uses_mult] false), so the slice it wants to keep has to be
+   skimmed out of the buy fill - exactly like Hyperliquid and Kraken. Gating that skim on
+   [use_accumulation_sells] (false for Alpaca, because that flag describes the SELL basis)
+   meant Alpaca never accrued anything while [accumulated_profit] kept climbing past the
+   buffer. Fill: 0.08 @ 100, sell_mult 0.98 -> 0.0016 retained. *)
+let test_alpaca_buy_fill_skims_reserve () =
+  let symbol = "ALPACA_SKIM/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.grid_qty <- 0.08;
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "alpaca";
+  state.cached_sell_mult <- 0.98;
+  state.cached_qty_increment <- 0.000000001;
+  state.base_accumulation_enabled <- true;
+  state.accumulation_buffer <- 0.5;
+  state.reserved_base <- 0.0;
+  state.accumulated_profit <- 10.0;
+  state.position_base <- 0.0;
+  state.attributed_balance_increase <- 0.0;
+  state.buy_credits_since_balance <- [];
+  state.startup_replay <- false;
+  state.last_fill_oid <- None;
   Sell_orders.clear state.open_sell_orders;
-  let asset = alpaca_excess_asset ~symbol in
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done symbol;
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
+    ~now:100.0
+    symbol
+    "alpaca-skim-buy-1"
+    Dio_strategies.Strategy_common.Buy
+    ~fill_price:100.0
+    ~fill_qty:0.08
+    None;
+  check
+    bool
+    "alpaca buy fill accrues into reserved_base (was always zero before)"
+    true
+    (state.reserved_base > 0.0 && state.reserved_base < 0.08);
+  check
+    (float 1e-6)
+    "the skim is debited from accumulated_profit at the fill price"
+    10.0
+    (state.accumulated_profit +. (state.reserved_base *. 100.0));
+  check
+    bool
+    "the sellable reference excludes the skimmed slice"
+    true
+    (match state.last_buy_fill_qty with
+     | Some q -> abs_float (q +. state.reserved_base -. 0.08) < 1e-9
+     | None -> false);
+  (* Profit below the buffer keeps the lot intact: no reserve without coverage. *)
+  let symbol2 = "ALPACA_SKIM_UNDER/USD" in
+  let state2 = Dio_strategies.Strategy_api.get_strategy_state symbol2 in
+  state2.exchange_id <- "alpaca";
+  state2.grid_qty <- 0.08;
+  state2.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "alpaca";
+  state2.cached_sell_mult <- 0.98;
+  state2.cached_qty_increment <- 0.000000001;
+  state2.base_accumulation_enabled <- true;
+  state2.accumulation_buffer <- 5.0;
+  state2.reserved_base <- 0.0;
+  state2.accumulated_profit <- 0.01;
+  state2.position_base <- 0.0;
+  state2.startup_replay <- false;
+  state2.last_fill_oid <- None;
+  Sell_orders.clear state2.open_sell_orders;
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done symbol2;
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
+    ~now:100.0
+    symbol2
+    "alpaca-skim-buy-2"
+    Dio_strategies.Strategy_common.Buy
+    ~fill_price:100.0
+    ~fill_qty:0.08
+    None;
+  check (float 1e-9) "profit below the buffer does not skim" 0.0 state2.reserved_base
+;;
+
+(* The ladder of record must track reality in both directions:
+   - a filled rung LEAVES the file (it is gone venue-side), and
+   - a cancelled rung STAYS in the file (Alpaca fractional orders are day TIF, so the
+     venue kills them at the close), which is what lets the next cycle notice held spot
+     inventory with no order behind it and replace the rung top-down.
+   Both sides run through the real lifecycle handlers, not a shortcut. *)
+let test_alpaca_ladder_of_record_tracks_fills_and_cancels () =
   let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  (* Fill: the resting rung and its recorded level both go. *)
+  let filled_symbol = "ALPACA_LEVELS_FILL/USD" in
+  let filled = reset_alpaca_excess_state filled_symbol in
+  filled.persisted_sell_levels <- [ 101.0, 1.0 ];
+  filled.open_sell_orders <- Sell_orders.of_list [ "oid-101-" ^ filled_symbol, 101.0, 1.0 ];
+  filled.last_fill_oid <- None;
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done filled_symbol;
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
+    ~now:100.0
+    filled_symbol
+    ("oid-101-" ^ filled_symbol)
+    Dio_strategies.Strategy_common.Sell
+    ~fill_price:101.0
+    ~fill_qty:1.0
+    None;
+  check
+    bool
+    "a filled sell rung is removed from the ladder of record"
+    true
+    (filled.persisted_sell_levels = []);
+  check bool "the removal is marked for persistence" true filled.persistence_dirty;
+  check
+    bool
+    "the filled rung is no longer tracked as resting"
+    true
+    (Sell_orders.length filled.open_sell_orders = 0);
+  (* Cancel: the level survives, and the next cycle replaces that rung at its recorded
+     price/qty - the top-down restore, driven by held inventory with no order behind it. *)
+  let cancelled_symbol = "ALPACA_LEVELS_CANCEL/USD" in
+  let state = reset_alpaca_excess_state cancelled_symbol in
+  state.persisted_sell_levels <- [ 101.0, 1.0 ];
+  state.open_sell_orders <- Sell_orders.of_list [ "oid-101-" ^ cancelled_symbol, 101.0, 1.0 ];
+  Dio_strategies.Strategy_api.Strategy.handle_order_cancelled
+    ~now:100.0
+    cancelled_symbol
+    ("oid-101-" ^ cancelled_symbol)
+    Dio_strategies.Strategy_common.Sell
+    None;
+  check bool "the cancelled rung leaves the book" true (Sell_orders.length state.open_sell_orders = 0);
+  check
+    bool
+    "a cancelled (TIF-expired) rung stays in the ladder of record"
+    true
+    (state.persisted_sell_levels = [ 101.0, 1.0 ]);
   Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
       (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
     ~state
-    ~now:100.0
-    ~asset
+    ~now:101.0
+    ~asset:(alpaca_excess_asset ~symbol:cancelled_symbol)
     ~bid_price:100.0
     ~ask_price:100.1
     ~asset_balance:1.0
@@ -5914,61 +5927,22 @@ let test_alpaca_restore_partial_headroom_clamped () =
     ~locked_in_sells:0.0
     ~base_balance_age:None
     ~oracle_halted:false;
-  (match pushed_sell_for symbol with
+  (match pushed_sell_for cancelled_symbol with
    | Some o ->
      check
        (float 0.005)
-       "partially-fundable rung restored at its recorded price"
+       "the cancelled rung is replaced at its recorded price"
        101.0
        (Option.value o.price ~default:0.0);
-     check
-       (float 1e-6)
-       "partially-fundable rung restored for the available headroom"
-       0.9
-       o.qty
-   | None -> failwith "expected the partially-fundable rung to be restored");
+     check (float 1e-6) "and at its recorded qty" 1.0 o.qty
+   | None -> failwith "expected the cancelled rung to be replaced");
   check
     bool
-    "persisted rung clamped to headroom (not pruned)"
+    "the level stays recorded while it is back on the book"
     true
     (List.exists
-       (fun (p, q) -> p = 101.0 && abs_float (q -. 0.9) < 1e-6)
+       (fun (p, q) -> abs_float (p -. 101.0) < 1e-6 && abs_float (q -. 1.0) < 1e-6)
        state.persisted_sell_levels)
-;;
-
-let test_alpaca_sweep_skips_dust_delta () =
-  (* The sweep gates on the added DELTA's notional, not the whole rung's. A dust excess
-     (here 1e-6 shares, worth ~1e-4) must not spin an Alpaca cancel+replace amend every
-     cycle. *)
-  let symbol = "ALPACA_SWEEP_DUST/USD" in
-  let state = reset_alpaca_excess_state symbol in
-  state.persisted_sell_levels <- [ 101.0, 1.0 ];
-  state.open_sell_orders <- Sell_orders.of_list [ "dust-top-oid", 101.0, 1.0 ];
-  let asset = alpaca_excess_asset ~symbol in
-  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
-  Dio_strategies.Strategy_api.evaluate_sell_leg
-    ~persisted_reconcile:
-      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
-    ~state
-    ~now:100.0
-    ~asset
-    ~bid_price:100.0
-    ~ask_price:100.1
-    ~asset_balance:1.000001
-    ~buy_attempted:false
-    ~ecfg
-    ~locked_in_sells:1.0
-    ~base_balance_age:None
-    ~oracle_halted:false;
-  let amends =
-    List.filter
-      (fun (o : Dio_strategies.Strategy_common.strategy_order) ->
-        o.operation = Dio_strategies.Strategy_common.Amend
-        && o.side = Dio_strategies.Strategy_common.Sell
-        && o.symbol = symbol)
-      (Dio_strategies.Strategy_api.get_pending_orders 100)
-  in
-  check bool "dust excess does not spin a sweep amend" true (amends = [])
 ;;
 
 let test_alpaca_sell_anchors_on_fill_not_ask () =
@@ -9008,6 +8982,10 @@ let () =
             `Quick
             test_sub_minimum_qty_sell_places
         ; test_case
+            "alpaca ladder of record tracks fills and cancels"
+            `Quick
+            test_alpaca_ladder_of_record_tracks_fills_and_cancels
+        ; test_case
             "alpaca sell anchors on fill, not the ask"
             `Quick
             test_alpaca_sell_anchors_on_fill_not_ask
@@ -9016,37 +8994,25 @@ let () =
             `Quick
             test_alpaca_excess_refills_before_dumping
         ; test_case
-            "alpaca excess amends an open top rung"
-            `Quick
-            test_alpaca_excess_amends_open_top_rung
-        ; test_case
             "alpaca in-flight amend rung is not restored"
             `Quick
             test_alpaca_inflight_amend_rung_not_restored
-        ; test_case
-            "alpaca excess excludes reserved_base"
-            `Quick
-            test_alpaca_excess_excludes_reserved_base
         ; test_case
             "alpaca venue free == reserved_base offers nothing"
             `Quick
             test_alpaca_venue_available_blocks_reserve_dip
         ; test_case
-            "alpaca excess sweep routes the full excess"
+            "alpaca restore drops an un-fundable rung"
             `Quick
-            test_alpaca_excess_sweep_takes_full_excess
+            test_alpaca_restore_prunes_unfundable_rung
         ; test_case
-            "alpaca restore excludes reserved_base"
+            "alpaca restore replaces top-down and prunes the bottom"
             `Quick
-            test_alpaca_restore_excludes_reserved_base
+            test_alpaca_restore_replaces_top_down_and_prunes_the_bottom
         ; test_case
-            "alpaca restore clamps a partially-fundable rung"
+            "alpaca buy fill skims into reserved_base"
             `Quick
-            test_alpaca_restore_partial_headroom_clamped
-        ; test_case
-            "alpaca sweep skips a dust delta"
-            `Quick
-            test_alpaca_sweep_skips_dust_delta
+            test_alpaca_buy_fill_skims_reserve
         ; test_case
             "new buy respects the 2x gi closest-sell cap"
             `Quick

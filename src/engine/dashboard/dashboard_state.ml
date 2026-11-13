@@ -416,7 +416,7 @@ let merge_oracle_asset_latencies latencies =
   Hashtbl.fold (fun _ (orig, json) acc -> (orig, json) :: acc) by_symbol []
 ;;
 
-(** Network windows for [venue] under the NETWORK-page labels, or [] when the venue has
+(** Network windows for [venue] under the EXTERNAL-page labels, or [] when the venue has
     not published a window yet. *)
 let network_entries venue =
   Network_latency.snapshots venue
@@ -440,10 +440,10 @@ let domain_latency_key (tc : Dio_engine.Config.trading_config) =
 ;;
 
 (** Merge the per-venue network latency windows into the per-domain latency map under the
-    NETWORK-page labels (ws_ping / ws_feed / rest_request / signer), so ENGINE LATENCY
+    EXTERNAL-page labels (ws_ping / ws_feed / rest_request / signer), so ENGINE LATENCY
     rows show the network characteristics of the venue each one trades: a grid row under
     its symbol, a perp or overlay row under its "<venue>:<instrument>" key. Venues with no
-    network measurement are absent; the NETWORK page renders "--".
+    network measurement are absent; the EXTERNAL page renders "--".
 
     A venue reached only through an overlay leg (a Lighter long funded by a spot grid on
     another venue) belongs to no domain row, so it gets a row keyed by the venue name. *)

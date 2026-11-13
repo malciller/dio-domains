@@ -137,14 +137,6 @@ when book.updates:
       sell.finalize.latch
       sell.finalize.facts
 
-  sell.excess.sweep:
-    if cycle.ok and $platform.remaintain.expired.sells and
-       $platform.sell.missing.empty and not $platform.just.filled.buy and
-       not $platform.resuming.after.balance and not $platform.buy.attempted and
-       not $platform.sell.pushed and not $platform.has.active.sell and
-       not $platform.asset.balance.nan and $platform.balance.fresh:
-      sell.excess.sweep.phase
-
   sell.finalize.end:
     if cycle.ok:
       sell.finalize.end

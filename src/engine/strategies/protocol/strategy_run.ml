@@ -85,7 +85,6 @@ let run_engine_phase ctx rt id =
     | "sell_finalize" -> E.sell_finalize ctx
     | "sell_finalize_facts" -> E.sell_finalize_facts ctx rt
     | "sell_finalize_latch" -> E.sell_finalize_latch ctx
-    | "sell_excess_sweep_phase" -> E.sell_excess_sweep_phase ctx
     | "sell_finalize_end" -> E.sell_finalize_end ctx
     | _ -> ())
 ;;

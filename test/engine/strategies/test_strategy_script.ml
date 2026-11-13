@@ -47,9 +47,9 @@ when book.updates:
       place.buy(qty: $params.qty.dec, price: $local.buy.px,
                 post_only: true, dedup_key: "buy:initial")
 
-  sweep:
+  restore:
     if cycle.ok and capacity(quote.gte: $price * $params.qty.f):
-      sell.excess.sweep.phase
+      sell.place.body
 |}
 ;;
 
@@ -307,7 +307,6 @@ let expected_jl_ids =
   ; "sell_place_should"
   ; "sell_place"
   ; "sell_finalize_latch"
-  ; "sell_excess_sweep"
   ; "sell_finalize_end"
   ]
 ;;

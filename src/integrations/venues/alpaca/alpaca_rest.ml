@@ -143,9 +143,13 @@ let parse_order_json json =
 (** Effective time-in-force and extended-hours eligibility. Returns
     [(tif_str, mark_extended)].
 
-    Fractional equity orders are forced to [day] (Alpaca constraint); others keep the
-    requested TIF, defaulting to [gtc]. A [gtc] limit order in an extended session
-    requires GTC-for-extended enablement, else the venue rejects.
+    Fractional equities: the venue accepts [gtc] only on an order flagged [extended_hours]
+    ("fractional gtc orders without extended_hours / overnight enabled are not currently
+    supported"), so fractional orders keep [gtc] when they are extended-eligible and fall
+    back to [day] everywhere else - which includes every fractional order during regular
+    hours, since [extended_hours] is only attached in an extended session. Fractional
+    [ioc]/[fok] are [day] regardless. GTC on the account must also be enabled by Alpaca.
+    Whole-share orders keep the requested TIF, defaulting to [gtc].
 
     [mark_extended] attaches [extended_hours] for non-crypto limit orders when extended
     trading is configured and the session is extended. Crypto never eligible. *)
@@ -165,16 +169,18 @@ let effective_tif_and_extended
   let mark_extended =
     (not is_crypto) && use_extended && in_extended_session && type_str = "limit"
   in
+  let requested_tif =
+    match time_in_force with
+    | Some "GTC" | Some "gtc" -> "gtc"
+    | Some "IOC" | Some "ioc" -> "ioc"
+    | Some "FOK" | Some "fok" -> "fok"
+    | Some "DAY" | Some "day" -> "day"
+    | _ -> "gtc"
+  in
   let tif_str =
     if is_fractional && not is_crypto
-    then "day"
-    else (
-      match time_in_force with
-      | Some "GTC" | Some "gtc" -> "gtc"
-      | Some "IOC" | Some "ioc" -> "ioc"
-      | Some "FOK" | Some "fok" -> "fok"
-      | Some "DAY" | Some "day" -> "day"
-      | _ -> "gtc")
+    then if mark_extended && String.equal requested_tif "gtc" then "gtc" else "day"
+    else requested_tif
   in
   tif_str, mark_extended
 ;;
@@ -275,8 +281,9 @@ let place_order
     | Some b -> b
     | None -> !Config.extended_hours
   in
-  (* Session-aware: outside regular hours (pre/after-market, overnight, closed) orders use
-     day + extended_hours; during regular hours the requested TIF is preserved. *)
+  (* Session-aware: outside regular hours (pre/after-market, overnight, closed) a limit
+     order is extended-eligible and keeps the requested TIF; during regular hours the
+     requested TIF is preserved too, except that fractional orders must be [day] there. *)
   let in_extended_session =
     (not is_crypto) && not (Alpaca_market_hours.is_regular_market_open ())
   in

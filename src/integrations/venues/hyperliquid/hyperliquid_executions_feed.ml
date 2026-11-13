@@ -1541,15 +1541,6 @@ let process_user_events data_json =
                   price
                   tid;
               let fill_value = !filled_out *. !avg_out in
-              let maker_fee_rate =
-                match Dio_exchange.Exchange_intf.Registry.get "hyperliquid" with
-                | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
-                  (match Ex.get_fees ~symbol with
-                   | Some f, _ -> f
-                   | _ -> 0.0)
-                | None -> 0.0
-              in
-              let estimated_fee = fill_value *. maker_fee_rate in
               let market =
                 if Hyperliquid_instruments_feed.is_perp_coin coin then "perp" else "spot"
               in
@@ -1584,7 +1575,7 @@ let process_user_events data_json =
                 ; amount = !filled_out
                 ; fill_price = !avg_out
                 ; value = fill_value
-                ; fee = estimated_fee
+                ; fee
                 ; timestamp = action_time
                 ; order_id
                 ; trade_id = Int64.to_string tid

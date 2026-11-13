@@ -352,24 +352,31 @@ let fetch_fees ~testnet ~symbol : (float * float) Lwt.t =
   Hyperliquid_get_fee.get_fee_info ~testnet ()
   >|= fun info ->
   let is_spot = String.contains symbol '/' in
-  match info with
-  | Some f ->
-    let maker =
-      if is_spot
-      then Option.value f.Hyperliquid_get_fee.spot_maker_fee ~default:0.0
-      else Option.value f.Hyperliquid_get_fee.maker_fee ~default:0.0002
-    in
-    let taker =
-      if is_spot
-      then Option.value f.Hyperliquid_get_fee.spot_taker_fee ~default:0.001
-      else Option.value f.Hyperliquid_get_fee.taker_fee ~default:0.0005
-    in
-    maker, taker
-  | None -> (if is_spot then 0.0 else 0.0002), if is_spot then 0.001 else 0.0005
+  let maker, taker =
+    match info with
+    | Some f ->
+      let maker =
+        if is_spot
+        then Option.value f.Hyperliquid_get_fee.spot_maker_fee ~default:0.0
+        else Option.value f.Hyperliquid_get_fee.maker_fee ~default:0.0002
+      in
+      let taker =
+        if is_spot
+        then Option.value f.Hyperliquid_get_fee.spot_taker_fee ~default:0.001
+        else Option.value f.Hyperliquid_get_fee.taker_fee ~default:0.0005
+      in
+      maker, taker
+    | None -> (if is_spot then 0.0 else 0.0002), if is_spot then 0.001 else 0.0005
+  in
+  (* [userFees] is account-wide; a builder dex's per-asset deployer fee sits on top of it. *)
+  ( Hyperliquid_instruments_feed.apply_deployer_fee ~symbol maker
+  , Hyperliquid_instruments_feed.apply_deployer_fee ~symbol taker )
 ;;
 
 let default_fees ~symbol : float * float =
-  if String.contains symbol '/' then 0.0, 0.001 else 0.0002, 0.0005
+  let maker, taker = if String.contains symbol '/' then 0.0, 0.001 else 0.0002, 0.0005 in
+  ( Hyperliquid_instruments_feed.apply_deployer_fee ~symbol maker
+  , Hyperliquid_instruments_feed.apply_deployer_fee ~symbol taker )
 ;;
 
 (* ---- Balances (spot only) ---- *)

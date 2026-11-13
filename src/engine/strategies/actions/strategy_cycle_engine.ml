@@ -2387,7 +2387,6 @@ let sell_place_body c =
       ~asset
       ~bid_price:c.cg_bid_r
       ~ask_price:c.cg_ask_r
-      ~buy_attempted:c.cg_buy_attempted
       ~ecfg
       ~pre
   | _ -> ()
@@ -2462,15 +2461,6 @@ let sell_finalize_latch c =
   | _ -> ()
 ;;
 
-(** Fine path sell phase 3b: excess sweep (the file gates when it runs). *)
-let sell_excess_sweep_phase c =
-  match c.cg_state, c.cg_asset, c.cg_ecfg with
-  | Some state, Some asset, Some ecfg when c.cg_sell_pre_valid ->
-    let pre = c.cg_sell_pre in
-    Jac.sell_excess_sweep_phase ~state ~now:c.cg_now ~asset ~pre ~ecfg
-  | _ -> ()
-;;
-
 (** Fine path sell phase 3c: clear the resume marker. *)
 let sell_finalize_end c =
   match c.cg_state with
@@ -2478,7 +2468,7 @@ let sell_finalize_end c =
   | None -> ()
 ;;
 
-(** Fine path sell phase 3: retry-latch bookkeeping, consumption, excess sweep. *)
+(** Fine path sell phase 3: retry-latch bookkeeping and consumption. *)
 let sell_finalize c =
   match c.cg_state, c.cg_asset, c.cg_ecfg with
   | Some state, Some asset, Some ecfg when c.cg_sell_pre_valid ->

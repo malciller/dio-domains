@@ -568,7 +568,7 @@ let () =
     let start_time = Unix.gettimeofday () in
     Lwt.async (fun () -> Dio_dashboard.Dashboard_server.start ~start_time);
     (* Publish per-venue network latency windows (ws_ping / ws_feed / rest_request /
-       signer) for the dashboard's NETWORK page. Network spike logs are gated separately
+       signer) for the dashboard's EXTERNAL page. Network spike logs are gated separately
        from the internal-op ones via latency_spike_report. *)
     Network_latency.start_publisher
       ~log_spikes:(Dio_engine.Config.reports_network config.latency_spike_report)

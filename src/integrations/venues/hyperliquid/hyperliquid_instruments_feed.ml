@@ -24,6 +24,22 @@ let published_cache : (string, pair_info) Hashtbl.t Atomic.t =
   Atomic.make (Hashtbl.create 128)
 ;;
 
+(** Builder-deployed perps price their own fees. Every asset in a builder dex's [meta]
+    payload carries [deployerFeeScale] (the deployer's cut on top of the protocol rate)
+    and may enable growth mode (protocol fees and rebates cut by 90%). The main perp dex
+    and spot have neither, so an absent symbol is neutral. *)
+type deployer_fee =
+  { scale : float
+  ; growth : bool
+  }
+
+(* Copy-on-write snapshot, published under [cache_mutex] alongside [published_cache]. *)
+let deployer_fees : (string, deployer_fee) Hashtbl.t = Hashtbl.create 16
+
+let published_deployer_fees : (string, deployer_fee) Hashtbl.t Atomic.t =
+  Atomic.make (Hashtbl.create 16)
+;;
+
 (** Republish the current [pair_cache] as an immutable snapshot.
 
     The copy reads the whole table, so it must happen *inside* [cache_mutex]. All three
@@ -33,7 +49,12 @@ let published_cache : (string, pair_info) Hashtbl.t Atomic.t =
     once-per-refresh metadata reload, never on a read path, so the extra hold costs
     nothing measurable. *)
 let publish_cache_locked () =
-  Atomic.set published_cache (Hashtbl.copy pair_cache);
+  (* Snapshot both tables before unlocking: the fee snapshot is written by the same
+     builder-dex reload that mutates [deployer_fees]. *)
+  let info = Hashtbl.copy pair_cache in
+  let fees = Hashtbl.copy deployer_fees in
+  Atomic.set published_cache info;
+  Atomic.set published_deployer_fees fees;
   Mutex.unlock cache_mutex
 ;;
 
@@ -49,10 +70,10 @@ let notify_ready () =
   Lwt_condition.broadcast ready_condition ()
 ;;
 
-(** True once the metadata cache holds at least one instrument. The startup gate uses
-    this to avoid signalling readiness (and letting domains place orders) on an empty
-    cache: an empty WS payload used to call [notify_ready] and every subsequent order was
-    rejected with "Unknown symbol". *)
+(** True once the metadata cache holds at least one instrument. The startup gate uses this
+    to avoid signalling readiness (and letting domains place orders) on an empty cache: an
+    empty WS payload used to call [notify_ready] and every subsequent order was rejected
+    with "Unknown symbol". *)
 let has_instruments () =
   Mutex.lock cache_mutex;
   let n = Hashtbl.length pair_cache in
@@ -217,6 +238,26 @@ let lookup_info symbol =
      | [] -> None)
 ;;
 
+(** Effective fee rate for [symbol] after its builder-dex fee configuration.
+
+    Hyperliquid's rule for a user rate [x] and deployer scale [s]: for a charge ([x > 0])
+    the deployer's cut is added, so [s < 1] yields [x *. (1 + s)] and [s > 1] yields
+    [x *. 2s]. A rebate ([x < 0]) is split between protocol and deployer but its total is
+    unchanged by [s]. Growth mode scales protocol fees and rebates by 0.1. The main dex
+    and spot pairs have no entry and pass through unchanged. *)
+let apply_deployer_fee ~symbol rate =
+  let scale, growth =
+    match Hashtbl.find_opt (Atomic.get published_deployer_fees) symbol with
+    | Some f -> Float.max 0.0 f.scale, f.growth
+    (* No deployer: the protocol keeps the whole rate. *)
+    | None -> 0.0, false
+  in
+  let scale_multiplier =
+    if rate < 0.0 then 1.0 else if scale < 1.0 then 1.0 +. scale else 2.0 *. scale
+  in
+  rate *. scale_multiplier *. if growth then 0.1 else 1.0
+;;
+
 (** Coarse price increment used when no instrument context is available. Per-symbol
     pricing actually follows Hyperliquid's 5-significant-figure rule with a
     (max_decimals - sz_decimals) cap; see [round_price_to_tick_for_symbol]. *)
@@ -224,8 +265,8 @@ let get_price_increment _symbol = Some 0.01
 
 (** Register a builder-deployed perp dex's instruments.
 
-    Builder perps live in their own `meta` namespace: the coin is `{dex}:{name}` and the
-    asset id the exchange expects is `100000 + perp_dex_index * 10000 + index_in_meta`
+    Builder perps live in their own `meta` namespace: the coin is `[{dex}]:[{name}]` and
+    the asset id the exchange expects is `100000 + perp_dex_index * 10000 + index_in_meta`
     (see the venue's asset-id reference). Getting that arithmetic wrong routes an order to
     an unrelated instrument, so it is computed only here and only from the dex index the
     exchange reports. *)
@@ -237,8 +278,7 @@ let process_builder_dex_meta ~dex_index ~dex_name payload =
     with
     | _ -> None
   with
-  | None ->
-    Logging.warn_f ~section "builder dex %s: unreadable meta payload" dex_name
+  | None -> Logging.warn_f ~section "builder dex %s: unreadable meta payload" dex_name
   | Some universe ->
     Mutex.lock cache_mutex;
     List.iteri
@@ -252,18 +292,40 @@ let process_builder_dex_meta ~dex_index ~dex_name payload =
               try Some (member "maxLeverage" item |> to_int) with
               | _ -> None
             in
-            Some (coin, sz_decimals, max_leverage)
+            (* Per-asset fee configuration. A dex that reports neither charges the plain
+               protocol rate, which is what a zero deployer scale means. *)
+            let scale =
+              try
+                match member "deployerFeeScale" item with
+                | `String s -> float_of_string s
+                | `Float f -> f
+                | `Int i -> float_of_int i
+                | _ -> 0.0
+              with
+              | _ -> 0.0
+            in
+            let growth =
+              try
+                match member "growthMode" item with
+                | `String s -> String.equal s "enabled"
+                | `Bool b -> b
+                | _ -> false
+              with
+              | _ -> false
+            in
+            Some (coin, sz_decimals, max_leverage, scale, growth)
           with
           | _ -> None
         with
         | None -> ()
-        | Some (coin, sz_decimals, max_leverage) ->
+        | Some (coin, sz_decimals, max_leverage, scale, growth) ->
           let symbol = dex_name ^ ":" ^ coin in
           let asset_index = 100_000 + (dex_index * 10_000) + index in
           Hashtbl.replace
             pair_cache
             symbol
-            { symbol; sz_decimals; max_leverage; asset_index })
+            { symbol; sz_decimals; max_leverage; asset_index };
+          Hashtbl.replace deployer_fees symbol { scale; growth })
       universe;
     publish_cache_locked ();
     Logging.info_f
@@ -294,9 +356,9 @@ let fetch_builder_dexes ~testnet () : unit Lwt.t =
     (fun () ->
       post_json (`Assoc [ "type", `String "perpDexs" ])
       >>= fun dexes ->
-      (* The position in this array *is* the perp dex index the asset id is built from, and
-         entry 0 is the main dex (null). Filtering before indexing would shift every dex by
-         one and misroute its orders to another instrument. *)
+      (* The position in this array *is* the perp dex index the asset id is built from,
+         and entry 0 is the main dex (null). Filtering before indexing would shift every
+         dex by one and misroute its orders to another instrument. *)
       let dex_entries =
         try
           List.mapi
@@ -323,10 +385,7 @@ let fetch_builder_dexes ~testnet () : unit Lwt.t =
           >|= fun payload -> process_builder_dex_meta ~dex_index:index ~dex_name payload)
         dex_entries)
     (fun exn ->
-      Logging.warn_f
-        ~section
-        "builder dex discovery failed: %s"
-        (Printexc.to_string exn);
+      Logging.warn_f ~section "builder dex discovery failed: %s" (Printexc.to_string exn);
       Lwt.return_unit)
 ;;
 
@@ -389,8 +448,7 @@ let fetch_meta_from_rest ~testnet () : unit Lwt.t =
       Lwt_list.iter_s
         (fun index_and_dex ->
           let index, dex_name = index_and_dex in
-          post_json
-            (`Assoc [ "type", `String "meta"; "dex", `String dex_name ])
+          post_json (`Assoc [ "type", `String "meta"; "dex", `String dex_name ])
           >|= fun payload -> process_builder_dex_meta ~dex_index:index ~dex_name payload)
         (List.filter_map
            (fun (i, d) ->
@@ -439,9 +497,9 @@ let get_subscription_coin symbol =
   let res =
     match Hashtbl.find_opt pair_cache symbol with
     | Some _ when String.contains symbol ':' ->
-      (* Builder perp: the venue's coin name is already [dex:coin]. Asset ids above
-         100000 are builder perps, not spot pairs - encoding them as @N subscribes to a
-         coin that does not exist and no book ever arrives. *)
+      (* Builder perp: the venue's coin name is already [dex:coin]. Asset ids above 100000
+         are builder perps, not spot pairs - encoding them as @N subscribes to a coin that
+         does not exist and no book ever arrives. *)
       symbol
     | Some info when info.asset_index >= 10000 && info.asset_index < 100_000 ->
       (* Spot pair: encode as @N where N = asset_index - 10000. *)

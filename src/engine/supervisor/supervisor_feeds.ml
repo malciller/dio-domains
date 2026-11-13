@@ -236,9 +236,9 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
               let dexes =
                 List.filter_map
                   (fun symbol ->
-                     match String.index_opt symbol ':' with
-                     | Some i -> Some (String.sub symbol 0 i)
-                     | None -> None)
+                    match String.index_opt symbol ':' with
+                    | Some i -> Some (String.sub symbol 0 i)
+                    | None -> None)
                   hyperliquid_symbols
               in
               Hyperliquid.Dex_positions.start
@@ -1804,6 +1804,36 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                                                                                     .taker_fee
                                                                                   ~default:
                                                                                     0.0005
+                                                                            in
+                                                                            (* userFees is
+                                                                               account-wide;
+                                                                               builder
+                                                                               dexs add a
+                                                                               per-asset
+                                                                               rate. *)
+                                                                            let scale =
+                                                                              Hyperliquid
+                                                                              .Instruments_feed
+                                                                              .apply_deployer_fee
+                                                                            in
+                                                                            let fee_symbol
+                                                                              =
+                                                                              asset
+                                                                                .Dio_engine
+                                                                                 .Config
+                                                                                 .symbol
+                                                                            in
+                                                                            let maker =
+                                                                              scale
+                                                                                ~symbol:
+                                                                                  fee_symbol
+                                                                                maker
+                                                                            in
+                                                                            let taker =
+                                                                              scale
+                                                                                ~symbol:
+                                                                                  fee_symbol
+                                                                                taker
                                                                             in
                                                                             Dio_strategies
                                                                             .Fee_cache

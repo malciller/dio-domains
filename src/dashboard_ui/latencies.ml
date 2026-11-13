@@ -110,42 +110,55 @@ type metric_group =
   ; trend_metric : string (* metric label plotted in the trend column *)
   ; trend_label : string (* header shown above the trend column *)
   ; trend_max_us : float (* full-scale value for the trend sparkline *)
+  ; is_external : bool (* venue I/O page: holds the venue-only rows and is ordered last *)
   }
 
-(** Latency pages.
+(** Latency pages: two in-process pages, then the venue waits.
 
-    - INTERNAL: per-asset work. [oracle] is the capital-oracle's per-asset analysis pass
-      (own ~5 min cadence, outside the per-cycle span). [orderbook] -> [execution] ->
-      [prep] -> [strategy] are the four sequential segments of one cycle; [cycle] is their
-      sum, which is why truncating the page must never drop it. The [gate] segment (book
-      read -> strategy call) rides on NATIVE so this page stays six columns wide. All are
-      in-process work with the same sub-10us target. A perp leg that runs inside its
-      owner's domain (a generic overlay instance, or a carry controller sharing the hedge
-      grid's domain) gets its own nested row keyed by venue. Its passes are charged to
-      what woke them - [orderbook] for a book tick, [execution] for a fill, [strategy]
-      otherwise - with its setup and persistence under [prep]. Its span is charged to the
-      owner's STRATEGY cell, not PREP; the nested row breaks it down.
-    - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed one-way latency,
-      REST round-trip, signer time). These measure exchange round-trips and feed transit,
-      not in-process work, and carry their own budgets. *)
+    - INTERNAL: the per-domain cycle in execution order. [orderbook] -> [execution] ->
+      [prep] -> [strategy] are the sequential segments of one cycle and [cycle] is their
+      sum, so truncating the page must never drop it. [oracle] is the capital-oracle's
+      per-asset analysis pass on its own ~5 min cadence, so it is listed last: in-process,
+      but not part of the cycle. A perp leg that runs inside its owner's domain (a generic
+      overlay instance, or a carry controller sharing the hedge grid's domain) gets its
+      own nested row keyed by venue. Its passes are charged to what woke them -
+      [orderbook] for a book tick, [execution] for a fill, [strategy] otherwise - with its
+      setup and persistence under [prep]. Its span is charged to the owner's STRATEGY
+      cell, not PREP; the nested row breaks it down.
+    - DECISION: the decision path in execution order. [wake] is the park -> running
+      handoff, [gate] covers the book read through the strategy call, then the compiled
+      strategy's phases [native_res] -> [native_bridge] -> [native_run] ->
+      [native_actions].
+    - EXTERNAL: waits on the venue, and how fast we react to one. [ws_feed] is
+      clock-corrected one-way feed transit, [ws_ping] the WebSocket round trip,
+      [rest_request] an HTTP round trip, [signer] the local signature before an order is
+      sent, and [e2e] the tick-to-decision span those wakes drive. Not in-process work,
+      and with their own budgets.
+
+    No page carries more than six metric columns: at a typical terminal width six is what
+    fits before the tail is truncated. *)
 let metric_pages =
   [ { page_label = "INTERNAL"
-    ; metrics = [ "oracle"; "orderbook"; "execution"; "prep"; "strategy"; "cycle" ]
+    ; metrics = [ "orderbook"; "execution"; "prep"; "strategy"; "cycle"; "oracle" ]
     ; trend_metric = "cycle"
     ; trend_label = "(TOTAL P99)"
     ; trend_max_us = 100.0
+    ; is_external = false
     }
-  ; { page_label = "NETWORK"
-    ; metrics = [ "e2e"; "wake"; "ws_ping"; "ws_feed"; "rest_request"; "signer" ]
+  ; { page_label = "DECISION"
+    ; metrics =
+        [ "wake"; "gate"; "native_res"; "native_bridge"; "native_run"; "native_actions" ]
+    ; trend_metric = "native_run"
+    ; trend_label = "(RUN P99)"
+    ; trend_max_us = 200.0
+    ; is_external = false
+    }
+  ; { page_label = "EXTERNAL"
+    ; metrics = [ "ws_feed"; "ws_ping"; "rest_request"; "signer"; "e2e" ]
     ; trend_metric = "ws_feed"
     ; trend_label = "(FEED P99)"
     ; trend_max_us = 200_000.0
-    }
-  ; { page_label = "NATIVE"
-    ; metrics = [ "native_res"; "native_bridge"; "native_run"; "native_actions"; "gate" ]
-    ; trend_metric = "native_run"
-    ; trend_label = "(NATIVE P99)"
-    ; trend_max_us = 200.0
+    ; is_external = true
     }
   ]
 ;;
@@ -153,9 +166,7 @@ let metric_pages =
 (** Every metric label from the in-process pages. A row carrying none of them is a
     venue-only row (an overlay venue with no domain of its own). *)
 let internal_labels =
-  List.concat_map
-    (fun p -> if String.equal p.page_label "NETWORK" then [] else p.metrics)
-    metric_pages
+  List.concat_map (fun p -> if p.is_external then [] else p.metrics) metric_pages
 ;;
 
 let page_count () = List.length metric_pages
@@ -197,9 +208,10 @@ let samples_cell_w = 4
     percentile. *)
 let samples_gap_w = 1
 
-(** Short display header per latency metric: ORACLE (the separate analysis-pass metric),
-    then the cycle segments BOOK -> EVENTS -> PREP -> STRATEGY, then TOTAL (the whole
-    cycle). *)
+(** Short display header per latency metric: the INTERNAL cycle in execution order BOOK ->
+    EVENTS -> PREP -> STRATEGY -> TOTAL, then ORACLE (the off-cycle analysis pass), the
+    DECISION path WAKE -> GATE -> RESERVE -> BRIDGE -> RUN -> ACTIONS, and the EXTERNAL
+    waits FEED / PING / REST / SIGN with the E2E reaction span. *)
 let short_label = function
   | "oracle" -> "ORACLE"
   | "orderbook" -> "BOOK"
@@ -215,8 +227,8 @@ let short_label = function
   | "rest_request" -> "REST"
   | "signer" -> "SIGN"
   | "native_res" -> "RESERVE"
-  | "native_bridge" -> "FACTS"
-  | "native_run" -> "STRAT"
+  | "native_bridge" -> "BRIDGE"
+  | "native_run" -> "RUN"
   | "native_actions" -> "ACTIONS"
   | l -> String.uppercase_ascii (truncate_string 6 l)
 ;;
@@ -326,12 +338,21 @@ let render_latencies w (snapshot : Snapshot.t) =
       all_page_labels
   in
   let active_lats = List.filter row_is_active lats in
-  (* The overlay-only perp domains (XMR/USDC, ETH/USDC, SOL/USDC, ADA/USDC) are the carry
-     controller's legs. Nest them under the grid row for the same base asset. *)
+  (* The overlay-only perp domains (XMR/USDC, ETH/USDC, SOL/USDC, ADA/USD) are the carry
+     controller's legs. Nest them under the grid row for the same base asset. A
+     builder-deployed dex instrument is keyed "<dex>:<coin>" (xyz:SPCX), so the dex prefix
+     has to come off before the base asset is compared - otherwise the leg matched no
+     parent and rendered as a top-level row beside its own grid. *)
   let base_of_symbol symbol =
-    match String.index_opt symbol '/' with
-    | Some i -> String.sub symbol 0 i
-    | None -> symbol
+    let coin =
+      match String.rindex_opt symbol ':' with
+      | Some i when i + 1 < String.length symbol ->
+        String.sub symbol (i + 1) (String.length symbol - i - 1)
+      | _ -> symbol
+    in
+    match String.index_opt coin '/' with
+    | Some i -> String.sub coin 0 i
+    | None -> coin
   in
   let grid_symbols = List.map fst snapshot.strategies in
   let parent_of symbol =
@@ -387,11 +408,11 @@ let render_latencies w (snapshot : Snapshot.t) =
   if active_lats = []
   then I.empty
   else (
-    (* Per-metric (warn_us, crit_us) thresholds. The four internal segments (orderbook,
+    (* Per-metric (warn_us, crit_us) thresholds. The four cycle segments (orderbook,
        execution, prep, strategy) share one budget: green < 10us, yellow 10-20us, red >
        20us. [cycle] is the whole-cycle sum with the wider end-to-end budget: green <
-       50us, yellow 50-100us, red > 100us. [oracle] is the separate analysis pass. NETWORK
-       metrics keep much larger budgets (exchange round-trips, not in-process work).
+       50us, yellow 50-100us, red > 100us. [oracle] is the separate analysis pass. The
+       EXTERNAL waits keep much larger budgets (venue round-trips, not in-process work).
        [f >= warn] is yellow, [f > crit] is red, else green. *)
     let latency_thresholds label =
       match label with
@@ -424,7 +445,7 @@ let render_latencies w (snapshot : Snapshot.t) =
     (* Venue-only rows carry network windows only; keep them off the in-process pages
        rather than draw a row of "--". *)
     let page_rows =
-      if String.equal page.page_label "NETWORK"
+      if page.is_external
       then ordered_rows
       else
         List.filter

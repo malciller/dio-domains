@@ -434,6 +434,9 @@ let test_fill_intent_close_short () =
   | None -> Alcotest.fail "fill event not published"
   | Some f ->
     Alcotest.(check string) "market is perp" "perp" f.market;
+    (* The venue's own [fee] is authoritative: it already includes the user's tier and any
+       builder-dex deployer fee, which the local rate estimate got wrong. *)
+    Alcotest.(check (float 0.000001)) "venue fee is published" 0.01 f.fee;
     Alcotest.(check string) "intent is close_short" "close_short" f.intent;
     Alcotest.(check string) "strategy is carry" "carry" f.strategy;
     (match f.realized_pnl with

@@ -660,14 +660,18 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
       <- updated.Dio_persistence.Base_accumulation_store.last_buy_fill_price;
       state.last_buy_fill_qty
       <- updated.Dio_persistence.Base_accumulation_store.last_buy_fill_qty;
-      (* Profit-gated lot skim for 1:1 venues. The order cannot withhold the
-         [(1 - sell_mult)] slice (below one lot), so split the buy fill's own base: once
-         quote profit covers a lot plus the buffer, move that lot into [reserved_base] and
-         reduce the sellable reference. The reserve is backed by this buy. Runs once per
-         buy, never on the sell path. *)
+      (* Profit-gated lot skim for 1:1 venues (Hyperliquid, Kraken, Alpaca, ...). The
+         order cannot withhold the [(1 - sell_mult)] slice (below one lot), so split the
+         buy fill's own base: once quote profit covers a lot plus the buffer, move that
+         lot into [reserved_base] and reduce the sellable reference. The reserve is backed
+         by this buy. Runs once per buy, never on the sell path.
+
+         Gated on [sell_uses_mult = false] (the venue sells 1:1, so the retention slice
+         needs its own skim), not on [use_accumulation_sells]: that flag describes the SELL
+         path (whether the order withholds the slice / sizes off the ledger basis), and
+         Alpaca sets it false while still accruing. *)
       if (not state.startup_replay)
          && state.base_accumulation_enabled
-         && state.cached_ecfg.use_accumulation_sells
          && (not state.cached_ecfg.sell_uses_mult)
          && fill_price > 0.0
          && acc_qty > 0.0

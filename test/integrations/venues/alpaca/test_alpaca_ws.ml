@@ -1,7 +1,7 @@
 (* Tests for Alpaca WebSocket feed/ping wiring:
    - send_ping returns false when no connection is established (both feeds)
    - venue profiler wiring: ping/feed recordings land under the "alpaca" venue so the
-     dashboard NETWORK page can render them *)
+     dashboard EXTERNAL page can render them *)
 
 let test_data_feed_send_ping_disconnected () =
   let result = Lwt_main.run (Alpaca.Orderbook.send_ping ~req_id:1 ~timeout_ms:100) in
