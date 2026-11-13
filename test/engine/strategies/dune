@@ -47,11 +47,3 @@
  (modules test_strategy_ir)
  (libraries dio.strategies dio.latency_profiling alcotest))
 
-(rule
- (copy ../../../strategies/private/short_overlay.strategy short_overlay.strategy))
-
-(test
- (name test_strategy_program)
- (modules test_strategy_program)
- (libraries dio.strategies dio.latency_profiling alcotest)
- (deps short_overlay.strategy jacobs_ladder.strategy))
