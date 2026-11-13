@@ -411,6 +411,14 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
        | _ -> true)
     | None -> true
   in
+  (* Blank row between stacked sections: with no gap a section's closing border sits
+     directly on the next title, so the two read as one block. Empty sections are dropped
+     first so a hidden feed does not leave a doubled gap. *)
+  let stack_sections ~gap imgs =
+    match List.filter (fun img -> I.height img > 0) imgs with
+    | [] -> I.empty
+    | first :: rest -> I.vcat (first :: List.concat_map (fun img -> [ gap; img ]) rest)
+  in
   let draw_frame w h =
     Anim.reset_frame ();
     let t = Theme.current () in
@@ -419,7 +427,9 @@ let run ?(config_file = "config.json") ?(theme_override = "") () =
       let content_img =
         match !view_mode_ref with
         | `MainView ->
-          I.vcat
+          let gap = I.string A.(bg t.c_bg) (String.make w ' ') in
+          stack_sections
+            ~gap
             [ Ticker_feed.render_ticker w !snapshot
             ; Holdings.render_strategies
                 ~selected_index:(Some !selected_index_ref)

@@ -125,6 +125,11 @@ let resolve path =
   else None
 ;;
 
+(** A percentile needs ten observations above its rank: ~1000 samples for p99, ~10,000 for
+    p999. Below 1000 the p999 column is the window maximum, so it prints as "-" and the
+    [n] column carries the truth. *)
+let p999_min_samples = 1_000
+
 type common =
   { dir : string
   ; file : string option
@@ -139,7 +144,7 @@ let usage =
   "usage:\n\
   \  dio latency tail    [--dir D | --file F] [--since 1h] [--domain BTC]\n\
   \  dio latency best    [--dir D] [--domain BTC]\n\
-  \  dio latency compare OLD NEW [--tolerance-pct 10] [--min-samples 100] [--gate]\n\n\
+  \  dio latency compare OLD NEW [--tolerance-pct 10] [--min-samples 1000] [--gate]\n\n\
   \  OLD/NEW may each be a .jsonl file or a directory (its newest run).\n\
   \  --gate makes compare exit 1 when any stage's p99 regresses past the tolerance."
 ;;
@@ -170,7 +175,7 @@ let default_common () =
   ; since_s = 3600.0
   ; domain = None
   ; tolerance_pct = 10.0
-  ; min_samples = 100
+  ; min_samples = 1000
   ; gate = false
   }
 ;;
@@ -318,7 +323,11 @@ let tail ~(c : common) =
           (pad_left (string_of_int v.n) 7)
           (pad_left (Latency_profiler.format_us v.p50) 9)
           (pad_left (Latency_profiler.format_us v.p99) 9)
-          (pad_left (Latency_profiler.format_us v.p999) 9)
+          (pad_left
+             (if v.n >= p999_min_samples
+              then Latency_profiler.format_us v.p999
+              else "-")
+             9)
           (pad_left (Latency_profiler.format_us v.mx) 9)
           (pad_left (if v.mt > 0.0 then clock_of_unix v.mt else "-") 8)
           (Option.value v.cause ~default:""))

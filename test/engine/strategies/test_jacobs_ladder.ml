@@ -231,6 +231,51 @@ let test_userref_generation () =
     (Dio_strategies.Strategy_common.is_strategy_order strategy_userref 2)
 ;;
 
+let test_superseded_buy_fill_still_arms_sell () =
+  (* Alpaca amends are cancel+replace. If the old buy id fills while it is still in the
+     [Replaced] window, the fill is real: it has to arm the owed sell even though buy
+     tracking must stay on the replacement. Skipping the latch folded that base into the
+     excess sweep, which amended the top rung instead of placing a new ladder rung. *)
+  let symbol = "SUPERSEDED_BUY_FILL/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.grid_qty <- 1.0;
+  state.maker_fee <- 0.0;
+  state.position_base <- 0.0;
+  state.attributed_balance_increase <- 0.0;
+  state.buy_credits_since_balance <- [];
+  state.just_filled_buy <- false;
+  state.last_buy_order_id <- Some "new-buy";
+  state.last_buy_order_price <- Some 100.0;
+  state.last_fill_oid <- None;
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done symbol;
+  let module IA = Dio_strategies.Strategy_common.InFlightAmendments in
+  ignore (IA.remove_in_flight_amendment "old-buy");
+  ignore (IA.remove_in_flight_amendment "new-buy");
+  IA.note_amendment_succeeded ~old_id:"old-buy" ~new_id:"new-buy";
+  check bool "old id is in the replaced window" true (IA.is_superseded "old-buy");
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
+    ~now:0.0
+    symbol
+    "old-buy"
+    Dio_strategies.Strategy_common.Buy
+    ~fill_price:99.0
+    ~fill_qty:1.0
+    None;
+  check bool "superseded buy fill still arms the owed sell" true state.just_filled_buy;
+  check
+    (option (float 1e-9))
+    "superseded fill updates the sell reference price"
+    (Some 99.0)
+    state.last_buy_fill_price;
+  check
+    (option string)
+    "resting replacement buy stays tracked"
+    (Some "new-buy")
+    state.last_buy_order_id;
+  ignore (IA.remove_in_flight_amendment "old-buy")
+;;
+
 let test_blocked_placement_sell_retries () =
   (* Placement-tick sell blocked by the sell cooldown: the non-accrued inventory sell
      stays owed and is placed on a later tick despite no new buy placement or fill.
@@ -9035,6 +9080,10 @@ let () =
         ] )
     ; ( "events"
       , [ test_case "order acknowledgment" `Quick test_order_acknowledgment
+        ; test_case
+            "superseded buy fill still arms the owed sell"
+            `Quick
+            test_superseded_buy_fill_still_arms_sell
         ; test_case "order cancellation" `Quick test_order_cancellation
         ; test_case
             "order cancellation matches client order id"

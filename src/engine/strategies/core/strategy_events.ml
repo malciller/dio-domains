@@ -749,8 +749,12 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
           asset_symbol
       else (
         state.last_buy_order_id <- None;
-        state.last_buy_order_price <- None;
-        if not state.startup_replay then state.just_filled_buy <- true));
+        state.last_buy_order_price <- None);
+      (* The fill created base that needs its own sell rung even when the order was
+         superseded by an amendment: skipping this latch treats that base as excess
+         inventory, so the sweep amends the top rung instead of laddering. Only the
+         resting-buy tracking must be preserved for a superseded order. *)
+      if not state.startup_replay then state.just_filled_buy <- true);
     if state.startup_replay
     then (
       let dominated =
@@ -1548,18 +1552,23 @@ let record_exec_event
   ?(reason = "")
   ()
   =
-  Strategy_event_recorder.record_event_if_active
-    symbol
-    { ev_kind = kind
-    ; ev_now = now
-    ; ev_order_id = order_id
-    ; ev_new_order_id = new_order_id
-    ; ev_side = side
-    ; ev_price = price
-    ; ev_qty = qty
-    ; ev_cl_ord_id = cl_ord_id
-    ; ev_reason = reason
-    }
+  (* The record below is 9 fields of allocation, built on every fill whether or not a
+     recorder is registered. Tracing is off in production, so gate on the registry lookup
+     (one Cow_table read) before building it. *)
+  if Strategy_event_recorder.is_active symbol
+  then
+    Strategy_event_recorder.record_event_if_active
+      symbol
+      { ev_kind = kind
+      ; ev_now = now
+      ; ev_order_id = order_id
+      ; ev_new_order_id = new_order_id
+      ; ev_side = side
+      ; ev_price = price
+      ; ev_qty = qty
+      ; ev_cl_ord_id = cl_ord_id
+      ; ev_reason = reason
+      }
 ;;
 
 (** Re-apply a recorded event through the reference handlers. Used by the replay driver. *)

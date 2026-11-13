@@ -483,7 +483,8 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
       in
       let lat_p99 label =
         match List.assoc_opt label lat_metrics with
-        | Some (m : Snapshot.latency_metric) when m.samples > 0 -> Some m.p99
+        | Some (m : Snapshot.latency_metric) when Snapshot.latency_basis m > 0 ->
+          Some m.p99
         | _ -> None
       in
       let sev_attr label f =

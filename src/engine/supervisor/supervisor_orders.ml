@@ -340,6 +340,18 @@ let hedger_callbacks : strategy_callbacks =
              order.duplicate_key))
   ; on_amend_ok =
       (fun order target_id new_id ->
+        (* Amend is cancel+replace on Hyperliquid; log it at INFO so a reprice is not
+           unexplained order churn. *)
+        Logging.info_f
+          ~section
+          "\226\156\147 Hedger order amended: %s [%s] %s %.8f @ %s (Order ID: %s -> %s)"
+          (side_str order)
+          (Dio_strategies.Strategy_common.string_of_market order.market)
+          order.symbol
+          order.qty
+          (price_str order)
+          target_id
+          new_id;
         if order.strategy = Dio_strategies.Strategy_common.Carry
            && not (String.equal order.duplicate_key "")
         then (
@@ -364,8 +376,15 @@ let hedger_callbacks : strategy_callbacks =
              replacement is live but unknown to the cache; hold the key briefly so the
              next tick does not place a second entry/exit beside it. *)
           if String.equal order.exchange "hyperliquid" && String.equal new_id target_id
-          then
-            Dio_strategies.Strategy_common.Placement_backoff.note_unresolved_amend ~key ()))
+          then (
+            Logging.info_f
+              ~section
+              "Hedger amend ack carried no replacement id for %s %s; holding the key \
+               %.0fs"
+              order.symbol
+              target_id
+              Dio_strategies.Strategy_common.Placement_backoff.unresolved_amend_s;
+            Dio_strategies.Strategy_common.Placement_backoff.note_unresolved_amend ~key ())))
   ; on_amend_skipped = (fun _order _target_id -> ())
   ; on_amend_fail =
       (fun order _target_id err ->

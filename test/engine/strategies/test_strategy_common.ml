@@ -298,18 +298,48 @@ let test_live_carry_order_holds_until_terminal () =
     false
     (C.has_live_carry_order ~kind:"test:entry" ~exchange ~instrument ~reduce_only:true ());
   (* A mapping the venue never retires must stop suppressing placement. *)
-  Mutex.lock C.carry_registry_mutex;
-  (match Concurrency.Fifo_index.find_opt C.carry_orders order_id with
+  let shard = C.carry_shard_of order_id in
+  Mutex.lock C.carry_order_mutexes.(shard);
+  (match Concurrency.Fifo_index.find_opt C.carry_order_shards.(shard) order_id with
    | Some meta ->
      Concurrency.Fifo_index.set
-       C.carry_orders
+       C.carry_order_shards.(shard)
        ~key:order_id
        ~value:{ meta with C.com_at = Unix.gettimeofday () -. 3600.0 }
    | None -> Alcotest.fail "live close mapping was not registered");
-  Mutex.unlock C.carry_registry_mutex;
+  Mutex.unlock C.carry_order_mutexes.(shard);
   Alcotest.(check bool) "an unreleased mapping stops suppressing" false (live ());
   C.retire_carry_order ~order_id;
   Alcotest.(check bool) "terminal retirement re-arms placement" false (live ())
+;;
+
+(** The trading domain defers its order ring to a cycle-bottom flush, so the self-pipe write
+    stops landing inside the measured STRATEGY span. Every other producer must keep the
+    immediate write: it has no flush of its own. *)
+let test_order_signal_deferral () =
+  let module C = Dio_strategies.Strategy_common in
+  let module S = C.OrderSignal in
+  let ready () =
+    let r, _, _ = Unix.select [ S.read_fd ] [] [] 0.0 in
+    r <> []
+  in
+  (* The consumer clears [pending] before draining; this test plays the consumer. *)
+  S.drain_pipe ();
+  Atomic.set S.pending false;
+  S.set_deferred true;
+  S.broadcast ();
+  Alcotest.(check bool) "deferred ring writes no byte" false (ready ());
+  S.flush ();
+  Alcotest.(check bool) "flush writes the byte" true (ready ());
+  S.drain_pipe ();
+  Atomic.set S.pending false;
+  S.set_deferred false;
+  S.broadcast ();
+  Alcotest.(check bool) "default producer writes immediately" true (ready ());
+  S.drain_pipe ();
+  Atomic.set S.pending false;
+  S.flush ();
+  Alcotest.(check bool) "flush without a pending ring writes nothing" false (ready ())
 ;;
 
 let test_carry_registry_stays_bounded () =
@@ -329,19 +359,28 @@ let test_carry_registry_stays_bounded () =
       ~key;
     C.retire_carry_order ~order_id
   done;
-  let before = F.stats C.carry_orders in
-  Alcotest.(check int) "retired ids leave the map empty" 0 before.entries;
+  (* The index is sharded by order id, so its statistics are summed across shards. *)
+  let stats () =
+    Array.fold_left
+      (fun (entries, pending) idx ->
+        let s = F.stats idx in
+        entries + s.F.entries, pending + s.F.pending_queue)
+      (0, 0)
+      C.carry_order_shards
+  in
+  let entries_before, pending_before = stats () in
+  Alcotest.(check int) "retired ids leave the map empty" 0 entries_before;
   Alcotest.(check bool)
     "superseded queue records are retained until the sweep"
     true
-    (before.pending_queue >= 5_000);
+    (pending_before >= 5_000);
   ignore (C.trim_carry_orders ());
-  let after = F.stats C.carry_orders in
-  Alcotest.(check int) "sweep compacts the admission queue" 0 after.pending_queue;
+  let entries_after, pending_after = stats () in
+  Alcotest.(check int) "sweep compacts the admission queue" 0 pending_after;
   Alcotest.(check bool)
     "map never exceeds its declared cap"
     true
-    (after.entries <= C.carry_order_capacity)
+    (entries_after <= C.carry_order_capacity)
 ;;
 
 let test_unanswered_amendment_is_age_bounded () =
@@ -530,6 +569,10 @@ let () =
             "carry registry queue is compacted and capped"
             `Quick
             test_carry_registry_stays_bounded
+        ; Alcotest.test_case
+            "order ring defers to the cycle-bottom flush"
+            `Quick
+            test_order_signal_deferral
         ; Alcotest.test_case
             "unanswered amendment is age bounded"
             `Quick

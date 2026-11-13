@@ -82,17 +82,41 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
   let strats = snapshot.strategies in
   let all_balances = snapshot.balances in
   (* Fixed column widths total [base_w]; compact drops the spot deltas and narrows the
-     perp cells. Any spare viewport width goes to the holdings columns so the table
-     reaches the right edge instead of leaving a gutter. The compact threshold is the full
-     layout's width: below it, the full row would be cropped. *)
-  let full_base_w = 200 in
+     perp cells. The compact threshold is the full layout's width: below it, the full row
+     would be cropped. Spare viewport width is shared evenly across the flexible columns
+     so the table reaches the right edge without opening a gulf in one block: dumping it
+     all into HOLD/ACCUM left those cells far apart while the spot cells stayed cramped. *)
+  let full_base_w = 197 in
   let is_compact = w - 2 < full_base_w in
-  let base_w = if is_compact then 172 else full_base_w in
+  let base_w = if is_compact then 176 else full_base_w in
   let extra = max 0 (w - 2 - base_w) in
-  let w_hold_qty = (if is_compact then 10 else 12) + (extra / 4) in
-  let w_hold_val = 10 + ((extra + 1) / 4) in
-  let w_accum_qty = (if is_compact then 10 else 12) + ((extra + 2) / 4) in
-  let w_accum_val = 10 + ((extra + 3) / 4) in
+  let n_flex = if is_compact then 15 else 17 in
+  let widen i =
+    let share = extra / n_flex in
+    share + if i < extra mod n_flex then 1 else 0
+  in
+  let w_symbol = (if is_compact then 14 else 15) + widen 0 in
+  let w_price = 13 + widen 1 in
+  let w_sqty = 8 + widen 2 in
+  let w_sclose = (if is_compact then 12 else 11) + widen 3 in
+  let w_ds = (if is_compact then 6 else 7) + widen 4 in
+  let w_dl = (if is_compact then 6 else 7) + widen 5 in
+  let w_lclose = (if is_compact then 12 else 11) + widen 6 in
+  let w_lqty = 8 + widen 7 in
+  let w_buy = 11 + widen 8 in
+  let w_sell = 11 + widen (if is_compact then 9 else 11) in
+  let w_sells = 6 + widen (if is_compact then 10 else 12) in
+  let w_hold_qty =
+    (if is_compact then 10 else 12) + widen (if is_compact then 11 else 13)
+  in
+  let w_hold_val = 10 + widen (if is_compact then 12 else 14) in
+  let w_accum_qty =
+    (if is_compact then 10 else 12) + widen (if is_compact then 13 else 15)
+  in
+  let w_accum_val = 10 + widen (if is_compact then 14 else 16) in
+  (* Full-only spot delta columns. *)
+  let w_dbuy = 8 + widen 9 in
+  let w_dsell = 8 + widen 10 in
   (* Column header row; compact layout omits the spot deltas and narrows the perp cells. *)
   let header =
     close_row
@@ -100,23 +124,24 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       (if is_compact
        then
          I.hcat
-           [ I.string a_border " │  "
-           ; col 14 a_label "SYMBOL"
+           [ I.string a_border " │ "
+           ; col w_symbol a_label "SYMBOL"
            ; col 3 a_label "ST"
-           ; col_right 12 a_label "PRICE"
-           ; I.string a_border " │ "
-           ; col 8 a_label "S QTY"
+           ; col_right w_price a_label "PRICE"
+           ; I.string a_border "│ "
+           ; col w_sqty a_label "S QTY"
            ; I.string a_border " "
-           ; col_right 12 a_label "S CLOSE @"
-           ; col_right 6 a_label "Δ S"
-           ; col_right 6 a_label "Δ L"
-           ; col_right 12 a_label "L CLOSE @"
+           ; col_right w_sclose a_label "S CLOSE @"
+           ; col_right w_ds a_label "Δ S"
+           ; col_right w_dl a_label "Δ L"
+           ; col_right w_lclose a_label "L CLOSE @"
            ; I.string a_border " "
-           ; col 8 a_label "L QTY"
-           ; col_right 11 a_label "BUY @"
+           ; col w_lqty a_label "L QTY"
+           ; col_right w_buy a_label "BUY @"
            ; col 17 a_label "SPOT DIST"
-           ; col_right 11 a_label "SELL @"
-           ; I.string a_border " │ "
+           ; col_right w_sell a_label "SELL @"
+           ; col_right w_sells a_label "SELLS"
+           ; I.string a_border "│ "
            ; col_right w_hold_qty a_label "HOLD QTY"
            ; col_right w_hold_val a_label "HOLD VAL"
            ; col_right w_accum_qty a_label "ACCUM QTY"
@@ -124,25 +149,26 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
            ]
        else
          I.hcat
-           [ I.string a_border " │  "
-           ; col 16 a_label "SYMBOL"
+           [ I.string a_border " │ "
+           ; col w_symbol a_label "SYMBOL"
            ; col 3 a_label "ST"
-           ; col_right 12 a_label "PRICE"
-           ; I.string a_border " │ "
-           ; col 9 a_label "S QTY"
+           ; col_right w_price a_label "PRICE"
+           ; I.string a_border "│ "
+           ; col w_sqty a_label "S QTY"
            ; I.string a_border " "
-           ; col_right 12 a_label "S CLOSE @"
-           ; col_right 7 a_label "Δ S"
-           ; col_right 7 a_label "Δ L"
-           ; col_right 12 a_label "L CLOSE @"
+           ; col_right w_sclose a_label "S CLOSE @"
+           ; col_right w_ds a_label "Δ S"
+           ; col_right w_dl a_label "Δ L"
+           ; col_right w_lclose a_label "L CLOSE @"
            ; I.string a_border " "
-           ; col 9 a_label "L QTY"
-           ; col_right 12 a_label "BUY @"
-           ; col_right 8 a_label "Δ BUY"
+           ; col w_lqty a_label "L QTY"
+           ; col_right w_buy a_label "BUY @"
+           ; col_right w_dbuy a_label "Δ BUY"
            ; col 17 a_label "SPOT DIST"
-           ; col_right 8 a_label "Δ SELL"
-           ; col_right 12 a_label "SELL @"
-           ; I.string a_border " │ "
+           ; col_right w_dsell a_label "Δ SELL"
+           ; col_right w_sell a_label "SELL @"
+           ; col_right w_sells a_label "SELLS"
+           ; I.string a_border "│ "
            ; col_right w_hold_qty a_label "HOLD QTY"
            ; col_right w_hold_val a_label "HOLD VAL"
            ; col_right w_accum_qty a_label "ACCUM QTY"
@@ -335,8 +361,8 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let a_near_fill_green = A.(t.a_near_fill_green ++ bg c_near_fill) in
     let a_near_sell_red = A.(t.a_near_sell_red ++ bg c_near_sell) in
     let exch_sym_attr ?dim exch = A.(Theme.exch_sym_attr ?dim exch ++ bg bg_color) in
-    let col w attr s = I.string attr (pad_right w s) in
-    let col_right w attr s = I.string attr (pad_left w s) in
+    let col w attr s = I.string attr (pad_right w (truncate_string w s)) in
+    let col_right w attr s = I.string attr (pad_left w (truncate_string w s)) in
     let close_row w img = close_row w img in
     let cursor_img =
       if is_selected
@@ -451,6 +477,11 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       | Some sp -> format_price sp, if flash_grid_sell then a_near_sell_red else a_yellow
       | None -> "--", a_dim
     in
+    let sell_count_str, sell_count_attr =
+      if s.sell_count > 0
+      then add_commas (string_of_int s.sell_count), a_yellow
+      else "0", a_dim
+    in
     let row_text = a_text in
     let sym_attr = exch_sym_attr exchange in
     let p_fg =
@@ -465,7 +496,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let price_cell =
       I.hcat
         [ I.string p_border_attr "["
-        ; col_right 10 row_text price_str
+        ; col_right (w_price - 2) row_text price_str
         ; I.string p_border_attr "]"
         ]
     in
@@ -475,21 +506,24 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         w
         (I.hcat
            [ cursor_img
-           ; I.string A.(bg bg_color) "  "
-           ; col 14 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 8 symbol) exch_tag)
+           ; I.string A.(bg bg_color) " "
+           ; col
+               w_symbol
+               sym_attr
+               (Printf.sprintf "%s(%s)" (truncate_string 8 symbol) exch_tag)
            ; I.hcat [ I.string status_attr status_str; I.string a_text "  " ]
            ; price_cell
-           ; I.string a_border " │ "
-           ; col 8 short_qty_attr short_qty_str
+           ; I.string a_border "│ "
+           ; col w_sqty short_qty_attr short_qty_str
            ; I.string a_border " "
-           ; col_right 12 short_close_attr short_close_str
-           ; col_right 6 short_dist_attr short_dist_str
-           ; col_right 6 long_dist_attr long_dist_str
-           ; col_right 12 long_close_attr long_close_str
+           ; col_right w_sclose short_close_attr short_close_str
+           ; col_right w_ds short_dist_attr short_dist_str
+           ; col_right w_dl long_dist_attr long_dist_str
+           ; col_right w_lclose long_close_attr long_close_str
            ; I.string a_border " "
-           ; col 8 long_qty_attr long_qty_str
+           ; col w_lqty long_qty_attr long_qty_str
            ; col_right
-               11
+               w_buy
                (if flash_grid_buy
                 then a_near_fill_green
                 else if buy_price > 0.0
@@ -497,8 +531,9 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
                 else a_dim)
                (if buy_price > 0.0 then format_price buy_price else "--")
            ; gauge_img
-           ; col_right 11 sell_price_attr sell_price_str
-           ; I.string a_border " │ "
+           ; col_right w_sell sell_price_attr sell_price_str
+           ; col_right w_sells sell_count_attr sell_count_str
+           ; I.string a_border "│ "
            ; col_right
                w_hold_qty
                row_text
@@ -521,35 +556,36 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         w
         (I.hcat
            [ cursor_img
-           ; I.string A.(bg bg_color) "  "
+           ; I.string A.(bg bg_color) " "
            ; col
-               16
+               w_symbol
                sym_attr
                (Printf.sprintf "%s(%s)" (truncate_string 10 symbol) exch_tag)
            ; I.hcat [ I.string status_attr status_str; I.string a_text "  " ]
            ; price_cell
-           ; I.string a_border " │ "
-           ; col 9 short_qty_attr short_qty_str
+           ; I.string a_border "│ "
+           ; col w_sqty short_qty_attr short_qty_str
            ; I.string a_border " "
-           ; col_right 12 short_close_attr short_close_str
-           ; col_right 7 short_dist_attr short_dist_str
-           ; col_right 7 long_dist_attr long_dist_str
-           ; col_right 12 long_close_attr long_close_str
+           ; col_right w_sclose short_close_attr short_close_str
+           ; col_right w_ds short_dist_attr short_dist_str
+           ; col_right w_dl long_dist_attr long_dist_str
+           ; col_right w_lclose long_close_attr long_close_str
            ; I.string a_border " "
-           ; col 9 long_qty_attr long_qty_str
+           ; col w_lqty long_qty_attr long_qty_str
            ; col_right
-               12
+               w_buy
                (if flash_grid_buy
                 then a_near_fill_green
                 else if buy_price > 0.0
                 then a_green
                 else a_dim)
                (if buy_price > 0.0 then format_price buy_price else "--")
-           ; col_right 8 buy_dist_attr buy_dist_str
+           ; col_right w_dbuy buy_dist_attr buy_dist_str
            ; gauge_img
-           ; col_right 8 sell_dist_attr sell_dist_str
-           ; col_right 12 sell_price_attr sell_price_str
-           ; I.string a_border " │ "
+           ; col_right w_dsell sell_dist_attr sell_dist_str
+           ; col_right w_sell sell_price_attr sell_price_str
+           ; col_right w_sells sell_count_attr sell_count_str
+           ; I.string a_border "│ "
            ; col_right
                w_hold_qty
                row_text
@@ -651,8 +687,8 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let exch_sym_attr ?dim exch = A.(Theme.exch_sym_attr ?dim exch ++ bg bg_color) in
     let row_text = if flash_sell then a_near_sell else a_text in
     let sym_attr = if flash_sell then a_near_sell else exch_sym_attr ~dim:true exchange in
-    let col w attr s = I.string attr (pad_right w s) in
-    let col_right w attr s = I.string attr (pad_left w s) in
+    let col w attr s = I.string attr (pad_right w (truncate_string w s)) in
+    let col_right w attr s = I.string attr (pad_left w (truncate_string w s)) in
     let close_row w img = close_row w img in
     let cursor_img =
       if is_selected
@@ -673,6 +709,13 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       match closest_sell_price_opt with
       | Some sp -> format_price sp, if flash_sell then a_near_sell_red else a_yellow
       | None -> "--", a_dim
+    in
+    let sell_count_str, sell_count_attr =
+      if is_quote
+      then "--", a_dim
+      else if b.sell_count > 0
+      then add_commas (string_of_int b.sell_count), a_yellow
+      else "0", a_dim
     in
     let render_gauge b_pct s_pct =
       let half = 7 in
@@ -730,7 +773,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let price_cell =
       I.hcat
         [ I.string p_border_attr "["
-        ; col_right 10 row_text price_str
+        ; col_right (w_price - 2) row_text price_str
         ; I.string p_border_attr "]"
         ]
     in
@@ -740,23 +783,27 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         w
         (I.hcat
            [ cursor_img
-           ; I.string A.(bg bg_color) "  "
-           ; col 14 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 8 asset) exch_tag)
+           ; I.string A.(bg bg_color) " "
+           ; col
+               w_symbol
+               sym_attr
+               (Printf.sprintf "%s(%s)" (truncate_string 8 asset) exch_tag)
            ; I.hcat [ I.string status_attr status_str; I.string row_text "  " ]
            ; price_cell
-           ; I.string a_border " │ "
-           ; col 8 a_dim "--"
+           ; I.string a_border "│ "
+           ; col w_sqty a_dim "--"
            ; I.string a_border " "
-           ; col_right 12 a_dim "--"
-           ; col_right 6 a_dim "--"
-           ; col_right 6 a_dim "--"
-           ; col_right 12 a_dim "--"
+           ; col_right w_sclose a_dim "--"
+           ; col_right w_ds a_dim "--"
+           ; col_right w_dl a_dim "--"
+           ; col_right w_lclose a_dim "--"
            ; I.string a_border " "
-           ; col 8 a_dim "--"
-           ; col_right 11 a_dim "--"
+           ; col w_lqty a_dim "--"
+           ; col_right w_buy a_dim "--"
            ; gauge_img
-           ; col_right 11 sell_price_attr sell_price_str
-           ; I.string a_border " │ "
+           ; col_right w_sell sell_price_attr sell_price_str
+           ; col_right w_sells sell_count_attr sell_count_str
+           ; I.string a_border "│ "
            ; col_right w_hold_qty row_text (format_qty balance)
            ; col_right
                w_hold_val
@@ -776,25 +823,29 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         w
         (I.hcat
            [ cursor_img
-           ; I.string A.(bg bg_color) "  "
-           ; col 16 sym_attr (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag)
+           ; I.string A.(bg bg_color) " "
+           ; col
+               w_symbol
+               sym_attr
+               (Printf.sprintf "%s(%s)" (truncate_string 10 asset) exch_tag)
            ; I.hcat [ I.string status_attr status_str; I.string row_text "  " ]
            ; price_cell
-           ; I.string a_border " │ "
-           ; col 9 a_dim "--"
+           ; I.string a_border "│ "
+           ; col w_sqty a_dim "--"
            ; I.string a_border " "
-           ; col_right 12 a_dim "--"
-           ; col_right 7 a_dim "--"
-           ; col_right 7 a_dim "--"
-           ; col_right 12 a_dim "--"
+           ; col_right w_sclose a_dim "--"
+           ; col_right w_ds a_dim "--"
+           ; col_right w_dl a_dim "--"
+           ; col_right w_lclose a_dim "--"
            ; I.string a_border " "
-           ; col 9 a_dim "--"
-           ; col_right 12 a_dim "--"
-           ; col_right 8 a_dim "--"
+           ; col w_lqty a_dim "--"
+           ; col_right w_buy a_dim "--"
+           ; col_right w_dbuy a_dim "--"
            ; gauge_img
-           ; col_right 8 sell_dist_attr sell_dist_str
-           ; col_right 12 sell_price_attr sell_price_str
-           ; I.string a_border " │ "
+           ; col_right w_dsell sell_dist_attr sell_dist_str
+           ; col_right w_sell sell_price_attr sell_price_str
+           ; col_right w_sells sell_count_attr sell_count_str
+           ; I.string a_border "│ "
            ; col_right w_hold_qty row_text (format_qty balance)
            ; col_right
                w_hold_val

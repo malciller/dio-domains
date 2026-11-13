@@ -170,6 +170,7 @@ type latency_metric =
   ; p99 : float
   ; p999 : float
   ; samples : int
+  ; union_samples : int
   ; sub_us_samples : int
   ; overflow : int
   ; max_us : float
@@ -181,6 +182,15 @@ type latency_metric =
   ; window_end : float
   ; max_cause : string
   }
+
+(** Samples the published percentiles were computed over. With rolling windows this is the
+    union of the retained windows, so it is the only count that answers "is this p99
+    meaningful?"; [samples] is the newest window alone. Frames from an engine that predates
+    the field fall back to [samples]. *)
+let latency_basis (m : latency_metric) =
+  if m.union_samples > 0 then m.union_samples else m.samples
+;;
+
 
 type memory =
   { heap_mb : int
@@ -459,6 +469,7 @@ let parse_latency_metric j =
   ; p99 = j |?> "p99" |> to_float_d 0.0
   ; p999 = j |?> "p999" |> to_float_d 0.0
   ; samples = j |?> "samples" |> to_int_d 0
+  ; union_samples = j |?> "union_samples" |> to_int_d 0
   ; sub_us_samples = j |?> "sub_us_samples" |> to_int_d 0
   ; overflow = j |?> "overflow" |> to_int_d 0
   ; max_us = j |?> "max_us" |> to_float_d 0.0

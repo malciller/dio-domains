@@ -23,7 +23,7 @@ for warnings and errors.
 > dio trades real money and ships without warranty. Test on a testnet before
 > risking capital.
 
-![dio terminal dashboard](assets/dio-dashboard.gif)
+![dio terminal dashboard](.github/assets/dio-dashboard.gif)
 
 ## Quick start
 
@@ -151,7 +151,14 @@ building and running the test suite.
 Latency and allocation are observable through every phase of the cycle:
 
 - A histogram profiler reports p50, p90, p95, p99, and p999, with a nanosecond
-  tier for sub-microsecond samples.
+  tier for sub-microsecond samples. Every per-cycle stage profiles at 1us
+  resolution, and the dashboard shows the sample count behind each percentile:
+  below 1000 samples a p999 is arithmetically the window maximum, so it is not
+  drawn. Samples beyond the histogram ceiling are counted and flagged.
+- The cycle is tiled end to end (BOOK, EVENTS, GATE, PREP, STRATEGY), so the
+  region between the book read and the strategy call is attributed instead of
+  inflating TOTAL beyond the sum of its segments. Wake latency (producer signal
+  to domain resume) is profiled on its own, since no cycle span covers it.
 - A busy-spin canary detects process-wide stop-the-world pauses and scheduler
   descheduling that per-domain GC counters miss.
 - Per-cycle GC counters attribute a spike to collector activity or to CPU work.

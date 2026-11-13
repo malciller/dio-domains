@@ -706,7 +706,11 @@ let parse_gc_config json : gc_config option =
       gc_json |> member "space_overhead" |> to_int_option |> Option.value ~default:120
     in
     let max_overhead =
-      gc_json |> member "max_overhead" |> to_int_option |> Option.value ~default:1_000_000
+      (* Compaction backstop. 1_000_000 is the "never compact" sentinel: with it the heap
+         keeps whatever slack fragmentation created and every major slice scans that slack.
+         500 (compact when free space exceeds 5x live) only fires on real fragmentation, and
+         is affordable now that the latency histograms no longer hold ~150MB live. *)
+      gc_json |> member "max_overhead" |> to_int_option |> Option.value ~default:500
     in
     let major_heap_increment =
       gc_json

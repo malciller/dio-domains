@@ -398,6 +398,7 @@ let snap
   ; p99
   ; p999 = 0.0
   ; samples
+  ; union_samples = samples
   ; sub_us_samples = 0
   ; overflow = 0
   ; max_us
@@ -472,6 +473,7 @@ let test_rolling_aggregates_windows () =
   done;
   let s1 = LP.snapshot_and_reset t in
   Alcotest.(check int) "window 1 samples" 10 s1.samples;
+  Alcotest.(check int) "window 1 union is the window" 10 s1.union_samples;
   Alcotest.(check (float 0.1)) "window 1 p50" 10.0 s1.p50;
   (* Window 2: 10 samples at 20us; percentiles cover the rolling union but [samples] stays
      per-window (so a spike alarms once, not for every window it remains in). *)
@@ -480,6 +482,9 @@ let test_rolling_aggregates_windows () =
   done;
   let s2 = LP.snapshot_and_reset t in
   Alcotest.(check int) "samples stay per-window" 10 s2.samples;
+  (* Percentiles cover both retained windows, so the basis - not [samples] - is the count a
+     consumer must use to decide whether a p99/p999 is meaningful. *)
+  Alcotest.(check int) "union spans both windows" 20 s2.union_samples;
   Alcotest.(check (float 0.1)) "window 2 p50 is the union's lower half" 10.0 s2.p50;
   (* Window 3: 10 samples at 30us; union median is now 20us. *)
   for _ = 1 to 10 do
@@ -490,7 +495,26 @@ let test_rolling_aggregates_windows () =
   (* Window 4 is empty: the oldest (10us) evicts, leaving 20us + 30us. *)
   let s4 = LP.snapshot_and_reset t in
   Alcotest.(check int) "empty window reports zero current samples" 0 s4.samples;
+  Alcotest.(check int) "union still spans the retained windows" 20 s4.union_samples;
   Alcotest.(check (float 0.1)) "window 4 p50 evicts the oldest" 20.0 s4.p50
+;;
+
+(** The stage geometry is a memory decision: (3 + rolling) copies of every bucket are live
+    major-heap words, and the major GC scans them. Pin the reduction so it cannot silently
+    drift back. *)
+let test_stage_geometry () =
+  Alcotest.(check int) "stage ceiling is 2ms" 2_000 LP.stage_max_latency_us;
+  Alcotest.(check int) "stage rolling depth is 4" 4 LP.stage_rolling_windows;
+  let before = LP.create ~bucket_us:1 ~max_latency_us:10_000 ~rolling_windows:8 "before" in
+  let now = LP.create_stage "now" in
+  let before_w = LP.storage_words before in
+  let now_w = LP.storage_words now in
+  Alcotest.(check bool)
+    (Printf.sprintf "stage histogram at least 4x smaller (%d -> %d words)" before_w now_w)
+    true
+    (before_w >= 4 * now_w);
+  (* 2000 coarse + 1000 ns buckets x 7 copies. *)
+  Alcotest.(check int) "stage storage words" 21_000 now_w
 ;;
 
 let test_rolling_peak_time_identifies_window () =
@@ -675,7 +699,8 @@ let () =
             test_shared_rotation_loses_nothing
         ] )
     ; ( "rolling window"
-      , [ test_case "aggregates and evicts windows" `Quick test_rolling_aggregates_windows
+      , [ test_case "stage geometry stays small" `Quick test_stage_geometry
+        ; test_case "aggregates and evicts windows" `Quick test_rolling_aggregates_windows
         ; test_case
             "peak time names the window that holds it"
             `Quick

@@ -197,7 +197,11 @@ let json_of_row ~(now : float) ~(sha : string) (r : row) =
     [ "t", `Float now
     ; "d", `String r.domain
     ; "s", `String r.stage
-    ; "n", `Int s.Latency_profiler.samples
+    ; ( "n"
+      , `Int
+          (if s.Latency_profiler.union_samples > 0
+           then s.Latency_profiler.union_samples
+           else s.Latency_profiler.samples) )
     ; "p50", `Float s.Latency_profiler.p50
     ; "p99", `Float s.Latency_profiler.p99
     ; "p999", `Float s.Latency_profiler.p999

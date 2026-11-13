@@ -31,7 +31,7 @@
   "gc": {
     "minor_heap_size": 1048576,
     "space_overhead": 120,
-    "max_overhead": 1000000,
+    "max_overhead": 500,
     "window_size": 10,
     "allocation_policy": 2,
     "major_heap_increment": 1048576

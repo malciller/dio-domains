@@ -145,7 +145,7 @@ let render_kpi_cards w (s : Snapshot.t) =
       let fresh =
         m.window_end > 0.0 && snapshot_ts > 0.0 && snapshot_ts -. m.window_end < 600.0
       in
-      m.p50, m.p99, fresh && m.samples > 0
+      m.p50, m.p99, fresh && Snapshot.latency_basis m > 0
     | None -> 0.0, 0.0, false
   in
   (* Oracle pass thresholds: yellow > 5s, red > 30s. A pass normally completes in a few

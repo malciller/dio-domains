@@ -51,10 +51,28 @@ let update_hist symbol metric p99 =
     event-driven metrics (signer, ws ping, rest request) keep their last value instead of
     flipping back to "idle". Only windows with samples refresh it; zero-sample windows
     keep prior values rendered dimmed. Clears when it exceeds [last_vals_max] entries. *)
-let last_vals : (string * string, float * float * float) Hashtbl.t = Hashtbl.create 64
+let last_vals : (string * string, float * float * float * int) Hashtbl.t =
+  Hashtbl.create 64
+;;
 
 let last_vals_max = 256
 let last_value symbol metric = Hashtbl.find_opt last_vals (symbol, metric)
+
+(** Compact sample count for a table cell: 4 columns, so 10000+ collapses to "12k" and a
+    non-zero overflow replaces the last column with "+" rather than widening the cell. *)
+let format_samples ?(overflow = 0) n =
+  let s = if n >= 10_000 then Printf.sprintf "%dk" (n / 1000) else string_of_int n in
+  if overflow <= 0
+  then s
+  else if String.length s < 4
+  then s ^ "+"
+  else String.sub s 0 3 ^ "+"
+;;
+
+(** A percentile needs ten observations above its rank to mean anything: p99 at ~1000
+    samples, p999 at ~10,000. Below 1000 a p999 is arithmetically the window maximum, so
+    the cell is left blank and the adjacent count carries the truth. *)
+let p999_min_samples = 1_000
 
 (** Current rolling p99 history for a (symbol, metric), or a zeroed array. *)
 let hist_of symbol metric =
@@ -71,7 +89,7 @@ let ingest (snapshot : Snapshot.t) =
     (fun (_symbol, metrics) ->
       List.iter
         (fun (label, (m : Snapshot.latency_metric)) ->
-          if m.samples > 0 then ignore (update_hist _symbol label m.p99))
+          if Snapshot.latency_basis m > 0 then ignore (update_hist _symbol label m.p99))
         metrics)
     snapshot.latencies
 ;;
@@ -99,12 +117,14 @@ type metric_group =
     - INTERNAL: per-asset work. [oracle] is the capital-oracle's per-asset analysis pass
       (own ~5 min cadence, outside the per-cycle span). [orderbook] -> [execution] ->
       [prep] -> [strategy] are the four sequential segments of one cycle; [cycle] is their
-      sum. All are in-process work with the same sub-10us target. A perp leg that runs
-      inside its owner's domain (a generic overlay instance, or a carry controller sharing
-      the hedge grid's domain) gets its own nested row keyed by venue. Its passes are
-      charged to what woke them - [orderbook] for a book tick, [execution] for a fill,
-      [strategy] otherwise - with its setup and persistence under [prep]. Its span is
-      charged to the owner's STRATEGY cell, not PREP; the nested row breaks it down.
+      sum, which is why truncating the page must never drop it. The [gate] segment (book
+      read -> strategy call) rides on NATIVE so this page stays six columns wide. All are
+      in-process work with the same sub-10us target. A perp leg that runs inside its
+      owner's domain (a generic overlay instance, or a carry controller sharing the hedge
+      grid's domain) gets its own nested row keyed by venue. Its passes are charged to
+      what woke them - [orderbook] for a book tick, [execution] for a fill, [strategy]
+      otherwise - with its setup and persistence under [prep]. Its span is charged to the
+      owner's STRATEGY cell, not PREP; the nested row breaks it down.
     - NETWORK: per-domain network/request latencies (ws ping RTT, ws feed one-way latency,
       REST round-trip, signer time). These measure exchange round-trips and feed transit,
       not in-process work, and carry their own budgets. *)
@@ -116,13 +136,13 @@ let metric_pages =
     ; trend_max_us = 100.0
     }
   ; { page_label = "NETWORK"
-    ; metrics = [ "ws_ping"; "ws_feed"; "rest_request"; "signer" ]
+    ; metrics = [ "e2e"; "wake"; "ws_ping"; "ws_feed"; "rest_request"; "signer" ]
     ; trend_metric = "ws_feed"
     ; trend_label = "(FEED P99)"
     ; trend_max_us = 200_000.0
     }
   ; { page_label = "NATIVE"
-    ; metrics = [ "native_res"; "native_bridge"; "native_run"; "native_actions" ]
+    ; metrics = [ "native_res"; "native_bridge"; "native_run"; "native_actions"; "gate" ]
     ; trend_metric = "native_run"
     ; trend_label = "(NATIVE P99)"
     ; trend_max_us = 200.0
@@ -166,6 +186,17 @@ let page_trend_label i =
     test_dashboard_holdings. *)
 let trend_col_w = 12
 
+(** Widths of one percentile cell and of the sample-count cell that follows them. 7 fits
+    every [Theme.format_latency_us] output ("1.2ms", "999µs", "123ns"); 4 fits the compact
+    count. *)
+let metric_cell_w = 7
+
+let samples_cell_w = 4
+
+(** Gutter between the p999 and sample cells: without it the count reads as a fourth
+    percentile. *)
+let samples_gap_w = 1
+
 (** Short display header per latency metric: ORACLE (the separate analysis-pass metric),
     then the cycle segments BOOK -> EVENTS -> PREP -> STRATEGY, then TOTAL (the whole
     cycle). *)
@@ -173,9 +204,12 @@ let short_label = function
   | "oracle" -> "ORACLE"
   | "orderbook" -> "BOOK"
   | "execution" -> "EVENTS"
+  | "gate" -> "GATE"
   | "prep" -> "PREP"
   | "strategy" -> "STRATEGY"
   | "cycle" -> "TOTAL"
+  | "e2e" -> "E2E"
+  | "wake" -> "WAKE"
   | "ws_ping" -> "PING"
   | "ws_feed" -> "FEED"
   | "rest_request" -> "REST"
@@ -226,6 +260,10 @@ let render_latency_title w (snapshot : Snapshot.t) =
       ; I.string t.a_text (Printf.sprintf "%d MB" snapshot.memory.heap_mb)
       ; I.string t.a_dim " · LIVE "
       ; I.string t.a_text (Printf.sprintf "%d MB" (snapshot.memory.live_kb / 1024))
+        (* The sample column is the percentile basis: with rolling windows it spans
+           several windows, so it is the only honest denominator for p99/p999. A trailing
+           "+" marks samples above the histogram ceiling (counted, not lost). *)
+      ; I.string t.a_dim " · n=samples (+ over range)"
       ]
   in
   let prefix =
@@ -358,9 +396,13 @@ let render_latencies w (snapshot : Snapshot.t) =
     let latency_thresholds label =
       match label with
       | "cycle" -> 50.0, 100.0
-      | "oracle" | "orderbook" | "prep" | "strategy" | "execution" -> 10.0, 20.0
+      | "oracle" | "orderbook" | "gate" | "prep" | "strategy" | "execution" -> 10.0, 20.0
       | "native_run" -> 5.0, 10.0
       | "native_bridge" | "native_actions" | "native_res" -> 50.0, 100.0
+      (* Application-layer latency: tick published by the feed thread -> decision
+         finished, and the wake half of it (futex round-trip plus the scheduler). *)
+      | "e2e" -> 100.0, 500.0
+      | "wake" -> 50.0, 200.0
       | "ws_ping" -> 20_000.0, 100_000.0
       | "ws_feed" -> 50_000.0, 200_000.0
       | "rest_request" -> 100_000.0, 500_000.0
@@ -391,10 +433,24 @@ let render_latencies w (snapshot : Snapshot.t) =
           ordered_rows
     in
     let n_metrics = List.length page.metrics in
-    let full_page_w = 62 + (27 * (n_metrics - 1)) in
-    let page_cols = if w < full_page_w then take_first 2 page.metrics else page.metrics in
+    let metric_block_w = (3 * metric_cell_w) + samples_gap_w + samples_cell_w in
+    (* Fit as many whole columns as the terminal allows instead of falling back to two: a
+       narrower window should lose the tail of the page, not every metric after the
+       second. *)
+    let fits = 1 + max 0 ((w - 62) / (metric_block_w + 3)) in
+    let page_cols =
+      if n_metrics <= fits
+      then page.metrics
+      else (
+        (* Truncate from the tail, but never drop the column the trend plots: on INTERNAL
+           that is TOTAL, and losing the whole cycle while its sparkline still shows it is
+           the most confusing way to run out of width. *)
+        let head = take_first (max 1 (fits - 1)) page.metrics in
+        if List.exists (String.equal page.trend_metric) head
+        then head
+        else head @ [ page.trend_metric ])
+    in
     let page_labels = List.map short_label page_cols in
-    let metric_cell_w = 8 in
     (* Two-row header: metric names on the first row, p50/p99/p999 sub-headers on the
        second. *)
     let header_row1 =
@@ -408,9 +464,9 @@ let render_latencies w (snapshot : Snapshot.t) =
          @ List.mapi
              (fun i lbl ->
                let len = String.length lbl in
-               let pad = (24 - len) / 2 in
+               let pad = (metric_block_w - len) / 2 in
                let s = String.make pad ' ' ^ lbl in
-               let img = col 24 t.a_label s in
+               let img = col metric_block_w t.a_label s in
                if i = 0 then img else I.hcat [ I.string t.a_border " │ "; img ])
              page_labels)
     in
@@ -429,6 +485,8 @@ let render_latencies w (snapshot : Snapshot.t) =
                    [ col_right metric_cell_w t.a_dim "p50"
                    ; col_right metric_cell_w t.a_dim "p99"
                    ; col_right metric_cell_w t.a_dim "p999"
+                   ; I.string t.a_dim (String.make samples_gap_w ' ')
+                   ; col_right samples_cell_w t.a_dim "n"
                    ]
                in
                if i = 0 then img else I.hcat [ I.string t.a_border " │ "; img ])
@@ -487,20 +545,26 @@ let render_latencies w (snapshot : Snapshot.t) =
             I.hcat (I.string a_dim (String.make empty_w ' ') :: blocks)
           in
           let mlist = metrics in
+          (* The percentile basis, not the newest window's count: with rolling windows the
+             published percentiles span several windows, so a per-window count understates
+             them by up to the rolling depth. Frames from an engine that predates the
+             field fall back to the per-window count. *)
+          let basis = Snapshot.latency_basis in
           let find_metric label =
             match List.assoc_opt label mlist with
-            | Some (m : Snapshot.latency_metric) -> m.p50, m.p99, m.p999, m.samples
-            | None -> 0.0, 0.0, 0.0, 0
+            | Some (m : Snapshot.latency_metric) ->
+              m.p50, m.p99, m.p999, basis m, m.overflow
+            | None -> 0.0, 0.0, 0.0, 0, 0
           in
           let worst_sev =
             List.fold_left
               (fun worst label ->
-                let _, p99, _, samples = find_metric label in
+                let _, p99, _, samples, _ = find_metric label in
                 if samples > 0
                 then max worst (severity label p99 samples)
                 else (
                   match last_value key label with
-                  | Some (_, lp99, _) -> max worst (severity_of_value label lp99)
+                  | Some (_, lp99, _, _) -> max worst (severity_of_value label lp99)
                   | None -> worst))
               0
               page_cols
@@ -509,54 +573,51 @@ let render_latencies w (snapshot : Snapshot.t) =
           let metric_cells =
             List.mapi
               (fun i label ->
-                let p50, p99, p999, samples = find_metric label in
-                let img =
-                  if samples > 0
+                let p50, p99, p999, samples, overflow = find_metric label in
+                let fresh = samples > 0 in
+                let p50, p99, p999, samples, overflow, stale =
+                  if fresh
                   then (
-                    Hashtbl.replace last_vals (key, label) (p50, p99, p999);
-                    let s50 = severity label p50 samples in
-                    let s99 = max s50 (severity label p99 samples) in
-                    let s999 = max s99 (severity label p999 samples) in
-                    I.hcat
-                      [ col_right
-                          metric_cell_w
-                          (latency_cell_attr (attr_of_sev s50) p50)
-                          (format_latency_us p50)
-                      ; col_right
-                          metric_cell_w
-                          (latency_cell_attr (attr_of_sev s99) p99)
-                          (format_latency_us p99)
-                      ; col_right
-                          metric_cell_w
-                          (latency_cell_attr (attr_of_sev s999) p999)
-                          (format_latency_us p999)
-                      ])
+                    Hashtbl.replace last_vals (key, label) (p50, p99, p999, samples);
+                    p50, p99, p999, samples, overflow, false)
                   else (
                     match last_value key label with
-                    | Some (lp50, lp99, lp999) ->
-                      let s50 = severity_of_value label lp50 in
-                      let s99 = max s50 (severity_of_value label lp99) in
-                      let s999 = max s99 (severity_of_value label lp999) in
-                      I.hcat
-                        [ col_right
-                            metric_cell_w
-                            (latency_cell_attr (attr_of_sev s50) lp50)
-                            (format_latency_us lp50)
-                        ; col_right
-                            metric_cell_w
-                            (latency_cell_attr (attr_of_sev s99) lp99)
-                            (format_latency_us lp99)
-                        ; col_right
-                            metric_cell_w
-                            (latency_cell_attr (attr_of_sev s999) lp999)
-                            (format_latency_us lp999)
-                        ]
-                    | None ->
-                      (* No window and no remembered value: the row has no data for this
-                         metric (a perp leg has no oracle pass). *)
-                      let cell_w = 3 * metric_cell_w in
-                      let pad = (cell_w - 4) / 2 in
-                      col cell_w a_dim (String.make pad ' ' ^ "idle"))
+                    | Some (lp50, lp99, lp999, ln) -> lp50, lp99, lp999, ln, 0, true
+                    | None -> 0.0, 0.0, 0.0, 0, 0, false)
+                in
+                (* p999 is a percentile only once the basis holds 1000 samples: below that
+                   ceil(0.999*n) = n, so the number is the window maximum wearing a
+                   percentile's name. Keep the cell width and draw a dash instead. *)
+                let p999_shown = samples >= p999_min_samples in
+                let value_cell v shown =
+                  if stale
+                  then col_right metric_cell_w a_dim (format_latency_us v)
+                  else if shown
+                  then
+                    col_right
+                      metric_cell_w
+                      (latency_cell_attr (attr_of_sev (severity_of_value label v)) v)
+                      (format_latency_us v)
+                  else col_right metric_cell_w a_dim "-"
+                in
+                let img =
+                  if fresh || stale
+                  then
+                    I.hcat
+                      [ value_cell p50 true
+                      ; value_cell p99 true
+                      ; value_cell p999 p999_shown
+                      ; I.string A.(bg bg_color) (String.make samples_gap_w ' ')
+                      ; col_right
+                          samples_cell_w
+                          (if overflow > 0 then a_red else if stale then a_dim else a_text)
+                          (format_samples ~overflow samples)
+                      ]
+                  else (
+                    (* No window and no remembered value: the row has no data for this
+                       metric (a perp leg has no oracle pass). *)
+                    let pad = (metric_block_w - 4) / 2 in
+                    col metric_block_w a_dim (String.make pad ' ' ^ "idle"))
                 in
                 if i = 0 then img else I.hcat [ I.string a_border " │ "; img ])
               page_cols

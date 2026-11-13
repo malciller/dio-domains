@@ -205,6 +205,26 @@ let test_latency_format () =
   Alcotest.(check bool) "zero is not sub-us" false (Dashboard_ui.Theme.is_sub_us 0.0)
 ;;
 
+(** The sample column tells you whether a percentile means anything, so its formatting has
+    to stay inside four columns and mark overflow. *)
+let test_sample_column () =
+  let open Dashboard_ui in
+  Alcotest.(check string) "exact count" "312" (Latencies.format_samples 312);
+  Alcotest.(check string)
+    "overflow folds into the cell"
+    "312+"
+    (Latencies.format_samples ~overflow:3 312);
+  Alcotest.(check string)
+    "four-digit counts keep the marker"
+    "123+"
+    (Latencies.format_samples ~overflow:1 1234);
+  Alcotest.(check string) "wide counts collapse" "12k" (Latencies.format_samples 12_345);
+  Alcotest.(check int)
+    "p999 is gated at 1000 samples"
+    1000
+    Latencies.p999_min_samples
+;;
+
 (** One latency window fixture (fresh relative to the snapshot timestamp). *)
 let latency_snapshot () =
   `Assoc
@@ -214,6 +234,7 @@ let latency_snapshot () =
     ; "p99", `Float 5.0
     ; "p999", `Float 9.0
     ; "samples", `Int 10
+    ; "union_samples", `Int 10
     ; "sub_us_samples", `Int 0
     ; "overflow", `Int 0
     ; "executions", `Int 10
@@ -284,6 +305,10 @@ let test_latency_pages () =
      && List.mem "native_run" native
      && List.mem "native_actions" native)
     true;
+  (* The book-read -> strategy-call segment moved off INTERNAL so that page fits six
+     columns, and TOTAL stays on it: truncation must never drop the column the trend
+     plots. *)
+  Alcotest.(check bool) "GATE rides on NATIVE" (List.mem "gate" native) true;
   (* Navigation wraps in both directions. *)
   Latencies.next_page ();
   Alcotest.(check int) "next -> NETWORK" 1 (Latencies.current_page_index ());
@@ -470,6 +495,60 @@ let test_overlay_latency_row () =
     "both perp legs of one asset keep their own row"
     (count_sub text "\226\134\179BTC")
     2
+;;
+
+(** The p999 cell is a percentile only once its basis holds 1000 samples. Below that the
+    number is arithmetically the window maximum, so it must not be drawn; the count is shown
+    instead, and the overflow marker flags samples past the histogram ceiling. *)
+let test_latency_sample_gate () =
+  let open Dashboard_ui in
+  let window ~union_samples ~overflow =
+    `Assoc
+      [ "name", `String "gate"
+      ; "p50", `Float 1.0
+      ; "p90", `Float 2.0
+      ; "p99", `Float 5.0
+      ; "p999", `Float 4321.0
+      ; "samples", `Int 10
+      ; "union_samples", `Int union_samples
+      ; "sub_us_samples", `Int 0
+      ; "overflow", `Int overflow
+      ; "max_us", `Float 4321.0
+      ; "executions", `Int 10
+      ; "executions_per_sec", `Float 2.0
+      ; "last_exec_time", `Float 999.0
+      ; "window_start", `Float 900.0
+      ; "window_end", `Float 999.0
+      ; "max_cause", `Null
+      ]
+  in
+  let render ?(page = 0) union_samples overflow =
+    let snap = window ~union_samples ~overflow in
+    let json =
+      `Assoc
+        [ "timestamp", `Float 1000.0
+        ; "strategies", `Assoc [ "BTC/USDC", `Assoc [ "exchange", `String "hyperliquid" ] ]
+        ; "latencies", `Assoc [ "BTC/USDC", `Assoc [ "oracle", snap ] ]
+        ]
+    in
+    Latencies.set_page page;
+    render_to_text (Latencies.render_latencies 180 (Snapshot.of_json json))
+  in
+  let thin = render 40 0 in
+  Alcotest.(check bool) "p999 hidden below 1000 samples" (contains_sub thin "4.3ms") false;
+  Alcotest.(check bool) "sample count drawn" (contains_sub thin "40") true;
+  let deep = render 5_000 0 in
+  Alcotest.(check bool) "p999 drawn above the floor" (contains_sub deep "4.3ms") true;
+  Alcotest.(check bool) "count still drawn" (contains_sub deep "5000") true;
+  let over = render 40 7 in
+  Alcotest.(check bool) "overflow marked in the count" (contains_sub over "40+") true;
+  (* Six columns on INTERNAL, and the TOTAL column must survive truncation because it is
+     what the trend plots. The gate segment lives on NATIVE. *)
+  Alcotest.(check bool) "INTERNAL keeps TOTAL" (contains_sub thin "TOTAL") true;
+  Alcotest.(check bool) "INTERNAL has no GATE column" (contains_sub thin "GATE") false;
+  let native_page = render ~page:2 40 0 in
+  Alcotest.(check bool) "GATE column moved to NATIVE" (contains_sub native_page "GATE") true;
+  Latencies.set_page 0
 ;;
 
 (* A venue reached only through an overlay instance (a Lighter perp funded by a spot grid
@@ -680,6 +759,8 @@ let () =
             "sub-microsecond latencies display at ns level"
             `Quick
             test_latency_format
+        ; Alcotest.test_case "sample column format" `Quick test_sample_column
+        ; Alcotest.test_case "p999 gated on the sample basis" `Quick test_latency_sample_gate
         ] )
     ; ( "latency pages"
       , [ Alcotest.test_case "page navigation wraps both ways" `Quick test_latency_pages

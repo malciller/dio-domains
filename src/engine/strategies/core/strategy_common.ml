@@ -105,22 +105,43 @@ type carry_order_meta =
       releasing early at worst re-sends a close the venue rejects harmlessly. *)
   }
 
-let carry_registry_mutex = Mutex.create ()
+(* Carry-order lookup runs twice per execution event on the trading domain, and the
+   registration side runs on the supervisor's Lwt thread. One process-wide mutex
+   serialised them, so a fill burst could wait behind an ack handler on another thread -
+   inside the measured GATE/STRATEGY span.
+
+   The id -> meta index is sharded: every order-id operation locks only its key's shard,
+   so lookups for different orders never serialise. [carry_pending] stays a single table
+   because it is touched on placement/ack, not per fill, and it is always locked *before*
+   a shard (never the reverse), so the two locks cannot deadlock. *)
+let carry_shard_count = 16
+let carry_shard_mask = carry_shard_count - 1
+let carry_shard_of key = Hashtbl.hash key land carry_shard_mask
+let carry_pending_mutex = Mutex.create ()
 let carry_pending : (string, carry_order_meta) Hashtbl.t = Hashtbl.create 16
 
-(** Bounded id -> meta index. The keyspace is every venue order id ever registered, which
-    is unbounded because an amend replaces the id. [Fifo_index] tracks admission
+(** Bounded id -> meta indexes. The keyspace is every venue order id ever registered,
+    which is unbounded because an amend replaces the id. [Fifo_index] tracks admission
     separately from map membership, so retiring an id out of band cannot make a later
-    re-insert double-queue and evict a live row; its FIFO queue still needs a periodic
-    [trim_carry_orders] because removals leave superseded queue records behind. *)
-let carry_orders : carry_order_meta Concurrency.Fifo_index.t =
-  Concurrency.Fifo_index.create
-    ~label:"strategy.carry_orders"
-    ~cap:Concurrency.Cache_limits.carry_order_index_cap
-    ()
+    re-insert double-queue and evict a live row; each shard's FIFO queue still needs a
+    periodic [trim_carry_orders] because removals leave superseded queue records behind. *)
+let carry_order_shard_cap =
+  max 1 (Concurrency.Cache_limits.carry_order_index_cap / carry_shard_count)
 ;;
 
-let carry_order_capacity = Concurrency.Fifo_index.cap carry_orders
+let carry_order_shards : carry_order_meta Concurrency.Fifo_index.t array =
+  Array.init carry_shard_count (fun i ->
+    Concurrency.Fifo_index.create
+      ~label:(Printf.sprintf "strategy.carry_orders.%d" i)
+      ~cap:carry_order_shard_cap
+      ())
+;;
+
+let carry_order_mutexes : Mutex.t array =
+  Array.init carry_shard_count (fun _ -> Mutex.create ())
+;;
+
+let carry_order_capacity = carry_shard_count * carry_order_shard_cap
 
 (** True only for the execution statuses that end an order's life. [New] and
     [PartiallyFilled] are live: the id -> kind mapping must survive so [order_replace]
@@ -133,7 +154,7 @@ let carry_order_terminal (status : Dio_exchange.Exchange_intf.Types.order_status
 ;;
 
 let register_pending_carry_order ~dedup_key ~market ~maker ~kind =
-  Mutex.lock carry_registry_mutex;
+  Mutex.lock carry_pending_mutex;
   Hashtbl.replace
     carry_pending
     dedup_key
@@ -143,7 +164,7 @@ let register_pending_carry_order ~dedup_key ~market ~maker ~kind =
     ; com_key = dedup_key
     ; com_at = Unix.gettimeofday ()
     };
-  Mutex.unlock carry_registry_mutex
+  Mutex.unlock carry_pending_mutex
 ;;
 
 (** Scope suffix shared by every placement key for one venue, instrument, and close class:
@@ -180,11 +201,9 @@ let has_live_carry_order
   =
   let scope = carry_scope ~exchange ~instrument ~reduce_only in
   let now = Unix.gettimeofday () in
-  Mutex.lock carry_registry_mutex;
-  (* Early exit: the fold visits every live carry order, and the common case is a hit. The
-     working set is small, so an index would cost more to keep consistent than the scan it
-     replaces; stopping at the first match removes the tail. *)
-  let found =
+  (* Early exit: the fold visits every live carry order on a shard, and the common case is
+     a hit. Each lock is held only for its own shard's fold. *)
+  let fold_hits index =
     try
       Concurrency.Fifo_index.fold
         (fun _ meta () ->
@@ -192,14 +211,22 @@ let has_live_carry_order
              && String.ends_with ~suffix:scope meta.com_key
              && now -. meta.com_at <= max_age
           then raise_notrace Exit)
-        carry_orders
+        index
         ();
       false
     with
     | Exit -> true
   in
-  Mutex.unlock carry_registry_mutex;
-  found
+  let found = ref false in
+  let i = ref 0 in
+  while !i < carry_shard_count && not !found do
+    Mutex.lock carry_order_mutexes.(!i);
+    let hit = fold_hits carry_order_shards.(!i) in
+    Mutex.unlock carry_order_mutexes.(!i);
+    found := hit;
+    incr i
+  done;
+  !found
 ;;
 
 (** Drop admission records whose row was retired out of band. [Fifo_index.evict] only pops
@@ -207,34 +234,45 @@ let has_live_carry_order
     most orders leaves one queue record per order ever seen. Called from the engine's
     periodic in-flight cleanup; returns the number dropped. *)
 let trim_carry_orders () =
-  Mutex.lock carry_registry_mutex;
-  let dropped = Concurrency.Fifo_index.trim_queue carry_orders in
-  Mutex.unlock carry_registry_mutex;
-  dropped
+  let dropped = ref 0 in
+  for i = 0 to carry_shard_count - 1 do
+    Mutex.lock carry_order_mutexes.(i);
+    dropped := !dropped + Concurrency.Fifo_index.trim_queue carry_order_shards.(i);
+    Mutex.unlock carry_order_mutexes.(i)
+  done;
+  !dropped
 ;;
 
-let set_carry_order_locked order_id meta =
-  Concurrency.Fifo_index.set carry_orders ~key:order_id ~value:meta
+(** Insert [meta] at [order_id] in [shard]. The shard's lock must be held. *)
+let set_carry_order_locked ~shard order_id meta =
+  Concurrency.Fifo_index.set carry_order_shards.(shard) ~key:order_id ~value:meta
 ;;
 
 let bind_carry_order ~dedup_key ~order_id =
   if not (String.equal dedup_key "")
   then (
-    Mutex.lock carry_registry_mutex;
+    (* Lock order is always pending -> shard; no path takes them the other way, so this
+       cannot deadlock. *)
+    Mutex.lock carry_pending_mutex;
     (match Hashtbl.find_opt carry_pending dedup_key with
      | Some meta ->
        Hashtbl.remove carry_pending dedup_key;
-       set_carry_order_locked order_id meta
+       let shard = carry_shard_of order_id in
+       Mutex.lock carry_order_mutexes.(shard);
+       set_carry_order_locked ~shard order_id meta;
+       Mutex.unlock carry_order_mutexes.(shard)
      | None -> ());
-    Mutex.unlock carry_registry_mutex)
+    Mutex.unlock carry_pending_mutex)
 ;;
 
 (** Register a replacement (amend) order id directly from the amend ack. The old id is
     retired by the caller: a venue amend produces a new id, and unless the old mapping is
     removed it keeps suppressing replacements for the same kind. *)
 let register_carry_order_id ~order_id ~market ~maker ~kind ~key =
-  Mutex.lock carry_registry_mutex;
+  let shard = carry_shard_of order_id in
+  Mutex.lock carry_order_mutexes.(shard);
   set_carry_order_locked
+    ~shard
     order_id
     { com_market = market
     ; com_maker = maker
@@ -242,38 +280,42 @@ let register_carry_order_id ~order_id ~market ~maker ~kind ~key =
     ; com_key = key
     ; com_at = Unix.gettimeofday ()
     };
-  Mutex.unlock carry_registry_mutex
+  Mutex.unlock carry_order_mutexes.(shard)
 ;;
 
 let retire_pending_carry_order ~dedup_key =
   if not (String.equal dedup_key "")
   then (
-    Mutex.lock carry_registry_mutex;
+    Mutex.lock carry_pending_mutex;
     Hashtbl.remove carry_pending dedup_key;
-    Mutex.unlock carry_registry_mutex)
+    Mutex.unlock carry_pending_mutex)
 ;;
 
+(** The per-fill read on the trading domain: one shard lock, never a process-wide one. *)
 let lookup_carry_order ~order_id =
-  Mutex.lock carry_registry_mutex;
-  let meta = Concurrency.Fifo_index.find_opt carry_orders order_id in
-  Mutex.unlock carry_registry_mutex;
+  let shard = carry_shard_of order_id in
+  Mutex.lock carry_order_mutexes.(shard);
+  let meta = Concurrency.Fifo_index.find_opt carry_order_shards.(shard) order_id in
+  Mutex.unlock carry_order_mutexes.(shard);
   meta
 ;;
 
 let retire_carry_order ~order_id =
-  Mutex.lock carry_registry_mutex;
-  Concurrency.Fifo_index.remove carry_orders order_id;
-  Mutex.unlock carry_registry_mutex
+  let shard = carry_shard_of order_id in
+  Mutex.lock carry_order_mutexes.(shard);
+  Concurrency.Fifo_index.remove carry_order_shards.(shard) order_id;
+  Mutex.unlock carry_order_mutexes.(shard)
 ;;
 
 (** Retire a carry order and return its in-flight key when tracked. The cancel ack
     releases the placement latch: the terminal event can race the ack or be dropped.
     [None] when the id was untracked. *)
 let retire_carry_order_key ~order_id =
-  Mutex.lock carry_registry_mutex;
-  let meta = Concurrency.Fifo_index.find_opt carry_orders order_id in
-  Concurrency.Fifo_index.remove carry_orders order_id;
-  Mutex.unlock carry_registry_mutex;
+  let shard = carry_shard_of order_id in
+  Mutex.lock carry_order_mutexes.(shard);
+  let meta = Concurrency.Fifo_index.find_opt carry_order_shards.(shard) order_id in
+  Concurrency.Fifo_index.remove carry_order_shards.(shard) order_id;
+  Mutex.unlock carry_order_mutexes.(shard);
   match meta with
   | Some m -> Some m.com_key
   | None -> None
@@ -414,34 +456,45 @@ let untagged_order_is_own_kind
     domain worker snapshots and resets once per latency window; the dashboard STRAT/S
     column reports actual order actions per second, not strategy-invocation cycles. *)
 module Order_actions = struct
-  let counters : (string, int Atomic.t) Hashtbl.t = Hashtbl.create 16
-  let mutex = Mutex.create ()
+  (* Sharded for the same reason as the carry index: [incr] runs on the trading domain for
+     every place/amend/cancel, inside the STRATEGY span, and the snapshot runs on the same
+     domain once per window. One global mutex put every symbol's order pushes on one lock. *)
+  let num_shards = 16
+  let shard_of symbol = Hashtbl.hash symbol land (num_shards - 1)
+
+  let counters : (string, int Atomic.t) Hashtbl.t array =
+    Array.init num_shards (fun _ -> Hashtbl.create 8)
+  ;;
+
+  let mutexes : Mutex.t array = Array.init num_shards (fun _ -> Mutex.create ())
 
   let incr symbol =
-    Mutex.lock mutex;
+    let shard = shard_of symbol in
+    Mutex.lock mutexes.(shard);
     let c =
-      match Hashtbl.find_opt counters symbol with
+      match Hashtbl.find_opt counters.(shard) symbol with
       | Some c -> c
       | None ->
         let c = Atomic.make 0 in
-        Hashtbl.add counters symbol c;
+        Hashtbl.add counters.(shard) symbol c;
         c
     in
     Atomic.incr c;
-    Mutex.unlock mutex
+    Mutex.unlock mutexes.(shard)
   ;;
 
   (** Return and zero the count for [symbol] since the last reset. *)
   let snapshot_and_reset symbol =
-    Mutex.lock mutex;
+    let shard = shard_of symbol in
+    Mutex.lock mutexes.(shard);
     let n =
-      match Hashtbl.find_opt counters symbol with
+      match Hashtbl.find_opt counters.(shard) symbol with
       | Some c ->
-        Hashtbl.remove counters symbol;
+        Hashtbl.remove counters.(shard) symbol;
         Atomic.get c
       | None -> 0
     in
-    Mutex.unlock mutex;
+    Mutex.unlock mutexes.(shard);
     n
   ;;
 end
@@ -1033,13 +1086,24 @@ module LockFreeQueue = struct
   ;;
 end
 
+(* [Domain.DLS] is flagged unsafe_multidomain because a value may be shared between a
+   domain's initial sequential phase and its runtime phase. The only DLS key here holds an
+   immutable bool that decides whether to defer a syscall, so sharing it is harmless. *)
+[@@@alert "-unsafe_multidomain"]
+
 (** Domain-safe order signal channel. Domain workers call [broadcast ()] to notify the
     supervisor's Lwt event loop that new orders are available. Implemented via a Unix
     self-pipe: a single-byte write from any domain wakes the Lwt scheduler without
     touching Lwt internals (Lwt_condition is not safe from non-Lwt domains).
 
     [pending] coalesces rapid broadcasts into one pipe write to avoid saturating the pipe
-    buffer under high order throughput. *)
+    buffer under high order throughput.
+
+    The trading domain sets [set_deferred true] for the life of its loop: its [broadcast]
+    then only sets [unsent] and the loop's [flush] performs the write after the measured
+    span, so a 1-3us syscall (and its occasional scheduler excursion) no longer lands
+    inside the STRATEGY percentile. Every other producer - the supervisor's REST path,
+    tests - keeps the immediate write, because it has no flush of its own. *)
 module OrderSignal = struct
   let read_fd, write_fd =
     let r, w = Unix.pipe ~cloexec:true () in
@@ -1077,7 +1141,29 @@ module OrderSignal = struct
      and parks forever on an order that was already enqueued. Clearing first means any
      producer in that window sees [false], writes its byte, and either the drain below
      consumes it or the next [wait_read] returns immediately. *)
-  let broadcast () = if not (Atomic.exchange pending true) then write_wake_byte ()
+  (** Set by [broadcast] when it defers the write; drained by [flush]. Deliberately not
+      [pending]: the consumer clears [pending] *before* draining, so a flush that
+      consulted it could skip the write and let the supervisor park on a queued order. *)
+  let unsent = Atomic.make false
+
+  (** Per-domain deferral. [Domain.DLS] rather than a global, so the supervisor thread's
+      own pushes keep writing the byte immediately. *)
+  let deferred : bool Domain.DLS.key = Domain.DLS.new_key (fun () -> false)
+
+  (** Defer this domain's rings to [flush]. Call once at the top of the trading loop. *)
+  let set_deferred b = Domain.DLS.set deferred b
+
+  let broadcast () =
+    if Domain.DLS.get deferred
+    then Atomic.set unsent true
+    else if not (Atomic.exchange pending true)
+    then write_wake_byte ()
+  ;;
+
+  (** Perform a deferred ring. Called at the bottom of the trading cycle, outside every
+      measured span. Writes unconditionally: a spurious byte costs one drain, while
+      consulting [pending] reintroduces the lost-wakeup window described on [unsent]. *)
+  let flush () = if Atomic.exchange unsent false then write_wake_byte ()
 
   let drain_pipe () =
     let buf = Bytes.create 64 in

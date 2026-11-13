@@ -23,6 +23,10 @@ type symbol_sync =
   { mutex : Mutex.t
   ; condition : Condition.t
   ; generation : int Atomic.t (** Monotonic count of signals ever sent. *)
+  ; signal_ns : int Atomic.t
+      (** Monotonic time of the last signal, written by the producer. The consumer reads it
+          on resume, so [now - signal_ns] is the wake cost (futex round-trip plus
+          scheduling) that no stage span covers. 0 before the first signal. *)
   }
 
 (** Immutable map of symbol sync records in one atomic cell. The [get_sync] fast path is
@@ -50,6 +54,7 @@ let[@inline] get_sync symbol =
             { mutex = Mutex.create ()
             ; condition = Condition.create ()
             ; generation = Atomic.make 0
+            ; signal_ns = Atomic.make 0
             }
           in
           if Atomic.compare_and_set syncs current (SymbolMap.add symbol fresh current)
@@ -106,9 +111,17 @@ let[@inline] aliases_of symbol = SymbolMap.find_opt symbol (Atomic.get aliases)
 let bump (sync : symbol_sync) =
   Mutex.lock sync.mutex;
   Atomic.set sync.generation (Atomic.get sync.generation + 1);
+  (* Timestamp inside the critical section, so a consumer that sees the new generation
+     always sees a timestamp at least as new. One non-allocating clock read per frame. *)
+  Atomic.set sync.signal_ns (Monotonic_clock.now_ns ());
   Condition.signal sync.condition;
   Mutex.unlock sync.mutex
 ;;
+
+(** Monotonic time of [sync]'s last signal. Paired with the time the consumer resumes, this
+    is the wake latency: the part of tick-to-decision that happens between the producer
+    publishing and the domain running again, which no measured cycle span covers. *)
+let[@inline] last_signal_ns_fast (sync : sync_handle) = Atomic.get sync.signal_ns
 
 (** Signal [symbol]'s condition variable, waking its blocked worker, and any domain aliased
     to it. The generation bump occurs under the symbol mutex, so it cannot interleave with a

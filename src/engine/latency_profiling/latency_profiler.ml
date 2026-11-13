@@ -44,6 +44,11 @@ type snapshot =
   ; p99 : float (* 99th percentile in microseconds. *)
   ; p999 : float (* 99.9th percentile in microseconds. *)
   ; samples : int (* Total samples in this window. *)
+  ; union_samples : int
+      (* Samples the percentiles above were computed over. Equals [samples] when rolling
+         is off; with rolling windows it is the union of the retained windows, which is the
+         only correct denominator for a percentile. Consumers that decide whether a p99 or
+         p999 is statistically meaningful must use this, not [samples]. *)
   ; sub_us_samples : int (* Samples below 1us, captured at ns resolution. *)
   ; overflow : int (* Overflow count in this window. *)
   ; max_us : float
@@ -192,6 +197,37 @@ let create
   ; sum_us = Array.make us_count 0
   ; sum_ns = Array.make ns_bucket_count 0
   }
+;;
+
+(** Geometry for the per-cycle stage profilers, kept here because it is a memory decision
+    as much as a resolution one.
+
+    The profiler holds the live, spare and union windows plus one array set per retained
+    ring slot - (3 + rolling) copies of every bucket - and the bucket count therefore
+    multiplies straight into live major-heap words. At the old 10k buckets x 8 rolling
+    windows a nine-profiler set was ~8MB, and a process carrying ~20 of them held ~150MB
+    live; a major-GC slice scans the live heap, so the rings were charging collector time to
+    the cycles they measured. 2000 one-microsecond buckets cover every stage budget at full
+    resolution (the spike threshold is 200us). A sample past 2ms clamps into the last bucket
+    and increments [overflow], which the dashboard surfaces rather than hiding. *)
+let stage_max_latency_us = 2_000
+let stage_rolling_windows = 4
+
+(** A stage profiler with the shared geometry. *)
+let create_stage ?(bucket_us = 1) name =
+  create
+    ~bucket_us
+    ~max_latency_us:stage_max_latency_us
+    ~rolling_windows:stage_rolling_windows
+    name
+;;
+
+(** Histogram storage held by [t] in words: the live, spare and union windows plus one
+    array set per retained ring slot. Deterministic, so a test can pin the memory geometry
+    instead of guessing at it. *)
+let storage_words t =
+  let tier_words = t.bucket_count + t.us_bucket_count + ns_bucket_count in
+  (3 + t.rolling) * tier_words
 ;;
 
 (** [record_ns t ns] records a latency in nanoseconds, bypassing the
@@ -512,6 +548,7 @@ let publish_locked t w ~now ~spike_threshold_us =
      so a low-rate symbol's percentiles rest on more than a handful of samples.
      Non-rolling: report the window alone. *)
   let ( samples
+      , union_samples
       , sub_us_samples
       , overflow
       , max_latency_ns
@@ -587,6 +624,7 @@ let publish_locked t w ~now ~spike_threshold_us =
         else 0
       in
       ( w.samples
+      , t.sum_samples
       , w.sub_us_samples
       , w.overflow
       , !maxns
@@ -612,6 +650,7 @@ let publish_locked t w ~now ~spike_threshold_us =
         else 0
       in
       ( w.samples
+      , w.samples
       , w.sub_us_samples
       , w.overflow
       , w.max_latency_ns
@@ -630,6 +669,7 @@ let publish_locked t w ~now ~spike_threshold_us =
     ; p99
     ; p999
     ; samples
+    ; union_samples
     ; sub_us_samples
     ; overflow
     ; max_us
@@ -827,6 +867,7 @@ let snapshot (prof : t) : snapshot option =
       ; p99
       ; p999
       ; samples = w.samples
+      ; union_samples = w.samples
       ; sub_us_samples = w.sub_us_samples
       ; overflow = w.overflow
       ; max_us = float w.max_latency_ns /. 1000.0

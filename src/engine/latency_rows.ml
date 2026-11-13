@@ -36,6 +36,7 @@ let canary_snapshot () =
   ; p99 = max_us
   ; p999 = max_us
   ; samples = 1
+  ; union_samples = 1
   ; sub_us_samples = 0
   ; overflow = 0
   ; max_us

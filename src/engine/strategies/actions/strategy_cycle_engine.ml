@@ -100,24 +100,27 @@ type ctx =
   ; mutable cg_base_symbol : string
   ; mutable cg_exchange_module : (module Dio_exchange.Exchange_intf.S) option
   ; mutable cg_adopt_untagged_orders : bool
+      (* Section timestamps written by [market_facts] when the owner asks for a
+         break-down: the cutover path times the fact refresh because its composition is
+         not obvious from the outside. Off by default, so the interpreter path pays one
+         branch. *)
   (** True for an overlay whose market no other strategy trades on a venue that drops the
       userref. A same-side order with a matching venue reduce-only flag is then this
       book's own resting order, adopted rather than duplicated after a restart. *)
-  (* Section timestamps written by [market_facts] when the owner asks for a break-down:
-     the cutover path times the fact refresh because its composition is not obvious from
-     the outside. Off by default, so the interpreter path pays one branch. *)
   ; mutable cg_instrument : bool
   ; cg_marks : int array
   ; cg_alloc_marks : int array
-  (* Venue capabilities resolved once by the owner. Registry lookups return a first-class
-     module, which allocates a block per call, and [market_facts] needs three of them per
-     tick. [None] means "not resolved here": the registry is used instead. *)
+      (* Venue capabilities resolved once by the owner. Registry lookups return a
+         first-class module, which allocates a block per call, and [market_facts] needs
+         three of them per tick. [None] means "not resolved here": the registry is used
+         instead. *)
   ; mutable cg_mc : (module Dio_exchange.Exchange_intf.Market_context.S) option
   ; mutable cg_capital : (module Dio_exchange.Exchange_intf.Capital_reservation.S) option
   ; mutable cg_key_coin : string
-  (** Prebuilt [exchange|coin] key for the funding and position stores, and the coin it was
-      built for. Both tables are keyed by that string, so a per-event reader that rebuilds
-      it allocates on every tick. Empty means "not resolved": build from [cg_base_symbol]. *)
+  (** Prebuilt [exchange|coin] key for the funding and position stores, and the coin it
+      was built for. Both tables are keyed by that string, so a per-event reader that
+      rebuilds it allocates on every tick. Empty means "not resolved": build from
+      [cg_base_symbol]. *)
   ; mutable cg_key_coin_for : string
   ; mutable cg_min_notional : float
   ; mutable cg_min_notional_for : string
@@ -126,14 +129,13 @@ type ctx =
       event. *)
   ; mutable cg_risk : Dio_exchange.Exchange_intf.Market_context.risk option
   ; mutable cg_risk_for : string
-  (** Per-coin risk metadata (maintenance fraction, max leverage). Venue metadata, not live
-      state: it only changes when the venue relists the instrument. *)
+  (** Per-coin risk metadata (maintenance fraction, max leverage). Venue metadata, not
+      live state: it only changes when the venue relists the instrument. *)
   ; cg_tob : float array
   (** Reused top-of-book buffer for {!get_top_of_book_into}: the accessor that returns an
       option tuple allocates one [Some] per read, and the cycle reads the book per event. *)
   ; mutable cg_venue : string
-  (** Exchange the two resolved capabilities belong to; a different one invalidates
-      them. *)
+  (** Exchange the two resolved capabilities belong to; a different one invalidates them. *)
   ; mutable cg_venue_cached : bool
   ; mutable cg_quote_free : (unit -> float) option
   (** Generation-cached tradeable quote figure for the book's quote asset, resolved once
@@ -231,7 +233,6 @@ type phase =
   | SfinLatch
   | SfinSweep
   | SfinEnd
-;;
 
 (** Per-cycle phase attribution. Cheap on the hot path: when profiling is off it just runs
     [f]; when on it reads the domain-local minor-word counter and monotonic clock and
@@ -749,8 +750,8 @@ let market_facts_io (io : Strategy_runtime.facts_io) c =
   let positions_updated_at =
     match mc with
     | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
-      (* Prefer the coin's own snapshot time: a coin published by a builder-dex poller must
-         not inherit the main dex's freshness, and vice versa. *)
+      (* Prefer the coin's own snapshot time: a coin published by a builder-dex poller
+         must not inherit the main dex's freshness, and vice versa. *)
       (match Dio_exchange.Market_context.get_position_updated_at ~exchange ~coin:base with
        | Some ts -> Some ts
        | None -> Mc.get_positions_updated_at ())
@@ -784,10 +785,10 @@ let market_facts_io (io : Strategy_runtime.facts_io) c =
     | Some (module Cr : Dio_exchange.Exchange_intf.Capital_reservation.S) ->
       Cr.get_total ()
     | None ->
-    match Dio_exchange.Exchange_intf.Registry.get_capital_reservation exchange with
-    | Some (module Cr : Dio_exchange.Exchange_intf.Capital_reservation.S) ->
-      Cr.get_total ()
-    | None -> 0.0
+      (match Dio_exchange.Exchange_intf.Registry.get_capital_reservation exchange with
+       | Some (module Cr : Dio_exchange.Exchange_intf.Capital_reservation.S) ->
+         Cr.get_total ()
+       | None -> 0.0)
   in
   mark 2;
   setstr Slots.symbol symbol;
@@ -954,64 +955,64 @@ let market_facts_io (io : Strategy_runtime.facts_io) c =
   in
   mark 4;
   (match ex with
-  | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
-    let staked =
-      try Ex.get_staked_balance ~asset:base with
-      | _ -> 0.0
-    in
-    let reserved =
-      match c.cg_state with
-      | Some s ->
-        s.staked_base <- Float.max 0.0 staked;
-        s.reserved_base
-      | None -> 0.0
-    in
-    let spot_total =
-      try Ex.get_total_balance ~asset:base with
-      | _ -> 0.0
-    in
-    let ledger_base = reserved +. staked in
-    let live_base = spot_total +. staked in
-    let hedge_base =
-      if live_base > 0.0 && live_base < ledger_base then live_base else ledger_base
-    in
-    (* A carry controller supplies its aggregate; a generic overlay instance supplies the
-       same rule over its owner and inventory legs. A plain grid keeps the local figure. *)
-    setf
-      Slots.accumulated_balance
-      (if c.cg_overlay_accumulated >= 0.0
-       then c.cg_overlay_accumulated
-       else if c.cg_inventory_override >= 0.0
-       then c.cg_inventory_override
-       else hedge_base);
-    setf Slots.spot_base_total spot_total;
-    setf
-      Slots.usdc_free
-      (match c.cg_quote_free with
-       | Some f ->
-         (try f () with
-          | _ -> 0.0)
-       | None ->
-         (try Ex.get_tradeable_balance ~asset:"USDC" with
-          | _ -> 0.0));
-    (* A perp l2Book can be keyed by the bare coin (the usual case) or, for a cross-venue
-       controller whose symbol has no matching spot pair, by the controller's pair: on
-       Hyperliquid the l2Book subscription for an ADA/XMR domain is the bare coin, but the
-       frame is filed under the domain pair, so the coin store stays empty. Try the coin,
-       then the domain symbol. For an overlay the domain symbol is frequently a *spot*
-       pair (ETH/USDC, SOL/USDC, HYPE/USDC), where the spot book is the wrong side of the
-       perp touch by the spot-perp premium; those already resolve on the coin store, so
-       the pair fallback only fires for the pair-keyed perp books. If neither exists,
-       quote the perp mark so the hedge is still priced off the perp rather than left with
-       no quote. *)
-    let overlay_controller = c.cg_overlay_accumulated >= 0.0 in
-    let fallback_mark =
-      match funding with
-      | Some f when fresh f.updated_at -> f.mark
-      | _ -> 0.0
-    in
-    let tob = c.cg_tob in
-    (if Ex.get_top_of_book_into ~symbol:base tob
+   | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+     let staked =
+       try Ex.get_staked_balance ~asset:base with
+       | _ -> 0.0
+     in
+     let reserved =
+       match c.cg_state with
+       | Some s ->
+         s.staked_base <- Float.max 0.0 staked;
+         s.reserved_base
+       | None -> 0.0
+     in
+     let spot_total =
+       try Ex.get_total_balance ~asset:base with
+       | _ -> 0.0
+     in
+     let ledger_base = reserved +. staked in
+     let live_base = spot_total +. staked in
+     let hedge_base =
+       if live_base > 0.0 && live_base < ledger_base then live_base else ledger_base
+     in
+     (* A carry controller supplies its aggregate; a generic overlay instance supplies the
+        same rule over its owner and inventory legs. A plain grid keeps the local figure. *)
+     setf
+       Slots.accumulated_balance
+       (if c.cg_overlay_accumulated >= 0.0
+        then c.cg_overlay_accumulated
+        else if c.cg_inventory_override >= 0.0
+        then c.cg_inventory_override
+        else hedge_base);
+     setf Slots.spot_base_total spot_total;
+     setf
+       Slots.usdc_free
+       (match c.cg_quote_free with
+        | Some f ->
+          (try f () with
+           | _ -> 0.0)
+        | None ->
+          (try Ex.get_tradeable_balance ~asset:"USDC" with
+           | _ -> 0.0));
+     (* A perp l2Book can be keyed by the bare coin (the usual case) or, for a cross-venue
+        controller whose symbol has no matching spot pair, by the controller's pair: on
+        Hyperliquid the l2Book subscription for an ADA/XMR domain is the bare coin, but
+        the frame is filed under the domain pair, so the coin store stays empty. Try the
+        coin, then the domain symbol. For an overlay the domain symbol is frequently
+        a *spot* pair (ETH/USDC, SOL/USDC, HYPE/USDC), where the spot book is the wrong
+        side of the perp touch by the spot-perp premium; those already resolve on the coin
+        store, so the pair fallback only fires for the pair-keyed perp books. If neither
+        exists, quote the perp mark so the hedge is still priced off the perp rather than
+        left with no quote. *)
+     let overlay_controller = c.cg_overlay_accumulated >= 0.0 in
+     let fallback_mark =
+       match funding with
+       | Some f when fresh f.updated_at -> f.mark
+       | _ -> 0.0
+     in
+     let tob = c.cg_tob in
+     if Ex.get_top_of_book_into ~symbol:base tob
      then (
        setf Slots.bid tob.(0);
        setf Slots.ask tob.(2))
@@ -1029,33 +1030,33 @@ let market_facts_io (io : Strategy_runtime.facts_io) c =
        setf Slots.ask tob.(2))
      else (
        setf Slots.bid 0.0;
-       setf Slots.ask 0.0));
-    let spot_enabled = (not overlay_controller) || c.cg_overlay_has_spot_leg in
-    let spot_symbol =
-      if overlay_controller && c.cg_overlay_spot_symbol <> ""
-      then c.cg_overlay_spot_symbol
-      else symbol
-    in
-    if spot_enabled
-    then (
-      if Ex.get_top_of_book_into ~symbol:spot_symbol tob
-      then (
-        setf Slots.spot_bid tob.(0);
-        setf Slots.spot_ask tob.(2))
-      else (
-        setf Slots.spot_bid 0.0;
-        setf Slots.spot_ask 0.0))
-    else (
-      setf Slots.spot_bid 0.0;
-      setf Slots.spot_ask 0.0)
-  | None ->
-    setf Slots.accumulated_balance 0.0;
-    setf Slots.spot_base_total 0.0;
-    setf Slots.usdc_free 0.0;
-    setf Slots.bid 0.0;
-    setf Slots.ask 0.0;
-    setf Slots.spot_bid 0.0;
-    setf Slots.spot_ask 0.0);
+       setf Slots.ask 0.0);
+     let spot_enabled = (not overlay_controller) || c.cg_overlay_has_spot_leg in
+     let spot_symbol =
+       if overlay_controller && c.cg_overlay_spot_symbol <> ""
+       then c.cg_overlay_spot_symbol
+       else symbol
+     in
+     if spot_enabled
+     then
+       if Ex.get_top_of_book_into ~symbol:spot_symbol tob
+       then (
+         setf Slots.spot_bid tob.(0);
+         setf Slots.spot_ask tob.(2))
+       else (
+         setf Slots.spot_bid 0.0;
+         setf Slots.spot_ask 0.0)
+     else (
+       setf Slots.spot_bid 0.0;
+       setf Slots.spot_ask 0.0)
+   | None ->
+     setf Slots.accumulated_balance 0.0;
+     setf Slots.spot_base_total 0.0;
+     setf Slots.usdc_free 0.0;
+     setf Slots.bid 0.0;
+     setf Slots.ask 0.0;
+     setf Slots.spot_bid 0.0;
+     setf Slots.spot_ask 0.0);
   mark 5
 ;;
 
@@ -1889,13 +1890,15 @@ let order_replace_body
                made a healthy no-op look like a rejected order. *)
             Logging.debug_f
               ~section
-              "Overlay cancel: no resting %s order on %s" kind_key instrument
+              "Overlay cancel: no resting %s order on %s"
+              kind_key
+              instrument
           else if Strategy_common.has_live_carry_order
-               ~kind:kind_key
-               ~exchange:asset.exchange
-               ~instrument
-               ~reduce_only
-               ()
+                    ~kind:kind_key
+                    ~exchange:asset.exchange
+                    ~instrument
+                    ~reduce_only
+                    ()
           then
             Logging.debug_f
               ~section
@@ -1922,7 +1925,8 @@ let order_replace_body
     then
       Logging.debug_f
         ~section
-        "Overlay cancel: no price for %s, nothing to place" dedup_key
+        "Overlay cancel: no price for %s, nothing to place"
+        dedup_key
     else
       order_place
         c
@@ -2140,8 +2144,8 @@ let buy_plan_exn c =
   | None -> failwith "strategy_cycle_engine: buy branch action without a plan"
 ;;
 
-(** Compiled guards run before the pass executes any phase, so the facts they read are
-    the previous cycle's. The plan and the state flags are fresh; decide on those. *)
+(** Compiled guards run before the pass executes any phase, so the facts they read are the
+    previous cycle's. The plan and the state flags are fresh; decide on those. *)
 let buy_gate_live c (p : Jac.buy_plan) =
   match c.cg_state with
   | None -> false
@@ -2162,8 +2166,8 @@ let buy_place_send c =
     then
       Logging.info_f
         ~section
-        "buy send suppressed for %s: the compiled guard passed on a stale fact (funded=%b \
-         capital_low=%b inflight=%b tracked=%s cooldown=%b crossing=%b)"
+        "buy send suppressed for %s: the compiled guard passed on a stale fact \
+         (funded=%b capital_low=%b inflight=%b tracked=%s cooldown=%b crossing=%b)"
         asset.symbol
         p.bp_balance_ok
         state.capital_low
@@ -2182,7 +2186,12 @@ let buy_place_send c =
         p.bp_price
         c.cg_open_buy_count;
       c.cg_buy_attempted
-      <- Jac.buy_place_send ~state ~now:c.cg_now ~asset ~qty:p.bp_qty ~buy_price:p.bp_price)
+      <- Jac.buy_place_send
+           ~state
+           ~now:c.cg_now
+           ~asset
+           ~qty:p.bp_qty
+           ~buy_price:p.bp_price)
   | _ -> ()
 ;;
 
@@ -2222,14 +2231,20 @@ let buy_place_latch_capital_low ?rt c =
          p.bp_quote_needed
      | None -> ());
     if p.bp_balance_ok
-    then
+    then (
       Logging.info_f
         ~section
         "latch suppressed for %s: the compiled guard saw a stale balance verdict, the \
          fresh plan is funded (available %.2f >= %.2f)"
         asset.symbol
         p.bp_available
-        (p.bp_price *. p.bp_qty)
+        (p.bp_price *. p.bp_qty);
+      (* The guard took the latch branch on last cycle's fact. Re-deciding on the fresh
+         plan is the whole point of this branch, so place now instead of consuming another
+         pass: on a quiet feed the next pass waits for the next book tick.
+         [buy_place_send] re-checks the live gate, so a genuinely low balance still
+         suppresses. *)
+      buy_place_send c)
     else
       Jac.buy_place_latch_capital_low
         ~state

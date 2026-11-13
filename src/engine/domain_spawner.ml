@@ -90,11 +90,14 @@ let registry_mutex = Mutex.create ()
 (** Atomic flag set to true when graceful shutdown is requested. *)
 let shutdown_requested = Atomic.make false
 
-(** Per-symbol latency profiler cache. Persists across domain restarts so ~800KB profiler
+(** Per-symbol latency profiler cache. Persists across domain restarts so the profiler
     objects are allocated once per symbol, not per asset_domain_worker invocation. *)
 type domain_profilers =
   { prof_ob : Latency_profiler.t
   ; prof_exec : Latency_profiler.t
+  ; prof_gate : Latency_profiler.t
+  ; prof_wake : Latency_profiler.t
+  ; prof_e2e : Latency_profiler.t
   ; prof_prep : Latency_profiler.t
   ; prof_strategy : Latency_profiler.t
   ; prof_cycle : Latency_profiler.t
@@ -103,6 +106,14 @@ type domain_profilers =
   ; prof_native_actions : Latency_profiler.t
   ; prof_native_res : Latency_profiler.t
   }
+
+(* Stage-profiler geometry lives in [Latency_profiler.create_stage]: 2000 one-microsecond
+   buckets x 4 rolling windows instead of 10k x 8. The rings are live major-heap words and
+   were ~150MB across the process, which the major GC then scanned on the trading domains'
+   behalf. See the comment on [stage_max_latency_us]. *)
+let create_stage_profiler ?(bucket_us = 1) name =
+  Latency_profiler.create_stage ~bucket_us name
+;;
 
 let domain_profiler_cache : (string, domain_profilers) Hashtbl.t = Hashtbl.create 8
 
@@ -132,15 +143,16 @@ let get_overlay_profiler ~owner_exchange ~owner_symbol ~id ~exchange ~symbol =
     match Hashtbl.find_opt overlay_profiler_cache key with
     | Some p -> p
     | None ->
-      let create suffix =
-        Latency_profiler.create ~rolling_windows:8 (symbol ^ ":overlay:" ^ suffix)
-      in
+      let create suffix = create_stage_profiler (symbol ^ ":overlay:" ^ suffix) in
       let p =
         { oip_exchange = Config.normalize_exchange exchange
         ; oip_symbol = symbol
         ; oip_profs =
             { prof_ob = create "ob"
             ; prof_exec = create "exec"
+            ; prof_gate = create "gate"
+            ; prof_wake = create "wake"
+            ; prof_e2e = create "e2e"
             ; prof_prep = create "prep"
             ; prof_strategy = create "strategy"
             ; prof_cycle = create "cycle"
@@ -175,6 +187,9 @@ let get_overlay_profiler_snapshots () =
       ( key
       , [ "orderbook", Latency_profiler.published_snapshot profs.prof_ob
         ; "execution", Latency_profiler.published_snapshot profs.prof_exec
+        ; "gate", Latency_profiler.published_snapshot profs.prof_gate
+        ; "wake", Latency_profiler.published_snapshot profs.prof_wake
+        ; "e2e", Latency_profiler.published_snapshot profs.prof_e2e
         ; "prep", Latency_profiler.published_snapshot profs.prof_prep
         ; "strategy", Latency_profiler.published_snapshot profs.prof_strategy
         ; "cycle", Latency_profiler.published_snapshot profs.prof_cycle
@@ -199,12 +214,13 @@ let get_controller_profiler ~exchange ~coin =
     match Hashtbl.find_opt controller_profiler_cache key with
     | Some p -> p
     | None ->
-      let create suffix =
-        Latency_profiler.create ~rolling_windows:8 (coin ^ ":carry:" ^ suffix)
-      in
+      let create suffix = create_stage_profiler (coin ^ ":carry:" ^ suffix) in
       let p =
         { prof_ob = create "ob"
         ; prof_exec = create "exec"
+        ; prof_gate = create "gate"
+        ; prof_wake = create "wake"
+        ; prof_e2e = create "e2e"
         ; prof_prep = create "prep"
         ; prof_strategy = create "strategy"
         ; prof_cycle = create "cycle"
@@ -232,6 +248,9 @@ let get_controller_profiler_snapshots () =
       ( key
       , [ "orderbook", Latency_profiler.published_snapshot profs.prof_ob
         ; "execution", Latency_profiler.published_snapshot profs.prof_exec
+        ; "gate", Latency_profiler.published_snapshot profs.prof_gate
+        ; "wake", Latency_profiler.published_snapshot profs.prof_wake
+        ; "e2e", Latency_profiler.published_snapshot profs.prof_e2e
         ; "prep", Latency_profiler.published_snapshot profs.prof_prep
         ; "strategy", Latency_profiler.published_snapshot profs.prof_strategy
         ; "cycle", Latency_profiler.published_snapshot profs.prof_cycle
@@ -250,29 +269,18 @@ let get_domain_profilers symbol =
     | Some p -> p
     | None ->
       let p =
-        { prof_ob = Latency_profiler.create ~rolling_windows:8 (symbol ^ ":ob")
-        ; prof_exec =
-            Latency_profiler.create
-              ~bucket_us:10
-              ~max_latency_us:20_000
-              ~rolling_windows:8
-              (symbol ^ ":exec")
-        ; prof_prep = Latency_profiler.create ~rolling_windows:8 (symbol ^ ":prep")
-        ; prof_strategy = Latency_profiler.create ~rolling_windows:8 (symbol ^ ":strategy")
-        ; prof_cycle =
-            Latency_profiler.create
-              ~bucket_us:10
-              ~max_latency_us:20_000
-              ~rolling_windows:8
-              (symbol ^ ":cycle")
-        ; prof_native_bridge =
-            Latency_profiler.create ~rolling_windows:8 (symbol ^ ":native_bridge")
-        ; prof_native_run =
-            Latency_profiler.create ~rolling_windows:8 (symbol ^ ":native_run")
-        ; prof_native_actions =
-            Latency_profiler.create ~rolling_windows:8 (symbol ^ ":native_actions")
-        ; prof_native_res =
-            Latency_profiler.create ~rolling_windows:8 (symbol ^ ":native_res")
+        { prof_ob = create_stage_profiler (symbol ^ ":ob")
+        ; prof_exec = create_stage_profiler (symbol ^ ":exec")
+        ; prof_gate = create_stage_profiler (symbol ^ ":gate")
+        ; prof_wake = create_stage_profiler (symbol ^ ":wake")
+        ; prof_e2e = create_stage_profiler (symbol ^ ":e2e")
+        ; prof_prep = create_stage_profiler (symbol ^ ":prep")
+        ; prof_strategy = create_stage_profiler (symbol ^ ":strategy")
+        ; prof_cycle = create_stage_profiler (symbol ^ ":cycle")
+        ; prof_native_bridge = create_stage_profiler (symbol ^ ":native_bridge")
+        ; prof_native_run = create_stage_profiler (symbol ^ ":native_run")
+        ; prof_native_actions = create_stage_profiler (symbol ^ ":native_actions")
+        ; prof_native_res = create_stage_profiler (symbol ^ ":native_res")
         }
       in
       Hashtbl.replace domain_profiler_cache symbol p;
@@ -393,6 +401,7 @@ type overlay_ladder_seed =
 (* One generic additional overlay-strategy instance running inside the owner grid's
    domain. The strategy file owns its policy; the engine owns state persistence and event
    dispatch. *)
+
 (** Remembered order intent for one dedup key. A compiled strategy emits a small fixed set
     of keys each pass (entry, take-profit), so one slot per key is enough to recognise a
     repeat. *)
@@ -428,21 +437,21 @@ type native_shadow =
   ; ns_sink : Dio_strategies.Strategy_program.sink
   ; ns_resolved : Dio_strategies.Strategy_program.resolved_slot array
   ; ns_state_slots : Dio_strategies.Strategy_program.resolved_slot array
-  (* Last value synced out of each state slot. Publishing a state value boxes it, so the
-     sync compares the unboxed env value first and touches the runtime only on a change;
-     the compiled program rewrites most of its state every pass, but only a few values
-     actually move. *)
+      (* Last value synced out of each state slot. Publishing a state value boxes it, so
+         the sync compares the unboxed env value first and touches the runtime only on a
+         change; the compiled program rewrites most of its state every pass, but only a
+         few values actually move. *)
   ; ns_sync_f : float array
   ; ns_sync_i : int array
   ; ns_sync_b : bool array
   ; ns_sync_s : string array
   (** Fact sink that writes into [ns_env] instead of the interpreter's platform table. *)
   ; ns_facts : Dio_strategies.Strategy_runtime.facts_io
-  (* Per-key memory of the last executed order intent and the venue's open-orders
-     generation right after it. A compressed overlay re-emits its resting orders on every
-     book event, and the engine's replace scans the venue's order index to discover the
-     order already matches. Skip when the intent is unchanged and the venue reports no
-     order change since the execution that settled it. *)
+      (* Per-key memory of the last executed order intent and the venue's open-orders
+         generation right after it. A compressed overlay re-emits its resting orders on
+         every book event, and the engine's replace scans the venue's order index to
+         discover the order already matches. Skip when the intent is unchanged and the
+         venue reports no order change since the execution that settled it. *)
   ; ns_memos : order_intent_memo array
   ; ns_oi_symbol : string
   ; ns_key : string (** identity in the promoted set: survives restarts *)
@@ -505,7 +514,6 @@ let sync_native_state rt (ns : native_shadow) =
     [Strategy_run], which replay and tests drive, so a live domain cannot drift from the
     path that is exercised by tests. *)
 let run_engine_phase ctx rt id = Dio_strategies.Strategy_run.run_engine_phase ctx rt id
-;;
 
 (** Execute a compiled pass for a grid instance.
 
@@ -549,19 +557,19 @@ let execute_grid_native ctx rt (ns : native_shadow) ~price:_ ~now:_ ~event:_ =
     through here, so a fill reaches the strategy file exactly as an interpreter would have
     seen it. *)
 let run_compiled_grid
-      ?(measure = false)
-      ?(prof_strategy = None)
-      ?(prof_bridge = None)
-      ?(prof_run = None)
-      ?(prof_actions = None)
-      (ctx : Dio_strategies.Strategy_cycle_engine.ctx)
-      (rt : Dio_strategies.Strategy_runtime.t)
-      (ns : native_shadow)
-      ~price
-      ~now
-      ~event
-      ~event_kind
-      ~event_fields
+  ?(measure = false)
+  ?(prof_strategy = None)
+  ?(prof_bridge = None)
+  ?(prof_run = None)
+  ?(prof_actions = None)
+  (ctx : Dio_strategies.Strategy_cycle_engine.ctx)
+  (rt : Dio_strategies.Strategy_runtime.t)
+  (ns : native_shadow)
+  ~price
+  ~now
+  ~event
+  ~event_kind
+  ~event_fields
   =
   rt.Dio_strategies.Strategy_runtime.event <- Some event;
   let t0 = if measure then Monotonic_clock.now_ns () else 0 in
@@ -582,11 +590,13 @@ let run_compiled_grid
   then (
     let t_end = Monotonic_clock.now_ns () in
     let total = t_end - t0 in
-    if total > 0 then Option.iter (fun p -> Latency_profiler.record_ns p total) prof_strategy;
+    if total > 0
+    then Option.iter (fun p -> Latency_profiler.record_ns p total) prof_strategy;
     let bridge = t_fill1 - t0 in
     let run = t_run1 - t_fill1 in
     let acts = t_end - t_run1 in
-    if bridge > 0 then Option.iter (fun p -> Latency_profiler.record_ns p bridge) prof_bridge;
+    if bridge > 0
+    then Option.iter (fun p -> Latency_profiler.record_ns p bridge) prof_bridge;
     if run > 0 then Option.iter (fun p -> Latency_profiler.record_ns p run) prof_run;
     if acts > 0 then Option.iter (fun p -> Latency_profiler.record_ns p acts) prof_actions)
 ;;
@@ -607,9 +617,9 @@ let execute_native ?(marks = [||]) ctx rt (ns : native_shadow) =
        | _ -> -1)
     | None -> -1
   in
-  (* One venue read per pass, not per intent. An execution that bumps the generation leaves
-     the other intents' stamps one interval behind, which costs a single extra pass later
-     and never skips a required one. *)
+  (* One venue read per pass, not per intent. An execution that bumps the generation
+     leaves the other intents' stamps one interval behind, which costs a single extra pass
+     later and never skips a required one. *)
   let gen_now = if orders > 0 then generation () else -1 in
   let next_order = ref 0 in
   let exec_order () =
@@ -682,109 +692,107 @@ let execute_native ?(marks = [||]) ctx rt (ns : native_shadow) =
     | Dio_strategies.Strategy_program.Cm_order -> exec_order ()
     | Cm_state -> ()
     | Cm_phase id -> run_engine_phase ctx rt id
-    | Cm_reserve amount ->
-      Dio_strategies.Strategy_cycle_engine.quote_reserve ctx ~amount
+    | Cm_reserve amount -> Dio_strategies.Strategy_cycle_engine.quote_reserve ctx ~amount
     | Cm_release -> Dio_strategies.Strategy_cycle_engine.quote_reserve ctx ~amount:0.0
     | Cm_credit (seq, qty) ->
       Dio_strategies.Strategy_cycle_engine.credit_profit ctx ~qty ~seq
   done;
   mark 1;
   mark 2;
-  (* A live instance keeps its state in the env; no engine action in an overlay pass writes
-     runtime state slots (the credit and reserve actions touch the strategy-state record and
-     the venue ledgers), so the runtime copy is not maintained at all. A shadow still needs
-     it, because the interpreter is the reference it is compared against. *)
+  (* A live instance keeps its state in the env; no engine action in an overlay pass
+     writes runtime state slots (the credit and reserve actions touch the strategy-state
+     record and the venue ledgers), so the runtime copy is not maintained at all. A shadow
+     still needs it, because the interpreter is the reference it is compared against. *)
   if not ns.ns_live then sync_native_state rt ns;
   mark 3
 ;;
 
 let make_native_shadow ~file ~symbol ~key rt =
   ignore key;
-  (
-    match Dio_strategies.Strategy_program.compile file with
-    | Error m ->
-      (* There is no interpreter to fall back to: a file the compiler cannot lower means
-         this asset does not trade. Loud, at startup, rather than a quiet second engine. *)
-      Logging.critical_f
-        ~section:"native_shadow"
-        "strategy %s failed to compile, %s will not trade: %s"
-        file.Dio_strategies.Strategy_file.name
-        symbol
-        m;
-      None
-    | Ok program ->
-      let l = program.Dio_strategies.Strategy_program.layout in
-      let env : Dio_strategies.Strategy_ir.env =
-        { floats = Array.make (max 1 l.float_count) 0.0
-        ; ints = Array.make (max 1 l.int_count) 0
-        ; bools = Array.make (max 1 l.bool_count) false
-        ; strings = Array.make (max 1 l.string_count) ""
-        ; price = 0.0
-        ; now = 0.0
-        ; event_kind = ""
-        ; event_side = ""
-        }
-      in
-      let sink = Dio_strategies.Strategy_program.create_sink () in
-      let resolved = Dio_strategies.Strategy_program.resolve program in
-      Dio_strategies.Strategy_program.fill_env_resolved
-        resolved
-        rt
-        env
-        ~price:0.0
-        ~now:0.0
-        ~event_kind:""
-        ~event_fields:[];
-      (* Startup self-check: the compiled pass cost on this host, logged once, so the
-         per-window profile can be read against a known-cold baseline. *)
-      (* Runs the file's unguarded state writes 20k times, so it must not touch the live
-         env: overlay instances fill state only at creation and would keep the values. *)
-      (let n = 20_000 in
-       let saved =
-         ( Array.copy env.Dio_strategies.Strategy_ir.floats
-         , Array.copy env.Dio_strategies.Strategy_ir.ints
-         , Array.copy env.Dio_strategies.Strategy_ir.bools
-         , Array.copy env.Dio_strategies.Strategy_ir.strings )
-       in
-       let w0 = Monotonic_clock.minor_words () in
-       let t0 = Monotonic_clock.now_ns () in
-       for _ = 1 to n do
-         Dio_strategies.Strategy_program.run program env sink
-       done;
-       let s_f, s_i, s_b, s_s = saved in
-       Array.blit s_f 0 env.Dio_strategies.Strategy_ir.floats 0 (Array.length s_f);
-       Array.blit s_i 0 env.Dio_strategies.Strategy_ir.ints 0 (Array.length s_i);
-       Array.blit s_b 0 env.Dio_strategies.Strategy_ir.bools 0 (Array.length s_b);
-       Array.blit s_s 0 env.Dio_strategies.Strategy_ir.strings 0 (Array.length s_s);
-       let t1 = Monotonic_clock.now_ns () in
-       let w1 = Monotonic_clock.minor_words () in
-       Logging.info_f
-         ~section:"native_shadow"
-         "compiled %s: %d steps, %.0f ns/pass, %.2f words/pass"
-         file.Dio_strategies.Strategy_file.name
-         (Array.length program.Dio_strategies.Strategy_program.steps)
-         (float (t1 - t0) /. float n)
-         (float (w1 - w0) /. float n));
-      Some
-        { ns_program = program
-        ; ns_env = env
-        ; ns_sink = sink
-        ; ns_resolved = resolved
-        ; ns_state_slots =
-            Array.of_list
-              (Array.to_list resolved
-               |> List.filter (fun (rs : Dio_strategies.Strategy_program.resolved_slot) ->
-                 rs.rs_scope = Dio_strategies.Strategy_expr.State))
-        ; ns_sync_f = Array.make (max 1 program.layout.float_count) nan
-        ; ns_sync_i = Array.make (max 1 program.layout.int_count) min_int
-        ; ns_sync_b = Array.make (max 1 program.layout.bool_count) false
-        ; ns_sync_s = Array.make (max 1 program.layout.string_count) ""
-        ; ns_facts = Dio_strategies.Strategy_program.env_facts_io program env rt
-        ; ns_memos = create_intent_memos 4
-        ; ns_oi_symbol = symbol
-        ; ns_key = key
-        ; ns_live = true
-        })
+  match Dio_strategies.Strategy_program.compile file with
+  | Error m ->
+    (* There is no interpreter to fall back to: a file the compiler cannot lower means
+       this asset does not trade. Loud, at startup, rather than a quiet second engine. *)
+    Logging.critical_f
+      ~section:"native_shadow"
+      "strategy %s failed to compile, %s will not trade: %s"
+      file.Dio_strategies.Strategy_file.name
+      symbol
+      m;
+    None
+  | Ok program ->
+    let l = program.Dio_strategies.Strategy_program.layout in
+    let env : Dio_strategies.Strategy_ir.env =
+      { floats = Array.make (max 1 l.float_count) 0.0
+      ; ints = Array.make (max 1 l.int_count) 0
+      ; bools = Array.make (max 1 l.bool_count) false
+      ; strings = Array.make (max 1 l.string_count) ""
+      ; price = 0.0
+      ; now = 0.0
+      ; event_kind = ""
+      ; event_side = ""
+      }
+    in
+    let sink = Dio_strategies.Strategy_program.create_sink () in
+    let resolved = Dio_strategies.Strategy_program.resolve program in
+    Dio_strategies.Strategy_program.fill_env_resolved
+      resolved
+      rt
+      env
+      ~price:0.0
+      ~now:0.0
+      ~event_kind:""
+      ~event_fields:[];
+    (* Startup self-check: the compiled pass cost on this host, logged once, so the
+       per-window profile can be read against a known-cold baseline. *)
+    (* Runs the file's unguarded state writes 20k times, so it must not touch the live
+       env: overlay instances fill state only at creation and would keep the values. *)
+    (let n = 20_000 in
+     let saved =
+       ( Array.copy env.Dio_strategies.Strategy_ir.floats
+       , Array.copy env.Dio_strategies.Strategy_ir.ints
+       , Array.copy env.Dio_strategies.Strategy_ir.bools
+       , Array.copy env.Dio_strategies.Strategy_ir.strings )
+     in
+     let w0 = Monotonic_clock.minor_words () in
+     let t0 = Monotonic_clock.now_ns () in
+     for _ = 1 to n do
+       Dio_strategies.Strategy_program.run program env sink
+     done;
+     let s_f, s_i, s_b, s_s = saved in
+     Array.blit s_f 0 env.Dio_strategies.Strategy_ir.floats 0 (Array.length s_f);
+     Array.blit s_i 0 env.Dio_strategies.Strategy_ir.ints 0 (Array.length s_i);
+     Array.blit s_b 0 env.Dio_strategies.Strategy_ir.bools 0 (Array.length s_b);
+     Array.blit s_s 0 env.Dio_strategies.Strategy_ir.strings 0 (Array.length s_s);
+     let t1 = Monotonic_clock.now_ns () in
+     let w1 = Monotonic_clock.minor_words () in
+     Logging.info_f
+       ~section:"native_shadow"
+       "compiled %s: %d steps, %.0f ns/pass, %.2f words/pass"
+       file.Dio_strategies.Strategy_file.name
+       (Array.length program.Dio_strategies.Strategy_program.steps)
+       (float (t1 - t0) /. float n)
+       (float (w1 - w0) /. float n));
+    Some
+      { ns_program = program
+      ; ns_env = env
+      ; ns_sink = sink
+      ; ns_resolved = resolved
+      ; ns_state_slots =
+          Array.of_list
+            (Array.to_list resolved
+             |> List.filter (fun (rs : Dio_strategies.Strategy_program.resolved_slot) ->
+               rs.rs_scope = Dio_strategies.Strategy_expr.State))
+      ; ns_sync_f = Array.make (max 1 program.layout.float_count) nan
+      ; ns_sync_i = Array.make (max 1 program.layout.int_count) min_int
+      ; ns_sync_b = Array.make (max 1 program.layout.bool_count) false
+      ; ns_sync_s = Array.make (max 1 program.layout.string_count) ""
+      ; ns_facts = Dio_strategies.Strategy_program.env_facts_io program env rt
+      ; ns_memos = create_intent_memos 4
+      ; ns_oi_symbol = symbol
+      ; ns_key = key
+      ; ns_live = true
+      }
 ;;
 
 type overlay_instance_rt =
@@ -823,8 +831,8 @@ type overlay_instance_rt =
   (** Generation-cached tradeable quote balance for this book's quote asset. *)
   ; mutable oir_save_at : float
   (** Last persistence snapshot. Building one is a JSON tree over the whole state, and the
-      strategy rewrites state every pass, so publish it on a short interval instead of every
-      cycle. The store write itself is already asynchronous. *)
+      strategy rewrites state every pass, so publish it on a short interval instead of
+      every cycle. The store write itself is already asynchronous. *)
   ; mutable oir_res_at : float
   (** Last reserve-share computation, and the inputs that invalidate it. The stress
       requirement moves with the position, margin and target, not with the mark tick, and
@@ -839,8 +847,7 @@ type overlay_instance_rt =
 let instance_state ov name =
   match ov.oir_native with
   | Some ns
-    when ns.ns_live
-         && Dio_strategies.Strategy_program.has_state_key ns.ns_program name ->
+    when ns.ns_live && Dio_strategies.Strategy_program.has_state_key ns.ns_program name ->
     Dio_strategies.Strategy_program.env_value ns.ns_program ns.ns_env name
   | _ -> Dio_strategies.Strategy_runtime.get_state ov.oir_rt name
 ;;
@@ -848,9 +855,8 @@ let instance_state ov name =
 let instance_platform ov name =
   match ov.oir_native with
   | Some ns
-    when ns.ns_live
-         && Dio_strategies.Strategy_program.has_platform_key ns.ns_program name ->
-    Dio_strategies.Strategy_program.env_platform_value ns.ns_program ns.ns_env name
+    when ns.ns_live && Dio_strategies.Strategy_program.has_platform_key ns.ns_program name
+    -> Dio_strategies.Strategy_program.env_platform_value ns.ns_program ns.ns_env name
   | _ -> Dio_strategies.Strategy_runtime.get_platform ov.oir_rt name
 ;;
 
@@ -1019,8 +1025,7 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
            where [market.facts] does not run, and the order path needs the module then. *)
         ctx.cg_exchange_module
         <- Dio_strategies.Strategy_venue.get_exchange_module oi.oi_exchange;
-        ctx.cg_mc
-        <- Dio_exchange.Exchange_intf.Registry.get_market_context oi.oi_exchange;
+        ctx.cg_mc <- Dio_exchange.Exchange_intf.Registry.get_market_context oi.oi_exchange;
         ctx.cg_capital
         <- Dio_exchange.Exchange_intf.Registry.get_capital_reservation oi.oi_exchange;
         ctx.cg_venue <- oi.oi_exchange;
@@ -1039,11 +1044,7 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
         let params =
           Dio_strategies.Overlay_instance_runtime.params_of_file file oi.oi_params
         in
-        let rt =
-          Dio_strategies.Strategy_runtime.create
-            ~params
-            file
-        in
+        let rt = Dio_strategies.Strategy_runtime.create ~params file in
         Dio_strategies.Overlay_instance_runtime.seed rt !state;
         Logging.info_f
           ~section
@@ -1102,10 +1103,8 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
                    ~symbol:oi.oi_symbol
                    ~self:(Some oi)
           ; oir_native = native
-          ; oir_mark_key =
-              Dio_exchange.Market_context.key_of oi.oi_exchange oi.oi_symbol
-          ; oir_venue =
-              Dio_strategies.Strategy_venue.get_exchange_module oi.oi_exchange
+          ; oir_mark_key = Dio_exchange.Market_context.key_of oi.oi_exchange oi.oi_symbol
+          ; oir_venue = Dio_strategies.Strategy_venue.get_exchange_module oi.oi_exchange
           ; oir_book_pos =
               (match Dio_strategies.Strategy_venue.get_exchange_module oi.oi_exchange with
                | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
@@ -1586,13 +1585,23 @@ let asset_domain_worker
     let tob_asize = ref nan in
     (* Event-driven flag: true when new data warrants a strategy execution *)
     let should_execute_strategy = ref true in
-    (* Quiet-market tick. A venue that stops publishing quotes while it still trades -
-       IEX after its close, prints only - would otherwise never run the strategy again:
-       the loop parks on a book/event wake and no wake ever comes. These two stamps let
-       the loop re-run a pass at 1 Hz on a price the venue last gave us, instead of
-       sitting idle until the next session. *)
+    (* Quiet-market tick. A venue that stops publishing quotes while it still trades - IEX
+       after its close, prints only - would otherwise never run the strategy again: the
+       loop parks on a book/event wake and no wake ever comes. These two stamps let the
+       loop re-run a pass at 1 Hz on a price the venue last gave us, instead of sitting
+       idle until the next session. *)
     let last_book_at = ref (Unix.gettimeofday ()) in
-    let last_quiet_tick = ref 0.0 in
+    (* Intent-driven ticking. A pass otherwise runs only on a top-of-book change, a fill,
+       or the quiet-market fallback, so a state change with no new tick (capital restored,
+       oracle reactivated, grid gate opened) would sit until the next book tick. State
+       changes bump [intent_gen]; the loop runs a pass within [intent_tick_s] of a bump it
+       has not acted on yet. The bump coalesces, so a burst of changes costs one pass, and
+       an idle domain with no pending intent never ticks. *)
+    let intent_tick_s = 0.1 in
+    let intent_gen = ref 0 in
+    let intent_ran = ref 0 in
+    let prev_capital_low = ref false in
+    let last_intent_tick = ref 0.0 in
     (* Startup gate: blocks strategy execution until the initial snapshot's execution
        events have been consumed, so handle_order_acknowledged restores order state
        (last_buy_order_id, etc.) before new placements. Applies to all exchanges. *)
@@ -1914,17 +1923,20 @@ let asset_domain_worker
     in
     let has_exec_fn = Ex.has_execution_data_fast ~symbol:asset_with_fees.symbol in
     let cycle_count = ref 0 in
-    let {
-      prof_ob;
-      prof_exec;
-      prof_prep;
-      prof_strategy;
-      prof_cycle;
-      prof_native_bridge;
-      prof_native_run;
-      prof_native_actions;
-      prof_native_res;
-    } =
+    let { prof_ob
+        ; prof_exec
+        ; prof_gate
+        ; prof_wake
+        ; prof_e2e
+        ; prof_prep
+        ; prof_strategy
+        ; prof_cycle
+        ; prof_native_bridge
+        ; prof_native_run
+        ; prof_native_actions
+        ; prof_native_res
+        }
+      =
       get_domain_profilers asset_with_fees.symbol
     in
     (* Rolling latency window: publish and reset each profiler every
@@ -1950,6 +1962,8 @@ let asset_domain_worker
         ; stages =
             [ "BOOK", prof_ob
             ; "EVENTS", prof_exec
+            ; "GATE", prof_gate
+            ; "E2E", prof_e2e
             ; "PREP", prof_prep
             ; "STRATEGY", prof_strategy
             ; "TOTAL", prof_cycle
@@ -1957,7 +1971,8 @@ let asset_domain_worker
         ; silent =
             Atomic.make
               (Order_executor.symbol_profilers asset_with_fees.symbol
-               @ [ prof_native_bridge
+               @ [ prof_wake
+                 ; prof_native_bridge
                  ; prof_native_run
                  ; prof_native_actions
                  ; prof_native_res
@@ -2210,11 +2225,7 @@ let asset_domain_worker
                c.oc_params.full_balance_ref
                ladder.ol_num_rungs
                ladder.ol_max_trail_pct;
-             let rt =
-               Dio_strategies.Strategy_runtime.create
-                      ~params
-                 overlay_file
-             in
+             let rt = Dio_strategies.Strategy_runtime.create ~params overlay_file in
              overlay_shadow
              := make_native_shadow
                   ~file:overlay_file
@@ -2236,6 +2247,9 @@ let asset_domain_worker
     let profilers_of (p : domain_profilers) =
       [ p.prof_ob
       ; p.prof_exec
+      ; p.prof_gate
+      ; p.prof_wake
+      ; p.prof_e2e
       ; p.prof_prep
       ; p.prof_strategy
       ; p.prof_cycle
@@ -2363,9 +2377,7 @@ let asset_domain_worker
              let t_bridge0 =
                if measured && cutover then Monotonic_clock.now_ns () else 0
              in
-             let a0 =
-               if t_bridge0 > 0 then Monotonic_clock.minor_words () else 0
-             in
+             let a0 = if t_bridge0 > 0 then Monotonic_clock.minor_words () else 0 in
              let t_facts0 = ref 0 in
              if cutover
              then (
@@ -2376,8 +2388,8 @@ let asset_domain_worker
                <- Some (Dio_strategies.Strategy_runtime.make_event event_name fields);
                (* The compiled path does not execute [context: market.facts], so refresh
                   the facts into its env before it reads them. Every event needs this, not
-                  just a book tick: a fill step reads the same platform facts (mark,
-                  perp margin) and would otherwise act on the last book's values. *)
+                  just a book tick: a fill step reads the same platform facts (mark, perp
+                  margin) and would otherwise act on the last book's values. *)
                if t_bridge0 > 0 then t_facts0 := Monotonic_clock.now_ns ();
                ov.oir_ctx.cg_instrument <- t_bridge0 > 0;
                Dio_strategies.Strategy_cycle_engine.market_facts_io
@@ -2422,7 +2434,8 @@ let asset_domain_worker
                  let order = [| 0; 1; 2; 6; 7; 3; 4; 5 |] in
                  let segs arr =
                    Array.init 7 (fun i ->
-                     let a = order.(i) and b = order.(i + 1) in
+                     let a = order.(i)
+                     and b = order.(i + 1) in
                      if m.(a) > 0 && m.(b) > 0 then arr.(b) - arr.(a) else 0)
                  in
                  fseg := segs m;
@@ -2437,9 +2450,9 @@ let asset_domain_worker
                alloc_ev.(3) <- Monotonic_clock.minor_words () - a3;
                oseg
                := Array.init 3 (fun i ->
-                 if orders_marks.(i) > 0 && orders_marks.(i + 1) > 0
-                 then orders_marks.(i + 1) - orders_marks.(i)
-                 else 0);
+                    if orders_marks.(i) > 0 && orders_marks.(i + 1) > 0
+                    then orders_marks.(i + 1) - orders_marks.(i)
+                    else 0);
                (* The existing STRATEGY column shows the compiled strategy call, not the
                   legacy bridge/action overhead. *)
                if run > 0 then Latency_profiler.record_ns profs.prof_strategy run)
@@ -2572,8 +2585,8 @@ let asset_domain_worker
               profs.prof_cycle
               (Printf.sprintf
                  "ov work=%s prep=%s save=%s wall=%s cpu=%s stall=%s alloc=%dw[state=%d \
-                  ev=%d save=%d] aev=[%d/%d/%d/%d] res=%s inv=%s orc=%s facts=%s[%s] fae=[%s] env=%s act=[%s] \
-                  global_major=+%d"
+                  ev=%d save=%d] aev=[%d/%d/%d/%d] res=%s inv=%s orc=%s facts=%s[%s] \
+                  fae=[%s] env=%s act=[%s] global_major=+%d"
                  (us (t_prep - t0))
                  (us prep_ns)
                  (us (t_end - t_save))
@@ -2699,7 +2712,7 @@ let asset_domain_worker
                  ~section:"native_shadow"
                  "compiled grid active for %s (%s)"
                  asset_with_fees.symbol
-                 file.Dio_strategies.Strategy_file.name;
+                 file.Dio_strategies.Strategy_file.name
              | None -> ());
             Some (ctx, rt, shadow)))
       else None
@@ -3205,6 +3218,10 @@ let asset_domain_worker
       | None -> quarter
     in
     let minor_words_at_gc = ref (Monotonic_clock.minor_words ()) in
+    (* The domain's order rings are flushed at the bottom of each cycle, so the self-pipe
+       write stays out of the STRATEGY and CYCLE spans. Other producers keep the immediate
+       write. *)
+    Dio_strategies.Strategy_common.OrderSignal.set_deferred true;
     while Atomic.get state.is_running do
       let latency_this_cycle = !latency_active in
       if !cycle_count = 0 then Logging.debug_f ~section "First cycle for %s" key;
@@ -3276,8 +3293,8 @@ let asset_domain_worker
                     in
                     match shadow with
                     | Some ns ->
-                      (* The compiled program owns the event surface now: a fill must reach
-                         the strategy file, not only the interpreter. *)
+                      (* The compiled program owns the event surface now: a fill must
+                         reach the strategy file, not only the interpreter. *)
                       run_compiled_grid
                         ctx
                         rt
@@ -3623,8 +3640,8 @@ let asset_domain_worker
                    record_overlay_fill ~now_exec ~market:event.market event;
                    (* Carry overlays are event-bound like the grid: dispatch the fill
                       through the compiled program in this event. A take-profit close then
-                      re-places the replacement short immediately instead of waiting for the
-                      next book tick or position snapshot. *)
+                      re-places the replacement short immediately instead of waiting for
+                      the next book tick or position snapshot. *)
                    match overlay_rt, overlay_ctx, !overlay_shadow with
                    | Some ort, Some octx, Some ns ->
                      octx.cg_asset <- Some overlay_asset;
@@ -3827,6 +3844,15 @@ let asset_domain_worker
         exec_checked := true);
       startup_replay := false;
       let t3 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
+      (* GATE: the whole t2 -> t3 wall span. Lifecycle drain, carry lookup,
+         gate/halt/reclaim checks, oracle apply and overlay setup sit between the
+         top-of-book read and the strategy call with no stage of their own, so TOTAL
+         exceeded the sum of its labelled segments by that amount (38us of a 50us median
+         cycle for a busy grid). Recording the region closes the tiling
+         t1->t2->t3->t3_strategy->t4. EVENTS stays the per-event average of this region,
+         so the two answer different questions: GATE is "what did this cycle pay here",
+         EVENTS is "what did one event cost". *)
+      if latency_this_cycle && t3 > t2 then Latency_profiler.record_ns prof_gate (t3 - t2);
       let alloc_at_t3 =
         if latency_this_cycle then Monotonic_clock.minor_words () else 0
       in
@@ -3976,6 +4002,7 @@ let asset_domain_worker
             nothing. *)
          if d.active then st.force_buy_reanchor <- true;
          should_execute_strategy := true;
+         incr intent_gen;
          Logging.debug_f
            ~section
            "[%s/%s] Capital oracle decision materialized (%s): qty %s gi %.4f%% (D_surv \
@@ -4018,6 +4045,7 @@ let asset_domain_worker
               gated on a sell-spacing violation. *)
            if gi_changed then st.force_buy_reanchor <- true;
            should_execute_strategy := true;
+           incr intent_gen;
            Logging.debug_f
              ~section
              "[%s/%s] Capital oracle updated sizing: qty %.8g gi %.4f%% (D_surv %.1f%%)"
@@ -4031,6 +4059,9 @@ let asset_domain_worker
       if oracle_halted <> !oracle_halted_prev
       then (
         oracle_halted_prev := oracle_halted;
+        (* Halt means cancel resting buys, reactivation means place: both need a pass, and
+           neither arrives as a book tick. *)
+        incr intent_gen;
         match oracle_decision with
         | Some d when d.active ->
           Logging.info_f
@@ -4047,7 +4078,23 @@ let asset_domain_worker
             in
             st.capital_low <- false;
             st.capital_low_logged <- false;
-            st.capital_low_at_balance <- 0.0)
+            st.capital_low_at_balance <- 0.0;
+            (* A reactivation is actionable now: let the decision bypass its placement
+               cooldowns, as it does for a balance recovery. *)
+            st.resuming_after_balance_flag <- true;
+            (* The compiled guard runs before the pass and reads the *previous* cycle's
+               facts. Its sticky [buy_capital_low] mirror routes the next pass into the
+               latch branch even though capital was just restored, so the reactivation
+               would wait a full pass (and, on a quiet feed, the next book tick) before a
+               buy could go out. Clear the mirror and force a pass on this cycle. *)
+            (match config_grid with
+             | Some (_, rt, _) ->
+               Dio_strategies.Strategy_runtime.set_platform_bool
+                 rt
+                 Dio_strategies.Strategy_fact_slots.buy_capital_low
+                 false
+             | None -> ());
+            should_execute_strategy := true)
         | Some d ->
           (* Why the grid's buy pool emptied is otherwise invisible: the venue can still
              show quote while the senior overlay reservations have claimed all of it
@@ -4193,6 +4240,7 @@ let asset_domain_worker
         | Some d ->
           oracle_gate_open := true;
           should_execute_strategy := true;
+          incr intent_gen;
           Logging.debug_f
             ~section
             "[%s/%s] Capital oracle first decision received (%s, qty %.8g gi %.4f%%, \
@@ -4246,20 +4294,42 @@ let asset_domain_worker
          execute_strategy); the SELL leg still runs. A sell is the capital- recovery path
          (needs inventory, not quote), so the sell for a just-filled buy is placed even
          under halt; otherwise the last fill's inventory stays unreclaimable. *)
-      (* No book tick for [quiet_tick_after_s] but a price to trade on: run the pass
-         anyway. The file's rung and spread logic still decides what is worth placing. *)
-      let quiet_tick_after_s = 60.0 in
       let now_loop = Unix.gettimeofday () in
+      (* Capital recovery is the edge that most needs acting on immediately: the strategy
+         clears the latch itself, but only a pass can place against the cleared balance.
+         Watching the flag (rather than the clearing site) catches every clearer. *)
+      (match cached_grid_state with
+       | Some s ->
+         let low = s.Dio_strategies.Strategy_state.capital_low in
+         if low <> !prev_capital_low
+         then (
+           prev_capital_low := low;
+           if not low then incr intent_gen)
+       | None -> ());
+      let tradable = (not (Float.is_nan !current_price)) && not equity_market_closed in
+      let intent_due =
+        (not !should_execute_strategy)
+        && !intent_gen <> !intent_ran
+        && now_loop -. !last_intent_tick >= intent_tick_s
+        && tradable
+      in
+      if intent_due
+      then (
+        last_intent_tick := now_loop;
+        should_execute_strategy := true);
+      (* Last resort, not the reaction path: with no book tick and no intent for five
+         minutes, still run one pass so a wedged feed cannot leave the sell leg unmanned
+         forever. *)
+      let quiet_safety_s = 300.0 in
       let quiet_market_tick =
         (not !should_execute_strategy)
-        && now_loop -. !last_book_at >= quiet_tick_after_s
-        && now_loop -. !last_quiet_tick >= 1.0
-        && (not (Float.is_nan !current_price))
-        && (not equity_market_closed)
+        && now_loop -. !last_book_at >= quiet_safety_s
+        && now_loop -. !last_intent_tick >= 1.0
+        && tradable
       in
       if quiet_market_tick
       then (
-        last_quiet_tick := now_loop;
+        last_intent_tick := now_loop;
         should_execute_strategy := true);
       let should_execute =
         !exec_ready
@@ -4268,6 +4338,10 @@ let asset_domain_worker
         && (not equity_market_closed)
         && !oracle_gate_open
       in
+      (* This pass consumes every intent raised so far. An edge raised later in this cycle
+         (the strategy clearing its own latch, the oracle republishing) leaves the
+         generations unequal and schedules the follow-up pass. *)
+      if should_execute then intent_ran := !intent_gen;
       (* Overlay cycle: independent of the grid's oracle gate. Triggered by a perp
          top-of-book change, a position/margin snapshot, a funding change, or a normal
          grid cycle. There is no timer. *)
@@ -4710,8 +4784,8 @@ let asset_domain_worker
           let now = Unix.gettimeofday () in
           (* A cutover instance is cheap enough to evaluate on every book event, and it
              must: the interpreter path rested until an entry existed because a pass cost
-             ~100us, which also meant the first pass after an idle spell ran on cold
-             code and caches. The compiled strategy decides for itself whether to act. *)
+             ~100us, which also meant the first pass after an idle spell ran on cold code
+             and caches. The compiled strategy decides for itself whether to act. *)
           (* The pass is driven by the instrument this instance trades. Riding the owner's
              book was wrong whenever the two differ: a perp hedge on a thin spot pair was
              re-evaluated at the spot book's rate. *)
@@ -5155,6 +5229,17 @@ let asset_domain_worker
          Exchange_wakeup.wait_since sleep. Only busy cycles are recorded; idle wakeups
          would pin cycle p50/p99 at 0us. *)
       let cycle_busy = did_ob || did_exec || should_execute in
+      (* Tick-to-decision: from the last publish for this symbol by the feed thread to the
+         end of the cycle that acted on it. The producer stamps [signal_ns] after writing
+         the book and bumping the generation, so this spans the wake/park cost plus every
+         stage: the latency the venue sees at the application layer, which no single stage
+         column reports. *)
+      if latency_this_cycle && (did_ob || did_exec) && t4 > 0
+      then (
+        let published = Concurrency.Exchange_wakeup.last_signal_ns_fast wakeup_sync in
+        let delta = t4 - published in
+        if published > 0 && delta > 0 && delta < 50_000_000
+        then Latency_profiler.record_ns prof_e2e delta);
       if latency_this_cycle && cycle_busy && t4 > t1
       then
         if (* Cause string is built only for a new window maximum, avoiding a per-cycle
@@ -5401,6 +5486,11 @@ let asset_domain_worker
         then (
           Gc.minor ();
           minor_words_at_gc := Monotonic_clock.minor_words ()));
+      (* Ring the supervisor for any order pushed during this cycle, outside every
+         measured span. Must precede the park: an order queued by the strategy is
+         invisible to the supervisor until its byte is written, and the park has no other
+         wake. *)
+      Dio_strategies.Strategy_common.OrderSignal.flush ();
       (* Blocks until a producer signals new data or data is ready. Uses the cached
          has_exec_fn closure to avoid a Hashtbl lookup. [wait_since] returns immediately
          if a producer signalled while this cycle ran, so a racing signal is not lost to
@@ -5410,7 +5500,19 @@ let asset_domain_worker
          unblock it (new book/exec frame, oracle publish, first data at session open) is a
          signal. No polling sleep. *)
       if not should_execute
-      then Concurrency.Exchange_wakeup.wait_since_fast wakeup_sync ~since:wake_baseline;
+      then (
+        let parked_at = Monotonic_clock.now_ns () in
+        Concurrency.Exchange_wakeup.wait_since_fast wakeup_sync ~since:wake_baseline;
+        (* Wake latency: producer signal -> this domain running again. The cycle spans
+           start after the park, so the futex round-trip and the scheduler delay it hides
+           were never in any percentile. A signal stamped before [parked_at] was absorbed
+           during the busy cycle, so its wake was already paid: only a fresher one is a
+           wake. *)
+        let woke = Monotonic_clock.now_ns () in
+        let signalled = Concurrency.Exchange_wakeup.last_signal_ns_fast wakeup_sync in
+        let delta = woke - signalled in
+        if signalled >= parked_at && delta > 0 && delta < 50_000_000
+        then Latency_profiler.record_ns prof_wake delta);
       if !exec_ready && (not !latency_active) && !cycle_count - !exec_ready_cycle >= 10
       then (
         latency_active := true;
@@ -5422,6 +5524,8 @@ let asset_domain_worker
           asset_with_fees.symbol);
       ()
     done;
+    (* Orders pushed in the final cycle still need their ring. *)
+    Dio_strategies.Strategy_common.OrderSignal.flush ();
     (* Flush the final trace on graceful shutdown. Periodic persistence is every 50 busy
        cycles, so without this a symbol that executed fewer cycles (or a short/slow run)
        writes no file at all. *)
@@ -5554,6 +5658,10 @@ let start_domain config state fee_fetcher =
             asset.symbol
         with
         | exn ->
+          (* The cycle defers its order ring to the loop bottom, which a crash skips:
+             flush here so an order queued before the failure still reaches the
+             supervisor. *)
+          Dio_strategies.Strategy_common.OrderSignal.flush ();
           Logging.critical_f
             ~section
             "Domain for %s/%s crashed (CAUGHT IN SPAWNER): %s"
@@ -5780,6 +5888,9 @@ let get_domain_profiler_snapshots () =
       let snaps =
         [ "orderbook", Latency_profiler.published_snapshot profs.prof_ob
         ; "execution", Latency_profiler.published_snapshot profs.prof_exec
+        ; "gate", Latency_profiler.published_snapshot profs.prof_gate
+        ; "wake", Latency_profiler.published_snapshot profs.prof_wake
+        ; "e2e", Latency_profiler.published_snapshot profs.prof_e2e
         ; "prep", Latency_profiler.published_snapshot profs.prof_prep
         ; "strategy", Latency_profiler.published_snapshot profs.prof_strategy
         ; "cycle", Latency_profiler.published_snapshot profs.prof_cycle
