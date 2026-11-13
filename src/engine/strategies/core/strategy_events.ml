@@ -867,14 +867,15 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
            state.persisted_sell_levels <- final_levels;
            state.persistence_dirty <- true));
        if acc_qty > 0.0
-       then
+       then (
+         state.last_base_fill_ts <- now;
          if (* Accumulation venues report tradeable = total - open-order hold: when a
                resting sell fills, the hold release offsets the total drop, so the venue
                figure does not fall and the ledger must not decrement here (that would
                double-count against [unnetted_hold]); venue reconciliation absorbs the
                netting. Gross-balance venues fall by the sold qty at fill. *)
             not state.cached_ecfg.use_accumulation_sells
-         then state.position_base <- Float.max 0.0 (state.position_base -. acc_qty);
+         then state.position_base <- Float.max 0.0 (state.position_base -. acc_qty));
        (* Base that just sold may have been riding the unreflected-buy bridge: retire it
           FIFO so the overlay cannot keep offering base that has already left the account. *)
        if acc_qty > 0.0 && not state.startup_replay

@@ -1200,13 +1200,18 @@ let sell_leg_prepare_into
   (* Whether a fresh buy fill / placement still owes its own ladder rung. Captured here,
      before [sell_leg_finalize_latch] consumes [just_filled_buy], so the restore branch
      cannot take over the fill's rung in the same cycle. *)
+  (* A fundable rung the venue dropped (fractional Alpaca sells expire at the session
+     boundary). It outranks the buy-companion and uncommitted-inventory fallbacks, which
+     size from the last fill and fire on the same cycle when every rung expired together. *)
+  let restore_pending = !missing_after_reconcile <> [] in
   let sell_owed =
     state.just_filled_buy
-    || buy_attempted
     || state.resuming_after_balance_flag
     || halt_inventory_check
-    || (Sell_orders.is_empty state.open_sell_orders
-        && Option.is_some state.last_buy_fill_price)
+    || ((not restore_pending)
+        && (buy_attempted
+            || (Sell_orders.is_empty state.open_sell_orders
+                && Option.is_some state.last_buy_fill_price)))
   in
   (* A rejected sell placement leaves its base free at the venue for the cooldown window
      (and latches [asset_low] when the venue says the base is not available). That base is

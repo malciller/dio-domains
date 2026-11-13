@@ -430,6 +430,10 @@ type strategy_state =
          the cycle and asks the venue for a fresh balance/open-orders snapshot. *)
   ; mutable last_balance_heal_log_at : float
       (* Last time the ledger-recovery WARN was emitted. *)
+  ; mutable last_base_fill_ts : float
+      (* Wall-clock time of the last fill that reduced [position_base]. A balance message
+         generated before it still reports the pre-fill base. 0.0 until the first such
+         fill. *)
   ; mutable persistence_dirty : bool
       (* true when accumulation state changed; flushed by caller outside hotloop *)
   ; mutable persistence_key : string option
@@ -758,6 +762,7 @@ let rec get_strategy_state asset_symbol =
       ; last_balance_delta = 0.0
       ; needs_resync = false
       ; last_balance_heal_log_at = 0.0
+      ; last_base_fill_ts = 0.0
       ; persistence_dirty = false
       ; persistence_key = None
       ; base_accumulation_enabled = true

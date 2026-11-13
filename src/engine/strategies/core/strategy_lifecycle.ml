@@ -358,9 +358,12 @@ let reconcile_position
       state.position_venue_ts <- venue_ts)
     else (
       (* No new timestamp: a venue figure above the whole ledger means an earlier adoption
-         was lost or arrived stale. Adopt it; this branch only raises the ledger. *)
+         was lost or arrived stale. Adopt it; this branch only raises the ledger.
+
+         Not when it predates the last base-reducing fill: it still reports the base that
+         fill sold, and healing would resurrect it. *)
       let ledger = state.position_base +. buy_credit_total state in
-      if asset_balance > ledger +. 1e-9
+      if asset_balance > ledger +. 1e-9 && venue_ts > state.last_base_fill_ts +. 0.001
       then (
         let healed = asset_balance -. ledger in
         if now -. state.last_balance_heal_log_at >= 10.0
