@@ -213,6 +213,20 @@ let default_retry_config = Error_handling.default_retry_config
 (** Alias of [Error_handling.is_retriable_error]. *)
 let is_retriable_error = Error_handling.is_retriable_error
 
+(* Reused serialization buffers. Signing runs on the single Lwt scheduler thread, but the
+   buffers are domain-local so a second scheduler cannot share them by accident. The order
+   path is the one place where a per-order [Buffer.create] is measurable: it happens on the
+   decision-to-wire path. *)
+[@@@alert "-unsafe_multidomain"]
+
+let action_buf_key = Domain.DLS.new_key (fun () -> Buffer.create 1024)
+let envelope_buf_key = Domain.DLS.new_key (fun () -> Buffer.create 1024)
+let action_buf () = Domain.DLS.get action_buf_key
+let envelope_buf () = Domain.DLS.get envelope_buf_key
+
+(* Restore the alert beyond the bindings above. *)
+[@@@alert "+unsafe_multidomain"]
+
 (** Atomic counter for WebSocket request IDs. *)
 
 let ws_req_id_counter = Atomic.make 1
@@ -221,6 +235,10 @@ let next_ws_req_id () =
   let id = Atomic.fetch_and_add ws_req_id_counter 1 in
   id
 ;;
+
+(** Value of the last nonce handed out. An action signed ahead is only valid while nothing
+    newer has been sent, because the venue orders a wallet's actions by nonce. *)
+let peek_last_nonce () = Atomic.get last_nonce
 
 (** Submits a signed action via the WebSocket "post" channel. Returns [Error] immediately
     when disconnected. Extracts data.response.payload to match the REST response shape for
@@ -243,7 +261,8 @@ let post_exchange_ws ~testnet:_ ~write_action ~action_msgpack ~is_mainnet =
     let req_id = next_ws_req_id () in
     (* Pre-serialize the envelope: the order path must not build a second Yojson AST (and
        its serializer) just to wrap the action. *)
-    let buf = Buffer.create 512 in
+    let buf = envelope_buf () in
+    Buffer.clear buf;
     Buffer.add_string buf "{\"method\":\"post\",\"id\":";
     Buffer.add_string buf (string_of_int req_id);
     Buffer.add_string buf ",\"request\":{\"type\":\"action\",\"payload\":{\"action\":";
@@ -320,7 +339,9 @@ let place_order
       }
     in
     let action = pack_order_action ~orders:[ order_wire ] ~grouping:"na" in
-    let action_msgpack = serialize_action action in
+    let buf = action_buf () in
+    Hyperliquid_types.serialize_action_into buf action;
+    let action_msgpack = Buffer.contents buf in
     let write_action buf =
       add_order_action_json buf ~orders:[ order_wire ] ~grouping:"na"
     in
@@ -506,9 +527,9 @@ let amend_order
     ()
 ;;
 
-(** Cancels one or more orders by their order IDs for a given symbol. Constructs a batch
-    cancel action and submits via WebSocket with retry. *)
-let cancel_orders ~symbol ~order_ids ~testnet =
+(** One cancel request for exactly [order_ids]: a batch cancel action submitted over the
+    WebSocket, with retry. *)
+let cancel_request ~symbol ~order_ids ~testnet =
   let cancel_orders_once () =
     let asset_index =
       match Hyperliquid_instruments_feed.get_asset_index symbol with
@@ -532,6 +553,9 @@ let cancel_orders ~symbol ~order_ids ~testnet =
     ~config:default_retry_config
     ~f:cancel_orders_once
     ()
+;;
+
+let cancel_orders = cancel_request
 ;;
 
 (** Transfers USDC between spot and perpetual wallets via the usdClassTransfer action.

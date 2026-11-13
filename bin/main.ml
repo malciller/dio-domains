@@ -384,6 +384,9 @@ let () =
      ignored. Never overwrites an already-set variable. *)
   Logging.load_dotenv ~path:".env" ();
   Concurrency.Exchange_wakeup.configure ();
+  (* Build the background CPU allocator here, not at module init: the latter read
+     DIO_BACKGROUND_CPUS before [.env] existed and silently ignored it. *)
+  Thread_affinity.configure ();
   (* Load engine configuration from config.json. *)
   let config = Dio_engine.Config.read_config () in
   (* Apply log level and section filters from configuration. *)
@@ -436,6 +439,10 @@ let () =
        ; Gc.major_heap_increment = gc_cfg.major_heap_increment
        }
    | None -> ());
+  (* The main Lwt domain sets GC directly rather than through Config.apply_gc_config, so
+     arm its major-GC alarm here. The canary sums these across domains to attribute a long
+     gap to a global collection rather than a host stall. *)
+  Gc_config.install_alarm ();
   (* Start the stop-the-world canary after GC configuration is applied so it observes the
      same collector settings as the trading domains; its window cadence matches the
      per-domain latency windows, allowing a global pause to be matched to the domain
@@ -443,6 +450,9 @@ let () =
      event-driven wakeups don't pay C-state/frequency exit latency. Disable with
      DIO_CANARY=0. *)
   Canary.start ();
+  (* Replacement feed path, shadow-only: one pinned domain consumes raw frames through an
+     SPSC ring and measures the zero-allocation decode. The legacy engine keeps trading. *)
+  Hotpath_feed.start ();
   (* Drain trading-domain latency windows on a background domain: the recording domains
      only close a window (O(1)); the fold, percentile scan and spike log run there.
      Started before the journal so its first tick sees published snapshots. *)
@@ -463,6 +473,12 @@ let () =
     }
     ~produce:Dio_engine.Latency_rows.all;
   Logging.info_f ~section:"main" "%s" (Thread_affinity.describe ());
+  (match
+     Thread_affinity.spin_isolation_warning
+       ~busy_spin:(Concurrency.Exchange_wakeup.busy_spin_enabled ())
+   with
+   | Some msg -> Logging.warn_f ~section:"affinity" "%s" msg
+   | None -> ());
   (* Periodic memory reporter on an Lwt timer (600s interval). Runs in the main domain
      scheduler, avoiding the prior Gc.create_alarm approach: alarm callbacks run in GC
      signal context, where Mutex.lock is unsafe on OCaml 5.x if the alarmed domain already
@@ -479,7 +495,9 @@ let () =
         else (
           let now = Unix.gettimeofday () in
           let runtime = now -. start_time in
-          let s = Gc.stat () in
+          (* quick_stat, not stat: the detailed stat can trigger a major collection, and
+             this reporter fired at the same instant as a 1.79s process freeze. *)
+          let s = Gc.quick_stat () in
           let heap_mb = s.heap_words * (Sys.word_size / 8) / 1048576 in
           let live_kb = s.live_words * (Sys.word_size / 8) / 1024 in
           let free_kb = (s.heap_words - s.live_words) * (Sys.word_size / 8) / 1024 in

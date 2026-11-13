@@ -188,8 +188,11 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
         base_bal
     in
     let accum_hold_value = accum_holding *. mid in
+    (* The distance is a property of the resting order and the market, not of available
+       capital: a book halted for capital still has a buy whose distance is the move
+       needed to fill it. The status icon already reports the capital halt. *)
     let buy_dist_pct =
-      if (not cap_low) && buy_price > 0.0 && mid > 0.0
+      if buy_price > 0.0 && mid > 0.0
       then Some ((buy_price -. mid) /. mid *. 100.0)
       else None
     in

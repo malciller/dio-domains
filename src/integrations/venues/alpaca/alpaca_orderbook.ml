@@ -6,10 +6,18 @@ open Dio_exchange.Exchange_intf.Types
 let section = "alpaca_orderbook"
 
 (** Top-of-book from the WebSocket quote stream: "q" messages on the session-appropriate
-    feed (v2 by day, v1beta1/overnight at night). When the active feed has no quotes (e.g.
-    IEX closed pre/after-market), [get_best_bid_ask] falls back to the position mark from
-    [Alpaca_balances.get_position_price]. Trade prints are analytics only and never
-    fabricate quotes. *)
+    feed (v2 by day, v1beta1/overnight at night). When the active feed publishes no quotes
+    (IEX stops quoting at its close, while prints keep arriving through extended hours),
+    a trade print is promoted to top-of-book after [trade_tob_fallback_s] so the strategy
+    still ticks and prices: bid=ask=last print, zero size. That is the venue's last traded
+    price, not a synthesized quote. Without any quote or print,
+    [get_best_bid_ask] falls back to the position mark. *)
+
+(** Quote age after which a trade print is promoted to top-of-book. The venue stops
+    quoting at its session close while prints continue into extended hours, and a book that
+    never ticks is a strategy that never runs. Long enough that a merely quiet live book is
+    not replaced by a zero-spread print. *)
+let trade_tob_fallback_s = 60.0
 
 type quote =
   { bid_price : float
@@ -37,6 +45,7 @@ module SymbolStore = struct
     ; ask_px : float
     ; ask_sz : float
     ; valid : bool
+    ; ts : float (** venue timestamp of the last quote or print that set this book *)
     }
 
   type t =
@@ -78,9 +87,34 @@ module SymbolStore = struct
           ; ask_px = 0.0
           ; ask_sz = 0.0
           ; valid = false
+          ; ts = 0.0
           }
     ; mutex = Mutex.create ()
     }
+  ;;
+
+  (** Publish [price] as top-of-book while the last quote is older than [stale_after].
+      Compare-and-swap, because a quote write and a promotion must not publish the same
+      [pos] (the domain's change detector keys on it) and a fresh quote must win.
+      [ts] is left stale so every print/poll re-promotes until quotes resume. *)
+  let rec promote t ~price ~now ~stale_after =
+    let prev = Atomic.get t.tob in
+    if price > 0.0 && now -. prev.ts > stale_after
+    then (
+      let next =
+        { prev with
+          pos = prev.pos + 1
+        ; bid_px = price
+        ; bid_sz = 0.0
+        ; ask_px = price
+        ; ask_sz = 0.0
+        ; valid = true
+        }
+      in
+      if not (Atomic.compare_and_set t.tob prev next)
+      then promote t ~price ~now ~stale_after
+      else true)
+    else false
   ;;
 
   let push t (q : quote) =
@@ -89,13 +123,15 @@ module SymbolStore = struct
       let idx = t.write_pos mod t.capacity in
       t.buffer.(idx) <- q;
       t.write_pos <- t.write_pos + 1;
+      let prev_pos = (Atomic.get t.tob).pos in
       let cache =
-        { pos = t.write_pos
+        { pos = prev_pos + 1
         ; bid_px = q.bid_price
         ; bid_sz = q.bid_size
         ; ask_px = q.ask_price
         ; ask_sz = q.ask_size
         ; valid = q.bid_price > 0.0 || q.ask_price > 0.0
+        ; ts = q.timestamp
         }
       in
       Mutex.unlock t.mutex;
@@ -113,7 +149,24 @@ module SymbolStore = struct
     t.trades_buffer.(idx) <- tr;
     t.trades_write_pos <- t.trades_write_pos + 1;
     Mutex.unlock t.mutex;
+    (* Outside the venue's quoting session there are no "q" messages, only prints, and a
+       book that never ticks never runs the strategy. When the last quote is older than
+       [trade_tob_fallback_s], the print becomes the price and the tick: bid=ask=print,
+       zero size, so the file's own rung/spread logic still decides what to place. This is
+       a degraded price, not a fabricated quote - it is the venue's last traded price. *)
+    ignore
+      (promote t ~price:tr.price ~now:tr.timestamp ~stale_after:trade_tob_fallback_s);
     Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
+  ;;
+
+  (** Promote the venue's mark to top-of-book while the quote stream is quiet. Marks are
+      republished every couple of seconds regardless of session and are the only price
+      that keeps moving after the venue's quote session closes. Same rule as a print:
+      only while the last quote is older than [trade_tob_fallback_s], stale timestamp
+      retained so each poll re-promotes. *)
+  let push_mark t ~(price : float) =
+    if promote t ~price ~now:(Unix.gettimeofday ()) ~stale_after:trade_tob_fallback_s
+    then Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
   ;;
 
   let get_recent_trades t count =
@@ -139,13 +192,36 @@ module SymbolStore = struct
       | _ -> None)
   ;;
 
+  let get_best_bid_ask_into t (buf : float array) =
+    let c = Atomic.get t.tob in
+    if c.valid
+    then (
+      buf.(0) <- c.bid_px;
+      buf.(1) <- c.bid_sz;
+      buf.(2) <- c.ask_px;
+      buf.(3) <- c.ask_sz;
+      true)
+    else (
+      match Alpaca_balances.get_position_price t.symbol with
+      | Some p when p > 0.0 ->
+        buf.(0) <- p;
+        buf.(1) <- 0.0;
+        buf.(2) <- p;
+        buf.(3) <- 0.0;
+        true
+      | _ -> false)
+  ;;
+
   let get_current_position t = (Atomic.get t.tob).pos
   let has_data t = (Atomic.get t.tob).valid
 
   let read_events t start_pos =
     Mutex.lock t.mutex;
     let current_pos = t.write_pos in
-    let start_idx = max start_pos (current_pos - t.capacity) in
+    (* [start_pos] may come from the top-of-book position, which also advances on promoted
+       prints/marks. It can therefore run ahead of the quote ring; clamp it so a cursor
+       past the ring still reads the quotes that exist. *)
+    let start_idx = min (max start_pos (current_pos - t.capacity)) current_pos in
     let events = ref [] in
     for i = current_pos - 1 downto start_idx do
       let idx = i mod t.capacity in
@@ -165,7 +241,7 @@ module SymbolStore = struct
   let iter_events t start_pos f =
     Mutex.lock t.mutex;
     let current_pos = t.write_pos in
-    let start_idx = max start_pos (current_pos - t.capacity) in
+    let start_idx = min (max start_pos (current_pos - t.capacity)) current_pos in
     for i = start_idx to current_pos - 1 do
       let idx = i mod t.capacity in
       let q = t.buffer.(idx) in
@@ -208,6 +284,12 @@ let active_conn : Ws_lwt.conn option ref = ref None
 let last_pong_time = ref 0.0
 let pong_condition = Lwt_condition.create ()
 
+let get_best_bid_ask_into symbol (buf : float array) =
+  match Ds.Cow_table.find_opt stores symbol with
+  | Some store -> SymbolStore.get_best_bid_ask_into store buf
+  | None -> false
+;;
+
 let get_best_bid_ask symbol =
   match Ds.Cow_table.find_opt stores symbol with
   | Some store -> SymbolStore.get_best_bid_ask store
@@ -245,6 +327,12 @@ let read_orderbook_events symbol start_pos =
   match Ds.Cow_table.find_opt stores symbol with
   | Some store -> SymbolStore.read_events store start_pos
   | None -> []
+;;
+
+let push_mark ~symbol ~price =
+  match Ds.Cow_table.find_opt stores symbol with
+  | Some store -> SymbolStore.push_mark store ~price
+  | None -> ()
 ;;
 
 let get_recent_trades symbol count =
@@ -390,10 +478,10 @@ let handle_message_str ?on_auth_success ?on_auth_error content =
                   else "trade"
                 | None -> "trade"
               in
-              (* Trades are analytics ONLY. A print is evidence of price, not a two-sided
-                 quote, and never fabricates a bid/ask. Top-of-book comes only from the WS
-                 quote stream; a quote gap holds the last real quote until the feed
-                 resumes. *)
+              (* A print is evidence of price, not a two-sided quote, so it only becomes
+                 top-of-book once the WS quote stream has gone quiet for
+                 [trade_tob_fallback_s] (extended hours, when the venue stops quoting).
+                 While quotes flow, this is analytics only. *)
               SymbolStore.push_trade
                 store
                 { price; size; timestamp = ts; side = side_str };

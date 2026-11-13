@@ -163,6 +163,107 @@ let test_max_retry_attempts () =
   | _ -> Alcotest.fail "Expected failure after max retries"
 ;;
 
+(* The direct body writer must produce the same request as the AST serializer it replaces:
+   same fields, same values, same precision. Key order differs (the AST helper prepends),
+   which is not significant in JSON. *)
+let rec canon_json (j : Yojson.Safe.t) : Yojson.Safe.t =
+  match j with
+  | `Assoc kvs ->
+    `Assoc
+      (List.sort
+         (fun (a, _) (b, _) -> String.compare a b)
+         (List.map (fun (k, v) -> k, canon_json v) kvs))
+  | `List items -> `List (List.map canon_json items)
+  | other -> other
+;;
+
+let test_add_order_body_matches_ast () =
+  let check ~name ~expected ~build =
+    let buf = Buffer.create 512 in
+    build buf;
+    let body = Yojson.Safe.from_string (Buffer.contents buf) in
+    let direct = Yojson.Safe.Util.(body |> member "params") in
+    let via_ast = Yojson.Safe.from_string (Kraken.Kraken_actions.json_to_string_precise
+                                         (Some "SPCX/UNKNOWN")
+                                         expected) in
+    Alcotest.(check bool)
+      name
+      true
+      (Yojson.Safe.to_string (canon_json direct)
+       = Yojson.Safe.to_string (canon_json via_ast))
+  in
+  let mk_params extras =
+    List.fold_left
+      (fun acc (k, v) -> Kraken.Kraken_actions.add_to_assoc acc (k, v))
+      (`Assoc
+         [ "order_type", `String "limit"
+         ; "side", `String "buy"
+         ; "order_qty", `Float 0.08
+         ; "symbol", `String "SPCX/UNKNOWN"
+         ; "token", `String "tok"
+         ])
+      extras
+  in
+  check
+    ~name:"plain limit order"
+    ~expected:
+      (mk_params
+         [ "limit_price", `Float 140.1; "time_in_force", `String "GTC"; "post_only", `Bool true ])
+    ~build:(fun buf ->
+      Kraken.Kraken_actions.add_order_body_into
+        buf
+        ~symbol:"SPCX/UNKNOWN"
+        ~req_id:7
+        ~order_type:"limit"
+        ~side:"buy"
+        ~order_qty:0.08
+        ~token:"tok"
+        ?limit_price:(Some 140.1)
+        ?time_in_force:(Some "GTC")
+        ?post_only:(Some true)
+        ?margin:None
+        ?reduce_only:None
+        ?order_userref:None
+        ?cl_ord_id:None
+        ?trigger_price:None
+        ?trigger_price_type:None
+        ?display_qty:None
+        ?fee_preference:None
+        ?validate:None
+        ());
+  check
+    ~name:"escaped id and triggers"
+    ~expected:
+      (mk_params
+         [ ( "cl_ord_id"
+           , `String "a\"b\\c" )
+         ; "triggers", `Assoc [ "price", `Float 135.5; "price_type", `String "stop-loss" ]
+         ; "order_userref", `Int 42
+         ])
+    ~build:(fun buf ->
+      Kraken.Kraken_actions.add_order_body_into
+        buf
+        ~symbol:"SPCX/UNKNOWN"
+        ~req_id:9
+        ~order_type:"limit"
+        ~side:"buy"
+        ~order_qty:0.08
+        ~token:"tok"
+        ?limit_price:None
+        ?time_in_force:None
+        ?post_only:None
+        ?margin:None
+        ?reduce_only:None
+        ?order_userref:(Some 42)
+        ?cl_ord_id:(Some "a\"b\\c")
+        ?trigger_price:(Some 135.5)
+        ?trigger_price_type:(Some "stop-loss")
+        ?display_qty:None
+        ?fee_preference:None
+        ?validate:None
+        ())
+;;
+
 let () =
   Alcotest.run
     "Kraken Actions"
@@ -175,6 +276,12 @@ let () =
     ; "request handling", [ Alcotest.test_case "next_req_id" `Quick test_next_req_id ]
     ; ( "error handling"
       , [ Alcotest.test_case "is_retriable_error" `Quick test_is_retriable_error ] )
+    ; ( "order body"
+      , [ Alcotest.test_case
+            "body matches the AST serializer"
+            `Quick
+            test_add_order_body_matches_ast
+        ] )
     ; ( "configuration"
       , [ Alcotest.test_case "retry_config_defaults" `Quick test_retry_config_defaults
         ; Alcotest.test_case

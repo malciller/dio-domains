@@ -726,6 +726,9 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
      | None -> ());
     if String.starts_with ~prefix:"{\"channel\":\"l2Book\"," content
     then (
+      (* Shadow the replacement feed path on the raw frame before the legacy parse. The
+         hotpath ring is a no-op unless DIO_HOTPATH_SHADOW is enabled. *)
+      Hotpath_feed.submit ~recv_ns:(Monotonic_clock.now_ns ()) content;
       (* Parse on the venue's parse domain; fall back to the raw stream (whose consumer
          parses inline) when that domain is saturated. *)
       if not (Concurrency.Parse_worker.submit_frame "hyperliquid" content)

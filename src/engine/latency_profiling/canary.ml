@@ -45,12 +45,28 @@ let env_float name default =
     global stop-the-world pause from a single thread being descheduled. *)
 let last_max_cell = Atomic.make 0
 
+(** Peak over every window since the journal last drained it. The journal samples on its
+    own (slower) cadence, so reporting only the newest window dropped most spikes. *)
+let peak_cell = Atomic.make 0
+
+(** Which window held that peak and how many major GCs completed during it, so a long
+    pause can be attributed later instead of guessed at. *)
+let peak_cause : string option Atomic.t = Atomic.make None
+
 (** Set by {!start} once the detector domain exists. Without it "no pause this window" and
     "canary switched off" are the same value, and both printed [stw=0ns]. *)
 let running = Atomic.make false
 
 let is_running () = Atomic.get running
 let last_window_max_ns () = Atomic.get last_max_cell
+
+(** Peak pause and its window's major-GC delta since the previous call, then reset. Single
+    consumer (the journal). *)
+let take_peak () =
+  let ns = Atomic.exchange peak_cell 0 in
+  let cause = Atomic.exchange peak_cause None in
+  ns, cause
+;;
 
 (** [run ~threshold_us ~window_seconds] never returns. Records the gap between consecutive
     clock reads into a latency histogram and logs a summary every [window_seconds], on the
@@ -61,6 +77,7 @@ let run ~threshold_us ~window_seconds =
   let window_ns = int_of_float (window_seconds *. 1_000_000_000.) in
   let window_start = ref (Monotonic_clock.now_ns ()) in
   let prev = ref (Monotonic_clock.now_ns ()) in
+  let prev_major_gc = ref (Gc_config.major_gc_epoch ()) in
   while true do
     let now = Monotonic_clock.now_ns () in
     let gap = now - !prev in
@@ -72,15 +89,24 @@ let run ~threshold_us ~window_seconds =
       let snap =
         Latency_profiler.snapshot_and_reset ~spike_threshold_us:threshold_us prof
       in
-      Atomic.set last_max_cell (int_of_float (snap.max_us *. 1000.0));
+      let max_ns = int_of_float (snap.max_us *. 1000.0) in
+      let major_now = Gc_config.major_gc_epoch () in
+      let major_delta = major_now - !prev_major_gc in
+      prev_major_gc := major_now;
+      Atomic.set last_max_cell max_ns;
+      if max_ns > Atomic.get peak_cell
+      then (
+        Atomic.set peak_cell max_ns;
+        Atomic.set peak_cause (Some (Printf.sprintf "major_gc=+%d" major_delta)));
       Logging.info_f
         ~section
-        "STW canary p50=%s p99=%s max=%s spikes=%d/%d (threshold %s)"
+        "STW canary p50=%s p99=%s max=%s spikes=%d/%d major_gc=+%d (threshold %s)"
         (Latency_profiler.format_us snap.p50)
         (Latency_profiler.format_us snap.p99)
         (Latency_profiler.format_us snap.max_us)
         snap.over_threshold
         snap.samples
+        major_delta
         (Latency_profiler.format_us threshold_us));
     Domain.cpu_relax ()
   done

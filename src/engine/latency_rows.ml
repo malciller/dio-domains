@@ -21,10 +21,13 @@
     a torn histogram or block a trading cycle. *)
 
 (** Synthetic canary row: the canary reports one maximum per window, not a distribution,
-    so every percentile field carries that maximum. Marking it this way keeps [tail] and
-    [compare] arithmetic sane instead of reporting a p99 of zero. *)
+    so every percentile field carries that maximum. Use the peak over every window since
+    the journal's previous tick, not just the newest window: the journal runs slower than
+    the canary, and sampling one window in six dropped most spikes. Marking the row this
+    way keeps [tail] and [compare] arithmetic sane instead of reporting a p99 of zero. *)
 let canary_snapshot () =
-  let max_us = float_of_int (Canary.last_window_max_ns ()) /. 1000.0 in
+  let peak_ns, cause = Canary.take_peak () in
+  let max_us = float_of_int peak_ns /. 1000.0 in
   let now = Unix.gettimeofday () in
   { Latency_profiler.name = "canary"
   ; p50 = max_us
@@ -38,7 +41,7 @@ let canary_snapshot () =
   ; max_us
   ; max_time = now
   ; over_threshold = 0
-  ; max_cause = None
+  ; max_cause = cause
   ; executions = 0
   ; last_exec_time = 0.0
   ; window_start = now

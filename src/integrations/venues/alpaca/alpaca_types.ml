@@ -45,6 +45,14 @@ module Config = struct
       / [APCA-API-SECRET-KEY], as REST. *)
   let trading_events_url () = rest_base_url () ^ "/v2/events/trades"
 
+  (** Trading stream: account order updates (accepted, canceled, replaced, rejected,
+      filled). Separate from the market-data stream. *)
+  let trading_ws_url () =
+    if !is_paper
+    then "wss://paper-api.alpaca.markets/stream"
+    else "wss://api.alpaca.markets/stream"
+  ;;
+
   let data_ws_url () = Printf.sprintf "wss://stream.data.alpaca.markets/v2/%s" !data_feed
 
   (** Overnight feed (8:00 PM - 4:00 AM ET). The regular v2 stream delivers nothing

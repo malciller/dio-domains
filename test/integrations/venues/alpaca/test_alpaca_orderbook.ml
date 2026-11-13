@@ -1,11 +1,12 @@
 (* Tests for the Alpaca orderbook TOB semantics:
-   - The top-of-book comes ONLY from the WebSocket quote stream ("q" messages) - the
-     single data source, matching every other exchange in this codebase. No REST snapshot
+   - The top-of-book comes from the WebSocket quote stream ("q" messages). No REST snapshot
      polling, no ticker fallback.
-   - Trade prints ("t" messages) are recorded for analytics but NEVER publish a bid/ask -
-     no single-price seed before a quote, no crossing-side nudge, no stale-quote fallback.
-     A fabricated bid = ask = last trade showed raw print volatility that is not a real
-     market. *)
+   - Trade prints ("t" messages) are analytics while quotes flow: they never nudge a live
+     book, so print volatility cannot move a resting rung.
+   - The venue stops quoting at its session close while prints continue into extended
+     hours. Once the last quote is older than [trade_tob_fallback_s], a print IS promoted
+     to top-of-book (bid = ask = last print, zero size) - otherwise the book never ticks
+     and the strategy never runs, which is a dead market rather than a cautious one. *)
 
 let () = Random.self_init ()
 
@@ -47,41 +48,40 @@ let check_book symbol expected =
 
 (* ---- Trade prints never publish TOB ------------------------------------- *)
 
-let test_trade_before_any_quote_publishes_nothing () =
-  (* No quote has arrived: a trade must not seed a single price, so the store has no valid
-     TOB until a real quote lands. *)
+let test_print_seeds_when_no_quote_has_arrived () =
+  (* No quote yet: the print is the only price evidence, and without it the store has no
+     valid TOB at all, so an extended-hours session could never start. *)
   let sym = "T_NOSEED" in
   handle (trade_msg sym 138.5 "2026-01-02T15:00:01Z");
-  check_book sym None
+  check_book sym (Some (138.5, 0.0, 138.5, 0.0))
 ;;
 
-let test_trade_after_quote_never_moves_book () =
+let test_print_never_moves_a_live_book () =
   let sym = "T_NOMOVE" in
   handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
   check_book sym (Some (140.0, 10.0, 141.0, 10.0));
-  (* A print above the ask must not move the book: one print is not a quote. *)
+  (* Prints on either side and inside the spread, all inside the fallback window. *)
   handle (trade_msg sym 142.0 "2026-01-02T15:00:01Z");
-  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
-  (* A print below the bid: no movement. *)
   handle (trade_msg sym 138.0 "2026-01-02T15:00:02Z");
-  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
-  (* A print inside the spread: no movement. *)
   handle (trade_msg sym 140.5 "2026-01-02T15:00:03Z");
-  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
-  (* Out-of-order print from a previous session: no movement. *)
+  (* Out-of-order print from a previous session. *)
   handle (trade_msg sym 130.0 "2026-01-02T14:59:00Z");
   check_book sym (Some (140.0, 10.0, 141.0, 10.0))
 ;;
 
-let test_trade_after_stale_quote_never_publishes_fallback () =
-  (* With no fresh quote for a long stretch, trade prints must never fabricate bid = ask =
-     last trade; the book holds the last real quote until the REST snapshot poll refreshes
-     it. A trade newer than the quote must not change the published TOB. *)
-  let sym = "T_NOSTALE" in
+let test_print_promotes_after_the_quote_goes_stale () =
+  let sym = "T_STALE" in
   handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
   check_book sym (Some (140.0, 10.0, 141.0, 10.0));
+  (* Three hours later the venue has stopped quoting and this is the only price there is. *)
   handle (trade_msg sym 130.0 "2026-01-02T18:00:00Z");
-  check_book sym (Some (140.0, 10.0, 141.0, 10.0))
+  check_book sym (Some (130.0, 0.0, 130.0, 0.0));
+  (* Every later print re-promotes: the stale quote timestamp stays in place. *)
+  handle (trade_msg sym 131.0 "2026-01-02T18:00:05Z");
+  check_book sym (Some (131.0, 0.0, 131.0, 0.0));
+  (* A real quote takes the book back. *)
+  handle (quote_msg sym 131.5 132.5 "2026-01-02T18:00:06Z");
+  check_book sym (Some (131.5, 10.0, 132.5, 10.0))
 ;;
 
 (* ---- Real quotes publish TOB -------------------------------------------- *)
@@ -152,19 +152,19 @@ let test_reordered_and_nested_fields () =
 let () =
   Alcotest.run
     "alpaca_orderbook"
-    [ ( "trade_never_publishes_tob"
+    [ ( "trade_promotes_only_when_quotes_stop"
       , [ Alcotest.test_case
-            "trade before any quote publishes nothing"
+            "print seeds the book before any quote"
             `Quick
-            test_trade_before_any_quote_publishes_nothing
+            test_print_seeds_when_no_quote_has_arrived
         ; Alcotest.test_case
-            "trade after quote never moves the book"
+            "print never moves a live book"
             `Quick
-            test_trade_after_quote_never_moves_book
+            test_print_never_moves_a_live_book
         ; Alcotest.test_case
-            "trade after stale quote never publishes a fallback"
+            "print promotes once the quote is stale"
             `Quick
-            test_trade_after_stale_quote_never_publishes_fallback
+            test_print_promotes_after_the_quote_goes_stale
         ] )
     ; ( "quote_publishes_tob"
       , [ Alcotest.test_case "quote publishes bid/ask" `Quick test_quote_publishes_bid_ask

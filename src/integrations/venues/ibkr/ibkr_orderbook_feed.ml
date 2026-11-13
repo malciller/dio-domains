@@ -63,6 +63,24 @@ let ensure_store symbol =
 
 let store_opt symbol = Ds.Cow_table.find_opt stores symbol
 
+(** Write top-of-book into [buf] as (bid price, bid size, ask price, ask size). *)
+let top_of_book_into ~symbol (buf : float array) =
+  match store_opt symbol with
+  | Some store ->
+    (match Concurrency.Ring_buffer.RingBuffer.read_latest store.buffer with
+     | Some ob
+       when Array.length ob.bids > 0 && Array.length ob.asks > 0 ->
+       let bid = ob.bids.(0) in
+       let ask = ob.asks.(0) in
+       buf.(0) <- bid.price;
+       buf.(1) <- bid.size;
+       buf.(2) <- ask.price;
+       buf.(3) <- ask.size;
+       true
+     | _ -> false)
+  | None -> false
+;;
+
 let notify_ready store =
   if not (Atomic.get store.ready)
   then (

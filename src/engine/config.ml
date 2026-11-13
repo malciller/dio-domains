@@ -2321,6 +2321,9 @@ let get_gc_config () =
 (** Applies GC tuning from the cached config. Must be called once per OCaml 5 domain (each
     domain has its own minor heap). No-op if [gc] is absent. *)
 let apply_gc_config () =
+  (* Arm the cross-domain major-GC counter even when no GC config is present: the canary
+     uses its delta to tell a global GC pause from a host/scheduler pause. *)
+  Gc_config.install_alarm ();
   match get_gc_config () with
   | None -> ()
   | Some gc ->

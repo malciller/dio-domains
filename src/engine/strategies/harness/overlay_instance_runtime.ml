@@ -66,18 +66,28 @@ let seed rt state =
     rt.file.state
 ;;
 
-let snapshot rt =
+(** [get_state] defaults to the interpreter runtime. A cut-over instance keeps its state in
+    the compiled env instead, so the caller passes a reader for it and the runtime copy is
+    no longer written on every pass just to be persisted. *)
+let snapshot ?(get_state = fun rt name -> Rt.get_state rt name) rt =
   `Assoc
     (List.filter_map
        (fun (decl : File.state_decl) ->
          if decl.s_persist
-         then Some (decl.s_name, json_of_value (Rt.get_state rt decl.s_name))
+         then Some (decl.s_name, json_of_value (get_state rt decl.s_name))
          else None)
        rt.file.state)
 ;;
 
-let save_if_changed ~owner_exchange ~owner_symbol ~id rt (previous : Yojson.Basic.t ref) =
-  let next = snapshot rt in
+let save_if_changed
+      ?get_state
+      ~owner_exchange
+      ~owner_symbol
+      ~id
+      rt
+      (previous : Yojson.Basic.t ref)
+  =
+  let next = snapshot ?get_state rt in
   if next <> !previous
   then (
     previous := next;

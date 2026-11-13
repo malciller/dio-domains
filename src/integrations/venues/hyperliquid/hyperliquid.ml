@@ -36,6 +36,7 @@ module Asset_ctx = Hyperliquid_asset_ctx
 
 (** Perp position and margin snapshots ([webData2]). *)
 module Positions = Hyperliquid_positions
+module Dex_positions = Hyperliquid_dex_positions
 
 (** Account abstraction mode ([unifiedAccount] / [portfolioMargin] / standard). *)
 module Account_mode = Hyperliquid_account_mode

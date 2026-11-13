@@ -121,6 +121,12 @@ let metric_pages =
     ; trend_label = "(FEED P99)"
     ; trend_max_us = 200_000.0
     }
+  ; { page_label = "NATIVE"
+    ; metrics = [ "native_res"; "native_bridge"; "native_run"; "native_actions" ]
+    ; trend_metric = "native_run"
+    ; trend_label = "(NATIVE P99)"
+    ; trend_max_us = 200.0
+    }
   ]
 ;;
 
@@ -174,6 +180,10 @@ let short_label = function
   | "ws_feed" -> "FEED"
   | "rest_request" -> "REST"
   | "signer" -> "SIGN"
+  | "native_res" -> "RESERVE"
+  | "native_bridge" -> "FACTS"
+  | "native_run" -> "STRAT"
+  | "native_actions" -> "ACTIONS"
   | l -> String.uppercase_ascii (truncate_string 6 l)
 ;;
 
@@ -349,6 +359,8 @@ let render_latencies w (snapshot : Snapshot.t) =
       match label with
       | "cycle" -> 50.0, 100.0
       | "oracle" | "orderbook" | "prep" | "strategy" | "execution" -> 10.0, 20.0
+      | "native_run" -> 5.0, 10.0
+      | "native_bridge" | "native_actions" | "native_res" -> 50.0, 100.0
       | "ws_ping" -> 20_000.0, 100_000.0
       | "ws_feed" -> 50_000.0, 200_000.0
       | "rest_request" -> 100_000.0, 500_000.0

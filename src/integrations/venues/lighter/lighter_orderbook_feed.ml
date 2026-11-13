@@ -444,6 +444,19 @@ let[@inline always] get_best_bid_ask symbol =
   | None -> None
 ;;
 
+let[@inline always] get_best_bid_ask_into symbol (buf : float array) =
+  match get_latest_orderbook symbol with
+  | Some { bids; asks; _ } ->
+    let bid = bids.(0) in
+    let ask = asks.(0) in
+    buf.(0) <- bid.price;
+    buf.(1) <- bid.size;
+    buf.(2) <- ask.price;
+    buf.(3) <- ask.size;
+    true
+  | None -> false
+;;
+
 let[@inline always] get_best_bid_ask_fast symbol =
   match get_store symbol with
   | Some store ->

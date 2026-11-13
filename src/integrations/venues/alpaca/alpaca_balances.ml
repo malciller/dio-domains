@@ -97,6 +97,13 @@ let get_all_balances () =
   Hashtbl.fold (fun k v acc -> (k, v) :: acc) t []
 ;;
 
+(** Called with every fresh position mark the poll publishes. The venue's marks keep
+    moving when its quote stream has stopped for the session, so the order book uses them
+    to keep ticking (see [Alpaca_orderbook.push_mark]). *)
+let mark_observer : (string -> float -> unit) ref = ref (fun _ _ -> ())
+
+let set_mark_observer f = mark_observer := f
+
 let update_balances () =
   Alpaca_rest.get_account ()
   >>= function
@@ -169,6 +176,14 @@ let update_balances () =
     Atomic.set total_balances new_total;
     Atomic.set available_balances new_available;
     Atomic.set position_marks new_marks;
+    (* Feed the book after publishing, so a reader never sees a tick for an unpublished
+       mark. *)
+    (match pos_res with
+     | Ok _ ->
+       Hashtbl.iter
+         (fun symbol price -> (!mark_observer) symbol price)
+         new_marks
+     | Error _ -> ());
     Atomic.set initial_data_received true;
     Atomic.set last_update (Unix.time ());
     (* Alpaca has no balance push, so this poll is the acquisition edge. Notify only when

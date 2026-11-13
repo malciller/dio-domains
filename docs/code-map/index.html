@@ -1,0 +1,1362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dio-domains code map</title>
+<style>
+  :root {
+    --bg: #0a0c0f;
+    --panel: #10141a;
+    --panel-2: #151a22;
+    --line: #222a35;
+    --line-2: #2d3745;
+    --text: #e4eaf2;
+    --muted: #8792a2;
+    --dim: #5c6878;
+    --accent: #5aa9ff;
+    --accent-2: #1b3552;
+    --engine: #5aa9ff;
+    --integrations: #c084fc;
+    --foundation: #f0a35e;
+    --bin: #4ade80;
+    --dashboard_ui: #f472b6;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+  }
+  [hidden] { display: none !important; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.45 ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  button { font: inherit; }
+
+  header {
+    flex: none;
+    height: 54px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--line);
+    background: #0c1015;
+  }
+  .brand { display: flex; align-items: center; gap: 9px; white-space: nowrap; font-weight: 600; letter-spacing: -0.01em; }
+  .brand .mark {
+    width: 15px; height: 15px; border-radius: 4px;
+    background: conic-gradient(from 210deg, var(--engine), var(--integrations), var(--foundation), var(--bin), var(--engine));
+  }
+  .brand .sub { color: var(--muted); font-weight: 400; }
+  nav { display: flex; gap: 2px; padding: 3px; background: #080b0e; border: 1px solid var(--line); border-radius: 8px; }
+  nav button {
+    border: 0; background: none; color: var(--muted); padding: 5px 12px; border-radius: 6px; cursor: pointer;
+    font-size: 12.5px; font-weight: 500;
+  }
+  nav button:hover { color: var(--text); }
+  nav button.on { background: #1a2532; color: #d9e9ff; }
+  nav .count { color: var(--dim); font-size: 11px; margin-left: 5px; }
+  .back {
+    border: 1px solid var(--line); background: none; color: var(--muted); border-radius: 7px;
+    width: 30px; height: 30px; cursor: pointer; display: none;
+  }
+  .back.on { display: block; }
+  .back:hover { color: var(--text); border-color: var(--line-2); }
+
+  .search { margin-left: auto; position: relative; width: min(400px, 32vw); }
+  .search input {
+    width: 100%; background: #080b0e; border: 1px solid var(--line); border-radius: 8px;
+    color: var(--text); padding: 7px 34px 7px 11px; outline: none; font-size: 12.5px;
+  }
+  .search input:focus { border-color: #37506c; background: #0a0e13; }
+  .search kbd {
+    position: absolute; right: 8px; top: 7px; font: 10px/1.4 var(--mono); color: var(--dim);
+    border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; pointer-events: none;
+  }
+  .results {
+    position: absolute; top: 39px; left: 0; right: 0; z-index: 30; display: none;
+    background: #11161d; border: 1px solid var(--line-2); border-radius: 10px;
+    box-shadow: 0 18px 50px #000a; overflow: hidden;
+  }
+  .results.open { display: block; }
+  .results button {
+    display: flex; align-items: center; gap: 9px; width: 100%; padding: 8px 11px;
+    background: none; border: 0; border-bottom: 1px solid #1a212b; color: var(--text);
+    text-align: left; cursor: pointer;
+  }
+  .results button:last-child { border-bottom: 0; }
+  .results button:hover, .results button.hot { background: #17202b; }
+  .results .type {
+    font: 9.5px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase;
+    color: var(--muted); border: 1px solid var(--line-2); border-radius: 3px; padding: 3px 4px;
+  }
+  .results .path { margin-left: auto; color: var(--dim); font: 10.5px var(--mono); max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .results .none { padding: 12px; color: var(--muted); }
+
+  main { flex: 1; display: flex; min-height: 0; }
+
+  .rail {
+    width: 236px; flex: none; background: var(--panel); border-right: 1px solid var(--line);
+    overflow: auto; padding: 16px 14px;
+  }
+  .rail h4 {
+    margin: 0 0 8px; font-size: 10.5px; font-weight: 600; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--dim);
+  }
+  .rail section + section { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+  .rail p { margin: 0 0 12px; color: var(--muted); font-size: 12px; }
+  .rail .root-card { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 12px; }
+  .rail .root-card b { display: block; font-weight: 600; font-size: 12.5px; overflow-wrap: anywhere; }
+  .rail .root-card span { display: block; color: var(--dim); font: 10.5px/1.5 var(--mono); margin-top: 4px; overflow-wrap: anywhere; }
+  .seg { display: flex; gap: 2px; background: #0a0d11; border: 1px solid var(--line); border-radius: 7px; padding: 2px; margin-bottom: 12px; }
+  .seg button {
+    flex: 1; border: 0; background: none; color: var(--muted); padding: 4px 6px; border-radius: 5px;
+    font-size: 11.5px; cursor: pointer;
+  }
+  .seg button.on { background: #1a2532; color: #d9e9ff; }
+  .seg button:hover { color: var(--text); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line);
+    background: #0c1015; color: var(--muted); border-radius: 20px; padding: 4px 9px;
+    font-size: 11.5px; cursor: pointer;
+  }
+  .chip:hover { color: var(--text); border-color: var(--line-2); }
+  .chip.on { color: var(--text); border-color: #39557a; background: #122031; }
+  .chip .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .chip .n { color: var(--dim); font: 10px var(--mono); }
+  .legend { display: grid; gap: 7px; }
+  .legend div { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+  .legend i { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+  .rail .hint { color: var(--dim); font-size: 11.5px; line-height: 1.55; }
+  .rail .hint b { color: var(--muted); font-weight: 500; }
+  .rail .ghost {
+    width: 100%; margin-bottom: 16px; border: 1px solid var(--line-2); background: #121a24;
+    color: #cfe4ff; border-radius: 7px; padding: 6px; font-size: 12px; cursor: pointer;
+  }
+  .rail .ghost:hover { border-color: var(--accent); }
+  .rail .stats { display: flex; gap: 14px; color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+  #stage {
+    flex: 1; position: relative; min-width: 0; overflow: hidden;
+    background-color: var(--bg);
+    background-image: radial-gradient(#161c25 1px, transparent 1px);
+    background-size: 22px 22px;
+  }
+  svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; }
+  svg.dragging { cursor: grabbing; }
+  .edge { fill: none; stroke: #2b3542; stroke-width: 1.2; opacity: 0; }
+  .edge[data-view="libraries"], .edge[data-view="modules"] { opacity: 0; }
+  .edge[data-view="trace"] { opacity: .55; }
+  .edge[data-mode="focus"] { opacity: .8; }
+  .edge.hot { stroke: var(--accent); stroke-width: 1.8; opacity: 1 !important; }
+  .edge.dim { opacity: 0 !important; }
+  .node { cursor: pointer; }
+  .node rect.body { fill: #11161d; stroke: #28313d; stroke-width: 1; }
+  .node:hover rect.body { stroke: #4a5b70; }
+  .node.sel rect.body { stroke: var(--accent); stroke-width: 2; }
+  .node.dim { opacity: .2; }
+  .node .txt { fill: #dbe3ee; font-size: 11.5px; pointer-events: none; }
+  .node .bar { pointer-events: none; }
+  .node .type { fill: var(--dim); font: 9px var(--mono); pointer-events: none; }
+  .node.sel .type { fill: var(--muted); }
+
+  .zoom {
+    position: absolute; right: 14px; bottom: 14px; display: flex; gap: 4px;
+    background: #0e1319dd; border: 1px solid var(--line); border-radius: 8px; padding: 3px;
+    backdrop-filter: blur(6px);
+  }
+  .zoom button {
+    width: 28px; height: 26px; border: 0; background: none; color: var(--muted);
+    border-radius: 5px; cursor: pointer; font-size: 14px;
+  }
+  .zoom button:hover { background: #1a212b; color: var(--text); }
+  .zoom .wide { width: 34px; font-size: 11px; }
+  .status {
+    position: absolute; left: 14px; bottom: 16px; color: var(--dim); font-size: 11px;
+    font-variant-numeric: tabular-nums; pointer-events: none;
+  }
+  .tip {
+    position: fixed; z-index: 60; pointer-events: none; max-width: 400px;
+    background: #0b0f14f2; border: 1px solid var(--line-2); border-radius: 7px;
+    padding: 7px 10px; box-shadow: 0 10px 28px #0009; font-size: 12px;
+  }
+  .tip .p { color: var(--dim); font: 10px/1.5 var(--mono); margin-top: 3px; }
+  .empty {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    pointer-events: none;
+  }
+  .empty > div {
+    max-width: 560px; text-align: center; color: var(--muted); line-height: 1.6;
+    background: #0d1116f2; border: 1px solid var(--line); border-radius: 14px; padding: 22px 26px;
+    pointer-events: auto;
+  }
+  .starters { display: flex; flex-wrap: wrap; gap: 7px; justify-content: center; margin-top: 14px; }
+  .starters .chip { font-size: 11.5px; }
+  .empty b { display: block; color: var(--text); font-size: 14px; margin-bottom: 6px; }
+
+  .inspector {
+    width: 336px; flex: none; background: var(--panel); border-left: 1px solid var(--line);
+    overflow: auto; padding: 18px 16px;
+  }
+  .inspector .kicker { display: flex; align-items: center; gap: 8px; margin-bottom: 9px; }
+  .inspector .kicker span {
+    font: 9.5px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
+    border: 1px solid var(--line-2); border-radius: 3px; padding: 3px 5px;
+  }
+  .inspector .kicker .dot { width: 8px; height: 8px; border-radius: 2px; }
+  .inspector h2 { margin: 0 0 6px; font-size: 15px; line-height: 1.3; word-break: break-word; }
+  .fileline {
+    display: flex; align-items: center; gap: 6px; background: #0b0f14; border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 8px; margin-bottom: 16px;
+  }
+  .fileline code { flex: 1; color: #9db1c9; font: 10.5px/1.5 var(--mono); overflow-wrap: anywhere; }
+  .fileline button {
+    border: 1px solid var(--line); background: none; color: var(--dim); border-radius: 4px;
+    font: 10px var(--mono); padding: 2px 6px; cursor: pointer; flex: none;
+  }
+  .fileline button:hover { color: var(--text); border-color: var(--line-2); }
+  .section-title {
+    display: flex; align-items: baseline; gap: 7px; margin: 18px 0 7px;
+    font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim);
+  }
+  .section-title b { color: var(--muted); font: 10px var(--mono); font-weight: 400; }
+  .rows { display: grid; gap: 2px; }
+  .rows button {
+    display: block; width: 100%; text-align: left; background: none; border: 0;
+    color: var(--text); padding: 6px 7px; border-radius: 6px; cursor: pointer;
+  }
+  .rows button:hover { background: #17202b; }
+  .rows .label { display: block; font-size: 12px; }
+  .rows .loc { display: block; color: var(--dim); font: 10px/1.5 var(--mono); overflow-wrap: anywhere; }
+  .rows .none { color: var(--dim); font-size: 12px; padding: 4px 7px; }
+  .inspector .ghost {
+    width: 100%; margin-top: 16px; border: 1px solid var(--line-2); background: #121a24;
+    color: #cfe4ff; border-radius: 7px; padding: 7px; font-size: 12px; cursor: pointer;
+  }
+  .inspector .ghost:hover { border-color: var(--accent); }
+  .inspector .foot { margin-top: 22px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--dim); font-size: 10.5px; line-height: 1.6; }
+  .inspector .foot code { color: #8fa6bf; font: 10px var(--mono); }
+  .inspector .intro { color: var(--muted); font-size: 12.5px; line-height: 1.65; }
+  .inspector .intro b { color: var(--text); }
+  .inspector .intro ul { margin: 10px 0 0; padding-left: 17px; }
+  .inspector .intro li { margin-bottom: 5px; }
+
+  @media (max-width: 1320px) {
+    .rail { width: 210px; }
+    .inspector { width: 306px; }
+    .search { width: min(320px, 28vw); }
+  }
+  @media (max-width: 1100px) {
+    .rail { width: 186px; padding: 14px 11px; }
+    .inspector { width: 284px; padding: 14px 12px; }
+    .brand .sub { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="mark"></span> dio-domains <span class="sub">/ code map</span></div>
+  <nav id="tabs"></nav>
+  <button class="back" id="back" title="Back">←</button>
+  <div class="search">
+    <input id="q" placeholder="Search libraries, modules, functions…" autocomplete="off" spellcheck="false">
+    <kbd>⌘K</kbd>
+    <div class="results" id="results"></div>
+  </div>
+</header>
+<main>
+  <aside class="rail" id="rail"></aside>
+  <section id="stage">
+    <svg id="canvas">
+      <defs>
+        <marker id="arrow" viewBox="0 0 8 8" refX="7.5" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L8,4 L0,8 z" fill="#3d4a5c"></path>
+        </marker>
+        <marker id="arrow-hot" viewBox="0 0 8 8" refX="7.5" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L8,4 L0,8 z" fill="#5aa9ff"></path>
+        </marker>
+      </defs>
+      <g id="world"></g>
+    </svg>
+    <div class="empty" id="empty" hidden><div id="empty-inner"></div></div>
+    <div class="tip" id="tip" hidden></div>
+    <div class="status" id="status"></div>
+    <div class="zoom">
+      <button id="zoom-out" title="Zoom out">−</button>
+      <button id="fit" class="wide" title="Fit to screen">fit</button>
+      <button id="zoom-in" title="Zoom in">+</button>
+    </div>
+  </section>
+  <aside class="inspector" id="inspector"></aside>
+</main>
+<script src="graph.js"></script>
+<script>
+(() => {
+  const data = window.CODEVIZ;
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.getElementById("canvas");
+  const world = document.getElementById("world");
+  const rail = document.getElementById("rail");
+  const inspector = document.getElementById("inspector");
+  const empty = document.getElementById("empty");
+  const emptyInner = document.getElementById("empty-inner");
+  const status = document.getElementById("status");
+  const tip = document.getElementById("tip");
+  const tabs = document.getElementById("tabs");
+  const back = document.getElementById("back");
+  const q = document.getElementById("q");
+  const results = document.getElementById("results");
+
+  if (!data) {
+    empty.hidden = false;
+    emptyInner.innerHTML = "<b>graph.js is missing</b>Run <code>python3 scripts/codeviz.py site</code> from the repo root.";
+    return;
+  }
+
+  const CHIP_H = 32, GAP_Y = 48, GAP_X = 320;
+  const BOARD_W = 1150, PANEL_GUTTER = 20, CHIP_W = 168, CHIP_GAP = 10;
+  const FOCUS_START = 360, FOCUS_ROWS = 14, FOCUS_MAX = 22, TRACE_SIDE_MAX = 24;
+  const AREA_COLOR = {
+    engine: "#5aa9ff",
+    integrations: "#c084fc",
+    foundation: "#f0a35e",
+    bin: "#4ade80",
+    dashboard_ui: "#f472b6",
+  };
+  const AREA_ORDER = ["engine", "integrations", "foundation", "dashboard_ui", "bin"];
+
+  const datasets = { libraries: data.libraries, modules: data.modules, symbols: data.symbols };
+  const VIEW_TYPE = { libraries: "library", modules: "module", trace: "function" };
+  const byId = new Map();
+  for (const [name, set] of Object.entries(datasets)) {
+    for (const n of set.nodes) {
+      n.view = name === "symbols" ? "trace" : name;
+      n.w = 0;
+      byId.set(n.id, n);
+    }
+  }
+
+  const OUT_DEGREE = new Map();
+  const TOTAL_DEGREE = new Map();
+  for (const [a, b] of datasets.symbols.edges) {
+    OUT_DEGREE.set(a, (OUT_DEGREE.get(a) || 0) + 1);
+    TOTAL_DEGREE.set(a, (TOTAL_DEGREE.get(a) || 0) + 1);
+    TOTAL_DEGREE.set(b, (TOTAL_DEGREE.get(b) || 0) + 1);
+  }
+  const GLOBAL_STARTERS = datasets.symbols.nodes
+    .filter((n) => !n.name.startsWith("<"))
+    .slice()
+    .sort((a, b) => (OUT_DEGREE.get(b.id) || 0) - (OUT_DEGREE.get(a.id) || 0))
+    .slice(0, 10);
+
+  function starters() {
+    if (state.traceScope) {
+      const list = datasets.symbols.nodes
+        .filter((n) => n.module === state.traceScope.module && !n.name.startsWith("<"))
+        .sort((a, b) => (OUT_DEGREE.get(b.id) || 0) - (OUT_DEGREE.get(a.id) || 0))
+        .slice(0, 14);
+      if (list.length) return list;
+    }
+    return GLOBAL_STARTERS;
+  }
+
+  function starterChips() {
+    return starters()
+      .map((n) => `<button class="chip" data-start="${esc(n.id)}">${esc(n.label)}</button>`)
+      .join("");
+  }
+
+  const state = {
+    view: "libraries",
+    mode: "board",
+    selected: null,
+    root: null,
+    direction: "both",
+    depth: 1,
+    areas: new Set(["engine"]),
+    traceScope: null,
+    history: [],
+    nodes: [],
+    edges: [],
+    nodeEls: new Map(),
+    edgeEls: [],
+    content: null,
+    viewport: { x: 0, y: 0, s: 1 },
+  };
+
+  // ---------------------------------------------------------------- data
+
+  function areaOf(node) {
+    return String(node.group || "").split("/")[0] || "other";
+  }
+
+  function colorOf(node) {
+    const area = areaOf(node);
+    if (AREA_COLOR[area]) return AREA_COLOR[area];
+    let h = 0;
+    for (let i = 0; i < area.length; i++) h = (h * 31 + area.charCodeAt(i)) | 0;
+    return `hsl(${Math.abs(h) % 360} 55% 60%)`;
+  }
+
+  function rawLabel(node) {
+    return node.view === "libraries" ? node.label.replace(/^dio\./, "") : node.label;
+  }
+
+  function displayLabel(node) {
+    const s = rawLabel(node);
+    const max = node.w ? Math.max(8, Math.floor((node.w - 30) / 6.9)) : 32;
+    return s.length > max ? s.slice(0, max - 1) + "…" : s;
+  }
+
+  function chipWidth(node) {
+    return Math.max(110, Math.min(260, Math.round(rawLabel(node).length * 7.1 + 34)));
+  }
+
+  function filteredModules() {
+    const nodes = datasets.modules.nodes.filter((n) => state.areas.has(areaOf(n)));
+    const ids = new Set(nodes.map((n) => n.id));
+    const edges = datasets.modules.edges.filter((e) => ids.has(e[0]) && ids.has(e[1]));
+    return { nodes, edges };
+  }
+
+  function ego(rootId, direction, depth) {
+    const levels = new Map([[rootId, 0]]);
+    let frontier = new Set([rootId]);
+    for (let d = 1; d <= depth; d++) {
+      const next = new Set();
+      const edges = datasets.symbols.edges;
+      if (direction !== "callees") {
+        for (const e of edges) {
+          if (frontier.has(e[1]) && !levels.has(e[0])) { levels.set(e[0], -d); next.add(e[0]); }
+        }
+      }
+      if (direction !== "callers") {
+        for (const e of edges) {
+          if (frontier.has(e[0]) && !levels.has(e[1])) { levels.set(e[1], d); next.add(e[1]); }
+        }
+      }
+      frontier = next;
+      if (!frontier.size) break;
+    }
+    const total = levels.size;
+    const keep = new Set([rootId]);
+    for (const sign of [-1, 1]) {
+      const side = [...levels.entries()]
+        .filter(([id, lvl]) => id !== rootId && Math.sign(lvl) === sign)
+        .sort((a, b) => Math.abs(a[1]) - Math.abs(b[1]) || String(byId.get(a[0])?.label).localeCompare(String(byId.get(b[0])?.label)));
+      if (sign < 0 && direction === "callees") continue;
+      if (sign > 0 && direction === "callers") continue;
+      side.slice(0, TRACE_SIDE_MAX).forEach(([id]) => keep.add(id));
+    }
+    const nodes = [...keep].map((id) => byId.get(id)).filter(Boolean);
+    const edges = datasets.symbols.edges.filter((e) => keep.has(e[0]) && keep.has(e[1]));
+    return { nodes, edges, levels, total, capped: total > keep.size };
+  }
+
+  // --------------------------------------------------------------- layout
+
+  function boardLayout(nodes, edges) {
+    const groups = new Map();
+    for (const n of nodes) {
+      const key = state.view === "libraries" ? areaOf(n) : n.group || "other";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(n);
+    }
+    const keys = [...groups.keys()].sort((a, b) => {
+      const ai = AREA_ORDER.indexOf(a.split("/")[0]);
+      const bi = AREA_ORDER.indexOf(b.split("/")[0]);
+      if (ai !== bi) return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+      return a.localeCompare(b);
+    });
+    const pad = 14;
+    const cols = keys.length > 2 ? 2 : 1;
+    const panelW = Math.floor((BOARD_W - PANEL_GUTTER * (cols - 1)) / cols);
+    const perRow = Math.max(1, Math.floor((panelW - pad * 2 + CHIP_GAP) / (CHIP_W + CHIP_GAP)));
+    const sections = [];
+    const heights = new Array(cols).fill(0);
+    for (const key of keys) {
+      const col = groups.get(key).sort((a, b) => a.label.localeCompare(b.label));
+      const rows = Math.ceil(col.length / perRow);
+      const h = 34 + rows * (CHIP_H + CHIP_GAP) + pad - CHIP_GAP;
+      const target = heights.indexOf(Math.min(...heights));
+      const x = target * (panelW + PANEL_GUTTER);
+      const y = heights[target];
+      sections.push({ key, x, y, w: panelW, h, count: col.length });
+      col.forEach((n, i) => {
+        const r = Math.floor(i / perRow), c = i % perRow;
+        n.w = CHIP_W;
+        n.x = x + pad + c * (CHIP_W + CHIP_GAP) + CHIP_W / 2;
+        n.y = y + 34 + r * (CHIP_H + CHIP_GAP) + CHIP_H / 2;
+      });
+      heights[target] += h + 18;
+    }
+    return { nodes, edges, sections, width: BOARD_W, height: Math.max(...heights, 200) };
+  }
+
+  function focusLayout(dataset, centerId) {
+    const center = byId.get(centerId);
+    const seen = new Set([centerId]);
+    const outs = [], ins = [];
+    for (const e of dataset.edges) {
+      if (e[0] === centerId && !seen.has(e[1])) { seen.add(e[1]); outs.push(byId.get(e[1])); }
+    }
+    for (const e of dataset.edges) {
+      if (e[1] === centerId && !seen.has(e[0])) { seen.add(e[0]); ins.push(byId.get(e[0])); }
+    }
+    const inTotal = ins.length;
+    const outTotal = outs.length;
+    ins.length = Math.min(ins.length, FOCUS_MAX);
+    outs.length = Math.min(outs.length, FOCUS_MAX);
+    const nodes = [center, ...ins, ...outs].filter(Boolean);
+    const ids = new Set(nodes.map((n) => n.id));
+    const edges = dataset.edges.filter(
+      (e) => ids.has(e[0]) && ids.has(e[1]) && (e[0] === centerId || e[1] === centerId)
+    );
+    center.w = chipWidth(center);
+    center.x = 0;
+    center.y = 0;
+
+    const place = (items, side) => {
+      items.sort((a, b) => a.label.localeCompare(b.label));
+      const chunks = [];
+      for (let i = 0; i < items.length; i += FOCUS_ROWS) chunks.push(items.slice(i, i + FOCUS_ROWS));
+      let cursor = FOCUS_START;
+      let top = Infinity;
+      let firstX = null;
+      for (const chunk of chunks) {
+        const maxW = Math.max(110, ...chunk.map((n) => chipWidth(n)));
+        const x = side * (cursor + maxW / 2);
+        if (firstX === null) firstX = x;
+        chunk.forEach((n, i) => {
+          n.w = chipWidth(n);
+          n.x = x;
+          n.y = (i - (chunk.length - 1) / 2) * (CHIP_H + 18);
+          top = Math.min(top, n.y);
+        });
+        cursor += maxW + 46;
+      }
+      return { x: firstX ?? side * FOCUS_START, top };
+    };
+
+    const left = place(ins, -1);
+    const right = place(outs, 1);
+    const headers = [];
+    const isLib = state.view === "libraries";
+    if (ins.length) {
+      headers.push({ x: left.x, y: Math.min(left.top, -CHIP_H) - 44, text: isLib ? "USED BY" : "IMPORTED BY" });
+    }
+    if (outs.length) {
+      headers.push({ x: right.x, y: Math.min(right.top, -CHIP_H) - 44, text: isLib ? "DEPENDS ON" : "IMPORTS" });
+    }
+    return { nodes, edges, headers, inTotal, outTotal, width: 900, height: 500 };
+  }
+
+  function traceLayout(nodes, edges, levels) {
+    const rank = new Map();
+    for (const n of nodes) rank.set(n.id, levels.get(n.id) ?? 0);
+    const inc = new Map(nodes.map((n) => [n.id, []]));
+    const out = new Map(nodes.map((n) => [n.id, []]));
+    const ids = new Set(nodes.map((n) => n.id));
+    for (const [a, b] of edges) {
+      if (!ids.has(a) || !ids.has(b)) continue;
+      out.get(a).push(b); inc.get(b).push(a);
+    }
+    return columnsFromRanks(nodes, edges, rank, inc, out);
+  }
+
+  function columnsFromRanks(nodes, edges, rank, inc, out) {
+    const minRank = Math.min(...nodes.map((n) => rank.get(n.id)));
+    for (const n of nodes) rank.set(n.id, rank.get(n.id) - minRank);
+    const maxRank = Math.max(...nodes.map((n) => rank.get(n.id)));
+    const columns = new Map();
+    for (let r = 0; r <= maxRank; r++) columns.set(r, []);
+    for (const n of nodes) columns.get(rank.get(n.id)).push(n);
+    for (const col of columns.values()) {
+      col.sort((a, b) => a.group.localeCompare(b.group) || a.label.localeCompare(b.label));
+      for (const n of col) n.w = chipWidth(n);
+    }
+
+    const orderIndex = () => {
+      const idx = new Map();
+      for (const col of columns.values()) col.forEach((n, i) => idx.set(n.id, i));
+      return idx;
+    };
+
+    for (let pass = 0; pass < 3; pass++) {
+      const idx = orderIndex();
+      for (let r = 1; r <= maxRank; r++) {
+        const col = columns.get(r);
+        const prev = columns.get(r - 1);
+        const score = new Map();
+        for (const n of col) {
+          const ps = inc.get(n.id).filter((p) => idx.has(p) && rank.get(p) === r - 1);
+          score.set(n.id, ps.length ? ps.reduce((s, p) => s + idx.get(p), 0) / ps.length : idx.get(n.id));
+        }
+        col.sort((a, b) => (score.get(a.id) - score.get(b.id)) || a.label.localeCompare(b.label));
+      }
+    }
+
+    let maxH = 0;
+    for (const col of columns.values()) maxH = Math.max(maxH, col.length * GAP_Y);
+    let width = 0;
+    for (let r = 0; r <= maxRank; r++) {
+      const col = columns.get(r);
+      const colH = col.length * GAP_Y;
+      const top = (maxH - colH) / 2;
+      col.forEach((n, i) => {
+        n.x = r * GAP_X;
+        n.y = top + i * GAP_Y + CHIP_H / 2;
+        width = Math.max(width, n.x + n.w / 2);
+      });
+    }
+    return { nodes, edges, width: width + 160, height: maxH + 120 };
+  }
+
+  // ---------------------------------------------------------------- render
+
+  function renderGraph() {
+    hideTip();
+    world.replaceChildren();
+    empty.hidden = true;
+
+    let graph;
+    if (state.view === "trace") {
+      if (!state.root) {
+        state.nodes = []; state.edges = [];
+        empty.hidden = false;
+        const scope = state.traceScope ? ` in ${esc(state.traceScope.label)}` : "";
+        emptyInner.innerHTML = `<b>Trace a function${scope}</b><p>Pick a starting point, or search any function above.</p><div class="starters">${starterChips()}</div>`;
+        drawStatic();
+        renderRail();
+        renderInspector();
+        updateBack();
+        updateHash();
+        return;
+      }
+      const egoGraph = ego(state.root, state.direction, state.depth);
+      state.traceTotal = egoGraph.total;
+      state.traceCapped = egoGraph.capped;
+      graph = traceLayout(egoGraph.nodes, egoGraph.edges, egoGraph.levels);
+    } else if (state.mode === "focus" && state.selected) {
+      const dataset = state.view === "modules" ? datasets.modules : datasets.libraries;
+      graph = focusLayout(dataset, state.selected);
+      state.graphIn = graph.inTotal;
+      state.graphOut = graph.outTotal;
+      state.cappedIn = graph.inTotal > FOCUS_MAX;
+      state.cappedOut = graph.outTotal > FOCUS_MAX;
+    } else {
+      state.mode = "board";
+      state.graphIn = state.graphOut = null;
+      state.cappedIn = state.cappedOut = false;
+      graph = state.view === "modules" ? filteredModules() : datasets.libraries;
+      if (!graph.nodes.length) {
+        state.nodes = []; state.edges = [];
+        empty.hidden = false;
+        emptyInner.innerHTML = "<b>Nothing selected</b>Turn an area back on in the left rail.";
+        drawStatic();
+        renderRail();
+        renderInspector();
+        return;
+      }
+      graph = boardLayout(graph.nodes, graph.edges);
+    }
+
+    state.nodes = graph.nodes;
+    state.edges = graph.edges;
+    state.nodeEls = new Map();
+    state.edgeEls = [];
+
+    drawSections(graph);
+    drawHeaders(graph);
+    drawEdges(graph);
+    drawNodes(graph);
+    drawStatic();
+    fitContent(graph);
+    applySelection();
+    renderRail();
+    renderInspector();
+    updateBack();
+    updateHash();
+  }
+
+  function showTip(ev, node) {
+    tip.innerHTML = `<div>${esc(rawLabel(node))}</div>${node.path ? `<div class="p">${esc(node.path)}${node.line ? ":" + node.line : ""}</div>` : ""}`;
+    tip.hidden = false;
+    moveTip(ev);
+  }
+
+  function moveTip(ev) {
+    if (tip.hidden) return;
+    const pad = 14;
+    const rect = tip.getBoundingClientRect();
+    let x = ev.clientX + pad;
+    let y = ev.clientY + pad;
+    if (x + rect.width > window.innerWidth - 8) x = ev.clientX - rect.width - pad;
+    if (y + rect.height > window.innerHeight - 8) y = ev.clientY - rect.height - pad;
+    tip.style.left = `${x}px`;
+    tip.style.top = `${y}px`;
+  }
+
+  function hideTip() {
+    tip.hidden = true;
+  }
+
+  function drawSections(graph) {
+    if (!graph.sections) return;
+    for (const s of graph.sections) {
+      const rect = document.createElementNS(NS, "rect");
+      rect.setAttribute("x", s.x);
+      rect.setAttribute("y", s.y);
+      rect.setAttribute("width", s.w);
+      rect.setAttribute("height", s.h);
+      rect.setAttribute("rx", 12);
+      rect.setAttribute("fill", "#0d1218");
+      rect.setAttribute("stroke", "#1b232d");
+      world.appendChild(rect);
+
+      const dot = document.createElementNS(NS, "circle");
+      dot.setAttribute("cx", s.x + 18);
+      dot.setAttribute("cy", s.y + 17);
+      dot.setAttribute("r", 4);
+      dot.setAttribute("fill", colorOf({ group: s.key }));
+      world.appendChild(dot);
+
+      const title = document.createElementNS(NS, "text");
+      title.setAttribute("x", s.x + 30);
+      title.setAttribute("y", s.y + 21);
+      title.setAttribute("fill", "#9aa6b6");
+      title.setAttribute("font-size", "11.5");
+      title.setAttribute("font-weight", "500");
+      title.textContent = s.key;
+      world.appendChild(title);
+
+      const count = document.createElementNS(NS, "text");
+      count.setAttribute("x", s.x + s.w - 18);
+      count.setAttribute("y", s.y + 21);
+      count.setAttribute("text-anchor", "end");
+      count.setAttribute("fill", "#55616f");
+      count.setAttribute("font", "10px ui-monospace, monospace");
+      count.textContent = s.count;
+      world.appendChild(count);
+    }
+  }
+
+  function drawHeaders(graph) {
+    if (!graph.headers) return;
+    for (const h of graph.headers) {
+      const text = document.createElementNS(NS, "text");
+      text.setAttribute("x", h.x);
+      text.setAttribute("y", h.y);
+      text.setAttribute("text-anchor", "middle");
+      text.setAttribute("fill", "#6f7c8e");
+      text.setAttribute("font", "10px ui-monospace, monospace");
+      text.setAttribute("letter-spacing", "0.1em");
+      text.textContent = h.text;
+      world.appendChild(text);
+    }
+  }
+
+  function drawEdges(graph) {
+    const pos = new Map(graph.nodes.map((n) => [n.id, n]));
+    for (const e of graph.edges) {
+      const a = pos.get(e[0]), b = pos.get(e[1]);
+      if (!a || !b) continue;
+      const forward = a.x <= b.x;
+      const x1 = forward ? a.x + a.w / 2 : a.x - a.w / 2;
+      const x2 = forward ? b.x - b.w / 2 : b.x + b.w / 2;
+      const dx = Math.max(36, Math.abs(x2 - x1) * 0.45);
+      const c1 = forward ? x1 + dx : x1 - dx;
+      const c2 = forward ? x2 - dx : x2 + dx;
+      const path = document.createElementNS(NS, "path");
+      path.setAttribute("class", "edge");
+      path.setAttribute("d", `M${x1},${a.y} C${c1},${a.y} ${c2},${b.y} ${x2},${b.y}`);
+      path.setAttribute("marker-end", "url(#arrow)");
+      path.dataset.from = e[0];
+      path.dataset.to = e[1];
+      path.dataset.view = state.view;
+      path.dataset.mode = state.mode;
+      world.appendChild(path);
+      state.edgeEls.push(path);
+    }
+  }
+
+  function drawNodes(graph) {
+    for (const node of graph.nodes) {
+      const g = document.createElementNS(NS, "g");
+      g.setAttribute("class", "node");
+      g.dataset.id = node.id;
+
+      const rect = document.createElementNS(NS, "rect");
+      rect.setAttribute("class", "body");
+      rect.setAttribute("x", node.x - node.w / 2);
+      rect.setAttribute("y", node.y - CHIP_H / 2);
+      rect.setAttribute("width", node.w);
+      rect.setAttribute("height", CHIP_H);
+      rect.setAttribute("rx", 7);
+      g.appendChild(rect);
+
+      const bar = document.createElementNS(NS, "rect");
+      bar.setAttribute("class", "bar");
+      bar.setAttribute("x", node.x - node.w / 2 + 1);
+      bar.setAttribute("y", node.y - CHIP_H / 2 + 7);
+      bar.setAttribute("width", 3);
+      bar.setAttribute("height", CHIP_H - 14);
+      bar.setAttribute("rx", 1.5);
+      bar.setAttribute("fill", colorOf(node));
+      g.appendChild(bar);
+
+      const text = document.createElementNS(NS, "text");
+      text.setAttribute("class", "txt");
+      text.setAttribute("x", node.x - node.w / 2 + 13);
+      text.setAttribute("y", node.y + 4.5);
+      text.textContent = displayLabel(node);
+      g.appendChild(text);
+
+
+      g.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        activate(node);
+      });
+      g.addEventListener("pointerenter", (ev) => showTip(ev, node));
+      g.addEventListener("pointermove", (ev) => moveTip(ev));
+      g.addEventListener("pointerleave", hideTip);
+      world.appendChild(g);
+      state.nodeEls.set(node.id, g);
+    }
+  }
+
+  function drawStatic() {
+    if (!state.nodes.length) {
+      status.textContent = state.view === "trace" ? "no root selected · pick a start" : "no nodes";
+      return;
+    }
+    let hint = "";
+    if (state.view !== "trace") {
+      hint = state.mode === "focus" ? " · click a chip to recenter" : " · click a chip to open its relationships";
+    }
+    status.textContent = `${state.nodes.length} nodes · ${state.edges.length} edges · ${Math.round(state.viewport.s * 100)}%${hint}`;
+  }
+
+  function updateHash() {
+    const target = state.selected;
+    const hash = target ? "#" + encodeURIComponent(target) : "";
+    if (window.location.hash !== hash) {
+      window.history.replaceState(null, "", window.location.pathname + window.location.search + hash);
+    }
+  }
+
+  function applySelection() {
+    const id = state.selected;
+    if (state.view === "trace") {
+      for (const [nid, el] of state.nodeEls) el.classList.toggle("sel", nid === id);
+      return;
+    }
+    const hotNodes = new Set();
+    if (id) {
+      hotNodes.add(id);
+      for (const e of state.edges) {
+        if (e[0] === id) hotNodes.add(e[1]);
+        if (e[1] === id) hotNodes.add(e[0]);
+      }
+    }
+    for (const [nid, el] of state.nodeEls) {
+      el.classList.toggle("sel", nid === id);
+      el.classList.toggle("dim", !!id && !hotNodes.has(nid));
+    }
+    for (const el of state.edgeEls) {
+      const touch = id && (el.dataset.from === id || el.dataset.to === id);
+      el.classList.toggle("hot", !!touch);
+      el.classList.toggle("dim", !!id && !touch);
+      el.setAttribute("marker-end", touch ? "url(#arrow-hot)" : "url(#arrow)");
+    }
+  }
+
+  function fitContent(graph) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    if (graph.sections && graph.sections.length) {
+      minX = 0;
+      maxX = BOARD_W;
+      minY = 0;
+      maxY = Math.max(...graph.sections.map((s) => s.y + s.h));
+    } else {
+      for (const n of graph.nodes) {
+        minX = Math.min(minX, n.x - n.w / 2);
+        maxX = Math.max(maxX, n.x + n.w / 2);
+        minY = Math.min(minY, n.y - CHIP_H / 2);
+        maxY = Math.max(maxY, n.y + CHIP_H / 2);
+      }
+    }
+    if (!isFinite(minX)) { minX = minY = 0; maxX = maxY = 100; }
+    const pad = 70;
+    state.content = { cx: (minX + maxX) / 2, cy: (minY + maxY) / 2, w: maxX - minX + pad * 2, h: maxY - minY + pad * 2 };
+    const box = svg.getBoundingClientRect();
+    const s = Math.min((box.width - 24) / state.content.w, (box.height - 24) / state.content.h, 1.6);
+    state.viewport = { x: box.width / 2, y: box.height / 2, s: Math.max(0.08, s) };
+    applyViewport();
+  }
+
+  function applyViewport() {
+    const { x, y, s } = state.viewport;
+    const c = state.content || { cx: 0, cy: 0 };
+    world.setAttribute("transform", `translate(${x} ${y}) scale(${s}) translate(${-c.cx} ${-c.cy})`);
+    if (state.nodes.length) drawStatic();
+  }
+
+  function zoomBy(factor) {
+    const box = svg.getBoundingClientRect();
+    const cx = box.width / 2, cy = box.height / 2;
+    const { x, y, s } = state.viewport;
+    const ns = Math.max(0.06, Math.min(3, s * factor));
+    state.viewport = { x: cx - ((cx - x) * ns) / s, y: cy - ((cy - y) * ns) / s, s: ns };
+    applyViewport();
+  }
+
+  // --------------------------------------------------------------- panels
+
+  function renderRail() {
+    if (state.view === "trace") {
+      const root = state.root ? byId.get(state.root) : null;
+      if (!root) {
+        rail.innerHTML = `
+          <h4>Trace</h4>
+          <p class="hint">Start with one of these, or search for any function. Click a node in the graph to walk the chain.</p>
+          <div class="rows">${starters().map((n) => `<button data-start="${esc(n.id)}"><span class="label">${esc(n.label)}</span><span class="loc">${esc(n.path)}:${n.line}</span></button>`).join("")}</div>
+          <section><p class="hint">Edges are source references, not a type-checked call graph.</p></section>`;
+        return;
+      }
+      rail.innerHTML = `
+        <button class="ghost" data-newtrace>← New trace</button>
+        <h4>Trace</h4>
+        ${root ? `<div class="root-card"><b>${esc(root.label)}</b><span>${esc(root.path)}:${root.line}</span></div>` : '<p>Pick a function from search.</p>'}
+        <h4>Direction</h4>
+        <div class="seg" data-seg="direction">
+          ${segBtn("callers", "Callers")}${segBtn("both", "Both")}${segBtn("callees", "Callees")}
+        </div>
+        <h4>Depth</h4>
+        <div class="seg" data-seg="depth">
+          ${[1, 2, 3].map((d) => `<button data-depth="${d}" class="${state.depth === d ? "on" : ""}">${d}</button>`).join("")}
+        </div>
+        <p class="hint"><b>Click a node</b> to walk the call graph; <b>back</b> returns. Edges are source references, not a type-checked call graph.</p>
+        ${state.traceCapped ? `<p class="hint" style="margin-top:10px">Showing the nearest ${TRACE_SIDE_MAX} per side of ${state.traceTotal} nodes. Narrow the direction or search a specific function.</p>` : ""}
+        <section><div class="stats"><span>${state.nodes.length} nodes</span><span>${state.edges.length} edges</span></div></section>`;
+      return;
+    }
+
+    if (state.mode === "focus" && state.selected) {
+      const node = byId.get(state.selected);
+      const dataset = state.view === "modules" ? datasets.modules : datasets.libraries;
+      const { out, inc } = neighbours(dataset, node.id);
+      rail.innerHTML = `
+        <button class="ghost" data-overview>← Overview</button>
+        <h4>${state.view === "libraries" ? "Library" : "Module"}</h4>
+        <div class="root-card"><b>${esc(node.label)}</b><span>${esc(node.path)}</span></div>
+        <p class="hint">Left: ${state.view === "libraries" ? "libraries that depend on this one" : "modules that import this one"}. Right: what it ${state.view === "libraries" ? "depends on" : "imports"}. <b>Click any chip</b> to recenter.</p>
+        <section><div class="stats"><span>${state.graphIn ?? inc.length} in</span><span>${state.graphOut ?? out.length} out</span></div></section>
+        ${(state.cappedIn || state.cappedOut) ? `<p class="hint" style="margin-top:10px">Drawing the first ${FOCUS_MAX} on each side. ${state.cappedIn ? state.graphIn - FOCUS_MAX + " more on the left" : ""}${state.cappedIn && state.cappedOut ? " and " : ""}${state.cappedOut ? state.graphOut - FOCUS_MAX + " more on the right" : ""} are listed in the inspector.</p>` : ""}`;
+      return;
+    }
+
+    if (state.view === "modules") {
+      const counts = new Map();
+      for (const n of datasets.modules.nodes) counts.set(areaOf(n), (counts.get(areaOf(n)) || 0) + 1);
+      const rank = (a) => { const i = AREA_ORDER.indexOf(a); return i === -1 ? 99 : i; };
+      const areas = [...counts.keys()].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+      rail.innerHTML = `
+        <h4>Areas</h4>
+        <div class="chips">
+          ${areas.map((a) => `<button class="chip ${state.areas.has(a) ? "on" : ""}" data-area="${esc(a)}"><span class="dot" style="color:${colorOf({ group: a })}"></span>${esc(a)}<span class="n">${counts.get(a)}</span></button>`).join("")}
+        </div>
+        <p class="hint" style="margin-top:12px">Click a module to open its relationships. Toggle areas to keep the overview readable; all ${datasets.modules.nodes.length} modules stay searchable.</p>
+        <section>
+          <h4>Legend</h4>
+          <div class="legend">${legendRows()}</div>
+        </section>
+        <section><div class="stats"><span>${state.nodes.length} shown</span><span>${state.edges.length} edges</span></div></section>`;
+      return;
+    }
+
+    rail.innerHTML = `
+      <h4>Architecture</h4>
+      <p>Arrows point at the dependency. Each node is one dune library; executables are marked in the panel.</p>
+      <section>
+        <h4>Legend</h4>
+        <div class="legend">${legendRows()}</div>
+      </section>
+      <section>
+        <h4>Reading it</h4>
+        <p class="hint">Each panel is one area of the source. <b>Click a library</b> to open a focused view of what it uses and what uses it.</p>
+        <div class="stats"><span>${state.nodes.length} libraries</span><span>${state.edges.length} edges</span></div>
+      </section>`;
+  }
+
+  function segBtn(value, label) {
+    const on = state.direction === value ? "on" : "";
+    return `<button data-direction="${value}" class="${on}">${label}</button>`;
+  }
+
+  function legendRows() {
+    return AREA_ORDER.map((a) => `<div><i style="background:${AREA_COLOR[a]}"></i>${a}</div>`).join("");
+  }
+
+  function renderInspector() {
+    const node = state.selected ? byId.get(state.selected) : null;
+    if (!node) {
+      inspector.innerHTML = introPanel();
+      return;
+    }
+    const dataset = node.view === "trace" ? datasets.symbols : datasets[node.view];
+    const { out, inc } = neighbours(dataset, node.id);
+    const outLabel = node.view === "libraries" ? "Depends on" : node.view === "modules" ? "Imports" : "Calls";
+    const inLabel = node.view === "libraries" ? "Used by" : node.view === "modules" ? "Imported by" : "Called by";
+    const type = VIEW_TYPE[node.view] || node.view;
+    const kind = node.kind === "exe" ? "executable" : type;
+    const traceBtn = node.view !== "trace"
+      ? `<button class="ghost" data-trace="${esc(node.id)}">Trace functions in this module</button>`
+      : "";
+    inspector.innerHTML = `
+      <div class="kicker"><span>${esc(kind)}</span><i class="dot" style="background:${colorOf(node)}"></i></div>
+      <h2>${esc(node.label)}</h2>
+      <div class="fileline"><code>${esc(node.path || "")}${node.line ? ":" + node.line : ""}</code><button data-copy>copy</button></div>
+      <div class="section-title">${outLabel} <b>${new Set(out.map((e) => e[1])).size}</b></div>
+      ${rows(out, 0)}
+      <div class="section-title">${inLabel} <b>${new Set(inc.map((e) => e[0])).size}</b></div>
+      ${rows(inc, 1)}
+      ${traceBtn}
+      <div class="foot">
+        ${notes(dataset)}
+        generated ${esc(data.generated)} · <code>scripts/codeviz.py site</code>
+      </div>`;
+  }
+
+  function introPanel() {
+    if (state.view === "trace") {
+      return `<div class="intro"><b>Walk the call graph</b>
+        <p>Pick a starter in the centre, or search for an entry point such as <code>process_single_order</code> or <code>asset_domain_worker</code>.</p>
+        <ul><li>Click a node to make it the new root.</li><li>Callers sit left, callees right.</li><li>Depth 2–3 follows the chain further.</li></ul></div>`;
+    }
+    if (state.view === "modules") {
+      return `<div class="intro"><b>Where does this module sit?</b>
+        <p>Each chip is one <code>.ml</code> file; arrows are imports from <code>ocamldep</code>.</p>
+        <ul><li>Click a module to open its importers and imports.</li><li>Filter areas on the left to keep the overview readable.</li><li>Use search to jump straight to a file.</li></ul></div>`;
+    }
+    return `<div class="intro"><b>The library graph</b>
+      <p>Dune stanzas decide what may link to what. This is the exact dependency graph, not an inference.</p>
+      <ul><li>Click a library to open its dependency view.</li><li>Executables sit in the <code>bin</code> panel.</li><li>Open Trace to follow a function.</li></ul></div>`;
+  }
+
+  function rows(edges, side) {
+    if (!edges.length) return '<div class="rows"><div class="none">none</div></div>';
+    const seen = new Set();
+    const items = [];
+    for (const e of edges) {
+      const other = e[side === 0 ? 1 : 0];
+      if (seen.has(other)) continue;
+      seen.add(other);
+      const n = byId.get(other);
+      if (!n) continue;
+      const loc = e[2] ? `${e[2]}${e[3] ? ":" + e[3] : ""}` : n.path || "";
+      items.push(`<button data-goto="${esc(n.id)}"><span class="label">${esc(n.label)}</span><span class="loc">${esc(loc)}</span></button>`);
+    }
+    return `<div class="rows">${items.slice(0, 80).join("")}</div>`;
+  }
+
+  function notes(dataset) {
+    if (!dataset.notes || !dataset.notes.length) return "";
+    return esc(dataset.notes.slice(0, 2).join(" · ")) + "<br>";
+  }
+
+  // --------------------------------------------------------------- actions
+
+  function activate(node) {
+    goTo(node);
+  }
+
+  function snapshot() {
+    return { view: state.view, mode: state.mode, selected: state.selected, root: state.root };
+  }
+
+  function goTo(node) {
+    if (state.mode === "focus" && state.selected === node.id && state.view === node.view) return;
+    state.history.push(snapshot());
+    if (state.history.length > 60) state.history.shift();
+    if (node.view === "trace") {
+      state.view = "trace";
+      state.mode = "focus";
+      state.traceScope = null;
+      state.root = node.id;
+      state.selected = node.id;
+    } else {
+      if (node.view === "modules" && !state.areas.has(areaOf(node))) state.areas.add(areaOf(node));
+      state.view = node.view;
+      state.mode = "focus";
+      state.selected = node.id;
+    }
+    renderTabs();
+    renderGraph();
+  }
+
+  function setView(view) {
+    state.view = view;
+    renderTabs();
+  }
+
+  function renderTabs() {
+    const counts = { libraries: datasets.libraries.nodes.length, modules: datasets.modules.nodes.length, trace: datasets.symbols.nodes.length };
+    tabs.innerHTML = ["libraries", "modules", "trace"].map((v) => {
+      const label = v === "libraries" ? "Architecture" : v === "modules" ? "Modules" : "Trace";
+      return `<button data-view="${v}" class="${state.view === v ? "on" : ""}">${label}<span class="count">${counts[v]}</span></button>`;
+    }).join("");
+  }
+
+  function updateBack() {
+    back.classList.toggle("on", state.history.length > 0);
+  }
+
+  function neighbours(dataset, id) {
+    const out = [], inc = [];
+    for (const e of dataset.edges) {
+      if (e[0] === id) out.push(e);
+      if (e[1] === id) inc.push(e);
+    }
+    return { out, inc };
+  }
+
+  // ---------------------------------------------------------------- search
+
+  const searchable = [...byId.values()];
+  let hotResult = -1;
+
+  function search() {
+    const term = q.value.trim().toLowerCase();
+    results.replaceChildren();
+    hotResult = -1;
+    if (!term) { results.classList.remove("open"); return; }
+    const scored = [];
+    for (const n of searchable) {
+      const label = n.label.toLowerCase();
+      const name = (n.name || n.label).toLowerCase();
+      const path = (n.path || "").toLowerCase();
+      let score = -1;
+      if (name === term) score = 0;
+      else if (name.startsWith(term)) score = 1;
+      else if (label.startsWith(term)) score = 2;
+      else if (label.includes(term)) score = 3;
+      else if (path.includes(term)) score = 4;
+      if (score >= 0) scored.push([score, n]);
+    }
+    scored.sort((a, b) =>
+      (a[0] - b[0]) ||
+      ((TOTAL_DEGREE.get(b[1].id) || 0) - (TOTAL_DEGREE.get(a[1].id) || 0)) ||
+      (a[1].label.length - b[1].label.length)
+    );
+    const top = scored.slice(0, 12);
+    if (!top.length) {
+      results.innerHTML = '<div class="none">No match.</div>';
+      results.classList.add("open");
+      return;
+    }
+    for (const [, n] of top) {
+      const b = document.createElement("button");
+      b.innerHTML = `<span class="type">${VIEW_TYPE[n.view]}</span><span>${esc(n.label)}</span><span class="path">${esc(n.path || "")}</span>`;
+      b.addEventListener("click", () => choose(n));
+      results.appendChild(b);
+    }
+    results.classList.add("open");
+  }
+
+  function choose(node) {
+    q.value = "";
+    results.classList.remove("open");
+    goTo(node);
+  }
+
+  // ---------------------------------------------------------------- events
+
+  tabs.addEventListener("click", (ev) => {
+    const view = ev.target.closest("[data-view]")?.dataset.view;
+    if (!view) return;
+    q.value = "";
+    state.history = [];
+    state.selected = null;
+    state.mode = view === "trace" && state.root ? "focus" : "board";
+    if (view === "trace") state.traceScope = null;
+    setView(view);
+    renderGraph();
+  });
+
+  back.addEventListener("click", () => {
+    const prev = state.history.pop();
+    if (!prev) return;
+    state.view = prev.view;
+    state.mode = prev.mode;
+    state.selected = prev.selected;
+    state.root = prev.root;
+    renderTabs();
+    renderGraph();
+  });
+
+  rail.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button");
+    if (!btn) return;
+    if (btn.dataset.start) {
+      goTo(byId.get(btn.dataset.start));
+      return;
+    }
+    if (btn.hasAttribute("data-newtrace")) {
+      state.history.push(snapshot());
+      state.root = null;
+      state.selected = null;
+      state.traceScope = null;
+      state.mode = "board";
+      renderGraph();
+      return;
+    }
+    if (btn.hasAttribute("data-overview")) {
+      state.history = [];
+      state.mode = "board";
+      state.selected = null;
+      renderGraph();
+      return;
+    }
+    if (btn.dataset.area) {
+      const area = btn.dataset.area;
+      if (state.areas.has(area)) state.areas.delete(area); else state.areas.add(area);
+      const selected = state.selected && byId.get(state.selected);
+      if (selected && selected.view === "modules" && !state.areas.has(areaOf(selected))) state.selected = null;
+      renderGraph();
+      return;
+    }
+    if (btn.dataset.direction) { state.direction = btn.dataset.direction; renderGraph(); return; }
+    if (btn.dataset.depth) { state.depth = Number(btn.dataset.depth); renderGraph(); return; }
+  });
+
+  inspector.addEventListener("click", (ev) => {
+    const goto = ev.target.closest("[data-goto]");
+    if (goto) { goTo(byId.get(goto.dataset.goto)); return; }
+    const copy = ev.target.closest("[data-copy]");
+    if (copy) {
+      const node = state.selected && byId.get(state.selected);
+      if (node) navigator.clipboard?.writeText(`${node.path}${node.line ? ":" + node.line : ""}`);
+      copy.textContent = "copied";
+      setTimeout(() => (copy.textContent = "copy"), 900);
+      return;
+    }
+    const trace = ev.target.closest("[data-trace]");
+    if (trace) {
+      const node = byId.get(trace.dataset.trace);
+      if (!node) return;
+      state.history = [];
+      state.root = null;
+      state.selected = null;
+      state.mode = "board";
+      state.traceScope = {
+        module: (node.path || "").split("/").pop().replace(/\.(ml|mli)$/, ""),
+        label: node.label,
+      };
+      setView("trace");
+      renderGraph();
+    }
+  });
+
+  empty.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-start]");
+    if (btn) goTo(byId.get(btn.dataset.start));
+  });
+
+  q.addEventListener("input", search);
+  q.addEventListener("focus", search);
+  q.addEventListener("keydown", (ev) => {
+    const buttons = [...results.querySelectorAll("button")];
+    if (ev.key === "Escape") { results.classList.remove("open"); q.blur(); }
+    if (ev.key === "Enter" && buttons.length) {
+      ev.preventDefault();
+      (buttons[hotResult] || buttons[0]).click();
+    }
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      if (!buttons.length) return;
+      ev.preventDefault();
+      hotResult = (hotResult + (ev.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length;
+      buttons.forEach((b, i) => b.classList.toggle("hot", i === hotResult));
+    }
+  });
+  document.addEventListener("click", (ev) => {
+    if (!results.contains(ev.target) && ev.target !== q) results.classList.remove("open");
+  });
+  document.addEventListener("keydown", (ev) => {
+    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") {
+      ev.preventDefault();
+      q.focus();
+      q.select();
+    }
+  });
+
+  let drag = null;
+  svg.addEventListener("pointerdown", (ev) => {
+    if (ev.target.closest(".node")) return;
+    drag = { x: ev.clientX, y: ev.clientY, vx: state.viewport.x, vy: state.viewport.y };
+    svg.classList.add("dragging");
+    svg.setPointerCapture(ev.pointerId);
+  });
+  svg.addEventListener("pointermove", (ev) => {
+    if (!drag) return;
+    state.viewport.x = drag.vx + (ev.clientX - drag.x);
+    state.viewport.y = drag.vy + (ev.clientY - drag.y);
+    applyViewport();
+  });
+  svg.addEventListener("pointerup", () => { drag = null; svg.classList.remove("dragging"); });
+  svg.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+    const { x, y, s } = state.viewport;
+    const ns = Math.max(0.06, Math.min(3, s * Math.exp(-ev.deltaY * 0.0014)));
+    state.viewport = { x: mx - ((mx - x) * ns) / s, y: my - ((my - y) / s) * ns, s: ns };
+    applyViewport();
+  }, { passive: false });
+
+  document.getElementById("zoom-in").addEventListener("click", () => zoomBy(1.18));
+  document.getElementById("zoom-out").addEventListener("click", () => zoomBy(1 / 1.18));
+  document.getElementById("fit").addEventListener("click", () => {
+    const graph = { nodes: state.nodes, edges: state.edges };
+    if (graph.nodes.length) fitContent(graph);
+  });
+  window.addEventListener("resize", () => {
+    if (state.nodes.length) fitContent({ nodes: state.nodes, edges: state.edges });
+  });
+
+  // ------------------------------------------------------------------ boot
+
+  function esc(text) {
+    return String(text).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  renderTabs();
+  const initial = decodeURIComponent(location.hash.slice(1));
+  const startNode = initial && byId.get(initial);
+  if (startNode && startNode.view === "trace") {
+    state.view = "trace";
+    state.root = startNode.id;
+    state.selected = startNode.id;
+    renderTabs();
+    renderGraph();
+  } else if (startNode) {
+    if (startNode.view === "modules") state.areas.add(areaOf(startNode));
+    state.view = startNode.view;
+    state.mode = "focus";
+    state.selected = startNode.id;
+    renderTabs();
+    renderGraph();
+  } else {
+    renderGraph();
+  }
+})();
+</script>
+</body>
+</html>

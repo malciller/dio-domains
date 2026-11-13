@@ -24,4 +24,5 @@
   dio.exchange
   dio.projected_balance
   dio.error_handling
+  dio.hotpath
   dio.latency_profiling))

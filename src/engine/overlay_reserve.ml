@@ -34,6 +34,22 @@ type leg =
   ; maintenance : float
   }
 
+(** {!pos_leg} over a prebuilt store key, so a per-event caller does not rebuild the
+    [exchange|coin] string for every read. *)
+let pos_leg_key ~coin ~key =
+  match Dio_exchange.Market_context.get_position_key key with
+  | None -> None
+  | Some p ->
+    let mark =
+      match Dio_exchange.Market_context.get_funding_key key with
+      | Some f when f.mark > 0.0 -> f.mark
+      | _ -> p.entry
+    in
+    if Float.is_finite p.qty && Float.is_finite p.entry && p.entry > 0.0 && mark > 0.0
+    then Some { qty = p.qty; entry = p.entry; mark; maintenance = maintenance_rate ~coin }
+    else None
+;;
+
 let pos_leg ~exchange ~coin =
   match Dio_exchange.Market_context.get_position ~exchange ~coin with
   | None -> None

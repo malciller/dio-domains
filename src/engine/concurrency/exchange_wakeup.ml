@@ -70,15 +70,55 @@ let[@inline] get_generation_fast (sync : sync_handle) = Atomic.get sync.generati
 (** Lock-free read of the symbol's current generation; baseline for [wait_since]. *)
 let[@inline] get_generation ~symbol = get_generation_fast (get_sync symbol)
 
-(** Signal [symbol]'s condition variable, waking its blocked worker. The generation bump
-    occurs under the symbol mutex, so it cannot interleave with a waiter's predicate
-    re-check. Callers MUST finish writing the signalled data before calling. *)
-let signal ~symbol =
-  let sync = get_sync symbol in
+(** Wake aliases: signalling one key also wakes the listed keys. A strategy that trades a
+    venue's perp runs inside the domain of the instrument it hedges (a Kraken spot pair,
+    say), but the events that must move it come from the perp book on another venue. The
+    owner registers the alias once; the feed then wakes the trading domain without knowing
+    anything about it.
+
+    The map is immutable and published through one atomic cell, so the signal path stays
+    lock-free in the common case (no alias) and allocation-free in every case. *)
+let aliases : string list SymbolMap.t Atomic.t = Atomic.make SymbolMap.empty
+
+let add_alias ~symbol ~target =
+  if not (String.equal symbol target)
+  then (
+    let rec loop () =
+      let current = Atomic.get aliases in
+      let existing =
+        match SymbolMap.find_opt symbol current with
+        | Some l -> l
+        | None -> []
+      in
+      if List.mem target existing
+      then ()
+      else (
+        let next =
+          SymbolMap.add symbol (target :: existing) current
+        in
+        if not (Atomic.compare_and_set aliases current next) then loop ())
+    in
+    loop ())
+;;
+
+let[@inline] aliases_of symbol = SymbolMap.find_opt symbol (Atomic.get aliases)
+
+let bump (sync : symbol_sync) =
   Mutex.lock sync.mutex;
   Atomic.set sync.generation (Atomic.get sync.generation + 1);
   Condition.signal sync.condition;
   Mutex.unlock sync.mutex
+;;
+
+(** Signal [symbol]'s condition variable, waking its blocked worker, and any domain aliased
+    to it. The generation bump occurs under the symbol mutex, so it cannot interleave with a
+    waiter's predicate re-check. Callers MUST finish writing the signalled data before
+    calling. *)
+let signal ~symbol =
+  bump (get_sync symbol);
+  match aliases_of symbol with
+  | None -> ()
+  | Some targets -> List.iter (fun target -> bump (get_sync target)) targets
 ;;
 
 (** Signal every per-symbol condition variable for cross-cutting events such as shutdown
@@ -99,22 +139,60 @@ let signal_all () =
    in the rare race case. *)
 let default_spin_iterations = 100
 
+(** Spin budget before parking, in atomic-read iterations (~10ns each). Tunable so the
+    trade-off between a futex round-trip and a busy core can be measured on the host
+    without a rebuild; 0 parks immediately. *)
+let spin_iterations = Atomic.make default_spin_iterations
+
+let spin_budget () = Atomic.get spin_iterations
+
 (** [DIO_BUSY_SPIN=1] keeps the domain spinning on its core instead of parking on the
     condition variable. A signal always bumps the generation, so shutdown still wakes a
     busy-spinning domain. Read after dotenv by [configure]. *)
 let spin_config : bool Atomic.t = Atomic.make false
 
-(** Read [DIO_BUSY_SPIN]. Must run after [Logging.load_dotenv]. *)
+let busy_spin_enabled () = Atomic.get spin_config
+
+(** True when a spinning domain on every trading CPU would only ever contend with
+    itself: the CPUs are in the kernel's isolated set, so the scheduler will not place other
+    runnable threads there. *)
+let spin_safe () =
+  (* The allocator hands out P-cores plus their SMT siblings, so checking only the
+     primaries leaves a spinner on a core the scheduler still fills. *)
+  match Thread_affinity.trading_allocation_order () with
+  | [] -> false
+  | cpus ->
+    List.for_all
+      (fun cpu -> Thread_affinity.is_isolated cpu)
+      cpus
+;;
+
+(** Read [DIO_BUSY_SPIN]. Must run after [Logging.load_dotenv]. [auto] enables the spin only
+    when the trading CPUs are isolated, so turning it on cannot silently recreate the
+    contention that made it slower than parking. *)
 let configure () =
   let busy =
     match Sys.getenv_opt "DIO_BUSY_SPIN" with
     | Some s ->
       (match String.lowercase_ascii (String.trim s) with
        | "1" | "true" | "on" | "yes" -> true
+       | "auto" -> spin_safe ()
        | _ -> false)
     | None -> false
   in
-  Atomic.set spin_config busy
+  if busy && not (spin_safe ())
+  then
+    Logging.warn
+      ~section:"exchange_wakeup"
+      "DIO_BUSY_SPIN requested but the trading cpus are not isolated; parking instead";
+  (* [auto] refuses to spin without isolation; an explicit opt-in is honoured, since a
+     cpuset-based isolation is not visible in /sys/devices/system/cpu/isolated. *)
+  Atomic.set spin_config busy;
+  (match Sys.getenv_opt "DIO_SPIN_ITERS" with
+   | Some s ->
+     (try Atomic.set spin_iterations (max 0 (int_of_string (String.trim s))) with
+      | _ -> ())
+   | None -> ())
 ;;
 
 (** Fast-path [wait_since] over a pre-resolved [sync_handle]; avoids map traversal on the
@@ -128,6 +206,7 @@ let wait_since_fast (sync : sync_handle) ~since =
       Domain.cpu_relax ()
     done
   else (
+    let budget = spin_budget () in
     let rec spin i =
       if Atomic.get sync.generation <> since
       then ()
@@ -142,7 +221,7 @@ let wait_since_fast (sync : sync_handle) ~since =
             done))
       else spin (i - 1)
     in
-    spin default_spin_iterations)
+    spin budget)
 ;;
 
 (** Block until the symbol's generation exceeds [since]. Returns immediately without

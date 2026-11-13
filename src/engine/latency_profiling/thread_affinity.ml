@@ -10,9 +10,13 @@
     Placement is configured with [DIO_TRADING_CPUS] (a comma-separated CPU list, e.g.
     [0,2,4,6,8,10]); when unset it is auto-detected from the sysfs topology (the CPUs
     whose [cpuinfo_max_freq] is at the package maximum, one logical CPU per physical
-    core). With no [DIO_BACKGROUND_CPUS], background work is left where it is unless a
-    background range is given. All calls are best-effort: a failure to pin is logged and
-    ignored, never fatal. *)
+    core). With no [DIO_BACKGROUND_CPUS], background work prefers CPUs on cores no trading
+    domain uses (the E-cores), then falls back to the unused SMT siblings. All calls are
+    best-effort: a failure to pin is logged and ignored, never fatal.
+
+    The background allocator is built by {!configure}, called from [main] after
+    [Logging.load_dotenv]. Building it at module-init time read [DIO_BACKGROUND_CPUS]
+    before [.env] was loaded and silently ignored the setting. *)
 
 external pin_current_thread : int -> bool = "dio_pin_current_thread"
 external pin_current_thread_range : int -> int -> bool = "dio_pin_current_thread_range"
@@ -32,6 +36,33 @@ let read_file path =
         | End_of_file -> None)
   with
   | Sys_error _ -> None
+;;
+
+(** True when the CPU is in the kernel's isolated set ([isolcpus]), i.e. the scheduler will
+    not place other runnable work there. A domain that busy-spins on a shared core turns
+    every neighbour into a latency spike, so the spin mode checks this before enabling. *)
+let is_isolated cpu =
+  match read_file "/sys/devices/system/cpu/isolated" with
+  | None -> false
+  | Some spec ->
+    let spec = String.trim spec in
+    if String.equal spec ""
+    then false
+    else (
+      let hit = ref false in
+      String.split_on_char ',' spec
+      |> List.iter (fun part ->
+        match String.split_on_char '-' part with
+        | [ a; b ] ->
+          (match int_of_string_opt (String.trim a), int_of_string_opt (String.trim b) with
+           | Some lo, Some hi -> if cpu >= lo && cpu <= hi then hit := true
+           | _ -> ())
+        | [ a ] ->
+          (match int_of_string_opt (String.trim a) with
+           | Some x when x = cpu -> hit := true
+           | _ -> ())
+        | _ -> ());
+      !hit)
 ;;
 
 let max_freq_khz cpu =
@@ -64,6 +95,13 @@ let package_id cpu =
     (try Some (int_of_string s) with
      | _ -> None)
   | None -> None
+;;
+
+(** Physical core key, shared by SMT siblings. [None] when the topology files are absent. *)
+let core_key cpu =
+  match package_id cpu, core_id cpu with
+  | Some p, Some k -> Some (p, k)
+  | _ -> None
 ;;
 
 let online_cpus () =
@@ -164,8 +202,31 @@ let configured_rt_prio () =
     that pinned two domains to one core, and under SCHED_FIFO those two starve each other
     (and every CFS thread on that core), enough to wedge startup. Callers pin on a real
     CPU and treat [-1] as "share the remaining cores" (unpinned, CFS). *)
+(* Trading CPU order: one thread per P-core first, then each core's SMT sibling. Two
+   domains on one thread time-slice; two on sibling threads of one core share its execution
+   ports, which is the better of the two when there are more assets than cores. *)
+let trading_allocation_order () =
+  let primary = trading_cpus () in
+  let primary_cores = List.filter_map core_key primary |> List.sort_uniq compare in
+  let siblings =
+    online_cpus ()
+    |> List.filter (fun c ->
+      (not (List.mem c primary))
+      &&
+      match core_key c with
+      | Some k -> List.mem k primary_cores
+      | None -> false)
+  in
+  primary @ siblings
+;;
+
+(** Allocator over the trading CPU order that hands out each CPU at most once and returns
+    [-1] (unpinned) once the list is exhausted. The cursor is an [Atomic], not a [ref]:
+    every trading domain allocates concurrently from its own domain. Never reusing a CPU
+    matters: two domains on one thread time-slice, and under SCHED_FIFO they starve each
+    other badly enough to wedge startup. *)
 let make_allocator () =
-  let cpus = Array.of_list (trading_cpus ()) in
+  let cpus = Array.of_list (trading_allocation_order ()) in
   let n = Array.length cpus in
   let cursor = Atomic.make 0 in
   fun () ->
@@ -174,13 +235,25 @@ let make_allocator () =
 ;;
 
 (** The background CPU list: [DIO_BACKGROUND_CPUS] if set, else every online CPU that is
-    not a trading CPU (i.e. the E-cores and the unused P-core siblings). *)
+    not a trading CPU, with CPUs on cores no trading domain uses first. The unused SMT
+    siblings come last: an idle-priority spinner or a parse worker on a sibling still
+    competes for the trading core's execution ports, so E-cores are the better default. *)
 let background_cpus () =
   match Sys.getenv_opt "DIO_BACKGROUND_CPUS" with
   | Some s -> parse_cpu_list s
   | None ->
     let trading = trading_cpus () in
-    List.filter (fun c -> not (List.mem c trading)) (online_cpus ())
+    let trading_cores = List.filter_map core_key trading |> List.sort_uniq compare in
+    let free = List.filter (fun c -> not (List.mem c trading)) (online_cpus ()) in
+    let non_sibling, sibling =
+      List.partition
+        (fun c ->
+          match core_key c with
+          | Some k -> not (List.mem k trading_cores)
+          | None -> true)
+        free
+    in
+    non_sibling @ sibling
 ;;
 
 (** Round-robin allocator over the background CPU list. Cursor is atomic: overflow trading
@@ -200,14 +273,42 @@ let make_background_allocator () =
 (** Shared background allocator so distinct background domains/threads land on distinct
     (E-)cores instead of all piling onto the first one.
 
-    Eager, not [lazy]: spawning domains force it concurrently, and OCaml 5 raises
-    [CamlinternalLazy.Undefined] in all but the winner. *)
-let background_alloc = make_background_allocator ()
+    Built by {!configure} after [.env] is loaded. The fallback builds on first use for
+    callers that never configure (tests, embedded use); the mutex is needed because
+    domains can spawn concurrently, and OCaml 5's [Lazy] is not safe under that race. *)
+let background_alloc_mutex = Mutex.create ()
+
+let background_alloc : (unit -> int) option ref = ref None
+
+let background_allocator () =
+  Mutex.lock background_alloc_mutex;
+  let f =
+    match !background_alloc with
+    | Some f -> f
+    | None ->
+      let f = make_background_allocator () in
+      background_alloc := Some f;
+      f
+  in
+  Mutex.unlock background_alloc_mutex;
+  f
+;;
+
+(** Read [DIO_TRADING_CPUS]/[DIO_BACKGROUND_CPUS] and rebuild the background allocator.
+    Call after [Logging.load_dotenv], before any domain spawns. *)
+let configure () =
+  Mutex.lock background_alloc_mutex;
+  background_alloc := Some (make_background_allocator ());
+  Mutex.unlock background_alloc_mutex
+;;
+
+(** Next background CPU for a newly spawned thread, or [-1] when none is configured. *)
+let next_background_cpu () = (background_allocator ()) ()
 
 (** Pin the calling thread to a background CPU (best-effort): keeps feed parsing,
     persistence and the supervisor off the trading P-cores so they cannot preempt a
     trading cycle. *)
-let pin_self_background () = pin_self (background_alloc ())
+let pin_self_background () = pin_self (next_background_cpu ())
 
 (** Dedicated parse CPUs: [DIO_PARSE_CPUS]. Parsing is on the feed critical path, so an
     operator who supplies P-cores here gets one shard per core. Unset leaves the scheduler
@@ -270,8 +371,34 @@ let set_self_rt prio =
 
 let describe () =
   let t = trading_cpus () in
+  let b = background_cpus () in
+  let shared = List.filter (fun c -> not (is_isolated c)) t in
   Printf.sprintf
-    "affinity: trading cpus=[%s] (allowed=%d)"
+    "affinity: trading cpus=[%s] background cpus=[%s] (allowed=%d%s)"
     (String.concat "," (List.map string_of_int t))
+    (String.concat "," (List.map string_of_int b))
     (allowed_cpu_count ())
+    (if shared = []
+     then ", isolated"
+     else
+       Printf.sprintf
+         "; %d trading cpu(s) are not [isol]ated from the scheduler"
+         (List.length shared))
+;;
+
+(** Busy-spin needs cores the scheduler will not otherwise use. Report the pairing so a
+    spin mode is not enabled on a shared core by accident. *)
+let spin_isolation_warning ~busy_spin =
+  if not busy_spin
+  then None
+  else (
+    let shared = List.filter (fun c -> not (is_isolated c)) (trading_cpus ()) in
+    if shared = []
+    then None
+    else
+      Some
+        (Printf.sprintf
+           "DIO_BUSY_SPIN is on but %d trading cpu(s) are not isolated ([%s]): other             runnable threads will preempt a spinning domain, which is worse than parking.             See isolcpus/cpuset before enabling."
+           (List.length shared)
+           (String.concat "," (List.map string_of_int shared))))
 ;;

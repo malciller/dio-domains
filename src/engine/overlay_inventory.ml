@@ -210,6 +210,37 @@ let leg_q_of ?cache ?(full_balance_ref = false) ~exchange ~symbol () =
       q_of_balances ~full_balance_ref ~free ~total ~staked ~open_sell_base:open_sell)
 ;;
 
+(** Same as {!leg_q_of}, but [free] supplies the tradeable figure from a reader the
+    caller resolved once. The venue's raw figure sweeps every quoting symbol's open
+    orders, and this runs per leg per tick. *)
+let leg_q_of_fast ?cache ?(full_balance_ref = false) ~free ~exchange ~symbol () =
+  match get_module exchange with
+  | None -> 0.0
+  | Some (module Ex : Exchange.S) ->
+    let base = base_coin_of_symbol symbol in
+    let total =
+      try sanitize (Ex.get_total_balance ~asset:base) with
+      | _ -> 0.0
+    in
+    if full_balance_ref
+    then total
+    else (
+      let free =
+        try sanitize (free ()) with
+        | _ -> 0.0
+      in
+      let staked =
+        try sanitize (Ex.get_staked_balance ~asset:base) with
+        | _ -> 0.0
+      in
+      let open_sell =
+        match cache with
+        | Some c -> open_sell_base_cached (module Ex) ~symbol ~cache:c
+        | None -> open_sell_base (module Ex) ~symbol
+      in
+      q_of_balances ~full_balance_ref ~free ~total ~staked ~open_sell_base:open_sell)
+;;
+
 let leg_q ?cache ?full_balance_ref (leg : Config.overlay_leg) =
   leg_q_of ?cache ?full_balance_ref ~exchange:leg.ol_exchange ~symbol:leg.ol_symbol ()
 ;;

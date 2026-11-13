@@ -451,6 +451,11 @@ module type S = sig
       orderbook data is unavailable. *)
   val get_top_of_book : symbol:string -> (float * float * float * float) option
 
+  (** Top of book written into [buf] as (bid price, bid size, ask price, ask size), returning
+      false when the venue has no quote. The tuple-returning accessor above allocates one
+      [Some] per call; the strategy cycle reads the book on every event. *)
+  val get_top_of_book_into : symbol:string -> float array -> bool
+
   (** Return [true] if a usable orderbook has been cached for [symbol] since the last
       connection reset. Unlike [get_top_of_book], this ignores freshness: a thin market
       that has not ticked recently still reports [true]. Callers use it to decide whether

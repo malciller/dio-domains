@@ -779,6 +779,12 @@ let send_ping ~req_id ~timeout_ms : Kraken_common_types.ws_response Lwt.t =
   Lwt.return response
 ;;
 
+(** Send a request whose JSON body the caller already serialized. The order path builds the
+    body once instead of an AST that this would serialize again. *)
+let send_request_body ~body ~req_id ~expected_method ~timeout_ms =
+  send_message ~message_str:body ~req_id ~expected_method ~timeout_ms
+;;
+
 let send_request ~symbol ~method_ ~params ~req_id ~timeout_ms
   : Kraken_common_types.ws_response Lwt.t
   =

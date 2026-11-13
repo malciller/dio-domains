@@ -1232,6 +1232,22 @@ let[@inline always] get_best_bid_ask symbol =
   | None -> None
 ;;
 
+let[@inline always] get_best_bid_ask_into symbol (buf : float array) =
+  match store_opt symbol with
+  | Some store ->
+    (match fresh_frame store with
+     | Some { bids; asks; _ } ->
+       let bid = bids.(0) in
+       let ask = asks.(0) in
+       buf.(0) <- bid.price_float;
+       buf.(1) <- bid.size_float;
+       buf.(2) <- ask.price_float;
+       buf.(3) <- ask.size_float;
+       true
+     | None -> false)
+  | None -> false
+;;
+
 let[@inline always] get_best_bid_ask_fast symbol =
   let store = ensure_store symbol in
   fun () ->

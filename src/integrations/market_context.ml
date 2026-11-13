@@ -59,6 +59,13 @@ let update table f =
   loop ()
 ;;
 
+(** Prebuilt lookup key. The key is [exchange ^ "|" ^ coin], which allocates; a caller on a
+    per-event path builds it once and reuses it with the [_key] readers below. *)
+let key_of = key
+
+let get_funding_key k = Hashtbl.find_opt (Atomic.get funding_table) k
+let get_position_key k = Hashtbl.find_opt (Atomic.get position_table) k
+
 let update_funding ~exchange ~coin ctx =
   update funding_table (fun t -> Hashtbl.replace t (key exchange coin) ctx)
 ;;
@@ -67,8 +74,24 @@ let get_funding ~exchange ~coin =
   Hashtbl.find_opt (Atomic.get funding_table) (key exchange coin)
 ;;
 
-let update_position ~exchange p =
-  update position_table (fun t -> Hashtbl.replace t (key exchange p.coin) p)
+(* Per-coin snapshot time. Builder-deployed perp dexs report their positions through their
+   own channel, so the exchange-wide "positions updated" stamp cannot say whether *this*
+   coin's view is fresh: a single stamp would mark the main dex fresh off a builder-dex
+   refresh. *)
+let position_updated : (string, float) Hashtbl.t Atomic.t =
+  Atomic.make (Hashtbl.create 16)
+;;
+
+let update_position ?at ~exchange p =
+  update position_table (fun t -> Hashtbl.replace t (key exchange p.coin) p);
+  match at with
+  | None -> ()
+  | Some ts -> update position_updated (fun t -> Hashtbl.replace t (key exchange p.coin) ts)
+;;
+
+(** Snapshot time for one coin, when its publisher stamped one. *)
+let get_position_updated_at ~exchange ~coin =
+  Hashtbl.find_opt (Atomic.get position_updated) (key exchange coin)
 ;;
 
 (** Replaces the venue's whole position set. Dropping absent coins is what turns a closed

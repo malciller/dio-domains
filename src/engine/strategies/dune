@@ -48,7 +48,6 @@
   ; actions/ — registry + grid bridge
   Strategy_actions
   Strategy_actions_builtin
-  Strategy_actions_cycle
   Strategy_cycle_engine
   ; protocol/ — strategy-file interpreter
   Strategy_file
@@ -56,8 +55,10 @@
   Strategy_loader
   Strategy_compile
   Strategy_expr
-  Strategy_guard
   Strategy_runtime
+  Strategy_ir
+  Strategy_program
+  Strategy_run
   Strategy_fact_slots
   ; harness/ — equivalence tooling
   Strategy_trace

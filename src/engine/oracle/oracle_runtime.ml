@@ -1142,6 +1142,12 @@ let in_startup_grace ~(now : int64) : bool =
     call every healthy reclaim ineffective. *)
 let reclaim_settle_ns = Int64.of_float 1e9
 
+(** A funded senior keeps the juniors out until its buy rests, so they cannot take the
+    quote back before it is committed. This caps that wait: a senior that funds and then
+    does not place (filled into a latched grid) must not strand every junior for the full
+    TTL. *)
+let reclaim_funded_hold_ns = Int64.of_float 5e9
+
 (** A reclaim that provably bought nothing: its cancels landed and the pool did not grow.
     Re-issuing it cannot fund the senior - the quote it points at is already counted - so
     every retry only starves the juniors again. Held until the pool moves (the next sell
@@ -1569,6 +1575,10 @@ let run_account_pass
                  percent above the quote it just reclaimed and never activate - the
                  reclaim cancels the junior and buys nothing. Size the reclaimed quote
                  down to what it can afford, but never below the configured minimum. *)
+              (* The survival gate's own verdict, before the sizing override. Only this
+                 one means the venue's quote covers the buy; the override sizes into pool
+                 quote the balance feed has not published yet. *)
+              let pipeline_active = d.active in
               let d : decision =
                 if is_reserved_senior
                    && (not d.active)
@@ -1629,9 +1639,17 @@ let run_account_pass
                      only fresh active placements consume free quote. *)
                   if (not resting_buy) && need <= quote_available +. 1e-9
                   then remaining := Float.max 0.0 (!remaining -. need);
-                  (* The reserved senior just funded: the reclaim completed, release the
-                     cross-pass hold so lower-priority strategies resume normally. *)
-                  if is_reserved_senior
+                  (* Reclaim complete: release the cross-pass hold. Requires the gate's
+                     verdict AND a resting buy - releasing on the override let a junior
+                     refill from quote the balance feed had not published yet, and the
+                     senior re-flagged itself short one pass later. *)
+                  let funded_hold_expired =
+                    match reservation with
+                    | Some r -> Int64.sub now_ns r.rr_at > reclaim_funded_hold_ns
+                    | None -> true
+                  in
+                  if is_reserved_senior && pipeline_active
+                     && (resting_buy || funded_hold_expired)
                   then (
                     Hashtbl.remove reclaim_reservations acct_id;
                     Hashtbl.remove reclaim_ineffective acct_id;

@@ -1,0 +1,6 @@
+(library
+ (name hotpath)
+ (public_name dio.hotpath)
+ (wrapped false)
+ (libraries dio.latency_profiling logging threads unix)
+ (modules Hotpath_feed))

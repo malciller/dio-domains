@@ -327,6 +327,8 @@ module Alpaca_impl = struct
   ;;
 
   let get_top_of_book ~symbol = Alpaca_orderbook.get_best_bid_ask symbol
+  let get_top_of_book_into ~symbol buf = Alpaca_orderbook.get_best_bid_ask_into symbol buf
+
   let get_top_of_book_fast ~symbol = Alpaca_orderbook.get_best_bid_ask_fast symbol
   let has_orderbook_data ~symbol = Alpaca_orderbook.has_orderbook_data symbol
   let get_tradeable_balance ~asset = Alpaca_balances.get_balance asset
@@ -537,6 +539,13 @@ let () = Exchange.Registry.register (module Alpaca_impl)
 let () =
   Concurrency.Parse_worker.register_venue_decoder ~venue:"alpaca" Alpaca_impl.decode_frame
 ;;
+
+(* The venue's position marks are the only price that keeps moving while its quote
+   stream is closed for the session; hand them to the book so a grid still ticks. *)
+let () =
+  Alpaca_balances.set_mark_observer (fun symbol price ->
+    Alpaca_orderbook.push_mark ~symbol ~price)
+
 
 (* Register the oracle data-venue adapter at load time. *)
 let () = Exchange.Oracle.Registry.register (module Alpaca_oracle)

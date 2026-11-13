@@ -14,7 +14,6 @@ module Expr = Dio_strategies.Strategy_expr
 module Jac = Dio_strategies.Strategy_api
 module Order = Dio_strategies.Strategy_common
 module Strategy_file = Dio_strategies.Strategy_file
-module Strategy_actions_cycle = Dio_strategies.Strategy_actions_cycle
 module Strategy_actions_builtin = Dio_strategies.Strategy_actions_builtin
 module Strategy_compile = Dio_strategies.Strategy_compile
 module Strategy_runtime = Dio_strategies.Strategy_runtime
@@ -563,18 +562,49 @@ let replay_candidate
   let ctx = Dio_strategies.Strategy_cycle_engine.create () in
   ctx.cg_symbol <- asset.symbol;
   ctx.cg_state <- Some state;
-  let module Handlers = Strategy_actions_cycle.Make (Dio_strategies.Strategy_cycle_engine)
+  let rt = Strategy_runtime.create file in
+  (* Replay drives the same compiled program live trading runs, through the same executor:
+     the interpreter it used to call no longer exists. *)
+  let program =
+    match Dio_strategies.Strategy_program.compile file with
+    | Ok p -> p
+    | Error m -> failwith ("replay: strategy does not compile: " ^ m)
   in
-  let rt = Strategy_runtime.create ~handlers:(Handlers.handler ctx) file in
+  let layout = program.Dio_strategies.Strategy_program.layout in
+  let env : Dio_strategies.Strategy_ir.env =
+    { floats = Array.make (max 1 layout.float_count) 0.0
+    ; ints = Array.make (max 1 layout.int_count) 0
+    ; bools = Array.make (max 1 layout.bool_count) false
+    ; strings = Array.make (max 1 layout.string_count) ""
+    ; price = 0.0
+    ; now = 0.0
+    ; event_kind = ""
+    ; event_side = ""
+    }
+  in
+  let sink = Dio_strategies.Strategy_program.create_sink () in
+  let resolved = Dio_strategies.Strategy_program.resolve program in
+  let run_pass ~price ~now event =
+    Dio_strategies.Strategy_run.run_pass
+      ctx
+      rt
+      program
+      env
+      sink
+      resolved
+      ~price
+      ~now
+      ~event
+      ~event_kind:event.Dio_strategies.Strategy_runtime.ev_kind
+      ~event_fields:event.ev_fields
+  in
   drive
     ~asset
     ~state
     ~set_venue_available
     ~dispatch_events:(fun ~events ~price ~now ->
       List.iter
-        (fun e ->
-          ignore
-            (Strategy_runtime.run_cycle rt ~price ~now ~event:(runtime_event_of_obs e)))
+        (fun e -> run_pass ~price ~now (runtime_event_of_obs e))
         events)
     ~execute:
       (fun
@@ -605,12 +635,10 @@ let replay_candidate
       ctx.cg_base_age <- base_age;
       ctx.cg_gen <- generation;
       ctx.cg_iter <- iter;
-      ignore
-        (Strategy_runtime.run_cycle
-           rt
-           ~price
-           ~now
-           ~event:(Strategy_runtime.make_event "book_update" [])))
+      run_pass
+        ~price
+        ~now
+        (Strategy_runtime.make_event "book_update" []))
     trace
 ;;
 

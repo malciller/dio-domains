@@ -28,16 +28,6 @@
  (deps jacobs_ladder.strategy))
 
 (test
- (name test_strategy_runtime)
- (modules test_strategy_runtime)
- (libraries dio.strategies alcotest))
-
-(test
- (name test_strategy_harness)
- (modules test_strategy_harness)
- (libraries dio.strategies alcotest))
-
-(test
  (name test_platform_accounting)
  (modules test_platform_accounting)
  (libraries dio.strategies alcotest))
@@ -51,3 +41,17 @@
  (name test_egress_invariants)
  (modules test_egress_invariants)
  (libraries dio.strategies dio.engine alcotest threads))
+
+(test
+ (name test_strategy_ir)
+ (modules test_strategy_ir)
+ (libraries dio.strategies dio.latency_profiling alcotest))
+
+(rule
+ (copy ../../../strategies/private/short_overlay.strategy short_overlay.strategy))
+
+(test
+ (name test_strategy_program)
+ (modules test_strategy_program)
+ (libraries dio.strategies dio.latency_profiling alcotest)
+ (deps short_overlay.strategy jacobs_ladder.strategy))

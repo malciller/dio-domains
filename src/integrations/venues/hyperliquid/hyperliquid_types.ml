@@ -262,9 +262,15 @@ let pack_usd_class_transfer_action ~amount ~to_perp =
     ]
 ;;
 
+(** Serialize a MsgPack value into [buf] (cleared first) using StringBuf encoding. *)
+let serialize_action_into buf (msg : t) : unit =
+  Buffer.clear buf;
+  ignore (Msgpck.StringBuf.write buf msg)
+;;
+
 (** Serialize a MsgPack value to a binary string using StringBuf encoding. *)
 let serialize_action (msg : t) : string =
   let buf = Buffer.create 512 in
-  ignore (Msgpck.StringBuf.write buf msg);
+  serialize_action_into buf msg;
   Buffer.contents buf
 ;;

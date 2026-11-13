@@ -78,3 +78,15 @@ strategies/*.private.strategy
 docs/carry-overlay-design.md
 # Any `private/` directory at any depth is local-only.
 private/
+# --- Shipped tooling ---------------------------------------------------------
+# The broad scratch-file globs above are for one-off outputs. Everything under
+# scripts/ is source, as are the editor dev helpers and the code-map explorer.
+# Private deployment/analytics tooling (deploy.sh, update.sh, utils/) stays
+# ignored.
+!scripts/
+!scripts/*
+scripts/__pycache__/
+!docs/code-map/
+!docs/code-map/index.html
+!editors/zed-strategy/dev-install.sh
+!editors/zed-strategy/tests/lsp_smoke.py

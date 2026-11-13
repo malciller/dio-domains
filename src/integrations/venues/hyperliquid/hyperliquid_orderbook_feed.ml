@@ -374,6 +374,21 @@ let get_best_bid_ask symbol =
 [@@inline always]
 ;;
 
+let get_best_bid_ask_into symbol (buf : float array) =
+  match Ds.Cow_table.find_opt stores symbol with
+  | Some store ->
+    let t = Atomic.get store.tob in
+    if t.tob_valid
+    then (
+      buf.(0) <- t.bid_px;
+      buf.(1) <- t.bid_sz;
+      buf.(2) <- t.ask_px;
+      buf.(3) <- t.ask_sz;
+      true)
+    else false
+  | None -> false
+;;
+
 let get_best_bid_ask_fast symbol =
   let store = ensure_store symbol in
   fun () ->

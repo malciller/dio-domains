@@ -30,13 +30,20 @@ let set ~exchange ~owner ~amount =
 
 let release ~exchange ~owner = set ~exchange ~owner ~amount:0.0
 
+(** True when [k] is a [exchange|...] key. Compared in place: the table is keyed by
+    [exchange ^ "|" ^ owner], and slicing the exchange out allocated once per reservation on
+    every read - the fact refresh reads this on every event. *)
+let key_belongs_to ~exchange k =
+  let n = String.length exchange in
+  String.length k > n
+  && Char.equal (String.unsafe_get k n) '|'
+  && String.starts_with ~prefix:exchange k
+;;
+
 (** Total reserved quote for [exchange]. *)
 let get_total ~exchange =
   Hashtbl.fold
-    (fun k v acc ->
-      match String.index_opt k '|' with
-      | Some i when String.sub k 0 i = exchange -> acc +. v
-      | _ -> acc)
+    (fun k v acc -> if key_belongs_to ~exchange k then acc +. v else acc)
     (Atomic.get reservations)
     0.0
 ;;

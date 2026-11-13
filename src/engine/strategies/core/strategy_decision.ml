@@ -354,6 +354,10 @@ let buy_place_send_insufficient
 (** Branch action: fresh balance genuinely cannot fund the buy - latch [capital_low] until
     available quote covers the next buy, and set the retry cooldown. *)
 let buy_place_latch_capital_low
+  ~(quote_balance : float)
+  ~(locked_in_buys : float)
+  ~(buy_price : float)
+  ~(qty : float)
   ~state
   ~now
   ~(asset : trading_config)
@@ -372,13 +376,18 @@ let buy_place_latch_capital_low
       ~section
       "Local balance insufficient for %s buy (need %.2f, available %.2f; venue quote \
        %.2f, overlays reserved %.2f, grids reserved %.2f) - skipping placement until \
-       balance recovers"
+       balance recovers [balance_ok inputs: quote=%.4f locked_buys=%.4f price=%.6f \
+       qty=%.8g]"
       asset.symbol
       quote_needed
       available_quote_balance
       venue_quote
       overlay_reserved
-      grid_reserved);
+      grid_reserved
+      quote_balance
+      locked_in_buys
+      buy_price
+      qty);
   Hashtbl.replace state.amend_cooldowns "place_Buy" (now +. 2.0)
 ;;
 
@@ -462,6 +471,10 @@ let buy_place_initial
           ~asset
           ~quote_needed:p.bp_quote_needed
           ~available_quote_balance:p.bp_available
+          ~quote_balance
+          ~locked_in_buys
+          ~buy_price:p.bp_price
+          ~qty:p.bp_qty
     else buy_place_warn_quote ~asset;
   !attempted
 ;;
@@ -645,6 +658,55 @@ let buy_amend_no_sell
      (* Nothing warranted: release the latch so the sizing counts as adopted without
         moving the book. *)
      if reanchor_buy && not trail_up then state.force_buy_reanchor <- false;
+     (* Sampled once per 100 cycles: the log otherwise only shows the amend that finally
+        fired, never the ticks in between. *)
+     (if cycle mod 100 = 0
+      then
+        let diff =
+          state.cached_round_price
+            (abs_float (target_buy_price -. current_buy_price_rounded))
+        in
+        if not trail_up
+        then
+          Logging.info_f
+            ~section
+            "buy amend idle for %s: target %.4f <= resting %.4f (diff %.4f, tick %.4f, \
+             bid %.4f ask %.4f)"
+            asset.symbol
+            target_buy_price
+            current_buy_price
+            diff
+            min_move_threshold
+            bid_price
+            ask_price
+        else if diff < min_move_threshold
+        then
+          Logging.info_f
+            ~section
+            "buy amend held for %s: move %.4f < tick %.4f (target %.4f, resting %.4f)"
+            asset.symbol
+            diff
+            min_move_threshold
+            target_buy_price
+            current_buy_price
+        else if
+          List.exists
+            (fun (id, _, _, _) ->
+               String.starts_with ~prefix:"pending_amend_" id
+               && String.sub id 14 (String.length id - 14) = buy_order_id)
+            state.pending_orders
+        then
+          Logging.info_f ~section "buy amend held for %s: amendment already pending" asset.symbol
+        else if InFlightAmendments.is_in_flight buy_order_id
+        then
+          Logging.info_f
+            ~section
+            "buy amend held for %s: amendment in flight for %s"
+            asset.symbol
+            buy_order_id
+        else if Hashtbl.mem state.amend_cooldowns buy_order_id
+        then
+          Logging.info_f ~section "buy amend held for %s: order on cooldown" asset.symbol);
      if trail_up
      then (
        let effective_amend_price = target_buy_price in

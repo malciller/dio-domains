@@ -536,6 +536,10 @@ module Hyperliquid_impl = struct
     | None -> None
   ;;
 
+  let get_top_of_book_into ~symbol buf =
+    Hyperliquid_orderbook_feed.get_best_bid_ask_into symbol buf
+  ;;
+
   let get_top_of_book_fast ~symbol =
     Hyperliquid_orderbook_feed.get_best_bid_ask_fast symbol
   ;;
@@ -937,8 +941,15 @@ let wait_for_ws_connected () =
     domains placed orders the signer could not resolve ("Unknown symbol"). *)
 let ensure_instruments_loaded () =
   let section = "hyperliquid_startup" in
+  (* Builder-deployed perps are not in the main WS meta payload, so they are fetched from
+     REST on every start regardless of how the main universe arrived. *)
+  let with_builder_dexes () =
+    Hyperliquid_instruments_feed.fetch_builder_dexes
+      ~testnet:(Atomic.get Hyperliquid_impl.is_testnet)
+      ()
+  in
   if Hyperliquid_instruments_feed.has_instruments ()
-  then Lwt.return_unit
+  then with_builder_dexes ()
   else (
     Logging.warn_f
       ~section
@@ -948,6 +959,8 @@ let ensure_instruments_loaded () =
         Hyperliquid_instruments_feed.fetch_meta_from_rest
           ~testnet:(Atomic.get Hyperliquid_impl.is_testnet)
           ()
+        >>= fun () ->
+        with_builder_dexes ()
         >>= fun () ->
         Hyperliquid_instruments_feed.notify_ready ();
         Lwt.return_unit)

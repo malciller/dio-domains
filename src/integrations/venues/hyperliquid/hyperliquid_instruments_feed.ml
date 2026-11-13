@@ -222,6 +222,114 @@ let lookup_info symbol =
     (max_decimals - sz_decimals) cap; see [round_price_to_tick_for_symbol]. *)
 let get_price_increment _symbol = Some 0.01
 
+(** Register a builder-deployed perp dex's instruments.
+
+    Builder perps live in their own `meta` namespace: the coin is `{dex}:{name}` and the
+    asset id the exchange expects is `100000 + perp_dex_index * 10000 + index_in_meta`
+    (see the venue's asset-id reference). Getting that arithmetic wrong routes an order to
+    an unrelated instrument, so it is computed only here and only from the dex index the
+    exchange reports. *)
+let process_builder_dex_meta ~dex_index ~dex_name payload =
+  match
+    try
+      let open Yojson.Safe.Util in
+      Some (member "universe" payload |> to_list)
+    with
+    | _ -> None
+  with
+  | None ->
+    Logging.warn_f ~section "builder dex %s: unreadable meta payload" dex_name
+  | Some universe ->
+    Mutex.lock cache_mutex;
+    List.iteri
+      (fun index item ->
+        match
+          try
+            let open Yojson.Safe.Util in
+            let coin = member "name" item |> to_string in
+            let sz_decimals = member "szDecimals" item |> to_int in
+            let max_leverage =
+              try Some (member "maxLeverage" item |> to_int) with
+              | _ -> None
+            in
+            Some (coin, sz_decimals, max_leverage)
+          with
+          | _ -> None
+        with
+        | None -> ()
+        | Some (coin, sz_decimals, max_leverage) ->
+          let symbol = dex_name ^ ":" ^ coin in
+          let asset_index = 100_000 + (dex_index * 10_000) + index in
+          Hashtbl.replace
+            pair_cache
+            symbol
+            { symbol; sz_decimals; max_leverage; asset_index })
+      universe;
+    publish_cache_locked ();
+    Logging.info_f
+      ~section
+      "builder dex %s: %d perp(s) registered (ids %d..)"
+      dex_name
+      (List.length universe)
+      (100_000 + (dex_index * 10_000))
+;;
+
+(** Fetch and register every builder-deployed perp dex. The main `meta` payload does not
+    contain them, so an instrument like `xyz:SPCX` only resolves after this runs. *)
+let fetch_builder_dexes ~testnet () : unit Lwt.t =
+  let url =
+    if testnet
+    then Uri.of_string "https://api.hyperliquid-testnet.xyz/info"
+    else Uri.of_string "https://api.hyperliquid.xyz/info"
+  in
+  let post_json json =
+    let body = Cohttp_lwt.Body.of_string (Yojson.Safe.to_string json) in
+    let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
+    Cohttp_lwt_unix.Client.post ~headers ~body url
+    >>= fun (_resp, resp_body) ->
+    Cohttp_lwt.Body.to_string resp_body
+    >>= fun body_str -> Lwt.return (Yojson.Safe.from_string body_str)
+  in
+  Lwt.catch
+    (fun () ->
+      post_json (`Assoc [ "type", `String "perpDexs" ])
+      >>= fun dexes ->
+      (* The position in this array *is* the perp dex index the asset id is built from, and
+         entry 0 is the main dex (null). Filtering before indexing would shift every dex by
+         one and misroute its orders to another instrument. *)
+      let dex_entries =
+        try
+          List.mapi
+            (fun index d ->
+              let name =
+                match d with
+                | `String name -> if name = "" then None else Some name
+                | `Assoc _ ->
+                  (try Some Yojson.Safe.Util.(d |> member "name" |> to_string) with
+                   | _ -> None)
+                | _ -> None
+              in
+              match name with
+              | Some dex_name when index > 0 -> Some (index, dex_name)
+              | _ -> None)
+            (Yojson.Safe.Util.to_list dexes)
+          |> List.filter_map (fun x -> x)
+        with
+        | _ -> []
+      in
+      Lwt_list.iter_s
+        (fun (index, dex_name) ->
+          post_json (`Assoc [ "type", `String "meta"; "dex", `String dex_name ])
+          >|= fun payload -> process_builder_dex_meta ~dex_index:index ~dex_name payload)
+        dex_entries)
+    (fun exn ->
+      Logging.warn_f
+        ~section
+        "builder dex discovery failed: %s"
+        (Printexc.to_string exn);
+      Lwt.return_unit)
+;;
+
 (** Fetches perp + spot metadata from REST /info into the cache. Used by out-of-process
     consumers (e.g. the capital oracle CLI) that do not run the WebSocket feed.
 
@@ -248,7 +356,48 @@ let fetch_meta_from_rest ~testnet () : unit Lwt.t =
       post_one "meta"
       >>= fun payload_perp ->
       post_one "spotMeta"
-      >>= fun payload_spot -> process_meta_response payload_perp payload_spot)
+      >>= fun payload_spot ->
+      process_meta_response payload_perp payload_spot
+      >>= fun () ->
+      (* Builder-deployed perps (equities and other external markets) are not in the main
+         meta payload; each dex has its own. *)
+      let post_json json =
+        let req_body = Yojson.Safe.to_string json in
+        let body = Cohttp_lwt.Body.of_string req_body in
+        let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
+        Cohttp_lwt_unix.Client.post ~headers ~body url
+        >>= fun (_resp, resp_body) ->
+        Cohttp_lwt.Body.to_string resp_body
+        >>= fun body_str -> Lwt.return (Yojson.Safe.from_string body_str)
+      in
+      post_json (`Assoc [ "type", `String "perpDexs" ])
+      >>= fun dexes ->
+      let names =
+        try
+          `List
+            (List.map
+               (fun d ->
+                 `String
+                   (match d with
+                    | `String name -> name
+                    | other -> Yojson.Safe.Util.(other |> member "name" |> to_string)))
+               (Yojson.Safe.Util.to_list dexes))
+          |> Yojson.Safe.Util.to_list
+        with
+        | _ -> []
+      in
+      Lwt_list.iter_s
+        (fun index_and_dex ->
+          let index, dex_name = index_and_dex in
+          post_json
+            (`Assoc [ "type", `String "meta"; "dex", `String dex_name ])
+          >|= fun payload -> process_builder_dex_meta ~dex_index:index ~dex_name payload)
+        (List.filter_map
+           (fun (i, d) ->
+             match d with
+             | `String name when i > 0 && name <> "" -> Some (i, name)
+             | _ -> None)
+           (List.mapi (fun i d -> i, d) names)))
     (fun exn ->
       Logging.error_f
         ~section
@@ -289,7 +438,12 @@ let get_subscription_coin symbol =
   Mutex.lock cache_mutex;
   let res =
     match Hashtbl.find_opt pair_cache symbol with
-    | Some info when info.asset_index >= 10000 ->
+    | Some _ when String.contains symbol ':' ->
+      (* Builder perp: the venue's coin name is already [dex:coin]. Asset ids above
+         100000 are builder perps, not spot pairs - encoding them as @N subscribes to a
+         coin that does not exist and no book ever arrives. *)
+      symbol
+    | Some info when info.asset_index >= 10000 && info.asset_index < 100_000 ->
       (* Spot pair: encode as @N where N = asset_index - 10000. *)
       Printf.sprintf "@%d" (info.asset_index - 10000)
     | _ ->

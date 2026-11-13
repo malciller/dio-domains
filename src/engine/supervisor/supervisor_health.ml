@@ -73,6 +73,11 @@ let monitor_loop () =
             let current_time = Unix.time () in
             try
               incr cycle_count;
+              (* Supervision tick: every trading domain re-evaluates at least once a
+                 second even when its market data is quiet. A grid's re-place after an
+                 order is cancelled at the venue otherwise waits for the next book update,
+                 which on a thin instrument (or a sparse feed) can be minutes away. *)
+              Concurrency.Exchange_wakeup.signal_all ();
               let current_open = Ibkr.Market_hours.is_market_open () in
               let current_status = Ibkr.Market_hours.market_status_string () in
               if (not !last_market_open) && current_open

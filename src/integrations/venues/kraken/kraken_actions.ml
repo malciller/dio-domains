@@ -63,6 +63,39 @@ let truncate_price_to_precision price symbol =
     [Error_handling.string_contains]. *)
 let string_contains = Error_handling.string_contains
 
+(** JSON string literal, escaped exactly as {!json_to_string_precise} escapes it. *)
+let json_escape_into buf s =
+  Buffer.add_char buf '"';
+  String.iter
+    (function
+      | '"' -> Buffer.add_string buf "\\\""
+      | '\\' -> Buffer.add_string buf "\\\\"
+      | '\b' -> Buffer.add_string buf "\\b"
+      | '\012' -> Buffer.add_string buf "\\f"
+      | '\n' -> Buffer.add_string buf "\\n"
+      | '\r' -> Buffer.add_string buf "\\r"
+      | '\t' -> Buffer.add_string buf "\\t"
+      | c -> Buffer.add_char buf c)
+    s;
+  Buffer.add_char buf '"'
+;;
+
+(** Number formatted with the instrument's precision for [field], matching
+    {!json_to_string_precise}'s rule: a field whose name contains "price" uses the price
+    precision, everything else the quantity precision. *)
+let precise_float_into buf symbol ~field f =
+  let precision =
+    match symbol with
+    | Some sym ->
+      (match Kraken_instruments_feed.get_precision_info sym with
+       | Some (price_precision, qty_precision) ->
+         if string_contains field "price" then price_precision else qty_precision
+       | None -> 8)
+    | None -> 8
+  in
+  Buffer.add_string buf (Printf.sprintf "%.*f" precision f)
+;;
+
 (** Serializes JSON to a string, applying instrument-specific float precision bounds. *)
 let rec json_to_string_precise ?field_name symbol (json : Yojson.Safe.t) : string =
   match json with
@@ -152,6 +185,117 @@ let default_retry_config = Error_handling.default_retry_config
     centralized [Error_handling.is_retriable_error]. *)
 let is_retriable_error = Error_handling.is_retriable_error
 
+(* Reused body buffer, domain-local so a second scheduler cannot share it. *)
+[@@@alert "-unsafe_multidomain"]
+
+let order_body_buf_key = Domain.DLS.new_key (fun () -> Buffer.create 1024)
+let order_body_buf () = Domain.DLS.get order_body_buf_key
+
+(* Restore the alert beyond the two bindings above. *)
+[@@@alert "+unsafe_multidomain"]
+
+(* Write the add_order request body straight into [buf], in the exact shape
+    {!json_to_string_precise} produces for the equivalent Yojson tree. The order path is the
+    one place where building a whole JSON AST per order is measurable, and the websocket
+   only needs the bytes. *)
+let add_order_body_into
+      buf
+      ~symbol
+      ~req_id
+      ~order_type
+      ~side
+      ~order_qty
+      ~token
+      ?limit_price
+      ?time_in_force
+      ?post_only
+      ?margin
+      ?reduce_only
+      ?order_userref
+      ?cl_ord_id
+      ?trigger_price
+      ?trigger_price_type
+      ?display_qty
+      ?fee_preference
+      ?validate
+      ()
+  =
+  let started = ref false in
+  let field name =
+    if !started then Buffer.add_char buf ',';
+    started := true;
+    Buffer.add_char buf '"';
+    Buffer.add_string buf name;
+    Buffer.add_string buf "\":"
+  in
+  let num name f =
+    field name;
+    precise_float_into buf (Some symbol) ~field:name f
+  in
+  let str name v =
+    field name;
+    json_escape_into buf v
+  in
+  let bool name v =
+    field name;
+    Buffer.add_string buf (if v then "true" else "false")
+  in
+  Buffer.add_string buf "{\"method\":\"add_order\",\"params\":{";
+  str "order_type" order_type;
+  str "side" side;
+  num "order_qty" order_qty;
+  str "symbol" symbol;
+  str "token" token;
+  (match limit_price with
+   | Some price -> num "limit_price" (truncate_price_to_precision price symbol)
+   | None -> ());
+  (match time_in_force with
+   | Some tif -> str "time_in_force" tif
+   | None -> ());
+  (match post_only with
+   | Some v -> bool "post_only" v
+   | None -> ());
+  (match margin with
+   | Some v -> bool "margin" v
+   | None -> ());
+  (match reduce_only with
+   | Some v -> bool "reduce_only" v
+   | None -> ());
+  (match order_userref with
+   | Some v ->
+     field "order_userref";
+     Buffer.add_string buf (string_of_int v)
+   | None -> ());
+  (match cl_ord_id with
+   | Some v -> str "cl_ord_id" v
+   | None -> ());
+  (match trigger_price with
+   | Some price ->
+     field "triggers";
+     Buffer.add_string buf "{\"price\":";
+     precise_float_into buf (Some symbol) ~field:"price"
+       (truncate_price_to_precision price symbol);
+     (match trigger_price_type with
+      | Some tpt ->
+        Buffer.add_string buf ",\"price_type\":";
+        json_escape_into buf tpt
+      | None -> ());
+     Buffer.add_char buf '}'
+   | None -> ());
+  (match display_qty with
+   | Some v -> num "display_qty" v
+   | None -> ());
+  (match fee_preference with
+   | Some v -> str "fee_preference" v
+   | None -> ());
+  (match validate with
+   | Some v -> bool "validate" v
+   | None -> ());
+  Buffer.add_string buf "},\"req_id\":";
+  Buffer.add_string buf (string_of_int req_id);
+  Buffer.add_char buf '}'
+;;
+
 (** Places an order, retrying via [retry_config]. *)
 let place_order
   ~token
@@ -203,80 +347,6 @@ let place_order
   in
   let place_order_once () =
     let req_id = next_req_id () in
-    let params =
-      `Assoc
-        [ "order_type", `String order_type
-        ; "side", `String side
-        ; "order_qty", `Float order_qty
-        ; "symbol", `String symbol
-        ; "token", `String token
-        ]
-    in
-    let params =
-      match limit_price with
-      | Some price ->
-        let truncated_price = truncate_price_to_precision price symbol in
-        add_to_assoc params ("limit_price", `Float truncated_price)
-      | None -> params
-    in
-    let params =
-      match time_in_force with
-      | Some tif -> add_to_assoc params ("time_in_force", `String tif)
-      | None -> params
-    in
-    let params =
-      match post_only with
-      | Some po -> add_to_assoc params ("post_only", `Bool po)
-      | None -> params
-    in
-    let params =
-      match margin with
-      | Some m -> add_to_assoc params ("margin", `Bool m)
-      | None -> params
-    in
-    let params =
-      match reduce_only with
-      | Some ro -> add_to_assoc params ("reduce_only", `Bool ro)
-      | None -> params
-    in
-    let params =
-      match order_userref with
-      | Some userref -> add_to_assoc params ("order_userref", `Int userref)
-      | None -> params
-    in
-    let params =
-      match cl_ord_id with
-      | Some id -> add_to_assoc params ("cl_ord_id", `String id)
-      | None -> params
-    in
-    let params =
-      match trigger_price with
-      | Some price ->
-        let truncated_price = truncate_price_to_precision price symbol in
-        let triggers = `Assoc [ "price", `Float truncated_price ] in
-        let triggers =
-          match trigger_price_type with
-          | Some tpt -> add_to_assoc triggers ("price_type", `String tpt)
-          | None -> triggers
-        in
-        add_to_assoc params ("triggers", triggers)
-      | None -> params
-    in
-    let params =
-      match display_qty with
-      | Some qty -> add_to_assoc params ("display_qty", `Float qty)
-      | None -> params
-    in
-    let params =
-      match fee_preference with
-      | Some pref -> add_to_assoc params ("fee_preference", `String pref)
-      | None -> params
-    in
-    let params =
-      match validate with
-      | Some v -> add_to_assoc params ("validate", `Bool v)
-      | None -> params
-    in
     Logging.debug_f
       ~section
       "Placing %s order: %s %s %f @ %s"
@@ -287,13 +357,36 @@ let place_order
       (match limit_price with
        | Some p -> Printf.sprintf "%.6f" (truncate_price_to_precision p symbol)
        | None -> "market");
-    let json_str = json_to_string_precise (Some symbol) params in
-    Logging.debug_f ~section "Order parameters: %s" json_str;
-    Kraken_trading_client.send_request
-      ~symbol:(Some symbol)
-      ~method_:"add_order"
-      ~params
+    let buf = order_body_buf () in
+    Buffer.clear buf;
+    add_order_body_into
+      buf
+      ~symbol
       ~req_id
+      ~order_type
+      ~side
+      ~order_qty
+      ~token
+      ?limit_price
+      ?time_in_force
+      ?post_only
+      ?margin
+      ?reduce_only
+      ?order_userref
+      ?cl_ord_id
+      ?trigger_price
+      ?trigger_price_type
+      ?display_qty
+      ?fee_preference
+      ?validate
+      ();
+    let body = Buffer.contents buf in
+    if Logging.will_log Logging.DEBUG section
+    then Logging.debug_f ~section "Order body: %s" body;
+    Kraken_trading_client.send_request_body
+      ~body
+      ~req_id
+      ~expected_method:"add_order"
       ~timeout_ms:order_request_timeout_ms
     >>= fun response ->
     if response.success

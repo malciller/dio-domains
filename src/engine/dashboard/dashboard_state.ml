@@ -892,10 +892,15 @@ let json_of_overlay_long (oi : Dio_engine.Config.overlay_instance) =
       try Mc.get_open_orders ~coin with
       | _ -> []
     in
+    (* The close sits on the side opposite the position: a short is closed with a BUY, so
+       filtering on Sell left every short's take-profit without a price or a distance. *)
+    let close_side =
+      if qty < 0.0 then Exchange.Types.Buy else Exchange.Types.Sell
+    in
     let closes =
       List.filter
         (fun (o : Exchange.Types.open_order) ->
-          o.side = Exchange.Types.Sell && o.remaining_qty > 0.0)
+          o.side = close_side && o.remaining_qty > 0.0)
         orders
     in
     let close_orders =

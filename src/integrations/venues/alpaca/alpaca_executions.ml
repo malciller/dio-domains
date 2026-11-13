@@ -67,6 +67,10 @@ let status_of_alpaca_status = function
   | Alpaca_types.Unknown s -> Unknown s
 ;;
 
+(** How long a per-order dedupe entry is kept. Covers the Events API backfill window, so a
+    reconnect replay is still recognised. *)
+let order_water_retention_s = 900.0
+
 module SymbolExecStore = struct
   type t =
     { symbol : string
@@ -92,6 +96,10 @@ module SymbolExecStore = struct
     ; changes_overflow : bool Atomic.t
     (** Set when the change log cannot represent the delta (a full snapshot replace),
         forcing the consumer to do a full rescan. *)
+    ; order_water : (string, float * bool * float) Hashtbl.t
+    (** Per order id: cumulative filled quantity booked, whether a terminal status was seen,
+        and when. Both transports deliver the same events, in either order, so a status
+        arriving after the terminal one must be dropped rather than resurrect the order. *)
     }
 
   let create symbol capacity =
@@ -121,6 +129,7 @@ module SymbolExecStore = struct
     ; mutex = Mutex.create ()
     ; changes = Atomic.make []
     ; changes_overflow = Atomic.make false
+    ; order_water = Hashtbl.create 32
     }
   ;;
 
@@ -149,50 +158,84 @@ module SymbolExecStore = struct
   ;;
 
   let push_event t (e : execution_event_internal) =
-    let idx = Atomic.get t.write_pos mod t.capacity in
-    t.buffer.(idx) <- e;
-    Atomic.set t.write_pos (Atomic.get t.write_pos + 1);
-    Atomic.set t.initial_data_received true;
-    (* Open-order store update, under the mutex. *)
+    let is_fill =
+      match e.order_status with
+      | Filled | PartiallyFilled -> true
+      | _ -> false
+    in
+    let is_terminal =
+      match e.order_status with
+      | Filled | Canceled | Expired | Rejected -> true
+      | _ -> false
+    in
     Mutex.lock t.mutex;
-    (match e.order_status with
-     | New | Pending | PartiallyFilled | Unknown _ ->
-       let existing_order = Hashtbl.find_opt t.open_orders e.order_id in
-       let qty =
-         match existing_order with
-         | Some o -> o.qty
-         | None -> e.filled_qty +. e.remaining_qty
-       in
-       let user_ref =
-         match e.cl_ord_id with
-         | Some cid ->
-           (try Some (int_of_string cid) with
-            | _ -> None)
-         | None -> None
-       in
-       let oo =
-         { order_id = e.order_id
-         ; symbol = t.symbol
-         ; side = e.side
-         ; qty
-         ; cum_qty = e.filled_qty
-         ; remaining_qty = e.remaining_qty
-         ; limit_price = e.limit_price
-         ; status = e.order_status
-         ; user_ref
-         ; cl_ord_id = e.cl_ord_id
-         }
-       in
-       Hashtbl.replace t.open_orders e.order_id oo;
-       note_change t e.order_id (Some oo)
-     | Filled | Canceled | Expired | Rejected ->
-       Hashtbl.remove t.open_orders e.order_id;
-       note_change t e.order_id None);
-    publish_open_orders_cache t;
-    Mutex.unlock t.mutex;
-    (* Per-symbol wakeup; only this symbol's domain consumes its exec events. *)
-    Concurrency.Exchange_wakeup.signal ~symbol:t.symbol;
-    Concurrency.Oracle_wakeup.notify_exec ()
+    let seen_cum, seen_terminal, _ =
+      match Hashtbl.find_opt t.order_water e.order_id with
+      | Some v -> v
+      | None -> 0.0, false, 0.0
+    in
+    let duplicate =
+      seen_terminal || (is_fill && e.filled_qty <= seen_cum)
+    in
+    if not duplicate
+    then (
+      Hashtbl.replace
+        t.order_water
+        e.order_id
+        (Float.max seen_cum e.filled_qty, is_terminal, Unix.gettimeofday ());
+      if Hashtbl.length t.order_water > 512
+      then (
+        let horizon = Unix.gettimeofday () -. order_water_retention_s in
+        Hashtbl.filter_map_inplace
+          (fun _ (cum, terminal, at) ->
+             if at > horizon then Some (cum, terminal, at) else None)
+          t.order_water));
+    if duplicate
+    then Mutex.unlock t.mutex
+    else (
+      let idx = Atomic.get t.write_pos mod t.capacity in
+      t.buffer.(idx) <- e;
+      Atomic.set t.write_pos (Atomic.get t.write_pos + 1);
+      Atomic.set t.initial_data_received true;
+      (* Open-order store update, under the mutex. *)
+      (match e.order_status with
+       | New | Pending | PartiallyFilled | Unknown _ ->
+         let existing_order = Hashtbl.find_opt t.open_orders e.order_id in
+         let qty =
+           match existing_order with
+           | Some o -> o.qty
+           | None -> e.filled_qty +. e.remaining_qty
+         in
+         let user_ref =
+           match e.cl_ord_id with
+           | Some cid ->
+             (try Some (int_of_string cid) with
+              | _ -> None)
+           | None -> None
+         in
+         let oo =
+           { order_id = e.order_id
+           ; symbol = t.symbol
+           ; side = e.side
+           ; qty
+           ; cum_qty = e.filled_qty
+           ; remaining_qty = e.remaining_qty
+           ; limit_price = e.limit_price
+           ; status = e.order_status
+           ; user_ref
+           ; cl_ord_id = e.cl_ord_id
+           }
+         in
+         Hashtbl.replace t.open_orders e.order_id oo;
+         note_change t e.order_id (Some oo)
+       | Filled | Canceled | Expired | Rejected ->
+         Hashtbl.remove t.open_orders e.order_id;
+         note_change t e.order_id None);
+      publish_open_orders_cache t;
+      Mutex.unlock t.mutex;
+      (* Per-symbol wakeup; only this symbol's domain consumes its exec events. *)
+      Concurrency.Exchange_wakeup.signal ~symbol:t.symbol;
+      Concurrency.Oracle_wakeup.notify_exec ())
   ;;
 
   let set_open_orders_snapshot t orders =
@@ -292,6 +335,11 @@ let get_or_create_store symbol =
   Mutex.unlock stores_mutex;
   store
 ;;
+
+(* Trade events arrive from two places: order status changes from the trading WebSocket
+   ([start_trade_updates_ws], below) and fills from the Events API (SSE). The trading WS
+   is the only push source for cancellations, so without it an order canceled outside this
+   process was invisible until the REST resync. *)
 
 (* Trade events arrive via the Events API (SSE), not the deprecated v1 [wss://.../stream]
    trade_updates WebSocket (HTTP 500).
@@ -443,9 +491,9 @@ let bootstrap_open_orders () =
     Lwt.return_unit
 ;;
 
-(** Period between background open-order reconciles (10s). The SSE feed is the hot-path
-    source, but a dropped/out-of-order event permanently desyncs the store until
-    reconnect; a periodic REST snapshot heals drift within one interval. *)
+(** Period between background open-order reconciles. Status changes arrive on the trading
+    WebSocket; this heals a missed reconnect. Every snapshot is a full replace
+    ([changes_overflow]), so a short period also defeats the per-order delta path. *)
 let open_orders_resync_interval_s = 10.0
 
 let open_orders_resync_running = Atomic.make false
@@ -479,13 +527,17 @@ let start_open_orders_resync () =
         Lwt.return_unit)))
 ;;
 
+(** Started by [initialize] and assigned once the frame handler below exists. *)
+let start_ws_hook : (unit -> unit) ref = ref (fun () -> ())
+
 let initialize symbols =
   List.iter
     (fun sym ->
       let store = get_or_create_store sym in
       SymbolExecStore.mark_ready store)
     symbols;
-  start_open_orders_resync ()
+  start_open_orders_resync ();
+  (!start_ws_hook) ()
 ;;
 
 let apply_trade_update json =
@@ -636,6 +688,102 @@ let handle_trade_update json =
     Alpaca_balances.request_balance_refresh ())
   else apply_trade_update json
 ;;
+
+(** Alpaca's trading WebSocket: the only push source for order *status* (the Events API
+    streams fills). Live-verified: [pending_new], [new] and [canceled] arrive within
+    milliseconds. Frames carry the same payload the SSE stream delivers under [data], so
+    both feed [apply_trade_update] and the per-order high-water guard absorbs the overlap.
+    Dispatched on this Lwt thread, off the trading cores. *)
+let start_trade_updates_ws () =
+  let uri = Uri.of_string (Alpaca_types.Config.trading_ws_url ()) in
+  let host = Uri.host uri |> Option.value ~default:"api.alpaca.markets" in
+  let port = Uri.port uri |> Option.value ~default:443 in
+  let send_json conn json =
+    Ws_lwt.write
+      conn
+      (Websocket.Frame.create ~content:(Yojson.Safe.to_string json) ())
+  in
+  let handle conn content =
+    let content = String.trim content in
+    if String.equal content ""
+    then Lwt.return_unit
+    else
+      match Yojson.Safe.from_string content with
+      | exception _ -> Lwt.return_unit
+      | json ->
+        let open Yojson.Safe.Util in
+        (match member "stream" json |> to_string_option with
+         | Some "authorization" ->
+           (match member "data" json |> member "status" |> to_string_option with
+            | Some "authorized" ->
+              Logging.info_f ~section "Alpaca trading WS authorized; listening for order updates";
+              send_json
+                conn
+                (`Assoc
+                  [ "action", `String "listen"
+                  ; "data", `Assoc [ "streams", `List [ `String "trade_updates" ] ]
+                  ])
+            | Some status ->
+              Logging.warn_f ~section "Alpaca trading WS authorization failed: %s" status;
+              Lwt.return_unit
+            | None -> Lwt.return_unit)
+         | Some "trade_updates" ->
+           (try apply_trade_update (member "data" json) with
+            | exn ->
+              Logging.warn_f
+                ~section
+                "Alpaca trading WS event failed: %s"
+                (Printexc.to_string exn));
+           Lwt.return_unit
+         | _ -> Lwt.return_unit)
+  in
+  let connection () =
+    let ctx = Ws_lwt.resolve_ctx () in
+    Ws_lwt.connect_failover ~ctx ~timeout_s:20.0 ~tls_host:host ~port uri
+    >>= fun (conn, dialed_ip) ->
+    Logging.info_f ~section "Alpaca trading WS established via %s" dialed_ip;
+    send_json
+      conn
+      (`Assoc
+        [ "action", `String "auth"
+        ; "key", `String (Alpaca_types.Config.api_key ())
+        ; "secret", `String (Alpaca_types.Config.api_secret ())
+        ])
+    >>= fun () ->
+    let rec read_loop () =
+      Ws_lwt.read conn
+      >>= fun frame ->
+      match frame.Websocket.Frame.opcode with
+      | Websocket.Frame.Opcode.Ping ->
+        Ws_lwt.write
+          conn
+          (Websocket.Frame.create
+             ~opcode:Websocket.Frame.Opcode.Pong
+             ~content:frame.Websocket.Frame.content
+             ())
+        >>= fun () -> read_loop ()
+      | Websocket.Frame.Opcode.Close ->
+        Lwt.fail (Failure "Alpaca trading WS closed by server")
+      | _ -> handle conn frame.Websocket.Frame.content
+      >>= fun () -> read_loop ()
+    in
+    read_loop ()
+  in
+  Lwt.async (fun () ->
+    let rec loop () =
+      Lwt.catch connection (fun exn ->
+        Logging.warn_f
+          ~section
+          "Alpaca trading WS disconnected: %s"
+          (Printexc.to_string exn);
+        Lwt.return_unit)
+      >>= fun () ->
+      Lwt_unix.sleep 5.0 >>= fun () -> loop ()
+    in
+    loop ())
+;;
+
+let () = start_ws_hook := start_trade_updates_ws
 
 (* Parse-domain entry for one SSE event. [handle_trade_update] is Lwt-free now that the
    balance refresh is a flag the poll loop observes. *)

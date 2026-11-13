@@ -289,6 +289,23 @@ let place_order
       ~in_extended_session
       ~use_extended
   in
+  (* Diagnostic override: submit every order with one TIF so the venue's acceptance rule
+     can be observed directly instead of inferred. Read per order (orders are rare here)
+     so it can be flipped between deploys without a restart of anything else. *)
+  let tif_str =
+    match Sys.getenv_opt "DIO_ALPACA_FORCE_TIF" with
+    | Some mode when String.trim mode <> "" ->
+      let mode = String.lowercase_ascii (String.trim mode) in
+      Logging.warn_f
+        ~section
+        "forcing tif=%s for %s (fractional=%b, extended=%b) via DIO_ALPACA_FORCE_TIF"
+        mode
+        symbol
+        is_fractional
+        mark_extended;
+      mode
+    | _ -> tif_str
+  in
   let side_str =
     match side with
     | Buy -> "buy"

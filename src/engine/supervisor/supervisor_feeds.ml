@@ -228,7 +228,24 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
               Hyperliquid.Instruments_feed.wait_until_ready ()
               >>= fun () ->
               Hyperliquid.Ws.subscribe_to_feeds ~symbols:hyperliquid_symbols ~wallet
-              >>= fun () -> Hyperliquid.Module.fetch_open_orders_ws ())
+              >>= fun () ->
+              Hyperliquid.Module.fetch_open_orders_ws ()
+              >>= fun () ->
+              (* Builder-deployed perp dexs report positions only through their own
+                 clearinghouse state; poll the dexs this deployment actually trades. *)
+              let dexes =
+                List.filter_map
+                  (fun symbol ->
+                     match String.index_opt symbol ':' with
+                     | Some i -> Some (String.sub symbol 0 i)
+                     | None -> None)
+                  hyperliquid_symbols
+              in
+              Hyperliquid.Dex_positions.start
+                ~testnet:hyperliquid_testnet
+                ~user:wallet
+                ~dexes
+                ())
           in
           Hyperliquid.Ws.connect_and_monitor
             ~testnet:hyperliquid_testnet

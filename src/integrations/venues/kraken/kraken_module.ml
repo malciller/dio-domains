@@ -276,6 +276,10 @@ module Kraken_impl = struct
   ;;
 
   let has_orderbook_data ~symbol = Kraken_orderbook_feed.has_orderbook_data symbol
+  let get_top_of_book_into ~symbol buf =
+    Kraken_orderbook_feed.get_best_bid_ask_into symbol buf
+  ;;
+
   let get_top_of_book_fast ~symbol = Kraken_orderbook_feed.get_best_bid_ask_fast symbol
 
   (** Open-order holds for [asset]: base held in resting sells plus quote held in resting

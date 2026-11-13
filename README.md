@@ -133,6 +133,7 @@ container walkthrough.
 | `licenses/` | Third-party notices and provenance, including the native-library licenses. |
 | `bin/` | The `dio`, `dio-dashboard`, and `dio-oracle` executables. |
 | `scripts/` | Operational shell scripts: the dashboard client (`dio-dash.sh`) and the container entrypoint/sidecar launchers. |
+| `docs/code-map/` | Interactive source explorer: library, module, and call graphs generated from the tree. See [`docs/code-map/README.md`](docs/code-map/README.md). |
 | `test/` | Test suites mirroring `src/`. |
 | `strategies/` | Strategy scripts loaded by name from `config.json`. |
 | `editors/` | Editor support for the strategy language: VS Code (`vscode-strategy`), Zed (`zed-strategy`), and the shared tree-sitter grammar. |
@@ -205,6 +206,9 @@ All documentation lives at **<https://diophantsolutions.com/dio/>**:
 [latency journal](https://diophantsolutions.com/dio/LATENCY/),
 [risk and terms](https://diophantsolutions.com/dio/RISK/), and the
 [specification](https://diophantsolutions.com/dio/SPEC/).
+
+For the source tree, `docs/code-map/index.html` is an offline explorer of the
+library, module, and call graphs ([details](docs/code-map/README.md)).
 
 ## Support
 

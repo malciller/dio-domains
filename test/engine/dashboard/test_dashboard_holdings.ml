@@ -253,7 +253,7 @@ let test_latency_pages () =
   (* Default view is the INTERNAL page; the section has room for the future network
      metrics without widening the table. *)
   Alcotest.(check int) "starts on INTERNAL page" 0 (Latencies.current_page_index ());
-  Alcotest.(check int) "two latency pages" 2 (Latencies.page_count ());
+  Alcotest.(check int) "three latency pages" 3 (Latencies.page_count ());
   (* INTERNAL lists the separate oracle-pass metric first, then the per-cycle segments in
      pipeline order, then the whole-cycle total. *)
   Alcotest.(check (list string))
@@ -277,13 +277,22 @@ let test_latency_pages () =
       (String.length (Latencies.page_trend_label i) <= Latencies.trend_col_w)
       true
   done;
+  let native = Latencies.page_metrics 2 in
+  Alcotest.(check bool)
+    "NATIVE carries the compiled strategy split"
+    (List.mem "native_bridge" native
+     && List.mem "native_run" native
+     && List.mem "native_actions" native)
+    true;
   (* Navigation wraps in both directions. *)
   Latencies.next_page ();
   Alcotest.(check int) "next -> NETWORK" 1 (Latencies.current_page_index ());
   Latencies.next_page ();
+  Alcotest.(check int) "next -> NATIVE" 2 (Latencies.current_page_index ());
+  Latencies.next_page ();
   Alcotest.(check int) "next wraps to INTERNAL" 0 (Latencies.current_page_index ());
   Latencies.prev_page ();
-  Alcotest.(check int) "prev wraps to NETWORK" 1 (Latencies.current_page_index ());
+  Alcotest.(check int) "prev wraps to NATIVE" 2 (Latencies.current_page_index ());
   Latencies.set_page 0
 ;;
 

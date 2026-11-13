@@ -3,5 +3,6 @@
   test_latency_profiler
   test_network_latency
   test_latency_journal
-  test_latency_publisher)
+  test_latency_publisher
+  test_thread_affinity)
  (libraries dio.latency_profiling alcotest dio.mtime dio.mtime.clock.os unix))

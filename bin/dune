@@ -13,6 +13,8 @@
   dio.strategies
   dio.dashboard
   dio.engine
+  dio.gc_config
+  dio.hotpath
   dio.oracle
   dio.concurrency
   dio.latency_profiling
