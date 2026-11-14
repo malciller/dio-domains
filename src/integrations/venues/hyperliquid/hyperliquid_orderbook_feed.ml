@@ -42,6 +42,10 @@ type store =
   (** Book revision: bumped by every touch update, whether it arrived as an l2Book
       snapshot or a bbo frame. The hot path polls this to decide whether the market moved;
       the ring buffer position stays the replay cursor for full snapshots. *)
+  ; last_event_ms : int Atomic.t
+  (** Newest server timestamp applied to [tob]. l2Book snapshots and bbo touches arrive on
+      separate channels, so a snapshot generated before a touch can be delivered after it;
+      applying it would roll the touch back. *)
   }
 
 let stores = Ds.Cow_table.create ~shard_count:32 ()
@@ -118,6 +122,7 @@ let ensure_store symbol =
                 ; tob_valid = false
                 }
           ; seq = Atomic.make 0
+          ; last_event_ms = Atomic.make 0
           }
         in
         Ds.Cow_table.set stores symbol store;
@@ -334,36 +339,81 @@ let parse_tob_fast msg =
   \    Layout: \"levels\":[[bids],[asks]]. "]
 ;;
 
+(** Span of the string value of [key] within [start_idx, limit), or [None]. *)
+let find_string_value msg key start_idx limit =
+  let msg_len = String.length msg in
+  let rec search idx =
+    if idx >= limit
+    then None
+    else (
+      match String.index_from_opt msg idx '"' with
+      | None -> None
+      | Some p ->
+        if p >= limit
+        then None
+        else if string_match msg p key
+        then (
+          let val_start = p + String.length key in
+          if val_start >= msg_len
+          then None
+          else (
+            match String.index_from_opt msg val_start '"' with
+            | Some val_end -> Some (val_start, val_end)
+            | None -> None))
+        else search (p + 1))
+  in
+  search start_idx
+;;
+
 (** Top-of-book parser for the [bbo] channel: the venue's only low-latency public touch
     feed ([l2Book] is throttled to one snapshot every few seconds). Layout:
-    ["bbo":[{"px":..,"sz":..},{"px":..,"sz":..}]]. *)
+    ["bbo":[{"px":..,"sz":..},{"px":..,"sz":..}]]. No level list or records. *)
 let parse_bbo_fast msg =
-  let key = "\"bbo\":[" in
-  let klen = String.length key in
-  let n = String.length msg in
-  let rec find i =
-    if i + klen > n
+  let msg_len = String.length msg in
+  let marker = "\"bbo\":[" in
+  let klen = String.length marker in
+  let rec find_marker i =
+    if i + klen > msg_len
     then None
-    else if string_match msg i key
+    else if string_match msg i marker
     then Some (i + klen)
-    else find (i + 1)
+    else find_marker (i + 1)
   in
-  match find 0 with
+  let parse_side start limit =
+    match String.index_from_opt msg start '{' with
+    | None -> None
+    | Some b when b >= limit -> None
+    | Some b ->
+      (match String.index_from_opt msg (b + 1) '}' with
+       | None -> None
+       | Some e when e > limit -> None
+       | Some e ->
+         (match find_string_value msg "\"px\":\"" b e with
+          | None -> None
+          | Some (px_s, px_e) ->
+            (match find_string_value msg "\"sz\":\"" (px_e + 1) e with
+             | None -> None
+             | Some (sz_s, sz_e) ->
+               Some (parse_float_fast msg px_s px_e, parse_float_fast msg sz_s sz_e, e))))
+  in
+  match find_marker 0 with
   | None -> 0.0, 0.0, 0.0, 0.0, false
   | Some start ->
     (match String.index_from_opt msg start ']' with
      | None -> 0.0, 0.0, 0.0, 0.0, false
-     | Some stop ->
-       (match parse_levels msg start stop 0 [] with
-        | { price = bid_px; size = bid_sz } :: { price = ask_px; size = ask_sz } :: _ ->
-          bid_px, bid_sz, ask_px, ask_sz, true
-        | _ -> 0.0, 0.0, 0.0, 0.0, false))
+     | Some limit ->
+       (match parse_side start limit with
+        | None -> 0.0, 0.0, 0.0, 0.0, false
+        | Some (bid_px, bid_sz, bid_end) ->
+          (match parse_side (bid_end + 1) limit with
+           | None -> 0.0, 0.0, 0.0, 0.0, false
+           | Some (ask_px, ask_sz, _) -> bid_px, bid_sz, ask_px, ask_sz, true)))
 ;;
 
-(** Server event time of a book frame, from its millisecond ["time"] field. Scanned
-    directly from the frame: no JSON DOM on the book hot path. [None] when the frame
-    carries no timestamp. *)
-let extract_event_time_s content =
+(** Server event time of a book frame from its millisecond ["time"] field, as
+    [(Unix seconds, epoch milliseconds)]. Scanned directly from the frame: no JSON DOM on
+    the book hot path. [None] when the frame carries no timestamp. *)
+let extract_event_time content =
   let key = "\"time\":" in
   let klen = String.length key in
   let n = String.length content in
@@ -392,7 +442,7 @@ let extract_event_time_s content =
         try
           let ms = float_of_string (String.sub content start (!j - start)) in
           if ms >= 1_000_000_000_000.0 && ms < 10_000_000_000_000.0
-          then Some (ms /. 1000.0)
+          then Some (ms /. 1000.0, int_of_float ms)
           else None
         with
         | _ -> None)
@@ -402,49 +452,56 @@ let extract_event_time_s content =
   find 0
 ;;
 
-(** Record this frame's clock-corrected one-way transit. Runs on the parse domain and uses
-    the receive time captured when the frame was submitted, so the measurement excludes
-    parse-queue residency - the same point Kraken's orderbook feed records from. *)
-let record_feed_latency msg =
-  match extract_event_time_s msg with
-  | None -> ()
-  | Some event ->
-    let recv =
-      match Concurrency.Parse_worker.current_recv_wall () with
-      | Some t -> t
-      | None -> Unix.gettimeofday ()
-    in
-    Network_latency.record_feed_event_s "hyperliquid" ~event ~recv ()
-;;
-
 (** Apply one touch update to every store the coin is routed to. [ring] is set for l2Book
-    snapshots, which are the replay log; bbo frames update the touch and revision only. *)
-let apply_book_update ~coin ~msg ~bid_px ~bid_sz ~ask_px ~ask_sz ~ok ~ring =
+    snapshots, which are the replay log; bbo frames update the touch and revision only. A
+    frame older than the newest touch already applied is still logged for replay but does
+    not move [tob] or the revision. *)
+let apply_book_update ~coin ~msg ~event ~bid_px ~bid_sz ~ask_px ~ask_sz ~ok ~ring =
   let symbols = find_registered_symbols coin in
   if symbols = []
   then warn_unrouted_coin coin
   else (
-    record_feed_latency msg;
+    (match event with
+     | None -> ()
+     | Some (event_s, _) ->
+       let recv =
+         match Concurrency.Parse_worker.current_recv_wall () with
+         | Some t -> t
+         | None -> Unix.gettimeofday ()
+       in
+       Network_latency.record_feed_event_s "hyperliquid" ~event:event_s ~recv ());
     List.iter
       (fun symbol ->
         try
           let store = ensure_store symbol in
-          if ok
-          then (
-            Atomic.set store.tob { bid_px; bid_sz; ask_px; ask_sz; tob_valid = true };
-            Atomic.incr store.seq);
+          let fresh =
+            match event with
+            | Some (_, event_ms) when ok ->
+              if event_ms < Atomic.get store.last_event_ms
+              then false
+              else (
+                Atomic.set store.last_event_ms event_ms;
+                true)
+            | _ -> true
+          in
           if ring then RingBuffer.write store.buffer msg;
-          notify_ready store;
-          Concurrency.Exchange_wakeup.signal ~symbol;
-          (* A perp tick also drives the overlay trailing inside the spot-pair domain. The
-             pair has its own market (and store) when the venue lists it; only the wake is
-             shared, never the book. *)
-          if not (String.contains symbol '/')
+          if fresh
           then (
-            let spot = symbol ^ "/USDC" in
-            match Ds.Cow_table.find_opt stores spot with
-            | Some _ -> Concurrency.Exchange_wakeup.signal ~symbol:spot
-            | None -> ())
+            if ok
+            then (
+              Atomic.set store.tob { bid_px; bid_sz; ask_px; ask_sz; tob_valid = true };
+              Atomic.incr store.seq);
+            notify_ready store;
+            Concurrency.Exchange_wakeup.signal ~symbol;
+            (* A perp tick also drives the overlay trailing inside the spot-pair domain.
+               The pair has its own market (and store) when the venue lists it; only the
+               wake is shared, never the book. *)
+            if not (String.contains symbol '/')
+            then (
+              let spot = symbol ^ "/USDC" in
+              match Ds.Cow_table.find_opt stores spot with
+              | Some _ -> Concurrency.Exchange_wakeup.signal ~symbol:spot
+              | None -> ()))
         with
         | exn ->
           Logging.warn_f
@@ -457,20 +514,21 @@ let apply_book_update ~coin ~msg ~bid_px ~bid_sz ~ask_px ~ask_sz ~ok ~ring =
 ;;
 
 let process_raw_market_data msg =
+  let event = extract_event_time msg in
   if String.starts_with ~prefix:"{\"channel\":\"l2Book\"," msg
   then (
     let coin = get_coin msg in
     if coin <> ""
     then (
       let bid_px, bid_sz, ask_px, ask_sz, ok = parse_tob_fast msg in
-      apply_book_update ~coin ~msg ~bid_px ~bid_sz ~ask_px ~ask_sz ~ok ~ring:true))
+      apply_book_update ~coin ~msg ~event ~bid_px ~bid_sz ~ask_px ~ask_sz ~ok ~ring:true))
   else if String.starts_with ~prefix:"{\"channel\":\"bbo\"," msg
   then (
     let coin = get_coin msg in
     if coin <> ""
     then (
       let bid_px, bid_sz, ask_px, ask_sz, ok = parse_bbo_fast msg in
-      apply_book_update ~coin ~msg ~bid_px ~bid_sz ~ask_px ~ask_sz ~ok ~ring:false))
+      apply_book_update ~coin ~msg ~event ~bid_px ~bid_sz ~ask_px ~ask_sz ~ok ~ring:false))
 [@@ocaml.doc
   " Hot-path book processor. l2Book snapshots update the touch, bump the book revision,\n\
   \    and are appended to the ring for replay; bbo frames update the touch and revision\n\

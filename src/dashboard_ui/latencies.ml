@@ -9,8 +9,17 @@ open Theme
     latency map and it appears. Switch pages with ←/→ in the main view. *)
 
 let history_len = 15
-let hist_tbl : (string * string, float array) Hashtbl.t = Hashtbl.create 32
-let hist_max = 128
+
+(** One rolling series plus the ingest epoch that last refreshed it. *)
+type hist_entry =
+  { samples : float array
+  ; mutable epoch : int
+  }
+
+let hist_tbl : (string * string, hist_entry) Hashtbl.t = Hashtbl.create 64
+
+(** Bumped once per snapshot; see [ingest]. *)
+let hist_epoch = ref 0
 
 (** Active page index into [metric_pages]; switched with [next_page]/[prev_page]. *)
 let active_page_ref = ref 0
@@ -27,19 +36,21 @@ let ema_smooth (arr : float array) ~alpha =
   out
 ;;
 
-(** Rolling p99 history keyed by (symbol, metric), so each page keeps its own sparkline.
-    Clears the whole table when it exceeds [hist_max] entries; sparklines repopulate
-    within seconds. *)
+(** Rolling p99 history keyed by (symbol, metric), so each page keeps its own sparkline. A
+    key the engine stops publishing is evicted on the next snapshot (see [ingest]), so the
+    table tracks the live domain set instead of growing without bound - and no cap ever
+    has to clear it wholesale, which would reset every sparkline mid-trend. *)
 let update_hist symbol metric p99 =
-  if Hashtbl.length hist_tbl > hist_max then Hashtbl.clear hist_tbl;
   let key = symbol, metric in
-  let arr =
+  let entry =
     try Hashtbl.find hist_tbl key with
     | Not_found ->
-      let a = Array.make history_len 0.0 in
-      Hashtbl.add hist_tbl key a;
-      a
+      let e = { samples = Array.make history_len 0.0; epoch = !hist_epoch } in
+      Hashtbl.add hist_tbl key e;
+      e
   in
+  entry.epoch <- !hist_epoch;
+  let arr = entry.samples in
   for i = 0 to history_len - 2 do
     arr.(i) <- arr.(i + 1)
   done;
@@ -77,21 +88,26 @@ let p999_min_samples = 1_000
 (** Current rolling p99 history for a (symbol, metric), or a zeroed array. *)
 let hist_of symbol metric =
   match Hashtbl.find_opt hist_tbl (symbol, metric) with
-  | Some a -> a
+  | Some e -> e.samples
   | None -> Array.make history_len 0.0
 ;;
 
 (** Advance the sparkline history once per snapshot (data cadence), not per render: at up
     to 30 fps, shifting per frame would scroll the sparkline absurdly fast and force a
-    redraw every frame. *)
+    redraw every frame. Series this snapshot did not refresh are dropped afterwards, so a
+    domain that stops publishing does not pin its key forever. *)
 let ingest (snapshot : Snapshot.t) =
+  incr hist_epoch;
   List.iter
-    (fun (_symbol, metrics) ->
+    (fun (symbol, metrics) ->
       List.iter
         (fun (label, (m : Snapshot.latency_metric)) ->
-          if Snapshot.latency_basis m > 0 then ignore (update_hist _symbol label m.p99))
+          if Snapshot.latency_basis m > 0 then ignore (update_hist symbol label m.p99))
         metrics)
-    snapshot.latencies
+    snapshot.latencies;
+  Hashtbl.filter_map_inplace
+    (fun _ e -> if e.epoch = !hist_epoch then Some e else None)
+    hist_tbl
 ;;
 
 (** Freshness tolerance per metric label: 600s for [oracle] (one analysis pass per ~5
@@ -145,12 +161,14 @@ let metric_pages =
     ; trend_max_us = 100.0
     ; is_external = false
     }
+    (* RUN's full scale is its own red line (5us warn, 10us crit): a wider scale leaves
+       every healthy run under one block, and the sparkline never draws. *)
   ; { page_label = "DECISION"
     ; metrics =
         [ "wake"; "gate"; "native_res"; "native_bridge"; "native_run"; "native_actions" ]
     ; trend_metric = "native_run"
     ; trend_label = "(RUN P99)"
-    ; trend_max_us = 200.0
+    ; trend_max_us = 10.0
     ; is_external = false
     }
   ; { page_label = "EXTERNAL"
@@ -559,8 +577,13 @@ let render_latencies w (snapshot : Snapshot.t) =
                 let v = data.(start_idx + idx) in
                 let ratio = if max_val > 0.0 then v /. max_val else 0.0 in
                 let ratio = max 0.0 (min 1.0 ratio) in
-                let block_idx = int_of_float (ratio *. 7.0) in
-                let block_idx = max 0 (min 7 block_idx) in
+                (* Any non-zero sample gets at least the bottom dots: flooring alone
+                   leaves everything under a seventh of full scale invisible, so a live
+                   but fast metric reads as a dead sparkline. *)
+                let block_idx =
+                  if v <= 0.0 then 0 else max 1 (int_of_float (ratio *. 7.0))
+                in
+                let block_idx = min 7 block_idx in
                 I.string (attr_fn v) Theme.block_chars.(block_idx))
             in
             I.hcat (I.string a_dim (String.make empty_w ' ') :: blocks)

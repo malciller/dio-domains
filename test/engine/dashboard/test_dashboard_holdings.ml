@@ -489,6 +489,70 @@ let test_overlay_latency_row () =
     2
 ;;
 
+(** The trend sparkline holds [history_len] samples per (symbol, metric). The table is
+    shared by every domain and every metric, so a wide deployment must not reset it: one
+    wholesale clear leaves each row drawing a single bar that restarts every snapshot. *)
+let test_latency_trend_history () =
+  let open Dashboard_ui in
+  let symbols = List.init 12 (fun i -> Printf.sprintf "AST%02d/USDC" i) in
+  let snap p99 =
+    let window =
+      `Assoc
+        [ "p50", `Float p99
+        ; "p99", `Float p99
+        ; "p999", `Float p99
+        ; "samples", `Int 100
+        ; "union_samples", `Int 100
+        ; "window_end", `Float 999.0
+        ]
+    in
+    `Assoc
+      [ "timestamp", `Float 1000.0
+      ; ( "latencies"
+        , `Assoc
+            (List.map
+               (fun s -> s, `Assoc [ "cycle", window; "native_run", window ])
+               symbols) )
+      ]
+  in
+  Latencies.ingest (Snapshot.of_json (snap 1.0));
+  Latencies.ingest (Snapshot.of_json (snap 2.0));
+  let hist = Latencies.hist_of "AST00/USDC" "cycle" in
+  Alcotest.(check int) "history keeps its full length" 15 (Array.length hist);
+  Alcotest.(check (float 1e-9))
+    "the prior sample survives a wide snapshot"
+    1.0
+    hist.(Latencies.history_len - 2);
+  Alcotest.(check (float 1e-9))
+    "the newest sample is appended"
+    2.0
+    hist.(Latencies.history_len - 1);
+  (* A metric a snapshot stops publishing is evicted, so the table tracks live keys rather
+     than pinning every symbol it has ever seen. *)
+  Latencies.ingest
+    (Snapshot.of_json
+       (`Assoc
+         [ "timestamp", `Float 1000.0
+         ; ( "latencies"
+           , `Assoc
+               [ ( "AST11/USDC"
+                 , `Assoc
+                     [ ( "cycle"
+                       , `Assoc
+                           [ "p99", `Float 3.0
+                           ; "samples", `Int 100
+                           ; "union_samples", `Int 100
+                           ; "window_end", `Float 999.0
+                           ] )
+                     ] )
+               ] )
+         ]));
+  Alcotest.(check (float 1e-9))
+    "a retired series is dropped"
+    0.0
+    (Latencies.hist_of "AST00/USDC" "cycle").(Latencies.history_len - 1)
+;;
+
 (** The p999 cell is a percentile only once its basis holds 1000 samples. Below that the
     number is arithmetically the window maximum, so it must not be drawn; the count is
     shown instead, and the overflow marker flags samples past the histogram ceiling. *)
@@ -774,6 +838,10 @@ let () =
             "overlay instance gets a nested row"
             `Quick
             test_overlay_latency_row
+        ; Alcotest.test_case
+            "trend history survives a wide snapshot"
+            `Quick
+            test_latency_trend_history
         ] )
     ; ( "footer"
       , [ Alcotest.test_case

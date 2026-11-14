@@ -1398,8 +1398,8 @@ let render_sparkline w data max_val attr_fn =
       let v = data.(start_idx + i) in
       let ratio = if max_val > 0.0 then v /. max_val else 0.0 in
       let ratio = max 0.0 (min 1.0 ratio) in
-      let block_idx = int_of_float (ratio *. 7.0) in
-      let block_idx = max 0 (min 7 block_idx) in
+      let block_idx = if v <= 0.0 then 0 else max 1 (int_of_float (ratio *. 7.0)) in
+      let block_idx = min 7 block_idx in
       I.string (attr_fn v) block_chars.(block_idx))
   in
   I.hcat (I.string t.a_dim (String.make empty_w ' ') :: blocks)

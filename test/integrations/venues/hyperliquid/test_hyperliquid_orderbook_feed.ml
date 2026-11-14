@@ -112,6 +112,57 @@ let test_builder_dex_resolves_without_cache () =
   | _ -> Alcotest.fail "a [dex:coin] name should resolve without the cache"
 ;;
 
+let bbo_json ~coin ~time ~bid ~ask =
+  Printf.sprintf
+    "{\"channel\":\"bbo\",\"data\":{\"coin\":\"%s\",\"time\":%d,\"bbo\":[{\"px\":\"%.4f\",\"sz\":\"1.0\"},{\"px\":\"%.4f\",\"sz\":\"1.0\"}]}}"
+    coin
+    time
+    bid
+    ask
+;;
+
+let book_json ~coin ~time ~bid ~ask =
+  Printf.sprintf
+    "{\"channel\":\"l2Book\",\"data\":{\"coin\":\"%s\",\"time\":%d,\"levels\":[[{\"px\":\"%.4f\",\"sz\":\"1.0\"}],[{\"px\":\"%.4f\",\"sz\":\"1.0\"}]]}}"
+    coin
+    time
+    bid
+    ask
+;;
+
+(* bbo and l2Book arrive on separate channels; a snapshot generated before a touch can be
+   delivered after it and must not roll the touch back. *)
+let test_stale_snapshot_does_not_roll_back_touch () =
+  Hyperliquid.Instruments_feed.initialize [ "TSX" ];
+  Hyperliquid.Orderbook_feed.initialize [ "TSX" ];
+  let t2 = 1794682000000 in
+  Hyperliquid.Orderbook_feed.process_raw_market_data
+    (bbo_json ~coin:"TSX" ~time:t2 ~bid:12.0 ~ask:12.1);
+  check_book ~symbol:"TSX" ~expected_bid:12.0;
+  Alcotest.(check int)
+    "touch revision"
+    1
+    ((Hyperliquid.Orderbook_feed.get_current_position_fast "TSX") ());
+  Hyperliquid.Orderbook_feed.process_raw_market_data
+    (book_json ~coin:"TSX" ~time:(t2 - 1000) ~bid:9.0 ~ask:9.1);
+  check_book ~symbol:"TSX" ~expected_bid:12.0;
+  Alcotest.(check int)
+    "stale snapshot does not bump the revision"
+    1
+    ((Hyperliquid.Orderbook_feed.get_current_position_fast "TSX") ());
+  Alcotest.(check int)
+    "stale snapshot is still logged for replay"
+    1
+    (Hyperliquid.Orderbook_feed.get_current_position "TSX");
+  Hyperliquid.Orderbook_feed.process_raw_market_data
+    (book_json ~coin:"TSX" ~time:(t2 + 1000) ~bid:13.0 ~ask:13.1);
+  check_book ~symbol:"TSX" ~expected_bid:13.0;
+  Alcotest.(check int)
+    "newer snapshot bumps the revision"
+    2
+    ((Hyperliquid.Orderbook_feed.get_current_position_fast "TSX") ())
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Orderbook Feed"
@@ -127,6 +178,10 @@ let () =
             `Quick
             test_unlisted_pair_aliases_its_perp
         ; Alcotest.test_case "bbo updates touch" `Quick test_bbo_updates_touch
+        ; Alcotest.test_case
+            "stale snapshot does not roll back the touch"
+            `Quick
+            test_stale_snapshot_does_not_roll_back_touch
         ; Alcotest.test_case
             "builder dex symbol is canonical"
             `Quick
