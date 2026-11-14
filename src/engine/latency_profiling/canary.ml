@@ -114,26 +114,41 @@ let run ~threshold_us ~window_seconds =
 
 (** [start ()] spawns the detector domain unless [DIO_CANARY] disables it.
     [DIO_CANARY_THRESHOLD_US] (default 10) sets the spike threshold and
-    [DIO_CANARY_WINDOW_S] (default 5) the log window. Detached; never joined. *)
+    [DIO_CANARY_WINDOW_S] (default 5) the log window. [DIO_CANARY_CPU] pins it to a
+    dedicated core; it runs at normal priority only when that core is isolated, otherwise
+    it stays idle priority. Detached; never joined. *)
 let start () =
   if enabled ()
   then (
     let threshold_us = env_float "DIO_CANARY_THRESHOLD_US" 10.0 in
     let window_seconds = env_float "DIO_CANARY_WINDOW_S" 5.0 in
+    let dedicated_cpu =
+      match Sys.getenv_opt "DIO_CANARY_CPU" with
+      | Some s -> int_of_string_opt (String.trim s)
+      | None -> None
+    in
     Atomic.set running true;
     Logging.info_f
       ~section
-      "Stop-the-world canary started (threshold %s, window %.0fs)"
+      "Stop-the-world canary started (threshold %s, window %.0fs%s)"
       (Latency_profiler.format_us threshold_us)
-      window_seconds;
+      window_seconds
+      (match dedicated_cpu with
+       | Some cpu -> Printf.sprintf ", cpu %d" cpu
+       | None -> ", background/idle");
     ignore
       (Domain.spawn (fun () ->
          Gc_config.apply ();
-         (* Keep the busy-spin off the trading P-cores: it exists to keep the package warm
-            and detect global pauses, not to compete with the strategy cycles. Idle policy
-            so it yields to anything runnable. *)
-         Thread_affinity.pin_self_background ();
-         Thread_affinity.set_self_idle ();
+         (* A dedicated core is the canary's own: run at normal priority so a gap is the
+            runtime pausing, not us being preempted. Without one, stay on the background
+            set at idle priority. *)
+         (match dedicated_cpu with
+          | Some cpu ->
+            Thread_affinity.pin_self cpu;
+            if not (Thread_affinity.is_isolated cpu) then Thread_affinity.set_self_idle ()
+          | None ->
+            Thread_affinity.pin_self_background ();
+            Thread_affinity.set_self_idle ());
          run ~threshold_us ~window_seconds)))
   else
     Logging.info_f

@@ -73,6 +73,18 @@ CAMLprim value dio_set_current_idle(value unit) {
   return Val_bool(rc == 0);
 }
 
+/* Return the calling thread to SCHED_OTHER. A domain spawned by a trading domain
+ * inherits its SCHED_FIFO policy and priority; a background helper must not keep it,
+ * or its wakeups preempt CFS work (feed parsing) on the core it is pinned to. Returns
+ * true on success. */
+CAMLprim value dio_set_current_other(value unit) {
+  (void)unit;
+  struct sched_param p;
+  p.sched_priority = 0;
+  int rc = sched_setscheduler(0, SCHED_OTHER, &p);
+  return Val_bool(rc == 0);
+}
+
 /* Promote the calling thread to SCHED_FIFO at [prio] so no CFS thread can preempt it.
  * Requires CAP_SYS_NICE; returns false (and the caller logs) without it. The kernel's
  * default sched_rt_runtime_us (95% of each period) keeps a runaway RT thread from
@@ -103,6 +115,11 @@ CAMLprim value dio_allowed_cpu_count(value unit) {
 }
 
 CAMLprim value dio_set_current_idle(value unit) {
+  (void)unit;
+  return Val_false;
+}
+
+CAMLprim value dio_set_current_other(value unit) {
   (void)unit;
   return Val_false;
 }

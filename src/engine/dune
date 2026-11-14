@@ -21,6 +21,7 @@
   dio.oracle
   dio.gc_config)
  (modules
+  Aux_services
   Config
   Domain_spawner
   Latency_rows

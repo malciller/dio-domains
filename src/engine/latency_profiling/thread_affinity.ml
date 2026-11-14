@@ -5,7 +5,8 @@
     and to preempt it against other runnable threads, which is what turns a fast cycle
     into a multi-hundred-microsecond p999 stall. This module pins each domain to a chosen
     CPU so the operator can keep the P-cores for the trading domains and everything else
-    on the E-cores.
+    on the E-cores. A trading domain that outnumbers the P-cores gets a dedicated E-core
+    before it shares a P-core's SMT sibling.
 
     Placement is configured with [DIO_TRADING_CPUS] (a comma-separated CPU list, e.g.
     [0,2,4,6,8,10]); when unset it is auto-detected from the sysfs topology (the CPUs
@@ -23,6 +24,7 @@ external pin_current_thread_range : int -> int -> bool = "dio_pin_current_thread
 external allowed_cpu_count : unit -> int = "dio_allowed_cpu_count"
 external set_current_idle : unit -> bool = "dio_set_current_idle"
 external set_current_rt : int -> bool = "dio_set_current_rt"
+external set_current_other : unit -> bool = "dio_set_current_other"
 
 let ( let* ) = Option.bind
 
@@ -104,9 +106,51 @@ let core_key cpu =
   | _ -> None
 ;;
 
+(** Parse a kernel CPU list ("0-15", "14,15", "0-3,8"). *)
+let parse_cpu_ranges spec =
+  String.split_on_char ',' spec
+  |> List.concat_map (fun part ->
+    let part = String.trim part in
+    match String.split_on_char '-' part with
+    | [ a; b ] ->
+      (match int_of_string_opt a, int_of_string_opt b with
+       | Some lo, Some hi when hi >= lo -> List.init (hi - lo + 1) (fun i -> lo + i)
+       | _ -> [])
+    | [ a ] ->
+      (match int_of_string_opt a with
+       | Some x -> [ x ]
+       | None -> [])
+    | _ -> [])
+;;
+
+(** CPUs this cgroup may pin to. [sched_getaffinity] cannot distinguish a cpuset from
+    [isolcpus], and isolated CPUs stay pinnable by an explicit request, so read the
+    cpuset instead. *)
+let cpuset_cpus () =
+  let of_file path =
+    match read_file path with
+    | Some s when String.trim s <> "" -> parse_cpu_ranges s
+    | _ -> []
+  in
+  match of_file "/sys/fs/cgroup/cpuset.cpus.effective" with
+  | [] -> of_file "/sys/fs/cgroup/cpuset/cpuset.cpus.effective"
+  | cpus -> cpus
+;;
+
+(** Online CPU ids, not the process's initial affinity mask. [isolcpus] shrinks that mask
+    to the non-isolated CPUs, but an explicit [sched_setaffinity] to an isolated CPU is
+    still permitted, and that is where the trading threads are pinned. *)
 let online_cpus () =
-  let n = max 1 (allowed_cpu_count ()) in
-  List.init n Fun.id
+  let online =
+    match read_file "/sys/devices/system/cpu/online" with
+    | Some s when String.trim s <> "" -> parse_cpu_ranges s
+    | _ ->
+      let n = max 1 (allowed_cpu_count ()) in
+      List.init n Fun.id
+  in
+  match cpuset_cpus () with
+  | [] -> online
+  | allowed -> List.filter (fun c -> List.mem c allowed) online
 ;;
 
 (** The CPUs that sit on a P-core: one logical CPU per physical core, chosen as the
@@ -195,29 +239,33 @@ let configured_rt_prio () =
      | _ -> None)
 ;;
 
-(** Allocator over the trading CPU list that hands out each CPU at most once and returns
-    [-1] (unpinned) once the list is exhausted. The cursor is an [Atomic], not a [ref]:
-    every trading domain allocates concurrently from its own domain. Unlike the previous
-    wrapping round-robin this never reuses a CPU - once the domains outnumbered the CPUs
-    that pinned two domains to one core, and under SCHED_FIFO those two starve each other
-    (and every CFS thread on that core), enough to wedge startup. Callers pin on a real
-    CPU and treat [-1] as "share the remaining cores" (unpinned, CFS). *)
-(* Trading CPU order: one thread per P-core first, then each core's SMT sibling. Two
-   domains on one thread time-slice; two on sibling threads of one core share its execution
-   ports, which is the better of the two when there are more assets than cores. *)
+(** Trading CPU order: one thread per P-core, then every remaining physical core (E-cores,
+    other sockets), then the P-cores' SMT siblings. A lowest-priority strategy gets a
+    slower dedicated core before it shares a P-core with a live strategy. *)
 let trading_allocation_order () =
   let primary = trading_cpus () in
-  let primary_cores = List.filter_map core_key primary |> List.sort_uniq compare in
-  let siblings =
-    online_cpus ()
-    |> List.filter (fun c ->
-      (not (List.mem c primary))
-      &&
-      match core_key c with
-      | Some k -> List.mem k primary_cores
-      | None -> false)
-  in
-  primary @ siblings
+  if primary = []
+  then []
+  else (
+    let primary_cores = List.filter_map core_key primary |> List.sort_uniq compare in
+    let rest = List.filter (fun c -> not (List.mem c primary)) (online_cpus ()) in
+    let others =
+      List.filter
+        (fun c ->
+          match core_key c with
+          | Some k -> not (List.mem k primary_cores)
+          | None -> false)
+        rest
+    in
+    let siblings =
+      List.filter
+        (fun c ->
+          match core_key c with
+          | Some k -> List.mem k primary_cores
+          | None -> false)
+        rest
+    in
+    primary @ others @ siblings)
 ;;
 
 (** Allocator over the trading CPU order that hands out each CPU at most once and returns
@@ -354,6 +402,17 @@ let set_self_idle () =
       "could not set SCHED_IDLE on current thread (continuing with default policy)"
 ;;
 
+(** Return the calling thread to SCHED_OTHER (best-effort). A domain spawned by a trading
+    domain inherits its scheduling policy, so a background helper must drop SCHED_FIFO
+    before it does any work. *)
+let set_self_other () =
+  if not (set_current_other ())
+  then
+    Logging.debug_f
+      ~section:"affinity"
+      "could not set SCHED_OTHER on current thread (continuing with inherited policy)"
+;;
+
 (** Promote the calling trading domain to SCHED_FIFO at [prio] (best-effort). A real-time
     thread cannot be preempted by any CFS thread, which is the only way to remove the
     scheduling component of the p999 tail. Needs CAP_SYS_NICE (see deploy: --cap-add
@@ -374,10 +433,10 @@ let describe () =
   let b = background_cpus () in
   let shared = List.filter (fun c -> not (is_isolated c)) t in
   Printf.sprintf
-    "affinity: trading cpus=[%s] background cpus=[%s] (allowed=%d%s)"
+    "affinity: trading cpus=[%s] background cpus=[%s] (online=%d%s)"
     (String.concat "," (List.map string_of_int t))
     (String.concat "," (List.map string_of_int b))
-    (allowed_cpu_count ())
+    (List.length (online_cpus ()))
     (if shared = []
      then ", isolated"
      else

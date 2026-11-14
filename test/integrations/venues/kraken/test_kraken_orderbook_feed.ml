@@ -348,6 +348,35 @@ let test_staleness_scan_is_throttled () =
   Atomic.set Kraken.Kraken_orderbook_feed.next_staleness_scan_ns 0L
 ;;
 
+let test_levels_to_array_top_n () =
+  let module K = Kraken.Kraken_orderbook_feed in
+  let lvl p =
+    let s = Printf.sprintf "%.2f" p in
+    { K.price = s; price_wire = s; size = "1"; price_float = p; size_float = 1.0 }
+  in
+  let tbl = Hashtbl.create 8 in
+  List.iter
+    (fun p -> Hashtbl.replace tbl (Printf.sprintf "%.2f" p) (lvl p))
+    [ 100.0; 99.0; 101.0; 98.5; 102.0 ];
+  let top n ~sort_desc =
+    K.levels_to_array ~sort_desc tbl n
+    |> Array.to_list
+    |> List.map (fun (l : K.level) -> l.price_float)
+  in
+  Alcotest.(check (list (float 1e-6)))
+    "bids keep the highest prices, descending"
+    [ 102.0; 101.0; 100.0 ]
+    (top 3 ~sort_desc:true);
+  Alcotest.(check (list (float 1e-6)))
+    "asks keep the lowest prices, ascending"
+    [ 98.5; 99.0; 100.0 ]
+    (top 3 ~sort_desc:false);
+  Alcotest.(check int)
+    "a depth above the book size is not padded"
+    5
+    (Array.length (K.levels_to_array tbl 10))
+;;
+
 let () =
   Alcotest.run
     "Kraken Orderbook Feed"
@@ -363,6 +392,10 @@ let () =
     ; ( "data structures"
       , [ Alcotest.test_case "orderbook_structure" `Quick test_orderbook_structure
         ; Alcotest.test_case "level_structure" `Quick test_level_structure
+        ; Alcotest.test_case
+            "levels_to_array selects the top depth in order"
+            `Quick
+            test_levels_to_array_top_n
         ] )
     ; ( "store operations"
       , [ Alcotest.test_case "store_operations" `Quick test_store_operations

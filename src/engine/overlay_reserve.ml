@@ -236,14 +236,27 @@ let diagnostics : (string * diag) list Atomic.t = Atomic.make []
 let diagnostics_gen = Atomic.make 0
 let diag_key ~exchange ~symbol = exchange ^ "|" ^ String.uppercase_ascii symbol
 
+(** Bumped whenever a book's requirement changes. The pool depends on every book, so a
+    reader that recomputes one share can use it to tell whether the others went stale. *)
+let diagnostics_generation () = Atomic.get diagnostics_gen
+
+(** [dg_at] older than the snapshot age is dropped as a stopped book. A reserve-owned book
+    is live for the process lifetime, so it publishes this instead of a timestamp and
+    needs no heartbeat to stay in the pool. *)
+let live_at = Float.infinity
+
 (* [dg_at] refreshes every cycle, so it must not count as a change: the generation is the
-   pool cache's invalidation key and a timestamp-only write has nothing new to publish. *)
+   pool cache's invalidation key and a timestamp-only write has nothing new to publish.
+   NaN-aware: [nan = nan] is false, so a NaN field would otherwise republish (and bump the
+   generation) on every read, which turns any event-driven consumer into a spinner. *)
+let same_value a b = a = b || (Float.is_nan a && Float.is_nan b)
+
 let same_requirement (a : diag) (b : diag) =
   a.dg_exchange = b.dg_exchange
-  && a.dg_gross = b.dg_gross
-  && a.dg_sells = b.dg_sells
-  && a.dg_required = b.dg_required
-  && a.dg_margin = b.dg_margin
+  && same_value a.dg_gross b.dg_gross
+  && same_value a.dg_sells b.dg_sells
+  && same_value a.dg_required b.dg_required
+  && same_value a.dg_margin b.dg_margin
 ;;
 
 let update_diag (d : diag) =

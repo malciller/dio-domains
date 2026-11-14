@@ -1646,7 +1646,8 @@ let apply_event symbol (e : Strategy_trace.event_obs) =
 ;;
 
 let dispatch_event symbol (ev : lifecycle_event) =
-  Strategy_event_recorder.record_event_if_active symbol (event_to_obs ev);
+  if Strategy_event_recorder.is_active symbol
+  then Strategy_event_recorder.record_event_if_active symbol (event_to_obs ev);
   match ev with
   | Ack { now; order_id; side; price } ->
     handle_order_acknowledged ~now symbol order_id side price

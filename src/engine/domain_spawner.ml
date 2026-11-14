@@ -15,6 +15,10 @@ module Types = Exchange.Types
 
 let section = "domain_spawner"
 
+(* Immutable; emitted every cycle, so reuse it instead of allocating one per pass. *)
+let book_update_event = Dio_strategies.Strategy_runtime.make_event "book_update" []
+let book_update_events = [ "book_update", [] ]
+
 (** Round-robin CPU allocator for the per-asset trading domains: pins each to a P-core
     (see [Thread_affinity]) so a busy cycle cannot be migrated onto an E-core or preempted
     against other runnable threads - the source of the wall >> cpu p999 stalls. Returns
@@ -830,15 +834,11 @@ type overlay_instance_rt =
   ; oir_quote_free : unit -> float
   (** Generation-cached tradeable quote balance for this book's quote asset. *)
   ; mutable oir_save_at : float
-  (** Last persistence snapshot. Building one is a JSON tree over the whole state, and the
-      strategy rewrites state every pass, so publish it on a short interval instead of
-      every cycle. The store write itself is already asynchronous. *)
-  ; mutable oir_res_at : float
-  (** Last reserve-share computation, and the inputs that invalidate it. The stress
-      requirement moves with the position, margin and target, not with the mark tick, and
-      each recomputation republished a diagnostics list into a process-wide atomic. *)
-  ; mutable oir_res_share : float
-  ; mutable oir_res_sig : float * float * float * float
+  (** Last persistence snapshot request. The JSON build and store write run on a
+      background domain; this domain only copies the persistent values. *)
+  ; oir_save_names : string array
+  ; oir_save_values : Dio_strategies.Strategy_expr.value array
+  ; oir_reservation : Aux_services.reservation option
   }
 
 (** State and platform reads for an instance. A live instance keeps the state the compiled
@@ -850,6 +850,12 @@ let instance_state ov name =
     when ns.ns_live && Dio_strategies.Strategy_program.has_state_key ns.ns_program name ->
     Dio_strategies.Strategy_program.env_value ns.ns_program ns.ns_env name
   | _ -> Dio_strategies.Strategy_runtime.get_state ov.oir_rt name
+;;
+
+let instance_state_float ov name =
+  match instance_state ov name with
+  | Dio_strategies.Strategy_expr.V_float f when Float.is_finite f -> f
+  | _ -> 0.0
 ;;
 
 let instance_platform ov name =
@@ -927,6 +933,29 @@ let overlay_market_exclusive
       all_trading
   in
   not (other_overlay || controller || grid)
+;;
+
+(** Number of flow-short books that publish a reserve requirement on [exchange]. Used when
+    an overlay registers its reservation; the worker's cached copy keeps the steady-state
+    path off [Config]. *)
+let overlay_reserve_expected exchange =
+  let key = Config.normalize_exchange exchange in
+  let controllers =
+    List.length
+      (List.filter
+         (fun (x : overlay_controller) ->
+           String.equal (Config.normalize_exchange x.oc_hedge_exchange) key)
+         (get_overlay_controllers ()))
+  in
+  let shorts =
+    List.length
+      (List.filter
+         (fun (x : Config.overlay_instance) ->
+           List.mem "flow_short" x.oi_capabilities
+           && String.equal (Config.normalize_exchange x.oi_exchange) key)
+         (Config.get_overlay_instances ()))
+  in
+  controllers + shorts
 ;;
 
 (** Load every overlay instance owned by [owner]. A failed instance is logged and skipped;
@@ -1034,6 +1063,11 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
         ctx.cg_key_coin_for <- Config.base_coin_of_symbol oi.oi_symbol;
         ctx.cg_key_coin
         <- Dio_exchange.Market_context.key_of oi.oi_exchange ctx.cg_key_coin_for;
+        (* [market.facts] otherwise resolves this on its first pass; do it once here so
+           the hot path never pays the venue lookup. *)
+        ctx.cg_min_notional
+        <- Dio_strategies.Strategy_venue.get_min_notional_val oi.oi_symbol oi.oi_exchange;
+        ctx.cg_min_notional_for <- oi.oi_symbol;
         let state =
           ref
             (Dio_persistence.Overlay_instance_store.load
@@ -1082,6 +1116,47 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
              oi.oi_owner_symbol
              oi.oi_id
          | None -> ());
+        let stress_rise =
+          match oi.oi_params |> Yojson.Basic.Util.member "stress_rise" with
+          | `Float f -> f
+          | `Int i -> float_of_int i
+          | _ -> 80.0
+        in
+        let maintenance = Overlay_reserve.maintenance_rate ~coin:ctx.cg_key_coin_for in
+        let restored_float name =
+          match Dio_strategies.Strategy_runtime.get_state rt name with
+          | Dio_strategies.Strategy_expr.V_float f when Float.is_finite f -> f
+          | _ -> 0.0
+        in
+        (* Only the flow-short book publishes a requirement; every other overlay reports a
+           zero share without touching the pool. *)
+        let reservation =
+          if List.mem "flow_short" oi.oi_capabilities
+          then
+            Some
+              (Aux_services.register_reservation
+                 ~exchange:oi.oi_exchange
+                 ~symbol:oi.oi_symbol
+                 ~coin:ctx.cg_key_coin_for
+                 ~key:ctx.cg_key_coin
+                 ~expected:(overlay_reserve_expected oi.oi_exchange)
+                 ~stress:stress_rise
+                 ~maintenance
+                 ~free:(quote_free ())
+                 ~target:(Float.max 0.0 (restored_float "short_base_target"))
+                 ~pending:(Float.max 0.0 (restored_float "pending_short_base")))
+          else None
+        in
+        let save_names =
+          Array.of_list
+            (List.filter_map
+               (fun (d : Dio_strategies.Strategy_file.state_decl) ->
+                 if d.s_persist then Some d.s_name else None)
+               file.state)
+        in
+        let save_values =
+          Array.make (Array.length save_names) Dio_strategies.Strategy_expr.V_unset
+        in
         Some
           { oir_config = oi
           ; oir_asset = asset
@@ -1113,9 +1188,9 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
           ; oir_book_pos_seen = -1
           ; oir_quote_free = quote_free
           ; oir_save_at = 0.0
-          ; oir_res_at = 0.0
-          ; oir_res_share = 0.0
-          ; oir_res_sig = 0.0, 0.0, 0.0, 0.0
+          ; oir_save_names = save_names
+          ; oir_save_values = save_values
+          ; oir_reservation = reservation
           ; oir_profs =
               (get_overlay_profiler
                  ~owner_exchange:oi.oi_owner_exchange
@@ -1125,212 +1200,6 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
                  ~symbol:oi.oi_symbol)
                 .oip_profs
           }))
-;;
-
-(** Reserve share is republished at most this often when nothing that can move the
-    requirement has changed. *)
-let short_reserve_refresh_s = 0.25
-
-(** Quote reserve a flow-sized short overlay needs on its venue.
-
-    The flow_short role mirrors the inventory hedge's starvation contract: publish the
-    gross requirement for the planned short at a stress price, let the venue pool split it
-    with any other reserved book, and return this instance's share. The requirement uses
-    the live position entry when one exists; a pending target starts at the mark so its
-    initial margin is reserved before the first fill. *)
-let compute_short_reserve_share ov ~now ~expected ~target_base ~pending_base ~key ~coin =
-  let exchange = ov.oir_config.oi_exchange in
-  (* Publish a zero requirement when flat so the venue pool still counts this book. *)
-  let publish_zero () =
-    Overlay_reserve.update_diag
-      { Overlay_reserve.dg_key =
-          Overlay_reserve.diag_key ~exchange ~symbol:ov.oir_config.oi_symbol
-      ; dg_exchange = exchange
-      ; dg_at = now
-      ; dg_gross = 0.0
-      ; dg_sells = 0.0
-      ; dg_required = 0.0
-      ; dg_margin = 0.0
-      };
-    0.0
-  in
-  let funding_mark =
-    match Dio_exchange.Market_context.get_funding_key key with
-    | Some f when f.mark > 0.0 -> f.mark
-    | _ -> 0.0
-  in
-  let open_short, entry, mark =
-    match Overlay_reserve.pos_leg_key ~coin ~key with
-    | Some leg ->
-      ( Float.max 0.0 (-.leg.Overlay_reserve.qty)
-      , (if leg.Overlay_reserve.entry > 0.0
-         then leg.Overlay_reserve.entry
-         else leg.Overlay_reserve.mark)
-      , leg.Overlay_reserve.mark )
-    | None -> 0.0, funding_mark, funding_mark
-  in
-  (* Reserve the live short plus the add this cycle can actually place. Before the first
-     book cycle has derived [pending_short_base], fall back to the raw target so a startup
-     buy still reserves its initial margin. *)
-  let total_qty =
-    if open_short > 1e-9 || pending_base > 1e-9
-    then open_short +. pending_base
-    else target_base
-  in
-  if total_qty <= 1e-9 || mark <= 0.0
-  then publish_zero ()
-  else (
-    let position = Dio_exchange.Market_context.get_position_key key in
-    let position_leverage =
-      match position with
-      | Some p -> Option.value p.leverage ~default:0.0
-      | None -> 0.0
-    in
-    let leverage =
-      if position_leverage > 0.0
-      then position_leverage
-      else (
-        match Dio_exchange.Exchange_intf.Registry.get_market_context exchange with
-        | Some (module Mc : Dio_exchange.Exchange_intf.Market_context.S) ->
-          (match Mc.get_risk ~coin with
-           | Some { Dio_exchange.Exchange_intf.Market_context.max_leverage = Some l; _ }
-             -> l
-           | _ -> 0.0)
-        | None -> 0.0)
-    in
-    if leverage <= 0.0
-    then publish_zero ()
-    else (
-      (* Keep the fallback in sync with the flow-short strategy's tunable default. *)
-      let stress_rise =
-        match ov.oir_config.oi_params |> Yojson.Basic.Util.member "stress_rise" with
-        | `Float f -> f
-        | `Int i -> float_of_int i
-        | _ -> 80.0
-      in
-      let target_leg : Overlay_reserve.leg =
-        { qty = -.total_qty
-        ; entry = (if entry > 0.0 then entry else mark)
-        ; mark
-        ; maintenance = Overlay_reserve.maintenance_rate ~coin
-        }
-      in
-      let req =
-        Overlay_reserve.compute_requirement
-          ~target:target_leg
-          ~max_qty:total_qty
-          ~leverage
-          ~min_liq_mult:(1.0 +. (stress_rise /. 100.0))
-          ~anchor:target_leg.entry
-          ~max_trail_pct:0.0
-          ~next_add:0.0
-          ~rungs:0
-          ~add_growth:1.0
-          ~sells_top:0.0
-          ~sells_stress:0.0
-      in
-      let free =
-        try ov.oir_quote_free () with
-        | _ -> nan
-      in
-      let margin = Dio_exchange.Market_context.get_margin ~exchange in
-      let account_margin_used =
-        match margin with
-        | Some m -> m.margin_used
-        | None -> nan
-      in
-      let position_margin_used =
-        match position with
-        | Some p -> p.margin_used
-        | None -> 0.0
-      in
-      Overlay_reserve.update_diag
-        { Overlay_reserve.dg_key =
-            Overlay_reserve.diag_key ~exchange ~symbol:ov.oir_config.oi_symbol
-        ; dg_exchange = exchange
-        ; dg_at = now
-        ; dg_gross = req.Overlay_reserve.rq_gross
-        ; dg_sells = 0.0
-        ; dg_required = req.Overlay_reserve.rq_required
-        ; dg_margin = position_margin_used
-        };
-      if not (Float.is_finite free)
-      then 0.0
-      else (
-        let own_share =
-          if Float.is_finite req.Overlay_reserve.rq_required
-          then
-            Float.min
-              free
-              (Float.max 0.0 (req.Overlay_reserve.rq_required -. position_margin_used))
-          else 0.0
-        in
-        let pool =
-          Overlay_reserve.pool_for
-            ~exchange
-            ~now
-            ~max_age:180.0
-            ~margin_used:account_margin_used
-            ~free
-        in
-        if pool.Overlay_reserve.pl_count >= expected
-        then Overlay_reserve.allocation pool ~gross:req.Overlay_reserve.rq_gross
-        else own_share)))
-;;
-
-let state_float rt name =
-  match Dio_strategies.Strategy_runtime.get_state rt name with
-  | Dio_strategies.Strategy_expr.V_float f when Float.is_finite f -> f
-  | _ -> 0.0
-;;
-
-let overlay_instance_short_reserve_share (ov : overlay_instance_rt) ~now ~expected =
-  if not (List.mem "flow_short" ov.oir_capabilities)
-  then 0.0
-  else (
-    let rt = ov.oir_rt in
-    (* A live instance keeps its state in the compiled env; reading the runtime copy would
-       be reading a value nothing updates any more. *)
-    let state name =
-      match ov.oir_native with
-      | Some ns when ns.ns_live ->
-        Dio_strategies.Strategy_program.env_state_float ns.ns_program ns.ns_env name
-      | _ -> state_float rt name
-    in
-    let target_base = Float.max 0.0 (state "short_base_target") in
-    let pending_base = Float.max 0.0 (state "pending_short_base") in
-    let exchange = ov.oir_config.oi_exchange in
-    let positions_at =
-      try
-        Option.value
-          (Dio_exchange.Market_context.get_positions_updated_at ~exchange)
-          ~default:(-1.0)
-      with
-      | _ -> -1.0
-    in
-    let margin_at =
-      match Dio_exchange.Market_context.get_margin ~exchange with
-      | Some m -> m.updated_at
-      | None -> -1.0
-    in
-    let sig_ = positions_at, margin_at, target_base, pending_base in
-    if now -. ov.oir_res_at < short_reserve_refresh_s && sig_ = ov.oir_res_sig
-    then ov.oir_res_share
-    else (
-      let share =
-        compute_short_reserve_share
-          ov
-          ~now
-          ~expected
-          ~target_base
-          ~pending_base
-          ~key:ov.oir_ctx.cg_key_coin
-          ~coin:ov.oir_ctx.cg_key_coin_for
-      in
-      ov.oir_res_at <- now;
-      ov.oir_res_share <- share;
-      ov.oir_res_sig <- sig_;
-      share))
 ;;
 
 (** Rebuild the ladder from the live short instead of persisting it.
@@ -2020,31 +1889,15 @@ let asset_domain_worker
         ~exchange:asset_with_fees.exchange
         ~symbol:asset_with_fees.symbol
     in
-    (* Count every book that publishes a reserve requirement on a venue: carry controllers
-       plus flow-sized short overlays. The pool uses the count to avoid splitting against
-       a partial diag set at startup. *)
+    (* The pool uses this count to avoid splitting against a partial diag set at startup.
+       Cache it: the controller reads it every cycle and the config does not change. *)
     let overlay_reserve_expected_cache = Hashtbl.create 8 in
     let overlay_reserve_expected exchange =
       let key = Config.normalize_exchange exchange in
       match Hashtbl.find_opt overlay_reserve_expected_cache key with
       | Some n -> n
       | None ->
-        let controllers =
-          List.length
-            (List.filter
-               (fun (x : overlay_controller) ->
-                 String.equal (Config.normalize_exchange x.oc_hedge_exchange) key)
-               (get_overlay_controllers ()))
-        in
-        let shorts =
-          List.length
-            (List.filter
-               (fun (x : Config.overlay_instance) ->
-                 List.mem "flow_short" x.oi_capabilities
-                 && String.equal (Config.normalize_exchange x.oi_exchange) key)
-               (Config.get_overlay_instances ()))
-        in
-        let n = controllers + shorts in
+        let n = overlay_reserve_expected exchange in
         Hashtbl.add overlay_reserve_expected_cache key n;
         n
     in
@@ -2076,6 +1929,43 @@ let asset_domain_worker
     let overlay_inventory_caches =
       match overlay_controller with
       | Some c -> Some (Overlay_inventory.create_caches c)
+      | None -> None
+    in
+    let overlay_quote_asset =
+      match overlay_controller with
+      | Some c ->
+        (match String.index_opt c.oc_hedge_symbol '/' with
+         | Some i ->
+           String.sub c.oc_hedge_symbol (i + 1) (String.length c.oc_hedge_symbol - i - 1)
+         | None -> "USDC")
+      | None -> "USDC"
+    in
+    let overlay_quote_free =
+      try Ex.get_tradeable_balance_fast ~asset:overlay_quote_asset with
+      | _ -> fun () -> nan
+    in
+    (* The fast reader caches the last open-buy figure in mutable refs, so the reserve
+       domain gets its own reader. *)
+    let overlay_quote_free_worker =
+      try Ex.get_tradeable_balance_fast ~asset:overlay_quote_asset with
+      | _ -> fun () -> nan
+    in
+    (* The controller's requirement, its resting-sell view and the venue pool split run on
+       the reserve domain. This domain publishes the ladder inputs and reads one float. *)
+    let controller_reservation =
+      match overlay_controller with
+      | Some c ->
+        Some
+          (Aux_services.register_controller
+             ~exchange:c.oc_hedge_exchange
+             ~diag_key:
+               (Overlay_reserve.diag_key
+                  ~exchange:c.oc_hedge_exchange
+                  ~symbol:c.oc_hedge_symbol)
+             ~expected:overlay_expected_controllers
+             ~legs:c.oc_legs
+             ~caches:(Overlay_inventory.create_caches c)
+             ~quote_free:overlay_quote_free_worker)
       | None -> None
     in
     (* The engine startup path is not the CLI/test path that registers the builtin action
@@ -2287,10 +2177,16 @@ let asset_domain_worker
       let asset = ov.oir_asset in
       let t_res0 = if measured then Monotonic_clock.now_ns () else 0 in
       let reserve_share =
-        overlay_instance_short_reserve_share
-          ov
-          ~now
-          ~expected:(overlay_reserve_expected ov.oir_config.oi_exchange)
+        match ov.oir_reservation with
+        | Some r ->
+          Aux_services.publish_share
+            r
+            ~target:(Float.max 0.0 (instance_state_float ov "short_base_target"))
+            ~pending:(Float.max 0.0 (instance_state_float ov "pending_short_base"))
+            ~free:
+              (try ov.oir_quote_free () with
+               | _ -> nan)
+        | None -> 0.0
       in
       let res_ns = if t_res0 > 0 then Monotonic_clock.now_ns () - t_res0 else 0 in
       if res_ns > 0 then Latency_profiler.record_ns profs.prof_native_res res_ns;
@@ -2386,7 +2282,10 @@ let asset_domain_worker
                rt.price <- price;
                rt.now <- now;
                rt.event
-               <- Some (Dio_strategies.Strategy_runtime.make_event event_name fields);
+               <- Some
+                    (if String.equal event_name "book_update" && fields = []
+                     then book_update_event
+                     else Dio_strategies.Strategy_runtime.make_event event_name fields);
                (* The compiled path does not execute [context: market.facts], so refresh
                   the facts into its env before it reads them. Every event needs this, not
                   just a book tick: a fill step reads the same platform facts (mark, perp
@@ -2555,13 +2454,17 @@ let asset_domain_worker
               else Dio_strategies.Strategy_runtime.get_state rt name
           | _ -> fun rt name -> Dio_strategies.Strategy_runtime.get_state rt name
         in
-        Dio_strategies.Overlay_instance_runtime.save_if_changed
-          ~get_state
+        let n = Array.length ov.oir_save_names in
+        for i = 0 to n - 1 do
+          ov.oir_save_values.(i) <- get_state ov.oir_rt ov.oir_save_names.(i)
+        done;
+        Aux_services.enqueue_save
           ~owner_exchange:ov.oir_config.oi_owner_exchange
           ~owner_symbol:ov.oir_config.oi_owner_symbol
           ~id:ov.oir_config.oi_id
-          ov.oir_rt
-          ov.oir_state);
+          ~names:ov.oir_save_names
+          ~values:(Array.copy ov.oir_save_values)
+          ~previous:ov.oir_state);
       if not measured
       then 0
       else (
@@ -2636,11 +2539,7 @@ let asset_domain_worker
           ov.oir_seen_margin_at <- margin_at;
           (* Return the pass so the owner can keep it out of its own PREP: the instance
              records the same span on its own row. *)
-          run_overlay_cycles
-            ov
-            ~now
-            ~price:(overlay_mark ov)
-            ~events:[ "book_update", [] ])
+          run_overlay_cycles ov ~now ~price:(overlay_mark ov) ~events:book_update_events)
         else 0
     in
     (* Config-driven grid runtime (milestone 3, coarse wrapper; default off). When a
@@ -3311,6 +3210,9 @@ let asset_domain_worker
           := !lifecycle_events
              + Dio_strategies.Strategy_api.Strategy.drain_events asset_with_fees.symbol);
       (* === ORDERBOOK HOT PATH === *)
+      (* [t1] stays the cycle start for TOTAL; the book bracket starts after the lifecycle
+         drain so it measures the book, not event handling. *)
+      let ob_t0 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
       let ob_pos = get_ob_pos_fn () in
       let did_ob =
         ob_pos <> !orderbook_read_pos || (!orderbook_read_pos = 0 && ob_pos > 0)
@@ -3387,8 +3289,8 @@ let asset_domain_worker
       let alloc_at_t2 =
         if latency_this_cycle then Monotonic_clock.minor_words () else 0
       in
-      if did_ob && latency_this_cycle && t2 > t1
-      then Latency_profiler.record_ns prof_ob (t2 - t1);
+      if did_ob && latency_this_cycle && t2 > ob_t0
+      then Latency_profiler.record_ns prof_ob (t2 - ob_t0);
       let was_exec_ready = !exec_ready in
       let event_count = ref 0 in
       if did_exec
@@ -4447,23 +4349,6 @@ let asset_domain_worker
            | None ->
              { Overlay_reserve.qty = 0.0; entry = 0.0; mark = 0.0; maintenance = 0.0 }
          in
-         let quote_asset =
-           match String.index_opt controller.oc_hedge_symbol '/' with
-           | Some i ->
-             String.sub
-               controller.oc_hedge_symbol
-               (i + 1)
-               (String.length controller.oc_hedge_symbol - i - 1)
-           | None -> "USDC"
-         in
-         let free =
-           try Ex.get_tradeable_balance ~asset:quote_asset with
-           | _ -> nan
-         in
-         let spot_total =
-           try Ex.get_total_balance ~asset:quote_asset with
-           | _ -> nan
-         in
          let acct_margin_used =
            match
              Dio_exchange.Market_context.get_margin ~exchange:controller.oc_hedge_exchange
@@ -4498,108 +4383,31 @@ let asset_domain_worker
            then target_leg.mark
            else scheduled
          in
-         (* Each leg's resting-sell view is cached by the venue's open-orders generation,
-            so a quiet pair refolds cached pairs instead of walking the venue book (two
-            process-wide mutexes on a perp symbol) on every overlay tick.
-            [overlay_inventory_caches] is aligned with [controller.oc_legs]. *)
-         let leg_cache i =
-           match overlay_inventory_caches with
-           | Some c when i < Array.length c -> Some (Array.unsafe_get c i)
-           | _ -> None
-         in
-         let sells_below max_price =
-           let i = ref 0 in
-           List.fold_left
-             (fun acc (l : Config.overlay_leg) ->
-               let cache = leg_cache !i in
-               incr i;
-               if Config.is_hyperliquid l.ol_exchange
-               then
-                 acc
-                 +. Overlay_inventory.open_sell_proceeds_below
-                      ?cache
-                      ~exchange:l.ol_exchange
-                      ~symbol:l.ol_symbol
-                      ~max_price
-                      ()
-               else acc)
-             0.0
-             controller.oc_legs
-         in
-         let sells_below2 price_a price_b =
-           let i = ref 0 in
-           List.fold_left
-             (fun (a, b) (l : Config.overlay_leg) ->
-               let cache = leg_cache !i in
-               incr i;
-               if Config.is_hyperliquid l.ol_exchange
-               then (
-                 let x, y =
-                   Overlay_inventory.open_sell_proceeds_below2
-                     ?cache
-                     ~exchange:l.ol_exchange
-                     ~symbol:l.ol_symbol
-                     ~price_a
-                     ~price_b
-                     ()
-                 in
-                 a +. x, b +. y)
-               else a, b)
-             (0.0, 0.0)
-             controller.oc_legs
-         in
          let stress_price =
            if p.min_liq_mult > 0.0 then p.min_liq_mult *. p_top_guess else p_top_guess
          in
-         let sells_top, sells_stress = sells_below2 p_top_guess stress_price in
-         let req =
-           Overlay_reserve.compute_requirement
-             ~target:target_leg
-             ~max_qty
-             ~leverage
-             ~min_liq_mult:p.min_liq_mult
-             ~anchor
-             ~max_trail_pct
-             ~next_add (* Remaining bands weight the entry at the top. *)
-             ~rungs:remaining_rungs
-             ~add_growth
-             ~sells_top
-             ~sells_stress
-         in
-         let diag =
-           { Overlay_reserve.dg_key =
-               Overlay_reserve.diag_key
-                 ~exchange:controller.oc_hedge_exchange
-                 ~symbol:controller.oc_hedge_symbol
-           ; dg_exchange = controller.oc_hedge_exchange
-           ; dg_at = now_ov
-           ; dg_gross = req.Overlay_reserve.rq_gross
-           ; dg_sells = req.Overlay_reserve.rq_sells_applied
-           ; dg_required = req.Overlay_reserve.rq_required
-           ; dg_margin = pos_margin_used
-           }
-         in
-         Overlay_reserve.update_diag diag;
-         let pool =
-           Overlay_reserve.pool_for
-             ~exchange:controller.oc_hedge_exchange
-             ~now:now_ov
-             ~max_age:180.0
-             ~margin_used:acct_margin_used
-             ~free
-         in
-         let own_share =
-           if Float.is_finite pos_margin_used && Float.is_finite free
-           then
-             Float.min
-               free
-               (Float.max 0.0 (req.Overlay_reserve.rq_required -. pos_margin_used))
-           else 0.0
-         in
          let share =
-           if pool.pl_count >= overlay_expected_controllers
-           then Overlay_reserve.allocation pool ~gross:req.Overlay_reserve.rq_gross
-           else own_share
+           match controller_reservation with
+           | Some cr ->
+             Aux_services.publish_controller
+               cr
+               ~target_qty:target_leg.qty
+               ~target_entry:target_leg.entry
+               ~target_mark:target_leg.mark
+               ~maintenance:target_leg.maintenance
+               ~max_qty
+               ~leverage
+               ~min_liq_mult:p.min_liq_mult
+               ~anchor
+               ~max_trail_pct
+               ~next_add
+               ~rungs:remaining_rungs
+               ~add_growth
+               ~p_top_guess
+               ~stress_price
+               ~position_margin:pos_margin_used
+               ~account_margin:acct_margin_used
+           | None -> 0.0
          in
          let share_changed =
            Float.is_finite !overlay_last_reserve_share
@@ -4619,7 +4427,7 @@ let asset_domain_worker
                 ns
                 ~price:!current_price
                 ~now:now_ov
-                ~event:(Dio_strategies.Strategy_runtime.make_event "book_update" [])
+                ~event:book_update_event
                 ~event_kind:"book_update"
                 ~event_fields:[])
           | None -> ());
@@ -4691,6 +4499,92 @@ let asset_domain_worker
          if now_ov -. !overlay_diag_log_at >= 60.0
          then (
            overlay_diag_log_at := now_ov;
+           (* Diagnostic only, once a minute: rebuild the requirement the reserve domain
+              computed so the log keeps its full breakdown. *)
+           let free = overlay_quote_free () in
+           let spot_total =
+             try Ex.get_total_balance ~asset:overlay_quote_asset with
+             | _ -> nan
+           in
+           (* Each leg's resting-sell view is cached by the venue's open-orders
+              generation. [overlay_inventory_caches] is aligned with [controller.oc_legs]. *)
+           let leg_cache i =
+             match overlay_inventory_caches with
+             | Some c when i < Array.length c -> Some (Array.unsafe_get c i)
+             | _ -> None
+           in
+           let sells_below max_price =
+             let i = ref 0 in
+             List.fold_left
+               (fun acc (l : Config.overlay_leg) ->
+                 let cache = leg_cache !i in
+                 incr i;
+                 if Config.is_hyperliquid l.ol_exchange
+                 then
+                   acc
+                   +. Overlay_inventory.open_sell_proceeds_below
+                        ?cache
+                        ~exchange:l.ol_exchange
+                        ~symbol:l.ol_symbol
+                        ~max_price
+                        ()
+                 else acc)
+               0.0
+               controller.oc_legs
+           in
+           let sells_below2 price_a price_b =
+             let i = ref 0 in
+             List.fold_left
+               (fun (a, b) (l : Config.overlay_leg) ->
+                 let cache = leg_cache !i in
+                 incr i;
+                 if Config.is_hyperliquid l.ol_exchange
+                 then (
+                   let x, y =
+                     Overlay_inventory.open_sell_proceeds_below2
+                       ?cache
+                       ~exchange:l.ol_exchange
+                       ~symbol:l.ol_symbol
+                       ~price_a
+                       ~price_b
+                       ()
+                   in
+                   a +. x, b +. y)
+                 else a, b)
+               (0.0, 0.0)
+               controller.oc_legs
+           in
+           let sells_top, sells_stress = sells_below2 p_top_guess stress_price in
+           let req =
+             Aux_services.requirement_of_input
+               ~sells_top
+               ~sells_stress
+               { Aux_services.target_qty = target_leg.qty
+               ; target_entry = target_leg.entry
+               ; target_mark = target_leg.mark
+               ; maintenance = target_leg.maintenance
+               ; max_qty
+               ; leverage
+               ; min_liq_mult = p.min_liq_mult
+               ; anchor
+               ; max_trail_pct
+               ; next_add
+               ; rungs = remaining_rungs
+               ; add_growth
+               ; p_top_guess
+               ; stress_price
+               ; position_margin = pos_margin_used
+               ; account_margin = acct_margin_used
+               }
+           in
+           let pool =
+             Overlay_reserve.pool_for
+               ~exchange:controller.oc_hedge_exchange
+               ~now:now_ov
+               ~max_age:180.0
+               ~margin_used:acct_margin_used
+               ~free
+           in
            let sells_all = sells_below Float.max_float in
            let ledger_total =
              match
@@ -4800,7 +4694,7 @@ let asset_domain_worker
                    ov
                    ~now
                    ~price:(overlay_mark ov)
-                   ~events:[ "book_update", [] ])
+                   ~events:book_update_events)
           else instance_ns := !instance_ns + overlay_venue_changed ov ~now)
         overlay_instances;
       (* Controller work stays on this domain's row. Every instance pass is charged to the
@@ -5093,7 +4987,7 @@ let asset_domain_worker
                  ns
                  ~price:!current_price
                  ~now
-                 ~event:(Dio_strategies.Strategy_runtime.make_event "book_update" [])
+                 ~event:book_update_event
                  ~event_kind:"book_update"
                  ~event_fields:[]
              | None -> ())
@@ -5808,6 +5702,11 @@ let spawn_supervised_domains_for_assets
   =
   (* Initialize strategy module state *)
   Dio_strategies.Strategy_api.Strategy.init ();
+  (* Start the off-cycle workers here, on the main domain, before any trading domain is
+     pinned or promoted: a domain spawned from a trading domain inherits its CPU pin and
+     scheduling policy for the window before it re-pins itself. *)
+  if Config.get_overlay_instances () <> [] || get_overlay_controllers () <> []
+  then Aux_services.start ();
   (* Register assets in core-assignment order: registration is where a trading CPU is
      claimed, so the highest [cpu_priority] claims a P-core first and ties keep config
      order. Priorities beyond the core count simply fall through to unpinned. *)
@@ -5817,19 +5716,19 @@ let spawn_supervised_domains_for_assets
      the remaining cores rather than doubling up on a P-core. Doubling up would, under
      SCHED_FIFO, put two real-time domains on one core and starve both. *)
   let domain_count = List.length assets in
-  let cpu_count = Thread_affinity.trading_cpu_count () in
-  if cpu_count > 0 && domain_count > cpu_count
+  let p_cores = Thread_affinity.trading_cpu_count () in
+  let total_cpus = List.length (Thread_affinity.trading_allocation_order ()) in
+  if p_cores > 0 && domain_count > p_cores
   then
     Logging.warn_f
       ~section
-      "affinity: %d trading domains but only %d trading CPUs (%s); the %d highest \
-       cpu_priority get a dedicated core and the remaining %d are pinned to the \
-       background CPU set (shared, but off the trading cores)"
+      "affinity: %d trading domains on %d P-cores; the highest cpu_priority keep a \
+       P-core and overflow takes a dedicated E-core before an SMT sibling (%d CPUs in \
+       the allocation order, %d domains unpinned)"
       domain_count
-      cpu_count
-      (String.concat "," (List.map string_of_int (Thread_affinity.trading_cpus ())))
-      cpu_count
-      (domain_count - cpu_count);
+      p_cores
+      total_cpus
+      (max 0 (domain_count - total_cpus));
   (* Pre-force the shared cached_gc_config Lazy before spawning domains: OCaml 5 domains
      concurrently forcing the same value race, and if the computing domain fails the
      others get CamlinternalLazy.Undefined. Forcing in the main domain eliminates the

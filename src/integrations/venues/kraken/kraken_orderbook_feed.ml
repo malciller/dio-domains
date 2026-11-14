@@ -794,27 +794,45 @@ let apply_levels_from_span symbol s tbl i j =
   else ()
 ;;
 
+let empty_level =
+  { price = ""; price_wire = ""; size = ""; price_float = 0.0; size_float = 0.0 }
+;;
+
 (** Converts a Hashtbl to a sorted level array truncated to [depth] entries. [sort_desc]
-    controls descending (bids) vs ascending (asks) order. *)
+    controls descending (bids) vs ascending (asks) order. Inserts into a fixed [depth]
+    array in one pass, so each call avoids the list copy and sort. *)
 let levels_to_array ?(sort_desc = false) tbl depth =
-  let levels_list = Hashtbl.fold (fun _ lvl acc -> lvl :: acc) tbl [] in
-  let sorted_levels =
-    List.sort
-      (fun l1 l2 ->
-        if sort_desc
-        then Float.compare l2.price_float l1.price_float
-        else Float.compare l1.price_float l2.price_float)
-      levels_list
-  in
-  let rec take n lst acc =
-    if n = 0
-    then List.rev acc
-    else (
-      match lst with
-      | [] -> List.rev acc
-      | level :: rest -> take (n - 1) rest (level :: acc))
-  in
-  Array.of_list (take depth sorted_levels [])
+  if depth <= 0
+  then [||]
+  else (
+    let out = Array.make depth empty_level in
+    let len = ref 0 in
+    let before a b =
+      if sort_desc
+      then Float.compare b.price_float a.price_float < 0
+      else Float.compare a.price_float b.price_float < 0
+    in
+    Hashtbl.iter
+      (fun _ (lvl : level) ->
+        if !len < depth
+        then (
+          let i = ref !len in
+          while !i > 0 && before lvl out.(!i - 1) do
+            out.(!i) <- out.(!i - 1);
+            decr i
+          done;
+          out.(!i) <- lvl;
+          incr len)
+        else if before lvl out.(depth - 1)
+        then (
+          let i = ref (depth - 1) in
+          while !i > 0 && before lvl out.(!i - 1) do
+            out.(!i) <- out.(!i - 1);
+            decr i
+          done;
+          out.(!i) <- lvl))
+      tbl;
+    if !len = depth then out else Array.sub out 0 !len)
 ;;
 
 (** Rebuilds a Hashtbl containing only the top [max_levels] entries. Used to bound map
