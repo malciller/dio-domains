@@ -168,6 +168,110 @@ let test_apply_sell_fill_fees_reduce_profit () =
   Alcotest.(check (float 1e-12)) "reserve still accrues after fees" 0.02 t.A.reserved_base
 ;;
 
+let ladder_sell t price oid =
+  A.apply_sell_fill
+    t
+    ~price
+    ~qty:0.5
+    ~oid
+    ~buffer:0.0
+    ~sell_mult:1.0
+    ~oracle_qty:0.0
+    ~sell_uses_mult:false
+    ~fees:0.0
+    ()
+;;
+
+let test_ladder_queue_one_cycle_per_buy () =
+  (* A ladder can fill several buys before a sell does. Each sell consumes its own lot:
+     pairing every sell in the run against the deepest fill would credit the ladder step
+     once per sell too many (0.03 here instead of 0.02). *)
+  let t = A.apply_buy_fill A.default ~price:10.00 ~qty:0.5 ~oid:"b1" in
+  let t = A.apply_buy_fill t ~price:9.98 ~qty:0.5 ~oid:"b2" in
+  let t = ladder_sell t 10.00 "s1" in
+  Alcotest.(check (float 1e-9)) "first cycle" 0.01 t.A.accumulated_profit;
+  let t = ladder_sell t 10.02 "s2" in
+  Alcotest.(check (float 1e-9)) "second cycle" 0.02 t.A.accumulated_profit;
+  Alcotest.(check int) "no unspent lots" 0 (List.length t.A.buy_lots);
+  (* A sell with no unspent buy behind it is a sale of inventory the ledger did not buy as
+     a cycle: it must credit nothing. *)
+  let t = ladder_sell t 10.04 "s3" in
+  Alcotest.(check (float 1e-9)) "no phantom cycle" 0.02 t.A.accumulated_profit
+;;
+
+let test_partial_sell_keeps_lot () =
+  let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"b1" in
+  let t =
+    A.apply_sell_fill
+      t
+      ~price:110.0
+      ~qty:0.2
+      ~oid:"s1"
+      ~buffer:0.0
+      ~sell_mult:1.0
+      ~oracle_qty:0.0
+      ~sell_uses_mult:false
+      ~fees:0.0
+      ()
+  in
+  match t.A.buy_lots with
+  | [ (p, q) ] ->
+    Alcotest.(check (float 1e-12)) "residual lot price" 100.0 p;
+    Alcotest.(check (float 1e-12)) "residual lot qty" 0.3 q
+  | lots -> Alcotest.failf "expected one residual lot, got %d" (List.length lots)
+;;
+
+let test_withheld_slice_leaves_the_lot () =
+  (* Kraken withholds (1 - sell_mult) of the oracle qty inside the order. That base was
+     never sold, so it must leave the lot too - otherwise it funds a second cycle. *)
+  let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"b1" in
+  let t =
+    A.apply_sell_fill
+      t
+      ~price:140.0
+      ~qty:0.4
+      ~oid:"s1"
+      ~buffer:0.0
+      ~sell_mult:0.8
+      ~oracle_qty:0.5
+      ~fees:0.0
+      ()
+  in
+  Alcotest.(check (float 1e-12)) "withheld slice reserved" 0.1 t.A.reserved_base;
+  Alcotest.(check int) "lot fully consumed" 0 (List.length t.A.buy_lots)
+;;
+
+let test_lots_survive_serialization () =
+  (* A pre-queue entry resumes with its last buy fill as the only open lot; an entry that
+     carries an explicit (even empty) queue is taken at its word, so a spent anchor is
+     never resurrected by a restart. *)
+  let legacy =
+    A.of_json
+      (Yojson.Basic.from_string
+         {|{"accumulated_profit":1.5,"last_buy_fill_price":100.0,"last_buy_fill_qty":0.2}|})
+  in
+  Alcotest.(check int) "legacy anchor becomes a lot" 1 (List.length legacy.A.buy_lots);
+  let spent =
+    A.of_json
+      (Yojson.Basic.from_string
+         {|{"accumulated_profit":1.5,"last_buy_fill_price":100.0,"last_buy_fill_qty":0.2,
+            "buy_lots":[]}|})
+  in
+  Alcotest.(check int) "empty queue preserved" 0 (List.length spent.A.buy_lots);
+  (* A null entry (torn or hand-edited file) must not raise: the store's parse would then
+     drop every entry in the file. *)
+  let null_entry = A.of_json `Null in
+  Alcotest.(check int) "null entry yields no lots" 0 (List.length null_entry.A.buy_lots);
+  let two = A.apply_buy_fill legacy ~price:9.98 ~qty:0.5 ~oid:"b2" in
+  let round_tripped = A.of_json (A.to_json two) in
+  Alcotest.(check int) "newest lot first" 2 (List.length round_tripped.A.buy_lots);
+  match round_tripped.A.buy_lots with
+  | [ (p1, _); (p2, _) ] ->
+    Alcotest.(check (float 1e-12)) "newest price first" 9.98 p1;
+    Alcotest.(check (float 1e-12)) "oldest price last" 100.0 p2
+  | _ -> Alcotest.fail "expected two lots after round trip"
+;;
+
 (* -- Round-trip serialization + persistence ---------------------------- *)
 
 let test_credit_profit_persists_and_adds () =
@@ -210,6 +314,7 @@ let test_accumulation_round_trip () =
       ; last_buy_fill_qty = Some 0.5
       ; last_sell_fill_price = None
       ; last_sell_fill_qty = None
+      ; buy_lots = [ 100.0, 0.5; 99.0, 0.25 ]
       }
     in
     A.save ~key t;
@@ -232,6 +337,13 @@ let test_accumulation_round_trip () =
       "round-trip sell price"
       None
       loaded.A.last_sell_fill_price;
+    Alcotest.(check int) "round-trip lots" 2 (List.length loaded.A.buy_lots);
+    Alcotest.(check (float 1e-12))
+      "round-trip newest lot qty"
+      0.5
+      (match loaded.A.buy_lots with
+       | (_, q) :: _ -> q
+       | [] -> neg_infinity);
     (* Absent key loads defaults. *)
     let missing = A.load ~key:"Ladder:MISSING:kraken" in
     Alcotest.(check (float 1e-12)) "missing loads default" 0.0 missing.A.reserved_base)
@@ -441,6 +553,10 @@ let () =
         ; ( "apply_sell_fill fees reduce profit"
           , `Quick
           , test_apply_sell_fill_fees_reduce_profit )
+        ; "ladder lots one cycle per buy", `Quick, test_ladder_queue_one_cycle_per_buy
+        ; "partial sell keeps the lot", `Quick, test_partial_sell_keeps_lot
+        ; "withheld slice leaves the lot", `Quick, test_withheld_slice_leaves_the_lot
+        ; "lots survive serialization", `Quick, test_lots_survive_serialization
         ; "credit_profit persists and adds", `Quick, test_credit_profit_persists_and_adds
         ] )
     ; ( "round_trip"

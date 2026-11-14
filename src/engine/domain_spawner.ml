@@ -2125,6 +2125,7 @@ let asset_domain_worker
            st.reserved_base <- a.Dio_persistence.Base_accumulation_store.reserved_base;
            st.accumulated_profit
            <- a.Dio_persistence.Base_accumulation_store.accumulated_profit;
+           st.buy_lots <- a.Dio_persistence.Base_accumulation_store.buy_lots;
            let default_maker, default_taker =
              Dio_oracle.Oracle_fees.default_or_configured_fees
                ~exchange:c.oc_hedge_exchange

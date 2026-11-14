@@ -8,6 +8,7 @@
    - reserved_base: base accumulated via sell_mult; excluded from sellable balance
    - accumulated_profit: realized local PnL in quote
    - carry_credit_seq: newest carry recycle already credited (restart dedup)
+   - buy_lots: unspent buy fills, newest first, consumed one per credited sell
    - last_fill_oid / last_buy_fill_* / last_sell_fill_*: most recent fill refs
 
    Crash window: an async save may lose the most recent coalesced write, so
@@ -29,6 +30,10 @@ type t =
   ; last_buy_fill_qty : float option
   ; last_sell_fill_price : float option
   ; last_sell_fill_qty : float option
+  ; buy_lots : (float * float) list
+  (** Unspent buy fills, newest first as [(price, qty)], consumed one per credited sell.
+      Sharing one last-buy anchor across a run of buys credits the ladder step once per
+      sell too many. *)
   }
 
 type key = string
@@ -45,6 +50,7 @@ let default =
   ; last_buy_fill_qty = None
   ; last_sell_fill_price = None
   ; last_sell_fill_qty = None
+  ; buy_lots = []
   }
 ;;
 
@@ -73,6 +79,38 @@ let opt_field name = function
   | None -> []
 ;;
 
+(** Reads [[price, qty], ...]. Malformed rows are dropped rather than failing the entry. *)
+let get_lots json field =
+  let open Yojson.Basic.Util in
+  try
+    json
+    |> member field
+    |> to_list
+    |> List.filter_map (fun lot ->
+      try
+        match lot |> to_list with
+        | p :: q :: _ ->
+          let p = to_float p
+          and q = to_float q in
+          if Float.is_finite p && Float.is_finite q && p > 0.0 && q > 0.0
+          then Some (p, q)
+          else None
+        | _ -> None
+      with
+      | _ -> None)
+  with
+  | _ -> []
+;;
+
+(** True when [field] is present and not JSON null. [member] raises on a non-assoc entry,
+    and the caller's parse would then drop every entry in the file. *)
+let has_field json field =
+  try json |> Yojson.Basic.Util.member field <> `Null with
+  | _ -> false
+;;
+
+let lots_json lots = `List (List.map (fun (p, q) -> `List [ `Float p; `Float q ]) lots)
+
 let of_json json =
   let f name default =
     match get_float_opt json name with
@@ -87,6 +125,18 @@ let of_json json =
   ; last_buy_fill_qty = get_float_opt json "last_buy_fill_qty"
   ; last_sell_fill_price = get_float_opt json "last_sell_fill_price"
   ; last_sell_fill_qty = get_float_opt json "last_sell_fill_qty"
+  ; buy_lots =
+      (if has_field json "buy_lots"
+       then get_lots json "buy_lots"
+       else (
+         (* Pre-queue entry: resume with the last buy fill as the only open lot. An absent
+            field must not be read as "no unspent buys", or the anchor is spent twice. *)
+         match
+           ( get_float_opt json "last_buy_fill_price"
+           , get_float_opt json "last_buy_fill_qty" )
+         with
+         | Some p, Some q when p > 0.0 && q > 0.0 -> [ p, q ]
+         | _ -> []))
   }
 ;;
 
@@ -95,6 +145,7 @@ let to_json t =
     ([ "reserved_base", `Float t.reserved_base
      ; "accumulated_profit", `Float t.accumulated_profit
      ; "carry_credit_seq", `Int t.carry_credit_seq
+     ; "buy_lots", lots_json t.buy_lots
      ]
      @ (match t.last_fill_oid with
         | Some oid -> [ "last_fill_oid", `String oid ]
@@ -117,15 +168,72 @@ let orchestrator =
 
 (* Pure decision logic: no I/O, unit-testable *)
 
-(** Buy fill: update the last-buy reference for the next sell's profitability check. [oid]
-    is accepted per the store contract; OID sequencing is owned by the execution layer. *)
-let apply_buy_fill t ~price ~qty ~oid =
-  let _ = oid in
-  { t with last_buy_fill_price = Some price; last_buy_fill_qty = Some qty }
+(** Open buy lots kept per strategy; the tail drops first, being the least likely
+    companion of a future sell. *)
+let max_buy_lots = 32
+
+(** Keeps the [n] newest lots, dropping the tail. *)
+let rec keep_lots n = function
+  | [] -> []
+  | _ :: _ when n <= 0 -> []
+  | lot :: rest -> lot :: keep_lots (n - 1) rest
 ;;
 
-(** Sell fill: profit = (sell_price - last_buy_price) * paired_qty - [fees] (all-in, both
-    legs); positive net profit accrues to [accumulated_profit].
+(** Buy fill: records an unspent lot for the next sell's profitability check and updates
+    the last-buy reference, which prices the follow-up sell. [oid] is accepted per the
+    store contract; OID sequencing is owned by the execution layer. *)
+let apply_buy_fill t ~price ~qty ~oid =
+  let _ = oid in
+  let buy_lots =
+    if Float.is_finite price && Float.is_finite qty && price > 0.0 && qty > 0.0
+    then keep_lots max_buy_lots ((price, qty) :: t.buy_lots)
+    else t.buy_lots
+  in
+  { t with last_buy_fill_price = Some price; last_buy_fill_qty = Some qty; buy_lots }
+;;
+
+(** Consumes unspent lots newest-first down to [qty]. Returns the matched spread, the qty
+    left unmatched, and the surviving lots. Newest-first because the ladder places one
+    companion sell per buy, so the most recent buy funds the next sell to fill. *)
+let rec consume_lots ~price ~remaining acc = function
+  | [] -> acc, remaining, []
+  | (lot_price, lot_qty) :: rest ->
+    if remaining <= 0.0
+    then acc, 0.0, (lot_price, lot_qty) :: rest
+    else (
+      let matched = Float.min lot_qty remaining in
+      let acc = acc +. ((price -. lot_price) *. matched) in
+      let remaining = remaining -. matched in
+      let left = lot_qty -. matched in
+      (* Relative cutoff: a rounded fill qty rarely drains a lot exactly, and a rounding
+         residual must not fund a later cycle. *)
+      if left > 1e-9 *. lot_qty
+      then acc, remaining, (lot_price, left) :: rest
+      else consume_lots ~price ~remaining acc rest)
+;;
+
+(** Removes [remaining] base from the newest lots without pricing it. Used for base that
+    left the sellable pool without being sold (the slice a [sell_uses_mult] venue withheld
+    inside the order), so it cannot fund a second cycle. *)
+let rec drop_lots ~remaining = function
+  | [] -> []
+  | (lot_price, lot_qty) :: rest ->
+    if remaining <= 0.0
+    then (lot_price, lot_qty) :: rest
+    else (
+      let matched = Float.min lot_qty remaining in
+      let remaining = remaining -. matched in
+      let left = lot_qty -. matched in
+      if left > 1e-9 *. lot_qty
+      then (lot_price, left) :: rest
+      else drop_lots ~remaining rest)
+;;
+
+(** Sell fill: profit = the spread over the buy lots the sell consumes, minus [fees]
+    (all-in, both legs); positive net profit accrues to [accumulated_profit].
+
+    The consumed lots are dropped even when the cycle does not net a profit: that base
+    left the account, so it cannot fund another cycle.
 
     [sell_uses_mult] venues (Kraken) withheld the [(1 - sell_mult)] slice inside the
     order, so [oracle_qty * (1 - sell_mult)] may move into [reserved_base] once profit
@@ -152,31 +260,35 @@ let apply_sell_fill
     ; last_fill_oid = Some oid
     }
   in
-  match t.last_buy_fill_price with
-  | Some buy_price when buy_price > 0.0 && buy_price < price ->
-    let paired_qty =
-      match t.last_buy_fill_qty with
-      | Some q when q > 0.0 -> Float.min q qty
-      | _ -> qty
-    in
-    let net_profit = ((price -. buy_price) *. paired_qty) -. fees in
-    if net_profit > 0.0
-    then (
-      let accumulated_profit = t.accumulated_profit +. net_profit in
-      if not sell_uses_mult
-      then { t with accumulated_profit }
-      else (
-        let accrued_base = Float.max 0.0 (oracle_qty *. (1.0 -. sell_mult)) in
-        let base_cost = accrued_base *. buy_price in
-        if accrued_base > 0.0 && accumulated_profit >= base_cost +. buffer
-        then
-          { t with
-            reserved_base = t.reserved_base +. accrued_base
-          ; accumulated_profit = accumulated_profit -. base_cost
-          }
-        else { t with accumulated_profit }))
-    else t
-  | _ -> t
+  let matched_profit, _unmatched, lots_after_sell =
+    consume_lots ~price ~remaining:qty 0.0 t.buy_lots
+  in
+  (* The reserved slice is part of the base just sold, so its cost is that base's own buy
+     price: the newest consumed lot, else the last-buy anchor. *)
+  let basis_price =
+    match t.buy_lots with
+    | (p, _) :: _ -> p
+    | [] -> Option.value t.last_buy_fill_price ~default:price
+  in
+  let net_profit = matched_profit -. fees in
+  if net_profit <= 0.0
+  then { t with buy_lots = lots_after_sell }
+  else (
+    let accumulated_profit = t.accumulated_profit +. net_profit in
+    if not sell_uses_mult
+    then { t with accumulated_profit; buy_lots = lots_after_sell }
+    else (
+      let accrued_base = Float.max 0.0 (oracle_qty *. (1.0 -. sell_mult)) in
+      let base_cost = accrued_base *. basis_price in
+      if accrued_base > 0.0 && accumulated_profit >= base_cost +. buffer
+      then
+        { t with
+          reserved_base = t.reserved_base +. accrued_base
+        ; accumulated_profit = accumulated_profit -. base_cost
+        ; (* Withheld, not sold. *)
+          buy_lots = drop_lots ~remaining:accrued_base lots_after_sell
+        }
+      else { t with accumulated_profit; buy_lots = lots_after_sell }))
 ;;
 
 (* -- Persistence ------------------------------------------------------ *)

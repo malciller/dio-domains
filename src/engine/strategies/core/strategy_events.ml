@@ -105,6 +105,7 @@ let flush_persistence asset_symbol =
           , state.last_sell_fill_price
           , state.last_buy_fill_qty
           , state.last_sell_fill_qty
+          , state.buy_lots
           , state.persisted_sell_levels ))
       else None
     in
@@ -118,6 +119,7 @@ let flush_persistence asset_symbol =
         , last_sell_fill_price
         , last_buy_fill_qty
         , last_sell_fill_qty
+        , buy_lots
         , persisted_sell_levels ) ->
       let key =
         match state.persistence_key with
@@ -143,6 +145,7 @@ let flush_persistence asset_symbol =
           ; last_buy_fill_qty
           ; last_sell_fill_price
           ; last_sell_fill_qty
+          ; buy_lots
           };
       if state.sell_levels_enabled
       then
@@ -651,6 +654,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
           ; last_buy_fill_qty = state.last_buy_fill_qty
           ; last_sell_fill_price = state.last_sell_fill_price
           ; last_sell_fill_qty = state.last_sell_fill_qty
+          ; buy_lots = state.buy_lots
           }
           ~price:fill_price
           ~qty:acc_qty
@@ -660,6 +664,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
       <- updated.Dio_persistence.Base_accumulation_store.last_buy_fill_price;
       state.last_buy_fill_qty
       <- updated.Dio_persistence.Base_accumulation_store.last_buy_fill_qty;
+      state.buy_lots <- updated.Dio_persistence.Base_accumulation_store.buy_lots;
       (* Profit-gated lot skim for 1:1 venues (Hyperliquid, Kraken, Alpaca, ...). The
          order cannot withhold the [(1 - sell_mult)] slice (below one lot), so split the
          buy fill's own base: once quote profit covers a lot plus the buffer, move that
@@ -690,6 +695,11 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
           state.reserved_base <- state.reserved_base +. skim;
           state.accumulated_profit <- Float.max 0.0 (state.accumulated_profit -. cost);
           state.last_buy_fill_qty <- Some (acc_qty -. skim);
+          (* The skimmed base was never sellable, so the newest lot cannot fund a sell. *)
+          state.buy_lots
+          <- (match state.buy_lots with
+              | (lot_price, _) :: rest -> (lot_price, acc_qty -. skim) :: rest
+              | [] -> []);
           state.persistence_dirty <- true;
           Logging.info_f
             ~section
@@ -898,6 +908,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
          ; last_buy_fill_qty = state.last_buy_fill_qty
          ; last_sell_fill_price = state.last_sell_fill_price
          ; last_sell_fill_qty = state.last_sell_fill_qty
+         ; buy_lots = state.buy_lots
          }
        in
        let qty = acc_qty in
@@ -939,7 +950,9 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
        state.last_sell_fill_price
        <- updated.Dio_persistence.Base_accumulation_store.last_sell_fill_price;
        state.last_sell_fill_qty
-       <- updated.Dio_persistence.Base_accumulation_store.last_sell_fill_qty
+       <- updated.Dio_persistence.Base_accumulation_store.last_sell_fill_qty;
+       (* Spent lots are gone: the next sell needs a buy that actually filled. *)
+       state.buy_lots <- updated.Dio_persistence.Base_accumulation_store.buy_lots
      | Buy -> ());
     let should_update_oid =
       match state.last_fill_oid with

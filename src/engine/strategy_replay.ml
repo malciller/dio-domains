@@ -78,6 +78,24 @@ let emitted_of_order (o : Order.strategy_order) : Trace.emitted =
   }
 ;;
 
+(** Unspent buy lots as ["price:qty;..."]. The value scope has no list type, and a replay
+    that drops them credits less profit than the live run. *)
+let encode_lots lots =
+  String.concat ";" (List.map (fun (p, q) -> Printf.sprintf "%.17g:%.17g" p q) lots)
+;;
+
+let decode_lots s =
+  List.filter_map
+    (fun row ->
+      match String.split_on_char ':' row with
+      | [ p; q ] ->
+        (match float_of_string_opt p, float_of_string_opt q with
+         | Some p, Some q when p > 0.0 && q > 0.0 -> Some (p, q)
+         | _ -> None)
+      | _ -> None)
+    (String.split_on_char ';' s)
+;;
+
 (** Snapshot the decision-relevant scalar/option strategy-state fields for replay seeding,
     recorded as ["s_"-prefixed] entries. *)
 let snapshot_entries (st : Dio_strategies.Strategy_state.strategy_state)
@@ -104,6 +122,7 @@ let snapshot_entries (st : Dio_strategies.Strategy_state.strategy_state)
   ; "s_last_sell_fill_price", optf st.last_sell_fill_price
   ; "s_last_buy_fill_qty", optf st.last_buy_fill_qty
   ; "s_last_sell_fill_qty", optf st.last_sell_fill_qty
+  ; "s_buy_lots", Expr.V_string (encode_lots st.buy_lots)
   ; "s_last_fill_oid", opts st.last_fill_oid
   ; "s_feed_locked_sell_base", Expr.V_float st.feed_locked_sell_base
   ; "s_cached_qty_increment", Expr.V_float st.cached_qty_increment
@@ -168,6 +187,9 @@ let seed
   st.last_sell_fill_price <- getfo "s_last_sell_fill_price";
   st.last_buy_fill_qty <- getfo "s_last_buy_fill_qty";
   st.last_sell_fill_qty <- getfo "s_last_sell_fill_qty";
+  (match List.assoc_opt "s_buy_lots" entries with
+   | Some (Expr.V_string s) -> st.buy_lots <- decode_lots s
+   | _ -> ());
   st.last_fill_oid <- gets "s_last_fill_oid";
   st.feed_locked_sell_base <- getf "s_feed_locked_sell_base" st.feed_locked_sell_base;
   st.cached_qty_increment <- getf "s_cached_qty_increment" st.cached_qty_increment;

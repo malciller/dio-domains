@@ -348,6 +348,7 @@ module Strategy = struct
             ; last_buy_fill_qty = state.last_buy_fill_qty
             ; last_sell_fill_price = state.last_sell_fill_price
             ; last_sell_fill_qty = state.last_sell_fill_qty
+            ; buy_lots = state.buy_lots
             };
         Logging.info_f
           ~section
