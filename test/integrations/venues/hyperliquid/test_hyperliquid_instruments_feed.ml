@@ -181,6 +181,27 @@ let test_deployer_fee_scaling () =
     (Hyperliquid.Instruments_feed.apply_deployer_fee ~symbol:"BTC" 0.0005)
 ;;
 
+let test_lookup_market () =
+  Hyperliquid.Instruments_feed.initialize [ "MKT"; "MKT/USDC" ];
+  (match Hyperliquid.Instruments_feed.lookup_market "MKT" with
+   | Some (Hyperliquid.Instruments_feed.Perp, coin) ->
+     Alcotest.(check string) "perp coin" "MKT" coin
+   | _ -> Alcotest.fail "MKT should resolve as a perpetual");
+  (match Hyperliquid.Instruments_feed.lookup_market "MKT/USDC" with
+   | Some (Hyperliquid.Instruments_feed.Spot, coin) ->
+     Alcotest.(check string) "spot channel" "@0" coin
+   | _ -> Alcotest.fail "MKT/USDC should resolve as a spot pair");
+  (* No base-asset fallback: an unlisted pair is not its base perpetual. *)
+  Alcotest.(check bool)
+    "unlisted pair has no market"
+    true
+    (Option.is_none (Hyperliquid.Instruments_feed.lookup_market "NOPE/USDC"));
+  Alcotest.(check string)
+    "unlisted pair has no subscription coin"
+    ""
+    (Hyperliquid.Instruments_feed.get_subscription_coin "NOPE/USDC")
+;;
+
 let () =
   Alcotest.run
     "Hyperliquid Instruments Feed"
@@ -191,6 +212,7 @@ let () =
         ] )
     ; ( "lookup"
       , [ Alcotest.test_case "get_subscription_coin" `Quick test_get_subscription_coin
+        ; Alcotest.test_case "lookup_market" `Quick test_lookup_market
         ; Alcotest.test_case "get_asset_index" `Quick test_get_asset_index
         ; Alcotest.test_case "lookup_info" `Quick test_lookup_info
         ; Alcotest.test_case "get_qty_increment" `Quick test_get_qty_increment

@@ -47,23 +47,27 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
       |> List.filter (fun cfg ->
         Dio_exchange.Exchange_intf.Types.exchange_of_string cfg.Dio_engine.Config.exchange
         = Hyperliquid)
-      |> List.fold_left
-           (fun acc cfg ->
-             let sym = cfg.Dio_engine.Config.symbol in
-             if String.contains sym '/'
-             then (
-               let base_asset = String.split_on_char '/' sym |> List.hd in
-               base_asset :: sym :: acc)
-             else sym :: acc)
-           []
+      |> List.map (fun cfg -> cfg.Dio_engine.Config.symbol)
     in
-    (* A cross-venue controller needs the hedge venue's perp/spot data even when no grid
-       trades it there. *)
+    (* A cross-venue controller needs the hedge venue's perp touch even when no grid
+       trades it there. An overlay instance hedges the base perpetual of its pair, so
+       subscribe both the pair and that coin; nothing else is expanded - a spot pair is
+       its own market and must not drag in the perpetual of the same name. *)
+    let from_instances =
+      Dio_engine.Config.get_overlay_instances ()
+      |> List.filter (fun (o : Dio_engine.Config.overlay_instance) ->
+        String.equal
+          (Dio_engine.Config.normalize_exchange o.Dio_engine.Config.oi_exchange)
+          "hyperliquid")
+      |> List.concat_map (fun (o : Dio_engine.Config.overlay_instance) ->
+        let base = Dio_engine.Config.base_coin_of_symbol o.Dio_engine.Config.oi_symbol in
+        if String.equal base o.Dio_engine.Config.oi_symbol
+        then [ base ]
+        else [ base; o.oi_symbol ])
+    in
     List.sort_uniq
       String.compare
-      (from_trading
-       @ overlay_hedge_symbols "hyperliquid"
-       @ overlay_instance_symbols "hyperliquid")
+      (from_trading @ overlay_hedge_symbols "hyperliquid" @ from_instances)
   in
   let has_hyperliquid = List.length hyperliquid_symbols > 0 in
   let has_kraken = List.length kraken_symbols > 0 in

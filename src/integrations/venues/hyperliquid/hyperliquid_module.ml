@@ -521,14 +521,29 @@ module Hyperliquid_impl = struct
   let subscribe_orderbook ~symbols =
     Lwt_list.iter_s
       (fun symbol ->
-        let _ = Hyperliquid_orderbook_feed.ensure_store symbol in
-        let _ = Hyperliquid_executions_feed.get_symbol_store symbol in
-        let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
-        Hyperliquid_ws.subscribe
-          (`Assoc
-            [ "method", `String "subscribe"
-            ; "subscription", `Assoc [ "type", `String "l2Book"; "coin", `String coin ]
-            ]))
+        match Hyperliquid_orderbook_feed.register_market symbol with
+        | None ->
+          Logging.debug_f
+            ~section:"hyperliquid_module"
+            "No Hyperliquid market for %s; skipping dynamic book subscription"
+            symbol;
+          Lwt.return_unit
+        | Some coin ->
+          let _ = Hyperliquid_executions_feed.get_symbol_store symbol in
+          Hyperliquid_ws.subscribe
+            (`Assoc
+              [ "method", `String "subscribe"
+              ; ( "subscription"
+                , `Assoc
+                    [ "type", `String "l2Book"; "coin", `String coin; "fast", `Bool true ]
+                )
+              ])
+          >>= fun () ->
+          Hyperliquid_ws.subscribe
+            (`Assoc
+              [ "method", `String "subscribe"
+              ; "subscription", `Assoc [ "type", `String "bbo"; "coin", `String coin ]
+              ]))
       symbols
   ;;
 
@@ -899,10 +914,12 @@ module Hyperliquid_impl = struct
       ~testnet:(Atomic.get is_testnet)
   ;;
 
-  (* Uniform decode entry: l2Book frames go through the zero-alloc TOB parser. Control
-     channels (pong/responses/subscriber fan-out) touch Lwt and stay in the WS layer. *)
+  (* Uniform decode entry: l2Book snapshots and bbo touches go through the zero-alloc
+     parsers on the parse domain. Control channels (pong/responses/subscriber fan-out)
+     touch Lwt and stay in the WS layer. *)
   let decode_frame content =
     if String.starts_with ~prefix:"{\"channel\":\"l2Book\"," content
+       || String.starts_with ~prefix:"{\"channel\":\"bbo\"," content
     then Hyperliquid_orderbook_feed.process_raw_market_data content
   ;;
 end

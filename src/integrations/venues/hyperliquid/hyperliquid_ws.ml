@@ -14,11 +14,6 @@ type subscription =
   }
 [@@ocaml.doc " Handle returned to consumers of [subscribe_market_data]. "]
 
-type raw_subscription =
-  { stream : string Lwt_stream.t
-  ; close : unit -> unit
-  }
-
 let is_connected_ref = Atomic.make false
 let is_connected () = Atomic.get is_connected_ref
 
@@ -108,8 +103,6 @@ let get_user_resync_needed () = Atomic.exchange user_resync_needed false
 
 let note_user_resync_needed () = Atomic.set user_resync_needed true
 let get_dropped_user_messages () = Atomic.get dropped_user_messages
-let raw_pushers : (string option -> bool) list ref = ref []
-let raw_pushers_mutex = Mutex.create ()
 
 module Response_table = Hashtbl.Make (struct
     type t = int
@@ -221,19 +214,6 @@ let close_all_subscribers () =
         try ignore (push None) with
         | _ -> ())
       ps);
-  Mutex.lock raw_pushers_mutex;
-  (let r_ps = !raw_pushers in
-   raw_pushers := [];
-   Mutex.unlock raw_pushers_mutex;
-   let count_raw = List.length r_ps in
-   if count_raw > 0
-   then (
-     Logging.debug_f ~section "Closing %d raw subscriber streams on disconnect" count_raw;
-     List.iter
-       (fun push ->
-         try ignore (push None) with
-         | _ -> ())
-       r_ps));
   Mutex.lock user_pushers_mutex;
   let u_ps = !user_pushers in
   user_pushers := [];
@@ -356,26 +336,6 @@ let broadcast_message json =
   else broadcast_market_message json
 ;;
 
-let broadcast_raw_message msg =
-  Mutex.lock raw_pushers_mutex;
-  let ps = !raw_pushers in
-  Mutex.unlock raw_pushers_mutex;
-  if ps = []
-  then ()
-  else (
-    let dead = ref [] in
-    List.iter
-      (fun push ->
-        try ignore (push (Some msg)) with
-        | _ -> dead := push :: !dead)
-      ps;
-    if !dead <> []
-    then (
-      Mutex.lock raw_pushers_mutex;
-      raw_pushers := List.filter (fun p -> not (List.memq p !dead)) !raw_pushers;
-      Mutex.unlock raw_pushers_mutex))
-;;
-
 let subscribe_market_data () =
   let stream, push_source = Lwt_stream.create_bounded 16 in
   let push_fn item =
@@ -436,32 +396,6 @@ let subscribe_user_data () =
   ({ stream; close } : subscription)
 [@@ocaml.doc
   " Dedicated stream for user-state messages (balances, fills, order updates). "]
-;;
-
-let subscribe_raw_market_data () =
-  let stream, push_source = Lwt_stream.create_bounded 16 in
-  let push_fn item =
-    match item with
-    | None ->
-      push_source#close;
-      true
-    | Some msg ->
-      let p = push_source#push msg in
-      if Lwt.is_sleeping p
-      then (
-        Lwt.cancel p;
-        false)
-      else true
-  in
-  Mutex.lock raw_pushers_mutex;
-  raw_pushers := push_fn :: !raw_pushers;
-  Mutex.unlock raw_pushers_mutex;
-  let close () =
-    Mutex.lock raw_pushers_mutex;
-    raw_pushers := List.filter (fun p -> p != push_fn) !raw_pushers;
-    Mutex.unlock raw_pushers_mutex
-  in
-  ({ stream; close } : raw_subscription)
 ;;
 
 let subscribe json =
@@ -633,27 +567,50 @@ let subscribe_to_feeds ~symbols ~wallet =
       | exn -> exn)
     __ppx_lwt_0
     (fun () ->
-      Lwt_list.iter_s
-        (fun symbol ->
-          let coin = Hyperliquid_instruments_feed.get_subscription_coin symbol in
-          Logging.debug_f ~section "Subscribing to l2Book for %s (coin=%s)" symbol coin;
-          subscribe
-            (`Assoc
-              [ "method", `String "subscribe"
-              ; "subscription", `Assoc [ "type", `String "l2Book"; "coin", `String coin ]
-              ]))
+      (* One l2Book + bbo subscription per distinct coin. Each configured symbol resolves
+         to its exact market (spot pair -> @N, perp -> bare coin); a symbol the venue does
+         not list is skipped instead of being aliased onto another market's coin.
+         [fast: true] is required: the default public book is 20 levels every 2-5s, which
+         starves a decision loop that reacts to book revisions. bbo is the venue's only
+         low-latency public touch feed (~5-10Hz). *)
+      let book_coins =
         symbols
-      >>= fun () ->
-      let coins = List.sort_uniq String.compare (List.map perp_coin_of_symbol symbols) in
+        |> List.filter_map (fun symbol ->
+          match Hyperliquid_instruments_feed.get_subscription_coin symbol with
+          | "" -> None
+          | coin -> Some coin)
+        |> List.sort_uniq String.compare
+      in
       Lwt_list.iter_s
         (fun coin ->
-          Logging.debug_f ~section "Subscribing to perp l2Book (coin=%s)" coin;
+          Logging.debug_f ~section "Subscribing to l2Book/bbo (coin=%s)" coin;
           subscribe
             (`Assoc
               [ "method", `String "subscribe"
-              ; "subscription", `Assoc [ "type", `String "l2Book"; "coin", `String coin ]
+              ; ( "subscription"
+                , `Assoc
+                    [ "type", `String "l2Book"; "coin", `String coin; "fast", `Bool true ]
+                )
               ])
           >>= fun () ->
+          subscribe
+            (`Assoc
+              [ "method", `String "subscribe"
+              ; "subscription", `Assoc [ "type", `String "bbo"; "coin", `String coin ]
+              ]))
+        book_coins
+      >>= fun () ->
+      (* Funding/mark context is perp-only, and is needed even when the perp book is not
+         consumed (an overlay prices its hedge off the mark when the touch is absent). *)
+      let coins =
+        List.sort_uniq
+          String.compare
+          (List.filter
+             Hyperliquid_instruments_feed.is_perp_coin
+             (List.map perp_coin_of_symbol symbols))
+      in
+      Lwt_list.iter_s
+        (fun coin ->
           Logging.debug_f ~section "Subscribing to activeAssetCtx (coin=%s)" coin;
           subscribe
             (`Assoc
@@ -665,55 +622,30 @@ let subscribe_to_feeds ~symbols ~wallet =
 [@@ocaml.doc
   " Sends subscription messages for all configured channels. If [wallet] is non-empty,\n\
   \    subscribes to user-specific channels: webData2, userEvents, spotState, userFills,\n\
-  \    userFundings, userNonFundingLedgerUpdates, orderUpdates. Subscribes to l2Book for \
-   each\n\
-  \    symbol, using the coin identifier resolved via [Hyperliquid_instruments_feed]. "]
+  \    userFundings, userNonFundingLedgerUpdates, orderUpdates. Subscribes to fast \
+   [l2Book]\n\
+  \    and [bbo] once per distinct coin resolved via [Hyperliquid_instruments_feed] (spot\n\
+  \    pairs use [@N], perpetuals their bare coin), and to [activeAssetCtx] for each perp\n\
+  \    coin. "]
 ;;
 
-let extract_event_time_s content =
-  let key = "\"time\":" in
-  let klen = String.length key in
-  let n = String.length content in
-  let matches_at i =
-    let rec go k = k >= klen || (content.[i + k] = key.[k] && go (k + 1)) in
-    i + klen <= n && go 0
-  in
-  let is_num_char c =
-    (c >= '0' && c <= '9') || c = '.' || c = '-' || c = '+' || c = 'e' || c = 'E'
-  in
-  let rec find i =
-    if i + klen > n
-    then None
-    else if matches_at i
-    then (
-      let j = ref (i + klen) in
-      while !j < n && (content.[!j] = ' ' || content.[!j] = '\t') do
-        incr j
-      done;
-      let start = !j in
-      while !j < n && is_num_char content.[!j] do
-        incr j
-      done;
-      if !j > start
-      then (
-        try
-          let ms = float_of_string (String.sub content start (!j - start)) in
-          if ms >= 1_000_000_000_000.0 && ms < 10_000_000_000_000.0
-          then Some (ms /. 1000.0)
-          else None
-        with
-        | _ -> None)
-      else None)
-    else find (i + 1)
-  in
-  find 0
-[@@ocaml.doc
-  " Extracts a server event timestamp (milliseconds since epoch) from a raw text frame by\n\
-  \    scanning for `\"time\":`, returning it as Unix seconds. Cheap and \
-   allocation-light: no\n\
-  \    JSON parse on the l2Book hot path. [None] when the frame carries no timestamp (e.g.\n\
-  \    ping/pong, subscription responses). "]
+(* Book frames are full snapshots or touches, so a frame the parse domain cannot accept is
+   dropped rather than parsed inline. The next push repairs the touch, and this keeps the
+   parse domain the only writer of every book store (the ring buffer is single-writer). *)
+let dropped_book_frames = Atomic.make 0
+
+let note_dropped_book () =
+  let n = Atomic.fetch_and_add dropped_book_frames 1 + 1 in
+  if n land 63 = 1
+  then
+    Logging.warn_f
+      ~section
+      "Hyperliquid parse queue full: dropped %d book frame(s); the next push repairs the \
+       touch"
+      n
 ;;
+
+let get_dropped_book_frames () = Atomic.get dropped_book_frames
 
 let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
   match frame.Websocket.Frame.opcode with
@@ -721,18 +653,14 @@ let handle_frame ~on_heartbeat (frame : Websocket.Frame.t) =
     Concurrency.Tick_event_bus.publish_tick ();
     on_heartbeat ();
     let content = frame.Websocket.Frame.content in
-    (match extract_event_time_s content with
-     | Some event -> Network_latency.record_feed_event_s "hyperliquid" ~event ()
-     | None -> ());
-    if String.starts_with ~prefix:"{\"channel\":\"l2Book\"," content
+    let l2book = String.starts_with ~prefix:"{\"channel\":\"l2Book\"," content in
+    let bbo = String.starts_with ~prefix:"{\"channel\":\"bbo\"," content in
+    if l2book || bbo
     then (
-      (* Shadow the replacement feed path on the raw frame before the legacy parse. The
-         hotpath ring is a no-op unless DIO_HOTPATH_SHADOW is enabled. *)
-      Hotpath_feed.submit ~recv_ns:(Monotonic_clock.now_ns ()) content;
-      (* Parse on the venue's parse domain; fall back to the raw stream (whose consumer
-         parses inline) when that domain is saturated. *)
+      (* The shadow decodes l2Book depth only; feeding it bbo would count parse failures. *)
+      if l2book then Hotpath_feed.submit ~recv_ns:(Monotonic_clock.now_ns ()) content;
       if not (Concurrency.Parse_worker.submit_frame "hyperliquid" content)
-      then broadcast_raw_message content;
+      then note_dropped_book ();
       Lwt.return_unit)
     else (
       (try

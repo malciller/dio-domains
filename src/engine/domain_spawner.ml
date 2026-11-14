@@ -1699,10 +1699,11 @@ let asset_domain_worker
       "Domain for %s/%s starting consumption from exec position 0 (full replay)"
       asset_with_fees.exchange
       asset_with_fees.symbol;
-    (* Orderbook position starts at the current write position, skipping stale ring-buffer
-       data. Starting at 0 would replay up to 128 historical entries per symbol on each
-       restart. *)
-    orderbook_read_pos := Ex.get_orderbook_position ~symbol:asset_with_fees.symbol;
+    (* Book revision starts at the current value, skipping stale ring-buffer data.
+       Starting at 0 would replay up to 128 historical entries per symbol on each restart.
+       The fast accessor is the revision (depth or touch), not the replay cursor. *)
+    orderbook_read_pos
+    := (Ex.get_orderbook_position_fast ~symbol:asset_with_fees.symbol) ();
     (* Seed current_price and top_of_book from the exchange live cache so the first cycle
        can execute immediately rather than waiting for the next incoming update. *)
     (match Ex.get_top_of_book ~symbol:asset_with_fees.symbol with

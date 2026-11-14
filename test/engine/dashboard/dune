@@ -17,3 +17,7 @@
 (executable
  (name preview_log_panel)
  (libraries dio.dashboard_ui dio.notty dio.yojson))
+
+(executable
+ (name preview_latencies)
+ (libraries dio.dashboard_ui dio.notty dio.yojson))

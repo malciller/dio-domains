@@ -995,16 +995,12 @@ let market_facts_io (io : Strategy_runtime.facts_io) c =
         | None ->
           (try Ex.get_tradeable_balance ~asset:"USDC" with
            | _ -> 0.0));
-     (* A perp l2Book can be keyed by the bare coin (the usual case) or, for a cross-venue
-        controller whose symbol has no matching spot pair, by the controller's pair: on
-        Hyperliquid the l2Book subscription for an ADA/XMR domain is the bare coin, but
-        the frame is filed under the domain pair, so the coin store stays empty. Try the
-        coin, then the domain symbol. For an overlay the domain symbol is frequently
-        a *spot* pair (ETH/USDC, SOL/USDC, HYPE/USDC), where the spot book is the wrong
-        side of the perp touch by the spot-perp premium; those already resolve on the coin
-        store, so the pair fallback only fires for the pair-keyed perp books. If neither
-        exists, quote the perp mark so the hedge is still priced off the perp rather than
-        left with no quote. *)
+     (* A perp l2Book is filed under its bare coin; a spot pair is its own market with its
+        own store. Try the coin first. For an overlay controller the pair is frequently a
+        spot book (ETH/USDC, SOL/USDC, HYPE/USDC) whose mid differs from the perp touch by
+        the spot-perp premium, so the pair must never stand in for the perp: when the coin
+        store has no touch the perp mark is the honest quote. A plain grid may still read
+        its own pair-keyed book. *)
      let overlay_controller = c.cg_overlay_accumulated >= 0.0 in
      let fallback_mark =
        match funding with
@@ -1022,10 +1018,10 @@ let market_facts_io (io : Strategy_runtime.facts_io) c =
           It is a genuine perp quote, unlike the pair store which can be a spot book. *)
        setf Slots.bid fallback_mark;
        setf Slots.ask fallback_mark)
-     else if Ex.get_top_of_book_into ~symbol tob
+     else if (not overlay_controller) && Ex.get_top_of_book_into ~symbol tob
      then (
-       (* Second attempt keyed by the domain symbol: a perp l2Book can be filed under the
-          pair rather than the bare coin. *)
+       (* Plain grid: a perp l2Book can be filed under the pair rather than the bare coin
+          on venues that enumerate it that way. *)
        setf Slots.bid tob.(0);
        setf Slots.ask tob.(2))
      else (

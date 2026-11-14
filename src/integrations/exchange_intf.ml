@@ -284,7 +284,7 @@ end
     Keep this signature minimal: adding an O(n) or lock-taking accessor here is how the
     hot-path guarantee silently regresses. *)
 module type HOT_READS = sig
-  (** O(1) lock-free closure for the current orderbook position. *)
+  (** O(1) lock-free closure for the current book revision. *)
   val get_orderbook_position_fast : symbol:string -> unit -> int
 
   (** O(1) lock-free closure for top-of-book. *)
@@ -451,9 +451,9 @@ module type S = sig
       orderbook data is unavailable. *)
   val get_top_of_book : symbol:string -> (float * float * float * float) option
 
-  (** Top of book written into [buf] as (bid price, bid size, ask price, ask size), returning
-      false when the venue has no quote. The tuple-returning accessor above allocates one
-      [Some] per call; the strategy cycle reads the book on every event. *)
+  (** Top of book written into [buf] as (bid price, bid size, ask price, ask size),
+      returning false when the venue has no quote. The tuple-returning accessor above
+      allocates one [Some] per call; the strategy cycle reads the book on every event. *)
   val get_top_of_book_into : symbol:string -> float array -> bool
 
   (** Return [true] if a usable orderbook has been cached for [symbol] since the last
@@ -594,8 +594,11 @@ module type S = sig
     :  symbol:string
     -> (string * (float option * float * string * int option) option) list * bool
 
-  (** Return a fast path closure for fetching the current orderbook position without lock
-      acquisition/hash lookup overhead. *)
+  (** Return a fast path closure for fetching the current book revision without lock
+      acquisition/hash lookup overhead. A monotonic counter is enough: callers only
+      compare it to the value they last saw to decide whether the market moved. Venues
+      whose touch feed is separate from their depth feed (Hyperliquid bbo vs l2Book)
+      advance it on both, so it is not necessarily the ring-buffer write position. *)
   val get_orderbook_position_fast : symbol:string -> unit -> int
 
   (** Return a fast path closure for fetching top-of-book data without hash lookup

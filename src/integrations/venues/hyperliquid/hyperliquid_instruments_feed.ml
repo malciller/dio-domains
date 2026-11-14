@@ -223,6 +223,34 @@ let is_perp_coin symbol =
     (not (String.contains symbol '/')) && not (String.starts_with ~prefix:"@" symbol)
 ;;
 
+(** Which book a configured symbol denotes. Spot pairs and perpetuals are distinct markets
+    on Hyperliquid even when they share a base asset, so callers must not conflate them. *)
+type market_kind =
+  | Spot
+  | Perp
+
+(** Exact market identity for [symbol]: its kind and the identifier the venue's WebSocket
+    channels use ([@N] for spot, the bare coin for a perpetual). [None] when the venue
+    does not list that exact symbol. Unlike {!lookup_info} there is no base-asset
+    fallback: a pair the venue has no spot listing for is not silently treated as its
+    perpetual. *)
+let lookup_market symbol =
+  let cache = Atomic.get published_cache in
+  match Hashtbl.find_opt cache symbol with
+  | Some info when info.asset_index >= 10_000 && info.asset_index < 100_000 ->
+    (* Spot: the channel identifier is the pair index, not the pair name. Builder perps
+       carry ids >= 100000 and stay perpetual even if their meta omits maxLeverage. *)
+    Some (Spot, Printf.sprintf "@%d" (info.asset_index - 10_000))
+  | Some info -> Some (Perp, info.symbol)
+  | None when String.contains symbol ':' ->
+    (* Builder-deployed perp: the venue names the market [dex:coin] and that name is its
+       own channel identifier, so it resolves without the cache (which is filled by a REST
+       fetch that can fail). Not a fallback between markets: no other symbol may contain
+       ':'. *)
+    Some (Perp, symbol)
+  | None -> None
+;;
+
 (** Looks up instrument info by symbol from the published snapshot (lock-free). Falls back
     to the base name (strip "/QUOTE") to resolve perpetuals. Spot pairs are keyed by full
     "BASE/QUOTE" with [asset_index >= 10000]. *)
@@ -319,7 +347,8 @@ let process_builder_dex_meta ~dex_index ~dex_name payload =
         with
         | None -> ()
         | Some (coin, sz_decimals, max_leverage, scale, growth) ->
-          let symbol = dex_name ^ ":" ^ coin in
+          (* Builder coins are already named [dex:coin]; prepend only for a bare name. *)
+          let symbol = if String.contains coin ':' then coin else dex_name ^ ":" ^ coin in
           let asset_index = 100_000 + (dex_index * 10_000) + index in
           Hashtbl.replace
             pair_cache
@@ -489,29 +518,13 @@ let resolve_symbol coin =
   res
 ;;
 
-(** Returns the coin identifier expected by Hyperliquid WebSocket channels (l2Book).
+(** Returns the coin identifier expected by Hyperliquid WebSocket channels (l2Book, bbo).
     Perpetuals use the base coin name; spot pairs use the "@N" format derived from
-    asset_index. *)
+    asset_index. Returns [""] when [symbol] is not an exact market on this venue. *)
 let get_subscription_coin symbol =
-  Mutex.lock cache_mutex;
-  let res =
-    match Hashtbl.find_opt pair_cache symbol with
-    | Some _ when String.contains symbol ':' ->
-      (* Builder perp: the venue's coin name is already [dex:coin]. Asset ids above 100000
-         are builder perps, not spot pairs - encoding them as @N subscribes to a coin that
-         does not exist and no book ever arrives. *)
-      symbol
-    | Some info when info.asset_index >= 10000 && info.asset_index < 100_000 ->
-      (* Spot pair: encode as @N where N = asset_index - 10000. *)
-      Printf.sprintf "@%d" (info.asset_index - 10000)
-    | _ ->
-      (* Perpetual or unknown: extract base coin name. *)
-      if String.contains symbol '/'
-      then String.split_on_char '/' symbol |> List.hd
-      else symbol
-  in
-  Mutex.unlock cache_mutex;
-  res
+  match lookup_market symbol with
+  | Some (_, coin) -> coin
+  | None -> ""
 ;;
 
 (** Rounds price according to Hyperliquid per-symbol precision rules. Step 1: round to 5
