@@ -750,7 +750,17 @@ let start_trade_updates_ws () =
         ; "secret", `String (Alpaca_types.Config.api_secret ())
         ])
     >>= fun () ->
+    (* Chained reads retain one Lwt node per frame. [read_done] carries a read failure to
+       the reconnect loop below. *)
+    let read_done, read_done_u = Lwt.wait () in
+    let fail_read exn =
+      if Lwt.is_sleeping read_done then Lwt.wakeup_later_exn read_done_u exn;
+      Lwt.return_unit
+    in
     let rec read_loop () =
+      Lwt.async (fun () -> Lwt.catch read_frame fail_read);
+      Lwt.return_unit
+    and read_frame () =
       Ws_lwt.read conn
       >>= fun frame ->
       match frame.Websocket.Frame.opcode with
@@ -764,10 +774,10 @@ let start_trade_updates_ws () =
         >>= fun () -> read_loop ()
       | Websocket.Frame.Opcode.Close ->
         Lwt.fail (Failure "Alpaca trading WS closed by server")
-      | _ -> handle conn frame.Websocket.Frame.content
-      >>= fun () -> read_loop ()
+      | _ ->
+        handle conn frame.Websocket.Frame.content >>= fun () -> read_loop ()
     in
-    read_loop ()
+    read_loop () >>= fun () -> read_done
   in
   Lwt.async (fun () ->
     let rec loop () =
@@ -778,7 +788,11 @@ let start_trade_updates_ws () =
           (Printexc.to_string exn);
         Lwt.return_unit)
       >>= fun () ->
-      Lwt_unix.sleep 5.0 >>= fun () -> loop ()
+      Lwt_unix.sleep 5.0
+      >>= fun () ->
+      (* Chained attempts retain one Lwt node per reconnect. *)
+      Lwt.async loop;
+      Lwt.return_unit
     in
     loop ())
 ;;
@@ -901,15 +915,9 @@ let consume_event_stream ~on_heartbeat body =
       scan chunk (i + 1) (i + 1))
     else scan chunk (i + 1) start
   in
-  let rec loop () =
-    Lwt_stream.get stream
-    >>= function
-    | None -> Lwt.return_unit
-    | Some chunk ->
-      scan chunk 0 0;
-      loop ()
-  in
-  loop ()
+  (* Chained [Lwt_stream.get] retains one Lwt node per chunk; [consume_stream] spawns each
+     iteration instead. *)
+  Concurrency.Lwt_util.consume_stream (fun chunk -> scan chunk 0 0) stream
   >>= fun () ->
   dispatch ();
   Lwt.return_unit

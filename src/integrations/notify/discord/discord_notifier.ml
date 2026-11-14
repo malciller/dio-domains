@@ -554,7 +554,11 @@ let start () =
             ~section
             "Discord consumer loop crashed: %s, restarting in 10s"
             (Printexc.to_string exn);
-          Lwt_unix.sleep 10.0 >>= fun () -> start_consumer ())
+          Lwt_unix.sleep 10.0
+          >>= fun () ->
+          (* Chained restarts retain one Lwt node per crash. *)
+          Lwt.async start_consumer;
+          Lwt.return_unit)
     in
     Lwt.async start_consumer
 ;;

@@ -366,7 +366,17 @@ let start ~start_time =
       Unix.chmod path 0o600;
       Logging.info_f ~section "Dashboard server listening on %s" path;
       Lwt.async state_broadcaster;
+      let accept_done, accept_done_u = Lwt.wait () in
+      let fail_accept exn =
+        if Lwt.is_sleeping accept_done then Lwt.wakeup_later_exn accept_done_u exn;
+        Lwt.return_unit
+      in
+      (* Chained accepts retain one Lwt node per connection. [accept_done] carries an
+         accept failure to the shutdown handler below. *)
       let rec accept_loop () =
+        Lwt.async (fun () -> Lwt.catch accept_one fail_accept);
+        Lwt.return_unit
+      and accept_one () =
         let __ppx_lwt_0 = Lwt_unix.accept server_socket in
         Lwt.backtrace_bind
           "src/engine/dashboard/dashboard_server.ml"
@@ -434,7 +444,7 @@ let start ~start_time =
               accept_loop ()))
       in
       Lwt.catch
-        (fun () -> accept_loop ())
+        (fun () -> accept_loop () >>= fun () -> accept_done)
         (fun exn ->
           Logging.info_f
             ~section

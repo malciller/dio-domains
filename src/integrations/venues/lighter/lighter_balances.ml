@@ -91,6 +91,7 @@ let balance_stores : (string, BalanceStore.t) Ds.Cow_table.t =
 ;;
 
 let is_ready = Atomic.make false
+let ready_doorbell = Concurrency.Domain_doorbell.create ()
 
 let get_balance_store asset =
   match Ds.Cow_table.find_opt balance_stores asset with
@@ -136,9 +137,12 @@ let get_all_assets () =
   Ds.Cow_table.fold (fun asset _store acc -> asset :: acc) balance_stores ~init:[]
 ;;
 
-(* Atomic flag only: account frames are decoded on the parse domain, which must not touch
-   Lwt. Startup waiters poll. *)
-let notify_ready () = Atomic.set is_ready true
+(* Account frames are decoded on the parse domain, which must not touch Lwt: flip the
+   flag, then ring the doorbell that wakes the Lwt waiter. *)
+let notify_ready () =
+  if not (Atomic.exchange is_ready true)
+  then Concurrency.Domain_doorbell.ring ready_doorbell
+;;
 
 let wait_for_balance_data_lwt assets timeout_seconds =
   let start_time = Unix.gettimeofday () in
@@ -154,10 +158,14 @@ let wait_for_balance_data_lwt assets timeout_seconds =
   wait_loop ()
 ;;
 
+(* Re-check after each wake: a ring between the flag read and the wait leaves a byte
+   pending, so the wait returns immediately instead of sleeping. *)
 let wait_until_ready () =
   let open Lwt.Infix in
   let rec wait_loop () =
-    if Atomic.get is_ready then Lwt.return_true else Lwt_unix.sleep 0.01 >>= wait_loop
+    if Atomic.get is_ready
+    then Lwt.return_true
+    else Concurrency.Domain_doorbell.wait ready_doorbell >>= wait_loop
   in
   wait_loop ()
 ;;

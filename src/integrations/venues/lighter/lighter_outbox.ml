@@ -33,7 +33,12 @@ let take t n =
 
 let rec writer_loop t =
   if Queue.is_empty t.queue
-  then Lwt_condition.wait t.cond >>= fun () -> writer_loop t
+  then (
+    Lwt_condition.wait t.cond
+    >>= fun () ->
+    (* Chained waits retain one Lwt node per wakeup. *)
+    Lwt.async (fun () -> writer_loop t);
+    Lwt.return_unit)
   else (
     let batch = take t t.max_batch in
     let payloads = List.map (fun request -> request.payload) batch in
@@ -52,7 +57,9 @@ let rec writer_loop t =
         in
         Lwt.wakeup_later reply result)
       batch;
-    writer_loop t)
+    (* Chained drains retain one Lwt node per batch. *)
+    Lwt.async (fun () -> writer_loop t);
+    Lwt.return_unit)
 ;;
 
 (** [send] is called by the writer, never concurrently with itself, and must return one
