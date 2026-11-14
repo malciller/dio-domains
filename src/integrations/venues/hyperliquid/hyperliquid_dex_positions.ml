@@ -147,7 +147,13 @@ let start ~testnet ~user ~dexes () =
                 (Printexc.to_string exn);
               Lwt.return_unit))
         dexes
-      >>= fun () -> Lwt_unix.sleep poll_interval_s >>= fun () -> loop ()
+      >>= fun () ->
+      Lwt_unix.sleep poll_interval_s
+      >>= fun () ->
+      (* Spawn the next poll independently: a chained loop retains one Lwt node per
+         interval for the process lifetime. *)
+      Lwt.async loop;
+      Lwt.return_unit
     in
     Lwt.async (fun () -> loop ());
     Lwt.return_unit)

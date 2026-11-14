@@ -568,7 +568,13 @@ let do_balance_refresh () =
 let rec refresh_loop () =
   let open Lwt.Infix in
   Concurrency.Domain_doorbell.wait refresh_doorbell
-  >>= fun () -> do_balance_refresh () >>= fun () -> refresh_loop ()
+  >>= fun () ->
+  do_balance_refresh ()
+  >>= fun () ->
+  (* Spawn the next wait independently: a chained loop retains one Lwt node per
+     refresh. *)
+  Lwt.async refresh_loop;
+  Lwt.return_unit
 ;;
 
 let start_refresh_loop () =

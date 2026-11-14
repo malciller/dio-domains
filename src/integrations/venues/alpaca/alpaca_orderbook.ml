@@ -700,7 +700,19 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
                 (fun () -> Ws_lwt.close_transport conn)
                 (fun _exn -> Lwt.return_unit))
           in
+          (* One iteration per frame, spawned independently: a recursive
+             [read >>= fun () -> loop ()] runs for the life of the connection and retains
+             an Lwt node per frame. A read failure resolves [read_done] so the outer
+             handler still reconnects. *)
+          let read_done, read_done_u = Lwt.wait () in
+          let fail_read exn =
+            if Lwt.is_sleeping read_done then Lwt.wakeup_later_exn read_done_u exn;
+            Lwt.return_unit
+          in
           let rec read_loop () =
+            Lwt.async (fun () -> Lwt.catch read_frame fail_read);
+            Lwt.return_unit
+          and read_frame () =
             Ws_lwt.read conn
             >>= fun frame ->
             on_heartbeat ();
@@ -768,7 +780,7 @@ let rec connect_and_monitor ~on_failure ~on_connected ~on_heartbeat =
               | _ -> Lwt.return_unit)
           in
           Lwt.async session_watcher;
-          read_loop ()))
+          read_loop () >>= fun () -> read_done))
       (fun exn ->
         (* A superseded socket was closed on purpose; reporting it would make the
            supervisor reconnect on top of the replacement. *)
