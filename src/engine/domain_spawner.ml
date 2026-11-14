@@ -2361,13 +2361,16 @@ let asset_domain_worker
           if t_native0 > 0
           then (
             let ns = Monotonic_clock.now_ns () - t_native0 in
+            (* BOOK is the market-facts read that starts the pass, not the pass itself. *)
+            let facts = !facts_ns in
+            if facts > 0 then Latency_profiler.record_ns profs.prof_ob facts;
             let prof =
               match event_name with
               | "filled" -> profs.prof_exec
-              | "book_update" -> profs.prof_ob
               | _ -> profs.prof_strategy
             in
-            if ns > 0 then Latency_profiler.record_ns prof ns))
+            let pass_ns = if facts > 0 && ns > facts then ns - facts else ns in
+            if pass_ns > 0 then Latency_profiler.record_ns prof pass_ns))
         events;
       (* A long overlay that owes exposure but cannot size it is otherwise silent: no
          order is placed, no error is logged. Report the sizing inputs when it is blocked. *)
@@ -2819,7 +2822,7 @@ let asset_domain_worker
       (event : Dio_exchange.Exchange_intf.Types.execution_event)
       =
       match overlay_carry, overlay_rt, overlay_ctx with
-      | Some r, Some rt, Some ctx ->
+      | Some r, Some rt, Some _ ->
         let meta_opt =
           match
             Dio_strategies.Strategy_common.lookup_carry_order ~order_id:event.order_id
@@ -2910,9 +2913,7 @@ let asset_domain_worker
                in
                (* Publish the latest perp entry fill so the overlay can place the TP from
                   the fill event, before the next webData2 position snapshot. A perp buy
-                  closes the short and clears the fallback. The overlay also stamps the
-                  entry fill time so [order_place] can hold a new entry until the position
-                  snapshot catches up. *)
+                  closes the short and clears the fallback. *)
                if market = Types.Perp
                then (
                  let setf key v =
@@ -2923,13 +2924,10 @@ let asset_domain_worker
                  in
                  match side with
                  | Dio_strategies.Strategy_common.Sell ->
-                   ctx.Dio_strategies.Strategy_cycle_engine.cg_last_entry_fill_at
-                   <- now_exec;
                    setf "carry_entry_fill_price" event.avg_price;
                    setf "carry_entry_fill_qty" event.filled_qty;
                    setf "carry_entry_fill_at" now_exec
                  | Dio_strategies.Strategy_common.Buy ->
-                   ctx.Dio_strategies.Strategy_cycle_engine.cg_last_entry_fill_at <- 0.0;
                    setf "carry_entry_fill_price" 0.0;
                    setf "carry_entry_fill_qty" 0.0;
                    setf "carry_entry_fill_at" 0.0);
@@ -5130,23 +5128,32 @@ let asset_domain_worker
          the book and bumping the generation, so this spans the wake/park cost plus every
          stage: the latency the venue sees at the application layer, which no single stage
          column reports. *)
-      if latency_this_cycle && (did_ob || did_exec) && t4 > 0
+      (* TOTAL must sample the same cycles as the stage columns: a book cycle ends at the
+         end of the prep span, a strategy cycle at [t4]. *)
+      let cycle_end = if should_execute then t4 else !t3_strategy in
+      if latency_this_cycle && (did_ob || did_exec) && cycle_end > 0
       then (
         let published = Concurrency.Exchange_wakeup.last_signal_ns_fast wakeup_sync in
-        let delta = t4 - published in
+        let delta = cycle_end - published in
         if published > 0 && delta > 0 && delta < 50_000_000
         then Latency_profiler.record_ns prof_e2e delta);
-      if latency_this_cycle && cycle_busy && t4 > t1
+      if latency_this_cycle && cycle_busy && cycle_end > t1
       then
         if (* Cause string is built only for a new window maximum, avoiding a per-cycle
               closure and [alloc_start] box. *)
-           Latency_profiler.record_max_ns prof_cycle (t4 - t1)
+           Latency_profiler.record_max_ns prof_cycle (cycle_end - t1)
         then (
-          let alloc_diff = alloc_at_t4 - alloc_start in
+          let alloc_end =
+            if should_execute then alloc_at_t4 else Monotonic_clock.minor_words ()
+          in
+          let alloc_diff = alloc_end - alloc_start in
           (* Wall vs thread-CPU over the cycle span: a large wall-minus-CPU gap means the
              thread was descheduled or caught in a stop-the-world pause, not doing work. *)
-          let wall_ns = t4 - t1 in
-          let cpu_ns = !cpu_strat_end - cpu_at_t1 in
+          let wall_ns = cycle_end - t1 in
+          let cpu_end =
+            if should_execute then !cpu_strat_end else Monotonic_clock.thread_cpu_ns ()
+          in
+          let cpu_ns = cpu_end - cpu_at_t1 in
           let stall_ns = wall_ns - cpu_ns in
           let wall_us = wall_ns / 1000 in
           let cpu_us = cpu_ns / 1000 in

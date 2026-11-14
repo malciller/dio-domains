@@ -43,17 +43,14 @@ type ctx =
   (** Symbol of the Hyperliquid spot leg whose book the recycle buy targets. *)
   ; mutable cg_overlay_spot_symbol : string
   ; mutable cg_last_leverage : float
-  (** Venue time of the last carry entry (perp sell) fill, or 0.0. A fresh entry fill can
-      arrive before the position snapshot reflects it; [order_place] holds a new entry for
-      a short grace window so the cycle cannot re-short the full target. *)
-  ; mutable cg_last_entry_fill_at : float
   (** Arrival time of the last perp execution whose effect the venue position snapshot has
-      not yet absorbed, or 0.0. While set, [order_place]/[order_replace] hold reduce-only
-      orders: the facts are still computed from the pre-fill position, so a take-profit
-      that just closed the short would be re-sent at full size into a flat position (the
-      venue rejects it with "Reduce only order would increase position"). The hold lifts
-      as soon as a position snapshot newer than the fill is published - never by a clock. *)
+      not yet absorbed, or 0.0. While set, [order_place]/[order_replace] hold perp orders:
+      the facts are still computed from the pre-fill position, so an entry or close sent
+      here would be sized against a book the venue no longer has. The hold lifts as soon
+      as a position snapshot newer than the fill is published - never by a clock. *)
   ; mutable cg_perp_fill_at : float
+  ; mutable cg_hold_active : bool
+  (** Last order attempt was held, so the transition logs once with no clock. *)
   ; mutable cg_price : float
   ; mutable cg_bid : float
   ; mutable cg_ask : float
@@ -171,8 +168,8 @@ let create () =
   ; cg_overlay_has_spot_leg = false
   ; cg_overlay_spot_symbol = ""
   ; cg_last_leverage = 0.0
-  ; cg_last_entry_fill_at = 0.0
   ; cg_perp_fill_at = 0.0
+  ; cg_hold_active = false
   ; cg_price = nan
   ; cg_bid = nan
   ; cg_ask = nan
@@ -1089,16 +1086,38 @@ let dry_run () = overlay_dry_run
     {!Strategy_common.overlay_inflight_key}). *)
 let overlay_inflight_key = Strategy_common.overlay_inflight_key
 
+let describe_hold ~fill_at ~stamp =
+  Printf.sprintf
+    "fill_at=%.3f positions_at=%s"
+    fill_at
+    (match stamp with
+     | Some t -> Printf.sprintf "%.3f" t
+     | None -> "none")
+;;
+
 (** Whether the venue's position snapshot still predates the last perp fill. Event-driven:
     the hold lifts as soon as a snapshot newer than the fill is published, so no clock is
-    involved. While it holds, a reduce-only order would be sized from the pre-fill
-    position and, for a close that just filled, would be re-sent into a flat book. *)
-let position_behind_fill c ~exchange =
-  c.cg_perp_fill_at > 0.0
-  &&
-  match Dio_exchange.Market_context.get_positions_updated_at ~exchange with
-  | Some ts -> ts <= c.cg_perp_fill_at
-  | None -> true
+    involved. The fill time is global per venue coin, so a domain that places a hedge
+    order sees the fill even when the fill arrived on another venue's feed. *)
+let position_behind_fill_diag c ~exchange ~coin =
+  let stamp =
+    match Dio_exchange.Market_context.get_position_updated_at ~exchange ~coin with
+    | Some ts -> Some ts
+    | None -> Dio_exchange.Market_context.get_positions_updated_at ~exchange
+  in
+  let fill_at =
+    Float.max
+      c.cg_perp_fill_at
+      (Dio_exchange.Market_context.get_perp_fill_at ~exchange ~coin)
+  in
+  let behind =
+    fill_at > 0.0
+    &&
+    match stamp with
+    | Some ts -> ts <= fill_at
+    | None -> true
+  in
+  behind, fill_at, stamp
 ;;
 
 (** Generic order placement for overlays. The engine knows nothing about carry policy: the
@@ -1169,30 +1188,27 @@ let order_place
         Strategy_common.reduce_only_room ~position ~side:order_side ~qty)
       else qty
     in
-    (* A fresh entry fill can precede the position snapshot; without a grace window the
-       overlay sees flat and re-shorts the full target. Hold new entries until the next
-       webData2 snapshot (~5s). The fill is already booked. *)
-    let entry_grace =
-      String.equal dedup_key "carry:entry"
-      && (not reduce_only)
-      && c.cg_last_entry_fill_at > 0.0
-      && c.cg_now -. c.cg_last_entry_fill_at <= 6.0
+    (* A fresh fill can precede the position snapshot. Hold every perp order until a
+       snapshot newer than the fill is published: the facts are computed from the pre-fill
+       position, so an entry would re-short the target and a close would be sent into a
+       flat book. *)
+    let behind, fill_at, positions_at =
+      if is_perp
+      then position_behind_fill_diag c ~exchange:asset.exchange ~coin:instrument
+      else false, 0.0, None
     in
-    if reduce_only && is_perp && position_behind_fill c ~exchange:asset.exchange
-    then
-      Logging.debug_f
-        ~section
-        "Overlay reduce-only order held until the position snapshot reflects the last \
-         fill: %s (%s)"
-        instrument
-        dedup_key
-    else if entry_grace
-    then
-      Logging.debug_f
-        ~section
-        "Overlay entry held %.2fs for the position snapshot after the entry fill (%s)"
-        (c.cg_now -. c.cg_last_entry_fill_at)
-        instrument
+    let hold_now = behind && not c.cg_hold_active in
+    c.cg_hold_active <- behind;
+    if behind
+    then (
+      if hold_now
+      then
+        Logging.info_f
+          ~section
+          "Overlay order held: %s (%s) %s"
+          instrument
+          dedup_key
+          (describe_hold ~fill_at ~stamp:positions_at))
     else if reduce_only && is_perp && qty <= 0.0
     then
       Logging.debug_f
@@ -1264,13 +1280,7 @@ let order_place
             ~instrument
             ~reduce_only
         in
-        if Strategy_common.Placement_backoff.remaining ~key:duplicate_key () > 0.0
-        then
-          Logging.debug_f
-            ~section
-            "Overlay placement backed off after a venue failure: %s"
-            duplicate_key
-        else if Strategy_common.InFlightOrders.is_in_flight duplicate_key
+        if Strategy_common.InFlightOrders.is_in_flight duplicate_key
         then
           (* The previous attempt for this kind/symbol/venue is still awaiting the venue
              ack. Retrying now can only create a duplicate; the first cycle after the ack
@@ -1508,21 +1518,6 @@ let order_replace_body
           (try Ex.round_price ~symbol:instrument ~price:px with
            | _ -> px)
         | None -> px
-      in
-      let backoff_key =
-        overlay_inflight_key
-          ~dedup_key
-          ~side:(Strategy_common.string_of_order_side order_side)
-          ~qty
-          ~price:(Some rounded)
-          ~exchange:asset.exchange
-          ~instrument
-          ~reduce_only
-      in
-      let backoff =
-        if qty <= 0.0
-        then 0.0
-        else Strategy_common.Placement_backoff.remaining ~key:backoff_key ()
       in
       let matching =
         match ex with
@@ -1809,13 +1804,6 @@ let order_replace_body
             List.iter (fun o -> cancel_one ~reason:"duplicate" o) extras
           | _ -> ())
         else List.iter (fun o -> cancel_one o) matching
-      else if backoff > 0.0
-      then
-        Logging.debug_f
-          ~section
-          "Overlay placement backed off %.1fs after a venue failure: %s"
-          backoff
-          backoff_key
       else (
         (match matching with
          | _ :: (_ :: _ as extras) ->
@@ -1954,19 +1942,24 @@ let order_replace
   ~post_only
   ~dedup_key
   =
-  let behind =
+  let behind, fill_at, positions_at =
     match c.cg_asset with
-    | Some asset -> position_behind_fill c ~exchange:asset.exchange
-    | None -> false
+    | Some asset when reduce_only && String.equal market "perp" ->
+      position_behind_fill_diag c ~exchange:asset.exchange ~coin:(perp_coin asset.symbol)
+    | _ -> false, 0.0, None
   in
-  if reduce_only && String.equal market "perp" && behind
-  then
-    Logging.debug_f
-      ~section
-      "Overlay reduce-only replace held until the position snapshot reflects the last \
-       fill: %s (%s)"
-      c.cg_symbol
-      dedup_key
+  let hold_now = behind && not c.cg_hold_active in
+  c.cg_hold_active <- behind;
+  if behind
+  then (
+    if hold_now
+    then
+      Logging.info_f
+        ~section
+        "Overlay reduce-only replace held: %s (%s) %s"
+        c.cg_symbol
+        dedup_key
+        (describe_hold ~fill_at ~stamp:positions_at))
   else
     order_replace_body
       c

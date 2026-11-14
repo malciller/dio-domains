@@ -687,19 +687,15 @@ let start_periodic_inflight_cleanup () =
                  compact them here so the queue tracks the live mapping set instead of
                  every id the process has ever seen. *)
               let trimmed_carry = Dio_strategies.Strategy_common.trim_carry_orders () in
-              let trimmed_backoff =
-                Dio_strategies.Strategy_common.Placement_backoff.cleanup ()
-              in
-              if trimmed1 > 0 || trimmed2 > 0 || trimmed_carry > 0 || trimmed_backoff > 0
+              if trimmed1 > 0 || trimmed2 > 0 || trimmed_carry > 0
               then
                 Logging.debug_f
                   ~section
                   "Periodic in-flight cleanup: removed %d orders, %d amendments, %d \
-                   carry records, %d backoff entries"
+                   carry records"
                   trimmed1
                   trimmed2
-                  trimmed_carry
-                  trimmed_backoff;
+                  trimmed_carry;
               (* A placement key should be released by its ack in well under a second. One
                  held past every venue's deadline is wedged and is silently suppressing
                  every retry for that overlay kind, so surface it. *)

@@ -130,6 +130,27 @@ let get_positions_updated_at ~exchange =
   | _ -> None
 ;;
 
+(** Arrival time of the newest perp fill for one venue coin, or 0.0. A venue feed
+    publishes this from wherever it processes the fill; the reduce-only hold reads it from
+    the domain that places the order, which for a cross-venue overlay is not the fill's
+    own domain. *)
+let perp_fill_tick : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
+
+let note_perp_fill ~exchange ~coin ~at =
+  let now = if at > 0.0 then at else Unix.gettimeofday () in
+  update perp_fill_tick (fun t ->
+    let key = key exchange coin in
+    match Hashtbl.find_opt t key with
+    | Some prev when prev >= now -> ()
+    | _ -> Hashtbl.replace t key now)
+;;
+
+let get_perp_fill_at ~exchange ~coin =
+  match Hashtbl.find_opt (Atomic.get perp_fill_tick) (key exchange coin) with
+  | Some t -> t
+  | None -> 0.0
+;;
+
 let update_margin ~exchange m =
   update margin_table (fun t -> Hashtbl.replace t exchange m)
 ;;

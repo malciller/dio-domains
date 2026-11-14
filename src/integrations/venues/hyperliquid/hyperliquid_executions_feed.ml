@@ -1544,6 +1544,12 @@ let process_user_events data_json =
               let market =
                 if Hyperliquid_instruments_feed.is_perp_coin coin then "perp" else "spot"
               in
+              if String.equal market "perp"
+              then
+                Dio_exchange.Market_context.note_perp_fill
+                  ~exchange:"hyperliquid"
+                  ~coin
+                  ~at:(Unix.gettimeofday ());
               let intent =
                 classify_fill_intent
                   ~own_account:(own_account_address ())
