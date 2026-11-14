@@ -695,7 +695,7 @@ let start_periodic_inflight_cleanup () =
                 Logging.debug_f
                   ~section
                   "Periodic in-flight cleanup: removed %d orders, %d amendments, %d \
-                   carry queue records, %d backoff entries"
+                   carry records, %d backoff entries"
                   trimmed1
                   trimmed2
                   trimmed_carry

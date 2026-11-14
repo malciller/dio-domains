@@ -68,7 +68,14 @@ let bump site d =
     Mutex.unlock mutex)
 ;;
 
-let enabled () = Sys.getenv_opt "DIO_MEMPROF_LIVE" <> None
+let enabled () =
+  match Sys.getenv_opt "DIO_MEMPROF_LIVE" with
+  | Some s ->
+    (match String.lowercase_ascii (String.trim s) with
+     | "1" | "true" | "on" | "yes" -> true
+     | _ -> false)
+  | None -> false
+;;
 
 let start () =
   if enabled () && not (Atomic.exchange started true)

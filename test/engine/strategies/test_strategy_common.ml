@@ -406,6 +406,25 @@ let test_unanswered_amendment_is_age_bounded () =
     still_present
 ;;
 
+let test_carry_pending_is_age_bounded () =
+  let module C = Dio_strategies.Strategy_common in
+  let key = "test:pending|hyperliquid|TEST" in
+  C.register_pending_carry_order
+    ~dedup_key:key
+    ~market:C.Carry_perp
+    ~maker:false
+    ~kind:"carry:entry";
+  Alcotest.(check bool)
+    "a fresh placement waits for its ack"
+    true
+    (Hashtbl.mem C.carry_pending key);
+  ignore (C.trim_carry_orders ~max_pending_age:(-1.0) ());
+  Alcotest.(check bool)
+    "a lost ack cannot retain the entry for the process lifetime"
+    false
+    (Hashtbl.mem C.carry_pending key)
+;;
+
 let test_reduce_only_room_clamps_to_position () =
   let module C = Dio_strategies.Strategy_common in
   let room ~position side qty = C.reduce_only_room ~position ~side ~qty in
@@ -581,6 +600,10 @@ let () =
             "placement backoff is bounded"
             `Quick
             test_placement_backoff_is_bounded
+        ; Alcotest.test_case
+            "carry pending placements are age bounded"
+            `Quick
+            test_carry_pending_is_age_bounded
         ; Alcotest.test_case
             "reduce-only size is capped at the live position"
             `Quick

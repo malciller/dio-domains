@@ -180,6 +180,11 @@ let carry_scope ~exchange ~instrument ~reduce_only =
     dropped without a terminal event cannot block the kind indefinitely. *)
 let carry_live_release_s = 15.0
 
+(** A placement waits in [carry_pending] for its ack; every venue deadline is seconds, so
+    an entry this old cannot still be in flight. Without the bound a lost ack retains the
+    entry, and its repriced key, for the process lifetime. *)
+let carry_pending_max_age_s = 600.0
+
 (** True when a registered, unterminated order existed recently enough for this logical
     kind on this instrument.
 
@@ -229,18 +234,28 @@ let has_live_carry_order
   !found
 ;;
 
-(** Drop admission records whose row was retired out of band. [Fifo_index.evict] only pops
-    while the map is over its cap, so without this sweep a long-lived process that retires
-    most orders leaves one queue record per order ever seen. Called from the engine's
-    periodic in-flight cleanup; returns the number dropped. *)
-let trim_carry_orders () =
+(** Drop admission records whose row was retired out of band, and pending placements whose
+    ack never arrived. [Fifo_index.evict] only pops while the map is over its cap, so
+    without the queue trim a long-lived process that retires most orders leaves one record
+    per order ever seen. Called from the engine's periodic in-flight cleanup; returns the
+    number dropped. *)
+let trim_carry_orders ?(max_pending_age = carry_pending_max_age_s) () =
   let dropped = ref 0 in
   for i = 0 to carry_shard_count - 1 do
     Mutex.lock carry_order_mutexes.(i);
     dropped := !dropped + Concurrency.Fifo_index.trim_queue carry_order_shards.(i);
     Mutex.unlock carry_order_mutexes.(i)
   done;
-  !dropped
+  Mutex.lock carry_pending_mutex;
+  let before = Hashtbl.length carry_pending in
+  let now = Unix.gettimeofday () in
+  Hashtbl.filter_map_inplace
+    (fun _ (meta : carry_order_meta) ->
+       if now -. meta.com_at <= max_pending_age then Some meta else None)
+    carry_pending;
+  let pending_dropped = before - Hashtbl.length carry_pending in
+  Mutex.unlock carry_pending_mutex;
+  !dropped + pending_dropped
 ;;
 
 (** Insert [meta] at [order_id] in [shard]. The shard's lock must be held. *)
