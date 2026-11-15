@@ -1,12 +1,40 @@
-(** Root namespace for the Kraken exchange integration. Re-exports all submodules that
-    implement WebSocket feed subscriptions, REST API clients, authentication, and shared
-    type definitions. *)
+(** Root namespace for the Kraken venue integration.
 
-(** Shared type definitions and JSON codec utilities used across all Kraken submodules. *)
+    The root holds the connector surface, and the two account-tier workflows live in
+    subdirectories:
+
+    - {!Kraken_account_tier} — which workflow the account is entitled to (standard =
+      WebSocket, enterprise = FIX). The only policy in the venue.
+    - {!Kraken_order_transport} — the seam every order path goes through. Both workflows
+      register an implementation of the same record, so the dimension adapter and the
+      execution feed never branch on the tier themselves.
+    - [retail/] — the v2 WebSocket workflow: JSON feeds on one authenticated socket, REST
+      clients, snapshot-driven order state.
+    - [enterprise/] — the Unified FIX workflow: a dedicated sequenced session, its own
+      codec, execution reports, and order entry. Its modules keep the [Kraken_fix_] prefix
+      because the protocol is what the code speaks; the directory is named for the tier
+      that can use it.
+    - {!Kraken_common_types} — the wire-level result and envelope types both return.
+
+    The retail modules keep their historical names, so the supervisor, the dashboard and
+    the tests are unaffected by the split. *)
+
+(** Wire-level result and response envelopes shared by both workflows. *)
 module Kraken_common_types = Kraken_common_types
 
-(** Defines the set of exchange actions (order placement, cancellation) dispatched to
-    Kraken. *)
+(** Account tier: selects the order-entry workflow. *)
+module Kraken_account_tier = Kraken_account_tier
+
+(** Order-entry transport seam. *)
+module Kraken_order_transport = Kraken_order_transport
+
+(** Unified FIX 4.4 workflow: session, codec, execution reports, order entry. *)
+module Kraken_fix = Kraken_fix
+
+(** --- WebSocket (retail) workflow --- *)
+
+(** Defines the set of exchange actions (order placement, cancellation) dispatched to the
+    retail WebSocket workflow. *)
 module Kraken_actions = Kraken_actions
 
 (** WebSocket feed subscription for real-time account balance updates. *)

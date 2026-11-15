@@ -5,7 +5,10 @@ are authored and extended through a scripting configuration. The engine loads a
 strategy, validates it, and runs it over a library of registered actions. The
 bundled strategy is Jacobs Ladder, a grid that buys dips and sells into
 reversals. It runs against Kraken, Hyperliquid, Lighter, Interactive Brokers,
-and Alpaca.
+and Alpaca. Kraken accounts can run either workflow the account tier allows: the
+WebSocket API (`standard`, the default) or a Unified FIX 4.4 session
+(`enterprise`, institutional). Both trade identically; only the order-entry
+transport differs.
 
 Each traded asset runs in its own OCaml domain. Order intents go through a
 lock-free executor, and market data arrives on lock-free ring buffers. A
@@ -126,7 +129,7 @@ container walkthrough.
 | Path | Contents |
 | --- | --- |
 | `src/engine/` | Trading core: config, domain spawner, order executor, strategies, oracle, supervisor, persistence, concurrency, logging, latency profiling. |
-| `src/integrations/` | First-party adapters to external services: `venues/` (Kraken, Hyperliquid, Lighter, IBKR, Alpaca), `market_data/` (Yahoo, CoinMarketCap), `notify/` (Discord), and `transport/` (client WebSocket connection). |
+| `src/integrations/` | First-party adapters to external services: `venues/` (Kraken, Hyperliquid, Lighter, IBKR, Alpaca), `market_data/` (Yahoo, CoinMarketCap), `notify/` (Discord), and `transport/` (client WebSocket connection). Venues with more than one account workflow split it into subdirectories: `venues/kraken/` keeps the connector surface at the root, `retail/` holds the WebSocket workflow and `enterprise/` the FIX one. |
 | `src/dashboard_ui/` | Terminal dashboard renderer. |
 | `src/foundation/` | Internally owned support libraries, grouped by capability. Public names are `dio.*` (for example `dio.lwt`, `dio.cohttp`); see [`src/foundation/README.md`](src/foundation/README.md). |
 | `native/` | Prebuilt native binaries that are not built from source here (the Lighter signer). |

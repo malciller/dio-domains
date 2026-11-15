@@ -788,9 +788,14 @@ let initialize_feeds () : (Dio_engine.Config.trading_config list * string) Lwt.t
                                                           ~on_connected:(fun () -> ())
                                                       ]))
                                               in
-                                              Kraken.Kraken_trading_client
-                                              .connect_and_monitor
-                                                auth_token
+                                              (* Start whichever order-entry transport the
+                                                 account tier selected: the WebSocket
+                                                 client for standard accounts, the FIX
+                                                 session for enterprise ones (which also
+                                                 keeps the WebSocket up for balances). *)
+                                              (Kraken.Kraken_order_transport.active ())
+                                                .connect_and_monitor
+                                                ~token:auth_token
                                                 ~on_failure
                                                 ~on_connected
                                               >>= fun () -> Lwt.return_unit)

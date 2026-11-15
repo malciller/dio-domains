@@ -1332,7 +1332,71 @@ let handle_snapshot json on_heartbeat =
       (Printexc.to_string exn)
 ;;
 
-(** Processes incremental execution update messages. *)
+(** Applies one execution event to the order cache and publishes the resulting fill.
+
+    Single ingestion point for both transports: the WebSocket parse worker and the FIX
+    session's parse worker call this, so a fill produces identical downstream effects
+    (ring buffer, open-order cache, strategy wakeups, fill notification) no matter which
+    wire it arrived on. Domain-safe: per-symbol mutexes, atomics, logging and wakeups. *)
+let apply_external_event (event : execution_event) =
+  let store = get_symbol_store event.symbol in
+  write_execution_event store.events_buffer event;
+  update_open_orders store event;
+  Atomic.set store.last_event_time event.timestamp;
+  notify_ready store;
+  Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
+  Concurrency.Oracle_wakeup.notify_exec ();
+  (* The order update event bus is backed by Lwt streams (single-domain), so publishing
+     from a parse domain is safe only with zero subscribers. The guard skips the publish
+     in that case and warns once if a subscriber appears; that consumer must be migrated
+     off the Lwt stream before relying on it here. *)
+  (match Atomic.get order_update_event_bus.subscribers with
+   | [] -> ()
+   | _ ->
+     if not (Atomic.get order_update_bus_warned)
+     then (
+       Atomic.set order_update_bus_warned true;
+       Logging.warn
+         ~section
+         "order_update_event_bus has subscribers but publishes are skipped on the parse \
+          domain; migrate the consumer off the Lwt stream"));
+  (* Publish complete fills to the centralized fill event bus for Discord notifications. *)
+  if event.order_status = FilledStatus
+  then (
+    let fill_value = event.cum_qty *. event.avg_price in
+    let maker_fee_rate =
+      match Dio_exchange.Exchange_intf.Registry.get "kraken" with
+      | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
+        (match Ex.get_fees ~symbol:event.symbol with
+         | Some f, _ -> f
+         | _ -> 0.0)
+      | None -> 0.0
+    in
+    let fee = fill_value *. maker_fee_rate in
+    let side_str = string_of_side event.side in
+    Concurrency.Fill_event_bus.publish_fill
+      { venue = "kraken"
+      ; symbol = event.symbol
+      ; side = side_str
+      ; amount = event.cum_qty
+      ; fill_price = event.avg_price
+      ; value = fill_value
+      ; fee
+      ; timestamp = event.timestamp
+      ; order_id = event.order_id
+      ; trade_id =
+          (match event.trade_id with
+           | Some tid -> Int64.to_string tid
+           | None -> "")
+      ; market = "spot"
+      ; intent = (if side_str = "buy" then "buy_spot" else "sell_spot")
+      ; strategy = "grid"
+      ; realized_pnl = None
+      ; note = None
+      })
+;;
+
+(** Processes an execution update: ingests events and reconciles stale open orders. *)
 let handle_update json on_heartbeat =
   try
     let open Yojson.Safe.Util in
@@ -1341,64 +1405,7 @@ let handle_update json on_heartbeat =
       (fun item ->
         match parse_execution_event item with
         | Some event ->
-          let store = get_symbol_store event.symbol in
-          write_execution_event store.events_buffer event;
-          update_open_orders store event;
-          Atomic.set store.last_event_time event.timestamp;
-          notify_ready store;
-          Concurrency.Exchange_wakeup.signal ~symbol:event.symbol;
-          Concurrency.Oracle_wakeup.notify_exec ();
-          (* The order update event bus is backed by Lwt streams (single-domain), so
-             publishing from the Parse_worker domain is safe only with zero subscribers.
-             The guard skips the publish in that case and warns once if a subscriber
-             appears; that consumer must be migrated off the Lwt stream before relying on
-             it here. *)
-          (match Atomic.get order_update_event_bus.subscribers with
-           | [] -> ()
-           | _ ->
-             if not (Atomic.get order_update_bus_warned)
-             then (
-               Atomic.set order_update_bus_warned true;
-               Logging.warn_f
-                 ~section
-                 "order_update_event_bus has subscribers but publishes are skipped on \
-                  the parse domain; migrate the consumer off the Lwt stream");
-             ());
-          (* Publish complete fills to the centralized fill event bus for Discord
-             notifications. *)
-          if event.order_status = FilledStatus
-          then (
-            let fill_value = event.cum_qty *. event.avg_price in
-            let maker_fee_rate =
-              match Dio_exchange.Exchange_intf.Registry.get "kraken" with
-              | Some (module Ex : Dio_exchange.Exchange_intf.S) ->
-                (match Ex.get_fees ~symbol:event.symbol with
-                 | Some f, _ -> f
-                 | _ -> 0.0)
-              | None -> 0.0
-            in
-            let fee = fill_value *. maker_fee_rate in
-            let side_str = string_of_side event.side in
-            Concurrency.Fill_event_bus.publish_fill
-              { venue = "kraken"
-              ; symbol = event.symbol
-              ; side = side_str
-              ; amount = event.cum_qty
-              ; fill_price = event.avg_price
-              ; value = fill_value
-              ; fee
-              ; timestamp = event.timestamp
-              ; order_id = event.order_id
-              ; trade_id =
-                  (match event.trade_id with
-                   | Some tid -> Int64.to_string tid
-                   | None -> "")
-              ; market = "spot"
-              ; intent = (if side_str = "buy" then "buy_spot" else "sell_spot")
-              ; strategy = "grid"
-              ; realized_pnl = None
-              ; note = None
-              });
+          apply_external_event event;
           (* Update the heartbeat. *)
           on_heartbeat ()
         | None -> ())
@@ -1502,8 +1509,9 @@ let () = Concurrency.Parse_worker.register "kraken_exec" process_parse_domain_fr
 let start_message_handler _conn _token _on_failure _on_heartbeat = Lwt.return_unit
 
 (** Subscribes to the Kraken executions channel on the authenticated WebSocket and starts
-    the message consumption loop. *)
-let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
+    the message consumption loop. Under the FIX transport the trading session itself
+    delivers execution reports, so subscribing here as well would apply every fill twice. *)
+let connect_and_subscribe_websocket token ~on_failure:_ ~on_heartbeat ~on_connected =
   Logging.debug
     ~section
     "Registering executions subscription on unified authenticated connection";
@@ -1553,6 +1561,35 @@ let subscribe_order_updates () =
   let subscription = OrderUpdateEventBus.subscribe order_update_event_bus in
   subscription.stream, subscription.close
 ;;
+
+(** The executions channel entry point the supervisor calls. Selects the transport that
+    owns execution reports. *)
+let connect_and_subscribe token ~on_failure ~on_heartbeat ~on_connected =
+  if Kraken_order_transport.execution_from_fix ()
+  then (
+    Logging.info
+      ~section
+      "Execution reports arrive over the FIX session; the WebSocket executions channel \
+       is not subscribed";
+    Lwt.return_unit)
+  else connect_and_subscribe_websocket token ~on_failure ~on_heartbeat ~on_connected
+;;
+
+(** Marks every initialised symbol's cache ready.
+
+    The WebSocket feed publishes readiness from its first snapshot; a FIX session has no
+    snapshot message, so its logon is the equivalent event. Without this the startup gate
+    would wait for a frame that only ever arrives after the first order. *)
+let mark_feed_ready () =
+  List.iter (fun symbol -> notify_ready (get_symbol_store symbol)) (get_all_symbols ())
+;;
+
+(** Asks the supervisor-registered hook to re-seed open orders from REST.
+
+    A FIX session starts with an empty view of the account, and with
+    [CancelOrdersOnDisconnect=1] orders placed before the restart are still working.
+    Re-seeding them is what stops a restart from treating committed inventory as free. *)
+let request_open_order_bootstrap () = !on_snapshot_hook ()
 
 (** Initializes execution stores for the given symbols and starts periodic maintenance. *)
 let initialize symbols =

@@ -110,7 +110,7 @@ module Kraken_impl = struct
     let kraken_side = string_of_side side in
     let time_in_force_str = Option.map string_of_time_in_force time_in_force in
     let actual_retry_config = convert_retry_config retry_config in
-    Kraken_actions.place_order
+    (Kraken_order_transport.active ()).place_order
       ~token
       ~order_type:kraken_order_type
       ~side:kraken_side
@@ -194,7 +194,7 @@ module Kraken_impl = struct
         | None -> existing.order_qty
       in
       let actual_retry_config = convert_retry_config retry_config in
-      Kraken_actions.amend_order
+      (Kraken_order_transport.active ()).amend_order
         ~token
         ~order_id
         ?cl_ord_id
@@ -232,7 +232,7 @@ module Kraken_impl = struct
   let cancel_orders ~token ?order_ids ?cl_ord_ids ?order_userrefs ?symbol ?retry_config ()
     =
     let actual_retry_config = convert_retry_config retry_config in
-    Kraken_actions.cancel_orders
+    (Kraken_order_transport.active ()).cancel_orders
       ~token
       ?order_ids
       ?cl_ord_ids
@@ -276,6 +276,7 @@ module Kraken_impl = struct
   ;;
 
   let has_orderbook_data ~symbol = Kraken_orderbook_feed.has_orderbook_data symbol
+
   let get_top_of_book_into ~symbol buf =
     Kraken_orderbook_feed.get_best_bid_ask_into symbol buf
   ;;
@@ -676,6 +677,32 @@ end
 (* Register the uniform venue decoder for the parse-domain offload route. *)
 let () =
   Concurrency.Parse_worker.register_venue_decoder ~venue:"kraken" Kraken_impl.decode_frame
+;;
+
+(* Publish the WebSocket adapter as a selectable order-entry transport. The FIX adapter
+   registers its own from dio.kraken_fix; Kraken_order_transport picks between them from
+   the account tier. *)
+let () =
+  Kraken_order_transport.register_websocket
+    { name = "kraken-websocket"
+    ; execution_source = Kraken_order_transport.Execution_from_websocket
+    ; place_order = Kraken_actions.place_order
+    ; amend_order = Kraken_actions.amend_order
+    ; cancel_orders =
+        (fun ~token ?order_ids ?cl_ord_ids ?order_userrefs ?retry_config () ->
+          Kraken_actions.cancel_orders
+            ~token
+            ?order_ids
+            ?cl_ord_ids
+            ?order_userrefs
+            ?retry_config
+            ())
+    ; is_connected = Kraken_trading_client.is_connected
+    ; connect_and_monitor =
+        (fun ~token ~on_failure ~on_connected ->
+          Kraken_trading_client.connect_and_monitor token ~on_failure ~on_connected)
+    ; send_ping = Kraken_trading_client.send_ping
+    }
 ;;
 
 (* Register Kraken_impl into the global exchange registry at load time. *)

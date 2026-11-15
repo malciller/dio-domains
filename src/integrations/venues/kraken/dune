@@ -1,3 +1,17 @@
+;; Two account-tier workflows, one library. The root modules are the connector surface: the
+;; account-tier policy, the order-transport seam every caller goes through, and the shared
+;; wire types. The implementations live in their own directories so neither carries the
+;; other's code:
+;;
+;;   retail/     the v2 WebSocket workflow the engine has always run (rate-limited REST,
+;;               JSON feeds on a shared socket, order state rebuilt from snapshots)
+;;   enterprise/ the institutional FIX workflow (dedicated session, sequenced messages,
+;;               dedicated line, cancel-scope and replay guarantees)
+;;
+;; The split is about the tier's resources, not about market data: both trades the same
+;; instruments the same way.
+(include_subdirs unqualified)
+
 (library
  (name kraken)
  (public_name dio.kraken)
@@ -13,6 +27,8 @@
   threads
   dio.websocket
   dio.ws_lwt
+  dio.conduit-lwt-unix
+  dio.ipaddr.unix
   dio.mtime
   dio.mtime.clock.os
   concurrency

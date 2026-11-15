@@ -19,6 +19,10 @@
  (libraries dio.kraken alcotest))
 
 (test
+ (name test_kraken_fix)
+ (libraries dio.kraken alcotest))
+
+(test
  (name test_kraken_get_fee)
  (libraries dio.kraken alcotest))
 

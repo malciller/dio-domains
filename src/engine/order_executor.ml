@@ -654,10 +654,16 @@ let cancel_orders ~token ?retry_config (request : cancel_request) =
 
 (** Closes all underlying trading client connections (Kraken and Hyperliquid). Invoked
     during graceful shutdown to tear down WebSocket transports, fail pending request
-    waiters, and release subscriber streams. *)
+    waiters, and release subscriber streams. The Kraken FIX session is closed too, even
+    when it is not the active transport: closing an idle session is a no-op, and with
+    [CancelOrdersOnDisconnect=1] the working orders survive either way. *)
 let close () : unit Lwt.t =
   Logging.info ~section "Closing order executor";
-  Lwt.join [ Kraken.Kraken_trading_client.close (); Hyperliquid.Ws.close () ]
+  Lwt.join
+    [ Kraken.Kraken_trading_client.close ()
+    ; Kraken.Kraken_fix.Kraken_fix_client.close ()
+    ; Hyperliquid.Ws.close ()
+    ]
 ;;
 
 let periodic_cleanup_started = Atomic.make false

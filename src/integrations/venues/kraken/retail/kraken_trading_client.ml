@@ -339,6 +339,7 @@ let handle_frame frame ~expected_generation =
      to the worker. On a full worker queue, fall through to the inline parse +
      message-buffer path. *)
   if String.starts_with ~prefix:"{\"channel\":\"executions" content
+     && (not (Kraken_order_transport.execution_from_fix ()))
      && Concurrency.Parse_worker.submit "kraken_exec" content
   then Lwt.return_unit
   else if String.starts_with ~prefix:"{\"channel\":\"balances" content
@@ -766,21 +767,27 @@ let get_connection () : Ws_lwt.conn Lwt.t =
 ;;
 
 let send_ping ~req_id ~timeout_ms : Kraken_common_types.ws_response Lwt.t =
-  get_connection ()
-  >>= fun _ ->
-  let send_time = Mtime_clock.now_ns () in
-  let message = `Assoc [ "method", `String "ping"; "req_id", `Int req_id ] in
-  let message_str = json_to_string_precise None message in
-  send_message ~message_str ~req_id ~expected_method:"ping" ~timeout_ms
-  >>= fun response ->
-  Network_latency.record_ping
-    "kraken"
-    (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) send_time));
-  Lwt.return response
+  (* Under the FIX transport the order path, and therefore the liveness that matters, is
+     the FIX session: probe it instead of the WebSocket that only carries balances. The
+     guard is on the execution source so this cannot recurse into itself. *)
+  if Kraken_order_transport.execution_from_fix ()
+  then (Kraken_order_transport.active ()).send_ping ~req_id ~timeout_ms
+  else
+    get_connection ()
+    >>= fun _ ->
+    let send_time = Mtime_clock.now_ns () in
+    let message = `Assoc [ "method", `String "ping"; "req_id", `Int req_id ] in
+    let message_str = json_to_string_precise None message in
+    send_message ~message_str ~req_id ~expected_method:"ping" ~timeout_ms
+    >>= fun response ->
+    Network_latency.record_ping
+      "kraken"
+      (Mtime.Span.of_uint64_ns (Int64.sub (Mtime_clock.now_ns ()) send_time));
+    Lwt.return response
 ;;
 
-(** Send a request whose JSON body the caller already serialized. The order path builds the
-    body once instead of an AST that this would serialize again. *)
+(** Send a request whose JSON body the caller already serialized. The order path builds
+    the body once instead of an AST that this would serialize again. *)
 let send_request_body ~body ~req_id ~expected_method ~timeout_ms =
   send_message ~message_str:body ~req_id ~expected_method ~timeout_ms
 ;;
@@ -843,8 +850,13 @@ let subscribe message =
       Lwt.return_unit)
 ;;
 
-(** Returns true if the trading WebSocket connection is currently established. *)
-let is_connected () = Atomic.get state.connected
+(** Returns true if the trading WebSocket connection is currently established. Under the
+    FIX transport this reports the FIX session instead: it is what the order path needs. *)
+let is_connected () =
+  if Kraken_order_transport.execution_from_fix ()
+  then (Kraken_order_transport.active ()).is_connected ()
+  else Atomic.get state.connected
+;;
 
 let init token : unit Lwt.t =
   request_cleanup ();
