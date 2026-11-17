@@ -642,6 +642,18 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
     in
     if side = Buy
     then (
+      (* HL-like spot charges the buy fee in base, so the received - and therefore
+         sellable - quantity is below the fill size. Every quantity downstream (the lot,
+         the sell reference, the skim) must be net; the quote actually spent is gross,
+         which is what the skim's cost prices in. *)
+      let fee_in_base =
+        hl_like_spot_fee_exchange state.exchange_id && state.maker_fee > 0.0
+      in
+      let net_qty =
+        if fee_in_base
+        then Float.max 0.0 (acc_qty -. (state.maker_fee *. acc_qty))
+        else acc_qty
+      in
       (* Route buy-fill bookkeeping through the base-accumulation store's pure decision
          logic (updates the last-buy reference for the next sell's profitability check). *)
       let updated =
@@ -657,7 +669,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
           ; buy_lots = state.buy_lots
           }
           ~price:fill_price
-          ~qty:acc_qty
+          ~qty:net_qty
           ~oid:order_id
       in
       state.last_buy_fill_price
@@ -679,26 +691,38 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
          && state.base_accumulation_enabled
          && (not state.cached_ecfg.sell_uses_mult)
          && fill_price > 0.0
-         && acc_qty > 0.0
+         && net_qty > 0.0
       then (
         let sell_mult = Float.min 1.0 (Float.max 0.0 state.cached_sell_mult) in
         let lot =
           if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
         in
-        let retained = acc_qty *. (1.0 -. sell_mult) in
+        let retained = net_qty *. (1.0 -. sell_mult) in
         let skim = round_qty_up (Float.max retained lot) asset_symbol state.exchange_id in
-        let cost = skim *. fill_price in
+        (* Cost is the gross quote the reserved slice consumed: on a base-fee venue the
+           fee is part of the bought notional, elsewhere it is a separate quote charge. *)
+        let cost =
+          if fee_in_base
+          then skim *. fill_price /. (1.0 -. state.maker_fee)
+          else
+            (skim *. fill_price)
+            +. buy_leg_fee
+                 ~exchange:state.exchange_id
+                 ~maker_fee:state.maker_fee
+                 ~qty:skim
+                 ~price:fill_price
+        in
         if skim > 0.0
-           && acc_qty -. skim >= lot -. 1e-9
+           && net_qty -. skim >= lot -. 1e-9
            && state.accumulated_profit >= cost +. state.accumulation_buffer
         then (
           state.reserved_base <- state.reserved_base +. skim;
           state.accumulated_profit <- Float.max 0.0 (state.accumulated_profit -. cost);
-          state.last_buy_fill_qty <- Some (acc_qty -. skim);
+          state.last_buy_fill_qty <- Some (net_qty -. skim);
           (* The skimmed base was never sellable, so the newest lot cannot fund a sell. *)
           state.buy_lots
           <- (match state.buy_lots with
-              | (lot_price, _) :: rest -> (lot_price, acc_qty -. skim) :: rest
+              | (lot_price, _) :: rest -> (lot_price, net_qty -. skim) :: rest
               | [] -> []);
           state.persistence_dirty <- true;
           Logging.info_f
@@ -708,15 +732,11 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
             asset_symbol
             skim
             cost
-            (acc_qty -. skim)));
+            (net_qty -. skim)));
       (* Persistence dirty-marking follows the per-strategy config opt-in
          (base_accumulation), not a hardcoded venue list. *)
       if state.base_accumulation_enabled then state.persistence_dirty <- true;
-      (* Spec-aligned buy fill: only the reference info for the next sell's profitability
-         check is updated (done above via apply_buy_fill). Per-fill slice retention into
-         reserved_base is gone - accumulation happens at sell-fill time when the profit
-         window exceeds the buffer (see below). *)
-      if acc_qty > 0.0 && not state.startup_replay
+      if net_qty > 0.0 && not state.startup_replay
       then (
         (* Record the buy credit for the fill-aware sizing bridge rather than mutating a
            running ledger: on Hyperliquid-like spot venues the buy fee is subtracted from
@@ -727,11 +747,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
            already adopted this fill (independent feeds, message before execution event),
            and adding the credit would then double-count it. Only the unmatched remainder
            is an unreflected credit. *)
-        let credit_qty =
-          if hl_like_spot_fee_exchange state.exchange_id && state.maker_fee > 0.0
-          then Float.max 0.0 (acc_qty -. (state.maker_fee *. acc_qty))
-          else acc_qty
-        in
+        let credit_qty = net_qty in
         let already_reflected = Float.min credit_qty state.attributed_balance_increase in
         state.attributed_balance_increase
         <- Float.max 0.0 (state.attributed_balance_increase -. already_reflected);
@@ -891,14 +907,9 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
        if acc_qty > 0.0 && not state.startup_replay
        then ignore (Strategy_lifecycle.consume_buy_credits ~state ~qty:acc_qty);
        state.last_sell_fill_qty <- Some acc_qty;
-       (* Spec-aligned sell fill: profit is measured against the LAST BUY fill (single
-          local buy/sell cycle pair). The prior-sell cost basis and grid-spread fallback
-          are removed. All fees (both legs) are folded into one [fees] figure passed to
-          the store's pure decision logic, which:
-          - accrues net profit into accumulated_profit when > 0,
-          - when accumulated_profit >= base_cost + buffer (realtime F&G), adds
-            oracle_qty * (1 - sell_mult) to reserved_base and debits accumulated_profit by
-            base_cost, preserving the buffer and surplus profit in the quote ledger. *)
+       (* Spec-aligned sell fill: profit is measured against the buy lots the fill
+          consumes. Accumulation happens on the bought side (the profit-gated skim on
+          the buy fill), so a 1:1 sell credits quote only. *)
        let store_t =
          { Dio_persistence.Base_accumulation_store.reserved_base = state.reserved_base
          ; accumulated_profit = state.accumulated_profit
@@ -934,10 +945,6 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
            ~price:sell_fill_price
            ~qty
            ~oid:order_id
-           ~buffer:state.accumulation_buffer
-           ~sell_mult:state.cached_sell_mult
-           ~oracle_qty:state.grid_qty
-           ~sell_uses_mult:state.cached_ecfg.sell_uses_mult
            ~fees
            ()
        in

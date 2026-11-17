@@ -5,7 +5,7 @@
    ("{strategy_name}:{symbol}:{venue}", from config.json's strategy field).
 
    Persisted fields (data/accumulation_state.json, keyed by strategy key):
-   - reserved_base: base accumulated via sell_mult; excluded from sellable balance
+   - reserved_base: base accumulated by the buy-fill skim; excluded from sellable balance
    - accumulated_profit: realized local PnL in quote
    - carry_credit_seq: newest carry recycle already credited (restart dedup)
    - buy_lots: unspent buy fills, newest first, consumed one per credited sell
@@ -212,47 +212,16 @@ let rec consume_lots ~price ~remaining acc = function
       else consume_lots ~price ~remaining acc rest)
 ;;
 
-(** Removes [remaining] base from the newest lots without pricing it. Used for base that
-    left the sellable pool without being sold (the slice a [sell_uses_mult] venue withheld
-    inside the order), so it cannot fund a second cycle. *)
-let rec drop_lots ~remaining = function
-  | [] -> []
-  | (lot_price, lot_qty) :: rest ->
-    if remaining <= 0.0
-    then (lot_price, lot_qty) :: rest
-    else (
-      let matched = Float.min lot_qty remaining in
-      let remaining = remaining -. matched in
-      let left = lot_qty -. matched in
-      if left > 1e-9 *. lot_qty
-      then (lot_price, left) :: rest
-      else drop_lots ~remaining rest)
-;;
-
 (** Sell fill: profit = the spread over the buy lots the sell consumes, minus [fees]
     (all-in, both legs); positive net profit accrues to [accumulated_profit].
 
     The consumed lots are dropped even when the cycle does not net a profit: that base
     left the account, so it cannot fund another cycle.
 
-    [sell_uses_mult] venues (Kraken) withheld the [(1 - sell_mult)] slice inside the
-    order, so [oracle_qty * (1 - sell_mult)] may move into [reserved_base] once profit
-    covers its cost. On 1:1 venues (Hyperliquid/Alpaca) the base was sold, not withheld;
-    accruing it would reserve base that does not exist. Those keep profit in quote and
-    skim a whole lot separately (see [Strategy_events]). [fees] is required: the real
-    all-in fee. *)
-let apply_sell_fill
-  t
-  ~price
-  ~qty
-  ~oid
-  ~buffer
-  ~sell_mult
-  ~oracle_qty
-  ~fees
-  ?(sell_uses_mult = true)
-  ()
-  =
+    No base is reserved here. Every venue sells 1:1, so a sell never withholds a slice;
+    accumulation happens on the bought side (the profit-gated lot skim in
+    [Strategy_events]), and this path only credits quote. [fees] is the real all-in fee. *)
+let apply_sell_fill t ~price ~qty ~oid ~fees () =
   let t =
     { t with
       last_sell_fill_price = Some price
@@ -263,32 +232,14 @@ let apply_sell_fill
   let matched_profit, _unmatched, lots_after_sell =
     consume_lots ~price ~remaining:qty 0.0 t.buy_lots
   in
-  (* The reserved slice is part of the base just sold, so its cost is that base's own buy
-     price: the newest consumed lot, else the last-buy anchor. *)
-  let basis_price =
-    match t.buy_lots with
-    | (p, _) :: _ -> p
-    | [] -> Option.value t.last_buy_fill_price ~default:price
-  in
   let net_profit = matched_profit -. fees in
   if net_profit <= 0.0
   then { t with buy_lots = lots_after_sell }
-  else (
-    let accumulated_profit = t.accumulated_profit +. net_profit in
-    if not sell_uses_mult
-    then { t with accumulated_profit; buy_lots = lots_after_sell }
-    else (
-      let accrued_base = Float.max 0.0 (oracle_qty *. (1.0 -. sell_mult)) in
-      let base_cost = accrued_base *. basis_price in
-      if accrued_base > 0.0 && accumulated_profit >= base_cost +. buffer
-      then
-        { t with
-          reserved_base = t.reserved_base +. accrued_base
-        ; accumulated_profit = accumulated_profit -. base_cost
-        ; (* Withheld, not sold. *)
-          buy_lots = drop_lots ~remaining:accrued_base lots_after_sell
-        }
-      else { t with accumulated_profit; buy_lots = lots_after_sell }))
+  else
+    { t with
+      accumulated_profit = t.accumulated_profit +. net_profit
+    ; buy_lots = lots_after_sell
+    }
 ;;
 
 (* -- Persistence ------------------------------------------------------ *)

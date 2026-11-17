@@ -116,6 +116,19 @@ let ibkr_commission ~qty ~price =
   Float.max min_fee (Float.min raw max_fee)
 ;;
 
+(** Quote fee paid on the buy leg for [qty] at [price]. Mirrors the sell-fill fee split:
+    IBKR pays its per-order commission, HL-like spot charges the fee in base (zero quote;
+    the base haircut already covers it), everything else pays [maker_fee] on the notional. *)
+let buy_leg_fee ~exchange ~maker_fee ~qty ~price =
+  if qty <= 0.0 || price <= 0.0
+  then 0.0
+  else if String.equal exchange "ibkr"
+  then ibkr_commission ~qty ~price
+  else if hl_like_spot_fee_exchange exchange
+  then 0.0
+  else price *. qty *. maker_fee
+;;
+
 (** Fee-rate resolution: an explicit config value wins, then the live [Fee_cache] entry
     (populated by the supervisor's venue fetch), then the caller's last known value. It
     never substitutes a literal 0.0, so a transient cache miss cannot silently make fills

@@ -57,26 +57,13 @@ let test_apply_buy_fill () =
     t.A.last_buy_fill_qty
 ;;
 
-let test_apply_sell_fill_profit_and_reserve () =
+let test_apply_sell_fill_credits_profit () =
   let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"o1" in
-  (* Profitable sell: profit = (110 - 100) * 0.5 = 5.0. oracle_qty = 0.1, sell_mult = 0.8
-     -> accrued_base = 0.1 * (1.0 - 0.8) = 0.02. base_cost = 0.02 * 100.0 = 2.0. With
-     buffer 2.0, threshold = base_cost + buffer = 4.0. Since profit 5.0 >= 4.0 -> reserve
-     0.02 base and debit profit by cost (5.0 - 2.0 = 3.0). *)
-  let t =
-    A.apply_sell_fill
-      t
-      ~price:110.0
-      ~qty:0.5
-      ~oid:"o2"
-      ~buffer:2.0
-      ~sell_mult:0.8
-      ~oracle_qty:0.1
-      ~fees:0.0
-      ()
-  in
-  Alcotest.(check (float 1e-12)) "reserved_base accrued" 0.02 t.A.reserved_base;
-  Alcotest.(check (float 1e-12)) "accumulated_profit debited" 3.0 t.A.accumulated_profit;
+  (* Profitable sell: profit = (110 - 100) * 0.5 = 5.0. A sell never reserves base - the
+     buy-fill skim owns accumulation - so the whole spread lands in quote. *)
+  let t = A.apply_sell_fill t ~price:110.0 ~qty:0.5 ~oid:"o2" ~fees:0.0 () in
+  Alcotest.(check (float 1e-12)) "no base reserved on a sell" 0.0 t.A.reserved_base;
+  Alcotest.(check (float 1e-12)) "profit accumulated" 5.0 t.A.accumulated_profit;
   Alcotest.(check (option (float 1e-12)))
     "sell price recorded"
     (Some 110.0)
@@ -87,100 +74,24 @@ let test_apply_sell_fill_profit_and_reserve () =
     t.A.last_fill_oid
 ;;
 
-let test_apply_sell_fill_below_buffer () =
-  let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"o1" in
-  (* Profit 1.0 < buffer 2.0: window accumulates, no reservation. *)
-  let t =
-    A.apply_sell_fill
-      t
-      ~price:102.0
-      ~qty:0.5
-      ~oid:"o2"
-      ~buffer:2.0
-      ~sell_mult:0.8
-      ~oracle_qty:0.1
-      ~fees:0.0
-      ()
-  in
-  Alcotest.(check (float 1e-12)) "no reservation under buffer" 0.0 t.A.reserved_base;
-  Alcotest.(check (float 1e-12)) "profit accumulated" 1.0 t.A.accumulated_profit
-;;
-
 let test_apply_sell_fill_unprofitable () =
   let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"o1" in
-  let t =
-    A.apply_sell_fill
-      t
-      ~price:90.0
-      ~qty:0.5
-      ~oid:"o2"
-      ~buffer:2.0
-      ~sell_mult:2.0
-      ~oracle_qty:1.0
-      ~fees:0.0
-      ()
-  in
+  let t = A.apply_sell_fill t ~price:90.0 ~qty:0.5 ~oid:"o2" ~fees:0.0 () in
   Alcotest.(check (float 1e-12)) "loss not accumulated" 0.0 t.A.accumulated_profit;
-  Alcotest.(check (float 1e-12)) "no reservation on loss" 0.0 t.A.reserved_base
-;;
-
-let test_apply_sell_fill_one_to_one_no_reserve () =
-  (* A 1:1 venue (Hyperliquid/Alpaca) did not withhold the sell_mult slice in the order,
-     so a sell fill must never accrue reserved_base: the base was sold. The profit stays
-     in quote for the separate, profit-gated lot skim. *)
-  let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"o1" in
-  let t =
-    A.apply_sell_fill
-      t
-      ~price:110.0
-      ~qty:0.5
-      ~oid:"o2"
-      ~buffer:0.0
-      ~sell_mult:0.8
-      ~oracle_qty:0.1
-      ~sell_uses_mult:false
-      ~fees:0.0
-      ()
-  in
-  Alcotest.(check (float 1e-12)) "1:1 sell accrues no base" 0.0 t.A.reserved_base;
-  Alcotest.(check (float 1e-12)) "profit kept in quote" 5.0 t.A.accumulated_profit
+  Alcotest.(check int) "sold base leaves the lots" 0 (List.length t.A.buy_lots)
 ;;
 
 let test_apply_sell_fill_fees_reduce_profit () =
-  (* 0.5 all-in fees reduce profit to 4.5; the reserve accrual then takes 2.0. *)
+  (* 0.5 all-in fees reduce the 5.0 spread to 4.5. *)
   let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"o1" in
-  let t =
-    A.apply_sell_fill
-      t
-      ~price:110.0
-      ~qty:0.5
-      ~oid:"o2"
-      ~buffer:2.0
-      ~sell_mult:0.8
-      ~oracle_qty:0.1
-      ~fees:0.5
-      ()
-  in
+  let t = A.apply_sell_fill t ~price:110.0 ~qty:0.5 ~oid:"o2" ~fees:0.5 () in
   Alcotest.(check (float 1e-12))
     "fees reduce accumulated profit"
-    2.5
-    t.A.accumulated_profit;
-  Alcotest.(check (float 1e-12)) "reserve still accrues after fees" 0.02 t.A.reserved_base
+    4.5
+    t.A.accumulated_profit
 ;;
 
-let ladder_sell t price oid =
-  A.apply_sell_fill
-    t
-    ~price
-    ~qty:0.5
-    ~oid
-    ~buffer:0.0
-    ~sell_mult:1.0
-    ~oracle_qty:0.0
-    ~sell_uses_mult:false
-    ~fees:0.0
-    ()
-;;
+let ladder_sell t price oid = A.apply_sell_fill t ~price ~qty:0.5 ~oid ~fees:0.0 ()
 
 let test_ladder_queue_one_cycle_per_buy () =
   (* A ladder can fill several buys before a sell does. Each sell consumes its own lot:
@@ -201,44 +112,12 @@ let test_ladder_queue_one_cycle_per_buy () =
 
 let test_partial_sell_keeps_lot () =
   let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"b1" in
-  let t =
-    A.apply_sell_fill
-      t
-      ~price:110.0
-      ~qty:0.2
-      ~oid:"s1"
-      ~buffer:0.0
-      ~sell_mult:1.0
-      ~oracle_qty:0.0
-      ~sell_uses_mult:false
-      ~fees:0.0
-      ()
-  in
+  let t = A.apply_sell_fill t ~price:110.0 ~qty:0.2 ~oid:"s1" ~fees:0.0 () in
   match t.A.buy_lots with
   | [ (p, q) ] ->
     Alcotest.(check (float 1e-12)) "residual lot price" 100.0 p;
     Alcotest.(check (float 1e-12)) "residual lot qty" 0.3 q
   | lots -> Alcotest.failf "expected one residual lot, got %d" (List.length lots)
-;;
-
-let test_withheld_slice_leaves_the_lot () =
-  (* Kraken withholds (1 - sell_mult) of the oracle qty inside the order. That base was
-     never sold, so it must leave the lot too - otherwise it funds a second cycle. *)
-  let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"b1" in
-  let t =
-    A.apply_sell_fill
-      t
-      ~price:140.0
-      ~qty:0.4
-      ~oid:"s1"
-      ~buffer:0.0
-      ~sell_mult:0.8
-      ~oracle_qty:0.5
-      ~fees:0.0
-      ()
-  in
-  Alcotest.(check (float 1e-12)) "withheld slice reserved" 0.1 t.A.reserved_base;
-  Alcotest.(check int) "lot fully consumed" 0 (List.length t.A.buy_lots)
 ;;
 
 let test_lots_survive_serialization () =
@@ -542,20 +421,13 @@ let () =
     "persistence_stores"
     [ ( "base_accumulation"
       , [ "apply_buy_fill", `Quick, test_apply_buy_fill
-        ; ( "apply_sell_fill profit+reserve"
-          , `Quick
-          , test_apply_sell_fill_profit_and_reserve )
-        ; "apply_sell_fill below buffer", `Quick, test_apply_sell_fill_below_buffer
+        ; "apply_sell_fill credits profit", `Quick, test_apply_sell_fill_credits_profit
         ; "apply_sell_fill unprofitable", `Quick, test_apply_sell_fill_unprofitable
-        ; ( "apply_sell_fill 1:1 accrues no base"
-          , `Quick
-          , test_apply_sell_fill_one_to_one_no_reserve )
         ; ( "apply_sell_fill fees reduce profit"
           , `Quick
           , test_apply_sell_fill_fees_reduce_profit )
         ; "ladder lots one cycle per buy", `Quick, test_ladder_queue_one_cycle_per_buy
         ; "partial sell keeps the lot", `Quick, test_partial_sell_keeps_lot
-        ; "withheld slice leaves the lot", `Quick, test_withheld_slice_leaves_the_lot
         ; "lots survive serialization", `Quick, test_lots_survive_serialization
         ; "credit_profit persists and adds", `Quick, test_credit_profit_persists_and_adds
         ] )

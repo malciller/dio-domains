@@ -397,7 +397,7 @@ let test_hl_buy_fill_accrues_reserve () =
     "hl buy reference price recorded"
     true
     (state.last_buy_fill_price = Some 62000.0);
-  check bool "hl buy reference qty recorded" true (state.last_buy_fill_qty = Some 0.5);
+  check bool "hl buy reference qty recorded" true (state.last_buy_fill_qty = Some landed);
   check
     bool
     "hl pending buy credit is net of the base-side buy fee"
@@ -5659,7 +5659,6 @@ let test_alpaca_excess_refills_before_dumping () =
   | None -> failwith "expected the missing top rung to be restored"
 ;;
 
-
 let test_alpaca_inflight_amend_rung_not_restored () =
   (* Regression: an Alpaca fractional amend is cancel+replace. The old order leaves the
      feed before the replacement lists; restoring the "missing" rung races the replacement
@@ -5731,7 +5730,6 @@ let test_alpaca_inflight_amend_rung_not_restored () =
   | None -> failwith "expected the dropped rung to be restored once the amend resolved"
 ;;
 
-
 let test_alpaca_venue_available_blocks_reserve_dip () =
   (* The venue's own free figure is authoritative. The account shows gross 3.0 but only
      reserved_base is free (the rest held), while the engine's reconstructed
@@ -5770,12 +5768,11 @@ let test_alpaca_venue_available_blocks_reserve_dip () =
     (pushed_sell_for symbol = None)
 ;;
 
-
 let test_alpaca_restore_prunes_unfundable_rung () =
   (* The file is the ladder of record, so a cancelled rung stays recorded and is re-placed
-     top-down at its recorded price/qty. When the account can no longer back it (here:
-     1.0 held, 0.1 of it reserved, so only 0.9 is sellable against a recorded 1.0) the rung
-     is REMOVED instead of being clamped to the remainder: an un-restable level left in the
+     top-down at its recorded price/qty. When the account can no longer back it (here: 1.0
+     held, 0.1 of it reserved, so only 0.9 is sellable against a recorded 1.0) the rung is
+     REMOVED instead of being clamped to the remainder: an un-restable level left in the
      file reports inventory that is not there and re-tries forever. *)
   let symbol = "ALPACA_RESTORE_UNFUNDED/USD" in
   let state = reset_alpaca_excess_state symbol in
@@ -5933,19 +5930,101 @@ let test_alpaca_buy_fill_skims_reserve () =
   check (float 1e-9) "profit below the buffer does not skim" 0.0 state2.reserved_base
 ;;
 
+(* Hyperliquid-like spot charges the buy fee in base, so received base is below the fill
+   size. Every quantity must be net (lot, sell reference, skim), while the skim's cost
+   prices the gross quote actually spent (skim / (1 - fee) * price). *)
+let test_hl_buy_fill_skims_net_qty_and_gross_cost () =
+  let symbol = "SKIM_HL_FEE/HYPE/USDC" in
+  Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:4;
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "hyperliquid";
+  state.grid_qty <- 0.08;
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "hyperliquid";
+  state.cached_sell_mult <- 0.98;
+  state.cached_qty_increment <- 0.0001;
+  state.maker_fee <- 0.001;
+  state.base_accumulation_enabled <- true;
+  state.accumulation_buffer <- 0.5;
+  state.reserved_base <- 0.0;
+  state.accumulated_profit <- 10.0;
+  state.position_base <- 0.0;
+  state.attributed_balance_increase <- 0.0;
+  state.buy_credits_since_balance <- [];
+  state.startup_replay <- false;
+  state.last_fill_oid <- None;
+  Sell_orders.clear state.open_sell_orders;
+  Dio_strategies.Strategy_api.Strategy.set_startup_replay_done symbol;
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
+    ~now:100.0
+    symbol
+    "hl-fee-buy"
+    Dio_strategies.Strategy_common.Buy
+    ~fill_price:100.0
+    ~fill_qty:0.08
+    None;
+  let net_qty = 0.08 *. (1.0 -. 0.001) in
+  (* retained = 0.07992 * 0.02 = 0.0015984, ceiled to the 0.0001 lot step. *)
+  let skim = 0.0016 in
+  let cost = skim *. 100.0 /. (1.0 -. 0.001) in
+  check (float 1e-9) "skim is taken from the net quantity" skim state.reserved_base;
+  check
+    (option (float 1e-9))
+    "sell reference is the net quantity less the skim"
+    (Some (net_qty -. skim))
+    state.last_buy_fill_qty;
+  check
+    bool
+    "reserved base plus sellable reference equals the net received base"
+    true
+    (match state.last_buy_fill_qty with
+     | Some q -> abs_float (q +. state.reserved_base -. net_qty) < 1e-12
+     | None -> false);
+  check
+    (float 1e-9)
+    "the skim is debited at the gross quote spent (fee inclusive)"
+    (10.0 -. cost)
+    state.accumulated_profit;
+  check
+    bool
+    "the newest lot is the net remaining quantity"
+    true
+    (match state.buy_lots with
+     | [ (p, q) ] ->
+       abs_float (p -. 100.0) < 1e-12 && abs_float (q -. (net_qty -. skim)) < 1e-12
+     | _ -> false);
+  (* The paired sell must credit the spread on that net remainder - no more, no less. *)
+  let sell_qty = state.last_buy_fill_qty |> Option.get in
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
+    ~now:101.0
+    symbol
+    "hl-fee-sell"
+    Dio_strategies.Strategy_common.Sell
+    ~fill_price:101.0
+    ~fill_qty:sell_qty
+    None;
+  let spread = (101.0 -. 100.0) *. sell_qty in
+  let sell_fee = 101.0 *. sell_qty *. 0.001 in
+  check
+    (float 1e-9)
+    "the adjusted sell credits exactly its own spread less fees"
+    (10.0 -. cost +. spread -. sell_fee)
+    state.accumulated_profit
+;;
+
 (* The ladder of record must track reality in both directions:
    - a filled rung LEAVES the file (it is gone venue-side), and
    - a cancelled rung STAYS in the file (Alpaca fractional orders are day TIF, so the
      venue kills them at the close), which is what lets the next cycle notice held spot
-     inventory with no order behind it and replace the rung top-down.
-   Both sides run through the real lifecycle handlers, not a shortcut. *)
+     inventory with no order behind it and replace the rung top-down. Both sides run
+     through the real lifecycle handlers, not a shortcut. *)
 let test_alpaca_ladder_of_record_tracks_fills_and_cancels () =
   let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
   (* Fill: the resting rung and its recorded level both go. *)
   let filled_symbol = "ALPACA_LEVELS_FILL/USD" in
   let filled = reset_alpaca_excess_state filled_symbol in
   filled.persisted_sell_levels <- [ 101.0, 1.0 ];
-  filled.open_sell_orders <- Sell_orders.of_list [ "oid-101-" ^ filled_symbol, 101.0, 1.0 ];
+  filled.open_sell_orders
+  <- Sell_orders.of_list [ "oid-101-" ^ filled_symbol, 101.0, 1.0 ];
   filled.last_fill_oid <- None;
   Dio_strategies.Strategy_api.Strategy.set_startup_replay_done filled_symbol;
   Dio_strategies.Strategy_api.Strategy.handle_order_filled
@@ -5972,14 +6051,19 @@ let test_alpaca_ladder_of_record_tracks_fills_and_cancels () =
   let cancelled_symbol = "ALPACA_LEVELS_CANCEL/USD" in
   let state = reset_alpaca_excess_state cancelled_symbol in
   state.persisted_sell_levels <- [ 101.0, 1.0 ];
-  state.open_sell_orders <- Sell_orders.of_list [ "oid-101-" ^ cancelled_symbol, 101.0, 1.0 ];
+  state.open_sell_orders
+  <- Sell_orders.of_list [ "oid-101-" ^ cancelled_symbol, 101.0, 1.0 ];
   Dio_strategies.Strategy_api.Strategy.handle_order_cancelled
     ~now:100.0
     cancelled_symbol
     ("oid-101-" ^ cancelled_symbol)
     Dio_strategies.Strategy_common.Sell
     None;
-  check bool "the cancelled rung leaves the book" true (Sell_orders.length state.open_sell_orders = 0);
+  check
+    bool
+    "the cancelled rung leaves the book"
+    true
+    (Sell_orders.length state.open_sell_orders = 0);
   check
     bool
     "a cancelled (TIF-expired) rung stays in the ladder of record"
@@ -9086,6 +9170,10 @@ let () =
             "alpaca buy fill skims into reserved_base"
             `Quick
             test_alpaca_buy_fill_skims_reserve
+        ; test_case
+            "hl buy fill skims the net qty at gross cost"
+            `Quick
+            test_hl_buy_fill_skims_net_qty_and_gross_cost
         ; test_case
             "new buy respects the 2x gi closest-sell cap"
             `Quick
