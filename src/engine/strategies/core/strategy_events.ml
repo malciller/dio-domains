@@ -716,8 +716,10 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
            && net_qty -. skim >= lot -. 1e-9
            && state.accumulated_profit >= cost +. state.accumulation_buffer
         then (
+          let reserved_before = state.reserved_base in
+          let profit_before = state.accumulated_profit in
           state.reserved_base <- state.reserved_base +. skim;
-          state.accumulated_profit <- Float.max 0.0 (state.accumulated_profit -. cost);
+          state.accumulated_profit <- state.accumulated_profit -. cost;
           state.last_buy_fill_qty <- Some (net_qty -. skim);
           (* The skimmed base was never sellable, so the newest lot cannot fund a sell. *)
           state.buy_lots
@@ -727,11 +729,16 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
           state.persistence_dirty <- true;
           Logging.info_f
             ~section
-            "Skimmed base for %s: +%.8f into reserved_base (cost $%.4f, sellable lot \
-             %.8f)"
+            "Skimmed base for %s: +%.8f (reserved_base %.8f -> %.8f), -$%.4f profit \
+             (%.4f -> %.4f, buffer %.4f), sellable lot %.8f"
             asset_symbol
             skim
+            reserved_before
+            state.reserved_base
             cost
+            profit_before
+            state.accumulated_profit
+            state.accumulation_buffer
             (net_qty -. skim)));
       (* Persistence dirty-marking follows the per-strategy config opt-in
          (base_accumulation), not a hardcoded venue list. *)
@@ -939,6 +946,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
              (sell_fill_price *. qty *. state.maker_fee) +. (bp *. qty *. state.maker_fee)
            | None -> sell_fill_price *. qty *. state.maker_fee)
        in
+       let profit_before = state.accumulated_profit in
        let updated =
          Dio_persistence.Base_accumulation_store.apply_sell_fill
            store_t
@@ -959,7 +967,17 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
        state.last_sell_fill_qty
        <- updated.Dio_persistence.Base_accumulation_store.last_sell_fill_qty;
        (* Spent lots are gone: the next sell needs a buy that actually filled. *)
-       state.buy_lots <- updated.Dio_persistence.Base_accumulation_store.buy_lots
+       state.buy_lots <- updated.Dio_persistence.Base_accumulation_store.buy_lots;
+       let credited = state.accumulated_profit -. profit_before in
+       Logging.info_f
+         ~section
+         "Sell credit %s: %+.4f over %.8f (fees $%.4f), accumulated_profit %.4f -> %.4f"
+         asset_symbol
+         credited
+         qty
+         fees
+         profit_before
+         state.accumulated_profit
      | Buy -> ());
     let should_update_oid =
       match state.last_fill_oid with

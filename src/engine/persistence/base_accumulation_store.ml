@@ -213,10 +213,10 @@ let rec consume_lots ~price ~remaining acc = function
 ;;
 
 (** Sell fill: profit = the spread over the buy lots the sell consumes, minus [fees]
-    (all-in, both legs); positive net profit accrues to [accumulated_profit].
+    (all-in, both legs). Signed: a losing cycle debits [accumulated_profit].
 
-    The consumed lots are dropped even when the cycle does not net a profit: that base
-    left the account, so it cannot fund another cycle.
+    The consumed lots are dropped either way: that base left the account, so it cannot
+    fund another cycle.
 
     No base is reserved here. Every venue sells 1:1, so a sell never withholds a slice;
     accumulation happens on the bought side (the profit-gated lot skim in
@@ -233,13 +233,10 @@ let apply_sell_fill t ~price ~qty ~oid ~fees () =
     consume_lots ~price ~remaining:qty 0.0 t.buy_lots
   in
   let net_profit = matched_profit -. fees in
-  if net_profit <= 0.0
-  then { t with buy_lots = lots_after_sell }
-  else
-    { t with
-      accumulated_profit = t.accumulated_profit +. net_profit
-    ; buy_lots = lots_after_sell
-    }
+  { t with
+    accumulated_profit = t.accumulated_profit +. net_profit
+  ; buy_lots = lots_after_sell
+  }
 ;;
 
 (* -- Persistence ------------------------------------------------------ *)

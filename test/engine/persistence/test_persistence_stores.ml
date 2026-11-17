@@ -77,7 +77,9 @@ let test_apply_sell_fill_credits_profit () =
 let test_apply_sell_fill_unprofitable () =
   let t = A.apply_buy_fill A.default ~price:100.0 ~qty:0.5 ~oid:"o1" in
   let t = A.apply_sell_fill t ~price:90.0 ~qty:0.5 ~oid:"o2" ~fees:0.0 () in
-  Alcotest.(check (float 1e-12)) "loss not accumulated" 0.0 t.A.accumulated_profit;
+  (* A losing cycle is a negative credit: profit is a signed quote ledger, not a
+     high-water mark. *)
+  Alcotest.(check (float 1e-12)) "loss debited" (-5.0) t.A.accumulated_profit;
   Alcotest.(check int) "sold base leaves the lots" 0 (List.length t.A.buy_lots)
 ;;
 
