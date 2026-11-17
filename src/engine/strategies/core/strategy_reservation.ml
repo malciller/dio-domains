@@ -86,7 +86,9 @@ let can_place_buy_order (_qty : float) quote_balance quote_needed =
   quote_balance >= quote_needed
 ;;
 
-(** True if an amendment of [order_id] is permitted. *)
+(** True if an amendment of [order_id] is permitted. Gated on the event-driven amend
+    lifecycle only: the executor's terminal event releases the order, so a resting buy can
+    be re-amended on the next book event. *)
 let amend_allowed
   ~state
   ~order_id
@@ -103,10 +105,8 @@ let amend_allowed
       state.pending_orders
   in
   let is_in_flight = InFlightAmendments.is_in_flight order_id in
-  let is_on_cooldown = Hashtbl.mem state.amend_cooldowns order_id in
   (not is_being_amended)
   && (not is_in_flight)
-  && (not is_on_cooldown)
   && price_diff >= min_move_threshold
   && target_price <> current_price_rounded
 ;;

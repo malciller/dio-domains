@@ -769,6 +769,16 @@ module InFlightAmendments = struct
     found
   ;;
 
+  (** True when [order_id] participates in an amendment: either the amended (old) id still
+      inside the lifecycle or the replacement (new) id produced by a cancel+replace. The
+      common (old-id) case takes one registry read; the reverse index is consulted only
+      for an unregistered id. *)
+  let is_amend_related order_id =
+    match phase_of order_id with
+    | Some (Pending | Replaced _) -> true
+    | _ -> is_replacement_target order_id
+  ;;
+
   (** Remove [order_id] from the registry (terminal phases, cleanup). Returns true if it
       was present. *)
   let remove_in_flight_amendment order_id =
@@ -823,6 +833,20 @@ module InFlightAmendments = struct
        | Some previous -> forget_replacement previous
        | None -> ());
       register_replacement ~old_id ~new_id)
+  ;;
+
+  (** The exchange acknowledged the amendment but did not name the replacement (a
+      cancel+replace venue whose ack carried no new id). Keep the old id in the
+      recognition window so a transient old/replacement pair cannot be swept as duplicate
+      buys. The entry is bounded by [cleanup] and dropped by the old id's terminal event. *)
+  let note_amendment_unresolved ~old_id =
+    let now = Unix.gettimeofday () in
+    let shard = shard_of old_id in
+    let registry = registries.(shard) in
+    let mutex = shard_mutexes.(shard) in
+    Mutex.lock mutex;
+    Hashtbl.replace registry old_id { phase = Replaced ""; last = now };
+    Mutex.unlock mutex
   ;;
 
   (** The exchange rejected the amendment: terminal. The entry is dropped so a follow-up

@@ -404,7 +404,7 @@ let prepare c =
   ignore (resolve_book c)
 ;;
 
-(** Fine path step 2a: expire stale amend cooldowns. *)
+(** Fine path step 2a: expire placement retry cooldowns. *)
 let expire_amend_cooldowns c =
   match c.cg_state, c.cg_asset with
   | Some state, Some asset -> Jac.expire_amend_cooldowns ~state ~now:c.cg_now ~asset

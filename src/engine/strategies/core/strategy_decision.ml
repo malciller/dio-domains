@@ -100,22 +100,16 @@ let buy_cancel_excess
      pointed at a dead order. Track what we actually cancelled so tracking is only cleared
      for orders that really left the book. *)
   (* Backstop for the same race: keep the old/replacement pair out of the rung reconcile
-     while the tracked buy is inside its amend cooldown, even if the registry mapping
-     lags. *)
+     while the tracked buy is still inside the event-driven amend lifecycle, even if the
+     registry mapping lags. *)
   let tracked_recently_amended =
+    state.inflight_amend_buy
+    ||
     match state.last_buy_order_id with
-    | Some tracked ->
-      (match Hashtbl.find_opt state.amend_cooldowns tracked with
-       | Some expiry -> now < expiry
-       | None -> false)
+    | Some tracked -> InFlightAmendments.is_amend_related tracked
     | None -> false
   in
-  let replacement_pending =
-    match Hashtbl.find_opt state.amend_cooldowns "replacement_pending" with
-    | Some expiry -> now < expiry
-    | None -> false
-  in
-  if replacement_pending || tracked_recently_amended
+  if tracked_recently_amended
   then (
     Logging.debug_f
       ~section
@@ -704,10 +698,7 @@ let buy_amend_no_sell
             ~section
             "buy amend held for %s: amendment in flight for %s"
             asset.symbol
-            buy_order_id
-        else if Hashtbl.mem state.amend_cooldowns buy_order_id
-        then
-          Logging.info_f ~section "buy amend held for %s: order on cooldown" asset.symbol);
+            buy_order_id);
      if trail_up
      then (
        let effective_amend_price = target_buy_price in

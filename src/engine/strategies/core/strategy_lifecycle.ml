@@ -618,16 +618,17 @@ let evaluate_capital_low_recovery
         was_at))
 ;;
 
-(** Expires rate-limit cooldowns and ghost-order markers.
+(** Expires the placement retry cooldowns (`place_Buy` / `place_Sell`) and ghost-order
+    markers.
 
-    Pending order/amendment tokens are deliberately not swept here. Their lifecycle is
-    purely event-driven: every dispatched place/amend produces one guaranteed terminal
-    event (Ack/Failed, Amended/Amendment_skipped/ Amendment_failed, or a recognized
-    cancel), and each handler removes the token, the in-flight flag, and the registry
-    entry. An age-based sweep resolved state while the exchange could still be executing
-    the request (Alpaca amends exceed 5s under SSL degradation), so a mid-flight cancel
-    event was no longer recognized as the amend's side effect and wrongly reset buy
-    tracking. *)
+    Amendment gating is event-driven ([InFlightAmendments]); the keys here are only
+    placement backoffs after a venue reject or a stale balance. Pending tokens are not
+    swept: every dispatched place/amend produces one terminal event (Ack/Failed,
+    Amended/Amendment_skipped/Amendment_failed, or a recognized cancel) whose handler
+    removes the token, flag, and registry entry. An age-based sweep resolved state while
+    the exchange could still be executing the request (Alpaca amends exceed 5s under SSL
+    degradation), so a mid-flight cancel was no longer recognized as the amend's side
+    effect and wrongly reset buy tracking. *)
 let expire_amend_cooldowns ~state ~now ~(asset : trading_config) =
   if Hashtbl.length state.amend_cooldowns > 0
   then (
@@ -752,10 +753,7 @@ let apply_open_order_delta ~state ~now_time ~ecfg ~changes =
   let recompute_recent_amend () =
     let found = ref false in
     Hashtbl.iter
-      (fun id _ ->
-        match Hashtbl.find_opt state.amend_cooldowns id with
-        | Some expiry when now_time < expiry -> found := true
-        | _ -> ())
+      (fun id _ -> if InFlightAmendments.is_amend_related id then found := true)
       state.feed_buy_index;
     state.cached_has_recent_amend_buy <- !found
   in
@@ -805,10 +803,8 @@ let apply_open_order_delta ~state ~now_time ~ecfg ~changes =
             then (
               state.cached_best_buy_id <- oid;
               state.cached_best_buy_price <- price);
-            match Hashtbl.find_opt state.amend_cooldowns oid with
-            | Some expiry when now_time < expiry ->
-              state.cached_has_recent_amend_buy <- true
-            | _ -> ())
+            if InFlightAmendments.is_amend_related oid
+            then state.cached_has_recent_amend_buy <- true)
           else if side_str = "sell"
           then (
             add_tracked_order_id state oid;
@@ -1024,9 +1020,8 @@ let sync_open_orders
           then (
             s.ss_best_buy_price <- price;
             s.ss_best_buy_id <- oid);
-          match Hashtbl.find_opt state.amend_cooldowns oid with
-          | Some expiry when now_time < expiry -> s.ss_has_recent_amend_buy <- true
-          | _ -> ())
+          if InFlightAmendments.is_amend_related oid
+          then s.ss_has_recent_amend_buy <- true)
         else if side_str = "sell"
         then (
           add_tracked_order_id state oid;
@@ -1180,13 +1175,7 @@ let sync_open_orders
     || InFlightOrders.is_in_flight state.duplicate_key_buy
     ||
     match state.last_buy_order_id with
-    | Some oid ->
-      InFlightAmendments.is_in_flight oid
-      || InFlightAmendments.is_amend_lifecycle_active oid
-      ||
-        (match Hashtbl.find_opt state.amend_cooldowns oid with
-        | Some expiry -> now_time < expiry
-        | None -> false)
+    | Some oid -> InFlightAmendments.is_amend_related oid
     | None -> false
   in
   (* Ghost-buy grace predicate moved to Platform_accounting (milestone 2). A freshly acked
@@ -1239,11 +1228,7 @@ let sync_open_orders
     then (
       let best_order_id = s.ss_best_buy_id in
       let best_price = s.ss_best_buy_price in
-      let recent_amend =
-        match Hashtbl.find_opt state.amend_cooldowns best_order_id with
-        | Some expiry -> now < expiry
-        | None -> false
-      in
+      let recent_amend = InFlightAmendments.is_amend_related best_order_id in
       (* Defense-in-depth: the purge above should already have dropped any terminal id
          from the index/cache, but never adopt one even if a future path republishes it -
          the adopt -> doomed amend -> evict loop is what wedged the symbol. *)
@@ -1296,13 +1281,8 @@ let sync_open_orders
         List.rev !open_acc, List.rev !missing_acc))
     else [], []
   in
-  let replacement_pending =
-    match Hashtbl.find_opt state.amend_cooldowns "replacement_pending" with
-    | Some expiry -> now_time < expiry
-    | None -> false
-  in
   ( s.ss_open_buy_count
-  , s.ss_has_recent_amend_buy || replacement_pending
+  , s.ss_has_recent_amend_buy
   , s.ss_locked_in_buys
   , s.ss_locked_in_sells
   , (if s.ss_closest_sell_id = ""

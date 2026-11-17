@@ -163,7 +163,9 @@ type strategy_state =
       (* true while buy amend is in-flight; gates duplicate-buy cancel during
          inject/remove window *)
   ; mutable amend_cooldowns : (string, float) Hashtbl.t
-      (* order_id -> expiry Unix timestamp *)
+      (* key -> expiry Unix timestamp. Holds the placement backoff keys (`place_Buy` /
+         `place_Sell`) only; amendment gating lives in the event-driven
+         [InFlightAmendments] registry. *)
   ; mutable last_cleanup_time : float
   ; mutable inflight_buy : bool (* true while buy Place is pending ack or reject *)
   ; mutable inflight_sell : bool (* true while sell Place is pending ack or reject *)

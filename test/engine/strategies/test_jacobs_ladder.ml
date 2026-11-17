@@ -1389,6 +1389,22 @@ let test_ghost_buy_suppressed_within_ack_grace () =
     "its quote reservation is retained within the grace"
     true
     (abs_float state.reserved_quote > 1.0);
+  (* A cancel+replace replacement is amend-active until the feed lists it, even after the
+     placement ack grace has elapsed. *)
+  let module IA = Dio_strategies.Strategy_common.InFlightAmendments in
+  ignore (IA.remove_in_flight_amendment "ack-buy-1");
+  ignore (IA.remove_in_flight_amendment "ack-buy-1-new");
+  IA.note_amendment_succeeded ~old_id:"ack-buy-1" ~new_id:"ack-buy-1-new";
+  state.last_buy_order_id <- Some "ack-buy-1-new";
+  state.last_buy_ack_ts <- now -. 20.0;
+  run_scan ();
+  check
+    bool
+    "a replacement awaiting the feed is not purged"
+    true
+    (state.last_buy_order_id = Some "ack-buy-1-new");
+  ignore (IA.remove_in_flight_amendment "ack-buy-1");
+  state.last_buy_order_id <- Some "ack-buy-1";
   (* Past the grace and still absent with no terminal event: recover it. *)
   state.last_buy_ack_ts <- now -. 20.0;
   run_scan ();
@@ -3301,10 +3317,11 @@ let test_cancel_mid_amend_keeps_pending_marker () =
   ignore (IA.remove_in_flight_amendment "old-1")
 ;;
 
-let test_same_id_amend_arms_replacement_pending () =
+let test_same_id_amend_stays_in_lifecycle () =
   (* A Hyperliquid modify ack without a replacement oid comes back as a same-id "amend".
-     Arm the symbol-level replacement-pending window so the excess sweep cannot mistake
-     the old/replacement pair for duplicate buys while the feed binds the real new id. *)
+     Keep the symbol's old id in the event-driven amend lifecycle so the excess sweep
+     cannot mistake the old/replacement pair for duplicate buys while the feed binds the
+     real new id. *)
   let symbol = "SAME_ID_AMEND/USD" in
   let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "hyperliquid";
@@ -3312,6 +3329,8 @@ let test_same_id_amend_arms_replacement_pending () =
   state.last_buy_order_id <- Some "old";
   state.last_buy_order_price <- Some 100.0;
   Hashtbl.reset state.amend_cooldowns;
+  ignore
+    (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment "old");
   Dio_strategies.Strategy_api.Strategy.handle_order_amended
     ~now:100.0
     symbol
@@ -3321,25 +3340,71 @@ let test_same_id_amend_arms_replacement_pending () =
     101.0;
   check
     bool
-    "replacement-pending marker armed for a same-id Hyperliquid ack"
+    "same-id Hyperliquid ack stays in the amend lifecycle"
     true
-    (match Hashtbl.find_opt state.amend_cooldowns "replacement_pending" with
-     | Some expiry -> expiry > 100.0
-     | None -> false);
+    (Dio_strategies.Strategy_common.InFlightAmendments.is_amend_lifecycle_active "old");
+  (* The executor resolves the replacement on a later ack: the old id stays recognized and
+     the new id becomes a replacement target until the recognition window ages out. *)
+  Dio_strategies.Strategy_common.InFlightAmendments.note_amendment_succeeded
+    ~old_id:"old"
+    ~new_id:"new";
+  check
+    bool
+    "resolved amend registers the replacement target"
+    true
+    (Dio_strategies.Strategy_common.InFlightAmendments.is_replacement_target "new");
+  ignore
+    (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment "old")
+;;
+
+let test_cancel_replace_amend_has_no_timer_gate () =
+  (* SPCX regression: a successful Alpaca fractional amend is a cancel+replace, which used
+     to arm a 10s per-order cooldown and log "buy amend held ... order on cooldown". The
+     amend lifecycle is event-driven, so the replacement can be re-amended on the next
+     book event. *)
+  let module IA = Dio_strategies.Strategy_common.InFlightAmendments in
+  let symbol = "AMEND_HF/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.pending_orders <- [];
+  state.last_buy_order_id <- Some "old";
+  state.last_buy_order_price <- Some 100.0;
+  state.inflight_amend_buy <- true;
+  Hashtbl.reset state.amend_cooldowns;
+  ignore (IA.remove_in_flight_amendment "old");
+  ignore (IA.remove_in_flight_amendment "new");
+  (* The executor resolves the replace before the Amended event reaches the domain. *)
+  IA.note_amendment_succeeded ~old_id:"old" ~new_id:"new";
   Dio_strategies.Strategy_api.Strategy.handle_order_amended
-    ~now:101.0
+    ~now:100.0
     symbol
     "old"
     "new"
     Dio_strategies.Strategy_common.Buy
-    102.0;
+    101.0;
+  check
+    (option string)
+    "tracking rekeyed to the replacement"
+    (Some "new")
+    state.last_buy_order_id;
   check
     bool
-    "resolved amend clears the replacement-pending marker"
+    "no timer entry for the replacement id"
+    false
+    (Hashtbl.mem state.amend_cooldowns "new");
+  check
+    bool
+    "replacement can be amended on the next event"
     true
-    (match Hashtbl.find_opt state.amend_cooldowns "replacement_pending" with
-     | None -> true
-     | Some expiry -> expiry <= 101.0)
+    (Dio_strategies.Strategy_api.amend_allowed
+       ~state
+       ~order_id:"new"
+       ~target_price:102.0
+       ~current_price_rounded:101.0
+       ~price_diff:1.0
+       ~min_move_threshold:0.01);
+  ignore (IA.remove_in_flight_amendment "old");
+  ignore (IA.remove_in_flight_amendment "new")
 ;;
 
 let test_order_rejection () =
@@ -3486,9 +3551,16 @@ let test_insufficient_qty_amend_failure_keeps_tracking () =
     "held-qty amend failure keeps the resting order tracked"
     (Some "held-1")
     state.last_buy_order_id;
-  (match Hashtbl.find_opt state.amend_cooldowns "held-1" with
-   | Some expiry -> check bool "non-terminal cooldown applied" true (expiry >= 101.5)
-   | None -> failwith "expected an amend cooldown");
+  check
+    bool
+    "held-qty amend failure applies no timer cooldown"
+    false
+    (Hashtbl.mem state.amend_cooldowns "held-1");
+  check
+    bool
+    "held-qty amend failure resolves the in-flight amend"
+    false
+    (Dio_strategies.Strategy_common.InFlightAmendments.is_in_flight "held-1");
   check
     bool
     "held-qty amend failure does not push a redundant cancel"
@@ -7178,11 +7250,11 @@ let test_buy_cancel_excess_spares_amend_replacement () =
     state.last_buy_order_id
 ;;
 
-let test_buy_cancel_excess_respects_tracked_amend_cooldown () =
-  (* Regression for the Hyperliquid modify-ack race: the amend cooldown is keyed to the
-     tracked (old) id, while the feed may already list the replacement. The
-     registry/replacement guards can be momentarily empty, but a tracked buy inside its
-     amend cooldown must still suppress the excess sweep. *)
+let test_buy_cancel_excess_respects_tracked_amend_lifecycle () =
+  (* Regression for the Hyperliquid modify-ack race: the tracked (old) id can still be in
+     the event-driven amend lifecycle while the feed already lists the replacement. The
+     registry/placement guards can be momentarily empty; a tracked buy in the amend
+     lifecycle must still suppress the excess sweep. *)
   let open Dio_strategies.Strategy_api in
   let module C = Dio_strategies.Strategy_common in
   let symbol = "EXCESS_COOLDOWN/USDC" in
@@ -7195,7 +7267,8 @@ let test_buy_cancel_excess_respects_tracked_amend_cooldown () =
   state.inflight_amend_buy <- false;
   state.inflight_cancel_buy <- false;
   Hashtbl.reset state.amend_cooldowns;
-  Hashtbl.replace state.amend_cooldowns "buy-old" 200.0;
+  ignore (C.InFlightAmendments.remove_in_flight_amendment "buy-old");
+  C.InFlightAmendments.note_amendment_unresolved ~old_id:"buy-old";
   let asset =
     { exchange = "hyperliquid"
     ; symbol
@@ -7228,11 +7301,11 @@ let test_buy_cancel_excess_respects_tracked_amend_cooldown () =
     ~effective_buy_count:2;
   check
     int
-    "no cancels while the tracked buy is inside its amend cooldown"
+    "no cancels while the tracked buy is inside the amend lifecycle"
     0
     (List.length (get_pending_orders 100));
-  (* Control: with the cooldown expired, a genuine duplicate pair is still cancelled. *)
-  Hashtbl.replace state.amend_cooldowns "buy-old" 50.0;
+  (* Control: once the amend lifecycle resolves, a genuine duplicate pair is cancelled. *)
+  ignore (C.InFlightAmendments.remove_in_flight_amendment "buy-old");
   drain ();
   Dio_strategies.Strategy_decision.buy_cancel_excess
     ~state
@@ -7243,7 +7316,7 @@ let test_buy_cancel_excess_respects_tracked_amend_cooldown () =
     ~effective_buy_count:2;
   check
     int
-    "duplicates cancelled after the cooldown"
+    "duplicates cancelled after the amend lifecycle resolves"
     2
     (List.length (get_pending_orders 100))
 ;;
@@ -8699,9 +8772,9 @@ let () =
             `Quick
             test_buy_cancel_excess_spares_amend_replacement
         ; test_case
-            "buy excess-cancel respects a tracked amend cooldown"
+            "buy excess-cancel respects a tracked amend lifecycle"
             `Quick
-            test_buy_cancel_excess_respects_tracked_amend_cooldown
+            test_buy_cancel_excess_respects_tracked_amend_lifecycle
         ; test_case
             "amend failure adopts a live replacement"
             `Quick
@@ -9060,9 +9133,13 @@ let () =
             `Quick
             test_cancel_mid_amend_keeps_pending_marker
         ; test_case
-            "same-id amend arms replacement pending"
+            "same-id amend stays in the amend lifecycle"
             `Quick
-            test_same_id_amend_arms_replacement_pending
+            test_same_id_amend_stays_in_lifecycle
+        ; test_case
+            "cancel+replace amend is not timer gated"
+            `Quick
+            test_cancel_replace_amend_has_no_timer_gate
         ; test_case "order rejection" `Quick test_order_rejection
         ; test_case
             "amendment TIF reject arms recovery"

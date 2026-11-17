@@ -1078,7 +1078,6 @@ let handle_order_cancelled ~now:_ asset_symbol order_id side cl_ord_id =
           state.pending_orders));
   if not is_being_amended
   then (
-    Hashtbl.remove state.amend_cooldowns order_id;
     (* A cancelled buy is terminal. Evict it so a stale open-order snapshot cannot
        re-adopt it as the resting buy and issue a doomed amend against a dead id. Sells
        are not evicted: an evicted sell arms the wash-trade crossing guard and would block
@@ -1241,39 +1240,32 @@ let handle_order_amended ~now asset_symbol old_order_id new_order_id side price 
        "SELL_AMEND [%s] result: sells_after=%d"
        asset_symbol
        (Sell_orders.length state.open_sell_orders));
-  let cooldown = if old_order_id = new_order_id then 2.0 else 10.0 in
-  Hashtbl.replace state.amend_cooldowns old_order_id (now +. cooldown);
-  Hashtbl.replace state.amend_cooldowns new_order_id (now +. cooldown);
-  (* On a cancel+replace venue, a same-id ack means the exchange did not name the
-     replacement. The ordinary cooldown is keyed to the old id, so it cannot cover the
-     replacement id until the feed binds it. Suppress the excess-buy sweep for the symbol
-     during that window; [sync_open_orders] folds this marker into [has_recent_amend_buy],
-     and [buy_cancel_excess] checks it as a backstop. *)
+  (* Amend gating is the executor's terminal event, not a timer. A same-id ack on a
+     cancel+replace venue means the exchange did not name the replacement; keep the old id
+     in the recognition window until cleanup. *)
   (match side with
    | Buy ->
-     if old_order_id = new_order_id
-     then (
-       if String.equal state.exchange_id "hyperliquid"
-       then Hashtbl.replace state.amend_cooldowns "replacement_pending" (now +. 30.0))
-     else Hashtbl.remove state.amend_cooldowns "replacement_pending"
+     if old_order_id = new_order_id && String.equal state.exchange_id "hyperliquid"
+     then InFlightAmendments.note_amendment_unresolved ~old_id:old_order_id;
+     state.inflight_amend_buy <- false
    | Sell -> ());
-  if side = Buy then state.inflight_amend_buy <- false;
   ()
 ;;
 
 (** Handles skipped order amendment (suppressed as a no-op by the executor).
 
-    Clears the pending-amend entry and applies a short cooldown so the strategy does not
-    re-push the same suppressed amendment every cycle (previously this produced a silent
-    retry loop that looked like a hang). *)
-let handle_order_amendment_skipped ~now asset_symbol order_id side _ =
+    Clears the pending-amend entry and folds the requested price into a tracked buy. A
+    skipped amendment means the venue already rests at that price, so updating tracking
+    stops the strategy re-pushing it. *)
+let handle_order_amendment_skipped ~now:_ asset_symbol order_id side price =
   let state = get_strategy_state asset_symbol in
   state.pending_orders
   <- filter_keep_if_needed
        (fun (pending_id, _s, _p, _) -> not (pending_amend_for pending_id order_id))
        state.pending_orders;
-  (* Throttle re-issue of a suppressed amendment. *)
-  Hashtbl.replace state.amend_cooldowns order_id (now +. 5.0);
+  (match side, state.last_buy_order_id with
+   | Buy, Some tracked when tracked = order_id -> state.last_buy_order_price <- Some price
+   | _ -> ());
   (* A suppressed amendment is a terminal outcome of the amend lifecycle: clear the
      in-flight flag or it stays set forever, silently blocking every later qty-only
      amendment on this symbol (the qty_mismatch gate requires
@@ -1314,18 +1306,6 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
     || contains_fragment lower_reason "already canceled"
     || contains_fragment lower_reason "already cancelled"
   in
-  let is_rate_limit =
-    contains_fragment lower_reason "too many cumulative requests"
-    || contains_fragment lower_reason "rate limit"
-  in
-  let cooldown_duration =
-    if is_rate_limit
-    then 10.0
-    else if is_cache_miss || is_cannot_modify || is_already_terminal
-    then 0.5
-    else 2.0
-  in
-  Hashtbl.replace state.amend_cooldowns order_id (now +. cooldown_duration);
   (* Terminal outcome of the amend lifecycle: clear the in-flight flag so later qty-only
      amendments are not silently blocked. *)
   (match side with
@@ -1344,8 +1324,8 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
      held_for_orders ..."), which fails precisely because the original order is still
      resting. Dropping tracking for it released the sell commitment while the venue still
      held the shares, and the next cycle re-issued the same doomed amend - the source of
-     the repeating 403/422 storm. Keep tracking and cool down instead; the order's own
-     terminal event or the cancel path will retire it. *)
+     the repeating 403/422 storm. Keep tracking instead; the order's own terminal event or
+     the cancel path will retire it. *)
   let is_order_gone =
     is_cache_miss || is_cannot_modify || is_tif_rejection || is_already_terminal
   in
@@ -1441,20 +1421,18 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
        | Some target_id when target_id = order_id ->
          Logging.info_f
            ~section
-           "Amendment failed for buy order %s: %s. Applying %.1fs cooldown (keeping \
-            tracking)."
+           "Amendment failed for buy order %s: %s. Keeping tracking; the next book event \
+            retries if still warranted."
            order_id
            reason
-           cooldown_duration
        | _ -> ())
     | Sell ->
       Logging.info_f
         ~section
-        "Amendment failed for sell order %s: %s. Applying %.1fs cooldown (keeping \
-         tracking)."
+        "Amendment failed for sell order %s: %s. Keeping tracking; the next book event \
+         retries if still warranted."
         order_id
-        reason
-        cooldown_duration);
+        reason);
   ignore
     (InFlightOrders.remove_in_flight_order
        (match side with
