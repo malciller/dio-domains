@@ -13,6 +13,20 @@ open Strategy_orders
 open Strategy_lifecycle
 module Sell_orders = Strategy_sell_orders
 
+(** True when an outstanding sell commitment already holds base at [price]. The commitment
+    is armed at dispatch, before the venue ack or the open-order feed, so a rung
+    dispatched in the current pass still reads as missing to the venue partition while its
+    base is already charged against the sellable pool ([committed_total]). Such a rung
+    must neither consume the free-base budget again nor be re-dispatched. Price matching
+    mirrors the ack re-key in [handle_order_acknowledged]. *)
+let sell_commitment_at_price ~(state : strategy_state) price =
+  let tol = Float.max (price *. 0.0001) 1e-9 in
+  Hashtbl.fold
+    (fun _ (c : sell_commitment) found -> found || abs_float (c.sc_price -. price) <= tol)
+    state.sell_commitments
+    false
+;;
+
 (** Price at which a newly-owed sell would be placed, given the current book; the single
     source of truth shared by [evaluate_sell_leg] (which places the sell) and
     [evaluate_buy_leg] (which pre-clamps a fresh buy against the companion sell's
@@ -655,50 +669,52 @@ let buy_amend_no_sell
      if reanchor_buy && not trail_up then state.force_buy_reanchor <- false;
      (* Sampled once per 100 cycles: the log otherwise only shows the amend that finally
         fired, never the ticks in between. *)
-     (if cycle mod 100 = 0
-      then
-        let diff =
-          state.cached_round_price
-            (abs_float (target_buy_price -. current_buy_price_rounded))
-        in
-        if not trail_up
-        then
-          Logging.info_f
-            ~section
-            "buy amend idle for %s: target %.4f <= resting %.4f (diff %.4f, tick %.4f, \
-             bid %.4f ask %.4f)"
-            asset.symbol
-            target_buy_price
-            current_buy_price
-            diff
-            min_move_threshold
-            bid_price
-            ask_price
-        else if diff < min_move_threshold
-        then
-          Logging.info_f
-            ~section
-            "buy amend held for %s: move %.4f < tick %.4f (target %.4f, resting %.4f)"
-            asset.symbol
-            diff
-            min_move_threshold
-            target_buy_price
-            current_buy_price
-        else if
-          List.exists
-            (fun (id, _, _, _) ->
-               String.starts_with ~prefix:"pending_amend_" id
-               && String.sub id 14 (String.length id - 14) = buy_order_id)
-            state.pending_orders
-        then
-          Logging.info_f ~section "buy amend held for %s: amendment already pending" asset.symbol
-        else if InFlightAmendments.is_in_flight buy_order_id
-        then
-          Logging.info_f
-            ~section
-            "buy amend held for %s: amendment in flight for %s"
-            asset.symbol
-            buy_order_id);
+     if cycle mod 100 = 0
+     then (
+       let diff =
+         state.cached_round_price
+           (abs_float (target_buy_price -. current_buy_price_rounded))
+       in
+       if not trail_up
+       then
+         Logging.info_f
+           ~section
+           "buy amend idle for %s: target %.4f <= resting %.4f (diff %.4f, tick %.4f, \
+            bid %.4f ask %.4f)"
+           asset.symbol
+           target_buy_price
+           current_buy_price
+           diff
+           min_move_threshold
+           bid_price
+           ask_price
+       else if diff < min_move_threshold
+       then
+         Logging.info_f
+           ~section
+           "buy amend held for %s: move %.4f < tick %.4f (target %.4f, resting %.4f)"
+           asset.symbol
+           diff
+           min_move_threshold
+           target_buy_price
+           current_buy_price
+       else if List.exists
+                 (fun (id, _, _, _) ->
+                   String.starts_with ~prefix:"pending_amend_" id
+                   && String.sub id 14 (String.length id - 14) = buy_order_id)
+                 state.pending_orders
+       then
+         Logging.info_f
+           ~section
+           "buy amend held for %s: amendment already pending"
+           asset.symbol
+       else if InFlightAmendments.is_in_flight buy_order_id
+       then
+         Logging.info_f
+           ~section
+           "buy amend held for %s: amendment in flight for %s"
+           asset.symbol
+           buy_order_id);
      if trail_up
      then (
        let effective_amend_price = target_buy_price in
@@ -1044,21 +1060,25 @@ let sell_leg_prepare_into
       let rem_avail = ref available_for_missing_sells in
       let kept_missing = ref [] in
       let pruned = ref [] in
-      (* Top-down, as the file records the ladder: the highest rung is re-placed first, and
-         once the sellable inventory is spent every rung below it is removed. A level left
-         recorded without base behind it is re-tried forever and reports inventory the
-         account does not hold. *)
+      (* Top-down, as the file records the ladder: the highest rung is re-placed first,
+         and once the sellable inventory is spent every rung below it is removed. A level
+         left recorded without base behind it is re-tried forever and reports inventory
+         the account does not hold. A rung already dispatched (its commitment is in
+         flight) is excluded from the budget: its base is inside [committed_total]
+         already, so charging it here would spend the free base twice and prune a fundable
+         sibling. *)
       List.iter
-        (fun ((_target_p, target_q) as level) ->
+        (fun ((target_p, target_q) as level) ->
           let min_order_size =
             if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
           in
+          let in_flight = sell_commitment_at_price ~state target_p in
           if target_q > 0.0
              && target_q >= min_order_size -. 1e-9
-             && !rem_avail >= target_q -. 1e-6
+             && (in_flight || !rem_avail >= target_q -. 1e-6)
           then (
             kept_missing := level :: !kept_missing;
-            rem_avail := max 0.0 (!rem_avail -. target_q))
+            if not in_flight then rem_avail := max 0.0 (!rem_avail -. target_q))
           else pruned := level :: !pruned)
         missing_desc;
       let new_persisted = open_levels @ List.rev !kept_missing in
@@ -1359,8 +1379,25 @@ let sell_place_body ~state ~now ~(asset : trading_config) ~bid_price ~ask_price 
       let missing_sorted_desc =
         List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) !missing_after_reconcile
       in
-      match missing_sorted_desc with
-      | (tp, tq) :: _ when tq > 0.0 ->
+      (* A rung whose sell was dispatched this pass (or is still in flight) is not
+         retried: the venue partition cannot see the commitment, and re-dispatching it
+         only trips the dedupe key while holding the restore slot. Prefer the next
+         fundable rung; when every missing rung is in flight, fall back to the top one so
+         the dedupe key still guards the duplicate. *)
+      let pick =
+        match
+          List.find_opt
+            (fun (p, _) -> not (sell_commitment_at_price ~state p))
+            missing_sorted_desc
+        with
+        | Some level -> Some level
+        | None ->
+          (match missing_sorted_desc with
+           | level :: _ -> Some level
+           | [] -> None)
+      in
+      match pick with
+      | Some (tp, tq) when tq > 0.0 ->
         (* A missing rung is restored at its OWN recorded price/qty, one per cycle. A
            restore never absorbs other base, so it cannot resurrect a dust level or
            balloon a rung into the whole balance. *)

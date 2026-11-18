@@ -1471,6 +1471,12 @@ let asset_domain_worker
     let intent_ran = ref 0 in
     let prev_capital_low = ref false in
     let last_intent_tick = ref 0.0 in
+    (* Last open-orders generation acted on. A venue cancel/expiry is written to the
+       open-order store, and on some venues (Alpaca DAY orders at the close) no exec event
+       ever follows, so the store change is the only detector. Without an intent the
+       restore would wait for the next book tick - minutes on a thin symbol, with only the
+       300s quiet-market fallback behind it. *)
+    let last_open_orders_gen = ref (-1) in
     (* Startup gate: blocks strategy execution until the initial snapshot's execution
        events have been consumed, so handle_order_acknowledged restores order state
        (last_buy_order_id, etc.) before new placements. Applies to all exchanges. *)
@@ -4208,6 +4214,16 @@ let asset_domain_worker
            prev_capital_low := low;
            if not low then incr intent_gen)
        | None -> ());
+      (* A changed open-order set means an order was added, amended, or vanished at the
+         venue. The vanish case is what matters here: a cancelled/expired rung has no book
+         tick of its own, so without this intent the restore waits for unrelated market
+         data. The generation is monotonic per symbol; -1 means the venue exposes no
+         signal and the snapshot is treated as changed on every call. *)
+      (let orders_gen = Ex.get_open_orders_generation ~symbol:asset_with_fees.symbol in
+       if orders_gen >= 0 && orders_gen <> !last_open_orders_gen
+       then (
+         last_open_orders_gen := orders_gen;
+         incr intent_gen));
       let tradable = (not (Float.is_nan !current_price)) && not equity_market_closed in
       let intent_due =
         (not !should_execute_strategy)

@@ -5858,6 +5858,53 @@ let test_alpaca_restore_replaces_top_down_and_prunes_the_bottom () =
    [use_accumulation_sells] (false for Alpaca, because that flag describes the SELL basis)
    meant Alpaca never accrued anything while [accumulated_profit] kept climbing past the
    buffer. Fill: 0.08 @ 100, sell_mult 0.98 -> 0.0016 retained. *)
+let test_alpaca_restore_keeps_sibling_of_inflight_rung () =
+  (* Both rungs were cancelled. The first pass restores the top one and arms its
+     commitment; the follow-up pass sees BOTH rungs missing (the venue partition cannot
+     see the in-flight commitment) while the free base already has the top rung deducted.
+     The sibling must not be pruned: it is fundable, and the restore slot moves to it. *)
+  let symbol = "ALPACA_RESTORE_INFLIGHT/USD" in
+  let state = reset_alpaca_excess_state symbol in
+  state.reserved_base <- 0.0;
+  Hashtbl.reset state.sell_commitments;
+  state.persisted_sell_levels <- [ 101.0, 1.0; 99.0, 1.0 ];
+  Sell_orders.clear state.open_sell_orders;
+  Dio_strategies.Strategy_api.arm_sell_commitment
+    ~state
+    ~id:"pending_sell_101.00"
+    ~price:101.0
+    ~qty:1.0;
+  let asset = alpaca_excess_asset ~symbol in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  Dio_strategies.Strategy_api.evaluate_sell_leg
+    ~persisted_reconcile:
+      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
+    ~state
+    ~now:100.0
+    ~asset
+    ~bid_price:100.0
+    ~ask_price:100.1
+    ~asset_balance:2.0
+    ~buy_attempted:false
+    ~ecfg
+    ~locked_in_sells:1.0
+    ~base_balance_age:None
+    ~oracle_halted:false;
+  check
+    bool
+    "the sibling of an in-flight rung stays in the ladder of record"
+    true
+    (List.exists (fun (p, _) -> abs_float (p -. 99.0) < 1e-6) state.persisted_sell_levels);
+  match pushed_sell_for symbol with
+  | Some o ->
+    check
+      (float 0.005)
+      "the restore slot moves to the fundable sibling, not the in-flight rung"
+      99.0
+      (Option.value o.price ~default:0.0)
+  | None -> failwith "expected the sibling rung to be restored"
+;;
+
 let test_alpaca_buy_fill_skims_reserve () =
   let symbol = "ALPACA_SKIM/USD" in
   let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
@@ -9166,6 +9213,10 @@ let () =
             "alpaca restore replaces top-down and prunes the bottom"
             `Quick
             test_alpaca_restore_replaces_top_down_and_prunes_the_bottom
+        ; test_case
+            "alpaca restore keeps the sibling of an in-flight rung"
+            `Quick
+            test_alpaca_restore_keeps_sibling_of_inflight_rung
         ; test_case
             "alpaca buy fill skims into reserved_base"
             `Quick
