@@ -1601,8 +1601,7 @@ let run_account_pass
               let resting_buy_covers =
                 resting_buy
                 && committed_buy
-                   >= need *. (1.0 -. (Float.max 0.0 d.grid_interval /. 100.0))
-                      -. 1e-9
+                   >= (need *. (1.0 -. (Float.max 0.0 d.grid_interval /. 100.0))) -. 1e-9
               in
               if is_reserved_senior
               then (
@@ -1648,7 +1647,8 @@ let run_account_pass
                     | Some r -> Int64.sub now_ns r.rr_at > reclaim_funded_hold_ns
                     | None -> true
                   in
-                  if is_reserved_senior && pipeline_active
+                  if is_reserved_senior
+                     && pipeline_active
                      && (resting_buy || funded_hold_expired)
                   then (
                     Hashtbl.remove reclaim_reservations acct_id;

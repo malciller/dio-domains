@@ -579,8 +579,7 @@ let rec refresh_loop () =
   >>= fun () ->
   do_balance_refresh ()
   >>= fun () ->
-  (* Spawn the next wait independently: a chained loop retains one Lwt node per
-     refresh. *)
+  (* Spawn the next wait independently: a chained loop retains one Lwt node per refresh. *)
   Lwt.async refresh_loop;
   Lwt.return_unit
 ;;

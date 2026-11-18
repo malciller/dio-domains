@@ -185,12 +185,11 @@ type latency_metric =
 
 (** Samples the published percentiles were computed over. With rolling windows this is the
     union of the retained windows, so it is the only count that answers "is this p99
-    meaningful?"; [samples] is the newest window alone. Frames from an engine that predates
-    the field fall back to [samples]. *)
+    meaningful?"; [samples] is the newest window alone. Frames from an engine that
+    predates the field fall back to [samples]. *)
 let latency_basis (m : latency_metric) =
   if m.union_samples > 0 then m.union_samples else m.samples
 ;;
-
 
 type memory =
   { heap_mb : int
@@ -401,7 +400,13 @@ let parse_strategy symbol j =
        | _ -> None)
   ; longs =
       (match j |?> "longs" with
-       | `List items -> List.filter_map (fun x -> match x with `Assoc _ -> Some (parse_long x) | _ -> None) items
+       | `List items ->
+         List.filter_map
+           (fun x ->
+             match x with
+             | `Assoc _ -> Some (parse_long x)
+             | _ -> None)
+           items
        | _ -> [])
   ; oracle =
       (match j |?> "oracle" with

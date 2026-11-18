@@ -482,8 +482,8 @@ let test_rolling_aggregates_windows () =
   done;
   let s2 = LP.snapshot_and_reset t in
   Alcotest.(check int) "samples stay per-window" 10 s2.samples;
-  (* Percentiles cover both retained windows, so the basis - not [samples] - is the count a
-     consumer must use to decide whether a p99/p999 is meaningful. *)
+  (* Percentiles cover both retained windows, so the basis - not [samples] - is the count
+     a consumer must use to decide whether a p99/p999 is meaningful. *)
   Alcotest.(check int) "union spans both windows" 20 s2.union_samples;
   Alcotest.(check (float 0.1)) "window 2 p50 is the union's lower half" 10.0 s2.p50;
   (* Window 3: 10 samples at 30us; union median is now 20us. *)
@@ -505,7 +505,9 @@ let test_rolling_aggregates_windows () =
 let test_stage_geometry () =
   Alcotest.(check int) "stage ceiling is 2ms" 2_000 LP.stage_max_latency_us;
   Alcotest.(check int) "stage rolling depth is 4" 4 LP.stage_rolling_windows;
-  let before = LP.create ~bucket_us:1 ~max_latency_us:10_000 ~rolling_windows:8 "before" in
+  let before =
+    LP.create ~bucket_us:1 ~max_latency_us:10_000 ~rolling_windows:8 "before"
+  in
   let now = LP.create_stage "now" in
   let before_w = LP.storage_words before in
   let now_w = LP.storage_words now in

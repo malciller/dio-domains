@@ -46,4 +46,3 @@
  (name test_strategy_ir)
  (modules test_strategy_ir)
  (libraries dio.strategies dio.latency_profiling alcotest))
-

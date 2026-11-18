@@ -68,8 +68,7 @@ let top_of_book_into ~symbol (buf : float array) =
   match store_opt symbol with
   | Some store ->
     (match Concurrency.Ring_buffer.RingBuffer.read_latest store.buffer with
-     | Some ob
-       when Array.length ob.bids > 0 && Array.length ob.asks > 0 ->
+     | Some ob when Array.length ob.bids > 0 && Array.length ob.asks > 0 ->
        let bid = ob.bids.(0) in
        let ask = ob.asks.(0) in
        buf.(0) <- bid.price;

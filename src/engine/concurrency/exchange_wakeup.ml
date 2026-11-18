@@ -24,9 +24,9 @@ type symbol_sync =
   ; condition : Condition.t
   ; generation : int Atomic.t (** Monotonic count of signals ever sent. *)
   ; signal_ns : int Atomic.t
-      (** Monotonic time of the last signal, written by the producer. The consumer reads it
-          on resume, so [now - signal_ns] is the wake cost (futex round-trip plus
-          scheduling) that no stage span covers. 0 before the first signal. *)
+  (** Monotonic time of the last signal, written by the producer. The consumer reads it on
+      resume, so [now - signal_ns] is the wake cost (futex round-trip plus scheduling)
+      that no stage span covers. 0 before the first signal. *)
   }
 
 (** Immutable map of symbol sync records in one atomic cell. The [get_sync] fast path is
@@ -98,9 +98,7 @@ let add_alias ~symbol ~target =
       if List.mem target existing
       then ()
       else (
-        let next =
-          SymbolMap.add symbol (target :: existing) current
-        in
+        let next = SymbolMap.add symbol (target :: existing) current in
         if not (Atomic.compare_and_set aliases current next) then loop ())
     in
     loop ())
@@ -118,15 +116,15 @@ let bump (sync : symbol_sync) =
   Mutex.unlock sync.mutex
 ;;
 
-(** Monotonic time of [sync]'s last signal. Paired with the time the consumer resumes, this
-    is the wake latency: the part of tick-to-decision that happens between the producer
-    publishing and the domain running again, which no measured cycle span covers. *)
+(** Monotonic time of [sync]'s last signal. Paired with the time the consumer resumes,
+    this is the wake latency: the part of tick-to-decision that happens between the
+    producer publishing and the domain running again, which no measured cycle span covers. *)
 let[@inline] last_signal_ns_fast (sync : sync_handle) = Atomic.get sync.signal_ns
 
-(** Signal [symbol]'s condition variable, waking its blocked worker, and any domain aliased
-    to it. The generation bump occurs under the symbol mutex, so it cannot interleave with a
-    waiter's predicate re-check. Callers MUST finish writing the signalled data before
-    calling. *)
+(** Signal [symbol]'s condition variable, waking its blocked worker, and any domain
+    aliased to it. The generation bump occurs under the symbol mutex, so it cannot
+    interleave with a waiter's predicate re-check. Callers MUST finish writing the
+    signalled data before calling. *)
 let signal ~symbol =
   bump (get_sync symbol);
   match aliases_of symbol with
@@ -166,22 +164,19 @@ let spin_config : bool Atomic.t = Atomic.make false
 
 let busy_spin_enabled () = Atomic.get spin_config
 
-(** True when a spinning domain on every trading CPU would only ever contend with
-    itself: the CPUs are in the kernel's isolated set, so the scheduler will not place other
+(** True when a spinning domain on every trading CPU would only ever contend with itself:
+    the CPUs are in the kernel's isolated set, so the scheduler will not place other
     runnable threads there. *)
 let spin_safe () =
   (* The allocator hands out P-cores plus their SMT siblings, so checking only the
      primaries leaves a spinner on a core the scheduler still fills. *)
   match Thread_affinity.trading_allocation_order () with
   | [] -> false
-  | cpus ->
-    List.for_all
-      (fun cpu -> Thread_affinity.is_isolated cpu)
-      cpus
+  | cpus -> List.for_all (fun cpu -> Thread_affinity.is_isolated cpu) cpus
 ;;
 
-(** Read [DIO_BUSY_SPIN]. Must run after [Logging.load_dotenv]. [auto] enables the spin only
-    when the trading CPUs are isolated, so turning it on cannot silently recreate the
+(** Read [DIO_BUSY_SPIN]. Must run after [Logging.load_dotenv]. [auto] enables the spin
+    only when the trading CPUs are isolated, so turning it on cannot silently recreate the
     contention that made it slower than parking. *)
 let configure () =
   let busy =
@@ -201,11 +196,11 @@ let configure () =
   (* [auto] refuses to spin without isolation; an explicit opt-in is honoured, since a
      cpuset-based isolation is not visible in /sys/devices/system/cpu/isolated. *)
   Atomic.set spin_config busy;
-  (match Sys.getenv_opt "DIO_SPIN_ITERS" with
-   | Some s ->
-     (try Atomic.set spin_iterations (max 0 (int_of_string (String.trim s))) with
-      | _ -> ())
-   | None -> ())
+  match Sys.getenv_opt "DIO_SPIN_ITERS" with
+  | Some s ->
+    (try Atomic.set spin_iterations (max 0 (int_of_string (String.trim s))) with
+     | _ -> ())
+  | None -> ()
 ;;
 
 (** Fast-path [wait_since] over a pre-resolved [sync_handle]; avoids map traversal on the

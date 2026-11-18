@@ -210,9 +210,9 @@ let leg_q_of ?cache ?(full_balance_ref = false) ~exchange ~symbol () =
       q_of_balances ~full_balance_ref ~free ~total ~staked ~open_sell_base:open_sell)
 ;;
 
-(** Same as {!leg_q_of}, but [free] supplies the tradeable figure from a reader the
-    caller resolved once. The venue's raw figure sweeps every quoting symbol's open
-    orders, and this runs per leg per tick. *)
+(** Same as {!leg_q_of}, but [free] supplies the tradeable figure from a reader the caller
+    resolved once. The venue's raw figure sweeps every quoting symbol's open orders, and
+    this runs per leg per tick. *)
 let leg_q_of_fast ?cache ?(full_balance_ref = false) ~free ~exchange ~symbol () =
   match get_module exchange with
   | None -> 0.0

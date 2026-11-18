@@ -97,9 +97,10 @@ module SymbolExecStore = struct
     (** Set when the change log cannot represent the delta (a full snapshot replace),
         forcing the consumer to do a full rescan. *)
     ; order_water : (string, float * bool * float) Hashtbl.t
-    (** Per order id: cumulative filled quantity booked, whether a terminal status was seen,
-        and when. Both transports deliver the same events, in either order, so a status
-        arriving after the terminal one must be dropped rather than resurrect the order. *)
+    (** Per order id: cumulative filled quantity booked, whether a terminal status was
+        seen, and when. Both transports deliver the same events, in either order, so a
+        status arriving after the terminal one must be dropped rather than resurrect the
+        order. *)
     }
 
   let create symbol capacity =
@@ -174,9 +175,7 @@ module SymbolExecStore = struct
       | Some v -> v
       | None -> 0.0, false, 0.0
     in
-    let duplicate =
-      seen_terminal || (is_fill && e.filled_qty <= seen_cum)
-    in
+    let duplicate = seen_terminal || (is_fill && e.filled_qty <= seen_cum) in
     if not duplicate
     then (
       Hashtbl.replace
@@ -188,7 +187,7 @@ module SymbolExecStore = struct
         let horizon = Unix.gettimeofday () -. order_water_retention_s in
         Hashtbl.filter_map_inplace
           (fun _ (cum, terminal, at) ->
-             if at > horizon then Some (cum, terminal, at) else None)
+            if at > horizon then Some (cum, terminal, at) else None)
           t.order_water));
     if duplicate
     then Mutex.unlock t.mutex
@@ -537,7 +536,7 @@ let initialize symbols =
       SymbolExecStore.mark_ready store)
     symbols;
   start_open_orders_resync ();
-  (!start_ws_hook) ()
+  !start_ws_hook ()
 ;;
 
 let apply_trade_update json =
@@ -699,15 +698,13 @@ let start_trade_updates_ws () =
   let host = Uri.host uri |> Option.value ~default:"api.alpaca.markets" in
   let port = Uri.port uri |> Option.value ~default:443 in
   let send_json conn json =
-    Ws_lwt.write
-      conn
-      (Websocket.Frame.create ~content:(Yojson.Safe.to_string json) ())
+    Ws_lwt.write conn (Websocket.Frame.create ~content:(Yojson.Safe.to_string json) ())
   in
   let handle conn content =
     let content = String.trim content in
     if String.equal content ""
     then Lwt.return_unit
-    else
+    else (
       match Yojson.Safe.from_string content with
       | exception _ -> Lwt.return_unit
       | json ->
@@ -716,7 +713,9 @@ let start_trade_updates_ws () =
          | Some "authorization" ->
            (match member "data" json |> member "status" |> to_string_option with
             | Some "authorized" ->
-              Logging.info_f ~section "Alpaca trading WS authorized; listening for order updates";
+              Logging.info_f
+                ~section
+                "Alpaca trading WS authorized; listening for order updates";
               send_json
                 conn
                 (`Assoc
@@ -735,7 +734,7 @@ let start_trade_updates_ws () =
                 "Alpaca trading WS event failed: %s"
                 (Printexc.to_string exn));
            Lwt.return_unit
-         | _ -> Lwt.return_unit)
+         | _ -> Lwt.return_unit))
   in
   let connection () =
     let ctx = Ws_lwt.resolve_ctx () in
@@ -774,8 +773,7 @@ let start_trade_updates_ws () =
         >>= fun () -> read_loop ()
       | Websocket.Frame.Opcode.Close ->
         Lwt.fail (Failure "Alpaca trading WS closed by server")
-      | _ ->
-        handle conn frame.Websocket.Frame.content >>= fun () -> read_loop ()
+      | _ -> handle conn frame.Websocket.Frame.content >>= fun () -> read_loop ()
     in
     read_loop () >>= fun () -> read_done
   in

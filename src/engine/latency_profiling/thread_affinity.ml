@@ -40,9 +40,10 @@ let read_file path =
   | Sys_error _ -> None
 ;;
 
-(** True when the CPU is in the kernel's isolated set ([isolcpus]), i.e. the scheduler will
-    not place other runnable work there. A domain that busy-spins on a shared core turns
-    every neighbour into a latency spike, so the spin mode checks this before enabling. *)
+(** True when the CPU is in the kernel's isolated set ([isolcpus]), i.e. the scheduler
+    will not place other runnable work there. A domain that busy-spins on a shared core
+    turns every neighbour into a latency spike, so the spin mode checks this before
+    enabling. *)
 let is_isolated cpu =
   match read_file "/sys/devices/system/cpu/isolated" with
   | None -> false
@@ -124,8 +125,8 @@ let parse_cpu_ranges spec =
 ;;
 
 (** CPUs this cgroup may pin to. [sched_getaffinity] cannot distinguish a cpuset from
-    [isolcpus], and isolated CPUs stay pinnable by an explicit request, so read the
-    cpuset instead. *)
+    [isolcpus], and isolated CPUs stay pinnable by an explicit request, so read the cpuset
+    instead. *)
 let cpuset_cpus () =
   let of_file path =
     match read_file path with
@@ -457,7 +458,9 @@ let spin_isolation_warning ~busy_spin =
     else
       Some
         (Printf.sprintf
-           "DIO_BUSY_SPIN is on but %d trading cpu(s) are not isolated ([%s]): other             runnable threads will preempt a spinning domain, which is worse than parking.             See isolcpus/cpuset before enabling."
+           "DIO_BUSY_SPIN is on but %d trading cpu(s) are not isolated ([%s]): \
+            other             runnable threads will preempt a spinning domain, which is \
+            worse than parking.             See isolcpus/cpuset before enabling."
            (List.length shared)
            (String.concat "," (List.map string_of_int shared))))
 ;;

@@ -51,12 +51,12 @@ type program =
       only these: everything else in a grid's state is written by engine phases, which a
       shadow does not execute (it must not place a second order set). *)
   ; written_state : (string * Strategy_ir.kind * int) array
+      (* Platform slot id -> env index, per value kind, as dense arrays: a Hashtbl lookup
+         allocates the [Some] it returns, and this runs on every fact written. An absent
+         slot is [-1]. *)
   (** Platform slot id (interned key) to env index, per value kind. A cutover writes its
       facts straight into the typed env through these, so the per-fact publish that only
       the interpreter consumes costs nothing. *)
-  (* Platform slot id -> env index, per value kind, as dense arrays: a Hashtbl lookup
-     allocates the [Some] it returns, and this runs on every fact written. An absent slot
-     is [-1]. *)
   ; p_float : int array
   ; p_int : int array
   ; p_bool : int array
@@ -209,9 +209,9 @@ let find_arg args name =
   | None -> invalid_arg ("strategy_program: missing argument " ^ name)
 ;;
 
-(** Engine phases a compiled strategy can call by name. Each maps to one engine entry point
-    in the executor; the list is fixed so a phase is an int on the command stream, not a
-    string dispatched per pass. *)
+(** Engine phases a compiled strategy can call by name. Each maps to one engine entry
+    point in the executor; the list is fixed so a phase is an int on the command stream,
+    not a string dispatched per pass. *)
 let engine_phases =
   [| "apply_order_event"
    ; "init_venue_state"
@@ -360,10 +360,14 @@ let compile (f : Strategy_file.t) : (program, string) result =
               Option.map (Strategy_ir.compile_guard ?locals layout ~kind_of) st.st_when
           ; then_actions =
               Array.of_list
-                (List.map (compile_action ?locals layout ~kind_of ~state_kinds) st.st_then)
+                (List.map
+                   (compile_action ?locals layout ~kind_of ~state_kinds)
+                   st.st_then)
           ; else_actions =
               Array.of_list
-                (List.map (compile_action ?locals layout ~kind_of ~state_kinds) st.st_else)
+                (List.map
+                   (compile_action ?locals layout ~kind_of ~state_kinds)
+                   st.st_else)
           ; stop = st.st_stop
           })
         f.steps
@@ -380,7 +384,7 @@ let compile (f : Strategy_file.t) : (program, string) result =
       let index_key = Hashtbl.create 32 in
       Hashtbl.iter
         (fun (scope, key) (_, index) ->
-           if scope = Strategy_expr.State then Hashtbl.replace index_key index key)
+          if scope = Strategy_expr.State then Hashtbl.replace index_key index key)
         layout.Strategy_ir.kinds;
       let seen = Hashtbl.create 32 in
       let out = ref [] in
@@ -400,7 +404,10 @@ let compile (f : Strategy_file.t) : (program, string) result =
           | Set_state (kind, index, _) -> note (kind, index)
           | _ -> ())
       in
-      Array.iter (fun (st : step) -> note_actions st.then_actions; note_actions st.else_actions)
+      Array.iter
+        (fun (st : step) ->
+          note_actions st.then_actions;
+          note_actions st.else_actions)
         (Array.of_list steps);
       Array.of_list (List.rev !out)
     in
@@ -408,15 +415,15 @@ let compile (f : Strategy_file.t) : (program, string) result =
       Array.of_list
         (List.filter_map
            (fun (scope, key, kind, index) ->
-              if scope = Strategy_expr.State then Some (key, kind, index) else None)
+             if scope = Strategy_expr.State then Some (key, kind, index) else None)
            (Array.to_list fills))
     in
     let max_slot =
       Array.fold_left
         (fun acc (scope, key, _, _) ->
-           if scope = Strategy_expr.Platform
-           then max acc (Strategy_runtime.slot_of_key key)
-           else acc)
+          if scope = Strategy_expr.Platform
+          then max acc (Strategy_runtime.slot_of_key key)
+          else acc)
         0
         fills
     in
@@ -427,17 +434,17 @@ let compile (f : Strategy_file.t) : (program, string) result =
     and p_string = make_table () in
     Array.iter
       (fun (scope, key, kind, index) ->
-         if scope = Strategy_expr.Platform
-         then (
-           let slot = Strategy_runtime.slot_of_key key in
-           let table =
-             match kind with
-             | Strategy_ir.K_float -> p_float
-             | K_int -> p_int
-             | K_bool -> p_bool
-             | K_string -> p_string
-           in
-           table.(slot) <- index))
+        if scope = Strategy_expr.Platform
+        then (
+          let slot = Strategy_runtime.slot_of_key key in
+          let table =
+            match kind with
+            | Strategy_ir.K_float -> p_float
+            | K_int -> p_int
+            | K_bool -> p_bool
+            | K_string -> p_string
+          in
+          table.(slot) <- index))
       fills;
     Ok
       { layout
@@ -464,35 +471,35 @@ let exec env sink = function
      | K_bool -> env.Strategy_ir.bools.(index) <- Strategy_ir.as_bool e env
      | K_string -> env.Strategy_ir.strings.(index) <- Strategy_ir.as_string e env)
   | Order_replace { market; side; qty; price; tif; reduce_only; dedup_key } ->
-    (if sink.order_count = Array.length sink.orders
-     then (
-       let grown =
-         Array.init
-           (2 * Array.length sink.orders)
-           (fun i ->
-              if i < sink.order_count
-              then sink.orders.(i)
-              else
-                { market = ""
-                ; side = ""
-                ; qty = 0.0
-                ; price = 0.0
-                ; tif = ""
-                ; reduce_only = false
-                ; dedup_key = ""
-                })
-       in
-       sink.orders <- grown);
-     let o = sink.orders.(sink.order_count) in
-     o.market <- market;
-     o.side <- side;
-     o.qty <- Strategy_ir.as_float qty env;
-     o.price <- Strategy_ir.as_float price env;
-     o.tif <- tif;
-     o.reduce_only <- reduce_only;
-     o.dedup_key <- dedup_key;
-     sink.order_count <- sink.order_count + 1;
-     push_cmd sink Cm_order)
+    if sink.order_count = Array.length sink.orders
+    then (
+      let grown =
+        Array.init
+          (2 * Array.length sink.orders)
+          (fun i ->
+            if i < sink.order_count
+            then sink.orders.(i)
+            else
+              { market = ""
+              ; side = ""
+              ; qty = 0.0
+              ; price = 0.0
+              ; tif = ""
+              ; reduce_only = false
+              ; dedup_key = ""
+              })
+      in
+      sink.orders <- grown);
+    let o = sink.orders.(sink.order_count) in
+    o.market <- market;
+    o.side <- side;
+    o.qty <- Strategy_ir.as_float qty env;
+    o.price <- Strategy_ir.as_float price env;
+    o.tif <- tif;
+    o.reduce_only <- reduce_only;
+    o.dedup_key <- dedup_key;
+    sink.order_count <- sink.order_count + 1;
+    push_cmd sink Cm_order
   | Quote_reserve e -> push_cmd sink (Cm_reserve (Strategy_ir.as_float e env))
   | Quote_release -> push_cmd sink Cm_release
   | Credit_profit { qty; seq } ->
@@ -578,28 +585,24 @@ type resolved_slot =
 let resolve program =
   Array.map
     (fun (scope, key, kind, index) ->
-       { rs_scope = scope
-       ; rs_key = key
-       ; rs_kind = kind
-       ; rs_env = index
-       ; rs_slot = Strategy_runtime.slot_of_key key
-       })
+      { rs_scope = scope
+      ; rs_key = key
+      ; rs_kind = kind
+      ; rs_env = index
+      ; rs_slot = Strategy_runtime.slot_of_key key
+      })
     program.fills
 ;;
 
-(** Pull the runtime's state into the compiled env. An engine phase writes state through the
-    runtime, so the compiled pass must read it back or a later guard would decide on the
-    value from before the phase. *)
+(** Pull the runtime's state into the compiled env. An engine phase writes state through
+    the runtime, so the compiled pass must read it back or a later guard would decide on
+    the value from before the phase. *)
 let fill_state_resolved resolved rt env =
   Array.iter
     (fun (rs : resolved_slot) ->
-       if rs.rs_scope = Strategy_expr.State
-       then
-         set_typed
-           env
-           rs.rs_kind
-           rs.rs_env
-           (Strategy_runtime.get_state_slot rt rs.rs_slot))
+      if rs.rs_scope = Strategy_expr.State
+      then
+        set_typed env rs.rs_kind rs.rs_env (Strategy_runtime.get_state_slot rt rs.rs_slot))
     resolved
 ;;
 
@@ -637,12 +640,10 @@ let env_facts_io program env rt : Strategy_runtime.facts_io =
   }
 ;;
 
-(** Compiled state value, read by key. The compiled env is the single source of truth for a
-    cut-over instance, so its readers (reserve sizing, persistence) read here instead of the
-    runtime copy. *)
-let has_state_key program key =
-  Hashtbl.mem program.layout.kinds (Strategy_expr.State, key)
-;;
+(** Compiled state value, read by key. The compiled env is the single source of truth for
+    a cut-over instance, so its readers (reserve sizing, persistence) read here instead of
+    the runtime copy. *)
+let has_state_key program key = Hashtbl.mem program.layout.kinds (Strategy_expr.State, key)
 
 let has_platform_key program key =
   Hashtbl.mem program.layout.kinds (Strategy_expr.Platform, key)
@@ -657,6 +658,7 @@ let env_value program env key =
      | K_int -> V_int env.ints.(index)
      | K_bool -> V_bool env.bools.(index)
      | K_string -> V_string env.strings.(index))
+;;
 
 (** Compiled value of a platform fact, read by key. *)
 let env_platform_value program env key =
@@ -668,6 +670,7 @@ let env_platform_value program env key =
      | K_int -> V_int env.ints.(index)
      | K_bool -> V_bool env.bools.(index)
      | K_string -> V_string env.strings.(index))
+;;
 
 let env_state_float program env key =
   match env_value program env key with
@@ -688,38 +691,38 @@ let env_platform_float program env key =
 
 (** {!fill_env} over {!resolve}d slots: no string hashing per cycle. *)
 let fill_env_resolved
-      ?(state = true)
-      ?(platform = true)
-      resolved
-      rt
-      env
-      ~price
-      ~now
-      ~event_kind
-      ~event_fields
+  ?(state = true)
+  ?(platform = true)
+  resolved
+  rt
+  env
+  ~price
+  ~now
+  ~event_kind
+  ~event_fields
   =
   Array.iter
     (fun (rs : resolved_slot) ->
-       let fill =
-         (state || rs.rs_scope <> Strategy_expr.State)
-         && (platform || rs.rs_scope <> Strategy_expr.Platform)
-       in
-       if fill
-       then (
-         let v =
-           match rs.rs_scope with
-           | Strategy_expr.State -> Strategy_runtime.get_state_slot rt rs.rs_slot
-           | Param -> Strategy_runtime.get_param_slot rt rs.rs_slot
-           | Platform -> Strategy_runtime.get_platform_slot rt rs.rs_slot
-           | Event ->
-             (match List.assoc_opt rs.rs_key event_fields with
-              | Some v -> v
-              | None -> Strategy_expr.V_unset)
-           | Local -> Strategy_expr.V_unset
-           | Signal -> Strategy_runtime.get_signal_slot rt rs.rs_slot
-           | Price | Now -> Strategy_expr.V_unset
-         in
-         set_typed env rs.rs_kind rs.rs_env v))
+      let fill =
+        (state || rs.rs_scope <> Strategy_expr.State)
+        && (platform || rs.rs_scope <> Strategy_expr.Platform)
+      in
+      if fill
+      then (
+        let v =
+          match rs.rs_scope with
+          | Strategy_expr.State -> Strategy_runtime.get_state_slot rt rs.rs_slot
+          | Param -> Strategy_runtime.get_param_slot rt rs.rs_slot
+          | Platform -> Strategy_runtime.get_platform_slot rt rs.rs_slot
+          | Event ->
+            (match List.assoc_opt rs.rs_key event_fields with
+             | Some v -> v
+             | None -> Strategy_expr.V_unset)
+          | Local -> Strategy_expr.V_unset
+          | Signal -> Strategy_runtime.get_signal_slot rt rs.rs_slot
+          | Price | Now -> Strategy_expr.V_unset
+        in
+        set_typed env rs.rs_kind rs.rs_env v))
     resolved;
   env.Strategy_ir.price <- price;
   env.now <- now;

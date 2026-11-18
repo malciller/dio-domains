@@ -46,9 +46,9 @@ type snapshot =
   ; samples : int (* Total samples in this window. *)
   ; union_samples : int
       (* Samples the percentiles above were computed over. Equals [samples] when rolling
-         is off; with rolling windows it is the union of the retained windows, which is the
-         only correct denominator for a percentile. Consumers that decide whether a p99 or
-         p999 is statistically meaningful must use this, not [samples]. *)
+         is off; with rolling windows it is the union of the retained windows, which is
+         the only correct denominator for a percentile. Consumers that decide whether a
+         p99 or p999 is statistically meaningful must use this, not [samples]. *)
   ; sub_us_samples : int (* Samples below 1us, captured at ns resolution. *)
   ; overflow : int (* Overflow count in this window. *)
   ; max_us : float
@@ -206,11 +206,12 @@ let create
     ring slot - (3 + rolling) copies of every bucket - and the bucket count therefore
     multiplies straight into live major-heap words. At the old 10k buckets x 8 rolling
     windows a nine-profiler set was ~8MB, and a process carrying ~20 of them held ~150MB
-    live; a major-GC slice scans the live heap, so the rings were charging collector time to
-    the cycles they measured. 2000 one-microsecond buckets cover every stage budget at full
-    resolution (the spike threshold is 200us). A sample past 2ms clamps into the last bucket
-    and increments [overflow], which the dashboard surfaces rather than hiding. *)
+    live; a major-GC slice scans the live heap, so the rings were charging collector time
+    to the cycles they measured. 2000 one-microsecond buckets cover every stage budget at
+    full resolution (the spike threshold is 200us). A sample past 2ms clamps into the last
+    bucket and increments [overflow], which the dashboard surfaces rather than hiding. *)
 let stage_max_latency_us = 2_000
+
 let stage_rolling_windows = 4
 
 (** A stage profiler with the shared geometry. *)

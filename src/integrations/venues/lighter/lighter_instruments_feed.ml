@@ -11,20 +11,18 @@ let index_to_symbol : (int, string) Hashtbl.t = Hashtbl.create 32
 let cache_mutex = Mutex.create ()
 
 (** Published immutable copies for lock-free readers. Writes stay under [cache_mutex];
-    each publish replaces the whole table, so a reader never sees a partially updated
-    map. *)
+    each publish replaces the whole table, so a reader never sees a partially updated map. *)
 let pair_snapshot : (string, Lighter_types.market_info) Hashtbl.t Atomic.t =
   Atomic.make (Hashtbl.create 32)
 ;;
 
-let index_snapshot : (int, string) Hashtbl.t Atomic.t =
-  Atomic.make (Hashtbl.create 32)
-;;
+let index_snapshot : (int, string) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 32)
 
 let publish () =
   Atomic.set pair_snapshot (Hashtbl.copy pair_cache);
   Atomic.set index_snapshot (Hashtbl.copy index_to_symbol)
 ;;
+
 let is_ready = Atomic.make false
 let ready_condition = Lwt_condition.create ()
 

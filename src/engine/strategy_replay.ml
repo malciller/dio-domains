@@ -625,9 +625,7 @@ let replay_candidate
     ~state
     ~set_venue_available
     ~dispatch_events:(fun ~events ~price ~now ->
-      List.iter
-        (fun e -> run_pass ~price ~now (runtime_event_of_obs e))
-        events)
+      List.iter (fun e -> run_pass ~price ~now (runtime_event_of_obs e)) events)
     ~execute:
       (fun
         ~asset
@@ -657,10 +655,7 @@ let replay_candidate
       ctx.cg_base_age <- base_age;
       ctx.cg_gen <- generation;
       ctx.cg_iter <- iter;
-      run_pass
-        ~price
-        ~now
-        (Strategy_runtime.make_event "book_update" []))
+      run_pass ~price ~now (Strategy_runtime.make_event "book_update" []))
     trace
 ;;
 

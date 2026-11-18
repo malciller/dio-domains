@@ -294,7 +294,7 @@ let handle_order_status fields =
             string_of_int order_id
             (* No per-trade id in the API; the order id stands in. *)
         ; market = "equity"
-        ; intent = if side_str = "buy" then "buy_equity" else "sell_equity"
+        ; intent = (if side_str = "buy" then "buy_equity" else "sell_equity")
         ; strategy = "grid"
         ; realized_pnl = None
         ; note = None

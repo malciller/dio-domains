@@ -313,9 +313,9 @@ let test_live_carry_order_holds_until_terminal () =
   Alcotest.(check bool) "terminal retirement re-arms placement" false (live ())
 ;;
 
-(** The trading domain defers its order ring to a cycle-bottom flush, so the self-pipe write
-    stops landing inside the measured STRATEGY span. Every other producer must keep the
-    immediate write: it has no flush of its own. *)
+(** The trading domain defers its order ring to a cycle-bottom flush, so the self-pipe
+    write stops landing inside the measured STRATEGY span. Every other producer must keep
+    the immediate write: it has no flush of its own. *)
 let test_order_signal_deferral () =
   let module C = Dio_strategies.Strategy_common in
   let module S = C.OrderSignal in

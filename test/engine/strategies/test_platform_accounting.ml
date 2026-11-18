@@ -281,17 +281,13 @@ let test_reserved_headroom () =
   Alcotest.(check (float 0.000001))
     "venue free above the reserve"
     0.30764165
-    (Platform_accounting.reserved_headroom
-       ~venue_free:0.83151659
-       ~reserved:0.52387494);
+    (Platform_accounting.reserved_headroom ~venue_free:0.83151659 ~reserved:0.52387494);
   (* Live shape: HYPE free 0.38151659 against a 0.52387494 reserve - nothing is sellable,
      whatever the ledger says. *)
   Alcotest.(check (float 0.000001))
     "venue free below the reserve is zero"
     0.0
-    (Platform_accounting.reserved_headroom
-       ~venue_free:0.38151659
-       ~reserved:0.52387494);
+    (Platform_accounting.reserved_headroom ~venue_free:0.38151659 ~reserved:0.52387494);
   Alcotest.(check bool)
     "no comparable venue figure does not bound"
     true

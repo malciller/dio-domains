@@ -29,16 +29,16 @@ type fill_event =
   ; order_id : string (** Exchange order ID for deduplication. *)
   ; trade_id : string (** Exchange trade/execution ID for deduplication. *)
   ; market : string
-    (** "spot", "perp", or "equity". Lets the notifier distinguish a spot grid sell
-        from a perp short entry. *)
+  (** "spot", "perp", or "equity". Lets the notifier distinguish a spot grid sell from a
+      perp short entry. *)
   ; intent : string
-    (** "open_short", "close_short", "open_long", "close_long", "buy_spot",
-        "sell_spot", "liquidation", or "" when the venue gives no direction. *)
+  (** "open_short", "close_short", "open_long", "close_long", "buy_spot", "sell_spot",
+      "liquidation", or "" when the venue gives no direction. *)
   ; strategy : string (** "grid", "carry", "hedge", or "account". *)
   ; realized_pnl : float option
-    (** Venue-reported realized PnL on a closing fill, when available. *)
+  (** Venue-reported realized PnL on a closing fill, when available. *)
   ; note : string option
-    (** Venue direction/method text (e.g. "Close Short", liquidation method). *)
+  (** Venue direction/method text (e.g. "Close Short", liquidation method). *)
   }
 
 (** Global fill event ring buffer. 1024 slots, sized so a burst or mass take-profit

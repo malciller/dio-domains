@@ -215,8 +215,8 @@ let is_retriable_error = Error_handling.is_retriable_error
 
 (* Reused serialization buffers. Signing runs on the single Lwt scheduler thread, but the
    buffers are domain-local so a second scheduler cannot share them by accident. The order
-   path is the one place where a per-order [Buffer.create] is measurable: it happens on the
-   decision-to-wire path. *)
+   path is the one place where a per-order [Buffer.create] is measurable: it happens on
+   the decision-to-wire path. *)
 [@@@alert "-unsafe_multidomain"]
 
 let action_buf_key = Domain.DLS.new_key (fun () -> Buffer.create 1024)
@@ -556,7 +556,6 @@ let cancel_request ~symbol ~order_ids ~testnet =
 ;;
 
 let cancel_orders = cancel_request
-;;
 
 (** Transfers USDC between spot and perpetual wallets via the usdClassTransfer action.
     Uses the REST endpoint (not WebSocket) with exponential backoff retry. *)

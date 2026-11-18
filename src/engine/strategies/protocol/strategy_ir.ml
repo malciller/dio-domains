@@ -29,8 +29,8 @@ type env =
 type layout =
   { kinds : (Strategy_expr.scope * string, kind * int) Hashtbl.t
   ; keys : (Strategy_expr.scope * string, string) Hashtbl.t
-  (** Insertion-ordered copy of [kinds]. The compiled runtime walks it every cycle to
-      fill the env; a preallocated array avoids both the [Hashtbl.iter] cursor and the
+  (** Insertion-ordered copy of [kinds]. The compiled runtime walks it every cycle to fill
+      the env; a preallocated array avoids both the [Hashtbl.iter] cursor and the
       [scope, key] tuple allocation per entry. *)
   ; mutable entries : (Strategy_expr.scope * string * kind * int) list
   ; mutable float_count : int
@@ -107,9 +107,9 @@ let as_string = function
   | Bool b -> fun env -> if b env then "true" else "false"
 ;;
 
-(** Compile an expression. [locals] binds a step's [let] names to the parsed expression they
-    were assigned: a reference to a local is substituted inline, so a let costs nothing at
-    run time and the compiled program never needs a locals table. *)
+(** Compile an expression. [locals] binds a step's [let] names to the parsed expression
+    they were assigned: a reference to a local is substituted inline, so a let costs
+    nothing at run time and the compiled program never needs a locals table. *)
 let compile ?locals layout ~kind_of e =
   let rec go = function
     | Strategy_expr.Lit_float f -> Float (fun _ -> f)
@@ -120,8 +120,7 @@ let compile ?locals layout ~kind_of e =
       let dotted = String.concat "." r.path in
       let underscored = String.map (fun c -> if c = '.' then '_' else c) dotted in
       (match locals with
-       | Some table when Hashtbl.mem table dotted ->
-         go (Hashtbl.find table dotted)
+       | Some table when Hashtbl.mem table dotted -> go (Hashtbl.find table dotted)
        | Some table when Hashtbl.mem table underscored ->
          go (Hashtbl.find table underscored)
        | _ ->
@@ -204,10 +203,7 @@ let compile ?locals layout ~kind_of e =
 ;;
 
 let compile_bool ?locals layout ~kind_of e = as_bool (compile ?locals layout ~kind_of e)
-
-let compile_float ?locals layout ~kind_of e =
-  as_float (compile ?locals layout ~kind_of e)
-
+let compile_float ?locals layout ~kind_of e = as_float (compile ?locals layout ~kind_of e)
 
 (** Lower the structured step guards to typed closures. Guards outside this subset are a
     compile error rather than a silent [false]: a compiled strategy must not change
@@ -223,16 +219,12 @@ let compile_guard ?locals layout ~kind_of g =
     | Strategy_file.G_all gs ->
       let fs = Array.of_list (List.map go gs) in
       fun env ->
-        let rec loop i =
-          i >= Array.length fs || (fs.(i) env && loop (i + 1))
-        in
+        let rec loop i = i >= Array.length fs || (fs.(i) env && loop (i + 1)) in
         loop 0
     | Strategy_file.G_any gs ->
       let fs = Array.of_list (List.map go gs) in
       fun env ->
-        let rec loop i =
-          i < Array.length fs && (fs.(i) env || loop (i + 1))
-        in
+        let rec loop i = i < Array.length fs && (fs.(i) env || loop (i + 1)) in
         loop 0
     | Strategy_file.G_not g ->
       let f = go g in
@@ -256,7 +248,8 @@ let as_int = function
     fun env ->
       (match int_of_string_opt (s env) with
        | Some i -> i
-       | None -> (match float_of_string_opt (s env) with
-                  | Some f -> int_of_float f
-                  | None -> 0))
+       | None ->
+         (match float_of_string_opt (s env) with
+          | Some f -> int_of_float f
+          | None -> 0))
 ;;

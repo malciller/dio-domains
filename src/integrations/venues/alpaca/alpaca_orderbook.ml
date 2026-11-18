@@ -7,16 +7,16 @@ let section = "alpaca_orderbook"
 
 (** Top-of-book from the WebSocket quote stream: "q" messages on the session-appropriate
     feed (v2 by day, v1beta1/overnight at night). When the active feed publishes no quotes
-    (IEX stops quoting at its close, while prints keep arriving through extended hours),
-    a trade print is promoted to top-of-book after [trade_tob_fallback_s] so the strategy
+    (IEX stops quoting at its close, while prints keep arriving through extended hours), a
+    trade print is promoted to top-of-book after [trade_tob_fallback_s] so the strategy
     still ticks and prices: bid=ask=last print, zero size. That is the venue's last traded
-    price, not a synthesized quote. Without any quote or print,
-    [get_best_bid_ask] falls back to the position mark. *)
+    price, not a synthesized quote. Without any quote or print, [get_best_bid_ask] falls
+    back to the position mark. *)
 
 (** Quote age after which a trade print is promoted to top-of-book. The venue stops
-    quoting at its session close while prints continue into extended hours, and a book that
-    never ticks is a strategy that never runs. Long enough that a merely quiet live book is
-    not replaced by a zero-spread print. *)
+    quoting at its session close while prints continue into extended hours, and a book
+    that never ticks is a strategy that never runs. Long enough that a merely quiet live
+    book is not replaced by a zero-spread print. *)
 let trade_tob_fallback_s = 60.0
 
 type quote =
@@ -95,8 +95,8 @@ module SymbolStore = struct
 
   (** Publish [price] as top-of-book while the last quote is older than [stale_after].
       Compare-and-swap, because a quote write and a promotion must not publish the same
-      [pos] (the domain's change detector keys on it) and a fresh quote must win.
-      [ts] is left stale so every print/poll re-promotes until quotes resume. *)
+      [pos] (the domain's change detector keys on it) and a fresh quote must win. [ts] is
+      left stale so every print/poll re-promotes until quotes resume. *)
   let rec promote t ~price ~now ~stale_after =
     let prev = Atomic.get t.tob in
     if price > 0.0 && now -. prev.ts > stale_after
@@ -154,16 +154,15 @@ module SymbolStore = struct
        [trade_tob_fallback_s], the print becomes the price and the tick: bid=ask=print,
        zero size, so the file's own rung/spread logic still decides what to place. This is
        a degraded price, not a fabricated quote - it is the venue's last traded price. *)
-    ignore
-      (promote t ~price:tr.price ~now:tr.timestamp ~stale_after:trade_tob_fallback_s);
+    ignore (promote t ~price:tr.price ~now:tr.timestamp ~stale_after:trade_tob_fallback_s);
     Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
   ;;
 
   (** Promote the venue's mark to top-of-book while the quote stream is quiet. Marks are
       republished every couple of seconds regardless of session and are the only price
-      that keeps moving after the venue's quote session closes. Same rule as a print:
-      only while the last quote is older than [trade_tob_fallback_s], stale timestamp
-      retained so each poll re-promotes. *)
+      that keeps moving after the venue's quote session closes. Same rule as a print: only
+      while the last quote is older than [trade_tob_fallback_s], stale timestamp retained
+      so each poll re-promotes. *)
   let push_mark t ~(price : float) =
     if promote t ~price ~now:(Unix.gettimeofday ()) ~stale_after:trade_tob_fallback_s
     then Concurrency.Exchange_wakeup.signal ~symbol:t.symbol

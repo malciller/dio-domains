@@ -1,6 +1,6 @@
 (* Tests for the Alpaca orderbook TOB semantics:
-   - The top-of-book comes from the WebSocket quote stream ("q" messages). No REST snapshot
-     polling, no ticker fallback.
+   - The top-of-book comes from the WebSocket quote stream ("q" messages). No REST
+     snapshot polling, no ticker fallback.
    - Trade prints ("t" messages) are analytics while quotes flow: they never nudge a live
      book, so print volatility cannot move a resting rung.
    - The venue stops quoting at its session close while prints continue into extended

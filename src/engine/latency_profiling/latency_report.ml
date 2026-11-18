@@ -324,9 +324,7 @@ let tail ~(c : common) =
           (pad_left (Latency_profiler.format_us v.p50) 9)
           (pad_left (Latency_profiler.format_us v.p99) 9)
           (pad_left
-             (if v.n >= p999_min_samples
-              then Latency_profiler.format_us v.p999
-              else "-")
+             (if v.n >= p999_min_samples then Latency_profiler.format_us v.p999 else "-")
              9)
           (pad_left (Latency_profiler.format_us v.mx) 9)
           (pad_left (if v.mt > 0.0 then clock_of_unix v.mt else "-") 8)

@@ -13,7 +13,8 @@ let parse s =
 
 let make_env layout ~ask ~flag ~price =
   let env =
-    { Dio_strategies.Strategy_ir.floats = Array.make (max 1 layout.Dio_strategies.Strategy_ir.float_count) 0.0
+    { Dio_strategies.Strategy_ir.floats =
+        Array.make (max 1 layout.Dio_strategies.Strategy_ir.float_count) 0.0
     ; ints = Array.make (max 1 layout.Dio_strategies.Strategy_ir.int_count) 0
     ; bools = Array.make (max 1 layout.Dio_strategies.Strategy_ir.bool_count) false
     ; strings = Array.make (max 1 layout.Dio_strategies.Strategy_ir.string_count) ""
@@ -23,13 +24,21 @@ let make_env layout ~ask ~flag ~price =
     ; event_side = ""
     }
   in
-  (match Hashtbl.find_opt layout.Dio_strategies.Strategy_ir.kinds
-           (Dio_strategies.Strategy_expr.Platform, "ask") with
-   | Some (Dio_strategies.Strategy_ir.K_float, i) -> env.Dio_strategies.Strategy_ir.floats.(i) <- ask
+  (match
+     Hashtbl.find_opt
+       layout.Dio_strategies.Strategy_ir.kinds
+       (Dio_strategies.Strategy_expr.Platform, "ask")
+   with
+   | Some (Dio_strategies.Strategy_ir.K_float, i) ->
+     env.Dio_strategies.Strategy_ir.floats.(i) <- ask
    | _ -> ());
-  (match Hashtbl.find_opt layout.Dio_strategies.Strategy_ir.kinds
-           (Dio_strategies.Strategy_expr.Platform, "flag") with
-   | Some (Dio_strategies.Strategy_ir.K_bool, i) -> env.Dio_strategies.Strategy_ir.bools.(i) <- flag
+  (match
+     Hashtbl.find_opt
+       layout.Dio_strategies.Strategy_ir.kinds
+       (Dio_strategies.Strategy_expr.Platform, "flag")
+   with
+   | Some (Dio_strategies.Strategy_ir.K_bool, i) ->
+     env.Dio_strategies.Strategy_ir.bools.(i) <- flag
    | _ -> ());
   env
 ;;
@@ -65,7 +74,6 @@ let test_zero_alloc () =
   let after = Monotonic_clock.minor_words () in
   Alcotest.(check int) "compiled guard allocates zero words" 0 (after - before)
 ;;
-
 
 let test_guard () =
   let layout = Dio_strategies.Strategy_ir.create_layout () in

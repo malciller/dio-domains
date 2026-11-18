@@ -43,7 +43,6 @@ type facts_io =
   ; io_get_f : int -> float
   }
 
-
 let default_of_kind = function
   | Strategy_file.S_float -> V_float 0.0
   | S_float_opt -> V_none
@@ -164,7 +163,6 @@ let expand_params (file : Strategy_file.t) (overrides : (string * value) list) =
   !arr
 ;;
 
-
 (** The runtime holds a strategy's state, params and published facts. Execution lives in
     {!Strategy_run}: the compiled program is the only engine, so there is no compiled-step
     form and no handler table here. *)
@@ -216,28 +214,23 @@ let[@inline] slot_unchanged (a : value array) slot (v : value) =
 
 let set_state t k v =
   let slot = intern_key k in
-  if not (slot_unchanged t.state slot v)
-  then (
-    t.state <- set_arr t.state slot v)
+  if not (slot_unchanged t.state slot v) then t.state <- set_arr t.state slot v
 ;;
 
 let get_state t k = get_arr t.state (intern_key k)
 
 let set_platform t k v =
   let slot = intern_key k in
-  if not (slot_unchanged t.platform slot v)
-  then (
-    t.platform <- set_arr t.platform slot v)
+  if not (slot_unchanged t.platform slot v) then t.platform <- set_arr t.platform slot v
 ;;
 
 let get_platform t k = get_arr t.platform (intern_key k)
 let get_param t k = get_arr t.params (intern_key k)
 let get_signal t k = get_arr t.signals (intern_key k)
+
 let set_signal t k v =
   let slot = intern_key k in
-  if not (slot_unchanged t.signals slot v)
-  then (
-    t.signals <- set_arr t.signals slot v)
+  if not (slot_unchanged t.signals slot v) then t.signals <- set_arr t.signals slot v
 ;;
 
 (* Slot-addressed publication for the fixed fact/gate set. [Strategy_fact_slots] resolves
@@ -250,9 +243,7 @@ let get_platform_slot t slot = get_arr t.platform slot
 let get_signal_slot t slot = get_arr t.signals slot
 
 let set_state_slot t slot v =
-  if not (slot_unchanged t.state slot v)
-  then (
-    t.state <- set_arr t.state slot v)
+  if not (slot_unchanged t.state slot v) then t.state <- set_arr t.state slot v
 ;;
 
 (* Shared immutable bool blocks: an unchanged gate stores nothing, and a changed bool
@@ -263,8 +254,7 @@ let v_false = V_bool false
 let[@inline] set_state_bool_slot t slot b =
   match get_arr t.state slot with
   | V_bool b0 when Bool.equal b0 b -> ()
-  | _ ->
-    t.state <- set_arr t.state slot (if b then v_true else v_false)
+  | _ -> t.state <- set_arr t.state slot (if b then v_true else v_false)
 ;;
 
 let[@inline] set_state_float_slot t slot f =
@@ -286,9 +276,7 @@ let[@inline] set_state_string_slot t slot str =
 ;;
 
 let set_platform_slot t slot v =
-  if not (slot_unchanged t.platform slot v)
-  then (
-    t.platform <- set_arr t.platform slot v)
+  if not (slot_unchanged t.platform slot v) then t.platform <- set_arr t.platform slot v
 ;;
 
 (* Typed platform setters. The caller passes the raw payload, so an unchanged fact is
@@ -302,22 +290,19 @@ let[@inline] platform_slot_get t slot =
 let[@inline] set_platform_bool t slot (b : bool) =
   match platform_slot_get t slot with
   | V_bool b0 when Bool.equal b0 b -> ()
-  | _ ->
-    t.platform <- set_arr t.platform slot (V_bool b)
+  | _ -> t.platform <- set_arr t.platform slot (V_bool b)
 ;;
 
 let[@inline] set_platform_float t slot (f : float) =
   match platform_slot_get t slot with
   | V_float f0 when Float.equal f0 f -> ()
-  | _ ->
-    t.platform <- set_arr t.platform slot (V_float f)
+  | _ -> t.platform <- set_arr t.platform slot (V_float f)
 ;;
 
 let[@inline] set_platform_int t slot (i : int) =
   match platform_slot_get t slot with
   | V_int i0 when Int.equal i0 i -> ()
-  | _ ->
-    t.platform <- set_arr t.platform slot (V_int i)
+  | _ -> t.platform <- set_arr t.platform slot (V_int i)
 ;;
 
 (* Raw-payload string setter: compare before allocating the [V_string] block. The symbol
@@ -325,8 +310,7 @@ let[@inline] set_platform_int t slot (i : int) =
 let[@inline] set_platform_string t slot (s : string) =
   match platform_slot_get t slot with
   | V_string s0 when String.equal s0 s -> ()
-  | _ ->
-    t.platform <- set_arr t.platform slot (V_string s)
+  | _ -> t.platform <- set_arr t.platform slot (V_string s)
 ;;
 
 let rt_facts_io t =
@@ -350,12 +334,9 @@ let rt_facts_io t =
 ;;
 
 let set_signal_slot t slot v =
-  if not (slot_unchanged t.signals slot v)
-  then (
-    t.signals <- set_arr t.signals slot v)
+  if not (slot_unchanged t.signals slot v) then t.signals <- set_arr t.signals slot v
 ;;
 
 let set_caps t c = t.caps <- c
 let make_event kind fields = { ev_kind = kind; ev_fields = fields }
 let current_event t = t.event
-

@@ -195,30 +195,30 @@ let order_body_buf () = Domain.DLS.get order_body_buf_key
 [@@@alert "+unsafe_multidomain"]
 
 (* Write the add_order request body straight into [buf], in the exact shape
-    {!json_to_string_precise} produces for the equivalent Yojson tree. The order path is the
-    one place where building a whole JSON AST per order is measurable, and the websocket
-   only needs the bytes. *)
+   {!json_to_string_precise} produces for the equivalent Yojson tree. The order path is
+   the one place where building a whole JSON AST per order is measurable, and the
+   websocket only needs the bytes. *)
 let add_order_body_into
-      buf
-      ~symbol
-      ~req_id
-      ~order_type
-      ~side
-      ~order_qty
-      ~token
-      ?limit_price
-      ?time_in_force
-      ?post_only
-      ?margin
-      ?reduce_only
-      ?order_userref
-      ?cl_ord_id
-      ?trigger_price
-      ?trigger_price_type
-      ?display_qty
-      ?fee_preference
-      ?validate
-      ()
+  buf
+  ~symbol
+  ~req_id
+  ~order_type
+  ~side
+  ~order_qty
+  ~token
+  ?limit_price
+  ?time_in_force
+  ?post_only
+  ?margin
+  ?reduce_only
+  ?order_userref
+  ?cl_ord_id
+  ?trigger_price
+  ?trigger_price_type
+  ?display_qty
+  ?fee_preference
+  ?validate
+  ()
   =
   let started = ref false in
   let field name =
@@ -273,7 +273,10 @@ let add_order_body_into
    | Some price ->
      field "triggers";
      Buffer.add_string buf "{\"price\":";
-     precise_float_into buf (Some symbol) ~field:"price"
+     precise_float_into
+       buf
+       (Some symbol)
+       ~field:"price"
        (truncate_price_to_precision price symbol);
      (match trigger_price_type with
       | Some tpt ->

@@ -183,9 +183,10 @@ let test_add_order_body_matches_ast () =
     build buf;
     let body = Yojson.Safe.from_string (Buffer.contents buf) in
     let direct = Yojson.Safe.Util.(body |> member "params") in
-    let via_ast = Yojson.Safe.from_string (Kraken.Kraken_actions.json_to_string_precise
-                                         (Some "SPCX/UNKNOWN")
-                                         expected) in
+    let via_ast =
+      Yojson.Safe.from_string
+        (Kraken.Kraken_actions.json_to_string_precise (Some "SPCX/UNKNOWN") expected)
+    in
     Alcotest.(check bool)
       name
       true
@@ -196,19 +197,22 @@ let test_add_order_body_matches_ast () =
     List.fold_left
       (fun acc (k, v) -> Kraken.Kraken_actions.add_to_assoc acc (k, v))
       (`Assoc
-         [ "order_type", `String "limit"
-         ; "side", `String "buy"
-         ; "order_qty", `Float 0.08
-         ; "symbol", `String "SPCX/UNKNOWN"
-         ; "token", `String "tok"
-         ])
+        [ "order_type", `String "limit"
+        ; "side", `String "buy"
+        ; "order_qty", `Float 0.08
+        ; "symbol", `String "SPCX/UNKNOWN"
+        ; "token", `String "tok"
+        ])
       extras
   in
   check
     ~name:"plain limit order"
     ~expected:
       (mk_params
-         [ "limit_price", `Float 140.1; "time_in_force", `String "GTC"; "post_only", `Bool true ])
+         [ "limit_price", `Float 140.1
+         ; "time_in_force", `String "GTC"
+         ; "post_only", `Bool true
+         ])
     ~build:(fun buf ->
       Kraken.Kraken_actions.add_order_body_into
         buf
@@ -235,8 +239,7 @@ let test_add_order_body_matches_ast () =
     ~name:"escaped id and triggers"
     ~expected:
       (mk_params
-         [ ( "cl_ord_id"
-           , `String "a\"b\\c" )
+         [ "cl_ord_id", `String "a\"b\\c"
          ; "triggers", `Assoc [ "price", `Float 135.5; "price_type", `String "stop-loss" ]
          ; "order_userref", `Int 42
          ])

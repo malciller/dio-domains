@@ -213,6 +213,7 @@ module Lighter_impl = struct
 
   let subscribe_orderbook ~symbols = Lighter_ws.subscribe_public_orderbook ~symbols
   let get_top_of_book ~symbol = Lighter_orderbook_feed.get_best_bid_ask symbol
+
   let get_top_of_book_into ~symbol buf =
     Lighter_orderbook_feed.get_best_bid_ask_into symbol buf
   ;;

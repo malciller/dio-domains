@@ -341,9 +341,7 @@ module Ibkr_impl = struct
     | None -> None
   ;;
 
-  let get_top_of_book_into ~symbol buf =
-    Ibkr_orderbook_feed.top_of_book_into ~symbol buf
-  ;;
+  let get_top_of_book_into ~symbol buf = Ibkr_orderbook_feed.top_of_book_into ~symbol buf
 
   let get_top_of_book_fast ~symbol =
     let store = Ibkr_orderbook_feed.ensure_store symbol in

@@ -251,7 +251,7 @@ let trim_carry_orders ?(max_pending_age = carry_pending_max_age_s) () =
   let now = Unix.gettimeofday () in
   Hashtbl.filter_map_inplace
     (fun _ (meta : carry_order_meta) ->
-       if now -. meta.com_at <= max_pending_age then Some meta else None)
+      if now -. meta.com_at <= max_pending_age then Some meta else None)
     carry_pending;
   let pending_dropped = before - Hashtbl.length carry_pending in
   Mutex.unlock carry_pending_mutex;

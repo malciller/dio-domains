@@ -916,8 +916,8 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
        then ignore (Strategy_lifecycle.consume_buy_credits ~state ~qty:acc_qty);
        state.last_sell_fill_qty <- Some acc_qty;
        (* Spec-aligned sell fill: profit is measured against the buy lots the fill
-          consumes. Accumulation happens on the bought side (the profit-gated skim on
-          the buy fill), so a 1:1 sell credits quote only. *)
+          consumes. Accumulation happens on the bought side (the profit-gated skim on the
+          buy fill), so a 1:1 sell credits quote only. *)
        let store_t =
          { Dio_persistence.Base_accumulation_store.reserved_base = state.reserved_base
          ; accumulated_profit = state.accumulated_profit

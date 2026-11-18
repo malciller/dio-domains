@@ -31,8 +31,8 @@ let set ~exchange ~owner ~amount =
 let release ~exchange ~owner = set ~exchange ~owner ~amount:0.0
 
 (** True when [k] is a [exchange|...] key. Compared in place: the table is keyed by
-    [exchange ^ "|" ^ owner], and slicing the exchange out allocated once per reservation on
-    every read - the fact refresh reads this on every event. *)
+    [exchange ^ "|" ^ owner], and slicing the exchange out allocated once per reservation
+    on every read - the fact refresh reads this on every event. *)
 let key_belongs_to ~exchange k =
   let n = String.length exchange in
   String.length k > n

@@ -59,8 +59,8 @@ let update table f =
   loop ()
 ;;
 
-(** Prebuilt lookup key. The key is [exchange ^ "|" ^ coin], which allocates; a caller on a
-    per-event path builds it once and reuses it with the [_key] readers below. *)
+(** Prebuilt lookup key. The key is [exchange ^ "|" ^ coin], which allocates; a caller on
+    a per-event path builds it once and reuses it with the [_key] readers below. *)
 let key_of = key
 
 let get_funding_key k = Hashtbl.find_opt (Atomic.get funding_table) k
@@ -86,7 +86,8 @@ let update_position ?at ~exchange p =
   update position_table (fun t -> Hashtbl.replace t (key exchange p.coin) p);
   match at with
   | None -> ()
-  | Some ts -> update position_updated (fun t -> Hashtbl.replace t (key exchange p.coin) ts)
+  | Some ts ->
+    update position_updated (fun t -> Hashtbl.replace t (key exchange p.coin) ts)
 ;;
 
 (** Snapshot time for one coin, when its publisher stamped one. *)

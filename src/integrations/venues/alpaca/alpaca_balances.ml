@@ -179,10 +179,7 @@ let update_balances () =
     (* Feed the book after publishing, so a reader never sees a tick for an unpublished
        mark. *)
     (match pos_res with
-     | Ok _ ->
-       Hashtbl.iter
-         (fun symbol price -> (!mark_observer) symbol price)
-         new_marks
+     | Ok _ -> Hashtbl.iter (fun symbol price -> !mark_observer symbol price) new_marks
      | Error _ -> ());
     Atomic.set initial_data_received true;
     Atomic.set last_update (Unix.time ());
