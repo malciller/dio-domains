@@ -28,6 +28,7 @@ type t =
   ; last_fill_oid : string option
   ; last_buy_fill_price : float option
   ; last_buy_fill_qty : float option
+  (** Full received fill; the skim is a profit debit, not a smaller buy. *)
   ; last_sell_fill_price : float option
   ; last_sell_fill_qty : float option
   ; buy_lots : (float * float) list

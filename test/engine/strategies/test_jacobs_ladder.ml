@@ -5044,8 +5044,8 @@ let test_venue_retention_and_skim () =
   check (float 1e-9) "skimmed lot is moved into reserved_base" 0.06 state.reserved_base;
   check
     (option (float 1e-9))
-    "sellable reference is the lot less the skim"
-    (Some 0.09)
+    "reported buy reference is the full fill (skim does not shrink it)"
+    (Some 0.1)
     state.last_buy_fill_qty;
   run ~symbol ~asset ~state ~ecfg ~now:100.0 ~asset_balance:0.151 ~age:0.1 ~price:200.0;
   check (float 1e-9) "sell is the 1:1 remainder" 0.09 (placed_sell_qty symbol);
@@ -5897,10 +5897,10 @@ let test_alpaca_buy_fill_skims_reserve () =
     (state.accumulated_profit +. (state.reserved_base *. 100.0));
   check
     bool
-    "the sellable reference excludes the skimmed slice"
+    "the reported buy reference is the full fill"
     true
     (match state.last_buy_fill_qty with
-     | Some q -> abs_float (q +. state.reserved_base -. 0.08) < 1e-9
+     | Some q -> abs_float (q -. 0.08) < 1e-9
      | None -> false);
   (* Profit below the buffer keeps the lot intact: no reserve without coverage. *)
   let symbol2 = "ALPACA_SKIM_UNDER/USD" in
@@ -5930,9 +5930,9 @@ let test_alpaca_buy_fill_skims_reserve () =
   check (float 1e-9) "profit below the buffer does not skim" 0.0 state2.reserved_base
 ;;
 
-(* Hyperliquid-like spot charges the buy fee in base, so received base is below the fill
-   size. Every quantity must be net (lot, sell reference, skim), while the skim's cost
-   prices the gross quote actually spent (skim / (1 - fee) * price). *)
+(* Hyperliquid-like spot charges the buy fee in base: the lot and skim are net, the
+   reported buy reference is the full net quantity, and the skim cost prices the gross
+   quote. *)
 let test_hl_buy_fill_skims_net_qty_and_gross_cost () =
   let symbol = "SKIM_HL_FEE/HYPE/USDC" in
   Hyperliquid.Instruments_feed.register_test_instrument ~symbol ~sz_decimals:4;
@@ -5969,15 +5969,15 @@ let test_hl_buy_fill_skims_net_qty_and_gross_cost () =
   check (float 1e-9) "skim is taken from the net quantity" skim state.reserved_base;
   check
     (option (float 1e-9))
-    "sell reference is the net quantity less the skim"
-    (Some (net_qty -. skim))
+    "reported buy reference is the full net quantity"
+    (Some net_qty)
     state.last_buy_fill_qty;
   check
     bool
-    "reserved base plus sellable reference equals the net received base"
+    "reserved base leaves the sellable lot below the reported fill"
     true
     (match state.last_buy_fill_qty with
-     | Some q -> abs_float (q +. state.reserved_base -. net_qty) < 1e-12
+     | Some q -> abs_float (q -. state.reserved_base -. (net_qty -. skim)) < 1e-12
      | None -> false);
   check
     (float 1e-9)
@@ -5992,8 +5992,8 @@ let test_hl_buy_fill_skims_net_qty_and_gross_cost () =
      | [ (p, q) ] ->
        abs_float (p -. 100.0) < 1e-12 && abs_float (q -. (net_qty -. skim)) < 1e-12
      | _ -> false);
-  (* The paired sell must credit the spread on that net remainder - no more, no less. *)
-  let sell_qty = state.last_buy_fill_qty |> Option.get in
+  (* Only the sellable remainder can be offered; the reserve stays out of the order. *)
+  let sell_qty = net_qty -. skim in
   Dio_strategies.Strategy_api.Strategy.handle_order_filled
     ~now:101.0
     symbol

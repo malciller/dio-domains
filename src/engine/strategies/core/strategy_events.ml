@@ -680,13 +680,13 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
       (* Profit-gated lot skim for 1:1 venues (Hyperliquid, Kraken, Alpaca, ...). The
          order cannot withhold the [(1 - sell_mult)] slice (below one lot), so split the
          buy fill's own base: once quote profit covers a lot plus the buffer, move that
-         lot into [reserved_base] and reduce the sellable reference. The reserve is backed
-         by this buy. Runs once per buy, never on the sell path.
+         lot into [reserved_base]. The reserve is backed by this buy. Runs once per buy,
+         never on the sell path.
 
          Gated on [sell_uses_mult = false] (the venue sells 1:1, so the retention slice
-         needs its own skim), not on [use_accumulation_sells]: that flag describes the SELL
-         path (whether the order withholds the slice / sizes off the ledger basis), and
-         Alpaca sets it false while still accruing. *)
+         needs its own skim), not on [use_accumulation_sells]: that flag describes the
+         SELL path (whether the order withholds the slice / sizes off the ledger basis),
+         and Alpaca sets it false while still accruing. *)
       if (not state.startup_replay)
          && state.base_accumulation_enabled
          && (not state.cached_ecfg.sell_uses_mult)
@@ -720,7 +720,8 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
           let profit_before = state.accumulated_profit in
           state.reserved_base <- state.reserved_base +. skim;
           state.accumulated_profit <- state.accumulated_profit -. cost;
-          state.last_buy_fill_qty <- Some (net_qty -. skim);
+          (* The fill stays whole: the skim debits profit above; only [buy_lots] loses the
+             slice. *)
           (* The skimmed base was never sellable, so the newest lot cannot fund a sell. *)
           state.buy_lots
           <- (match state.buy_lots with
