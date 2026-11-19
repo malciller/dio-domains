@@ -130,6 +130,35 @@ let json_of_grid_strategy exchange symbol =
     in
     from_feed @ from_ledger
   in
+  (* Pre-scan: the strategy set is empty while the asset domain is still starting. Read
+     the venue's grid sells so the panel does not report a false 0. *)
+  let sell_orders =
+    if state.open_orders_scan_valid
+    then sell_orders
+    else (
+      let seen = Hashtbl.create 16 in
+      List.iter (fun (oid, _, _) -> Hashtbl.replace seen oid ()) sell_orders;
+      let from_venue =
+        match Exchange.Registry.get exchange with
+        | None -> []
+        | Some (module Ex) ->
+          (try
+             Ex.get_open_orders ~symbol
+             |> List.filter_map (fun (o : Exchange.Types.open_order) ->
+               if o.side = Exchange.Types.Sell
+                  && o.remaining_qty > 0.0
+                  && Dio_strategies.Strategy_common.is_grid_order o.user_ref
+                  && not (Hashtbl.mem seen o.order_id)
+               then (
+                 Hashtbl.replace seen o.order_id ();
+                 Some
+                   (o.order_id, Option.value o.limit_price ~default:0.0, o.remaining_qty))
+               else None)
+           with
+           | _ -> [])
+      in
+      sell_orders @ from_venue)
+  in
   `Assoc
     [ "type", `String "Ladder"
     ; "buy_price", json_of_float_opt state.last_buy_order_price

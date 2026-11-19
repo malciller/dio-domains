@@ -5,12 +5,14 @@
 open Lwt.Infix
 module StringMap = Map.Make (String)
 
-(** Optional concentration cap for one strategy. Both ratios use the strategy's marked
-    base position; only the denominator differs. Absent key = no cap. *)
+(** Optional concentration cap for one strategy. Absent key = no cap. *)
 type exposure_limit =
   { portfolio_pct : float option
-  (** Position value / total value across every connected venue. *)
-  ; venue_pct : float option (** Position value / the strategy venue's total value. *)
+  (** Total base held across the primary leg and its configured inventory legs, marked at
+      the primary price, / total value across every connected venue. *)
+  ; venue_pct : float option
+  (** The primary venue leg's base holding, marked at the primary price, / that venue's
+      total value. *)
   }
 
 (** Per-symbol trading parameters parsed from config.json. *)

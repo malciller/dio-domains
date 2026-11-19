@@ -659,6 +659,18 @@ let test_overlay_merges_legs () =
    | Some c ->
      Alcotest.(check int) "two legs" 2 (List.length c.oc_legs);
      Alcotest.(check bool) "hl spot leg present" true c.oc_has_hl_spot_leg);
+  let legs =
+    Dio_engine.Config.inventory_legs_for ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
+  in
+  Alcotest.(check int) "controller legs" 2 (List.length legs);
+  Alcotest.(check bool)
+    "primary leg first"
+    true
+    (List.hd legs = ("hyperliquid", "BTC/USDC"));
+  Alcotest.(check bool)
+    "cross-venue leg included"
+    true
+    (List.mem ("kraken", "BTC/USD") legs);
   let entries =
     match json |> Yojson.Basic.Util.member "trading" with
     | `List es -> List.map Dio_engine.Config.parse_config es
@@ -887,7 +899,19 @@ let test_flow_short_inventory_legs () =
     "the inventory leg spawns no second instance"
     0
     (List.length
-       (Dio_engine.Config.get_overlay_instances_for ~exchange:"kraken" ~symbol:"BTC/USD"))
+       (Dio_engine.Config.get_overlay_instances_for ~exchange:"kraken" ~symbol:"BTC/USD"));
+  let legs =
+    Dio_engine.Config.inventory_legs_for ~exchange:"hyperliquid" ~symbol:"BTC/USDC"
+  in
+  Alcotest.(check int) "primary plus inventory leg" 2 (List.length legs);
+  Alcotest.(check bool)
+    "primary leg first"
+    true
+    (List.hd legs = ("hyperliquid", "BTC/USDC"));
+  Alcotest.(check bool)
+    "inventory leg included"
+    true
+    (List.mem ("kraken", "BTC/USD") legs)
 ;;
 
 let test_parse_overlay_instances () =

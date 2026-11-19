@@ -1935,6 +1935,20 @@ let asset_domain_worker
       | None -> -1
       | Some _ -> Exposure.venue_index ~exchange:asset_with_fees.exchange
     in
+    let exposure_asset_idx =
+      match exposure_limits with
+      | None -> -1
+      | Some _ ->
+        let legs =
+          Config.inventory_legs_for
+            ~exchange:asset_with_fees.exchange
+            ~symbol:asset_with_fees.symbol
+        in
+        Exposure.register_asset
+          ~exchange:asset_with_fees.exchange
+          ~symbol:asset_with_fees.symbol
+          ~legs
+    in
     let cached_fng_check_threshold = config.fng_check_threshold in
     let wakeup_sync =
       Concurrency.Exchange_wakeup.get_sync_handle asset_with_fees.symbol
@@ -2279,19 +2293,27 @@ let asset_domain_worker
          the owner and declared inventory legs with the rule carry uses, on their own
          venues, so the short cap sees the spot that actually backs the short. *)
       let t_inv0 = if measured then Monotonic_clock.now_ns () else 0 in
-      ctx.cg_inventory_override
-      <- (if List.is_empty ov.oir_inventory_legs
-          then -1.0
-          else (
-            let i = ref 0 in
-            List.fold_left
-              (fun acc (exchange, symbol) ->
-                let cache = Array.unsafe_get ov.oir_inventory_caches !i in
-                let free = Array.unsafe_get ov.oir_inventory_free !i in
-                incr i;
-                acc +. Overlay_inventory.leg_q_of_fast ~cache ~free ~exchange ~symbol ())
-              0.0
-              ov.oir_inventory_legs));
+      let previous_inventory = ctx.cg_inventory_override in
+      let inventory_override =
+        if List.is_empty ov.oir_inventory_legs
+        then -1.0
+        else (
+          let i = ref 0 in
+          List.fold_left
+            (fun acc (exchange, symbol) ->
+              let cache = Array.unsafe_get ov.oir_inventory_caches !i in
+              let free = Array.unsafe_get ov.oir_inventory_free !i in
+              incr i;
+              acc +. Overlay_inventory.leg_q_of_fast ~cache ~free ~exchange ~symbol ())
+            0.0
+            ov.oir_inventory_legs)
+      in
+      ctx.cg_inventory_override <- inventory_override;
+      if Exposure.enabled ()
+         && inventory_override >= 0.0
+         && previous_inventory >= 0.0
+         && inventory_override <> previous_inventory
+      then Exposure.notify ();
       let inv_ns = if t_inv0 > 0 then Monotonic_clock.now_ns () - t_inv0 else 0 in
       ctx.cg_overlay_has_spot_leg <- false;
       ctx.cg_overlay_spot_symbol <- "";
@@ -3965,16 +3987,28 @@ let asset_domain_worker
          clears on a price move wakes the next pass. Unknown denominators fail open. *)
       let exposure_high =
         match exposure_limits, cached_grid_state with
-        | Some _, Some st when exposure_venue_idx >= 0 && !current_price > 0.0 ->
+        | Some _, Some _ when exposure_venue_idx >= 0 && !current_price > 0.0 ->
           let snapshot = Exposure.current () in
-          let position_value = (st.position_base +. st.staked_base) *. !current_price in
+          let total_qty =
+            if exposure_asset_idx >= 0
+               && exposure_asset_idx < Array.length snapshot.asset_quantities
+            then snapshot.asset_quantities.(exposure_asset_idx)
+            else 0.0
+          in
+          let venue_qty =
+            if exposure_asset_idx >= 0
+               && exposure_asset_idx < Array.length snapshot.venue_asset_quantities
+            then snapshot.venue_asset_quantities.(exposure_asset_idx)
+            else 0.0
+          in
           let venue_value =
             if exposure_venue_idx < Array.length snapshot.venue_values
             then snapshot.venue_values.(exposure_venue_idx)
             else 0.0
           in
           Exposure.breached
-            ~position_value
+            ~venue_position_value:(venue_qty *. !current_price)
+            ~portfolio_position_value:(total_qty *. !current_price)
             ~portfolio_value:snapshot.portfolio_value
             ~venue_value
             ~limits:exposure_limits
@@ -3988,12 +4022,20 @@ let asset_domain_worker
         exposure_high_prev := exposure_high;
         incr intent_gen;
         match cached_grid_state with
-        | Some st ->
+        | Some _ ->
           let snapshot = Exposure.current () in
-          let position_value =
-            if Float.is_nan !current_price
-            then 0.0
-            else (st.position_base +. st.staked_base) *. !current_price
+          let price = if Float.is_nan !current_price then 0.0 else !current_price in
+          let total_qty =
+            if exposure_asset_idx >= 0
+               && exposure_asset_idx < Array.length snapshot.asset_quantities
+            then snapshot.asset_quantities.(exposure_asset_idx)
+            else 0.0
+          in
+          let venue_qty =
+            if exposure_asset_idx >= 0
+               && exposure_asset_idx < Array.length snapshot.venue_asset_quantities
+            then snapshot.venue_asset_quantities.(exposure_asset_idx)
+            else 0.0
           in
           let venue_value =
             if exposure_venue_idx >= 0
@@ -4003,7 +4045,8 @@ let asset_domain_worker
           in
           let portfolio_pct, venue_pct =
             Exposure.ratios
-              ~position_value
+              ~venue_position_value:(venue_qty *. price)
+              ~portfolio_position_value:(total_qty *. price)
               ~portfolio_value:snapshot.portfolio_value
               ~venue_value
           in

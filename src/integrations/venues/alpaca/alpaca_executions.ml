@@ -120,6 +120,10 @@ module SymbolExecStore = struct
     ; open_orders_generation : int Atomic.t
     (** Per-symbol generation bumped when this symbol's snapshot is republished, so a
         consumer skips a rescan only when *this* symbol's orders changed. *)
+    ; open_orders_snapshot : bool Atomic.t
+    (** A REST snapshot has been applied. Distinct from [initial_data_received]: the store
+        exists (and is marked ready) before any snapshot, and an empty cache must not be
+        read as "no open orders". *)
     ; initial_data_received : bool Atomic.t
     ; mutex : Mutex.t
     ; changes : (string * open_order_internal option) list Atomic.t
@@ -160,6 +164,7 @@ module SymbolExecStore = struct
     ; open_orders = Hashtbl.create 32
     ; open_orders_cache = Atomic.make []
     ; open_orders_generation = Atomic.make 0
+    ; open_orders_snapshot = Atomic.make false
     ; initial_data_received = Atomic.make false
     ; mutex = Mutex.create ()
     ; changes = Atomic.make []
@@ -305,6 +310,7 @@ module SymbolExecStore = struct
         note_change t o.id (Some oo))
       orders;
     publish_open_orders_cache t;
+    Atomic.set t.open_orders_snapshot true;
     Mutex.unlock t.mutex;
     Atomic.set t.initial_data_received true;
     (* Snapshot readiness is per-store; only this symbol's domain gates on it. *)
@@ -324,8 +330,9 @@ let stores_mutex = Mutex.create ()
     consumer's rescan gate forces a scan until the first snapshot. *)
 let get_orders_generation_for_symbol symbol =
   match Ds.Cow_table.find_opt stores symbol with
-  | Some s -> Atomic.get s.SymbolExecStore.open_orders_generation
-  | None -> -1
+  | Some s when Atomic.get s.SymbolExecStore.open_orders_snapshot ->
+    Atomic.get s.SymbolExecStore.open_orders_generation
+  | _ -> -1
 ;;
 
 (** Drain the per-order change delta for [symbol]: [(changes, overflow)] where [changes]
@@ -538,14 +545,14 @@ let start_open_orders_resync () =
   if Atomic.compare_and_set open_orders_resync_running false true
   then (
     let rec loop () =
-      Lwt_unix.sleep open_orders_resync_interval_s
-      >>= fun () ->
       Lwt.catch bootstrap_open_orders (fun exn ->
         Logging.warn_f
           ~section
           "Periodic open-orders resync failed: %s"
           (Printexc.to_string exn);
         Lwt.return_unit)
+      >>= fun () ->
+      Lwt_unix.sleep open_orders_resync_interval_s
       >>= fun () ->
       (* Spawn the next reconcile independently so this process-lifetime poll does not
          retain a recursive Lwt Forward chain. *)

@@ -3,11 +3,16 @@ module Limits = Dio_strategies.Strategy_common
 let () = ignore Hyperliquid.Module.Hyperliquid_impl.name
 let limits ?portfolio_pct ?venue_pct () = Some { Limits.portfolio_pct; venue_pct }
 
-let check name expected position_value portfolio_value venue_value limits =
+let check name expected value portfolio_value venue_value limits =
   Alcotest.(check bool)
     name
     expected
-    (Dio_engine.Exposure.breached ~position_value ~portfolio_value ~venue_value ~limits)
+    (Dio_engine.Exposure.breached
+       ~venue_position_value:value
+       ~portfolio_position_value:value
+       ~portfolio_value
+       ~venue_value
+       ~limits)
 ;;
 
 let test_no_limit_fails_open () = check "no limit" false 500.0 0.0 0.0 None
@@ -33,6 +38,26 @@ let test_either_limit_wins () =
   check "both clear" false 1_000.0 10_000.0 20_000.0 l
 ;;
 
+let test_cross_venue_inventory_only_affects_portfolio () =
+  let l = limits ~portfolio_pct:5.0 ~venue_pct:25.0 () in
+  let hit venue portfolio =
+    Dio_engine.Exposure.breached
+      ~venue_position_value:venue
+      ~portfolio_position_value:portfolio
+      ~portfolio_value:100_000.0
+      ~venue_value:20_000.0
+      ~limits:l
+  in
+  Alcotest.(check bool)
+    "venue leg passes, cross-venue total breaches portfolio"
+    true
+    (hit 4_000.0 6_000.0);
+  Alcotest.(check bool)
+    "same total below the portfolio cap passes"
+    false
+    (hit 4_000.0 5_000.0)
+;;
+
 let test_unknown_denominator_fails_open () =
   let l = limits ~portfolio_pct:10.0 ~venue_pct:25.0 () in
   check "portfolio unknown" false 100.0 0.0 20_000.0 l;
@@ -43,7 +68,8 @@ let test_unknown_denominator_fails_open () =
 let test_ratios () =
   let portfolio, venue =
     Dio_engine.Exposure.ratios
-      ~position_value:1_000.0
+      ~venue_position_value:1_000.0
+      ~portfolio_position_value:1_000.0
       ~portfolio_value:10_000.0
       ~venue_value:20_000.0
   in
@@ -51,7 +77,8 @@ let test_ratios () =
   Alcotest.(check (float 1e-9)) "venue pct" 5.0 venue;
   let portfolio, venue =
     Dio_engine.Exposure.ratios
-      ~position_value:1_000.0
+      ~venue_position_value:1_000.0
+      ~portfolio_position_value:1_000.0
       ~portfolio_value:0.0
       ~venue_value:0.0
   in
@@ -150,6 +177,10 @@ let () =
         ; Alcotest.test_case "portfolio ratio" `Quick test_portfolio_ratio
         ; Alcotest.test_case "venue ratio" `Quick test_venue_ratio
         ; Alcotest.test_case "either limit wins" `Quick test_either_limit_wins
+        ; Alcotest.test_case
+            "cross-venue inventory only affects portfolio"
+            `Quick
+            test_cross_venue_inventory_only_affects_portfolio
         ; Alcotest.test_case
             "unknown denominator fails open"
             `Quick

@@ -931,6 +931,44 @@ let get_overlay_legs ~exchange ~symbol =
   | None -> []
 ;;
 
+(** Every venue/symbol holding this primary asset: the primary leg first, then the overlay
+    inventory legs attached to it. Used by [max_exposure.portfolio_pct] so the numerator
+    spans the same inventory the parent strategy actually owns. *)
+let inventory_legs_for ~exchange ~symbol =
+  let exchange = normalize_exchange exchange in
+  let same_leg (l : overlay_leg) =
+    String.equal (normalize_exchange l.ol_exchange) exchange
+    && String.equal l.ol_symbol symbol
+  in
+  let legs =
+    match
+      List.find_opt
+        (fun (c : overlay_controller) -> List.exists same_leg c.oc_legs)
+        !overlay_controllers
+    with
+    | Some c ->
+      (exchange, symbol)
+      :: List.map (fun l -> normalize_exchange l.ol_exchange, l.ol_symbol) c.oc_legs
+    | None ->
+      (exchange, symbol)
+      :: List.map
+           (fun (exchange, symbol) -> normalize_exchange exchange, symbol)
+           (List.concat_map
+              (fun (oi : overlay_instance) -> oi.oi_inventory_legs)
+              (get_overlay_instances_for ~exchange ~symbol))
+  in
+  let seen = Hashtbl.create 8 in
+  List.filter
+    (fun (exchange, symbol) ->
+      let key = exchange ^ "|" ^ base_coin_of_symbol symbol in
+      if Hashtbl.mem seen key
+      then false
+      else (
+        Hashtbl.replace seen key ();
+        true))
+    legs
+;;
+
 let find_leg ~exchange ~symbol =
   let exchange = normalize_exchange exchange in
   List.find_opt

@@ -981,6 +981,9 @@ let sync_open_orders
     || generation < 0
     || state.open_orders_scan_generation <> generation
   in
+  (* Alpaca has no WS open-order snapshot: generation stays -1 until its REST bootstrap
+     lands, so an empty scan is not authoritative yet. *)
+  let venue_ready = generation >= 0 in
   let can_skip = (not generation_changed) && not has_changes in
   if can_skip
   then (
@@ -1021,7 +1024,7 @@ let sync_open_orders
        s.ss_closest_sell_price <- p
      | None -> ());
     state.open_orders_scan_generation <- generation;
-    state.open_orders_scan_valid <- true)
+    state.open_orders_scan_valid <- venue_ready)
   else (
     (* Hot-path invariant (enforced): reaching the O(open-orders) scan means the
        persistent index was not a complete snapshot, which is only ever true before the
@@ -1105,7 +1108,7 @@ let sync_open_orders
     state.cached_best_buy_price <- s.ss_best_buy_price;
     state.feed_index_valid <- true;
     state.open_orders_scan_generation <- generation;
-    state.open_orders_scan_valid <- true);
+    state.open_orders_scan_valid <- venue_ready);
   (* Rebuild the persisted ladder from the feed deterministically: one rung per price
      (within the same tolerance the matcher uses), its qty the live order qty at that
      price; levels with no live order keep their recorded (missing) qty; feed prices
