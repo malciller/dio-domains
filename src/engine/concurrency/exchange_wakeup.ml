@@ -19,6 +19,10 @@
     [signal_all] broadcasts to all waiting workers for cross-cutting events such as
     shutdown or snapshot completion. *)
 
+(* One detached timer domain; no trading domain is spawned here. *)
+[@@@alert "-unsafe_multidomain"]
+[@@@alert "-do_not_spawn_domains"]
+
 type symbol_sync =
   { mutex : Mutex.t
   ; condition : Condition.t
@@ -145,6 +149,98 @@ let signal_all () =
     all_syncs
 ;;
 
+(* Time-based state becomes a per-symbol deadline that arrives as an ordinary signal. The
+   trading loop never polls and the park needs no timeout; one background domain sleeps
+   until the earliest armed deadline. Deadlines are Unix seconds because every strategy
+   timestamp (cooldowns, TIF recovery, sell commitments) is Unix seconds. *)
+
+let deadline_started = Atomic.make false
+let deadline_mutex = Mutex.create ()
+let deadlines : (string, float) Hashtbl.t = Hashtbl.create 64
+let deadline_r, deadline_w = Unix.pipe ~cloexec:true ()
+
+let () =
+  Unix.set_nonblock deadline_r;
+  Unix.set_nonblock deadline_w
+;;
+
+let deadline_byte = Bytes.make 1 '\x00'
+
+let ring_deadline_timer () =
+  try ignore (Unix.write deadline_w deadline_byte 0 1) with
+  | Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> ()
+  | _ -> ()
+;;
+
+let drain_deadline_timer () =
+  let buf = Bytes.create 64 in
+  let rec go () =
+    match Unix.read deadline_r buf 0 64 with
+    | 0 -> ()
+    | _ -> go ()
+    | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> ()
+    | exception _ -> ()
+  in
+  go ()
+;;
+
+(* A wall-clock step moves every deadline; re-reading the clock at least once a minute
+   bounds the error. Paid only by the background timer domain. *)
+let max_deadline_sleep_s = 60.0
+
+let rec deadline_loop () =
+  let now = Unix.gettimeofday () in
+  Mutex.lock deadline_mutex;
+  let due =
+    Hashtbl.fold
+      (fun symbol at acc -> if at <= now then symbol :: acc else acc)
+      deadlines
+      []
+  in
+  List.iter (fun symbol -> Hashtbl.remove deadlines symbol) due;
+  let next =
+    Hashtbl.fold
+      (fun _ at acc ->
+        match acc with
+        | None -> Some at
+        | Some n -> Some (Float.min n at))
+      deadlines
+      None
+  in
+  Mutex.unlock deadline_mutex;
+  List.iter (fun symbol -> signal ~symbol) due;
+  let timeout =
+    match next with
+    | None -> max_deadline_sleep_s
+    | Some at ->
+      Float.min max_deadline_sleep_s (Float.max 0.0 (at -. Unix.gettimeofday ()))
+  in
+  (try ignore (Unix.select [ deadline_r ] [] [] timeout) with
+   | _ -> ());
+  drain_deadline_timer ();
+  deadline_loop ()
+;;
+
+(** Start the timer domain. Called from [main] before trading domains exist: spawning it
+    from a pinned or real-time domain would inherit that placement for a window. *)
+let start_deadline_timer () =
+  if Atomic.compare_and_set deadline_started false true
+  then
+    ignore
+      (Domain.spawn (fun () ->
+         (try
+            Thread_affinity.set_self_other ();
+            Thread_affinity.pin_self_background ()
+          with
+          | _ -> ());
+         try deadline_loop () with
+         | exn ->
+           Logging.error_f
+             ~section:"exchange_wakeup"
+             "deadline timer domain died: %s"
+             (Printexc.to_string exn)))
+;;
+
 (* Spin iterations before parking. Each iteration is one atomic read; the spin is a
    latency optimization only. A shorter spin costs at most one futex wake/sleep round-trip
    in the rare race case. *)
@@ -201,6 +297,22 @@ let configure () =
     (try Atomic.set spin_iterations (max 0 (int_of_string (String.trim s))) with
      | _ -> ())
   | None -> ()
+;;
+
+(** Arm a wake for [symbol] at Unix time [at]. Only the earliest pending deadline per
+    symbol survives: a later arm never pushes an earlier one back, and a stale one that
+    fires after the state cleared is a harmless extra pass. Called at the edge that arms a
+    timer, never per cycle. *)
+let schedule ~symbol ~at =
+  Mutex.lock deadline_mutex;
+  let changed =
+    match Hashtbl.find_opt deadlines symbol with
+    | Some cur -> cur > at
+    | None -> true
+  in
+  if changed then Hashtbl.replace deadlines symbol at;
+  Mutex.unlock deadline_mutex;
+  if changed then ring_deadline_timer ()
 ;;
 
 (** Fast-path [wait_since] over a pre-resolved [sync_handle]; avoids map traversal on the

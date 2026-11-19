@@ -20,6 +20,42 @@ let orders_generation = Atomic.make 0
 
 let[@inline] get_orders_generation () = Atomic.get orders_generation
 
+(** Open-orders change notification.
+
+    The vendored Lwt runs a resolved callback inline on the resolving thread, so a
+    producer must never touch Lwt state: Alpaca publishes from a parse domain (and from
+    under the store mutex), where an inline waiter would re-enter the mutex and raise
+    [EDEADLK]. Producers only ring a domain-safe pipe; a single pump fiber on the Lwt
+    domain drains it and broadcasts the condition with no lock held. *)
+let orders_doorbell = Concurrency.Domain_doorbell.create ()
+
+let orders_changed : unit Lwt_condition.t = Lwt_condition.create ()
+let orders_pump_started = Atomic.make false
+
+let start_orders_pump () =
+  if Atomic.compare_and_set orders_pump_started false true
+  then (
+    let rec pump () =
+      Concurrency.Domain_doorbell.wait orders_doorbell
+      >>= fun () ->
+      Lwt_condition.broadcast orders_changed ();
+      (* Spawn the next iteration independently: a chained bind would retain one pending
+         Lwt node per publication for the process lifetime. *)
+      Lwt.async pump;
+      Lwt.return_unit
+    in
+    Lwt.async pump)
+;;
+
+(** Ring from any domain. Never blocks, never allocates, never calls Lwt. *)
+let notify_orders_changed () = Concurrency.Domain_doorbell.ring orders_doorbell
+
+(** Lwt-domain only. *)
+let wait_orders_changed () =
+  start_orders_pump ();
+  Lwt_condition.wait orders_changed
+;;
+
 type open_order_internal =
   { order_id : string
   ; symbol : string
@@ -139,6 +175,7 @@ module SymbolExecStore = struct
     Atomic.set t.open_orders_cache snapshot;
     Atomic.incr t.open_orders_generation;
     Atomic.incr orders_generation;
+    notify_orders_changed ();
     Concurrency.Oracle_wakeup.notify_orders ()
   ;;
 
@@ -704,6 +741,12 @@ let start_trade_updates_ws () =
     let content = String.trim content in
     if String.equal content ""
     then Lwt.return_unit
+    else if (* Trade updates are the hot path: hand the raw frame to a parse domain before
+               the Yojson parse. Authorization/control frames keep the inline path; a full
+               worker queue falls through to it too. *)
+            String.starts_with ~prefix:"{\"stream\":\"trade_updates\"" content
+            && Concurrency.Parse_worker.submit "alpaca_ws" content
+    then Lwt.return_unit
     else (
       match Yojson.Safe.from_string content with
       | exception _ -> Lwt.return_unit
@@ -807,6 +850,25 @@ let () =
       Logging.error_f
         ~section
         "Failed to parse Alpaca trade event: %s (payload: %s)"
+        (Printexc.to_string exn)
+        raw)
+;;
+
+(* Trade-update frame from the streaming WS, still carrying its [{stream,data}] wrapper. *)
+let () =
+  Concurrency.Parse_worker.register "alpaca_ws" (fun raw ->
+    match Yojson.Safe.from_string raw with
+    | json ->
+      (try apply_trade_update (Yojson.Safe.Util.member "data" json) with
+       | exn ->
+         Logging.warn_f
+           ~section
+           "Alpaca WS trade update failed: %s"
+           (Printexc.to_string exn))
+    | exception exn ->
+      Logging.error_f
+        ~section
+        "Failed to parse Alpaca WS frame: %s (payload: %s)"
         (Printexc.to_string exn)
         raw)
 ;;

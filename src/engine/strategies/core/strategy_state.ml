@@ -69,6 +69,11 @@ type exchange_config =
   (** Re-submit missing sell grid levels (Alpaca GTC maintenance) *)
   }
 
+(** How long a dispatched sell with no venue confirmation is kept as committed base. Owned
+    here so [next_deadline] and the ledger cannot disagree. Applies only to a never-acked,
+    never-seen (lost) dispatch; an acked order is kept until its terminal event. *)
+let sell_commitment_timeout_s = 120.0
+
 (** Per-asset trading configuration. *)
 type trading_config =
   { exchange : string
@@ -903,4 +908,21 @@ let reset_phase_metrics ?(profiling = false) (s : strategy_state) =
   s.time_splan_reconcile_ns <- 0;
   s.time_bplan_price_ns <- 0;
   s.time_bplan_sells_ns <- 0
+;;
+
+(** Earliest armed timer in Unix seconds, or [None]. Every entry is a state transition
+    whose time is known when it is armed, so the domain sleeps until it instead of
+    re-checking the clock on a periodic pass. *)
+let next_deadline t =
+  let at = ref nan in
+  let take v = if Float.is_finite v && (Float.is_nan !at || v < !at) then at := v in
+  Hashtbl.iter (fun _ expiry -> take expiry) t.amend_cooldowns;
+  if t.tif_recovery_pending then take (t.tif_recovery_since +. 900.0);
+  Hashtbl.iter (fun _ (expiry, _) -> take expiry) t.evicted_orders;
+  Hashtbl.iter
+    (fun _ (c : sell_commitment) ->
+      if (not c.sc_seen) && not c.sc_acked
+      then take (c.sc_armed +. sell_commitment_timeout_s))
+    t.sell_commitments;
+  if Float.is_nan !at then None else Some !at
 ;;

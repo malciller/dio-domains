@@ -6,13 +6,14 @@
       so a pass pays no standalone HTTP round-trip. Best-effort: an unregistered exchange
       or empty store yields None and the caller falls back to REST.
    2. One-shot REST fetches ([fetch_account] / [fetch_task]), used by the CLI
-      (bin/oracle.ml) and as runtime fallback. Per-venue fetch and asset normalization
-      live in the venue's oracle adapter ([Exchange_intf.Oracle.S.fetch_balances] via
-      [Exchange_intf.Oracle.Registry]).
+      (bin/oracle.ml), at cold start before a live store has data, and as runtime
+      fallback. Per-venue fetch and asset normalization live in the venue's oracle adapter
+      ([Exchange_intf.Oracle.S.fetch_balances] via [Exchange_intf.Oracle.Registry]).
 
-   Hyperliquid is always REST: its live "USDC" store aggregates perp margin with spot,
-   while the oracle pool counts spot capital only (perp margin is not grid capital), so
-   REST spotClearinghouseState stays authoritative. *)
+   Every venue that exposes [Oracle.S.live_balances] is read in-process per pass, so
+   sizing does not wait for the background refresh. Hyperliquid's live view is spot-only
+   ([Hyperliquid_balances.spot_balances]), matching REST [spotClearinghouseState]: perp
+   margin is excluded because it is not grid capital. *)
 
 open Lwt.Infix
 module Exchange = Dio_exchange.Exchange_intf

@@ -25,3 +25,7 @@
 (test
  (name test_io_backend)
  (libraries dio.lwt.unix alcotest))
+
+(test
+ (name test_deadline)
+ (libraries dio.concurrency alcotest))

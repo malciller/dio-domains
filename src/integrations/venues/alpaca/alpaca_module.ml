@@ -107,12 +107,10 @@ module Alpaca_impl = struct
       Alpaca's DELETE returns 200 as soon as the cancellation is *accepted*; the order
       sits in [pending_cancel] and its shares stay in [held_for_orders] until the venue
       finishes. Placing the replacement immediately therefore races the release and is
-      rejected with HTTP 403 ["insufficient qty available for order"]. Poll the local
-      open-order store (fed by the executions SSE stream, healed every 10s by the REST
-      resync) until the order leaves it. *)
+      rejected with HTTP 403 ["insufficient qty available for order"]. Park on the
+      execution stream's open-orders change and re-check the store; the timeout is only an
+      alarm. *)
   let cancel_settle_timeout_s = 15.0
-
-  let cancel_settle_poll_s = 0.2
 
   type cancel_settle =
     | Cancel_settled
@@ -138,6 +136,10 @@ module Alpaca_impl = struct
   let wait_for_cancel_settle ~symbol ~order_id =
     let deadline = Unix.gettimeofday () +. cancel_settle_timeout_s in
     let rec loop () =
+      (* Capture the generation before reading the store: a publication that lands between
+         the read and the wait must leave the generation changed, so the waiter re-checks
+         instead of sleeping to the deadline. *)
+      let seen = Alpaca_executions.get_orders_generation () in
       match Alpaca_executions.get_open_order symbol order_id with
       | None ->
         let filled = filled_qty_for_order ~symbol ~order_id in
@@ -151,9 +153,28 @@ module Alpaca_impl = struct
            Alpaca_executions.remove_open_order symbol order_id;
            Lwt.return Cancel_settled
          | _ ->
-           if Unix.gettimeofday () >= deadline
+           let remaining = deadline -. Unix.gettimeofday () in
+           if remaining <= 0.0
            then Lwt.return Cancel_unsettled
-           else Lwt_unix.sleep cancel_settle_poll_s >>= fun () -> loop ())
+           else if Alpaca_executions.get_orders_generation () <> seen
+           then loop ()
+           else (
+             let changed = Alpaca_executions.wait_orders_changed () in
+             (* Close the register-then-recheck race without broadcasting: this Lwt
+                resolves callbacks inline, and a self-broadcast would re-enter [loop]. *)
+             if Alpaca_executions.get_orders_generation () <> seen
+             then (
+               Lwt.cancel changed;
+               loop ())
+             else
+               Lwt.pick
+                 [ (changed >|= fun () -> `Change)
+                 ; (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
+                 ]
+               >>= fun outcome ->
+               match outcome with
+               | `Change -> loop ()
+               | `Timeout -> Lwt.return Cancel_unsettled))
     in
     loop ()
   ;;

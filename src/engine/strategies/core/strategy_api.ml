@@ -137,6 +137,7 @@ let buy_place_latch_capital_low = Strategy_decision.buy_place_latch_capital_low
 let buy_place_warn_quote = Strategy_decision.buy_place_warn_quote
 let cleanup_pending_and_cooldowns = Strategy_lifecycle.cleanup_pending_and_cooldowns
 let expire_amend_cooldowns = Strategy_lifecycle.expire_amend_cooldowns
+let next_deadline = Strategy_state.next_deadline
 let evict_ghost_orders = Strategy_lifecycle.evict_ghost_orders
 let reconcile_position = Strategy_lifecycle.reconcile_position
 let arm_buy_credit = Strategy_lifecycle.arm_buy_credit

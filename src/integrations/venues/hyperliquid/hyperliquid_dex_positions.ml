@@ -106,16 +106,21 @@ let publish ~now ~dex (payload : Yojson.Safe.t) =
   with
   | None -> ()
   | Some positions ->
+    let updated = ref false in
     List.iter
       (fun json ->
         match parse_position ~dex json with
         | Some (p : Dio_exchange.Exchange_intf.Market_context.position) ->
+          updated := true;
           Dio_exchange.Market_context.update_position
             ~at:now
             ~exchange:"hyperliquid"
             { p with updated_at = now }
         | None -> ())
-      positions
+      positions;
+    (* Position snapshots size overlay hedges across owner domains, so this is a
+       cross-cutting edge. The poll only fetches; the wake is an ordinary signal. *)
+    if !updated then Concurrency.Exchange_wakeup.signal_all ()
 ;;
 
 let start ~testnet ~user ~dexes () =

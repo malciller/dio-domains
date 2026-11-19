@@ -387,6 +387,9 @@ let () =
   (* Build the background CPU allocator here, not at module init: the latter read
      DIO_BACKGROUND_CPUS before [.env] existed and silently ignored it. *)
   Thread_affinity.configure ();
+  (* Start the deadline timer after the allocator exists so it pins to the background set;
+     spawning it from a trading domain would inherit that placement for a window. *)
+  Concurrency.Exchange_wakeup.start_deadline_timer ();
   (* Load engine configuration from config.json. *)
   let config = Dio_engine.Config.read_config () in
   (* Apply log level and section filters from configuration. *)

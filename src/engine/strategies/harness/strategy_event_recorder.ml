@@ -66,11 +66,13 @@ let finish t =
 
 (** Non-mutating view of the trace so far (the current cycle is included without ending
     it). Safe to call mid-run for periodic persistence. *)
-let snapshot t =
-  let cycles =
-    if t.obs = []
-    then t.cycles
-    else { Strategy_trace.c_index = t.index; c_obs = List.rev t.obs } :: t.cycles
-  in
-  List.rev cycles
+let snapshot_reversed t =
+  if t.obs = []
+  then t.cycles
+  else { Strategy_trace.c_index = t.index; c_obs = List.rev t.obs } :: t.cycles
 ;;
+
+(** Forward-order view. [snapshot_reversed] is the hot-path form: it shares the immutable
+    prefix instead of reversing (copying) every cycle recorded so far. Callers that
+    persist off-domain use it and reverse there. *)
+let snapshot t = List.rev (snapshot_reversed t)

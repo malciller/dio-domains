@@ -614,6 +614,15 @@ type save_job =
   }
 
 let save_jobs : save_job Queue.t = Queue.create ()
+
+(** One-shot work handed to the maintenance domain: JSON trace snapshots and other
+    callbacks that must never run I/O on a trading domain. Bounded so a slow disk cannot
+    grow the queue without limit; the oldest entry is dropped and counted. *)
+let task_jobs : (string * (unit -> unit)) Queue.t = Queue.create ()
+
+let task_capacity = 8
+let tasks_dropped = Atomic.make 0
+let tasks_dropped_count () = Atomic.get tasks_dropped
 let save_mutex = Mutex.create ()
 let save_wake = Condition.create ()
 let save_started = Atomic.make false
@@ -657,14 +666,17 @@ let start_save_service () =
          let seen_maintenance = ref (-1) in
          while true do
            Mutex.lock save_mutex;
-           let has_jobs = not (Queue.is_empty save_jobs) in
+           let has_task = not (Queue.is_empty task_jobs) in
+           let has_save = not (Queue.is_empty save_jobs) in
+           let has_jobs = has_task || has_save in
            let epoch = Atomic.get maintenance_epoch in
            if (not has_jobs) && epoch = !seen_maintenance
            then (
              Condition.wait save_wake save_mutex;
              Mutex.unlock save_mutex)
            else (
-             let job = if has_jobs then Some (Queue.pop save_jobs) else None in
+             let task = if has_task then Some (Queue.pop task_jobs) else None in
+             let job = if has_save then Some (Queue.pop save_jobs) else None in
              seen_maintenance := epoch;
              Mutex.unlock save_mutex;
              (* Maintenance first: a slow persistence write must not delay a risk
@@ -679,6 +691,16 @@ let start_save_service () =
                      name
                      (Printexc.to_string exn))
                (Atomic.get maintenance_tasks);
+             (match task with
+              | Some (name, f) ->
+                (try f () with
+                 | exn ->
+                   Logging.error_f
+                     ~section
+                     "background task '%s' failed: %s"
+                     name
+                     (Printexc.to_string exn))
+              | None -> ());
              match job with
              | Some j -> save_one j
              | None -> ())
@@ -711,6 +733,20 @@ let register_maintenance ~name ~run =
 let enqueue_save ~owner_exchange ~owner_symbol ~id ~names ~values ~previous =
   Mutex.lock save_mutex;
   Queue.push { owner_exchange; owner_symbol; id; names; values; previous } save_jobs;
+  Condition.signal save_wake;
+  Mutex.unlock save_mutex;
+  start_save_service ()
+;;
+
+(** Hand one-shot work to the maintenance domain. [name] identifies the task in an error
+    log. Called from a trading domain, so it must stay a queue push and a signal. *)
+let enqueue_background ~name f =
+  Mutex.lock save_mutex;
+  if Queue.length task_jobs >= task_capacity
+  then (
+    ignore (Queue.pop task_jobs);
+    ignore (Atomic.fetch_and_add tasks_dropped 1));
+  Queue.push (name, f) task_jobs;
   Condition.signal save_wake;
   Mutex.unlock save_mutex;
   start_save_service ()

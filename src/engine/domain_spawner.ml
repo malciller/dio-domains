@@ -1461,10 +1461,13 @@ let asset_domain_worker
     let should_execute_strategy = ref true in
     (* Quiet-market tick. A venue that stops publishing quotes while it still trades - IEX
        after its close, prints only - would otherwise never run the strategy again: the
-       loop parks on a book/event wake and no wake ever comes. These two stamps let the
-       loop re-run a pass at 1 Hz on a price the venue last gave us, instead of sitting
-       idle until the next session. *)
+       loop parks on a book/event wake and no wake ever comes. These stamps let the loop
+       re-run a pass once a second on a price the venue last gave us (armed as a deadline,
+       not a periodic broadcast), instead of sitting idle until the next session. *)
     let last_book_at = ref (Unix.gettimeofday ()) in
+    (* Earliest deadline this domain armed for itself. A wake at or past it is a timer
+       edge and must run a pass; a plain producer wake still needs book/exec/intent work. *)
+    let next_wake_at = ref nan in
     (* Intent-driven ticking. A pass otherwise runs only on a top-of-book change, a fill,
        or the quiet-market fallback, so a state change with no new tick (capital restored,
        oracle reactivated, grid gate opened) would sit until the next book tick. State
@@ -3916,6 +3919,8 @@ let asset_domain_worker
           := Oracle_runtime.decision_for
                ~exchange:asset_with_fees.exchange
                ~symbol:asset_with_fees.symbol;
+          (* A changed decision is an edge: run a pass now, not on the next book tick. *)
+          should_execute_strategy := true;
           !oracle_decision_cached)
         else !oracle_decision_cached
       in
@@ -4364,10 +4369,21 @@ let asset_domain_worker
          last_open_orders_gen := orders_gen;
          incr intent_gen));
       let tradable = (not (Float.is_nan !current_price)) && not equity_market_closed in
+      (* A wake at or past the armed deadline is a timer edge and must run a pass; a plain
+         producer wake still needs book/exec/intent work. Skip an untradable price: the
+         pass would act on a NaN quote. *)
+      if tradable && (not (Float.is_nan !next_wake_at)) && now_loop >= !next_wake_at
+      then (
+        next_wake_at := nan;
+        should_execute_strategy := true);
+      (* Coalesce intents only while the cycle already has book/exec work. An idle domain
+         must act on the edge: a suppressed intent parks on [wait_since] with no deadline
+         and waits for an unrelated tick. *)
+      let busy_this_cycle = did_ob || did_exec in
       let intent_due =
         (not !should_execute_strategy)
         && !intent_gen <> !intent_ran
-        && now_loop -. !last_intent_tick >= intent_tick_s
+        && ((not busy_this_cycle) || now_loop -. !last_intent_tick >= intent_tick_s)
         && tradable
       in
       if intent_due
@@ -4430,12 +4446,14 @@ let asset_domain_worker
          ctx.cg_price <- !current_price;
          ctx.cg_bid <- !tob_bid;
          ctx.cg_ask <- !tob_ask;
+         (* Cached closures: the plain accessor rescans every symbol's resting buys on
+            each call, which is O(symbols x open orders) inside the cycle. *)
          ctx.cg_abal
-         <- (try Ex.get_tradeable_balance ~asset:base_asset with
+         <- (try base_balance_fn () with
              | _ -> nan);
          ctx.cg_qbal
          <- available_quote
-              (try Ex.get_tradeable_balance ~asset:quote_currency with
+              (try quote_balance_fn () with
                | _ -> nan);
          ctx.cg_now <- now_ov;
          ctx.cg_cycle <- !cycle_count;
@@ -5237,10 +5255,17 @@ let asset_domain_worker
           Dio_strategies.Strategy_event_recorder.end_cycle r;
           incr trace_cycles;
           if !trace_cycles = 1 || !trace_cycles mod 50 = 0
-          then
-            Dio_strategies.Strategy_trace.save
-              trace_path
-              (Dio_strategies.Strategy_event_recorder.snapshot r)
+          then (
+            (* Share the immutable prefix; the reversal and the JSON write are O(cycles)
+               and run on the maintenance domain, never on the trading domain. *)
+            let snap_rev = Dio_strategies.Strategy_event_recorder.snapshot_reversed r in
+            Aux_services.enqueue_background ~name:"strategy_trace" (fun () ->
+              try Dio_strategies.Strategy_trace.save trace_path (List.rev snap_rev) with
+              | exn ->
+                Logging.warn_f
+                  ~section
+                  "strategy trace save failed: %s"
+                  (Printexc.to_string exn)))
         | _ -> ());
       let t4 = !strat_end_ns in
       let alloc_at_t4 = !alloc_strat_end in
@@ -5566,6 +5591,43 @@ let asset_domain_worker
          signal. No polling sleep. *)
       if not should_execute
       then (
+        (* Arm the next transition that has a known time: a pending intent waiting out the
+           coalesce window, a reclaim retry, the quiet-market backstop, or a strategy
+           timer (cooldown, TIF recovery, ghost marker, unconfirmed sell). The timer
+           domain turns the earliest into an ordinary signal, so the park needs no
+           deadline and no periodic pass. Deadlines already in the past are skipped: the
+           pass that would consume them is gated off, so arming them would spin. *)
+        let park_now = Unix.gettimeofday () in
+        let at = ref nan in
+        let take v =
+          if Float.is_finite v && v > park_now && (Float.is_nan !at || v < !at)
+          then at := v
+        in
+        if tradable && !intent_gen <> !intent_ran
+        then take (!last_intent_tick +. intent_tick_s);
+        if !reclaim_cancel_issued then take (!reclaim_cancel_at +. reclaim_retry_seconds);
+        take (!last_book_at +. quiet_safety_s);
+        if tradable && park_now -. !last_book_at >= quiet_safety_s
+        then take (!last_intent_tick +. 1.0);
+        (match cached_grid_state with
+         | Some s ->
+           (match Dio_strategies.Strategy_api.next_deadline s with
+            | Some d -> take d
+            | None -> ())
+         | None -> ());
+        (match overlay_state with
+         | Some s
+           when not
+                  (match cached_grid_state with
+                   | Some g -> g == s
+                   | None -> false) ->
+           (match Dio_strategies.Strategy_api.next_deadline s with
+            | Some d -> take d
+            | None -> ())
+         | _ -> ());
+        if Float.is_finite !at
+        then Concurrency.Exchange_wakeup.schedule ~symbol:asset_with_fees.symbol ~at:!at;
+        next_wake_at := !at;
         let parked_at = Monotonic_clock.now_ns () in
         Concurrency.Exchange_wakeup.wait_since_fast wakeup_sync ~since:wake_baseline;
         (* Wake latency: producer signal -> this domain running again. The cycle spans
@@ -5877,7 +5939,9 @@ let spawn_supervised_domains_for_assets
      scheduling policy for the window before it re-pins itself. *)
   if List.exists (fun (t : Config.trading_config) -> t.max_exposure <> None) assets
   then Exposure.start ();
-  if Config.get_overlay_instances () <> [] || get_overlay_controllers () <> []
+  if Config.get_overlay_instances () <> []
+     || get_overlay_controllers () <> []
+     || config.strategy_trace
   then Aux_services.start ();
   (* Register assets in core-assignment order: registration is where a trading CPU is
      claimed, so the highest [cpu_priority] claims a P-core first and ties keep config

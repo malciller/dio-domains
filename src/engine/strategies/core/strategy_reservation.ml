@@ -138,7 +138,7 @@ let has_active_sell state =
 (** Seconds a dispatched sell with no venue confirmation is kept as committed base.
     Applies only to a never-acked, never-seen (lost) dispatch; an acked order is kept
     until its terminal event. *)
-let sell_commitment_in_flight_timeout_s = 120.0
+let sell_commitment_in_flight_timeout_s = sell_commitment_timeout_s
 
 (** Bumps the commitment generation, invalidating the [committed_sell_base] fold cache.
     Called on every [sell_commitments] mutation. *)

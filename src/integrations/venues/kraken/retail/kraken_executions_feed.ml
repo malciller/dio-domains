@@ -1323,7 +1323,10 @@ let handle_snapshot json on_heartbeat =
     (* Lock the adaptive order_to_symbol cap after startup snapshot ingestion. *)
     lock_order_to_symbol_cap ();
     (* Restore orders the (possibly capped) WS snapshot omitted. *)
-    !on_snapshot_hook ()
+    !on_snapshot_hook ();
+    (* The snapshot replaced open-order state for every subscribed symbol. Wake the
+       domains so restart/reconnect reconciliation does not wait for a market tick. *)
+    Concurrency.Exchange_wakeup.signal_all ()
   with
   | exn ->
     Logging.error_f
