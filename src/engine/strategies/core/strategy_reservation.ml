@@ -153,6 +153,10 @@ let has_active_sell state =
     until its terminal event. *)
 let sell_commitment_in_flight_timeout_s = sell_commitment_timeout_s
 
+(** Consecutive full snapshots a seen/acked sell may be missing before the commitment is
+    evicted. Alpaca resyncs open orders every 10s, so this tolerates a short feed gap. *)
+let unlisted_sell_scan_limit = 3
+
 (** Bumps the commitment generation, invalidating the [committed_sell_base] fold cache.
     Called on every [sell_commitments] mutation. *)
 let[@inline] touch_commitments state =
@@ -179,7 +183,9 @@ let upsert_sell_commitment ~state ~id ~price ~qty ~seen ~acked =
         c.sc_qty <- qty;
         c.sc_seen <- c.sc_seen || seen;
         c.sc_acked <- c.sc_acked || acked);
-      if seen then c.sc_listed <- true;
+      if seen then (
+        c.sc_listed <- true;
+        c.sc_unlisted_scans <- 0);
       changed
     | None ->
       Hashtbl.replace
@@ -190,6 +196,7 @@ let upsert_sell_commitment ~state ~id ~price ~qty ~seen ~acked =
         ; sc_seen = seen
         ; sc_acked = acked
         ; sc_listed = seen
+        ; sc_unlisted_scans = 0
         ; sc_armed = Unix.gettimeofday ()
         };
       true

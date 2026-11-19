@@ -21,6 +21,7 @@ let set_sell_commitments tbl entries =
         ; sc_seen = seen
         ; sc_acked = acked
         ; sc_listed = seen
+        ; sc_unlisted_scans = 0
         ; sc_armed = armed
         })
     entries
@@ -8493,6 +8494,7 @@ let test_buy_amend_clamps_from_sell_commitments () =
     ; sc_seen = true
     ; sc_acked = true
     ; sc_listed = true
+    ; sc_unlisted_scans = 0
     ; sc_armed = 0.0
     };
   ignore
@@ -8880,11 +8882,10 @@ let test_sell_commitment_lifecycle_all_venues () =
         (Dio_strategies.Strategy_api.committed_sell_base state);
       feed := [];
       ignore (sync ());
-      (* A feed absence is venue-specific: venues whose balance nets holds from their own
-         state (Hyperliquid/Alpaca) trust the feed, so a dropped order is terminal and
-         evicted; venues deriving holds from the same feed (Kraken/IBKR/Lighter) keep the
-         base committed. *)
-      let trust_feed = exchange = "hyperliquid" || exchange = "alpaca" in
+      (* A feed absence is venue-specific: only venue state that is authoritative on
+         every scan (Hyperliquid's own hold ledger) evicts a dropped order; every other
+         venue keeps the base committed until a terminal event. *)
+      let trust_feed = ecfg.Dio_strategies.Strategy_api.evict_unlisted_sells in
       check
         (float 1e-9)
         (label
@@ -8908,10 +8909,12 @@ let test_sell_commitment_lifecycle_all_venues () =
           ~feed_total:state.feed_locked_sell_base
           ~unnetted_hold:0.0
       in
+      (* Sizing still trusts a venue that nets holds from its own state; the retained
+         ledger entry only feeds the buy leg's 2*gi clamp. *)
       check
         (float 1e-9)
         (label "dropped-feed base is subtracted only on feed-derived venues")
-        (if trust_feed then 0.0 else 0.2)
+        (if ecfg.Dio_strategies.Strategy_api.hold_netted_from_venue_state then 0.0 else 0.2)
         effective;
       (* 5. A full fill releases the commitment. *)
       Dio_strategies.Strategy_api.Strategy.handle_order_filled
@@ -8928,6 +8931,68 @@ let test_sell_commitment_lifecycle_all_venues () =
         0.0
         (Dio_strategies.Strategy_api.committed_sell_base state))
     venues
+;;
+
+let test_sell_commitment_evicts_after_unlisted_scans () =
+  (* A seen/acked sell absent from one snapshot stays committed (the 2*gi clamp must not
+     vanish); after [unlisted_sell_scan_limit] consecutive full snapshots it is evicted. *)
+  let symbol = "UNLISTED_AGE/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "kraken";
+  Sell_orders.clear state.open_sell_orders;
+  Hashtbl.clear state.sell_commitments;
+  state.feed_index_valid <- false;
+  state.open_orders_scan_valid <- false;
+  state.last_buy_order_id <- None;
+  state.pending_orders <- [];
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "kraken"
+    ; symbol
+    ; qty = "0.2"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = false
+    ; sell_levels_persistence = false
+    }
+  in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "kraken" in
+  let feed = ref [ "age-oid", 100.0, 0.2, "sell", None ] in
+  let iter f = List.iter (fun (a, b, c, d, e) -> f a b c d e) !feed in
+  let sync () =
+    ignore
+      (Dio_strategies.Strategy_api.sync_open_orders
+         ~state
+         ~now:(Unix.gettimeofday ())
+         ~asset
+         ~bid_price:100.0
+         ~lot_qty:0.2
+         ~iter_open_orders:iter
+         ~get_open_orders_generation:(fun () -> -1)
+         ~drain_open_order_changes:(fun ~symbol:_ -> [], true)
+         ~ecfg)
+  in
+  sync ();
+  check bool "listed sell is committed" true (Hashtbl.mem state.sell_commitments "age-oid");
+  feed := [];
+  for _ = 1 to Dio_strategies.Strategy_api.unlisted_sell_scan_limit do
+    sync ();
+    check
+      bool
+      "retained within the unlisted-scan limit"
+      true
+      (Hashtbl.mem state.sell_commitments "age-oid")
+  done;
+  sync ();
+  check
+    bool
+    "evicted after the unlisted-scan limit"
+    false
+    (Hashtbl.mem state.sell_commitments "age-oid")
 ;;
 
 let test_terminal_sell_fill_releases_full_commitment () =
@@ -9504,6 +9569,10 @@ let () =
             "sell commitment lifecycle on every venue"
             `Quick
             test_sell_commitment_lifecycle_all_venues
+        ; test_case
+            "unlisted sell commitments age out after the scan limit"
+            `Quick
+            test_sell_commitment_evicts_after_unlisted_scans
         ; test_case
             "terminal sell fill releases the whole commitment"
             `Quick

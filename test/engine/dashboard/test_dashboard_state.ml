@@ -177,6 +177,7 @@ let test_ladder_sell_count_uses_ledger () =
     ; sc_seen = false
     ; sc_acked = false
     ; sc_listed = false
+    ; sc_unlisted_scans = 0
     ; sc_armed = 0.0
     };
   Hashtbl.replace
@@ -187,6 +188,7 @@ let test_ladder_sell_count_uses_ledger () =
     ; sc_seen = true
     ; sc_acked = true
     ; sc_listed = true
+    ; sc_unlisted_scans = 0
     ; sc_armed = 0.0
     };
   let j = Dio_dashboard.Dashboard_state.json_of_grid_strategy "kraken" symbol in

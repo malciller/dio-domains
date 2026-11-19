@@ -59,6 +59,12 @@ type exchange_config =
       [unnetted_hold] dispatch overlay is. false: holds derive from the same open-order
       feed the ledger tracks (e.g. Kraken), so the excess is the gap compensation and is
       subtracted. *)
+  ; evict_unlisted_sells : bool
+  (** true: drop a sell commitment the open-order feed no longer lists. Only venue state
+      that is authoritative on every scan (Hyperliquid's own hold ledger) qualifies.
+      false: keep it until a terminal fill/cancel event; Alpaca's cancel+replace and REST
+      resync can omit a live sell for a cycle, and dropping it removes the buy leg's 2*gi
+      clamp, letting the buy amend into the sell zone and back out. *)
   ; asset_low_requires_balance_change : bool
   (** true: clear asset_low only on balance increase *)
   ; merge_preserved_sells : bool
@@ -103,6 +109,9 @@ type sell_commitment =
   ; mutable sc_seen : bool
   ; mutable sc_acked : bool
   ; mutable sc_listed : bool
+  ; mutable sc_unlisted_scans : int
+  (** Consecutive snapshots this order was missing from. Bounds how long a seen/acked sell
+      stays committed when the feed can omit a live order. *)
   ; sc_armed : float
   }
 
@@ -517,6 +526,7 @@ let default_kraken_config =
   ; use_unnetted_sell_hold = true
   ; balance_nets_open_order_holds = true
   ; hold_netted_from_venue_state = false
+  ; evict_unlisted_sells = false
   ; asset_low_requires_balance_change = true
   ; merge_preserved_sells = true
   ; check_stale_balance = true

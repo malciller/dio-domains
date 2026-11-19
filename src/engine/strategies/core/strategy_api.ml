@@ -21,6 +21,7 @@ type exchange_config = Strategy_state.exchange_config =
   ; use_unnetted_sell_hold : bool
   ; balance_nets_open_order_holds : bool
   ; hold_netted_from_venue_state : bool
+  ; evict_unlisted_sells : bool
   ; asset_low_requires_balance_change : bool
   ; merge_preserved_sells : bool
   ; check_stale_balance : bool
@@ -49,6 +50,7 @@ type sell_commitment = Strategy_state.sell_commitment =
   ; mutable sc_seen : bool
   ; mutable sc_acked : bool
   ; mutable sc_listed : bool
+  ; mutable sc_unlisted_scans : int
   ; sc_armed : float
   }
 
@@ -102,6 +104,7 @@ let remove_sell_commitment = Strategy_reservation.remove_sell_commitment
 let remove_pending_sell_commitments = Strategy_reservation.remove_pending_sell_commitments
 let committed_sell_base = Strategy_reservation.committed_sell_base
 let effective_committed_sell_base = Strategy_reservation.effective_committed_sell_base
+let unlisted_sell_scan_limit = Strategy_reservation.unlisted_sell_scan_limit
 let order_buffer = Strategy_orders.order_buffer
 let get_order_buffer = Strategy_orders.get_order_buffer
 let create_place_order = Strategy_orders.create_place_order

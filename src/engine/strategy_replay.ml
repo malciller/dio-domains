@@ -331,6 +331,7 @@ let seed_collections
              ; sc_seen = seen
              ; sc_acked = acked
              ; sc_listed = listed
+             ; sc_unlisted_scans = 0
              ; sc_armed = armed
              }
          | _ -> ())

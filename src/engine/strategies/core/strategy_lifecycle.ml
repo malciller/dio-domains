@@ -771,7 +771,6 @@ let purge_terminal_feed_buys ~state =
     the corresponding index (O(index), but only on an extreme leaving - not per changed
     id). [changes] is [(id, snapshot option)] in chronological order ([None] = removed). *)
 let apply_open_order_delta ~state ~now_time ~ecfg ~changes =
-  let trust_feed = ecfg.hold_netted_from_venue_state in
   let evicted_empty = Hashtbl.length state.evicted_orders = 0 in
   let sells_dirty = ref false in
   (* Set whenever a sell is retracted or added; resolved once after the whole delta by
@@ -876,7 +875,9 @@ let apply_open_order_delta ~state ~now_time ~ecfg ~changes =
       else (
         match Hashtbl.find_opt state.sell_commitments oid with
         | Some c when c.sc_seen || c.sc_acked ->
-          if trust_feed
+          (* A delta removal is not authoritative where the feed can omit a live sell for a
+             cycle (Alpaca cancel+replace); keep it so the 2*gi clamp never vanishes. *)
+          if ecfg.evict_unlisted_sells
           then (
             Hashtbl.remove state.sell_commitments oid;
             touch_commitments state)
@@ -985,6 +986,10 @@ let sync_open_orders
      lands, so an empty scan is not authoritative yet. *)
   let venue_ready = generation >= 0 in
   let can_skip = (not generation_changed) && not has_changes in
+  (* A full snapshot was consulted this cycle (not a skip, not a delta-only pass). *)
+  let full_scanned =
+    (not can_skip) && not (state.feed_index_valid && not changes_overflow)
+  in
   if can_skip
   then (
     Sell_orders.blit ~src:state.cached_feed_sell_orders ~dst:state.open_sell_orders;
@@ -1177,17 +1182,14 @@ let sync_open_orders
        within the dispatch window (a lost placement). Local-only commitments are merged
        back into [open_sell_orders] so the buy leg's wash-trade and 2*gi clamps still see
        them. [s.ss_locked_in_sells] is then the ledger total. *)
-  let trust_feed = ecfg.hold_netted_from_venue_state in
   (* A cache-hit cycle whose ledger is fully feed-listed has nothing to reconcile:
      [open_sell_orders] was just blitted from the cache (the feed's sells) and every
      commitment is listed, so no local-only entry is missing and none is stale. Skip the
-     O(commitments) walk entirely. Otherwise one walk both pushes unlisted local-only
+     O(commitments) walk entirely. Otherwise one walk pushes unlisted local-only
      commitments back into [open_sell_orders] (so the buy leg's wash-trade / 2*gi clamps
-     still see them) and drops the commitments the feed no longer lists (trust_feed venue)
-     or that aged out of the dispatch window, then records whether any unlisted commitment
-     remains. This is the union of the previous "needs rebuild" and no-op paths: the old
-     guard scan short- circuited on the first unlisted commitment, so both paths together
-     already visited exactly these cases. *)
+     still see them) and drops commitments that aged out of the dispatch window. A
+     seen/acked sell is never dropped here: a missing snapshot is not a terminal event,
+     and Alpaca can omit a live sell for a cycle. *)
   if state.sell_commitments_clean
   then ()
   else (
@@ -1203,12 +1205,19 @@ let sync_open_orders
         else (
           any_unlisted := true;
           if c.sc_seen || c.sc_acked
-          then
-            if trust_feed
+          then (
+            if ecfg.evict_unlisted_sells
             then to_remove := id :: !to_remove
-            else Sell_orders.push state.open_sell_orders id c.sc_price c.sc_qty
+            else (
+              if full_scanned then c.sc_unlisted_scans <- c.sc_unlisted_scans + 1;
+              if c.sc_unlisted_scans > unlisted_sell_scan_limit
+              then to_remove := id :: !to_remove
+              else if not (Sell_orders.exists_id state.open_sell_orders id)
+              then Sell_orders.push state.open_sell_orders id c.sc_price c.sc_qty))
           else if now_time -. c.sc_armed <= sell_commitment_in_flight_timeout_s
-          then Sell_orders.push state.open_sell_orders id c.sc_price c.sc_qty
+          then (
+            if not (Sell_orders.exists_id state.open_sell_orders id)
+            then Sell_orders.push state.open_sell_orders id c.sc_price c.sc_qty)
           else to_remove := id :: !to_remove))
       state.sell_commitments;
     List.iter (Hashtbl.remove state.sell_commitments) !to_remove;
