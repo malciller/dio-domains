@@ -210,6 +210,32 @@ type buy_plan =
   ; bp_inflight : bool
   }
 
+(** Closest tracked sell price: the feed/pending sells plus the commitment ledger. The
+    ledger survives a feed gap (and an Alpaca cancel+replace window), so the 2*gi clamp
+    cannot vanish while a sell is still committed. *)
+let closest_sell_price ~(state : strategy_state) ~closest_sell_order_initial =
+  let best =
+    match closest_sell_order_initial with
+    | Some (_, p) when p > 0.0 -> ref (Some p)
+    | _ -> ref None
+  in
+  let consider p =
+    if p > 0.0
+    then (
+      match !best with
+      | None -> best := Some p
+      | Some b when p < b -> best := Some p
+      | Some _ -> ())
+  in
+  List.iter
+    (fun (_, side, price, _) -> if side = Sell then consider price)
+    state.pending_orders;
+  Hashtbl.iter
+    (fun _ (c : sell_commitment) -> if c.sc_qty > 0.0 then consider c.sc_price)
+    state.sell_commitments;
+  !best
+;;
+
 (** Computes the fresh-buy price (grid rung clamped to the bid and to the closest or
     prospective sell's 2*gi zone) and the branch facts. *)
 let buy_place_plan
@@ -235,8 +261,8 @@ let buy_place_plan
     sell_price -. (sell_price *. (2.0 *. grid_interval /. 100.0))
   in
   let buy_price =
-    match closest_sell_order_initial with
-    | Some (_, sell_price) -> min buy_price (floor_for_sell sell_price)
+    match closest_sell_price ~state ~closest_sell_order_initial with
+    | Some sell_price -> min buy_price (floor_for_sell sell_price)
     | None -> buy_price
   in
   let buy_price =
@@ -500,18 +526,9 @@ let buy_place_initial
     !attempted)
 ;;
 
-(** True when a resting or pending sell is tracked (the 2*gi clamp applies). *)
+(** True when a resting, pending or committed sell is tracked (the 2*gi clamp applies). *)
 let buy_amend_has_sell ~state ~closest_sell_order_initial =
-  let closest = ref closest_sell_order_initial in
-  let update oid price =
-    match !closest with
-    | None -> closest := Some (oid, price)
-    | Some (_, best_p) -> if price < best_p then closest := Some (oid, price)
-  in
-  List.iter
-    (fun (oid, side, price, _) -> if side = Sell then update oid price)
-    state.pending_orders;
-  !closest <> None
+  Option.is_some (closest_sell_price ~state ~closest_sell_order_initial)
 ;;
 
 (** Branch: a sell is tracked - trail the buy, or amend it down to clear the sell's 2*gi
@@ -528,18 +545,9 @@ let buy_amend_with_sell
   ~closest_sell_order_initial
   =
   let grid_interval = asset.grid_interval in
-  let closest_sell_ref = ref closest_sell_order_initial in
-  let update_closest_pending oid price =
-    match !closest_sell_ref with
-    | None -> closest_sell_ref := Some (oid, price)
-    | Some (_, best_p) -> if price < best_p then closest_sell_ref := Some (oid, price)
-  in
-  List.iter
-    (fun (oid, side, price, _) -> if side = Sell then update_closest_pending oid price)
-    state.pending_orders;
-  let closest_sell_order_val = !closest_sell_ref in
+  let closest_sell_order_val = closest_sell_price ~state ~closest_sell_order_initial in
   (match closest_sell_order_val, state.last_buy_order_price, state.last_buy_order_id with
-   | Some (_sell_order_id, sell_price), Some current_buy_price, Some buy_order_id ->
+   | Some sell_price, Some current_buy_price, Some buy_order_id ->
      (* The 2*gi separation from the closest sell is anchored on the sell order and is
         price-independent: while a sell is tracked by order management, the buy never
         trails above sell - 2*gi, no matter where the perceived top of book sits. Price

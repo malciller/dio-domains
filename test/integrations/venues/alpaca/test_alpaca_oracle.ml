@@ -120,6 +120,14 @@ let test_venue_contract () =
     (min_notional ~symbol:"QQQ")
 ;;
 
+let test_next_day_iso () =
+  let open Alpaca.Alpaca_oracle in
+  Alcotest.(check string) "day" "2026-11-20" (next_day_iso "2026-11-19");
+  Alcotest.(check string) "month" "2026-12-01" (next_day_iso "2026-11-30");
+  Alcotest.(check string) "year" "2027-01-01" (next_day_iso "2026-12-31");
+  Alcotest.(check string) "unparseable kept" "nope" (next_day_iso "nope")
+;;
+
 let () =
   Alcotest.run
     "alpaca_oracle"
@@ -131,6 +139,7 @@ let () =
             "intraday folds into daily sessions"
             `Quick
             test_aggregate_daily
+        ; Alcotest.test_case "next-day end bound" `Quick test_next_day_iso
         ] )
     ; ( "venue contract"
       , [ Alcotest.test_case "default_quote / min_notional" `Quick test_venue_contract ] )

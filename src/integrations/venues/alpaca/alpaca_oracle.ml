@@ -51,6 +51,34 @@ let today_iso () =
     tm.Unix.tm_mday
 ;;
 
+(** Exclusive end bound one day past [date], so the day itself is included. The bars [end]
+    is a timestamp: [today T00:00:00Z] drops the current session, which is the only bar a
+    fresh listing has after the feed stops. *)
+let next_day_iso date =
+  try
+    Scanf.sscanf date "%d-%d-%d" (fun y m d ->
+      let tm =
+        { Unix.tm_sec = 0
+        ; tm_min = 0
+        ; tm_hour = 12
+        ; tm_mday = d
+        ; tm_mon = m - 1
+        ; tm_year = y - 1900
+        ; tm_wday = 0
+        ; tm_yday = 0
+        ; tm_isdst = false
+        }
+      in
+      let next = Unix.localtime (fst (Unix.mktime tm) +. 86_400.0) in
+      Printf.sprintf
+        "%04d-%02d-%02d"
+        (next.Unix.tm_year + 1900)
+        (next.Unix.tm_mon + 1)
+        next.Unix.tm_mday)
+  with
+  | _ -> date
+;;
+
 let iso_date_of_timestamp t = if String.length t >= 10 then String.sub t 0 10 else t
 
 let number_of_json = function
@@ -231,6 +259,7 @@ let fetch_bars ?(feed = "iex") ?end_date ~from ~symbol () : Exchange.Types.bar l
   load_dotenv ();
   let start_date = Option.value from ~default:"2010-01-01" in
   let end_date = Option.value end_date ~default:(today_iso ()) in
+  let end_exclusive = next_day_iso end_date in
   let intraday_start =
     let recent = iso_of_days_ago 60 in
     if String.compare start_date recent > 0 then start_date else recent
@@ -239,12 +268,17 @@ let fetch_bars ?(feed = "iex") ?end_date ~from ~symbol () : Exchange.Types.bar l
      thin feed has neither daily bars nor an intraday print for the symbol, so the caller
      tries the consolidated feed next. *)
   let history_on feed =
-    fetch_range ~timeframe:"1Day" ~start_date ~end_date ~symbol ~feed
+    fetch_range ~timeframe:"1Day" ~start_date ~end_date:end_exclusive ~symbol ~feed
     >>= fun daily ->
     if daily <> []
     then Lwt.return daily
     else
-      fetch_range ~timeframe:"1Hour" ~start_date:intraday_start ~end_date ~symbol ~feed
+      fetch_range
+        ~timeframe:"1Hour"
+        ~start_date:intraday_start
+        ~end_date:end_exclusive
+        ~symbol
+        ~feed
       >|= fun intraday ->
       let sessions = aggregate_daily intraday in
       Logging.info_f

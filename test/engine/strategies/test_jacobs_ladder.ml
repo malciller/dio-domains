@@ -8469,6 +8469,78 @@ let test_buy_trail_respects_sell_zone_while_tracked () =
     (run_case ~symbol:"TRAIL_ZONE_NONE/USD" ~sell_opt:None)
 ;;
 
+let test_buy_amend_clamps_from_sell_commitments () =
+  (* Alpaca's feed can miss a resting sell for a cycle. The commitment ledger still holds
+     it, so the 2*gi clamp must apply with no feed closest; otherwise the buy trails into
+     the sell zone and the next cycle amends it back down. *)
+  let symbol = "TRAIL_LEDGER_CLAMP/USD" in
+  let buy_id = symbol ^ "_buy" in
+  let st = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  st.exchange_id <- "alpaca";
+  st.grid_qty <- 1.0;
+  st.cached_round_price <- (fun p -> Float.round (p *. 100.0) /. 100.0);
+  st.last_buy_order_id <- Some buy_id;
+  st.last_buy_order_price <- Some 96.0;
+  st.pending_orders <- [];
+  st.inflight_amend_buy <- false;
+  Sell_orders.clear st.open_sell_orders;
+  Hashtbl.clear st.sell_commitments;
+  Hashtbl.replace
+    st.sell_commitments
+    "sell-1"
+    { Dio_strategies.Strategy_api.sc_price = 100.0
+    ; sc_qty = 1.0
+    ; sc_seen = true
+    ; sc_acked = true
+    ; sc_listed = true
+    ; sc_armed = 0.0
+    };
+  ignore
+    (Dio_strategies.Strategy_common.InFlightAmendments.remove_in_flight_amendment buy_id);
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "alpaca"
+    ; symbol
+    ; qty = "1.0"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "jacobs_ladder"
+    ; maker_fee = Some 0.0
+    ; taker_fee = Some 0.0
+    ; accumulation_buffer = 0.01
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
+    }
+  in
+  let iter_open_orders _ = () in
+  let now = Unix.gettimeofday () in
+  ignore (Dio_strategies.Strategy_api.get_pending_orders 100);
+  ignore
+    (Dio_strategies.Strategy_decision.evaluate_buy_leg
+       ~oracle_halted:false
+       ~state:st
+       ~now
+       ~asset
+       ~bid_price:100.0
+       ~ask_price:100.5
+       ~quote_balance:1000.0
+       ~quote_balance_stale:false
+       ~cycle:1
+       ~iter_open_orders
+       ~open_buy_count_from_scan:1
+       ~has_recent_amend_buy:false
+       ~locked_in_buys:0.0
+       ~closest_sell_order_initial:None);
+  let pushed = Dio_strategies.Strategy_api.get_pending_orders 10 in
+  match pushed with
+  | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
+    check
+      (option (float 0.))
+      "ledger sell holds the buy at its 2*gi floor"
+      (Some 98.0)
+      o.price
+  | _ -> failwith "expected exactly one buy amend"
+;;
+
 let test_buy_trail_never_enters_sell_zone_until_removed () =
   (* Ladder-respecting property: while a sell is tracked, the buy trails up toward it but
      stops exactly 2*gi below (sell - 2*gi) and never crosses that boundary, even when the
@@ -9079,6 +9151,10 @@ let () =
             "no 2x gi clamp when the sell is at/below the top of book"
             `Quick
             test_buy_trail_respects_sell_zone_while_tracked
+        ; test_case
+            "clamp applies from the sell commitment when the feed misses it"
+            `Quick
+            test_buy_amend_clamps_from_sell_commitments
         ; test_case
             "buy never enters the sell zone until the sell is removed"
             `Quick
