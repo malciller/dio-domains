@@ -5591,12 +5591,10 @@ let asset_domain_worker
          signal. No polling sleep. *)
       if not should_execute
       then (
-        (* Arm the next transition that has a known time: a pending intent waiting out the
-           coalesce window, a reclaim retry, the quiet-market backstop, or a strategy
-           timer (cooldown, TIF recovery, ghost marker, unconfirmed sell). The timer
-           domain turns the earliest into an ordinary signal, so the park needs no
-           deadline and no periodic pass. Deadlines already in the past are skipped: the
-           pass that would consume them is gated off, so arming them would spin. *)
+        (* Arm the next timed transition (intent coalescing, reclaim retry, quiet
+           backstop, strategy timer). The timer domain turns the earliest into a signal.
+           Past deadlines are skipped: the pass that would consume them is gated off, so
+           arming them would spin. *)
         let park_now = Unix.gettimeofday () in
         let at = ref nan in
         let take v =

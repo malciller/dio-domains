@@ -22,11 +22,9 @@ let[@inline] get_orders_generation () = Atomic.get orders_generation
 
 (** Open-orders change notification.
 
-    The vendored Lwt runs a resolved callback inline on the resolving thread, so a
-    producer must never touch Lwt state: Alpaca publishes from a parse domain (and from
-    under the store mutex), where an inline waiter would re-enter the mutex and raise
-    [EDEADLK]. Producers only ring a domain-safe pipe; a single pump fiber on the Lwt
-    domain drains it and broadcasts the condition with no lock held. *)
+    This Lwt resolves callbacks inline, so a producer must not touch it: Alpaca publishes
+    from a parse domain under the store mutex, and an inline waiter there raises
+    [EDEADLK]. Producers ring a pipe; one Lwt pump broadcasts with no lock held. *)
 let orders_doorbell = Concurrency.Domain_doorbell.create ()
 
 let orders_changed : unit Lwt_condition.t = Lwt_condition.create ()

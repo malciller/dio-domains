@@ -149,10 +149,9 @@ let signal_all () =
     all_syncs
 ;;
 
-(* Time-based state becomes a per-symbol deadline that arrives as an ordinary signal. The
-   trading loop never polls and the park needs no timeout; one background domain sleeps
-   until the earliest armed deadline. Deadlines are Unix seconds because every strategy
-   timestamp (cooldowns, TIF recovery, sell commitments) is Unix seconds. *)
+(* Time-based state becomes a per-symbol deadline that arrives as a signal: the park needs
+   no timeout and the loop never polls. One background domain sleeps to the earliest.
+   Deadlines are Unix seconds, like every strategy timestamp they come from. *)
 
 let deadline_started = Atomic.make false
 let deadline_mutex = Mutex.create ()
