@@ -95,6 +95,7 @@ let known_platform_caps =
   ; "reserve_share"
   ; "parent_unfunded"
   ; "parent_order_qty"
+  ; "parent_config_qty"
   ; "carry_close_price"
   ; "carry_close_qty"
   ; "carry_close_kind"

@@ -102,6 +102,11 @@ let parent_unfunded = platform "parent_unfunded"
 
 let parent_order_qty = platform "parent_order_qty"
 
+(** The owner grid's configured [strategy.qty] in base units, fixed at spawn. The paused
+    fallback sizes from this rather than the oracle's current buy, so a local pause
+    (capital_low / max_exposure) does not inherit an up-sized oracle order. *)
+let parent_config_qty = platform "parent_config_qty"
+
 (* Carry overlay actual-fill facts. Published from the durable carry state, never derived
    from the trigger mark. *)
 let carry_close_price = platform "carry_close_price"

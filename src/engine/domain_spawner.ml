@@ -1035,6 +1035,11 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
         in
         let ctx = Dio_strategies.Strategy_cycle_engine.create () in
         ctx.cg_symbol <- oi.oi_symbol;
+        (* Fixed at spawn: the owner grid's configured size, which the paused fallback
+           stands in with. The runtime asset's qty is oracle-derived and up-sizes. *)
+        ctx.cg_parent_config_qty
+        <- (try Float.max 0.0 (float_of_string owner.qty) with
+            | Failure _ -> 0.0);
         (* The venue's raw tradeable figure sweeps every quoting symbol's open orders on
            each read. Resolve the generation-cached reader once per instance: the reserve
            share and [market.facts] both need it on every tick. *)

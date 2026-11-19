@@ -41,6 +41,8 @@ type ctx =
   ; mutable cg_parent_oracle_active : bool
   (** Parent's next buy size in base units, inherited verbatim by the outlier fallback. *)
   ; mutable cg_parent_order_qty : float
+  (** The parent's configured [strategy.qty] in base units, fixed at spawn. *)
+  ; mutable cg_parent_config_qty : float
   (** True when the controller has a Hyperliquid spot leg, so the recycle base buy is
       active. When false the recycle stays 100% quote. *)
   ; mutable cg_overlay_has_spot_leg : bool
@@ -170,6 +172,7 @@ let create () =
   ; cg_parent_unfunded = false
   ; cg_parent_oracle_active = true
   ; cg_parent_order_qty = 0.0
+  ; cg_parent_config_qty = 0.0
   ; cg_overlay_has_spot_leg = false
   ; cg_overlay_spot_symbol = ""
   ; cg_last_leverage = 0.0
@@ -900,6 +903,7 @@ let market_facts_io (io : Strategy_runtime.facts_io) c =
   setf Slots.reserve_share c.cg_reserve_share;
   setb Slots.parent_unfunded c.cg_parent_unfunded;
   setf Slots.parent_order_qty c.cg_parent_order_qty;
+  setf Slots.parent_config_qty c.cg_parent_config_qty;
   mark 3;
   (match c.cg_carry with
    | Some cs ->
