@@ -489,6 +489,9 @@ type strategy_state =
   ; mutable exchange_reserved_atomic : float Atomic.t option
   ; processed_fills : (string, unit) Hashtbl.t
   ; processed_fills_queue : string Queue.t
+  ; mutable applied_fill_ids : string list
+  (** Newest-first booked fill ids, persisted. [last_fill_oid] cannot order UUID ids, so a
+      restart would otherwise re-apply a replayed exec ring. *)
   ; tracked_order_ids : (string, unit) Hashtbl.t
       (* Bounded set of venue order ids this strategy has ever tracked (acked, adopted, or
          filled), FIFO-evicted at 1024. Distinguishes a late WS cancel for a
@@ -645,6 +648,21 @@ let rec get_strategy_state asset_symbol =
       | Some a -> a.Dio_persistence.Base_accumulation_store.buy_lots
       | None -> []
     in
+    let persisted_applied_fill_ids =
+      match persisted_accumulation with
+      | Some a -> a.Dio_persistence.Base_accumulation_store.applied_fill_ids
+      | None -> []
+    in
+    (* Seeds the in-memory guard; without it the replay would re-book. *)
+    let processed_fills = Hashtbl.create 1024 in
+    let processed_fills_queue = Queue.create () in
+    List.iter
+      (fun id ->
+        if not (Hashtbl.mem processed_fills id)
+        then (
+          Queue.push id processed_fills_queue;
+          Hashtbl.replace processed_fills id ()))
+      persisted_applied_fill_ids;
     let persisted_sell_levels =
       if sell_levels_on
       then (
@@ -807,8 +825,9 @@ let rec get_strategy_state asset_symbol =
       ; cached_venue_min_qty = 1.0
       ; cached_venue_min_notional = 0.0
       ; exchange_reserved_atomic = None
-      ; processed_fills = Hashtbl.create 1024
-      ; processed_fills_queue = Queue.create ()
+      ; processed_fills
+      ; processed_fills_queue
+      ; applied_fill_ids = persisted_applied_fill_ids
       ; tracked_order_ids = Hashtbl.create 256
       ; tracked_order_ids_queue = Queue.create ()
       ; sync_scratch =

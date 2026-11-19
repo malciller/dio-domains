@@ -455,6 +455,44 @@ let venue_gross_base ~(hold_netted : bool) ~(asset : trading_config) ~spendable 
     | None -> None)
 ;;
 
+(** Trims persisted lots to the base the venue holds. Runs once, on the first balance
+    adoption, when [position_base] is venue truth and [buy_lots] came from disk.
+
+    Gross-holding venues only: Alpaca reports the whole position, so the lots and the skim
+    reserve account for all of it. A hold-netted figure can be adopted as 0 before the
+    venue's first snapshot, and trimming against that would erase real cost basis. *)
+let reconcile_lots_to_inventory ~(asset : trading_config) ~state =
+  if Exchange.Types.exchange_of_string asset.exchange = Alpaca
+  then (
+    (* [position_base] is gross, so it already includes base resting in sells. Credits are
+       fills the venue has not adopted yet; staked base offsets the reserve. *)
+    let reserved_tradeable =
+      Float.max 0.0 (state.reserved_base -. Float.max 0.0 state.staked_base)
+    in
+    let sellable =
+      Float.max 0.0 (state.position_base +. buy_credit_total state -. reserved_tradeable)
+    in
+    let lots, dropped =
+      Dio_persistence.Base_accumulation_store.reconcile_lots
+        ~sellable_base:sellable
+        state.buy_lots
+    in
+    if dropped > 1e-12
+    then (
+      let before = List.length state.buy_lots in
+      state.buy_lots <- lots;
+      state.persistence_dirty <- true;
+      Logging.warn_f
+        ~section
+        "Reconciled buy lots for %s: dropped %.8f base (%d -> %d lots) against \
+         venue-held %.8f"
+        asset.symbol
+        dropped
+        before
+        (List.length lots)
+        sellable))
+;;
+
 (** Evaluates asset balance recovery and clears asset_low when available balance is
     restored. *)
 let evaluate_asset_low_recovery
@@ -475,7 +513,12 @@ let evaluate_asset_low_recovery
         ~asset
         ~spendable:asset_balance
     in
+    let first_adoption = not state.position_initialized in
     reconcile_position ~state ~now ~base_balance_age ~asset_balance ~asset_gross;
+    (* Load-time lot repair: the queue is trusted only until the venue's own holding can
+       be compared against it. *)
+    if first_adoption && state.base_accumulation_enabled
+    then reconcile_lots_to_inventory ~asset ~state;
     let unreflected = unreflected_buy_credit ~state ~base_balance_age ~now in
     let asset_bal = state.position_base +. unreflected in
     let qty_f = lot_qty in

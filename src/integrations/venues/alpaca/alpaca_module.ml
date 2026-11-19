@@ -320,10 +320,6 @@ module Alpaca_impl = struct
            ; amend_id = Some "skipped_no_change"
            ; cl_ord_id = existing.cl_ord_id
            })
-    | Some { status = Types.Pending; _ } ->
-      (* Cancelling an order the venue is still routing parks it in [pending_cancel].
-         Defer without a REST call; the order's own status update retries. *)
-      Lwt.return (Error "order not yet confirmed by the venue")
     | found when is_fractional ->
       (match found, qty, limit_price with
        | Some existing, Some q, Some lp ->

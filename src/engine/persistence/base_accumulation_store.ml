@@ -9,6 +9,7 @@
    - accumulated_profit: realized local PnL in quote
    - carry_credit_seq: newest carry recycle already credited (restart dedup)
    - buy_lots: unspent buy fills, newest first, consumed one per credited sell
+   - applied_fill_ids: fills already booked, newest first (restart replay dedup)
    - last_fill_oid / last_buy_fill_* / last_sell_fill_*: most recent fill refs
 
    Crash window: an async save may lose the most recent coalesced write, so
@@ -35,6 +36,9 @@ type t =
   (** Unspent buy fills, newest first as [(price, qty)], consumed one per credited sell.
       Sharing one last-buy anchor across a run of buys credits the ladder step once per
       sell too many. *)
+  ; applied_fill_ids : string list
+  (** Newest-first ids of booked fills, bounded. [last_fill_oid] alone cannot dedup a
+      replayed exec ring on non-monotonic ids (Alpaca UUIDs). *)
   }
 
 type key = string
@@ -52,6 +56,7 @@ let default =
   ; last_sell_fill_price = None
   ; last_sell_fill_qty = None
   ; buy_lots = []
+  ; applied_fill_ids = []
   }
 ;;
 
@@ -112,6 +117,23 @@ let has_field json field =
 
 let lots_json lots = `List (List.map (fun (p, q) -> `List [ `Float p; `Float q ]) lots)
 
+(** Reads a JSON array of non-empty strings. Malformed entries are dropped. *)
+let get_strings json field =
+  let open Yojson.Basic.Util in
+  try
+    json
+    |> member field
+    |> to_list
+    |> List.filter_map (fun v ->
+      try
+        let s = to_string v in
+        if String.equal s "" then None else Some s
+      with
+      | _ -> None)
+  with
+  | _ -> []
+;;
+
 let of_json json =
   let f name default =
     match get_float_opt json name with
@@ -138,6 +160,7 @@ let of_json json =
          with
          | Some p, Some q when p > 0.0 && q > 0.0 -> [ p, q ]
          | _ -> []))
+  ; applied_fill_ids = get_strings json "applied_fill_ids"
   }
 ;;
 
@@ -147,6 +170,7 @@ let to_json t =
      ; "accumulated_profit", `Float t.accumulated_profit
      ; "carry_credit_seq", `Int t.carry_credit_seq
      ; "buy_lots", lots_json t.buy_lots
+     ; "applied_fill_ids", `List (List.map (fun id -> `String id) t.applied_fill_ids)
      ]
      @ (match t.last_fill_oid with
         | Some oid -> [ "last_fill_oid", `String oid ]
@@ -180,17 +204,37 @@ let rec keep_lots n = function
   | lot :: rest -> lot :: keep_lots (n - 1) rest
 ;;
 
+(** Booked fill ids retained for replay dedup. Sized to cover a venue exec ring's replay
+    window; larger than the lot cap because every fill kind is remembered, not just buys. *)
+let max_applied_fill_ids = 256
+
+(** Prepends [oid] to a persisted fill-id list: bounded, deduplicated, empty ids ignored. *)
+let record_fill_id_list ids oid =
+  if String.equal oid "" || List.mem oid ids
+  then ids
+  else keep_lots max_applied_fill_ids (oid :: ids)
+;;
+
+(** Marks [oid] as booked: idempotent and bounded. *)
+let record_fill_id t oid =
+  let applied_fill_ids = record_fill_id_list t.applied_fill_ids oid in
+  if applied_fill_ids == t.applied_fill_ids then t else { t with applied_fill_ids }
+;;
+
+let has_applied_fill t oid =
+  (not (String.equal oid "")) && List.mem oid t.applied_fill_ids
+;;
+
 (** Buy fill: records an unspent lot for the next sell's profitability check and updates
-    the last-buy reference, which prices the follow-up sell. [oid] is accepted per the
-    store contract; OID sequencing is owned by the execution layer. *)
+    the last-buy reference. [oid] is booked for the restart replay guard. *)
 let apply_buy_fill t ~price ~qty ~oid =
-  let _ = oid in
   let buy_lots =
     if Float.is_finite price && Float.is_finite qty && price > 0.0 && qty > 0.0
     then keep_lots max_buy_lots ((price, qty) :: t.buy_lots)
     else t.buy_lots
   in
   { t with last_buy_fill_price = Some price; last_buy_fill_qty = Some qty; buy_lots }
+  |> fun t -> record_fill_id t oid
 ;;
 
 (** Consumes unspent lots newest-first down to [qty]. Returns the matched spread, the qty
@@ -238,6 +282,63 @@ let apply_sell_fill t ~price ~qty ~oid ~fees () =
     accumulated_profit = t.accumulated_profit +. net_profit
   ; buy_lots = lots_after_sell
   }
+  |> fun t -> record_fill_id t oid
+;;
+
+(** Reconciles recorded lots with the base the venue holds. A replay (or a lost update)
+    can leave more base in [buy_lots] than the account has; that surplus would fund
+    impossible sells and misprice later credits. Only a surplus is corrected:
+    byte-identical replay copies first, then the oldest tail. A genuine repeated fill at
+    one rung is indistinguishable from a copy, so dedupe is gated on the account showing
+    less base than recorded - never applied blanket. Never pads.
+
+    Returns the surviving lots and the quantity dropped. *)
+let reconcile_lots ~sellable_base lots =
+  let sum = List.fold_left (fun acc (_, q) -> acc +. q) 0.0 in
+  let original_total = sum lots in
+  let tolerance = Float.max 1e-9 (Float.abs sellable_base *. 1e-6) in
+  if (not (Float.is_finite sellable_base))
+     || sellable_base < 0.0
+     || original_total <= sellable_base +. tolerance
+  then lots, 0.0
+  else (
+    (* Pass 1: drop duplicate copies of a fill already kept, newest first, until the
+       recorded total fits. *)
+    let seen = Hashtbl.create (List.length lots) in
+    let remaining = ref original_total in
+    let deduped =
+      List.filter
+        (fun (p, q) ->
+          if !remaining <= sellable_base
+          then true
+          else (
+            let key = Int64.bits_of_float p, Int64.bits_of_float q in
+            if Hashtbl.mem seen key
+            then (
+              remaining := !remaining -. q;
+              false)
+            else (
+              Hashtbl.add seen key ();
+              true)))
+        lots
+    in
+    if !remaining <= sellable_base +. tolerance
+    then deduped, original_total -. !remaining
+    else (
+      (* Pass 2: still over (the surplus was not an exact replay copy). Keep newest-first
+         and clip the boundary lot so the queue sums to the venue figure. *)
+      let rec take budget acc = function
+        | [] -> List.rev acc
+        | _ :: _ when budget <= 0.0 -> List.rev acc
+        | (p, q) :: rest ->
+          let kept = Float.min q budget in
+          (* A rounding residual must not survive as a dust lot. *)
+          if kept <= 1e-9 *. q
+          then List.rev acc
+          else take (budget -. kept) ((p, kept) :: acc) rest
+      in
+      let kept = take sellable_base [] deduped in
+      kept, original_total -. sum kept))
 ;;
 
 (* -- Persistence ------------------------------------------------------ *)

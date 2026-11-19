@@ -120,6 +120,54 @@ let test_partial_sell_keeps_lot () =
   | lots -> Alcotest.failf "expected one residual lot, got %d" (List.length lots)
 ;;
 
+let test_applied_fill_ids_round_trip () =
+  (* The booked-id list is what survives a restart; the single [last_fill_oid] cannot
+     order UUID ids, so every fill id has to be remembered. It is newest-first, unique,
+     and bounded. *)
+  let t = A.apply_buy_fill A.default ~price:1.0 ~qty:1.0 ~oid:"uuid-buy" in
+  let t = A.apply_sell_fill t ~price:2.0 ~qty:1.0 ~oid:"uuid-sell" ~fees:0.0 () in
+  let loaded = A.of_json (A.to_json t) in
+  Alcotest.(check int) "both fills remembered" 2 (List.length loaded.A.applied_fill_ids);
+  Alcotest.(check bool)
+    "newest first"
+    true
+    (match loaded.A.applied_fill_ids with
+     | "uuid-sell" :: "uuid-buy" :: _ -> true
+     | _ -> false);
+  Alcotest.(check bool) "buy id recognised" true (A.has_applied_fill loaded "uuid-buy");
+  let many =
+    List.init 400 (fun i -> string_of_int i)
+    |> List.fold_left (fun t oid -> A.apply_buy_fill t ~price:1.0 ~qty:1.0 ~oid) A.default
+  in
+  Alcotest.(check int) "id list stays bounded" 256 (List.length many.A.applied_fill_ids)
+;;
+
+let test_reconcile_lots () =
+  (* Under the venue holding: untouched, so a genuine repeated fill at a rung survives. *)
+  let under = [ 10.0, 1.0; 10.0, 1.0 ] in
+  let kept, dropped = A.reconcile_lots ~sellable_base:2.5 under in
+  Alcotest.(check int) "under target keeps lots" 2 (List.length kept);
+  Alcotest.(check (float 0.)) "under target drops nothing" 0.0 dropped;
+  (* Over: replay copies are dropped first, then the oldest tail is trimmed. *)
+  let over = [ 10.0, 1.0; 10.0, 1.0; 9.0, 1.0 ] in
+  let kept, dropped = A.reconcile_lots ~sellable_base:2.0 over in
+  Alcotest.(check int) "duplicate replay copy dropped" 2 (List.length kept);
+  Alcotest.(check (float 0.)) "dropped the duplicate qty" 1.0 dropped;
+  Alcotest.(check bool)
+    "newest kept first"
+    true
+    (match kept with
+     | (p, _) :: _ -> p = 10.0
+     | _ -> false);
+  (* Distinct excess clips the oldest boundary lot. *)
+  let kept, dropped =
+    A.reconcile_lots ~sellable_base:1.5 [ 10.0, 1.0; 9.0, 1.0; 8.0, 1.0 ]
+  in
+  Alcotest.(check int) "clipped to two lots" 2 (List.length kept);
+  Alcotest.(check (float 1e-12)) "boundary lot clipped" 0.5 (snd (List.nth kept 1));
+  Alcotest.(check (float 1e-12)) "dropped the excess" 1.5 dropped
+;;
+
 let test_lots_survive_serialization () =
   (* A pre-queue entry resumes with its last buy fill as the only open lot; an entry that
      carries an explicit (even empty) queue is taken at its word, so a spent anchor is
@@ -194,6 +242,7 @@ let test_accumulation_round_trip () =
       ; last_sell_fill_price = None
       ; last_sell_fill_qty = None
       ; buy_lots = [ 100.0, 0.5; 99.0, 0.25 ]
+      ; applied_fill_ids = []
       }
     in
     A.save ~key t;
@@ -428,6 +477,8 @@ let () =
           , test_apply_sell_fill_fees_reduce_profit )
         ; "ladder lots one cycle per buy", `Quick, test_ladder_queue_one_cycle_per_buy
         ; "partial sell keeps the lot", `Quick, test_partial_sell_keeps_lot
+        ; "applied fill ids round trip", `Quick, test_applied_fill_ids_round_trip
+        ; "reconcile lots", `Quick, test_reconcile_lots
         ; "lots survive serialization", `Quick, test_lots_survive_serialization
         ; "credit_profit persists and adds", `Quick, test_credit_profit_persists_and_adds
         ] )

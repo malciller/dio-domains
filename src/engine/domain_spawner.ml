@@ -2075,6 +2075,15 @@ let asset_domain_worker
            st.accumulated_profit
            <- a.Dio_persistence.Base_accumulation_store.accumulated_profit;
            st.buy_lots <- a.Dio_persistence.Base_accumulation_store.buy_lots;
+           st.applied_fill_ids
+           <- a.Dio_persistence.Base_accumulation_store.applied_fill_ids;
+           List.iter
+             (fun id ->
+               if not (Hashtbl.mem st.processed_fills id)
+               then (
+                 Queue.push id st.processed_fills_queue;
+                 Hashtbl.replace st.processed_fills id ()))
+             st.applied_fill_ids;
            let default_maker, default_taker =
              Dio_oracle.Oracle_fees.default_or_configured_fees
                ~exchange:c.oc_hedge_exchange

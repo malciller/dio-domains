@@ -145,6 +145,7 @@ let expire_amend_cooldowns = Strategy_lifecycle.expire_amend_cooldowns
 let next_deadline = Strategy_state.next_deadline
 let evict_ghost_orders = Strategy_lifecycle.evict_ghost_orders
 let reconcile_position = Strategy_lifecycle.reconcile_position
+let reconcile_lots_to_inventory = Strategy_lifecycle.reconcile_lots_to_inventory
 let arm_buy_credit = Strategy_lifecycle.arm_buy_credit
 let consume_buy_credits = Strategy_lifecycle.consume_buy_credits
 let buy_credit_total = Strategy_lifecycle.buy_credit_total
@@ -355,6 +356,7 @@ module Strategy = struct
             ; last_sell_fill_price = state.last_sell_fill_price
             ; last_sell_fill_qty = state.last_sell_fill_qty
             ; buy_lots = state.buy_lots
+            ; applied_fill_ids = state.applied_fill_ids
             };
         Logging.info_f
           ~section

@@ -2510,6 +2510,109 @@ let test_position_startup_replay_records_no_credit () =
     (state.buy_credits_since_balance = [])
 ;;
 
+let test_position_replayed_uuid_fill_not_rebooked () =
+  (* Alpaca order ids are UUIDs, so the numeric high-water cannot order them. The
+     persisted applied-id list is what stops the exec ring from re-booking a fill the
+     previous process already counted after a restart. *)
+  let symbol = "REPLAYUUID/ANT" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "alpaca";
+  state.base_accumulation_enabled <- true;
+  state.startup_replay <- true;
+  state.last_fill_oid <- Some "11111111-1111-1111-1111-111111111111";
+  state.buy_lots <- [ 95.0, 0.02 ];
+  state.applied_fill_ids <- [ "22222222-2222-2222-2222-222222222222" ];
+  (* The state loader seeds the in-memory guard from the persisted ids. *)
+  Hashtbl.replace state.processed_fills "22222222-2222-2222-2222-222222222222" ();
+  Queue.push "22222222-2222-2222-2222-222222222222" state.processed_fills_queue;
+  Dio_strategies.Strategy_api.Strategy.handle_order_filled
+    ~now:100.0
+    symbol
+    "22222222-2222-2222-2222-222222222222"
+    Dio_strategies.Strategy_common.Buy
+    ~fill_price:95.0
+    ~fill_qty:0.02
+    None;
+  check int "replayed booked fill adds no lot" 1 (List.length state.buy_lots);
+  check (float 0.) "existing lot qty untouched" 0.02 (snd (List.hd state.buy_lots))
+;;
+
+let test_first_adoption_reconciles_replayed_lots () =
+  (* A restart replays the unsold tail of the exec ring. Once the venue's holding is
+     adopted, the surplus is dropped: only the base the account actually holds may remain
+     in the queue. *)
+  let symbol = "RECONCILE_LOTS/ANT" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "alpaca";
+  state.base_accumulation_enabled <- true;
+  state.reserved_base <- 0.0;
+  state.position_initialized <- false;
+  state.position_base <- 0.08;
+  state.buy_lots
+  <- [ 100.5, 0.02
+     ; 98.95, 0.02
+     ; 98.54, 0.02
+     ; 98.23, 0.02
+     ; 100.5, 0.02
+     ; 98.95, 0.02
+     ; 98.54, 0.02
+     ; 98.23, 0.02
+     ; 100.5, 0.02
+     ; 98.95, 0.02
+     ; 98.54, 0.02
+     ; 98.23, 0.02
+     ];
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "alpaca"
+    ; symbol
+    ; qty = "2(min)"
+    ; grid_interval = 1.0
+    ; sell_mult = "0.99"
+    ; strategy = "Ladder"
+    ; maker_fee = None
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
+    }
+  in
+  Dio_strategies.Strategy_api.reconcile_lots_to_inventory ~asset ~state;
+  let total = List.fold_left (fun acc (_, q) -> acc +. q) 0.0 state.buy_lots in
+  check int "replay copies collapse to the held base" 4 (List.length state.buy_lots);
+  check (float 1e-9) "queue sums to the venue holding" 0.08 total
+;;
+
+let test_reconcile_lots_skips_hold_netted_venues () =
+  (* A hold-netted venue can be adopted as 0 before its first snapshot. Trimming against
+     that would erase cost basis that is still held. *)
+  let symbol = "RECONCILE_KRAKEN/XMR" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "kraken";
+  state.cached_ecfg <- Dio_strategies.Strategy_api.get_exchange_config "kraken";
+  state.base_accumulation_enabled <- true;
+  state.reserved_base <- 0.0;
+  state.position_base <- 0.0;
+  state.buy_lots <- [ 600.0, 0.02 ];
+  let asset =
+    { Dio_strategies.Strategy_api.exchange = "kraken"
+    ; symbol
+    ; qty = "min"
+    ; grid_interval = 1.0
+    ; sell_mult = "1.0"
+    ; strategy = "Ladder"
+    ; maker_fee = None
+    ; taker_fee = None
+    ; accumulation_buffer = 0.0
+    ; base_accumulation = true
+    ; sell_levels_persistence = true
+    }
+  in
+  Dio_strategies.Strategy_api.reconcile_lots_to_inventory ~asset ~state;
+  check int "hold-netted venue leaves lots untouched" 1 (List.length state.buy_lots)
+;;
+
 let test_position_gross_venue_sell_fill_decrements () =
   (* Gross-balance venues (Alpaca) report the full holding, so the ledger falls by the
      sold qty at fill, clamped at zero. *)
@@ -9269,6 +9372,18 @@ let () =
             "startup replay records no pending credit"
             `Quick
             test_position_startup_replay_records_no_credit
+        ; test_case
+            "replayed UUID fill is not re-booked"
+            `Quick
+            test_position_replayed_uuid_fill_not_rebooked
+        ; test_case
+            "first adoption reconciles replayed lots"
+            `Quick
+            test_first_adoption_reconciles_replayed_lots
+        ; test_case
+            "lot reconcile skips hold-netted venues"
+            `Quick
+            test_reconcile_lots_skips_hold_netted_venues
         ; test_case
             "gross venue sell fill decrements the ledger"
             `Quick

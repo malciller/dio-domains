@@ -106,6 +106,7 @@ let flush_persistence asset_symbol =
           , state.last_buy_fill_qty
           , state.last_sell_fill_qty
           , state.buy_lots
+          , state.applied_fill_ids
           , state.persisted_sell_levels ))
       else None
     in
@@ -120,6 +121,7 @@ let flush_persistence asset_symbol =
         , last_buy_fill_qty
         , last_sell_fill_qty
         , buy_lots
+        , applied_fill_ids
         , persisted_sell_levels ) ->
       let key =
         match state.persistence_key with
@@ -146,6 +148,7 @@ let flush_persistence asset_symbol =
           ; last_sell_fill_price
           ; last_sell_fill_qty
           ; buy_lots
+          ; applied_fill_ids
           };
       if state.sell_levels_enabled
       then
@@ -516,6 +519,11 @@ let add_processed_fill state order_id =
   then (
     Queue.push order_id state.processed_fills_queue;
     Hashtbl.replace state.processed_fills order_id ();
+    (* Persisted so the replay guard survives a restart. *)
+    state.applied_fill_ids
+    <- Dio_persistence.Base_accumulation_store.record_fill_id_list
+         state.applied_fill_ids
+         order_id;
     if Hashtbl.length state.processed_fills > 2000
     then (
       try
@@ -667,6 +675,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
           ; last_sell_fill_price = state.last_sell_fill_price
           ; last_sell_fill_qty = state.last_sell_fill_qty
           ; buy_lots = state.buy_lots
+          ; applied_fill_ids = state.applied_fill_ids
           }
           ~price:fill_price
           ~qty:net_qty
@@ -677,6 +686,8 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
       state.last_buy_fill_qty
       <- updated.Dio_persistence.Base_accumulation_store.last_buy_fill_qty;
       state.buy_lots <- updated.Dio_persistence.Base_accumulation_store.buy_lots;
+      state.applied_fill_ids
+      <- updated.Dio_persistence.Base_accumulation_store.applied_fill_ids;
       (* Profit-gated lot skim for 1:1 venues (Hyperliquid, Kraken, Alpaca, ...). The
          order cannot withhold the [(1 - sell_mult)] slice (below one lot), so split the
          buy fill's own base: once quote profit covers a lot plus the buffer, move that
@@ -928,6 +939,7 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
          ; last_sell_fill_price = state.last_sell_fill_price
          ; last_sell_fill_qty = state.last_sell_fill_qty
          ; buy_lots = state.buy_lots
+         ; applied_fill_ids = state.applied_fill_ids
          }
        in
        let qty = acc_qty in
@@ -969,6 +981,8 @@ let handle_order_filled ~now asset_symbol order_id side ~fill_price ~fill_qty cl
        <- updated.Dio_persistence.Base_accumulation_store.last_sell_fill_qty;
        (* Spent lots are gone: the next sell needs a buy that actually filled. *)
        state.buy_lots <- updated.Dio_persistence.Base_accumulation_store.buy_lots;
+       state.applied_fill_ids
+       <- updated.Dio_persistence.Base_accumulation_store.applied_fill_ids;
        let credited = state.accumulated_profit -. profit_before in
        Logging.info_f
          ~section
@@ -1463,12 +1477,7 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
       || contains_fragment lower_reason "qty available"
       || contains_fragment lower_reason "held_for_orders"
     in
-    (* The venue had not confirmed the order yet; its own status update is the retry
-       trigger, so a backoff would only delay the amend past that event. *)
-    let is_venue_deferral =
-      contains_fragment lower_reason "not yet confirmed by the venue"
-    in
-    if not (is_held_qty || is_venue_deferral)
+    if not is_held_qty
     then (
       (* 429 is account-wide: another amend on the same order would only deepen it, so the
          backoff outlasts the bucket refill instead of retrying on the next tick. *)
