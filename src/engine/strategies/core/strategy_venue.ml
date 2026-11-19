@@ -281,6 +281,35 @@ let get_min_notional_val symbol exchange =
   | None -> 0.0
 ;;
 
+(** True when a configured [qty] names the venue's minimum placeable size (["min"],
+    case-insensitive) instead of a base quantity. *)
+let qty_is_min (qty : string) =
+  String.equal (String.lowercase_ascii (String.trim qty)) "min"
+;;
+
+(** Minimum placeable base quantity from resolved venue metadata: the base-quantity floor
+    or the quote-notional floor at [price], whichever is larger. Venues round size DOWN to
+    the lot, so the notional leg is ceiled (Hyperliquid SOL: 0.0925 -> 0.09). Pure, so the
+    hot path passes cached metadata. *)
+let min_order_base ~qty_min ~qty_increment ~min_notional ~price =
+  if (not (price > 0.0)) || not (Float.is_finite price)
+  then qty_min
+  else if min_notional > 0.0 && qty_increment > 0.0
+  then Float.max qty_min (ceil_to_inv (min_notional /. price) (1.0 /. qty_increment))
+  else qty_min
+;;
+
+(** Minimum placeable base quantity for [symbol] on [exchange] at [price], resolved from
+    the live venue modules. Price-dependent, so it is resolved at spawn and on each oracle
+    publish, never per market tick. *)
+let venue_min_qty ~exchange ~symbol ~price =
+  min_order_base
+    ~qty_min:(get_qty_min_val symbol exchange)
+    ~qty_increment:(get_qty_increment_val symbol exchange)
+    ~min_notional:(get_min_notional_val symbol exchange)
+    ~price
+;;
+
 (** Venue tradeable figure for [symbol]'s quote currency, or [nan]. Diagnostic: the grid
     uses the domain figure (already net of overlay reservations); the raw figure lets
     capital-low logs show the overlay claim. *)
@@ -313,6 +342,23 @@ let venue_lot_qty grid_qty exchange state =
   | _ -> grid_qty
 ;;
 
+(** Base quantity for a new order resting at [price]: the grid's configured size, floored
+    up to the venue's minimum when [strategy.qty] is ["min"]. Evaluated at the order's own
+    price, so a move between oracle passes cannot place a size the venue rejects. *)
+let order_qty ~price ~exchange state =
+  let qty = venue_lot_qty state.grid_qty exchange state in
+  if state.qty_min_mode
+  then
+    Float.max
+      qty
+      (min_order_base
+         ~qty_min:state.cached_venue_min_qty
+         ~qty_increment:state.cached_qty_increment
+         ~min_notional:state.cached_venue_min_notional
+         ~price)
+  else qty
+;;
+
 (** Venues whose order feed does not echo the strategy userref. On these, a resting
     order's identity must come from its venue-side flags (market, side, reduce-only). *)
 let drops_userref ~exchange =
@@ -331,6 +377,15 @@ let parse_config_float config value_name default exchange symbol =
       symbol
       default;
     default
+;;
+
+(** Resolve a configured [qty] string to base units. ["min"] asks for the venue's minimum
+    placeable size at [price]; anything else is the configured number. An unparsable value
+    resolves to 0.0, which withholds buying rather than trading a guessed size. *)
+let resolve_config_qty (qty : string) ~exchange ~symbol ~price =
+  if qty_is_min qty
+  then venue_min_qty ~exchange ~symbol ~price
+  else parse_config_float qty "qty" 0.0 exchange symbol
 ;;
 
 let get_min_move_threshold price_increment =

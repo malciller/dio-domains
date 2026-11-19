@@ -1213,24 +1213,62 @@ let run_account_pass
          (decisions ()))
   | Some acs ->
     let acct_id = account_id account in
-    (* Open-order summaries and config bounds are invariant across the pass, so resolve
-       them once here instead of 2-3x in the sizing loop. The pool is derived from them
-       rather than before them: its resting-buy quote discounts holds the balance frame
-       has not netted yet. *)
+    (* Open-order summaries are invariant across the pass, so resolve them once here
+       instead of 2-3x in the sizing loop. The pool is derived from them rather than
+       before them: its resting-buy quote discounts holds the balance frame has not netted
+       yet. Config bounds are too, except ["min"], which needs the live anchor. *)
     let task_rows =
-      List.map
+      List.filter_map
         (fun (t : Oracle_tasks.task) ->
           let summary = open_orders_summary ~exchange:t.exchange ~symbol:t.symbol in
           let knobs = effective_knobs ~config ~symbol:t.symbol in
-          let qty_raw = float_of_string_opt t.config.qty |> Option.value ~default:0.0 in
-          let bounds =
-            { Oracle_core.qty = Float.max 1e-12 qty_raw
-            ; qty_cap_mult = Float.max 1.0 knobs.k_qty_cap_mult
-            ; gi_min = fst t.config.grid_interval
-            ; gi_max = snd t.config.grid_interval
-            }
+          (* ["min"] is price-dependent: resolve it against the rung the first buy rests
+             at, not at config load. The grid consumes the concrete number published. *)
+          let min_sentinel = Dio_strategies.Strategy_venue.qty_is_min t.config.qty in
+          let qty_raw =
+            if min_sentinel
+            then (
+              let fallback =
+                match Hashtbl.find_opt history_cache (t.exchange, t.symbol) with
+                | Some series ->
+                  Option.value
+                    (Oracle_pipeline.current_price_of_series series)
+                    ~default:0.0
+                | None -> 0.0
+              in
+              let anchor =
+                live_buy_anchor ~exchange:t.exchange ~symbol:t.symbol ~fallback
+              in
+              let rung =
+                anchor *. (1.0 -. (Float.max 0.0 (fst t.config.grid_interval) /. 100.0))
+              in
+              Dio_strategies.Strategy_venue.venue_min_qty
+                ~exchange:t.exchange
+                ~symbol:t.symbol
+                ~price:rung)
+            else float_of_string_opt t.config.qty |> Option.value ~default:0.0
           in
-          t, summary, knobs, bounds)
+          (* Instrument metadata can lag the first passes. A dust bound would trade a size
+             the venue rejects, so skip this asset and keep its last-known-good decision,
+             as an unavailable history does. *)
+          if min_sentinel && qty_raw <= 0.0
+          then (
+            Logging.debug_f
+              ~section
+              "%s/%s: venue minimum unavailable (instrument metadata missing); no \
+               decision published this pass"
+              t.exchange
+              t.symbol;
+            None)
+          else (
+            let bounds =
+              { Oracle_core.qty = Float.max 1e-12 qty_raw
+              ; qty_cap_mult = Float.max 1.0 knobs.k_qty_cap_mult
+              ; gi_min = fst t.config.grid_interval
+              ; gi_max = snd t.config.grid_interval
+              }
+            in
+            Some (t, summary, knobs, bounds)))
         tasks
     in
     let committed_venue_buys =

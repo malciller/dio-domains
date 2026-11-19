@@ -525,6 +525,56 @@ let test_resolve_fee_rate () =
     (resolve_fee_rate ~configured:(Some Float.nan) ~cached:(Some 0.003) ~current:0.004)
 ;;
 
+let test_qty_min_sentinel () =
+  let open Dio_strategies.Strategy_venue in
+  Alcotest.(check bool) "plain sentinel" true (qty_is_min "min");
+  Alcotest.(check bool) "trimmed and cased" true (qty_is_min "  MIN ");
+  Alcotest.(check bool) "a number is not a sentinel" false (qty_is_min "0.1");
+  Alcotest.(check bool) "a longer word is not a sentinel" false (qty_is_min "minimum");
+  Alcotest.(check (float 1e-12))
+    "numeric config resolves verbatim"
+    0.25
+    (resolve_config_qty "0.25" ~exchange:"kraken" ~symbol:"X/USD" ~price:100.0)
+;;
+
+let test_min_order_base () =
+  (* The venue floor is the larger of the base-quantity minimum and the notional minimum
+     converted at the price, ceiled to the lot: venues round size DOWN. *)
+  let open Dio_strategies.Strategy_venue in
+  let q ?(qty_min = 0.0) ?(qty_increment = 0.01) ?(min_notional = 10.0) price =
+    min_order_base ~qty_min ~qty_increment ~min_notional ~price
+  in
+  Alcotest.(check (float 1e-12)) "notional floor at 100" 0.1 (q 100.0);
+  Alcotest.(check (float 1e-12)) "notional floor ceils to the lot" 0.1 (q 104.5);
+  Alcotest.(check (float 1e-12)) "an exact lot is not bumped" 0.1 (q 100.0);
+  Alcotest.(check (float 1e-12)) "base floor dominates" 0.2 (q ~qty_min:0.2 100.0);
+  Alcotest.(check (float 1e-12))
+    "no notional floor leaves the base floor"
+    0.05
+    (q ~qty_min:0.05 ~min_notional:0.0 100.0);
+  Alcotest.(check (float 1e-12))
+    "no usable price leaves the base floor"
+    0.05
+    (q ~qty_min:0.05 0.0)
+;;
+
+let test_order_qty_floors_at_the_resting_price () =
+  let open Dio_strategies in
+  let state = Strategy_api.get_strategy_state "QTYMIN/USD" in
+  state.grid_qty <- 0.05;
+  state.cached_venue_min_qty <- 0.0;
+  state.cached_qty_increment <- 0.01;
+  state.cached_venue_min_notional <- 10.0;
+  state.qty_min_mode <- true;
+  let qty price = Strategy_venue.order_qty ~price ~exchange:"kraken" state in
+  Alcotest.(check (float 1e-12)) "floor at 100" 0.1 (qty 100.0);
+  Alcotest.(check (float 1e-12)) "a drop refloors without an oracle pass" 0.13 (qty 80.0);
+  state.grid_qty <- 0.5;
+  Alcotest.(check (float 1e-12)) "a larger grid size wins" 0.5 (qty 80.0);
+  state.qty_min_mode <- false;
+  Alcotest.(check (float 1e-12)) "a numeric qty is untouched" 0.5 (qty 80.0)
+;;
+
 let () =
   Alcotest.run
     "Strategy Common"
@@ -595,6 +645,14 @@ let () =
         ; Alcotest.test_case "empty read" `Quick test_queue_empty_read
         ; Alcotest.test_case "batch read" `Quick test_queue_batch_read
         ; Alcotest.test_case "batch read empty" `Quick test_queue_batch_read_empty
+        ] )
+    ; ( "venue minimums"
+      , [ Alcotest.test_case "qty sentinel" `Quick test_qty_min_sentinel
+        ; Alcotest.test_case "minimum order base" `Quick test_min_order_base
+        ; Alcotest.test_case
+            "order qty floors at the resting price"
+            `Quick
+            test_order_qty_floors_at_the_resting_price
         ] )
     ]
 ;;

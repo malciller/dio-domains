@@ -100,6 +100,11 @@ balance-only inventory legs:
   that venue; `defaults.overlay.<name>` merges into the matching overlay.
   Objects merge key by key; a list or scalar replaces the default.
   `defaults.oracle` sets the global oracle knobs.
+- `strategy.qty` is the grid's base order size. Set it to `"min"` to trade the
+  venue's minimum placeable size: the base-quantity floor or the quote-notional
+  floor at the order's own price, ceiled to the lot, re-checked when each order is
+  built. Overlays size against their own venue's minimum instead of inheriting the
+  owner's.
 - In the grouped layout the strategy file name is `strategy.name`. The legacy
   flat `trading` array is still accepted; there the file name is `strategy`.
 - `overlay` takes a list of instances. Engine behaviour comes from the strategy

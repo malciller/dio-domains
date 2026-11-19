@@ -80,6 +80,8 @@
         "strategy": {
           "exchange": "hyperliquid",
           "symbol": "BTC/USDC",
+          // Base order size. "min" trades the venue's minimum placeable size,
+          // resolved per venue and price (base floor vs $ notional, ceiled to lot).
           "qty": "0.0001",
           "grid_interval": [0.1, 0.5],
           "cpu_priority": 10

@@ -1036,10 +1036,15 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
         let ctx = Dio_strategies.Strategy_cycle_engine.create () in
         ctx.cg_symbol <- oi.oi_symbol;
         (* Fixed at spawn: the owner grid's configured size, which the paused fallback
-           stands in with. The runtime asset's qty is oracle-derived and up-sizes. *)
+           stands in with. The runtime asset's qty is oracle-derived and up-sizes. ["min"]
+           carries no base size: the overlay sizes its own venue's minimum. *)
+        ctx.cg_parent_config_is_min <- Dio_strategies.Strategy_venue.qty_is_min owner.qty;
         ctx.cg_parent_config_qty
-        <- (try Float.max 0.0 (float_of_string owner.qty) with
-            | Failure _ -> 0.0);
+        <- (if ctx.cg_parent_config_is_min
+            then 0.0
+            else (
+              try Float.max 0.0 (float_of_string owner.qty) with
+              | Failure _ -> 0.0));
         (* The venue's raw tradeable figure sweeps every quoting symbol's open orders on
            each read. Resolve the generation-cached reader once per instance: the reserve
            share and [market.facts] both need it on every tick. *)
@@ -1623,8 +1628,23 @@ let asset_domain_worker
         match oracle_decision_at_startup with
         | Some d when d.active && d.buy_qty > 0.0 -> d.buy_qty
         | _ ->
-          (try float_of_string asset_with_fees.qty with
-           | Failure _ -> 0.001)
+          (* ["min"] is price-dependent. Use the live touch when the book is already
+             loaded, otherwise the base floor: this is a placeholder for fill-handler math
+             until the first oracle decision publishes the real size. *)
+          let price =
+            match Ex.get_top_of_book ~symbol:asset_with_fees.symbol with
+            | Some (bid, _, _, _) when bid > 0.0 -> bid
+            | Some (_, _, ask, _) when ask > 0.0 -> ask
+            | _ -> nan
+          in
+          let q =
+            Dio_strategies.Strategy_api.resolve_config_qty
+              asset_with_fees.qty
+              ~exchange:asset_with_fees.exchange
+              ~symbol:asset_with_fees.symbol
+              ~price
+          in
+          if q > 0.0 then q else 0.001
       in
       st.grid_qty <- initial_qty;
       st.cached_sell_mult
@@ -1646,6 +1666,7 @@ let asset_domain_worker
       <- Dio_strategies.Strategy_api.get_min_notional_val
            asset_with_fees.symbol
            asset_with_fees.exchange;
+      st.qty_min_mode <- Dio_strategies.Strategy_venue.qty_is_min asset_with_fees.qty;
       st.persistence_dirty <- false;
       st.persistence_key
       <- Some
@@ -4027,7 +4048,16 @@ let asset_domain_worker
          let qty_str =
            if d.buy_qty > 0.0
            then Printf.sprintf "%.8g" d.buy_qty
-           else asset_with_fees.qty
+           else
+             (* ["min"] must never be materialized as a string: the grid needs a number.
+                Resolve it at the current touch (base floor when no price is known yet). *)
+             Printf.sprintf
+               "%.8g"
+               (Dio_strategies.Strategy_api.resolve_config_qty
+                  asset_with_fees.qty
+                  ~exchange:asset_with_fees.exchange
+                  ~symbol:asset_with_fees.symbol
+                  ~price:!current_price)
          in
          let st = Dio_strategies.Strategy_api.get_strategy_state asset_with_fees.symbol in
          grid_strategy_asset_ref

@@ -93,6 +93,13 @@ let spot_base_total = platform "spot_base_total"
 let usdc_free = platform "usdc_free"
 let overlay_reserved = platform "overlay_reserved"
 let min_notional = platform "min_notional"
+
+(** Minimum placeable base quantity on THIS venue at the current ask: the venue's
+    base-quantity floor, or its quote-notional floor ceiled to the lot, whichever is
+    larger. Overlays size against the venue they execute on, so a cross-venue hedge does
+    not inherit the owner grid's size. *)
+let min_order_base = platform "min_order_base"
+
 let reserve_share = platform "reserve_share"
 
 (** Parent grid state for the short overlay's unfunded fallback. [parent_unfunded] is the
@@ -106,6 +113,11 @@ let parent_order_qty = platform "parent_order_qty"
     fallback sizes from this rather than the oracle's current buy, so a local pause
     (capital_low / max_exposure) does not inherit an up-sized oracle order. *)
 let parent_config_qty = platform "parent_config_qty"
+
+(** True when the owner grid's configured [strategy.qty] is the ["min"] sentinel: there is
+    no base size to inherit, so a cross-venue overlay fallback sizes at its own venue's
+    minimum ([min_order_base]) instead. *)
+let parent_config_is_min = platform "parent_config_is_min"
 
 (* Carry overlay actual-fill facts. Published from the durable carry state, never derived
    from the trigger mark. *)

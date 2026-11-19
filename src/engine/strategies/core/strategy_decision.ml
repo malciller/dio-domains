@@ -224,9 +224,7 @@ let buy_place_plan
   ~locked_in_buys
   ~closest_sell_order_initial
   =
-  let qty = venue_lot_qty state.grid_qty asset.exchange state in
   let grid_interval = asset.grid_interval in
-  let quote_needed = ask_price *. qty in
   let _bp_price = Strategy_state.sub_start state in
   let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
   let raw_buy_price = calculate_grid_price ref_price grid_interval false state in
@@ -257,6 +255,8 @@ let buy_place_plan
     else buy_price
   in
   Strategy_state.sub_stop state Strategy_state.Bplan_price _bp_price;
+  let qty = order_qty ~price:buy_price ~exchange:asset.exchange state in
+  let quote_needed = ask_price *. qty in
   let is_buy_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Buy" in
   let _bp_sells = Strategy_state.sub_start state in
   let has_crossing_sell =
@@ -527,9 +527,7 @@ let buy_amend_with_sell
   ~locked_in_buys
   ~closest_sell_order_initial
   =
-  let qty = venue_lot_qty state.grid_qty asset.exchange state in
   let grid_interval = asset.grid_interval in
-  let quote_needed = ask_price *. qty in
   let closest_sell_ref = ref closest_sell_order_initial in
   let update_closest_pending oid price =
     match !closest_sell_ref with
@@ -602,6 +600,10 @@ let buy_amend_with_sell
        in
        if allow
        then (
+         let qty =
+           order_qty ~price:effective_amend_price ~exchange:asset.exchange state
+         in
+         let quote_needed = ask_price *. qty in
          let quote_bal = quote_balance in
          (* An amend replaces the resting buy (cancel+create on Alpaca): the capital
             committed to that buy is released and re-committed at the new price, so the
@@ -659,9 +661,7 @@ let buy_amend_no_sell
   ~locked_in_buys
   ~closest_sell_order_initial:_
   =
-  let qty = venue_lot_qty state.grid_qty asset.exchange state in
   let grid_interval = asset.grid_interval in
-  let quote_needed = ask_price *. qty in
   (match state.last_buy_order_price, state.last_buy_order_id with
    | Some current_buy_price, Some buy_order_id ->
      let ref_price = compute_buy_ref_price ~bid_price ~ask_price in
@@ -745,6 +745,10 @@ let buy_amend_no_sell
        in
        if allow
        then (
+         let qty =
+           order_qty ~price:effective_amend_price ~exchange:asset.exchange state
+         in
+         let quote_needed = ask_price *. qty in
          let quote_bal = quote_balance in
          (* See the with-sell branch: an amend releases the committed capital of the
             resting buy it replaces, so that committed notional is added back to the
@@ -1961,6 +1965,7 @@ let execute_strategy
           Option.value (Ex.get_qty_min ~symbol:asset.symbol) ~default:1.0
         | None -> 1.0);
     state.cached_venue_min_notional <- get_min_notional_val asset.symbol asset.exchange;
+    state.qty_min_mode <- qty_is_min asset.qty;
     state.exchange_reserved_atomic <- Some (get_exchange_reserved_atomic asset.exchange));
   if state.cached_venue_min_notional <= 0.0
   then state.cached_venue_min_notional <- get_min_notional_val asset.symbol asset.exchange;

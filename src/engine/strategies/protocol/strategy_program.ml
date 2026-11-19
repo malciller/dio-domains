@@ -150,6 +150,7 @@ let event_kind = function
 
 let platform_kind = function
   | "parent_unfunded"
+  | "parent_config_is_min"
   | "perp_valid"
   | "funding_valid"
   | "buy_capital_low"

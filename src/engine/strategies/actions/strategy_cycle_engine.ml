@@ -43,6 +43,9 @@ type ctx =
   ; mutable cg_parent_order_qty : float
   (** The parent's configured [strategy.qty] in base units, fixed at spawn. *)
   ; mutable cg_parent_config_qty : float
+  (** The parent's configured [strategy.qty] is the ["min"] sentinel: no base size to
+      inherit, so an overlay fallback sizes at its own venue's minimum. *)
+  ; mutable cg_parent_config_is_min : bool
   (** True when the controller has a Hyperliquid spot leg, so the recycle base buy is
       active. When false the recycle stays 100% quote. *)
   ; mutable cg_overlay_has_spot_leg : bool
@@ -130,6 +133,13 @@ type ctx =
   (** Venue minimum notional per instrument. It is static metadata, but the accessor is a
       registry lookup returning a first-class module, and [market_facts] needs it on every
       event. *)
+  ; mutable cg_qty_min : float
+  ; mutable cg_qty_min_for : string
+  ; mutable cg_qty_increment : float
+  ; mutable cg_qty_increment_for : string
+  (** Instrument lot floor and lot step, cached for the same reason as [cg_min_notional]:
+      [min_order_base] is published every ticket and must not pay a registry lookup to
+      convert the notional floor into base units. *)
   ; mutable cg_risk : Dio_exchange.Exchange_intf.Market_context.risk option
   ; mutable cg_risk_for : string
   (** Per-coin risk metadata (maintenance fraction, max leverage). Venue metadata, not
@@ -160,6 +170,10 @@ let create () =
   ; cg_key_coin_for = ""
   ; cg_min_notional = nan
   ; cg_min_notional_for = ""
+  ; cg_qty_min = nan
+  ; cg_qty_min_for = ""
+  ; cg_qty_increment = nan
+  ; cg_qty_increment_for = ""
   ; cg_risk = None
   ; cg_risk_for = ""
   ; cg_tob = Array.make 4 0.0
@@ -173,6 +187,7 @@ let create () =
   ; cg_parent_oracle_active = true
   ; cg_parent_order_qty = 0.0
   ; cg_parent_config_qty = 0.0
+  ; cg_parent_config_is_min = false
   ; cg_overlay_has_spot_leg = false
   ; cg_overlay_spot_symbol = ""
   ; cg_last_leverage = 0.0
@@ -334,6 +349,7 @@ let prepare_init c =
           | None -> 1.0);
       state.cached_venue_min_notional
       <- Jac.get_min_notional_val asset.symbol asset.exchange;
+      state.qty_min_mode <- Jac.qty_is_min asset.qty;
       state.exchange_reserved_atomic
       <- Some (Jac.get_exchange_reserved_atomic asset.exchange));
     if state.cached_venue_min_notional <= 0.0
@@ -893,20 +909,40 @@ let market_facts_io (io : Strategy_runtime.facts_io) c =
      setf Slots.perp_maintenance_frac 0.0;
      setf Slots.perp_max_leverage 0.0);
   setf Slots.overlay_reserved reserved;
-  setf
-    Slots.min_notional
-    (if String.equal c.cg_min_notional_for symbol && Float.is_finite c.cg_min_notional
-     then c.cg_min_notional
-     else (
-       let v = Strategy_venue.get_min_notional_val symbol exchange in
-       c.cg_min_notional <- v;
-       c.cg_min_notional_for <- symbol;
-       v));
+  let min_notional =
+    if String.equal c.cg_min_notional_for symbol && Float.is_finite c.cg_min_notional
+    then c.cg_min_notional
+    else (
+      let v = Strategy_venue.get_min_notional_val symbol exchange in
+      c.cg_min_notional <- v;
+      c.cg_min_notional_for <- symbol;
+      v)
+  in
+  setf Slots.min_notional min_notional;
+  let qty_min =
+    if String.equal c.cg_qty_min_for symbol && Float.is_finite c.cg_qty_min
+    then c.cg_qty_min
+    else (
+      let v = Strategy_venue.get_qty_min_val symbol exchange in
+      c.cg_qty_min <- v;
+      c.cg_qty_min_for <- symbol;
+      v)
+  in
+  let qty_increment =
+    if String.equal c.cg_qty_increment_for symbol && Float.is_finite c.cg_qty_increment
+    then c.cg_qty_increment
+    else (
+      let v = Strategy_venue.get_qty_increment_val symbol exchange in
+      c.cg_qty_increment <- v;
+      c.cg_qty_increment_for <- symbol;
+      v)
+  in
   mark 7;
   setf Slots.reserve_share c.cg_reserve_share;
   setb Slots.parent_unfunded c.cg_parent_unfunded;
   setf Slots.parent_order_qty c.cg_parent_order_qty;
   setf Slots.parent_config_qty c.cg_parent_config_qty;
+  setb Slots.parent_config_is_min c.cg_parent_config_is_min;
   mark 3;
   (match c.cg_carry with
    | Some cs ->
@@ -1017,25 +1053,42 @@ let market_facts_io (io : Strategy_runtime.facts_io) c =
        | _ -> 0.0
      in
      let tob = c.cg_tob in
-     if Ex.get_top_of_book_into ~symbol:base tob
-     then (
-       setf Slots.bid tob.(0);
-       setf Slots.ask tob.(2))
-     else if overlay_controller && fallback_mark > 0.0
-     then (
-       (* The perp book store is not keyed by the coin for this domain: use the perp mark.
-          It is a genuine perp quote, unlike the pair store which can be a spot book. *)
-       setf Slots.bid fallback_mark;
-       setf Slots.ask fallback_mark)
-     else if (not overlay_controller) && Ex.get_top_of_book_into ~symbol tob
-     then (
-       (* Plain grid: a perp l2Book can be filed under the pair rather than the bare coin
-          on venues that enumerate it that way. *)
-       setf Slots.bid tob.(0);
-       setf Slots.ask tob.(2))
-     else (
-       setf Slots.bid 0.0;
-       setf Slots.ask 0.0);
+     let book_ask =
+       if Ex.get_top_of_book_into ~symbol:base tob
+       then (
+         setf Slots.bid tob.(0);
+         setf Slots.ask tob.(2);
+         tob.(2))
+       else if overlay_controller && fallback_mark > 0.0
+       then (
+         (* The perp book store is not keyed by the coin for this domain: use the perp
+            mark. It is a genuine perp quote, unlike the pair store which can be a spot
+            book. *)
+         setf Slots.bid fallback_mark;
+         setf Slots.ask fallback_mark;
+         fallback_mark)
+       else if (not overlay_controller) && Ex.get_top_of_book_into ~symbol tob
+       then (
+         (* Plain grid: a perp l2Book can be filed under the pair rather than the bare
+            coin on venues that enumerate it that way. *)
+         setf Slots.bid tob.(0);
+         setf Slots.ask tob.(2);
+         tob.(2))
+       else (
+         setf Slots.bid 0.0;
+         setf Slots.ask 0.0;
+         0.0)
+     in
+     (* The overlay's own venue floor in base units, so a cross-venue hedge sizes from
+        where it executes. No book carries the base floor from metadata; consumers gate on
+        the price. *)
+     setf
+       Slots.min_order_base
+       (Strategy_venue.min_order_base
+          ~qty_min
+          ~qty_increment
+          ~min_notional
+          ~price:book_ask);
      let spot_enabled = (not overlay_controller) || c.cg_overlay_has_spot_leg in
      let spot_symbol =
        if overlay_controller && c.cg_overlay_spot_symbol <> ""
@@ -1060,6 +1113,7 @@ let market_facts_io (io : Strategy_runtime.facts_io) c =
      setf Slots.usdc_free 0.0;
      setf Slots.bid 0.0;
      setf Slots.ask 0.0;
+     setf Slots.min_order_base 0.0;
      setf Slots.spot_bid 0.0;
      setf Slots.spot_ask 0.0);
   mark 5
