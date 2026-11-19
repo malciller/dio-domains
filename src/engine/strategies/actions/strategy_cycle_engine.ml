@@ -43,9 +43,9 @@ type ctx =
   ; mutable cg_parent_order_qty : float
   (** The parent's configured [strategy.qty] in base units, fixed at spawn. *)
   ; mutable cg_parent_config_qty : float
-  (** The parent's configured [strategy.qty] is the ["min"] sentinel: no base size to
-      inherit, so an overlay fallback sizes at its own venue's minimum. *)
-  ; mutable cg_parent_config_is_min : bool
+  (** The parent's configured [strategy.qty] multiplier over the venue minimum: 0.0 when
+      the qty is numeric, else [n] from ["n(min)"]. *)
+  ; mutable cg_parent_config_min_mult : float
   (** True when the controller has a Hyperliquid spot leg, so the recycle base buy is
       active. When false the recycle stays 100% quote. *)
   ; mutable cg_overlay_has_spot_leg : bool
@@ -187,7 +187,7 @@ let create () =
   ; cg_parent_oracle_active = true
   ; cg_parent_order_qty = 0.0
   ; cg_parent_config_qty = 0.0
-  ; cg_parent_config_is_min = false
+  ; cg_parent_config_min_mult = 0.0
   ; cg_overlay_has_spot_leg = false
   ; cg_overlay_spot_symbol = ""
   ; cg_last_leverage = 0.0
@@ -349,7 +349,7 @@ let prepare_init c =
           | None -> 1.0);
       state.cached_venue_min_notional
       <- Jac.get_min_notional_val asset.symbol asset.exchange;
-      state.qty_min_mode <- Jac.qty_is_min asset.qty;
+      state.qty_min_mult <- Option.value (Jac.qty_min_multiplier asset.qty) ~default:0.0;
       state.exchange_reserved_atomic
       <- Some (Jac.get_exchange_reserved_atomic asset.exchange));
     if state.cached_venue_min_notional <= 0.0
@@ -942,7 +942,7 @@ let market_facts_io (io : Strategy_runtime.facts_io) c =
   setb Slots.parent_unfunded c.cg_parent_unfunded;
   setf Slots.parent_order_qty c.cg_parent_order_qty;
   setf Slots.parent_config_qty c.cg_parent_config_qty;
-  setb Slots.parent_config_is_min c.cg_parent_config_is_min;
+  setf Slots.parent_config_min_mult c.cg_parent_config_min_mult;
   mark 3;
   (match c.cg_carry with
    | Some cs ->

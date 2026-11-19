@@ -114,10 +114,11 @@ let parent_order_qty = platform "parent_order_qty"
     (capital_low / max_exposure) does not inherit an up-sized oracle order. *)
 let parent_config_qty = platform "parent_config_qty"
 
-(** True when the owner grid's configured [strategy.qty] is the ["min"] sentinel: there is
-    no base size to inherit, so a cross-venue overlay fallback sizes at its own venue's
-    minimum ([min_order_base]) instead. *)
-let parent_config_is_min = platform "parent_config_is_min"
+(** The owner grid's configured [strategy.qty] multiplier over the venue minimum: 0.0 when
+    the qty is numeric, else [n] from ["n(min)"]. A cross-venue overlay fallback sizes at
+    its own venue's minimum ([min_order_base]) times this multiplier instead of inheriting
+    the owner's base size. *)
+let parent_config_min_mult = platform "parent_config_min_mult"
 
 (* Carry overlay actual-fill facts. Published from the durable carry state, never derived
    from the trigger mark. *)

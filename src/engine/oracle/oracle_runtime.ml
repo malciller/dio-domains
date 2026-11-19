@@ -1222,12 +1222,13 @@ let run_account_pass
         (fun (t : Oracle_tasks.task) ->
           let summary = open_orders_summary ~exchange:t.exchange ~symbol:t.symbol in
           let knobs = effective_knobs ~config ~symbol:t.symbol in
-          (* ["min"] is price-dependent: resolve it against the rung the first buy rests
-             at, not at config load. The grid consumes the concrete number published. *)
-          let min_sentinel = Dio_strategies.Strategy_venue.qty_is_min t.config.qty in
+          (* ["n(min)"] is price-dependent: resolve it against the rung the first buy
+             rests at, not at config load. The grid consumes the concrete number
+             published. *)
+          let min_mult = Dio_strategies.Strategy_venue.qty_min_multiplier t.config.qty in
           let qty_raw =
-            if min_sentinel
-            then (
+            match min_mult with
+            | Some mult ->
               let fallback =
                 match Hashtbl.find_opt history_cache (t.exchange, t.symbol) with
                 | Some series ->
@@ -1243,15 +1244,16 @@ let run_account_pass
                 anchor *. (1.0 -. (Float.max 0.0 (fst t.config.grid_interval) /. 100.0))
               in
               Dio_strategies.Strategy_venue.venue_min_qty
+                ~mult
                 ~exchange:t.exchange
                 ~symbol:t.symbol
-                ~price:rung)
-            else float_of_string_opt t.config.qty |> Option.value ~default:0.0
+                ~price:rung
+            | None -> float_of_string_opt t.config.qty |> Option.value ~default:0.0
           in
           (* Instrument metadata can lag the first passes. A dust bound would trade a size
              the venue rejects, so skip this asset and keep its last-known-good decision,
              as an unavailable history does. *)
-          if min_sentinel && qty_raw <= 0.0
+          if Option.is_some min_mult && qty_raw <= 0.0
           then (
             Logging.debug_f
               ~section

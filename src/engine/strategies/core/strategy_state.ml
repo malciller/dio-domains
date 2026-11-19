@@ -276,9 +276,9 @@ type strategy_state =
       (* unspent buy fills, newest first; one consumed per credited sell so a run of buys
          cannot be re-anchored to its deepest fill *)
   ; mutable grid_qty : float (* cached config qty; used by fill handler for profit calc *)
-  ; mutable qty_min_mode : bool
-      (* config qty is the ["min"] sentinel: order size is floored up to the venue's
-         minimum at the price the order rests at (see [order_qty]) *)
+  ; mutable qty_min_mult : float
+      (* 0.0 = config qty is numeric; otherwise ["n(min)"] and orders are floored up to
+         [n] times the venue minimum at the price the order rests at (see [order_qty]) *)
   ; mutable cached_sell_mult : float
       (* cached parsed sell_mult; avoids float_of_string per cycle *)
   ; mutable cached_ecfg : exchange_config
@@ -711,7 +711,7 @@ let rec get_strategy_state asset_symbol =
       ; last_sell_fill_qty = persisted_last_sell_fill_qty
       ; buy_lots = persisted_buy_lots
       ; grid_qty = 0.0
-      ; qty_min_mode = false
+      ; qty_min_mult = 0.0
       ; cached_sell_mult = 1.0
       ; cached_ecfg = default_kraken_config
       ; maker_fee = 0.0

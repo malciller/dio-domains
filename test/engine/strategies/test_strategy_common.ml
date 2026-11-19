@@ -525,12 +525,19 @@ let test_resolve_fee_rate () =
     (resolve_fee_rate ~configured:(Some Float.nan) ~cached:(Some 0.003) ~current:0.004)
 ;;
 
-let test_qty_min_sentinel () =
+let test_qty_min_multiplier () =
   let open Dio_strategies.Strategy_venue in
-  Alcotest.(check bool) "plain sentinel" true (qty_is_min "min");
-  Alcotest.(check bool) "trimmed and cased" true (qty_is_min "  MIN ");
-  Alcotest.(check bool) "a number is not a sentinel" false (qty_is_min "0.1");
-  Alcotest.(check bool) "a longer word is not a sentinel" false (qty_is_min "minimum");
+  let check label expected qty =
+    Alcotest.(check (option (float 1e-12))) label expected (qty_min_multiplier qty)
+  in
+  check "plain sentinel" (Some 1.0) "min";
+  check "trimmed and cased" (Some 1.0) "  MIN ";
+  check "an integer multiplier" (Some 3.0) "3(min)";
+  check "a fractional multiplier" (Some 2.5) "2.5(MIN)";
+  check "a spaced multiplier" (Some 1.5) " 1.5 (min) ";
+  check "a number is not a sentinel" None "0.1";
+  check "a longer word is not a sentinel" None "minimum";
+  check "a sub-minimum multiplier clamps to the minimum" (Some 1.0) "0.5(min)";
   Alcotest.(check (float 1e-12))
     "numeric config resolves verbatim"
     0.25
@@ -565,13 +572,19 @@ let test_order_qty_floors_at_the_resting_price () =
   state.cached_venue_min_qty <- 0.0;
   state.cached_qty_increment <- 0.01;
   state.cached_venue_min_notional <- 10.0;
-  state.qty_min_mode <- true;
+  state.qty_min_mult <- 1.0;
   let qty price = Strategy_venue.order_qty ~price ~exchange:"kraken" state in
   Alcotest.(check (float 1e-12)) "floor at 100" 0.1 (qty 100.0);
   Alcotest.(check (float 1e-12)) "a drop refloors without an oracle pass" 0.13 (qty 80.0);
+  state.qty_min_mult <- 2.5;
+  Alcotest.(check (float 1e-12)) "a multiplier scales the floor" 0.25 (qty 100.0);
+  Alcotest.(check (float 1e-12))
+    "a scaled floor still ceils to the lot after a drop"
+    0.33
+    (qty 80.0);
   state.grid_qty <- 0.5;
   Alcotest.(check (float 1e-12)) "a larger grid size wins" 0.5 (qty 80.0);
-  state.qty_min_mode <- false;
+  state.qty_min_mult <- 0.0;
   Alcotest.(check (float 1e-12)) "a numeric qty is untouched" 0.5 (qty 80.0)
 ;;
 
@@ -647,7 +660,7 @@ let () =
         ; Alcotest.test_case "batch read empty" `Quick test_queue_batch_read_empty
         ] )
     ; ( "venue minimums"
-      , [ Alcotest.test_case "qty sentinel" `Quick test_qty_min_sentinel
+      , [ Alcotest.test_case "qty min multiplier" `Quick test_qty_min_multiplier
         ; Alcotest.test_case "minimum order base" `Quick test_min_order_base
         ; Alcotest.test_case
             "order qty floors at the resting price"

@@ -1036,11 +1036,15 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
         let ctx = Dio_strategies.Strategy_cycle_engine.create () in
         ctx.cg_symbol <- oi.oi_symbol;
         (* Fixed at spawn: the owner grid's configured size, which the paused fallback
-           stands in with. The runtime asset's qty is oracle-derived and up-sizes. ["min"]
-           carries no base size: the overlay sizes its own venue's minimum. *)
-        ctx.cg_parent_config_is_min <- Dio_strategies.Strategy_venue.qty_is_min owner.qty;
+           stands in with. The runtime asset's qty is oracle-derived and up-sizes.
+           ["n(min)"] carries no base size: the overlay sizes its own venue's minimum
+           times that multiplier. *)
+        ctx.cg_parent_config_min_mult
+        <- Option.value
+             (Dio_strategies.Strategy_venue.qty_min_multiplier owner.qty)
+             ~default:0.0;
         ctx.cg_parent_config_qty
-        <- (if ctx.cg_parent_config_is_min
+        <- (if ctx.cg_parent_config_min_mult > 0.0
             then 0.0
             else (
               try Float.max 0.0 (float_of_string owner.qty) with
@@ -1666,7 +1670,10 @@ let asset_domain_worker
       <- Dio_strategies.Strategy_api.get_min_notional_val
            asset_with_fees.symbol
            asset_with_fees.exchange;
-      st.qty_min_mode <- Dio_strategies.Strategy_venue.qty_is_min asset_with_fees.qty;
+      st.qty_min_mult
+      <- Option.value
+           (Dio_strategies.Strategy_venue.qty_min_multiplier asset_with_fees.qty)
+           ~default:0.0;
       st.persistence_dirty <- false;
       st.persistence_key
       <- Some
