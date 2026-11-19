@@ -896,4 +896,28 @@ module Oracle = struct
       |> List.sort_uniq String.compare
     ;;
   end
+
+  (** Cold-start history from the live feed.
+
+      A venue's historical bar endpoints can be empty for a symbol that is nevertheless
+      trading live (a recent IPO whose thin feed publishes quotes but no bars). With no
+      bars the oracle publishes no decision, so the domain withholds every order forever.
+      A venue registers a provider that returns its in-progress session bar, and the
+      oracle uses it as one observed session instead of withholding. *)
+  module Live_session = struct
+    let _providers : (string, string -> Types.bar option) Hashtbl.t = Hashtbl.create 4
+
+    (** Register [f] as [exchange]'s live session-bar provider (replaces any existing). *)
+    let register ~(exchange : string) f = Hashtbl.replace _providers exchange f
+
+    (** The live session bar for [symbol] on [exchange], or [None] when the venue has
+        published no price yet / registers no provider. *)
+    let bar ~(exchange : string) ~(symbol : string) =
+      match Hashtbl.find_opt _providers exchange with
+      | Some f ->
+        (try f symbol with
+         | _ -> None)
+      | None -> None
+    ;;
+  end
 end

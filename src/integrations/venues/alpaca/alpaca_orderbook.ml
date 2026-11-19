@@ -34,6 +34,56 @@ type trade =
   ; side : string
   }
 
+(** In-progress session bar, built from whatever this feed publishes (quotes and/or
+    prints). A fresh listing can have an empty bar endpoint on a thin feed while its live
+    book ticks, and a symbol with no history gets no oracle decision. Prices are observed,
+    never synthesized. *)
+type session =
+  { day : string
+  ; open_px : float
+  ; high_px : float
+  ; low_px : float
+  ; last_px : float
+  ; volume : float
+  }
+
+let local_day ts =
+  let tm = Unix.localtime (if ts > 0.0 then ts else Unix.gettimeofday ()) in
+  Printf.sprintf
+    "%04d-%02d-%02d"
+    (tm.Unix.tm_year + 1900)
+    (tm.Unix.tm_mon + 1)
+    tm.Unix.tm_mday
+;;
+
+(** Fold one observed price into the session, rolling over on a date change. *)
+let observe_session current ~(price : float) ~(volume : float) ~(at : float)
+  : session option
+  =
+  if not (price > 0.0 && Float.is_finite price)
+  then current
+  else (
+    let day = local_day at in
+    match current with
+    | Some s when String.equal s.day day ->
+      Some
+        { s with
+          high_px = Float.max s.high_px price
+        ; low_px = Float.min s.low_px price
+        ; last_px = price
+        ; volume = s.volume +. Float.max 0.0 volume
+        }
+    | _ ->
+      Some
+        { day
+        ; open_px = price
+        ; high_px = price
+        ; low_px = price
+        ; last_px = price
+        ; volume = Float.max 0.0 volume
+        })
+;;
+
 module SymbolStore = struct
   (** Single-writer atomic TOB cache: the WS writer publishes a fresh immutable record per
       push; readers do one lock-free [Atomic.get]. Position and best-bid/ask travel
@@ -56,6 +106,9 @@ module SymbolStore = struct
     ; trades_capacity : int
     ; mutable write_pos : int
     ; mutable trades_write_pos : int
+    ; mutable session : session option
+    (** In-progress session bar from this feed (see [session] above), rolled on date
+        change. Guarded by [mutex]. *)
     ; tob : tob_cache Atomic.t
     (** Serializes full ring-buffer reads only (read_events / iter_events /
         get_recent_trades). The hot-path TOB/position reads are lock-free via [tob]. *)
@@ -79,6 +132,7 @@ module SymbolStore = struct
     ; trades_capacity = 100
     ; write_pos = 0
     ; trades_write_pos = 0
+    ; session = None
     ; tob =
         Atomic.make
           { pos = 0
@@ -123,6 +177,12 @@ module SymbolStore = struct
       let idx = t.write_pos mod t.capacity in
       t.buffer.(idx) <- q;
       t.write_pos <- t.write_pos + 1;
+      let px =
+        if q.bid_price > 0.0 && q.ask_price > 0.0
+        then (q.bid_price +. q.ask_price) /. 2.0
+        else Float.max q.bid_price q.ask_price
+      in
+      t.session <- observe_session t.session ~price:px ~volume:0.0 ~at:q.timestamp;
       let prev_pos = (Atomic.get t.tob).pos in
       let cache =
         { pos = prev_pos + 1
@@ -148,6 +208,8 @@ module SymbolStore = struct
     let idx = t.trades_write_pos mod t.trades_capacity in
     t.trades_buffer.(idx) <- tr;
     t.trades_write_pos <- t.trades_write_pos + 1;
+    t.session
+    <- observe_session t.session ~price:tr.price ~volume:tr.size ~at:tr.timestamp;
     Mutex.unlock t.mutex;
     (* Outside the venue's quoting session there are no "q" messages, only prints, and a
        book that never ticks never runs the strategy. When the last quote is older than
@@ -179,6 +241,24 @@ module SymbolStore = struct
     done;
     Mutex.unlock t.mutex;
     !trades
+  ;;
+
+  (** The session bar observed so far on this feed, if it has priced at all. *)
+  let session_bar t : bar option =
+    Mutex.lock t.mutex;
+    let s = t.session in
+    Mutex.unlock t.mutex;
+    match s with
+    | None -> None
+    | Some s ->
+      Some
+        { date = s.day
+        ; open_ = s.open_px
+        ; high = s.high_px
+        ; low = s.low_px
+        ; close = s.last_px
+        ; volume = s.volume
+        }
   ;;
 
   let get_best_bid_ask t =
@@ -301,6 +381,15 @@ let get_best_bid_ask symbol =
 let get_best_bid_ask_fast symbol =
   let store = get_or_create_store symbol in
   fun () -> SymbolStore.get_best_bid_ask store
+;;
+
+(** In-progress session bar from the live feed for [symbol]. [None] until the feed prices
+    it once. Used by the capital oracle's cold start when the venue's historical bar
+    endpoints have nothing for a fresh listing. *)
+let session_bar ~symbol =
+  match Ds.Cow_table.find_opt stores symbol with
+  | Some store -> SymbolStore.session_bar store
+  | None -> None
 ;;
 
 let get_current_position symbol =

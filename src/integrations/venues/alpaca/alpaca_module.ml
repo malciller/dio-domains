@@ -282,38 +282,65 @@ module Alpaca_impl = struct
         let all_syms = Alpaca_executions.get_all_symbols () in
         List.find_map (fun s -> Alpaca_executions.get_open_order s order_id) all_syms
     in
-    if is_fractional
-    then (
-      match find_existing (), qty, limit_price with
-      | Some existing, Some q, Some lp ->
-        fallback_cancel_replace
-          existing.symbol
-          q
-          lp
-          (match existing.side with
-           | Buy -> Alpaca_types.Buy
-           | Sell -> Sell)
-      | _ -> perform_rest_amend ())
-    else
+    (* A fractional amend is a cancel+replace, and re-requesting the resting price and
+       size burns a cancel slot that can stall in [pending_cancel] past the fallback's
+       settle window. The executions store is the venue's view, so compare there and
+       report a no-op as skipped (Kraken's "no amendable parameters" contract). *)
+    let unchanged (existing : Alpaca_executions.open_order_internal) =
+      match qty, limit_price with
+      | Some q, Some lp ->
+        let price_same =
+          match existing.limit_price with
+          | Some p -> Float.abs (p -. lp) < 1e-9
+          | None -> false
+        in
+        let qty_same =
+          Float.abs (q -. existing.qty) < 1e-9
+          || Float.abs (q -. (existing.qty -. existing.cum_qty)) < 1e-9
+        in
+        price_same && qty_same
+      | _ -> false
+    in
+    match find_existing () with
+    | Some existing when unchanged existing ->
+      Lwt.return
+        (Ok
+           { Types.original_order_id = order_id
+           ; new_order_id = order_id
+           ; amend_id = Some "skipped_no_change"
+           ; cl_ord_id = existing.cl_ord_id
+           })
+    | found when is_fractional ->
+      (match found, qty, limit_price with
+       | Some existing, Some q, Some lp ->
+         fallback_cancel_replace
+           existing.symbol
+           q
+           lp
+           (match existing.side with
+            | Buy -> Alpaca_types.Buy
+            | Sell -> Sell)
+       | _ -> perform_rest_amend ())
+    | _ ->
       perform_rest_amend ()
-      >>= function
-      | Ok res -> Lwt.return (Ok res)
-      | Error e when Alpaca_rest.is_retriable_http_exception e ->
-        (* Transport failure (timeout/connection) that survived the REST retry loop: the
-           amend may already have landed venue-side. Do not cancel-and-replace, which
-           could duplicate the order; reconciliation will heal it. *)
-        Lwt.return (Error e)
-      | Error e ->
-        (match find_existing (), qty, limit_price with
-         | Some existing, Some q, Some lp ->
-           fallback_cancel_replace
-             existing.symbol
-             q
-             lp
-             (match existing.side with
-              | Buy -> Alpaca_types.Buy
-              | Sell -> Sell)
-         | _ -> Lwt.return (Error e))
+      >>= (function
+       | Ok res -> Lwt.return (Ok res)
+       | Error e when Alpaca_rest.is_retriable_http_exception e ->
+         (* Transport failure (timeout/connection) that survived the REST retry loop: the
+            amend may already have landed venue-side. Do not cancel-and-replace, which
+            could duplicate the order; reconciliation will heal it. *)
+         Lwt.return (Error e)
+       | Error e ->
+         (match find_existing (), qty, limit_price with
+          | Some existing, Some q, Some lp ->
+            fallback_cancel_replace
+              existing.symbol
+              q
+              lp
+              (match existing.side with
+               | Buy -> Alpaca_types.Buy
+               | Sell -> Sell)
+          | _ -> Lwt.return (Error e)))
   ;;
 
   let cancel_orders
@@ -569,3 +596,9 @@ let () =
 
 (* Register the oracle data-venue adapter at load time. *)
 let () = Exchange.Oracle.Registry.register (module Alpaca_oracle)
+
+(* Oracle cold start: the session bar observed from the live quote/print stream. *)
+let () =
+  Exchange.Oracle.Live_session.register ~exchange:"alpaca" (fun symbol ->
+    Alpaca_orderbook.session_bar ~symbol)
+;;

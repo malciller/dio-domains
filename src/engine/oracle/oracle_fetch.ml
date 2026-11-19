@@ -98,36 +98,37 @@ let deep_series_of_bars
 ;;
 
 (** Merge deep history into the venue series: deep bars strictly before the venue's first
-    bar are prepended; venue bars win on overlap; result is sorted and de-duplicated.
-    Returns the number of deep bars added. The venue's first bar is the minimum date over
-    its bars (feeds are not assumed ascending). *)
+    bar are prepended; venue bars win on overlap; result is sorted and de-duplicated. With
+    no venue bars at all (a listing whose feed produced nothing usable) the deep
+    series *is* the history. Returns the number of deep bars added. The venue's first bar
+    is the minimum date over its bars (feeds are not assumed ascending). *)
 let merge_series ~(venue : Oracle_types.series) ~(deep : Oracle_types.series)
   : Oracle_types.series * int
   =
   let venue_bars = venue.bars in
   let deep_bars = deep.bars in
-  if Array.length venue_bars = 0
+  let added =
+    if Array.length venue_bars = 0
+    then Array.to_list deep_bars
+    else (
+      let venue_first =
+        Array.fold_left
+          (fun acc (b : Oracle_types.bar) -> if b.date < acc then b.date else acc)
+          venue_bars.(0).Oracle_types.date
+          venue_bars
+      in
+      Array.to_list deep_bars
+      |> List.filter (fun (b : Oracle_types.bar) -> b.date < venue_first))
+  in
+  if added = []
   then venue, 0
   else (
-    let venue_first =
-      Array.fold_left
-        (fun acc (b : Oracle_types.bar) -> if b.date < acc then b.date else acc)
-        venue_bars.(0).Oracle_types.date
-        venue_bars
+    let merged =
+      Array.of_list (added @ Array.to_list venue_bars)
+      |> Oracle_calendar.sort_bars
+      |> Oracle_calendar.dedup
     in
-    let added =
-      Array.to_list deep_bars
-      |> List.filter (fun (b : Oracle_types.bar) -> b.date < venue_first)
-    in
-    if added = []
-    then venue, 0
-    else (
-      let merged =
-        Array.of_list (added @ Array.to_list venue_bars)
-        |> Oracle_calendar.sort_bars
-        |> Oracle_calendar.dedup
-      in
-      { venue with bars = merged }, List.length added))
+    { venue with bars = merged }, List.length added)
 ;;
 
 (** Fetch one symbol's daily series through the registry, cached per run and disk-cached
@@ -171,7 +172,11 @@ let fetch_series_for
 (** Extend a venue series backward with Yahoo deep history for the same underlying asset
     (venue bars win on overlap; nothing synthesized). Deep history is disk-cached and
     delta-fetched like the venue series, keyed on the resolved Yahoo symbol. Returns the
-    deepened series and deep bars added. *)
+    deepened series and deep bars added.
+
+    An empty venue series still gets a deep fetch, through today: that is the only history
+    a fresh listing whose venue feed yields no daily bars can have, and withholding the
+    fetch made it permanently unmodeled. *)
 let deepen_series
   ?(no_deep_history = false)
   ?(offline = false)
@@ -179,7 +184,7 @@ let deepen_series
   : (Oracle_types.series * int) Lwt.t
   =
   let venue_bars = series.bars in
-  if no_deep_history || offline || Array.length venue_bars = 0
+  if no_deep_history || offline
   then Lwt.return (series, 0)
   else (
     match
@@ -187,8 +192,11 @@ let deepen_series
     with
     | None -> Lwt.return (series, 0)
     | Some yahoo_symbol ->
-      let venue_first = venue_bars.(0).Oracle_types.date in
-      let end_date = Oracle_calendar.add_days venue_first (-1) in
+      let end_date =
+        if Array.length venue_bars = 0
+        then today_iso ()
+        else Oracle_calendar.add_days venue_bars.(0).Oracle_types.date (-1)
+      in
       (* Deep history is bounded by [end_date] (day before the venue series starts) and
          complete once its last bar reaches it; a "today" freshness check would re-fetch
          it with start > end every pass. *)

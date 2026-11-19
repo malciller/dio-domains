@@ -125,21 +125,26 @@ let fetch_calendar ~start_date ~end_date : string list Lwt.t =
 (** Daily bars for [symbol] from [from] (ISO date; [None] = "2010-01-01"), paginating on
     next_page_token. [feed] is "iex" or "sip"; [end_date] bounds the request window
     (default today). *)
-let fetch_bars ?(feed = "iex") ?end_date ~from ~symbol () : Exchange.Types.bar list Lwt.t =
-  load_dotenv ();
-  let start_date = Option.value from ~default:"2010-01-01" in
-  let end_date = Option.value end_date ~default:(today_iso ()) in
+let fetch_range
+  ~(timeframe : string)
+  ~(start_date : string)
+  ~(end_date : string)
+  ~symbol
+  ~feed
+  : Exchange.Types.bar list Lwt.t
+  =
   let rec go page_token acc pages =
     if pages = 0
     then Lwt.return (List.rev acc)
     else (
       let url =
         Printf.sprintf
-          "%s/v2/stocks/%s/bars?start=%sT00:00:00Z&end=%sT00:00:00Z&timeframe=1Day&feed=%s&limit=10000%s"
+          "%s/v2/stocks/%s/bars?start=%sT00:00:00Z&end=%sT00:00:00Z&timeframe=%s&feed=%s&limit=10000%s"
           data_base_url
           (Uri.pct_encode symbol)
           start_date
           end_date
+          timeframe
           feed
           (match page_token with
            | Some t -> "&page_token=" ^ Uri.pct_encode t
@@ -184,6 +189,93 @@ let fetch_bars ?(feed = "iex") ?end_date ~from ~symbol () : Exchange.Types.bar l
           Lwt.return (List.rev acc)))
   in
   go None [] max_pages
+;;
+
+(** Fold intraday bars into one daily bar per session: open from the first, close from the
+    last, high/low the extremes, volume summed. A fresh listing can print intraday on a
+    thin feed while the daily endpoint returns nothing, and a symbol with no history gets
+    no capital-oracle decision at all (its domain withholds every order). *)
+let aggregate_daily (bars : Exchange.Types.bar list) : Exchange.Types.bar list =
+  let order = ref [] in
+  let by_date = Hashtbl.create 64 in
+  List.iter
+    (fun (b : Exchange.Types.bar) ->
+      match Hashtbl.find_opt by_date b.date with
+      | None ->
+        Hashtbl.replace by_date b.date b;
+        order := b.date :: !order
+      | Some (acc : Exchange.Types.bar) ->
+        Hashtbl.replace
+          by_date
+          b.date
+          { acc with
+            Exchange.Types.high = Float.max acc.high b.high
+          ; low = Float.min acc.low b.low
+          ; close = b.close
+          ; volume = acc.volume +. b.volume
+          })
+    bars;
+  List.rev_map (fun d -> Hashtbl.find by_date d) !order
+;;
+
+let iso_of_days_ago days =
+  let tm = Unix.localtime (Unix.time () -. (float_of_int days *. 86_400.0)) in
+  Printf.sprintf
+    "%04d-%02d-%02d"
+    (tm.Unix.tm_year + 1900)
+    (tm.Unix.tm_mon + 1)
+    tm.Unix.tm_mday
+;;
+
+let fetch_bars ?(feed = "iex") ?end_date ~from ~symbol () : Exchange.Types.bar list Lwt.t =
+  load_dotenv ();
+  let start_date = Option.value from ~default:"2010-01-01" in
+  let end_date = Option.value end_date ~default:(today_iso ()) in
+  let intraday_start =
+    let recent = iso_of_days_ago 60 in
+    if String.compare start_date recent > 0 then start_date else recent
+  in
+  (* One feed's history: daily first, then hourly folded into sessions. A recent IPO on a
+     thin feed has neither daily bars nor an intraday print for the symbol, so the caller
+     tries the consolidated feed next. *)
+  let history_on feed =
+    fetch_range ~timeframe:"1Day" ~start_date ~end_date ~symbol ~feed
+    >>= fun daily ->
+    if daily <> []
+    then Lwt.return daily
+    else
+      fetch_range ~timeframe:"1Hour" ~start_date:intraday_start ~end_date ~symbol ~feed
+      >|= fun intraday ->
+      let sessions = aggregate_daily intraday in
+      Logging.info_f
+        ~section
+        "%s: no daily bars on feed %s; folded %d intraday bar(s) into %d session(s)"
+        symbol
+        feed
+        (List.length intraday)
+        (List.length sessions);
+      sessions
+  in
+  let feeds = if feed = "sip" then [ "sip" ] else [ feed; "sip" ] in
+  let rec first_history = function
+    | [] -> Lwt.return []
+    | f :: rest ->
+      Lwt.catch
+        (fun () ->
+          history_on f
+          >>= fun bars -> if bars <> [] then Lwt.return bars else first_history rest)
+        (fun exn ->
+          (* A plan without consolidated data rejects the sip request; the thin feed is
+             then the only source, and the oracle reports "no decision published". *)
+          Logging.warn_f
+            ~section
+            "%s: %s history unavailable (%s)"
+            symbol
+            f
+            (Printexc.to_string exn);
+          first_history rest)
+  in
+  first_history feeds
 ;;
 
 (* ---- Fees (Alpaca is commission-free) ---- *)

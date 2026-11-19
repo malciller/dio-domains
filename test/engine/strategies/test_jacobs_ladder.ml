@@ -3358,10 +3358,11 @@ let test_same_id_amend_stays_in_lifecycle () =
 ;;
 
 let test_cancel_replace_amend_has_no_timer_gate () =
-  (* SPCX regression: a successful Alpaca fractional amend is a cancel+replace, which used
-     to arm a 10s per-order cooldown and log "buy amend held ... order on cooldown". The
-     amend lifecycle is event-driven, so the replacement can be re-amended on the next
-     book event. *)
+  (* SPCX regression: a successful Alpaca fractional amend is a cancel+replace. The amend
+     lifecycle is event-driven (no per-order cooldown), but the replacement id the venue
+     just produced is held for the feed-ack window: re-amending it immediately made the
+     venue cancel an order it was still accepting, and the fallback cancel then timed out
+     with no replacement placed. *)
   let module IA = Dio_strategies.Strategy_common.InFlightAmendments in
   let symbol = "AMEND_HF/USD" in
   let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
@@ -3392,9 +3393,26 @@ let test_cancel_replace_amend_has_no_timer_gate () =
     "no timer entry for the replacement id"
     false
     (Hashtbl.mem state.amend_cooldowns "new");
+  (* Fully event-driven: the gate is the venue's open-order delta listing the replacement,
+     not a clock. *)
+  Hashtbl.reset state.feed_buy_index;
+  state.feed_index_valid <- true;
   check
     bool
-    "replacement can be amended on the next event"
+    "unlisted replacement is not amendable"
+    false
+    (Dio_strategies.Strategy_api.amend_allowed
+       ~state
+       ~order_id:"new"
+       ~target_price:102.0
+       ~current_price_rounded:101.0
+       ~price_diff:1.0
+       ~min_move_threshold:0.01);
+  (* The feed delta that carries the venue's ack adds it; the very next pass can amend. *)
+  Hashtbl.replace state.feed_buy_index "new" (101.0, 0.02);
+  check
+    bool
+    "listed replacement is amendable on the next event"
     true
     (Dio_strategies.Strategy_api.amend_allowed
        ~state
@@ -3403,6 +3421,7 @@ let test_cancel_replace_amend_has_no_timer_gate () =
        ~current_price_rounded:101.0
        ~price_diff:1.0
        ~min_move_threshold:0.01);
+  Hashtbl.reset state.feed_buy_index;
   ignore (IA.remove_in_flight_amendment "old");
   ignore (IA.remove_in_flight_amendment "new")
 ;;
@@ -3518,6 +3537,123 @@ let test_alpaca_filled_amend_failure_clears_tracking () =
     "terminal (non-TIF) amend failure does not arm recovery"
     false
     state.tif_recovery_pending;
+  drain ()
+;;
+
+(* Alpaca closes a filled/canceled order on the amend path with code 42210000
+   ["order is not open"]. Matching none of the earlier classifiers kept tracking on a dead
+   id: the symbol re-issued the same amend on every book tick (the 422 storm) and never
+   placed a fresh buy because a tracked buy counted as a resting one. *)
+let test_alpaca_not_open_amend_failure_clears_tracking () =
+  let symbol = "NOTOPEN/SMH/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.tif_recovery_pending <- false;
+  state.last_buy_order_id <- Some "7f919d2f";
+  state.last_buy_order_price <- Some 135.14;
+  Hashtbl.remove state.evicted_orders "7f919d2f";
+  Hashtbl.remove state.amend_cooldowns "7f919d2f";
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Strategy_api.Strategy.handle_order_amendment_failed
+    ~now:100.0
+    symbol
+    "7f919d2f"
+    Dio_strategies.Strategy_common.Buy
+    {|HTTP 422: {"code":42210000,"message":"order is not open"}|};
+  check
+    (option string)
+    "order-is-not-open amend failure clears tracked buy id"
+    None
+    state.last_buy_order_id;
+  check
+    bool
+    "order-is-not-open amend failure evicts the dead id"
+    true
+    (Hashtbl.mem state.evicted_orders "7f919d2f");
+  check
+    bool
+    "order-is-not-open amend failure retries without a cooldown"
+    false
+    (Hashtbl.mem state.amend_cooldowns "7f919d2f");
+  drain ()
+;;
+
+(* The fractional cancel+replace cancels the old order, then suppresses the replacement
+   because the cancel raced a partial fill. No order exists afterwards, so keeping the old
+   id tracked wedges the buy leg on a dead id. *)
+let test_alpaca_cancel_replace_race_clears_tracking () =
+  let symbol = "RACEFIL/SMH/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.last_buy_order_id <- Some "race-1";
+  state.last_buy_order_price <- Some 135.14;
+  Hashtbl.remove state.evicted_orders "race-1";
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Strategy_api.Strategy.handle_order_amendment_failed
+    ~now:100.0
+    symbol
+    "race-1"
+    Dio_strategies.Strategy_common.Buy
+    "Fallback cancel raced a fill (0.00007227 filled); replacement suppressed";
+  check
+    (option string)
+    "raced-fill cancel+replace clears tracked buy id"
+    None
+    state.last_buy_order_id;
+  check
+    bool
+    "raced-fill cancel+replace evicts the dead id"
+    true
+    (Hashtbl.mem state.evicted_orders "race-1");
+  drain ()
+;;
+
+(* A failure that leaves the order live at the venue (the cancel had not settled) emits no
+   terminal event, so without a backoff the next book tick re-dispatches the same amend. *)
+let test_unsettled_amend_failure_backs_off () =
+  let symbol = "UNSETTL/SMH/USD" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.last_buy_order_id <- Some "settle-1";
+  state.last_buy_order_price <- Some 135.14;
+  Hashtbl.remove state.amend_cooldowns "settle-1";
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Strategy_api.Strategy.handle_order_amendment_failed
+    ~now:100.0
+    symbol
+    "settle-1"
+    Dio_strategies.Strategy_common.Buy
+    "Fallback cancel still pending at venue after 15s; replacement deferred";
+  check
+    (option string)
+    "unsettled cancel keeps the resting order tracked"
+    (Some "settle-1")
+    state.last_buy_order_id;
+  check
+    bool
+    "unsettled cancel backs the next amend off past the settle window"
+    true
+    (match Hashtbl.find_opt state.amend_cooldowns "settle-1" with
+     | Some expiry -> expiry >= 116.0
+     | None -> false);
   drain ()
 ;;
 
@@ -9292,6 +9428,18 @@ let () =
             "Alpaca filled amend failure clears tracking and evicts"
             `Quick
             test_alpaca_filled_amend_failure_clears_tracking
+        ; test_case
+            "Alpaca order-is-not-open amend failure clears tracking"
+            `Quick
+            test_alpaca_not_open_amend_failure_clears_tracking
+        ; test_case
+            "Alpaca cancel+replace raced a fill clears tracking"
+            `Quick
+            test_alpaca_cancel_replace_race_clears_tracking
+        ; test_case
+            "unsettled cancel backs the next amend off"
+            `Quick
+            test_unsettled_amend_failure_backs_off
         ; test_case
             "held-qty amend failure keeps tracking"
             `Quick

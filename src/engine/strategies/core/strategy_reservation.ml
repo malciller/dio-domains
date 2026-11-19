@@ -87,8 +87,10 @@ let can_place_buy_order (_qty : float) quote_balance quote_needed =
 ;;
 
 (** True if an amendment of [order_id] is permitted. Gated on the event-driven amend
-    lifecycle only: the executor's terminal event releases the order, so a resting buy can
-    be re-amended on the next book event. *)
+    lifecycle, plus the venue's own listing of a replacement: a cancel+replace venue
+    returns the new id before its feed carries it, and amending it in that window makes
+    the venue cancel an order it is still accepting. The gate clears on the open-order
+    delta that lists the id - no timer. *)
 let amend_allowed
   ~state
   ~order_id
@@ -105,8 +107,19 @@ let amend_allowed
       state.pending_orders
   in
   let is_in_flight = InFlightAmendments.is_in_flight order_id in
+  let is_on_cooldown = Hashtbl.mem state.amend_cooldowns order_id in
+  (* A replacement the venue has not listed yet. [feed_index_valid] false means the index
+     is not a complete snapshot, so membership cannot be judged: allow (the next full scan
+     settles it). *)
+  let awaiting_listing =
+    InFlightAmendments.is_replacement_target order_id
+    && state.feed_index_valid
+    && not (Hashtbl.mem state.feed_buy_index order_id)
+  in
   (not is_being_amended)
   && (not is_in_flight)
+  && (not is_on_cooldown)
+  && (not awaiting_listing)
   && price_diff >= min_move_threshold
   && target_price <> current_price_rounded
 ;;

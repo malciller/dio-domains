@@ -4,6 +4,10 @@
    search -> decision record. The only path from market data to a [decision]; downstream
    consumers (pools, execution) take the record as-is. *)
 
+let section = "oracle_pipeline"
+
+module Exchange = Dio_exchange.Exchange_intf
+
 (** Inputs for one decision pass on one asset on one venue. *)
 type inputs =
   { exchange : string
@@ -38,16 +42,36 @@ let current_price_of_series (s : Oracle_types.series) : float option =
 
 (** All-time merged history for one asset: registry-backed venue series delta-fetched
     against the disk cache, extended backwards with Yahoo deep history. Venue bars win on
-    overlap; nothing is synthesized. No gap tolerance, no minimum length. *)
+    overlap; nothing is synthesized. No gap tolerance, no minimum length.
+
+    When both sources are empty but the venue's live feed has priced the symbol, the
+    in-progress session becomes the history: one observed bar is enough for a decision,
+    and without one the asset never publishes a decision at all. *)
 let history_of ~(offline : bool) ~(exchange : string) ~(symbol : string)
   : Oracle_types.series Lwt.t
   =
   let open Lwt.Infix in
   Oracle_fetch.fetch_series_for ~offline ~exchange ~symbol ()
   >>= fun venue ->
-  if offline
-  then Lwt.return venue
-  else Oracle_fetch.deepen_series ~no_deep_history:false ~offline:false venue >|= fst
+  (if offline
+   then Lwt.return venue
+   else Oracle_fetch.deepen_series ~no_deep_history:false ~offline:false venue >|= fst)
+  >|= fun series ->
+  if Array.length series.bars > 0
+  then series
+  else (
+    match Exchange.Oracle.Live_session.bar ~exchange ~symbol with
+    | None -> series
+    | Some bar ->
+      Logging.info_f
+        ~section
+        "%s/%s: no historical bars; cold start from the live session %s (%.4f..%.4f)"
+        exchange
+        symbol
+        bar.date
+        bar.low
+        bar.high;
+      { series with bars = [| bar |] })
 ;;
 
 (** Decision pass from already-computed [refs]. Caching [refs] per history version keeps

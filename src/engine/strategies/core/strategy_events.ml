@@ -1318,6 +1318,8 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
   let is_cannot_modify =
     contains_fragment lower_reason "cannot modify canceled or filled"
   in
+  (* Alpaca answers 42210000 "order is not open" for an order it has already closed. *)
+  let is_not_open = contains_fragment lower_reason "order is not open" in
   (* Alpaca reports a terminal order on the amend/fallback-cancel path as
      [order is already in "filled" state] (JSON-escaped, so the embedded quotes carry
      backslashes). Match the stable words rather than the quoted fragment. Such an order
@@ -1344,6 +1346,12 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
     || contains_fragment lower_reason "post only"
     || contains_fragment lower_reason "cross"
   in
+  (* Alpaca's fractional cancel+replace cancelled the old order but suppressed the
+     replacement because the cancel raced a partial fill: the old id is dead and no new
+     order exists, though the message names no status. *)
+  let is_cancel_replace_aborted =
+    contains_fragment lower_reason "fallback cancel raced a fill"
+  in
   (* An "insufficient qty" amendment failure deliberately does NOT mean the order is gone.
      On the Alpaca fractional cancel-and-replace path that message comes from
      the *replacement* placement ("insufficient qty available for order ...
@@ -1353,7 +1361,12 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
      the repeating 403/422 storm. Keep tracking instead; the order's own terminal event or
      the cancel path will retire it. *)
   let is_order_gone =
-    is_cache_miss || is_cannot_modify || is_tif_rejection || is_already_terminal
+    is_cache_miss
+    || is_cannot_modify
+    || is_not_open
+    || is_cancel_replace_aborted
+    || is_tif_rejection
+    || is_already_terminal
   in
   (* A venue-terminal order can linger in the local open-order cache if the terminal
      trade-update was missed. Evict it from the open-orders scan so the adoption path
@@ -1441,6 +1454,29 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
           order_id
           reason)
   else (
+    (* A failure that leaves the order live at the venue emits no terminal event, so
+       without a backoff the next book tick re-dispatches the same amend. A cancel still
+       in flight needs its settle window. [insufficient qty] must retry on the venue's own
+       release of the hold, so it stays timer-free. *)
+    let is_held_qty =
+      contains_fragment lower_reason "insufficient qty"
+      || contains_fragment lower_reason "qty available"
+      || contains_fragment lower_reason "held_for_orders"
+    in
+    if not is_held_qty
+    then (
+      (* 429 is account-wide: another amend on the same order would only deepen it, so the
+         backoff outlasts the bucket refill instead of retrying on the next tick. *)
+      let backoff =
+        if contains_fragment lower_reason "rate limit"
+           || contains_fragment lower_reason "too many requests"
+           || contains_fragment lower_reason "429"
+        then 10.0
+        else if contains_fragment lower_reason "still pending at venue"
+        then 16.0
+        else 2.0
+      in
+      Hashtbl.replace state.amend_cooldowns order_id (now +. backoff));
     match side with
     | Buy ->
       (match state.last_buy_order_id with

@@ -302,14 +302,24 @@ let request
   let dial_host = Option.value connect_host ~default:host in
   let key = pool_key ~is_tls ~host ~port in
   let connect () =
+    (* IPv4 only: [Conduit_lwt_unix.tcp_connect] always dials a [PF_INET] socket, so an
+       AAAA-first answer from the resolver fails [connect] with EAFNOSUPPORT on a v4-only
+       container. Every other dialer here pins the family the same way. *)
     Lwt_unix.getaddrinfo
       dial_host
       (string_of_int port)
-      [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM ]
+      [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM; Unix.AI_FAMILY Unix.PF_INET ]
     >>= fun addresses ->
     let ip =
-      match addresses with
-      | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } :: _ ->
+      match
+        List.find_opt
+          (function
+            | { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } ->
+              Unix.is_inet6_addr addr |> not
+            | _ -> false)
+          addresses
+      with
+      | Some { Unix.ai_addr = Unix.ADDR_INET (addr, _); _ } ->
         Ipaddr_unix.of_inet_addr addr
       | _ -> failwith (Printf.sprintf "cannot resolve %s:%d" dial_host port)
     in

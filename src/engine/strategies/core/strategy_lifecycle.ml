@@ -618,12 +618,13 @@ let evaluate_capital_low_recovery
         was_at))
 ;;
 
-(** Expires the placement retry cooldowns (`place_Buy` / `place_Sell`) and ghost-order
-    markers.
+(** Expires the placement/amend retry cooldowns (`place_Buy` / `place_Sell` / an order id)
+    and ghost-order markers.
 
-    Amendment gating is event-driven ([InFlightAmendments]); the keys here are only
-    placement backoffs after a venue reject or a stale balance. Pending tokens are not
-    swept: every dispatched place/amend produces one terminal event (Ack/Failed,
+    Amendment success gating is event-driven ([InFlightAmendments]); the order-id keys
+    here only hold back an amend whose failure left the order live at the venue, which
+    emits no terminal event of its own. Pending tokens are not swept: every dispatched
+    place/amend produces one terminal event (Ack/Failed,
     Amended/Amendment_skipped/Amendment_failed, or a recognized cancel) whose handler
     removes the token, flag, and registry entry. An age-based sweep resolved state while
     the exchange could still be executing the request (Alpaca amends exceed 5s under SSL
