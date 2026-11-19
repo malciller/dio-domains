@@ -118,6 +118,7 @@ type strategy =
   ; sell_orders : order list
   ; sell_count : int
   ; capital_low : bool
+  ; exposure_high : bool
   ; market_is_closed : bool
   ; last_buy_fill : float
   ; last_sell_fill : float
@@ -379,6 +380,7 @@ let parse_strategy symbol j =
       (let sc = strat |?> "sell_count" |> to_int_d 0 in
        if sc > 0 then sc else List.length sell_orders)
   ; capital_low = strat |?> "capital_low" |> to_bool_d false
+  ; exposure_high = strat |?> "exposure_high" |> to_bool_d false
   ; market_is_closed = strat |?> "market_is_closed" |> to_bool_d false
   ; last_buy_fill = strat |?> "last_buy_fill" |> to_float_d 0.0
   ; last_sell_fill = strat |?> "last_sell_fill" |> to_float_d 0.0
@@ -519,16 +521,16 @@ let oracle_inactive (s : strategy) =
   | None -> false
 ;;
 
-(** Paused if the oracle is INACTIVE, [capital_low] is set, or the market is closed. A
-    resting buy overrides the capital/oracle gates (already placed and funded), leaving
-    only [market_is_closed] to pause it. *)
+(** Paused if the oracle is INACTIVE, [capital_low] or [exposure_high] is set, or the
+    market is closed. A resting buy overrides the capital/exposure/oracle gates (already
+    placed and funded), leaving only [market_is_closed] to pause it. *)
 let strategy_paused (s : strategy) =
   let has_resting_buy =
     s.buy_price > 0.0 || List.exists is_grid_order s.market.buy_orders
   in
   if has_resting_buy
   then s.market_is_closed
-  else oracle_inactive s || s.capital_low || s.market_is_closed
+  else oracle_inactive s || s.capital_low || s.exposure_high || s.market_is_closed
 ;;
 
 let quote_assets = [ "USD"; "USDC"; "USDT"; "ZUSD"; "USDe" ]

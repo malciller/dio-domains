@@ -10,7 +10,7 @@ type trading_config = Dio_strategies.Strategy_common.trading_config =
       provided *)
   ; sell_mult : string
   ; min_usd_balance : string option
-  ; max_exposure : string option
+  ; max_exposure : Dio_strategies.Strategy_common.exposure_limit option
   ; strategy : string
   ; maker_fee : float option
   ; taker_fee : float option
@@ -233,6 +233,10 @@ let known_oracle_asset_keys =
   [ "target_survival"; "min_active_dsurv"; "qty_cap_mult"; "lookback_days" ]
 ;;
 
+(** Keys accepted inside a [max_exposure] object. [null] disables that component, which
+    lets an asset clear a limit inherited from a venue default. *)
+let known_exposure_keys = [ "portfolio_pct"; "venue_pct" ]
+
 let known_trading_keys =
   [ "symbol"
   ; "exchange"
@@ -450,6 +454,41 @@ let parse_accumulation_buffer json exchange symbol =
   | _ -> default
 ;;
 
+(** Parses the optional [max_exposure] object. Absent/null = no cap. A component set to
+    null disables only that ratio, so an asset can clear a venue-default leg while keeping
+    its own. *)
+let parse_exposure_limit json =
+  let open Yojson.Basic.Util in
+  let fail key msg =
+    Logging.critical_f ~section "max_exposure.%s: %s" key msg;
+    exit 1
+  in
+  match json with
+  | `Null -> None
+  | `Assoc _ as obj ->
+    if validate_keys ~context:"max_exposure" ~allowed:known_exposure_keys obj then exit 1;
+    let pct key =
+      match obj |> member key with
+      | `Null -> None
+      | `Int i -> Some (float_of_int i)
+      | `Float f -> Some f
+      | _ -> fail key "expected a number or null"
+    in
+    let check key = function
+      | Some v when (not (Float.is_finite v)) || v < 0.0 ->
+        fail key "expected a finite non-negative percentage"
+      | _ -> ()
+    in
+    let portfolio_pct = pct "portfolio_pct" in
+    let venue_pct = pct "venue_pct" in
+    check "portfolio_pct" portfolio_pct;
+    check "venue_pct" venue_pct;
+    (match portfolio_pct, venue_pct with
+     | None, None -> None
+     | _ -> Some { Dio_strategies.Strategy_common.portfolio_pct; venue_pct })
+  | _ -> fail "max_exposure" "expected an object or null"
+;;
+
 (** Parses one flattened entry of the trading section into a [trading_config]. Validates
     keys and venue restrictions; [exit 1] on schema violation. *)
 let parse_config json =
@@ -540,7 +579,7 @@ let parse_config json =
   ; sell_mult =
       json |> member "sell_mult" |> to_string_option |> Option.value ~default:"1.0"
   ; min_usd_balance = json |> member "min_usd_balance" |> to_string_option
-  ; max_exposure = json |> member "max_exposure" |> to_string_option
+  ; max_exposure = parse_exposure_limit (json |> member "max_exposure")
   ; strategy
   ; maker_fee = json |> member "maker_fee" |> to_float_opt
   ; taker_fee = json |> member "taker_fee" |> to_float_opt

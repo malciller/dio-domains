@@ -251,7 +251,7 @@ let buy_place_plan
           ~ecfg:state.cached_ecfg
           ~bid_price
           ~ask_price
-          ~capital_exhausted:(oracle_halted || state.capital_low)
+          ~capital_exhausted:(oracle_halted || state.capital_low || state.exposure_high)
       in
       min buy_price (floor_for_sell companion_sell_price))
     else buy_price
@@ -291,35 +291,38 @@ let buy_place_plan
 
 (** Branch action: send the balanced fresh buy. *)
 let buy_place_send ~state ~now ~(asset : trading_config) ~qty ~buy_price =
-  state.last_buy_attempted_insufficient <- false;
-  let order =
-    create_order
-      state.duplicate_key_buy
-      asset.symbol
-      Buy
-      qty
-      (Some buy_price)
-      true
-      asset.exchange
-  in
-  if push_order ~now ~state order
-  then (
-    (* Don't overwrite a tracked buy's price: the rejection handlers match on it. *)
-    if state.last_buy_order_id = None then state.last_buy_order_price <- Some buy_price;
-    state.tif_recovery_pending <- false;
-    state.force_buy_reanchor <- false;
-    (* When the decision-flow layer is on, [push_order] already emitted a SEND block for
-       this intent; skip the plain line so placement is not logged twice. *)
-    if not (Flow_log.enabled ())
-    then
-      Logging.info_f
-        ~section
-        "Placed buy order for %s: %.8f @ %.4f"
+  if state.exposure_high
+  then false
+  else (
+    state.last_buy_attempted_insufficient <- false;
+    let order =
+      create_order
+        state.duplicate_key_buy
         asset.symbol
+        Buy
         qty
-        buy_price;
-    true)
-  else false
+        (Some buy_price)
+        true
+        asset.exchange
+    in
+    if push_order ~now ~state order
+    then (
+      (* Don't overwrite a tracked buy's price: the rejection handlers match on it. *)
+      if state.last_buy_order_id = None then state.last_buy_order_price <- Some buy_price;
+      state.tif_recovery_pending <- false;
+      state.force_buy_reanchor <- false;
+      (* When the decision-flow layer is on, [push_order] already emitted a SEND block for
+         this intent; skip the plain line so placement is not logged twice. *)
+      if not (Flow_log.enabled ())
+      then
+        Logging.info_f
+          ~section
+          "Placed buy order for %s: %.8f @ %.4f"
+          asset.symbol
+          qty
+          buy_price;
+      true)
+    else false)
 ;;
 
 (** Branch action: the balance snapshot is stale - attempt anyway (the exchange's verdict
@@ -334,30 +337,33 @@ let buy_place_send_insufficient
   ~quote_needed
   ~available_quote_balance
   =
-  Logging.warn_f
-    ~section
-    "Local balance low for %s buy (need %.2f, available %.2f, balance snapshot stale) - \
-     attempting anyway, exchange will reject if truly insufficient"
-    asset.symbol
-    quote_needed
-    available_quote_balance;
-  state.last_buy_attempted_insufficient <- true;
-  Hashtbl.replace state.amend_cooldowns "place_Buy" (now +. 2.0);
-  let order =
-    create_order
-      state.duplicate_key_buy
+  if state.exposure_high
+  then false
+  else (
+    Logging.warn_f
+      ~section
+      "Local balance low for %s buy (need %.2f, available %.2f, balance snapshot stale) \
+       - attempting anyway, exchange will reject if truly insufficient"
       asset.symbol
-      Buy
-      qty
-      (Some buy_price)
-      true
-      asset.exchange
-  in
-  if push_order ~now ~state order
-  then (
-    if state.last_buy_order_id = None then state.last_buy_order_price <- Some buy_price;
-    true)
-  else false
+      quote_needed
+      available_quote_balance;
+    state.last_buy_attempted_insufficient <- true;
+    Hashtbl.replace state.amend_cooldowns "place_Buy" (now +. 2.0);
+    let order =
+      create_order
+        state.duplicate_key_buy
+        asset.symbol
+        Buy
+        qty
+        (Some buy_price)
+        true
+        asset.exchange
+    in
+    if push_order ~now ~state order
+    then (
+      if state.last_buy_order_id = None then state.last_buy_order_price <- Some buy_price;
+      true)
+    else false)
 ;;
 
 (** Branch action: fresh balance genuinely cannot fund the buy - latch [capital_low] until
@@ -373,31 +379,34 @@ let buy_place_latch_capital_low
   ~quote_needed
   ~available_quote_balance
   =
-  if not state.capital_low
-  then (
-    state.capital_low <- true;
-    state.capital_low_logged <- true;
-    state.capital_low_at_balance <- -1.0;
-    state.capital_low_last_log_at <- now;
-    let venue_quote, overlay_reserved = capital_low_venue_figures ~asset in
-    let grid_reserved = get_total_reserved_quote state in
-    Logging.warn_f
-      ~section
-      "Local balance insufficient for %s buy (need %.2f, available %.2f; venue quote \
-       %.2f, overlays reserved %.2f, grids reserved %.2f) - skipping placement until \
-       balance recovers [balance_ok inputs: quote=%.4f locked_buys=%.4f price=%.6f \
-       qty=%.8g]"
-      asset.symbol
-      quote_needed
-      available_quote_balance
-      venue_quote
-      overlay_reserved
-      grid_reserved
-      quote_balance
-      locked_in_buys
-      buy_price
-      qty);
-  Hashtbl.replace state.amend_cooldowns "place_Buy" (now +. 2.0)
+  if state.exposure_high
+  then ()
+  else (
+    if not state.capital_low
+    then (
+      state.capital_low <- true;
+      state.capital_low_logged <- true;
+      state.capital_low_at_balance <- -1.0;
+      state.capital_low_last_log_at <- now;
+      let venue_quote, overlay_reserved = capital_low_venue_figures ~asset in
+      let grid_reserved = get_total_reserved_quote state in
+      Logging.warn_f
+        ~section
+        "Local balance insufficient for %s buy (need %.2f, available %.2f; venue quote \
+         %.2f, overlays reserved %.2f, grids reserved %.2f) - skipping placement until \
+         balance recovers [balance_ok inputs: quote=%.4f locked_buys=%.4f price=%.6f \
+         qty=%.8g]"
+        asset.symbol
+        quote_needed
+        available_quote_balance
+        venue_quote
+        overlay_reserved
+        grid_reserved
+        quote_balance
+        locked_in_buys
+        buy_price
+        qty);
+    Hashtbl.replace state.amend_cooldowns "place_Buy" (now +. 2.0))
 ;;
 
 (** Branch action: no quote-balance data available. *)
@@ -420,72 +429,75 @@ let buy_place_initial
   ~locked_in_buys
   ~closest_sell_order_initial
   =
-  let p =
-    buy_place_plan
-      ~state
-      ~now
-      ~asset
-      ~bid_price
-      ~ask_price
-      ~quote_balance
-      ~oracle_halted
-      ~cycle
-      ~locked_in_buys
-      ~closest_sell_order_initial
-  in
-  let attempted = ref false in
-  if p.bp_capital_low
-  then
-    Logging.debug_f
-      ~section
-      "Buy placement skipped for %s: capital_low flag is set"
-      asset.symbol
-  else if p.bp_crossing
-  then
-    Logging.debug_f
-      ~section
-      "Buy placement deferred for %s: active or evicted sell order price <= \
-       buy_price/bid (wash trade protection)"
-      asset.symbol
-  else if not p.bp_quote_nan
-  then
-    if p.bp_cooldown || p.bp_inflight
+  if state.exposure_high
+  then false
+  else (
+    let p =
+      buy_place_plan
+        ~state
+        ~now
+        ~asset
+        ~bid_price
+        ~ask_price
+        ~quote_balance
+        ~oracle_halted
+        ~cycle
+        ~locked_in_buys
+        ~closest_sell_order_initial
+    in
+    let attempted = ref false in
+    if p.bp_capital_low
     then
       Logging.debug_f
         ~section
-        "Buy placement skipped for %s (cooldown=%B, inflight=%B)"
+        "Buy placement skipped for %s: capital_low flag is set"
         asset.symbol
-        p.bp_cooldown
-        p.bp_inflight
-    else if p.bp_balance_ok
+    else if p.bp_crossing
     then
-      attempted := buy_place_send ~state ~now ~asset ~qty:p.bp_qty ~buy_price:p.bp_price
-    else if not (Hashtbl.mem state.amend_cooldowns "place_Buy")
+      Logging.debug_f
+        ~section
+        "Buy placement deferred for %s: active or evicted sell order price <= \
+         buy_price/bid (wash trade protection)"
+        asset.symbol
+    else if not p.bp_quote_nan
     then
-      if quote_balance_stale
+      if p.bp_cooldown || p.bp_inflight
       then
-        attempted
-        := buy_place_send_insufficient
-             ~state
-             ~now
-             ~asset
-             ~qty:p.bp_qty
-             ~buy_price:p.bp_price
-             ~quote_needed:p.bp_quote_needed
-             ~available_quote_balance:p.bp_available
-      else
-        buy_place_latch_capital_low
-          ~state
-          ~now
-          ~asset
-          ~quote_needed:p.bp_quote_needed
-          ~available_quote_balance:p.bp_available
-          ~quote_balance
-          ~locked_in_buys
-          ~buy_price:p.bp_price
-          ~qty:p.bp_qty
-    else buy_place_warn_quote ~asset;
-  !attempted
+        Logging.debug_f
+          ~section
+          "Buy placement skipped for %s (cooldown=%B, inflight=%B)"
+          asset.symbol
+          p.bp_cooldown
+          p.bp_inflight
+      else if p.bp_balance_ok
+      then
+        attempted := buy_place_send ~state ~now ~asset ~qty:p.bp_qty ~buy_price:p.bp_price
+      else if not (Hashtbl.mem state.amend_cooldowns "place_Buy")
+      then
+        if quote_balance_stale
+        then
+          attempted
+          := buy_place_send_insufficient
+               ~state
+               ~now
+               ~asset
+               ~qty:p.bp_qty
+               ~buy_price:p.bp_price
+               ~quote_needed:p.bp_quote_needed
+               ~available_quote_balance:p.bp_available
+        else
+          buy_place_latch_capital_low
+            ~state
+            ~now
+            ~asset
+            ~quote_needed:p.bp_quote_needed
+            ~available_quote_balance:p.bp_available
+            ~quote_balance
+            ~locked_in_buys
+            ~buy_price:p.bp_price
+            ~qty:p.bp_qty
+      else buy_place_warn_quote ~asset;
+    !attempted)
 ;;
 
 (** True when a resting or pending sell is tracked (the 2*gi clamp applies). *)
@@ -1206,7 +1218,7 @@ let sell_leg_prepare_into
      consumed the last quote leaves the filled base unsold and the strategy paused longer
      than necessary (and over-accumulating). Placement is inventory-gated and clamped to
      non-reserved base, so it can never dip into reserved_base. *)
-  let capital_exhausted = oracle_halted || state.capital_low in
+  let capital_exhausted = oracle_halted || state.capital_low || state.exposure_high in
   let halt_inventory_check = capital_exhausted && inventory_ok in
   (* Whether a fresh buy fill / placement still owes its own ladder rung. Captured here,
      before [sell_leg_finalize_latch] consumes [just_filled_buy], so the restore branch

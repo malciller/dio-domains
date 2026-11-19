@@ -1512,6 +1512,9 @@ let asset_domain_worker
          | Some d -> not d.active
          | None -> false)
     in
+    (* Max-exposure transitions only: the flag is re-derived every cycle, but only a
+       change wakes the domain or logs. *)
+    let exposure_high_prev = ref false in
     (* Cascade cancel state: a decision with [cancel_resting_buys] asks this domain to
        cancel its resting buys so committed capital returns to the venue pool for a
        higher-priority strategy. The cancel is a network op that can fail silently
@@ -1753,6 +1756,10 @@ let asset_domain_worker
     (* Allocation-free cached balance closures. *)
     let base_balance_fn = Ex.get_tradeable_balance_fast ~asset:base_asset in
     let quote_balance_fn = Ex.get_tradeable_balance_fast ~asset:quote_currency in
+    (* Cross-venue portfolio valuation inputs. Every domain reports a balance move, not
+       only capped ones: one venue's fill changes the shared denominator of every cap. *)
+    let exposure_last_base = ref Float.nan in
+    let exposure_last_quote = ref Float.nan in
     (* Optional venue capability: senior quote reservations (overlays) reduce the quote
        available to the primary grid. Venues that do not register the capability keep the
        raw tradeable figure. *)
@@ -1882,6 +1889,15 @@ let asset_domain_worker
       if is_grid_strategy
       then Some (Dio_strategies.Strategy_api.get_strategy_state asset_with_fees.symbol)
       else None
+    in
+    (* Cold-path exposure wiring: limits and the venue's snapshot slot are fixed at spawn.
+       A domain with no cap pays one [None] match per cycle and never touches the
+       valuation snapshot. *)
+    let exposure_limits = asset_with_fees.max_exposure in
+    let exposure_venue_idx =
+      match exposure_limits with
+      | None -> -1
+      | Some _ -> Exposure.venue_index ~exchange:asset_with_fees.exchange
     in
     let cached_fng_check_threshold = config.fng_check_threshold in
     let wakeup_sync =
@@ -2264,12 +2280,42 @@ let asset_domain_worker
               ~symbol:ov.oir_config.oi_owner_symbol
           with
           | Some d ->
-            ctx.cg_parent_unfunded <- not d.active;
+            ctx.cg_parent_oracle_active <- d.active;
             ctx.cg_parent_order_qty
             <- (if Float.is_finite d.buy_qty then Float.max 0.0 d.buy_qty else 0.0)
           | None ->
-            ctx.cg_parent_unfunded <- false;
-            ctx.cg_parent_order_qty <- 0.0));
+            ctx.cg_parent_oracle_active <- true;
+            ctx.cg_parent_order_qty <- 0.0);
+        (* The parent's local pauses do not wait for an oracle pass. Keep the two flags
+           separate: capital_low and max exposure are different causes with the same
+           outcome for this overlay. *)
+        let parent_capital_low, parent_exposure_high =
+          match cached_grid_state with
+          | Some s -> s.capital_low, s.exposure_high
+          | None -> false, false
+        in
+        let was_unfunded = ctx.cg_parent_unfunded in
+        ctx.cg_parent_unfunded
+        <- Exposure.parent_unfunded
+             ~oracle_active:ctx.cg_parent_oracle_active
+             ~capital_low:parent_capital_low
+             ~exposure_high:parent_exposure_high;
+        if was_unfunded <> ctx.cg_parent_unfunded
+        then (
+          let reason =
+            if parent_exposure_high
+            then "max_exposure"
+            else if parent_capital_low
+            then "capital_low"
+            else "oracle_inactive"
+          in
+          Logging.info_f
+            ~section
+            "[%s/%s] parent %s: short fallback %s"
+            asset_with_fees.exchange
+            asset_with_fees.symbol
+            reason
+            (if ctx.cg_parent_unfunded then "active" else "clear")));
       let orc_ns = if t_orc0 > 0 then Monotonic_clock.now_ns () - t_orc0 else 0 in
       let t_prep = if measured then Monotonic_clock.now_ns () else 0 in
       let alloc_at_prep = if measured then Monotonic_clock.minor_words () else 0 in
@@ -3868,6 +3914,81 @@ let asset_domain_worker
           !oracle_decision_cached)
         else !oracle_decision_cached
       in
+      (* One snapshot read + two compares. Runs outside the execution gate so a cap that
+         clears on a price move wakes the next pass. Unknown denominators fail open. *)
+      let exposure_high =
+        match exposure_limits, cached_grid_state with
+        | Some _, Some st when exposure_venue_idx >= 0 && !current_price > 0.0 ->
+          let snapshot = Exposure.current () in
+          let position_value = (st.position_base +. st.staked_base) *. !current_price in
+          let venue_value =
+            if exposure_venue_idx < Array.length snapshot.venue_values
+            then snapshot.venue_values.(exposure_venue_idx)
+            else 0.0
+          in
+          Exposure.breached
+            ~position_value
+            ~portfolio_value:snapshot.portfolio_value
+            ~venue_value
+            ~limits:exposure_limits
+        | _ -> false
+      in
+      (match cached_grid_state with
+       | Some st -> st.exposure_high <- exposure_high
+       | None -> ());
+      if exposure_high <> !exposure_high_prev
+      then (
+        exposure_high_prev := exposure_high;
+        incr intent_gen;
+        match cached_grid_state with
+        | Some st ->
+          let snapshot = Exposure.current () in
+          let position_value =
+            if Float.is_nan !current_price
+            then 0.0
+            else (st.position_base +. st.staked_base) *. !current_price
+          in
+          let venue_value =
+            if exposure_venue_idx >= 0
+               && exposure_venue_idx < Array.length snapshot.venue_values
+            then snapshot.venue_values.(exposure_venue_idx)
+            else 0.0
+          in
+          let portfolio_pct, venue_pct =
+            Exposure.ratios
+              ~position_value
+              ~portfolio_value:snapshot.portfolio_value
+              ~venue_value
+          in
+          let portfolio_limit, venue_limit =
+            match exposure_limits with
+            | Some limits ->
+              ( Option.value limits.portfolio_pct ~default:nan
+              , Option.value limits.venue_pct ~default:nan )
+            | None -> nan, nan
+          in
+          if exposure_high
+          then
+            Logging.info_f
+              ~section
+              "[%s/%s] Max exposure reached: %.2f%% of portfolio (limit %.2f%%), %.2f%% \
+               of venue (limit %.2f%%); new buys paused"
+              asset_with_fees.exchange
+              asset_with_fees.symbol
+              portfolio_pct
+              portfolio_limit
+              venue_pct
+              venue_limit
+          else
+            Logging.info_f
+              ~section
+              "[%s/%s] Max exposure cleared: %.2f%% of portfolio, %.2f%% of venue; \
+               resuming buys"
+              asset_with_fees.exchange
+              asset_with_fees.symbol
+              portfolio_pct
+              venue_pct
+        | None -> ());
       let oracle_halted =
         match oracle_decision with
         | Some d when d.cancel_resting_buys -> true
@@ -4214,6 +4335,19 @@ let asset_domain_worker
            prev_capital_low := low;
            if not low then incr intent_gen)
        | None -> ());
+      (* Feed the shared valuation service from the balance edge, not a timer. Every
+         domain reports, including uncapped ones: one venue's fill moves the shared
+         portfolio denominator. *)
+      if Exposure.enabled ()
+      then (
+        let base = base_balance_fn () in
+        let quote = quote_balance_fn () in
+        let changed a b = not (a = b || (Float.is_nan a && Float.is_nan b)) in
+        if changed base !exposure_last_base || changed quote !exposure_last_quote
+        then (
+          exposure_last_base := base;
+          exposure_last_quote := quote;
+          Exposure.notify ()));
       (* A changed open-order set means an order was added, amended, or vanished at the
          venue. The vanish case is what matters here: a cancelled/expired rung has no book
          tick of its own, so without this intent the restore waits for unrelated market
@@ -4929,6 +5063,11 @@ let asset_domain_worker
           | Some s -> s.capital_low
           | None -> false
         in
+        let trace_input_exposure_high =
+          match cached_grid_state with
+          | Some s -> s.exposure_high
+          | None -> false
+        in
         (* Venue immediately-sellable base (Alpaca qty_available), distinct from the
            tradeable balance above; the strategy reads it via [get_available_balance_fast]
            and it must be recorded to replay the sell leg. *)
@@ -5071,6 +5210,8 @@ let asset_domain_worker
             ; ( "force_buy_reanchor"
               , Dio_strategies.Strategy_expr.V_bool trace_input_force_reanchor )
             ; "capital_low", Dio_strategies.Strategy_expr.V_bool trace_input_capital_low
+            ; ( "exposure_high"
+              , Dio_strategies.Strategy_expr.V_bool trace_input_exposure_high )
             ; ( "venue_available"
               , Dio_strategies.Strategy_expr.V_float trace_input_venue_available )
             ; ( "grid_qty"
@@ -5729,6 +5870,8 @@ let spawn_supervised_domains_for_assets
   (* Start the off-cycle workers here, on the main domain, before any trading domain is
      pinned or promoted: a domain spawned from a trading domain inherits its CPU pin and
      scheduling policy for the window before it re-pins itself. *)
+  if List.exists (fun (t : Config.trading_config) -> t.max_exposure <> None) assets
+  then Exposure.start ();
   if Config.get_overlay_instances () <> [] || get_overlay_controllers () <> []
   then Aux_services.start ();
   (* Register assets in core-assignment order: registration is where a trading CPU is

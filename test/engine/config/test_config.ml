@@ -29,18 +29,43 @@ let test_parse_trading_config_defaults () =
   Alcotest.(check (option (float 0.001))) "maker_fee none" None config.maker_fee;
   Alcotest.(check (option (float 0.001))) "taker_fee none" None config.taker_fee;
   Alcotest.(check (option string)) "min_usd_balance none" None config.min_usd_balance;
-  Alcotest.(check (option string)) "max_exposure none" None config.max_exposure
+  Alcotest.(check bool) "max_exposure none" true (config.max_exposure = None)
 ;;
 
 let test_parse_trading_config_optional_fields () =
   let json_str =
-    {|{"symbol": "LTC/USD", "qty": "0.1", "strategy": "grid", "min_usd_balance": "100", "max_exposure": "500"}|}
+    {|{"symbol": "LTC/USD", "qty": "0.1", "strategy": "grid", "min_usd_balance": "100",
+       "max_exposure": {"portfolio_pct": 10, "venue_pct": 25}}|}
   in
   let json = Yojson.Basic.from_string json_str in
   let config = Dio_engine.Config.parse_config json in
   Alcotest.(check string) "strategy preserved verbatim" "grid" config.strategy;
   Alcotest.(check (option string)) "min_usd_balance" (Some "100") config.min_usd_balance;
-  Alcotest.(check (option string)) "max_exposure" (Some "500") config.max_exposure
+  match config.max_exposure with
+  | Some limits ->
+    Alcotest.(check (option (float 1e-9)))
+      "portfolio_pct"
+      (Some 10.0)
+      limits.portfolio_pct;
+    Alcotest.(check (option (float 1e-9))) "venue_pct" (Some 25.0) limits.venue_pct
+  | None -> Alcotest.fail "max_exposure not parsed"
+;;
+
+let test_parse_exposure_null_clears_inherited () =
+  let json =
+    Yojson.Basic.from_string
+      {|{"symbol": "SPCX", "exchange": "alpaca", "qty": "1", "strategy": "grid",
+         "max_exposure": {"venue_pct": null, "portfolio_pct": 10}}|}
+  in
+  let config = Dio_engine.Config.parse_config json in
+  match config.max_exposure with
+  | Some limits ->
+    Alcotest.(check (option (float 1e-9))) "venue leg cleared" None limits.venue_pct;
+    Alcotest.(check (option (float 1e-9)))
+      "portfolio leg kept"
+      (Some 10.0)
+      limits.portfolio_pct
+  | None -> Alcotest.fail "max_exposure not parsed"
 ;;
 
 let test_parse_overlays () =
@@ -983,6 +1008,10 @@ let () =
             "optional fields"
             `Quick
             test_parse_trading_config_optional_fields
+        ; Alcotest.test_case
+            "exposure null clears one leg"
+            `Quick
+            test_parse_exposure_null_clears_inherited
         ; Alcotest.test_case "cpu priority" `Quick test_parse_trading_config_cpu_priority
         ; Alcotest.test_case
             "overlay key accepted"

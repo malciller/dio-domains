@@ -24,6 +24,7 @@
   Aux_services
   Config
   Domain_spawner
+  Exposure
   Latency_rows
   Order_executor
   Strategy_replay

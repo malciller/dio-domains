@@ -372,7 +372,7 @@ let render_asset_detail w h asset_key (snapshot : Snapshot.t) =
     (* Buy orders: real exchange orders, else a synthetic strategy target. *)
     let cap_low =
       match strat_opt with
-      | Some s -> s.capital_low
+      | Some s -> s.capital_low || s.exposure_high
       | None -> false
     in
     let buy_orders_parsed =

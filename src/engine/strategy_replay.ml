@@ -134,6 +134,7 @@ let snapshot_entries (st : Dio_strategies.Strategy_state.strategy_state)
   ; "s_cached_sell_mult", Expr.V_float st.cached_sell_mult
   ; "s_asset_low", Expr.V_bool st.asset_low
   ; "s_capital_low", Expr.V_bool st.capital_low
+  ; "s_exposure_high", Expr.V_bool st.exposure_high
   ; "s_resuming_after_balance_flag", Expr.V_bool st.resuming_after_balance_flag
   ; "s_just_filled_buy", Expr.V_bool st.just_filled_buy
   ; "s_startup_replay", Expr.V_bool st.startup_replay
@@ -206,6 +207,7 @@ let seed
   st.cached_sell_mult <- getf "s_cached_sell_mult" st.cached_sell_mult;
   st.asset_low <- getb "s_asset_low" st.asset_low;
   st.capital_low <- getb "s_capital_low" st.capital_low;
+  st.exposure_high <- getb "s_exposure_high" st.exposure_high;
   st.resuming_after_balance_flag
   <- getb "s_resuming_after_balance_flag" st.resuming_after_balance_flag;
   st.just_filled_buy <- getb "s_just_filled_buy" st.just_filled_buy;
@@ -480,6 +482,7 @@ let drive
       (* Domain-provided knobs the oracle re-sets outside the strategy call. *)
       if b_entry entries "force_buy_reanchor" false then state.force_buy_reanchor <- true;
       if b_entry entries "capital_low" false then state.capital_low <- true;
+      if b_entry entries "exposure_high" false then state.exposure_high <- true;
       (* Restore the venue's immediately-sellable base snapshot for this cycle. *)
       (match set_venue_available with
        | Some f ->

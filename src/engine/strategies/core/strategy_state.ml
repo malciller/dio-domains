@@ -183,6 +183,10 @@ type strategy_state =
       (* unix time of the last deduplicated sell-block log entry *)
   ; mutable capital_low : bool
       (* set when quote balance is insufficient for next buy; pauses strategy *)
+  ; mutable exposure_high : bool
+      (* set when the optional max_exposure cap is reached; pauses new buys. Derivable
+         from live valuation every cycle, never persisted, and independent of
+         [capital_low]. *)
   ; mutable capital_low_logged : bool (* suppresses repeated capital-low log warnings *)
   ; mutable capital_low_at_balance : float
       (* quote_bal snapshot when capital_low was set (log context only); -1.0 = unstamped.
@@ -673,6 +677,7 @@ let rec get_strategy_state asset_symbol =
       ; last_sell_block_reason = ""
       ; last_sell_block_log_at = 0.0
       ; capital_low = false
+      ; exposure_high = false
       ; capital_low_logged = false
       ; capital_low_at_balance = 0.0
       ; capital_low_last_log_at = 0.0

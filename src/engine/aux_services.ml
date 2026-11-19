@@ -618,46 +618,94 @@ let save_mutex = Mutex.create ()
 let save_wake = Condition.create ()
 let save_started = Atomic.make false
 
+(** Non-persistent work multiplexed onto the same low-priority background domain. The
+    registry is a callback list so this module never depends on its users. *)
+let maintenance_tasks : (string * (unit -> unit)) list Atomic.t = Atomic.make []
+
+(** Bumped by [signal_maintenance]; the worker compares it under [save_mutex] so a
+    notification that lands just before [Condition.wait] cannot be lost. *)
+let maintenance_epoch = Atomic.make 0
+
+let save_one (j : save_job) =
+  let json =
+    `Assoc
+      (Array.to_list
+         (Array.map2
+            (fun name v -> name, Dio_strategies.Overlay_instance_runtime.json_of_value v)
+            j.names
+            j.values))
+  in
+  if json <> !(j.previous)
+  then (
+    j.previous := json;
+    Dio_persistence.Overlay_instance_store.save_async
+      ~owner_exchange:j.owner_exchange
+      ~owner_symbol:j.owner_symbol
+      ~id:j.id
+      json)
+;;
+
 let start_save_service () =
   if Atomic.compare_and_set save_started false true
   then (
-    Logging.info_f ~section "save domain started";
+    Logging.info_f ~section "maintenance domain started";
     ignore
       (Domain.spawn (fun () ->
          Thread_affinity.set_self_other ();
          Thread_affinity.pin_self_background ();
          Gc_config.apply ();
+         let seen_maintenance = ref (-1) in
          while true do
            Mutex.lock save_mutex;
-           if Queue.is_empty save_jobs
+           let has_jobs = not (Queue.is_empty save_jobs) in
+           let epoch = Atomic.get maintenance_epoch in
+           if (not has_jobs) && epoch = !seen_maintenance
            then (
              Condition.wait save_wake save_mutex;
              Mutex.unlock save_mutex)
            else (
-             let jobs = Queue.fold (fun acc j -> j :: acc) [] save_jobs in
-             Queue.clear save_jobs;
+             let job = if has_jobs then Some (Queue.pop save_jobs) else None in
+             seen_maintenance := epoch;
              Mutex.unlock save_mutex;
+             (* Maintenance first: a slow persistence write must not delay a risk
+                snapshot. One save job per pass keeps the two interleaved. *)
              List.iter
-               (fun j ->
-                 let json =
-                   `Assoc
-                     (Array.to_list
-                        (Array.map2
-                           (fun name v ->
-                             name, Dio_strategies.Overlay_instance_runtime.json_of_value v)
-                           j.names
-                           j.values))
-                 in
-                 if json <> !(j.previous)
-                 then (
-                   j.previous := json;
-                   Dio_persistence.Overlay_instance_store.save_async
-                     ~owner_exchange:j.owner_exchange
-                     ~owner_symbol:j.owner_symbol
-                     ~id:j.id
-                     json))
-               jobs)
+               (fun (name, run) ->
+                 try run () with
+                 | exn ->
+                   Logging.error_f
+                     ~section
+                     "maintenance task '%s' failed: %s"
+                     name
+                     (Printexc.to_string exn))
+               (Atomic.get maintenance_tasks);
+             match job with
+             | Some j -> save_one j
+             | None -> ())
          done)))
+;;
+
+(** Wake the shared maintenance domain. Safe from any domain; the epoch closes the
+    check-then-wait race. *)
+let signal_maintenance () =
+  Atomic.incr maintenance_epoch;
+  Mutex.lock save_mutex;
+  Condition.signal save_wake;
+  Mutex.unlock save_mutex
+;;
+
+let register_maintenance ~name ~run =
+  let rec add () =
+    let old = Atomic.get maintenance_tasks in
+    if List.mem_assoc name old
+    then ()
+    else if Atomic.compare_and_set maintenance_tasks old ((name, run) :: old)
+    then ()
+    else add ()
+  in
+  add ();
+  start_save_service ();
+  signal_maintenance ()
 ;;
 
 let enqueue_save ~owner_exchange ~owner_symbol ~id ~names ~values ~previous =

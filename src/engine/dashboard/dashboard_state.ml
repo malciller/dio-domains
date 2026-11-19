@@ -146,6 +146,7 @@ let json_of_grid_strategy exchange symbol =
     ; "reserved_base", `Float state.reserved_base
     ; "reserved_quote", `Float state.reserved_quote
     ; "capital_low", `Bool state.capital_low
+    ; "exposure_high", `Bool state.exposure_high
     ; "market_is_closed", `Bool market_is_closed
     ; "asset_low", `Bool state.asset_low
     ; "inflight_buy", `Bool state.inflight_buy

@@ -95,7 +95,12 @@
           "exchange": "alpaca",
           "symbol": "SPY",
           "qty": "0.01",
-          "grid_interval": [0.1, 0.5]
+          "grid_interval": [0.1, 0.5],
+          // Optional concentration caps. Both are percentages of the strategy's
+          // marked position value; omit either key (or the whole object) for no cap.
+          // venue_pct is against this venue's total value; portfolio_pct is against
+          // the total value of every connected venue. Either breach pauses new buys.
+          "max_exposure": { "venue_pct": 25, "portfolio_pct": 10 }
         }
       }
     ]

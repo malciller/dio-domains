@@ -33,8 +33,12 @@ type ctx =
       lock-free hashtable read but hashing the (exchange, symbol) key allocates, so the
       overlay refreshes at most once per oracle pass instead of once per cycle. *)
   ; mutable cg_parent_gen : int
-  (** Parent grid cannot place its next buy (capital oracle INACTIVE). *)
+  (** Parent grid cannot place its next buy. Oracle INACTIVE, the parent's local
+      capital_low latch, and the parent's max-exposure halt all feed the same fallback. *)
   ; mutable cg_parent_unfunded : bool
+  (** Oracle verdict cached per publish generation; local parent flags are read every
+      overlay pass because they can change without an oracle pass. *)
+  ; mutable cg_parent_oracle_active : bool
   (** Parent's next buy size in base units, inherited verbatim by the outlier fallback. *)
   ; mutable cg_parent_order_qty : float
   (** True when the controller has a Hyperliquid spot leg, so the recycle base buy is
@@ -164,6 +168,7 @@ let create () =
   ; cg_inventory_override = -1.0
   ; cg_parent_gen = -1
   ; cg_parent_unfunded = false
+  ; cg_parent_oracle_active = true
   ; cg_parent_order_qty = 0.0
   ; cg_overlay_has_spot_leg = false
   ; cg_overlay_spot_symbol = ""

@@ -178,6 +178,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
   let build_strategy_row ?(is_selected = false) is_even (symbol, (s : Snapshot.strategy)) =
     let exchange = s.exchange in
     let cap_low = s.capital_low in
+    let expo_high = s.exposure_high in
     let mid = s.market.mid in
     let base_bal = s.market.base_balance in
     let staked_bal = s.market.staked_balance in
@@ -254,7 +255,7 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
       | [] -> None
       | prices -> Some (List.fold_left min (List.hd prices) prices)
     in
-    let has_buy = (not cap_low) && buy_price > 0.0 && mid > 0.0 in
+    let has_buy = (not cap_low) && (not expo_high) && buy_price > 0.0 && mid > 0.0 in
     let has_sell = closest_sell_price_opt <> None in
     let execution_proximity_opt =
       match has_buy, closest_sell_price_opt with
@@ -376,7 +377,8 @@ let render_strategies ?(selected_index = None) w (snapshot : Snapshot.t) =
     let oracle_paused = oracle_inactive s in
     let has_resting_buy = buy_price > 0.0 in
     let status_str, status_attr =
-      if ((not has_resting_buy) && (oracle_paused || cap_low)) || market_is_closed
+      if ((not has_resting_buy) && (oracle_paused || cap_low || expo_high))
+         || market_is_closed
       then "⏸", a_yellow
       else "▶", a_green
     in
