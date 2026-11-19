@@ -108,8 +108,8 @@ module Alpaca_impl = struct
       sits in [pending_cancel] and its shares stay in [held_for_orders] until the venue
       finishes. Placing the replacement immediately therefore races the release and is
       rejected with HTTP 403 ["insufficient qty available for order"]. Park on the
-      execution stream's open-orders change and re-check the store; the timeout is only an
-      alarm. *)
+      execution stream's open-orders change and re-check the store; the timeout bounds the
+      wait, it never decides the outcome on its own. *)
   let cancel_settle_timeout_s = 15.0
 
   type cancel_settle =
@@ -135,46 +135,56 @@ module Alpaca_impl = struct
 
   let wait_for_cancel_settle ~symbol ~order_id =
     let deadline = Unix.gettimeofday () +. cancel_settle_timeout_s in
+    (* One authoritative read of the venue's view; [None] = still open. *)
+    let settled_now () =
+      match Alpaca_executions.get_open_order symbol order_id with
+      | None ->
+        let filled = filled_qty_for_order ~symbol ~order_id in
+        Some (if filled > 0.0 then Cancel_filled filled else Cancel_settled)
+      | Some (o : Alpaca_executions.open_order_internal) ->
+        (match o.status with
+         | Types.Filled -> Some (Cancel_filled o.cum_qty)
+         | Types.Canceled | Types.Expired | Types.Rejected ->
+           Alpaca_executions.remove_open_order symbol order_id;
+           Some Cancel_settled
+         | _ -> None)
+    in
     let rec loop () =
       (* Capture the generation before reading the store: a publication that lands between
          the read and the wait must leave the generation changed, so the waiter re-checks
          instead of sleeping to the deadline. *)
       let seen = Alpaca_executions.get_orders_generation () in
-      match Alpaca_executions.get_open_order symbol order_id with
+      match settled_now () with
+      | Some outcome -> Lwt.return outcome
       | None ->
-        let filled = filled_qty_for_order ~symbol ~order_id in
-        if filled > 0.0
-        then Lwt.return (Cancel_filled filled)
-        else Lwt.return Cancel_settled
-      | Some (o : Alpaca_executions.open_order_internal) ->
-        (match o.status with
-         | Types.Filled -> Lwt.return (Cancel_filled o.cum_qty)
-         | Types.Canceled | Types.Expired | Types.Rejected ->
-           Alpaca_executions.remove_open_order symbol order_id;
-           Lwt.return Cancel_settled
-         | _ ->
-           let remaining = deadline -. Unix.gettimeofday () in
-           if remaining <= 0.0
-           then Lwt.return Cancel_unsettled
-           else if Alpaca_executions.get_orders_generation () <> seen
-           then loop ()
-           else (
-             let changed = Alpaca_executions.wait_orders_changed () in
-             (* Close the register-then-recheck race without broadcasting: this Lwt
-                resolves callbacks inline, and a self-broadcast would re-enter [loop]. *)
-             if Alpaca_executions.get_orders_generation () <> seen
-             then (
-               Lwt.cancel changed;
-               loop ())
-             else
-               Lwt.pick
-                 [ (changed >|= fun () -> `Change)
-                 ; (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
-                 ]
-               >>= fun outcome ->
-               match outcome with
-               | `Change -> loop ()
-               | `Timeout -> Lwt.return Cancel_unsettled))
+        let remaining = deadline -. Unix.gettimeofday () in
+        if remaining <= 0.0
+        then Lwt.return Cancel_unsettled
+        else if Alpaca_executions.get_orders_generation () <> seen
+        then loop ()
+        else (
+          let changed = Alpaca_executions.wait_orders_changed () in
+          (* Close the register-then-recheck race without broadcasting: this Lwt resolves
+             callbacks inline, and a self-broadcast would re-enter [loop]. *)
+          if Alpaca_executions.get_orders_generation () <> seen
+          then (
+            Lwt.cancel changed;
+            loop ())
+          else
+            Lwt.pick
+              [ (changed >|= fun () -> `Change)
+              ; (Lwt_unix.sleep remaining >|= fun () -> `Timeout)
+              ]
+            >>= fun outcome ->
+            match outcome with
+            | `Change -> loop ()
+            | `Timeout ->
+              (* The alarm never decides: a confirm that landed in the same tick, or whose
+                 wakeup this waiter never saw, is already in the store. *)
+              Lwt.return
+                (match settled_now () with
+                 | Some r -> r
+                 | None -> Cancel_unsettled))
     in
     loop ()
   ;;
@@ -310,6 +320,10 @@ module Alpaca_impl = struct
            ; amend_id = Some "skipped_no_change"
            ; cl_ord_id = existing.cl_ord_id
            })
+    | Some { status = Types.Pending; _ } ->
+      (* Cancelling an order the venue is still routing parks it in [pending_cancel].
+         Defer without a REST call; the order's own status update retries. *)
+      Lwt.return (Error "order not yet confirmed by the venue")
     | found when is_fractional ->
       (match found, qty, limit_price with
        | Some existing, Some q, Some lp ->

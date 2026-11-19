@@ -1463,7 +1463,12 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
       || contains_fragment lower_reason "qty available"
       || contains_fragment lower_reason "held_for_orders"
     in
-    if not is_held_qty
+    (* The venue had not confirmed the order yet; its own status update is the retry
+       trigger, so a backoff would only delay the amend past that event. *)
+    let is_venue_deferral =
+      contains_fragment lower_reason "not yet confirmed by the venue"
+    in
+    if not (is_held_qty || is_venue_deferral)
     then (
       (* 429 is account-wide: another amend on the same order would only deepen it, so the
          backoff outlasts the bucket refill instead of retrying on the next tick. *)
