@@ -74,6 +74,10 @@ type exchange_config =
     never-seen (lost) dispatch; an acked order is kept until its terminal event. *)
 let sell_commitment_timeout_s = 120.0
 
+(** TIF-recovery window: a buy killed by the venue keeps retrying for this long. Owned
+    here so the gate, the expiry and [next_deadline] share one value. *)
+let tif_recovery_window_s = 900.0
+
 (** Per-asset trading configuration. *)
 type trading_config =
   { exchange : string
@@ -917,7 +921,7 @@ let next_deadline t =
   let at = ref nan in
   let take v = if Float.is_finite v && (Float.is_nan !at || v < !at) then at := v in
   Hashtbl.iter (fun _ expiry -> take expiry) t.amend_cooldowns;
-  if t.tif_recovery_pending then take (t.tif_recovery_since +. 900.0);
+  if t.tif_recovery_pending then take (t.tif_recovery_since +. tif_recovery_window_s);
   Hashtbl.iter (fun _ (expiry, _) -> take expiry) t.evicted_orders;
   Hashtbl.iter
     (fun _ (c : sell_commitment) ->

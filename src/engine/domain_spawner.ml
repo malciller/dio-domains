@@ -5638,7 +5638,12 @@ let asset_domain_worker
         let woke = Monotonic_clock.now_ns () in
         let signalled = Concurrency.Exchange_wakeup.last_signal_ns_fast wakeup_sync in
         let delta = woke - signalled in
-        if signalled >= parked_at && delta > 0 && delta < 50_000_000
+        (* A timer wake measures the timer domain's scheduling, not producer -> domain;
+           exclude it so the histogram keeps one meaning. *)
+        let timer_edge =
+          (not (Float.is_nan !next_wake_at)) && Unix.gettimeofday () >= !next_wake_at
+        in
+        if (not timer_edge) && signalled >= parked_at && delta > 0 && delta < 50_000_000
         then Latency_profiler.record_ns prof_wake delta);
       if !exec_ready && (not !latency_active) && !cycle_count - !exec_ready_cycle >= 10
       then (

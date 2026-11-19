@@ -509,7 +509,8 @@ let buy_gate c =
   match c.cg_state, c.cg_asset with
   | Some state, Some asset ->
     let recovery_expired =
-      state.tif_recovery_pending && c.cg_now -. state.tif_recovery_since >= 900.0
+      state.tif_recovery_pending
+      && c.cg_now -. state.tif_recovery_since >= Types.tif_recovery_window_s
     in
     if recovery_expired
     then (
@@ -519,7 +520,8 @@ let buy_gate c =
         "TIF recovery window expired for %s - resuming normal oracle-gated buying"
         asset.symbol);
     let tif_recovery_active =
-      state.tif_recovery_pending && c.cg_now -. state.tif_recovery_since < 900.0
+      state.tif_recovery_pending
+      && c.cg_now -. state.tif_recovery_since < Types.tif_recovery_window_s
     in
     let active = not (c.cg_oracle_halted && not tif_recovery_active) in
     c.cg_buy_active <- active;
@@ -536,7 +538,8 @@ let expire_tif_recovery c =
   c.cg_buy_attempted <- false;
   match c.cg_state, c.cg_asset with
   | Some state, Some asset ->
-    if state.tif_recovery_pending && c.cg_now -. state.tif_recovery_since >= 900.0
+    if state.tif_recovery_pending
+       && c.cg_now -. state.tif_recovery_since >= Types.tif_recovery_window_s
     then (
       state.tif_recovery_pending <- false;
       Logging.info_f

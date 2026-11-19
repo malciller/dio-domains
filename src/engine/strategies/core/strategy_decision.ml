@@ -2069,7 +2069,8 @@ let execute_strategy
          for the entire oracle-inactive window. The latch expires (900s) so it cannot pin
          buys through a genuine, persistent capital halt. *)
       let recovery_expired =
-        state.tif_recovery_pending && now -. state.tif_recovery_since >= 900.0
+        state.tif_recovery_pending
+        && now -. state.tif_recovery_since >= tif_recovery_window_s
       in
       if recovery_expired
       then (
@@ -2079,7 +2080,8 @@ let execute_strategy
           "TIF recovery window expired for %s - resuming normal oracle-gated buying"
           asset.symbol);
       let tif_recovery_active =
-        state.tif_recovery_pending && now -. state.tif_recovery_since < 900.0
+        state.tif_recovery_pending
+        && now -. state.tif_recovery_since < tif_recovery_window_s
       in
       let a_buy_start = Gc.minor_words () in
       let t_buy_start = Monotonic_clock.now_ns () in

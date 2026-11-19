@@ -617,12 +617,11 @@ let save_jobs : save_job Queue.t = Queue.create ()
 
 (** One-shot work handed to the maintenance domain: JSON trace snapshots and other
     callbacks that must never run I/O on a trading domain. Bounded so a slow disk cannot
-    grow the queue without limit; the oldest entry is dropped and counted. *)
+    grow the queue without limit; the oldest entry is dropped and reported. *)
 let task_jobs : (string * (unit -> unit)) Queue.t = Queue.create ()
 
 let task_capacity = 8
 let tasks_dropped = Atomic.make 0
-let tasks_dropped_count () = Atomic.get tasks_dropped
 let save_mutex = Mutex.create ()
 let save_wake = Condition.create ()
 let save_started = Atomic.make false
@@ -741,14 +740,25 @@ let enqueue_save ~owner_exchange ~owner_symbol ~id ~names ~values ~previous =
 (** Hand one-shot work to the maintenance domain. [name] identifies the task in an error
     log. Called from a trading domain, so it must stay a queue push and a signal. *)
 let enqueue_background ~name f =
+  let dropped = ref 0 in
   Mutex.lock save_mutex;
   if Queue.length task_jobs >= task_capacity
   then (
     ignore (Queue.pop task_jobs);
-    ignore (Atomic.fetch_and_add tasks_dropped 1));
+    dropped := Atomic.fetch_and_add tasks_dropped 1 + 1);
   Queue.push (name, f) task_jobs;
   Condition.signal save_wake;
   Mutex.unlock save_mutex;
+  (* Power-of-two rate limit: a stuck writer drops every task, and an unthrottled warn
+     would turn that into a log storm from a trading domain. *)
+  let n = !dropped in
+  if n > 0 && n land (n - 1) = 0
+  then
+    Logging.warn_f
+      ~section
+      "background task '%s' dropped (%d total; oldest replaced)"
+      name
+      n;
   start_save_service ()
 ;;
 
