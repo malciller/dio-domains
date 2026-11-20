@@ -1477,7 +1477,12 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
       || contains_fragment lower_reason "qty available"
       || contains_fragment lower_reason "held_for_orders"
     in
-    if not is_held_qty
+    (* The order is still routing; the store listing it is the retry trigger, so a backoff
+       would only delay the amend past that event. *)
+    let is_venue_deferral =
+      contains_fragment lower_reason "not yet confirmed by the venue"
+    in
+    if not (is_held_qty || is_venue_deferral)
     then (
       (* 429 is account-wide: another amend on the same order would only deepen it, so the
          backoff outlasts the bucket refill instead of retrying on the next tick. *)
@@ -1491,24 +1496,28 @@ let handle_order_amendment_failed ~now asset_symbol order_id side reason =
         else 2.0
       in
       Hashtbl.replace state.amend_cooldowns order_id (now +. backoff));
-    match side with
-    | Buy ->
-      (match state.last_buy_order_id with
-       | Some target_id when target_id = order_id ->
-         Logging.info_f
-           ~section
-           "Amendment failed for buy order %s: %s. Keeping tracking; the next book event \
-            retries if still warranted."
-           order_id
-           reason
-       | _ -> ())
-    | Sell ->
-      Logging.info_f
-        ~section
-        "Amendment failed for sell order %s: %s. Keeping tracking; the next book event \
-         retries if still warranted."
-        order_id
-        reason);
+    (* A deferral retries every tick until the venue lists the order; logging it there
+       would spam the ring for the whole routing window. *)
+    if not is_venue_deferral
+    then (
+      match side with
+      | Buy ->
+        (match state.last_buy_order_id with
+         | Some target_id when target_id = order_id ->
+           Logging.info_f
+             ~section
+             "Amendment failed for buy order %s: %s. Keeping tracking; the next book event \
+              retries if still warranted."
+             order_id
+             reason
+         | _ -> ())
+      | Sell ->
+        Logging.info_f
+          ~section
+          "Amendment failed for sell order %s: %s. Keeping tracking; the next book event \
+           retries if still warranted."
+          order_id
+          reason));
   ignore
     (InFlightOrders.remove_in_flight_order
        (match side with

@@ -3766,6 +3766,41 @@ let test_unsettled_amend_failure_backs_off () =
    still resting and holding the shares. Classifying it as order-gone cleared tracking,
    released the commitment and pushed a cancel, so every cooldown re-issued the same
    doomed amend (the repeating 403/422 storm). *)
+let test_unconfirmed_amend_deferral_has_no_backoff () =
+  (* The order is still routing; the store listing it is the retry event, so the deferral
+     must not arm a cooldown (which would delay the amend past the listing). *)
+  let symbol = "DEFER_AMEND/ANT" in
+  let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
+  state.exchange_id <- "alpaca";
+  state.last_buy_order_id <- Some "defer-1";
+  state.last_buy_order_price <- Some 92.0;
+  Hashtbl.remove state.amend_cooldowns "defer-1";
+  let buffer = Dio_strategies.Strategy_api.get_order_buffer () in
+  let rec drain () =
+    match Dio_strategies.Strategy_common.LockFreeQueue.read buffer with
+    | Some _ -> drain ()
+    | None -> ()
+  in
+  drain ();
+  Dio_strategies.Strategy_api.Strategy.handle_order_amendment_failed
+    ~now:100.0
+    symbol
+    "defer-1"
+    Dio_strategies.Strategy_common.Buy
+    "order not yet confirmed by the venue";
+  check
+    (option string)
+    "unconfirmed amend keeps tracking"
+    (Some "defer-1")
+    state.last_buy_order_id;
+  check
+    bool
+    "unconfirmed amend arms no cooldown"
+    false
+    (Hashtbl.mem state.amend_cooldowns "defer-1");
+  drain ()
+;;
+
 let test_insufficient_qty_amend_failure_keeps_tracking () =
   let symbol = "HELDQ/SMH/USD" in
   let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
@@ -9704,6 +9739,10 @@ let () =
             "held-qty amend failure keeps tracking"
             `Quick
             test_insufficient_qty_amend_failure_keeps_tracking
+        ; test_case
+            "unconfirmed amend defers without a backoff"
+            `Quick
+            test_unconfirmed_amend_deferral_has_no_backoff
         ; test_case
             "insufficient-balance failure does not arm recovery"
             `Quick

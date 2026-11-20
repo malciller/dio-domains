@@ -312,6 +312,13 @@ module Alpaca_impl = struct
       | _ -> false
     in
     match find_existing () with
+    | None ->
+      (* Still routing: the venue has not listed it yet. Cancelling now parks the cancel in
+         [pending_cancel] and the replacement stalls to the settle timeout, leaving the book
+         empty. The executions store listing the order is the retry event. *)
+      Lwt.return (Error "order not yet confirmed by the venue")
+    | Some { status = Types.Pending; _ } ->
+      Lwt.return (Error "order not yet confirmed by the venue")
     | Some existing when unchanged existing ->
       Lwt.return
         (Ok
