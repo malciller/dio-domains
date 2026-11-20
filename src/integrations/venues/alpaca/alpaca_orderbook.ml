@@ -26,6 +26,15 @@ let arrival_clock = ref (fun () -> Unix.gettimeofday ())
 let set_arrival_clock_for_test f = arrival_clock := f
 let now_s () = !arrival_clock ()
 
+(** Prints and position marks may only become top-of-book outside regular trading hours.
+    During RTH a quiet quote is still the NBBO: replacing it with a print or the mark made
+    a thin symbol's mid jump away from the book and snap back on the next quote. *)
+let promotion_allowed =
+  ref (fun () -> not (Alpaca_market_hours.is_regular_market_open ()))
+;;
+
+let set_promotion_allowed_for_test f = promotion_allowed := f
+
 type quote =
   { bid_price : float
   ; bid_size : float
@@ -159,14 +168,15 @@ module SymbolStore = struct
     }
   ;;
 
-  (** Publish [price] as top-of-book while no quote has arrived for [stale_after]. Gated
-      on arrival ([quote_at]), not the venue quote timestamp: a quiet symbol's quote
-      timestamp stays old while its quote is current, so using [ts] let prints and marks
-      overwrite the quote on alternate polls. Compare-and-swap, because a quote write and
-      a promotion must not publish the same [pos] and a fresh quote must win. *)
+  (** Publish [price] as top-of-book only outside regular trading hours, and only while no
+      quote has arrived for [stale_after]. Gated on arrival ([quote_at]), not the venue
+      quote timestamp: a quiet symbol's quote timestamp stays old while its quote is
+      current, so using [ts] let prints and marks overwrite the quote on alternate polls.
+      Compare-and-swap, because a quote write and a promotion must not publish the same
+      [pos] and a fresh quote must win. *)
   let rec promote t ~price ~now ~stale_after =
     let prev = Atomic.get t.tob in
-    if price > 0.0 && now -. prev.quote_at > stale_after
+    if price > 0.0 && !promotion_allowed () && now -. prev.quote_at > stale_after
     then (
       let next =
         { prev with
