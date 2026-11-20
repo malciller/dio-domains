@@ -303,6 +303,56 @@ let test_replace_positions_scope () =
   | None -> fail "expected builder position"
 ;;
 
+let test_builder_publish_drops_closed () =
+  Dio_exchange.Market_context.clear ~exchange:"hyperliquid";
+  let pos coin =
+    `Assoc
+      [ ( "position"
+        , `Assoc
+            [ "coin", `String coin
+            ; "szi", `String "-0.5"
+            ; "entryPx", `String "100"
+            ; "positionValue", `String "50"
+            ; "unrealizedPnl", `String "0"
+            ; "marginUsed", `String "5"
+            ; "leverage", `Assoc [ "type", `String "cross"; "value", `Int 10 ]
+            ] )
+      ]
+  in
+  let frame positions = `Assoc [ "assetPositions", `List positions ] in
+  Hyperliquid.Dex_positions.publish ~now:1.0 ~dex:"xyz" (frame [ pos "ANT" ]);
+  (match
+     Dio_exchange.Market_context.get_position ~exchange:"hyperliquid" ~coin:"xyz:ANT"
+   with
+   | Some p -> check (float 1e-12) "builder qty" (-0.5) p.qty
+   | None -> fail "expected builder position");
+  (* A main-dex coin is outside this dex's namespace and must survive. *)
+  Dio_exchange.Market_context.update_position
+    ~at:1.5
+    ~exchange:"hyperliquid"
+    { Dio_exchange.Exchange_intf.Market_context.coin = "MAIN"
+    ; qty = 1.0
+    ; entry = 100.0
+    ; position_value = 100.0
+    ; unrealized_pnl = 0.0
+    ; margin_used = 10.0
+    ; liquidation = None
+    ; leverage = Some 10.0
+    ; updated_at = 0.0
+    };
+  (* The dex's whole set is now empty: its position is closed and is dropped. *)
+  Hyperliquid.Dex_positions.publish ~now:2.0 ~dex:"xyz" (frame []);
+  check
+    bool
+    "closed builder position dropped"
+    true
+    (Dio_exchange.Market_context.get_position ~exchange:"hyperliquid" ~coin:"xyz:ANT"
+     = None);
+  match Dio_exchange.Market_context.get_position ~exchange:"hyperliquid" ~coin:"MAIN" with
+  | Some p -> check (float 1e-12) "main survives" 1.0 p.qty
+  | None -> fail "builder publish wiped a main position"
+;;
+
 let () =
   run
     "hyperliquid_market_context"
@@ -310,6 +360,10 @@ let () =
     ; ( "positions"
       , [ test_case "webData2" `Quick test_positions
         ; test_case "replace scope per dex" `Quick test_replace_positions_scope
+        ; test_case
+            "builder publish drops a closed position"
+            `Quick
+            test_builder_publish_drops_closed
         ] )
     ; "reservation", [ test_case "quote reservation" `Quick test_reservation ]
     ; "capabilities", [ test_case "optional exchange-intf" `Quick test_capabilities ]

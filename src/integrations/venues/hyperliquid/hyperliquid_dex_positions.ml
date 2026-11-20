@@ -96,8 +96,8 @@ let fetch_dex ~testnet ~user ~dex =
   >>= fun text -> Lwt.return (Yojson.Safe.from_string text)
 ;;
 
-(** Publish one dex's positions into the shared market context. Coins the dex no longer
-    reports are dropped so a closed position cannot linger. *)
+(** Publish one dex's positions into the shared market context. The payload is the dex's
+    whole set, so coins it no longer reports are dropped. *)
 let publish ~now ~dex (payload : Yojson.Safe.t) =
   let open Yojson.Safe.Util in
   match
@@ -106,21 +106,25 @@ let publish ~now ~dex (payload : Yojson.Safe.t) =
   with
   | None -> ()
   | Some positions ->
-    let updated = ref false in
-    List.iter
-      (fun json ->
-        match parse_position ~dex json with
-        | Some (p : Dio_exchange.Exchange_intf.Market_context.position) ->
-          updated := true;
-          Dio_exchange.Market_context.update_position
-            ~at:now
-            ~exchange:"hyperliquid"
-            { p with updated_at = now }
-        | None -> ())
-      positions;
+    let live =
+      List.filter_map
+        (fun json ->
+          match parse_position ~dex json with
+          | Some (p : Dio_exchange.Exchange_intf.Market_context.position) ->
+            Some { p with updated_at = now }
+          | None -> None)
+        positions
+    in
+    let prefix = dex ^ ":" in
+    (* Own namespace only: the main dex and other builder dexs publish their own sets. *)
+    Dio_exchange.Market_context.replace_positions
+      ~only:(fun coin -> String.starts_with ~prefix coin)
+      ~exchange:"hyperliquid"
+      ~updated_at:now
+      live;
     (* Position snapshots size overlay hedges across owner domains, so this is a
        cross-cutting edge. The poll only fetches; the wake is an ordinary signal. *)
-    if !updated then Concurrency.Exchange_wakeup.signal_all ()
+    Concurrency.Exchange_wakeup.signal_all ()
 ;;
 
 let start ~testnet ~user ~dexes () =
