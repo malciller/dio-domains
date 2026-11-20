@@ -104,8 +104,11 @@ balance-only inventory legs:
 - `strategy.qty` is the grid's base order size. Set it to `"min"` (or `"n(min)"`,
   n ≥ 1) to trade the venue's minimum placeable size times n: the base-quantity
   floor or the quote-notional floor at the order's own price, ceiled to the lot,
-  re-checked when each order is built. Overlays size against their own venue's
-  minimum instead of inheriting the owner's.
+  re-checked when each order is built. Set it to `"n + min"` (or `"min + n"`,
+  n > 0) to trade that minimum plus n units of the quote currency at the order's
+  own price, e.g. `"1 + min"` is the minimum notional plus 1 USDC. Overlays size
+  against their own venue's minimum (plus the same quote addition for the
+  `"n + min"` forms) instead of inheriting the owner's base size.
 - In the grouped layout the strategy file name is `strategy.name`. The legacy
   flat `trading` array is still accepted; there the file name is `strategy`.
 - `overlay` takes a list of instances. Engine behaviour comes from the strategy

@@ -537,7 +537,21 @@ let test_qty_min_multiplier () =
   check "a spaced multiplier" (Some 1.5) " 1.5 (min) ";
   check "a number is not a sentinel" None "0.1";
   check "a longer word is not a sentinel" None "minimum";
+  check "a plus form is not a multiplier" None "1 + min";
+  check "a reversed plus form is not a multiplier" None "min + 1";
   check "a sub-minimum multiplier clamps to the minimum" (Some 1.0) "0.5(min)";
+  let check_plus label expected qty =
+    Alcotest.(check (option (float 1e-12))) label expected (qty_min_plus_quote qty)
+  in
+  check_plus "quote addition" (Some 1.0) "1 + min";
+  check_plus "unspaced quote addition" (Some 2.5) "2.5+min";
+  check_plus "trimmed and cased quote addition" (Some 1.0) " 1 + MIN ";
+  check_plus "reversed quote addition" (Some 1.0) "min + 1";
+  check_plus "unspaced reversed quote addition" (Some 2.5) "MIN+2.5";
+  check_plus "a plain sentinel is not a quote addition" None "min";
+  check_plus "a multiplier is not a quote addition" None "3(min)";
+  check_plus "a number is not a quote addition" None "0.1";
+  check_plus "a longer word is not a reversed quote addition" None "minimum + 1";
   Alcotest.(check (float 1e-12))
     "numeric config resolves verbatim"
     0.25
@@ -585,7 +599,16 @@ let test_order_qty_floors_at_the_resting_price () =
   state.grid_qty <- 0.5;
   Alcotest.(check (float 1e-12)) "a larger grid size wins" 0.5 (qty 80.0);
   state.qty_min_mult <- 0.0;
-  Alcotest.(check (float 1e-12)) "a numeric qty is untouched" 0.5 (qty 80.0)
+  Alcotest.(check (float 1e-12)) "a numeric qty is untouched" 0.5 (qty 80.0);
+  state.grid_qty <- 0.05;
+  state.qty_min_plus_quote <- 1.0;
+  Alcotest.(check (float 1e-12)) "a quote addition lifts the floor" 0.11 (qty 100.0);
+  Alcotest.(check (float 1e-12))
+    "a quote addition refloors and ceils to the lot after a drop"
+    0.15
+    (qty 80.0);
+  state.qty_min_plus_quote <- 0.0;
+  Alcotest.(check (float 1e-12)) "no quote addition leaves a numeric qty" 0.05 (qty 80.0)
 ;;
 
 let () =

@@ -163,21 +163,29 @@ let analyze_one
       else (
         let knobs = knobs_for ~config ~symbol:tc.symbol in
         let qty_raw =
+          (* The buy rests one grid interval under the anchor; size the minimum at that
+             rung so the notional floor still clears after the venue's rounding. *)
+          let rung =
+            current *. (1.0 -. (Float.max 0.0 (fst tc.grid_interval) /. 100.0))
+          in
           match Dio_strategies.Strategy_venue.qty_min_multiplier tc.qty with
           | Some mult ->
-            (* The buy rests one grid interval under the anchor; size the minimum at that
-               rung so the notional floor still clears after the venue's rounding. *)
-            let rung =
-              current *. (1.0 -. (Float.max 0.0 (fst tc.grid_interval) /. 100.0))
-            in
             Dio_strategies.Strategy_venue.venue_min_qty
               ~mult
               ~exchange:tc.exchange
               ~symbol:tc.symbol
               ~price:rung
           | None ->
-            (try Float.of_string tc.qty with
-             | _ -> 0.0)
+            (match Dio_strategies.Strategy_venue.qty_min_plus_quote tc.qty with
+             | Some extra_quote ->
+               Dio_strategies.Strategy_venue.venue_min_qty_plus_quote
+                 ~extra_quote
+                 ~exchange:tc.exchange
+                 ~symbol:tc.symbol
+                 ~price:rung
+             | None ->
+               (try Float.of_string tc.qty with
+                | _ -> 0.0))
         in
         let bounds =
           { Dio_oracle.Oracle_core.qty = Float.max 1e-12 qty_raw

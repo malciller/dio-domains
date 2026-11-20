@@ -286,6 +286,45 @@ let get_min_notional_val symbol exchange =
   | None -> 0.0
 ;;
 
+(** Quote-currency amount added to the venue minimum by a configured [qty] of the form
+    ["n + min"] or ["min + n"] with [n] > 0, e.g. ["1 + min"] is the minimum plus 1 USDC
+    of notional at the order's price. [None] when [qty] is not that form. A malformed
+    amount warns and falls back to 0.0 (the bare minimum) rather than a size that cannot
+    fill. *)
+let qty_min_plus_quote (qty : string) : float option =
+  let s = String.lowercase_ascii (String.trim qty) in
+  let n = String.length s in
+  let k = 3 in
+  let parse_amount amount =
+    match float_of_string_opt (String.trim amount) with
+    | Some q when Float.is_finite q && q > 0.0 -> Some q
+    | _ ->
+      Logging.warn_f
+        ~section
+        "Invalid qty '%s' (want 'n + min' or 'min + n' with n > 0); using the venue \
+         minimum"
+        qty;
+      Some 0.0
+  in
+  if n <= k
+  then None
+  else if String.equal (String.sub s (n - k) k) "min"
+  then (
+    let prefix = String.trim (String.sub s 0 (n - k)) in
+    let p = String.length prefix in
+    if p = 0 || not (Char.equal prefix.[p - 1] '+')
+    then None
+    else parse_amount (String.sub prefix 0 (p - 1)))
+  else if String.equal (String.sub s 0 k) "min"
+  then (
+    let rest = String.trim (String.sub s k (n - k)) in
+    let p = String.length rest in
+    if p = 0 || not (Char.equal rest.[0] '+')
+    then None
+    else parse_amount (String.sub rest 1 (p - 1)))
+  else None
+;;
+
 (** Multiplier over the venue minimum named by a configured [qty], or [None] when [qty] is
     a plain number. ["min"] is 1.0; ["2.5(min)"] is 2.5. A malformed multiplier warns and
     falls back to 1.0 (the minimum, still placeable) rather than a size that cannot fill. *)
@@ -340,6 +379,30 @@ let venue_min_qty ~mult ~exchange ~symbol ~price =
   if mult <= 1.0 then base else ceil_to_inv (mult *. base) (1.0 /. increment)
 ;;
 
+(** [base] plus [extra_quote] worth of the quote currency at [price], in base units and
+    ceiled to the lot. The minimum itself already clears its own floor, so only the added
+    notional can fall between lots. *)
+let add_quote_base ~extra_quote ~base ~qty_increment ~price =
+  if extra_quote <= 0.0 || (not (price > 0.0)) || not (Float.is_finite price)
+  then base
+  else ceil_to_inv (base +. (extra_quote /. price)) (1.0 /. qty_increment)
+;;
+
+(** The venue minimum placeable base quantity for [symbol] plus [extra_quote] of quote at
+    [price] (["n + min"] / ["min + n"]). Price-dependent, so resolved at spawn and on each
+    oracle publish. *)
+let venue_min_qty_plus_quote ~extra_quote ~exchange ~symbol ~price =
+  let increment = get_qty_increment_val symbol exchange in
+  let base =
+    min_order_base
+      ~qty_min:(get_qty_min_val symbol exchange)
+      ~qty_increment:increment
+      ~min_notional:(get_min_notional_val symbol exchange)
+      ~price
+  in
+  add_quote_base ~extra_quote ~base ~qty_increment:increment ~price
+;;
+
 (** Venue tradeable figure for [symbol]'s quote currency, or [nan]. Diagnostic: the grid
     uses the domain figure (already net of overlay reservations); the raw figure lets
     capital-low logs show the overlay claim. *)
@@ -373,13 +436,14 @@ let venue_lot_qty grid_qty exchange state =
 ;;
 
 (** Base quantity for a new order resting at [price]: the grid's configured size, floored
-    up to [n] times the venue minimum when [strategy.qty] is ["n(min)"]. Evaluated at the
-    order's own price, so a move between oracle passes cannot place a size the venue
-    rejects. *)
+    up to [n] times the venue minimum when [strategy.qty] is ["n(min)"], or to the venue
+    minimum plus [n] quote when it is ["n + min"] or ["min + n"]. Evaluated at the order's
+    own price, so a move between oracle passes cannot place a size the venue rejects. *)
 let order_qty ~price ~exchange state =
   let qty = venue_lot_qty state.grid_qty exchange state in
   let mult = state.qty_min_mult in
-  if mult <= 0.0
+  let extra_quote = state.qty_min_plus_quote in
+  if mult <= 0.0 && extra_quote <= 0.0
   then qty
   else (
     let base =
@@ -390,7 +454,10 @@ let order_qty ~price ~exchange state =
         ~price
     in
     let floor =
-      if mult > 1.0
+      if extra_quote > 0.0
+      then
+        add_quote_base ~extra_quote ~base ~qty_increment:state.cached_qty_increment ~price
+      else if mult > 1.0
       then ceil_to_inv (mult *. base) (1.0 /. state.cached_qty_increment)
       else base
     in
@@ -418,13 +485,17 @@ let parse_config_float config value_name default exchange symbol =
 ;;
 
 (** Resolve a configured [qty] string to base units. ["min"] and ["n(min)"] ask for the
-    venue's minimum placeable size times [n]; anything else is the configured number. An
-    unparsable value resolves to 0.0, which withholds buying rather than trading a guessed
-    size. *)
+    venue's minimum placeable size times [n]; ["n + min"] and ["min + n"] ask for the
+    minimum plus [n] of quote currency at [price]; anything else is the configured number.
+    An unparsable value resolves to 0.0, which withholds buying rather than trading a
+    guessed size. *)
 let resolve_config_qty (qty : string) ~exchange ~symbol ~price =
   match qty_min_multiplier qty with
   | Some mult -> venue_min_qty ~mult ~exchange ~symbol ~price
-  | None -> parse_config_float qty "qty" 0.0 exchange symbol
+  | None ->
+    (match qty_min_plus_quote qty with
+     | Some extra_quote -> venue_min_qty_plus_quote ~extra_quote ~exchange ~symbol ~price
+     | None -> parse_config_float qty "qty" 0.0 exchange symbol)
 ;;
 
 let get_min_move_threshold price_increment =

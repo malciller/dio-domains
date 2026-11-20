@@ -1037,14 +1037,20 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
         ctx.cg_symbol <- oi.oi_symbol;
         (* Fixed at spawn: the owner grid's configured size, which the paused fallback
            stands in with. The runtime asset's qty is oracle-derived and up-sizes.
-           ["n(min)"] carries no base size: the overlay sizes its own venue's minimum
-           times that multiplier. *)
+           ["n(min)"] and the ["n + min"] / ["min + n"] forms carry no base size: the
+           overlay sizes its own venue's minimum times that multiplier, or plus that quote
+           amount. *)
         ctx.cg_parent_config_min_mult
         <- Option.value
              (Dio_strategies.Strategy_venue.qty_min_multiplier owner.qty)
              ~default:0.0;
+        ctx.cg_parent_config_plus_quote
+        <- Option.value
+             (Dio_strategies.Strategy_venue.qty_min_plus_quote owner.qty)
+             ~default:0.0;
         ctx.cg_parent_config_qty
         <- (if ctx.cg_parent_config_min_mult > 0.0
+               || ctx.cg_parent_config_plus_quote > 0.0
             then 0.0
             else (
               try Float.max 0.0 (float_of_string owner.qty) with
@@ -1673,6 +1679,10 @@ let asset_domain_worker
       st.qty_min_mult
       <- Option.value
            (Dio_strategies.Strategy_venue.qty_min_multiplier asset_with_fees.qty)
+           ~default:0.0;
+      st.qty_min_plus_quote
+      <- Option.value
+           (Dio_strategies.Strategy_venue.qty_min_plus_quote asset_with_fees.qty)
            ~default:0.0;
       st.persistence_dirty <- false;
       st.persistence_key

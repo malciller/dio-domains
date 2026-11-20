@@ -1974,6 +1974,7 @@ let execute_strategy
         | None -> 1.0);
     state.cached_venue_min_notional <- get_min_notional_val asset.symbol asset.exchange;
     state.qty_min_mult <- Option.value (qty_min_multiplier asset.qty) ~default:0.0;
+    state.qty_min_plus_quote <- Option.value (qty_min_plus_quote asset.qty) ~default:0.0;
     state.exchange_reserved_atomic <- Some (get_exchange_reserved_atomic asset.exchange));
   if state.cached_venue_min_notional <= 0.0
   then state.cached_venue_min_notional <- get_min_notional_val asset.symbol asset.exchange;

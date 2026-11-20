@@ -43,9 +43,12 @@ type ctx =
   ; mutable cg_parent_order_qty : float
   (** The parent's configured [strategy.qty] in base units, fixed at spawn. *)
   ; mutable cg_parent_config_qty : float
-  (** The parent's configured [strategy.qty] multiplier over the venue minimum: 0.0 when
-      the qty is numeric, else [n] from ["n(min)"]. *)
+  (** The parent's configured [strategy.qty] multiplier over the venue minimum: 0.0 unless
+      the qty is ["n(min)"], then [n]. *)
   ; mutable cg_parent_config_min_mult : float
+  (** The parent's configured [strategy.qty] quote addition over the venue minimum from
+      ["n + min"] / ["min + n"]: 0.0 when the qty is a number or a plain multiplier. *)
+  ; mutable cg_parent_config_plus_quote : float
   (** True when the controller has a Hyperliquid spot leg, so the recycle base buy is
       active. When false the recycle stays 100% quote. *)
   ; mutable cg_overlay_has_spot_leg : bool
@@ -188,6 +191,7 @@ let create () =
   ; cg_parent_order_qty = 0.0
   ; cg_parent_config_qty = 0.0
   ; cg_parent_config_min_mult = 0.0
+  ; cg_parent_config_plus_quote = 0.0
   ; cg_overlay_has_spot_leg = false
   ; cg_overlay_spot_symbol = ""
   ; cg_last_leverage = 0.0
@@ -350,6 +354,8 @@ let prepare_init c =
       state.cached_venue_min_notional
       <- Jac.get_min_notional_val asset.symbol asset.exchange;
       state.qty_min_mult <- Option.value (Jac.qty_min_multiplier asset.qty) ~default:0.0;
+      state.qty_min_plus_quote
+      <- Option.value (Jac.qty_min_plus_quote asset.qty) ~default:0.0;
       state.exchange_reserved_atomic
       <- Some (Jac.get_exchange_reserved_atomic asset.exchange));
     if state.cached_venue_min_notional <= 0.0
@@ -943,6 +949,7 @@ let market_facts_io (io : Strategy_runtime.facts_io) c =
   setf Slots.parent_order_qty c.cg_parent_order_qty;
   setf Slots.parent_config_qty c.cg_parent_config_qty;
   setf Slots.parent_config_min_mult c.cg_parent_config_min_mult;
+  setf Slots.parent_config_plus_quote c.cg_parent_config_plus_quote;
   mark 3;
   (match c.cg_carry with
    | Some cs ->

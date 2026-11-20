@@ -98,6 +98,7 @@ let known_platform_caps =
   ; "parent_order_qty"
   ; "parent_config_qty"
   ; "parent_config_min_mult"
+  ; "parent_config_plus_quote"
   ; "carry_close_price"
   ; "carry_close_qty"
   ; "carry_close_kind"

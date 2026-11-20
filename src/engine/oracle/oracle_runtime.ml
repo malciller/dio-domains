@@ -1222,13 +1222,17 @@ let run_account_pass
         (fun (t : Oracle_tasks.task) ->
           let summary = open_orders_summary ~exchange:t.exchange ~symbol:t.symbol in
           let knobs = effective_knobs ~config ~symbol:t.symbol in
-          (* ["n(min)"] is price-dependent: resolve it against the rung the first buy
-             rests at, not at config load. The grid consumes the concrete number
-             published. *)
+          (* ["n(min)"], ["n + min"] and ["min + n"] are price-dependent: resolve them
+             against the rung the first buy rests at, not at config load. The grid
+             consumes the concrete number published. *)
           let min_mult = Dio_strategies.Strategy_venue.qty_min_multiplier t.config.qty in
+          let min_plus_quote =
+            Dio_strategies.Strategy_venue.qty_min_plus_quote t.config.qty
+          in
+          let venue_sized = Option.is_some min_mult || Option.is_some min_plus_quote in
           let qty_raw =
-            match min_mult with
-            | Some mult ->
+            if venue_sized
+            then (
               let fallback =
                 match Hashtbl.find_opt history_cache (t.exchange, t.symbol) with
                 | Some series ->
@@ -1243,17 +1247,26 @@ let run_account_pass
               let rung =
                 anchor *. (1.0 -. (Float.max 0.0 (fst t.config.grid_interval) /. 100.0))
               in
-              Dio_strategies.Strategy_venue.venue_min_qty
-                ~mult
-                ~exchange:t.exchange
-                ~symbol:t.symbol
-                ~price:rung
-            | None -> float_of_string_opt t.config.qty |> Option.value ~default:0.0
+              match min_mult, min_plus_quote with
+              | Some mult, _ ->
+                Dio_strategies.Strategy_venue.venue_min_qty
+                  ~mult
+                  ~exchange:t.exchange
+                  ~symbol:t.symbol
+                  ~price:rung
+              | None, Some extra_quote ->
+                Dio_strategies.Strategy_venue.venue_min_qty_plus_quote
+                  ~extra_quote
+                  ~exchange:t.exchange
+                  ~symbol:t.symbol
+                  ~price:rung
+              | None, None -> 0.0)
+            else float_of_string_opt t.config.qty |> Option.value ~default:0.0
           in
           (* Instrument metadata can lag the first passes. A dust bound would trade a size
              the venue rejects, so skip this asset and keep its last-known-good decision,
              as an unavailable history does. *)
-          if Option.is_some min_mult && qty_raw <= 0.0
+          if venue_sized && qty_raw <= 0.0
           then (
             Logging.debug_f
               ~section
