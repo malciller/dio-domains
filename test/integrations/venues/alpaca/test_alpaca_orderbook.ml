@@ -51,12 +51,9 @@ let check_book symbol expected =
 let test_print_seeds_when_no_quote_has_arrived () =
   (* No quote yet: the print is the only price evidence, and without it the store has no
      valid TOB at all, so an extended-hours session could never start. *)
-  Alpaca.Orderbook.set_promotion_allowed_for_test (fun () -> true);
   let sym = "T_NOSEED" in
   handle (trade_msg sym 138.5 "2026-01-02T15:00:01Z");
-  check_book sym (Some (138.5, 0.0, 138.5, 0.0));
-  Alpaca.Orderbook.set_promotion_allowed_for_test (fun () ->
-    not (Alpaca.Market_hours.is_regular_market_open ()))
+  check_book sym (Some (138.5, 0.0, 138.5, 0.0))
 ;;
 
 let test_print_never_moves_a_live_book () =
@@ -76,7 +73,6 @@ let test_print_promotes_after_the_quote_goes_stale () =
   let sym = "T_STALE" in
   let clock = ref 1_000.0 in
   Alpaca.Orderbook.set_arrival_clock_for_test (fun () -> !clock);
-  Alpaca.Orderbook.set_promotion_allowed_for_test (fun () -> true);
   handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
   check_book sym (Some (140.0, 10.0, 141.0, 10.0));
   (* The quote stream has been silent for the fallback window: this is the only price. *)
@@ -90,24 +86,36 @@ let test_print_promotes_after_the_quote_goes_stale () =
   clock := 1_067.0;
   handle (quote_msg sym 131.5 132.5 "2026-01-02T18:00:06Z");
   check_book sym (Some (131.5, 10.0, 132.5, 10.0));
-  Alpaca.Orderbook.set_arrival_clock_for_test Unix.gettimeofday;
-  Alpaca.Orderbook.set_promotion_allowed_for_test (fun () ->
-    not (Alpaca.Market_hours.is_regular_market_open ()))
+  Alpaca.Orderbook.set_arrival_clock_for_test Unix.gettimeofday
 ;;
 
-let test_regular_hours_keep_the_quote () =
-  (* During RTH a quiet quote is still the NBBO; a print must not replace it. *)
-  let sym = "T_RTH" in
-  let clock = ref 1_000.0 in
-  Alpaca.Orderbook.set_arrival_clock_for_test (fun () -> !clock);
-  Alpaca.Orderbook.set_promotion_allowed_for_test (fun () -> false);
-  handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
-  clock := 1_200.0;
-  handle (trade_msg sym 145.0 "2026-01-02T15:05:00Z");
-  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
-  Alpaca.Orderbook.set_promotion_allowed_for_test (fun () ->
-    not (Alpaca.Market_hours.is_regular_market_open ()));
-  Alpaca.Orderbook.set_arrival_clock_for_test Unix.gettimeofday
+let test_wide_quote_uses_the_last_trade () =
+  (* IEX books on thin names can be 10-30% wide; their mid is not a price. *)
+  let sym = "T_WIDE" in
+  handle (trade_msg sym 110.0 "2026-01-02T15:00:00Z");
+  handle (quote_msg sym 100.0 120.0 "2026-01-02T15:00:01Z");
+  check_book sym (Some (110.0, 0.0, 110.0, 0.0));
+  (* A sane two-sided quote takes the book back. *)
+  handle (quote_msg sym 109.5 110.5 "2026-01-02T15:00:02Z");
+  check_book sym (Some (109.5, 10.0, 110.5, 10.0));
+  (* An out-of-order print cannot drag the fallback price backwards. *)
+  handle (quote_msg sym 100.0 120.0 "2026-01-02T15:00:03Z");
+  handle (trade_msg sym 90.0 "2026-01-02T14:59:00Z");
+  handle (quote_msg sym 100.0 120.0 "2026-01-02T15:00:04Z");
+  check_book sym (Some (110.0, 0.0, 110.0, 0.0))
+;;
+
+let test_grid_spread_cap_governs_the_mid () =
+  (* The cap comes from the grid interval: 1% here, so a 1.8% book is rejected even though
+     it would pass the 5% default. *)
+  let sym = "T_CAP" in
+  handle (trade_msg sym 105.0 "2026-01-02T15:00:00Z");
+  Dio_exchange.Market_context.set_spread_cap ~exchange:"alpaca" ~coin:sym ~frac:0.01;
+  handle (quote_msg sym 109.0 111.0 "2026-01-02T15:00:01Z");
+  check_book sym (Some (105.0, 0.0, 105.0, 0.0));
+  (* Inside the cap the mid wins. *)
+  handle (quote_msg sym 109.9 110.1 "2026-01-02T15:00:02Z");
+  check_book sym (Some (109.9, 10.0, 110.1, 10.0))
 ;;
 
 let test_quiet_quote_stamp_still_wins () =
@@ -209,9 +217,13 @@ let () =
             `Quick
             test_quiet_quote_stamp_still_wins
         ; Alcotest.test_case
-            "regular hours keep the quote"
+            "a wide quote falls back to the last trade"
             `Quick
-            test_regular_hours_keep_the_quote
+            test_wide_quote_uses_the_last_trade
+        ; Alcotest.test_case
+            "the grid spread cap governs the mid"
+            `Quick
+            test_grid_spread_cap_governs_the_mid
         ] )
     ; ( "quote_publishes_tob"
       , [ Alcotest.test_case "quote publishes bid/ask" `Quick test_quote_publishes_bid_ask

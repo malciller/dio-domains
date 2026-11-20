@@ -1468,6 +1468,7 @@ let asset_domain_worker
     let orderbook_read_pos = ref 0 in
     (* Latest market data derived from consumed ring buffer events *)
     let current_price = ref nan in
+    let spread_cap_frac = ref (-1.0) in
     let tob_bid = ref nan in
     let tob_ask = ref nan in
     let tob_bsize = ref nan in
@@ -3340,6 +3341,21 @@ let asset_domain_worker
       (* === ORDERBOOK HOT PATH === *)
       (* [t1] stays the cycle start for TOTAL; the book bracket starts after the lifecycle
          drain so it measures the book, not event handling. *)
+      (* The venue's quote sanity cap follows this grid's spacing: a book wider than two
+         grid intervals cannot price an order. Set once per interval change. *)
+      let grid_interval =
+        match !grid_strategy_asset_ref with
+        | Some a -> a.grid_interval
+        | None -> fst asset_with_fees.grid_interval
+      in
+      let spread_cap = 2.0 *. grid_interval /. 100.0 in
+      if Float.abs (spread_cap -. !spread_cap_frac) > 1e-12
+      then (
+        spread_cap_frac := spread_cap;
+        Dio_exchange.Market_context.set_spread_cap
+          ~exchange:asset_with_fees.exchange
+          ~coin:(Config.base_coin_of_symbol asset_with_fees.symbol)
+          ~frac:spread_cap);
       let ob_t0 = if latency_this_cycle then Monotonic_clock.now_ns () else 0 in
       let ob_pos = get_ob_pos_fn () in
       let did_ob =

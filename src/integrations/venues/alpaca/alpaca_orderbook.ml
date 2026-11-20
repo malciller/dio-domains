@@ -26,14 +26,10 @@ let arrival_clock = ref (fun () -> Unix.gettimeofday ())
 let set_arrival_clock_for_test f = arrival_clock := f
 let now_s () = !arrival_clock ()
 
-(** Prints and position marks may only become top-of-book outside regular trading hours.
-    During RTH a quiet quote is still the NBBO: replacing it with a print or the mark made
-    a thin symbol's mid jump away from the book and snap back on the next quote. *)
-let promotion_allowed =
-  ref (fun () -> not (Alpaca_market_hours.is_regular_market_open ()))
-;;
-
-let set_promotion_allowed_for_test f = promotion_allowed := f
+(** Fallback relative spread cap when the trading domain has not published one from its
+    grid interval. A wider book is not a usable price — IEX shows 10–30% two-sided books
+    on thin names — so the last trade wins until a sane quote returns. *)
+let default_max_mid_spread_frac = 0.05
 
 type quote =
   { bid_price : float
@@ -126,6 +122,8 @@ module SymbolStore = struct
     ; trades_capacity : int
     ; mutable write_pos : int
     ; mutable trades_write_pos : int
+    ; mutable last_trade_px : float
+    ; mutable last_trade_at : float
     ; mutable session : session option
     (** In-progress session bar from this feed (see [session] above), rolled on date
         change. Guarded by [mutex]. *)
@@ -152,6 +150,8 @@ module SymbolStore = struct
     ; trades_capacity = 100
     ; write_pos = 0
     ; trades_write_pos = 0
+    ; last_trade_px = 0.0
+    ; last_trade_at = 0.0
     ; session = None
     ; tob =
         Atomic.make
@@ -168,15 +168,14 @@ module SymbolStore = struct
     }
   ;;
 
-  (** Publish [price] as top-of-book only outside regular trading hours, and only while no
-      quote has arrived for [stale_after]. Gated on arrival ([quote_at]), not the venue
-      quote timestamp: a quiet symbol's quote timestamp stays old while its quote is
-      current, so using [ts] let prints and marks overwrite the quote on alternate polls.
-      Compare-and-swap, because a quote write and a promotion must not publish the same
-      [pos] and a fresh quote must win. *)
+  (** Publish [price] as top-of-book while no quote has arrived for [stale_after]. Gated
+      on arrival ([quote_at]), not the venue quote timestamp: a quiet symbol's quote
+      timestamp stays old while its quote is current, so using [ts] let prints and marks
+      overwrite the quote on alternate polls. Compare-and-swap, because a quote write and
+      a promotion must not publish the same [pos] and a fresh quote must win. *)
   let rec promote t ~price ~now ~stale_after =
     let prev = Atomic.get t.tob in
-    if price > 0.0 && !promotion_allowed () && now -. prev.quote_at > stale_after
+    if price > 0.0 && now -. prev.quote_at > stale_after
     then (
       let next =
         { prev with
@@ -200,19 +199,41 @@ module SymbolStore = struct
       let idx = t.write_pos mod t.capacity in
       t.buffer.(idx) <- q;
       t.write_pos <- t.write_pos + 1;
-      let px =
+      let mid =
         if q.bid_price > 0.0 && q.ask_price > 0.0
         then (q.bid_price +. q.ask_price) /. 2.0
         else Float.max q.bid_price q.ask_price
+      in
+      let max_spread =
+        match
+          Dio_exchange.Market_context.get_spread_cap ~exchange:"alpaca" ~coin:t.symbol
+        with
+        | Some f -> f
+        | None -> default_max_mid_spread_frac
+      in
+      let spread_ok =
+        q.bid_price > 0.0
+        && q.ask_price > 0.0
+        && mid > 0.0
+        && (q.ask_price -. q.bid_price) /. mid <= max_spread
+      in
+      (* A wide/one-sided IEX book is not a price: its mid can sit 5-30% off the last
+         trade. Use the trade until a sane two-sided quote returns. *)
+      let px, bid_px, bid_sz, ask_px, ask_sz =
+        if spread_ok
+        then mid, q.bid_price, q.bid_size, q.ask_price, q.ask_size
+        else if t.last_trade_px > 0.0
+        then t.last_trade_px, t.last_trade_px, 0.0, t.last_trade_px, 0.0
+        else mid, q.bid_price, q.bid_size, q.ask_price, q.ask_size
       in
       t.session <- observe_session t.session ~price:px ~volume:0.0 ~at:q.timestamp;
       let prev_pos = (Atomic.get t.tob).pos in
       let cache =
         { pos = prev_pos + 1
-        ; bid_px = q.bid_price
-        ; bid_sz = q.bid_size
-        ; ask_px = q.ask_price
-        ; ask_sz = q.ask_size
+        ; bid_px
+        ; bid_sz
+        ; ask_px
+        ; ask_sz
         ; valid = q.bid_price > 0.0 || q.ask_price > 0.0
         ; ts = q.timestamp
         ; quote_at = now_s ()
@@ -232,6 +253,10 @@ module SymbolStore = struct
     let idx = t.trades_write_pos mod t.trades_capacity in
     t.trades_buffer.(idx) <- tr;
     t.trades_write_pos <- t.trades_write_pos + 1;
+    if tr.price > 0.0 && tr.timestamp >= t.last_trade_at
+    then (
+      t.last_trade_px <- tr.price;
+      t.last_trade_at <- tr.timestamp);
     t.session
     <- observe_session t.session ~price:tr.price ~volume:tr.size ~at:tr.timestamp;
     Mutex.unlock t.mutex;

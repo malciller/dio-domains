@@ -721,6 +721,11 @@ let get_pending_sell_qty base_asset =
     open_orders
 ;;
 
+(** A key that cannot use Earn/Allocations (no Earn product, permission, or a key type
+    that does not expose it) will not gain it during this process. Stop polling instead of
+    logging an error every 10s. *)
+let earn_allocations_unavailable = Atomic.make false
+
 (** Fetches Earn allocations from private REST API to support Bitcoin Vault balance. *)
 let poll_earn_allocations () =
   let endpoint = "https://api.kraken.com" in
@@ -784,10 +789,19 @@ let poll_earn_allocations () =
        let open Yojson.Safe.Util in
        match member "error" json with
        | `List (_ :: _ as errs) ->
-         Logging.error_f
-           ~section
-           "Earn/Allocations API error: %s"
-           (errs |> filter_string |> String.concat "; ");
+         let msg = errs |> filter_string |> String.concat "; " in
+         let lower = String.lowercase_ascii msg in
+         if Error_handling.string_contains lower "unknown method"
+            || Error_handling.string_contains lower "permission denied"
+         then (
+           if not (Atomic.exchange earn_allocations_unavailable true)
+           then
+             Logging.warn_f
+               ~section
+               "Earn/Allocations unavailable for this Kraken API key (%s); Vault \
+                balances fall back to the wallet figure"
+               msg)
+         else Logging.error_f ~section "Earn/Allocations API error: %s" msg;
          Lwt.return_unit
        | _ ->
          let result = member "result" json in
@@ -895,6 +909,7 @@ let connect_and_subscribe token ~on_failure:_ ~on_heartbeat ~on_connected =
     let read_pos = ref (Ring_buffer.RingBuffer.get_position buffer) in
     let rec earn_poll_loop () =
       if Atomic.get Kraken_trading_client.shutdown_requested
+         || Atomic.get earn_allocations_unavailable
       then Lwt.return_unit
       else
         poll_earn_allocations ()

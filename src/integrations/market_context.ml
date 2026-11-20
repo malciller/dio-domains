@@ -135,6 +135,20 @@ let get_positions_updated_at ~exchange =
   | _ -> None
 ;;
 
+(** Per-coin quote sanity cap published by the trading domain: the book's relative spread
+    above which its mid is not a price. Derived from the grid interval, so the venue
+    adapter does not need a strategy-specific constant. *)
+let spread_caps : (string, float) Hashtbl.t Atomic.t = Atomic.make (Hashtbl.create 16)
+
+let set_spread_cap ~exchange ~coin ~frac =
+  if Float.is_finite frac && frac > 0.0
+  then update spread_caps (fun t -> Hashtbl.replace t (key exchange coin) frac)
+;;
+
+let get_spread_cap ~exchange ~coin =
+  Hashtbl.find_opt (Atomic.get spread_caps) (key exchange coin)
+;;
+
 (** Arrival time of the newest perp fill for one venue coin, or 0.0. A venue feed
     publishes this from wherever it processes the fill; the reduce-only hold reads it from
     the domain that places the order, which for a cross-venue overlay is not the fill's
