@@ -425,6 +425,34 @@ let remove_open_order symbol order_id =
   | None -> ()
 ;;
 
+(** Install an order the venue has accepted. The placement response carries the order id,
+    so the book is authoritative at submit time; the stream event only refreshes it. *)
+let upsert_open_order symbol (o : open_order_internal) =
+  let store = get_or_create_store symbol in
+  Mutex.lock store.mutex;
+  Hashtbl.replace store.open_orders o.order_id o;
+  SymbolExecStore.note_change store o.order_id (Some o);
+  SymbolExecStore.publish_open_orders_cache store;
+  Mutex.unlock store.mutex;
+  Concurrency.Exchange_wakeup.signal ~symbol
+;;
+
+(** Swap [old_id] for [o] in one publication, so a cancel+replace never leaves the book
+    empty between the cancel half and the replacement. *)
+let replace_open_order symbol ~old_id (o : open_order_internal) =
+  let store = get_or_create_store symbol in
+  Mutex.lock store.mutex;
+  if old_id <> o.order_id && Hashtbl.mem store.open_orders old_id
+  then (
+    Hashtbl.remove store.open_orders old_id;
+    SymbolExecStore.note_change store old_id None);
+  Hashtbl.replace store.open_orders o.order_id o;
+  SymbolExecStore.note_change store o.order_id (Some o);
+  SymbolExecStore.publish_open_orders_cache store;
+  Mutex.unlock store.mutex;
+  Concurrency.Exchange_wakeup.signal ~symbol
+;;
+
 let get_open_orders symbol =
   match Ds.Cow_table.find_opt stores symbol with
   | Some store -> Atomic.get store.open_orders_cache

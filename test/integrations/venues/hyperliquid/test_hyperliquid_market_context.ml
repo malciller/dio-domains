@@ -246,11 +246,71 @@ let test_account_mode_strings () =
   check bool "no spot collateral" false (uses_spot_collateral Standard)
 ;;
 
+let test_replace_positions_scope () =
+  Dio_exchange.Market_context.clear ~exchange:"hyperliquid";
+  let pos coin qty =
+    { Dio_exchange.Exchange_intf.Market_context.coin
+    ; qty
+    ; entry = 100.0
+    ; position_value = 50.0
+    ; unrealized_pnl = 0.0
+    ; margin_used = 5.0
+    ; liquidation = None
+    ; leverage = Some 10.0
+    ; updated_at = 0.0
+    }
+  in
+  Dio_exchange.Market_context.update_position
+    ~at:1.0
+    ~exchange:"hyperliquid"
+    (pos "xyz:TEST" (-0.5));
+  (match
+     Dio_exchange.Market_context.get_position ~exchange:"hyperliquid" ~coin:"xyz:TEST"
+   with
+   | Some p -> check (float 1e-12) "builder qty" (-0.5) p.qty
+   | None -> fail "expected builder position");
+  (* A main-dex snapshot replaces only the main-dex coins. *)
+  Dio_exchange.Market_context.replace_positions
+    ~only:(fun c -> not (String.contains c ':'))
+    ~exchange:"hyperliquid"
+    ~updated_at:2.0
+    [ pos "MAIN" 1.0 ];
+  (match
+     Dio_exchange.Market_context.get_position ~exchange:"hyperliquid" ~coin:"MAIN"
+   with
+   | Some p -> check (float 1e-12) "main qty" 1.0 p.qty
+   | None -> fail "expected main position");
+  (match
+     Dio_exchange.Market_context.get_position ~exchange:"hyperliquid" ~coin:"xyz:TEST"
+   with
+   | Some _ -> ()
+   | None -> fail "main snapshot wiped a builder position");
+  (* A builder-dex snapshot replaces only its own namespace. *)
+  Dio_exchange.Market_context.replace_positions
+    ~only:(fun c -> String.starts_with ~prefix:"xyz:" c)
+    ~exchange:"hyperliquid"
+    ~updated_at:3.0
+    [ pos "xyz:TEST" (-0.7) ];
+  (match
+     Dio_exchange.Market_context.get_position ~exchange:"hyperliquid" ~coin:"MAIN"
+   with
+   | Some p -> check (float 1e-12) "main survives builder snapshot" 1.0 p.qty
+   | None -> fail "builder snapshot wiped a main position");
+  match
+    Dio_exchange.Market_context.get_position ~exchange:"hyperliquid" ~coin:"xyz:TEST"
+  with
+  | Some p -> check (float 1e-12) "builder refreshed" (-0.7) p.qty
+  | None -> fail "expected builder position"
+;;
+
 let () =
   run
     "hyperliquid_market_context"
     [ "asset_ctx", [ test_case "activeAssetCtx" `Quick test_active_asset_ctx ]
-    ; "positions", [ test_case "webData2" `Quick test_positions ]
+    ; ( "positions"
+      , [ test_case "webData2" `Quick test_positions
+        ; test_case "replace scope per dex" `Quick test_replace_positions_scope
+        ] )
     ; "reservation", [ test_case "quote reservation" `Quick test_reservation ]
     ; "capabilities", [ test_case "optional exchange-intf" `Quick test_capabilities ]
     ; ( "flat"

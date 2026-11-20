@@ -36,10 +36,17 @@ let float_opt json =
   | _ -> None
 ;;
 
-let parse_position ~now (json : Yojson.Safe.t) =
+let parse_position ~now ?(dex = "") (json : Yojson.Safe.t) =
   let open Yojson.Safe.Util in
   let p = json |> member "position" in
-  let coin = p |> member "coin" |> to_string in
+  let raw_coin = p |> member "coin" |> to_string in
+  (* A builder-dex state can report the bare coin; namespace it so the lookup key matches
+     the instrument the overlay trades. *)
+  let coin =
+    if String.equal dex "" || String.contains raw_coin ':'
+    then raw_coin
+    else dex ^ ":" ^ raw_coin
+  in
   let qty = p |> member "szi" |> float_of_json in
   let leverage =
     match p |> member "leverage" with
@@ -128,8 +135,18 @@ let () = Hyperliquid_balances.on_spot_update := recompute_margin_from_last_state
 
 (** Applies the inner clearinghouse state used by both [webData2] and the current
     [clearinghouseState] subscription. *)
-let apply_clearinghouse_state ~now state =
+let apply_clearinghouse_state ~now ?(dex = "") state =
   let open Yojson.Safe.Util in
+  (* A state is authoritative only for its own dex's coins: the main dex for unprefixed
+     coins, a builder dex for its "<dex>:" namespace. Otherwise each frame replaces the
+     whole venue and wipes the other dexes' positions, so a builder short flickers on the
+     dashboard until the next poll republishes it. *)
+  let prefix = dex ^ ":" in
+  let owns coin =
+    if String.equal dex ""
+    then not (String.contains coin ':')
+    else String.starts_with ~prefix coin
+  in
   let applied =
     match state |> member "assetPositions" with
     | `Null ->
@@ -145,7 +162,7 @@ let apply_clearinghouse_state ~now state =
         List.filter_map
           (fun p ->
             try
-              let pos = parse_position ~now p in
+              let pos = parse_position ~now ~dex p in
               if pos.Dio_exchange.Market_context.coin = "" then None else Some pos
             with
             | _ -> None)
@@ -154,7 +171,11 @@ let apply_clearinghouse_state ~now state =
       let live =
         List.filter (fun p -> Float.abs p.Dio_exchange.Market_context.qty > 1e-12) parsed
       in
-      Dio_exchange.Market_context.replace_positions ~exchange ~updated_at:now live;
+      Dio_exchange.Market_context.replace_positions
+        ~only:owns
+        ~exchange
+        ~updated_at:now
+        live;
       List.iter
         (fun p ->
           Concurrency.Exchange_wakeup.signal
@@ -279,7 +300,7 @@ let process_market_data (json : Yojson.Safe.t) =
          List.exists
            (fun pair ->
              match pair with
-             | `List [ _dex; state ] -> apply_clearinghouse_state ~now state
+             | `List [ `String dex; state ] -> apply_clearinghouse_state ~now ~dex state
              | _ -> false)
            pairs
        | _ -> false

@@ -71,17 +71,35 @@ let test_print_never_moves_a_live_book () =
 
 let test_print_promotes_after_the_quote_goes_stale () =
   let sym = "T_STALE" in
+  let clock = ref 1_000.0 in
+  Alpaca.Orderbook.set_arrival_clock_for_test (fun () -> !clock);
   handle (quote_msg sym 140.0 141.0 "2026-01-02T15:00:00Z");
   check_book sym (Some (140.0, 10.0, 141.0, 10.0));
-  (* Three hours later the venue has stopped quoting and this is the only price there is. *)
+  (* The quote stream has been silent for the fallback window: this is the only price. *)
+  clock := 1_061.0;
   handle (trade_msg sym 130.0 "2026-01-02T18:00:00Z");
   check_book sym (Some (130.0, 0.0, 130.0, 0.0));
-  (* Every later print re-promotes: the stale quote timestamp stays in place. *)
+  clock := 1_066.0;
   handle (trade_msg sym 131.0 "2026-01-02T18:00:05Z");
   check_book sym (Some (131.0, 0.0, 131.0, 0.0));
   (* A real quote takes the book back. *)
+  clock := 1_067.0;
   handle (quote_msg sym 131.5 132.5 "2026-01-02T18:00:06Z");
-  check_book sym (Some (131.5, 10.0, 132.5, 10.0))
+  check_book sym (Some (131.5, 10.0, 132.5, 10.0));
+  Alpaca.Orderbook.set_arrival_clock_for_test Unix.gettimeofday
+;;
+
+let test_quiet_quote_stamp_still_wins () =
+  (* A quiet symbol's quote carries an old venue timestamp but is the current NBBO and
+     just arrived. It must not be replaced by a print or the position mark. *)
+  let sym = "T_QUIET" in
+  let clock = ref 1_000.0 in
+  Alpaca.Orderbook.set_arrival_clock_for_test (fun () -> !clock);
+  handle (quote_msg sym 140.0 141.0 "2026-01-02T13:00:00Z");
+  clock := 1_005.0;
+  handle (trade_msg sym 142.0 "2026-01-02T14:30:00Z");
+  check_book sym (Some (140.0, 10.0, 141.0, 10.0));
+  Alpaca.Orderbook.set_arrival_clock_for_test Unix.gettimeofday
 ;;
 
 (* ---- Real quotes publish TOB -------------------------------------------- *)
@@ -162,9 +180,13 @@ let () =
             `Quick
             test_print_never_moves_a_live_book
         ; Alcotest.test_case
-            "print promotes once the quote is stale"
+            "print promotes once the quote stream stops"
             `Quick
             test_print_promotes_after_the_quote_goes_stale
+        ; Alcotest.test_case
+            "a quiet quote stamp is not replaced by a print"
+            `Quick
+            test_quiet_quote_stamp_still_wins
         ] )
     ; ( "quote_publishes_tob"
       , [ Alcotest.test_case "quote publishes bid/ask" `Quick test_quote_publishes_bid_ask

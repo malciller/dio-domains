@@ -8,6 +8,7 @@ let check name expected value portfolio_value venue_value limits =
     name
     expected
     (Dio_engine.Exposure.breached
+       ~previously_breached:false
        ~venue_position_value:value
        ~portfolio_position_value:value
        ~portfolio_value
@@ -42,6 +43,7 @@ let test_cross_venue_inventory_only_affects_portfolio () =
   let l = limits ~portfolio_pct:5.0 ~venue_pct:25.0 () in
   let hit venue portfolio =
     Dio_engine.Exposure.breached
+      ~previously_breached:false
       ~venue_position_value:venue
       ~portfolio_position_value:portfolio
       ~portfolio_value:100_000.0
@@ -169,6 +171,23 @@ let test_exposure_blocks_buy_not_sell_state () =
   Alcotest.(check bool) "allowed after clear" true (place ())
 ;;
 
+let test_clear_band_hysteresis () =
+  (* 5% of a 25% venue cap is 1.25pp: a latched breach holds at 24.8% and clears at 23.7%. *)
+  let l = limits ~venue_pct:25.0 () in
+  let hit ?(prev = false) value =
+    Dio_engine.Exposure.breached
+      ~previously_breached:prev
+      ~venue_position_value:value
+      ~portfolio_position_value:value
+      ~portfolio_value:0.0
+      ~venue_value:20_000.0
+      ~limits:l
+  in
+  Alcotest.(check bool) "fresh at 24.8% passes" false (hit 4_960.0);
+  Alcotest.(check bool) "latched at 24.8% holds" true (hit ~prev:true 4_960.0);
+  Alcotest.(check bool) "latched clears at 23.7%" false (hit ~prev:true 4_740.0)
+;;
+
 let () =
   Alcotest.run
     "Exposure"
@@ -176,6 +195,7 @@ let () =
       , [ Alcotest.test_case "no limit fails open" `Quick test_no_limit_fails_open
         ; Alcotest.test_case "portfolio ratio" `Quick test_portfolio_ratio
         ; Alcotest.test_case "venue ratio" `Quick test_venue_ratio
+        ; Alcotest.test_case "clear-band hysteresis" `Quick test_clear_band_hysteresis
         ; Alcotest.test_case "either limit wins" `Quick test_either_limit_wins
         ; Alcotest.test_case
             "cross-venue inventory only affects portfolio"

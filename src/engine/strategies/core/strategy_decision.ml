@@ -321,6 +321,8 @@ let buy_place_send ~state ~now ~(asset : trading_config) ~qty ~buy_price =
   then false
   else (
     state.last_buy_attempted_insufficient <- false;
+    (* A fresh placement starts a new buy cycle. *)
+    state.buy_clamp <- None;
     let order =
       create_order
         state.duplicate_key_buy
@@ -567,6 +569,16 @@ let buy_amend_with_sell
      let target_buy_price = min proposed_buy_price exact_target in
      let current_buy_price_rounded = state.cached_round_price current_buy_price in
      let min_move_threshold = get_min_move_threshold state.cached_price_increment in
+     (* A parked buy stays at its clamp: a republished grid interval must not walk it back
+        up inside the deadzone. A sell at a new price has moved the clamp. *)
+     let parked =
+       match state.buy_clamp with
+       | Some p when Float.abs (p -. sell_price) <= 1e-9 -> true
+       | Some _ ->
+         state.buy_clamp <- None;
+         false
+       | None -> false
+     in
      (* A sizing re-anchor (the capital oracle published a changed grid interval - flagged
         by the domain worker on [force_buy_reanchor]) used to amend the resting buy in
         both directions. A downward amendment is warranted only by a sell-spacing
@@ -583,7 +595,7 @@ let buy_amend_with_sell
         inside the restricted zone (e.g. after an external upward amendment, book
         dislocation, or grid interval widening). A resting buy already outside the
         restricted zone is never snapped down. *)
-     let trail_up = target_buy_price > current_buy_price in
+     let trail_up = (not parked) && target_buy_price > current_buy_price in
      let zone_violation = (not trail_up) && current_buy_price_rounded > exact_target in
      let should_amend = trail_up || zone_violation in
      (* Release reanchor latch if no action is needed. *)
@@ -636,6 +648,11 @@ let buy_amend_with_sell
            in
            ignore (push_order ~now ~state order);
            state.last_buy_order_price <- Some effective_amend_price;
+           let at_clamp =
+             Float.abs (effective_amend_price -. exact_target)
+             <= Float.max 1e-9 (state.cached_price_increment *. 0.5)
+           in
+           if at_clamp then state.buy_clamp <- Some sell_price;
            state.force_buy_reanchor <- false;
            ())
          else if not (Float.is_nan quote_balance)
@@ -670,6 +687,9 @@ let buy_amend_no_sell
   ~closest_sell_order_initial:_
   =
   let grid_interval = asset.grid_interval in
+  (* No sell is tracked (the clamp includes the commitment ledger), so a park has no
+     evidence left; the buy trails again. *)
+  state.buy_clamp <- None;
   (match state.last_buy_order_price, state.last_buy_order_id with
    | Some current_buy_price, Some buy_order_id ->
      let ref_price = compute_buy_ref_price ~bid_price ~ask_price in

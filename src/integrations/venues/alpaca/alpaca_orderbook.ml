@@ -19,6 +19,13 @@ let section = "alpaca_orderbook"
     book is not replaced by a zero-spread print. *)
 let trade_tob_fallback_s = 60.0
 
+(** Arrival clock for the quote/print/mark staleness gate. Tests advance it to exercise
+    the extended-hours fallback without sleeping. *)
+let arrival_clock = ref (fun () -> Unix.gettimeofday ())
+
+let set_arrival_clock_for_test f = arrival_clock := f
+let now_s () = !arrival_clock ()
+
 type quote =
   { bid_price : float
   ; bid_size : float
@@ -96,6 +103,10 @@ module SymbolStore = struct
     ; ask_sz : float
     ; valid : bool
     ; ts : float (** venue timestamp of the last quote or print that set this book *)
+    ; quote_at : float
+    (** wall-clock arrival of the last quote. Promotion is gated on this, not [ts]: a
+        quiet symbol's quote timestamp stays old while the quote itself is current, which
+        made prints and marks overwrite it on alternate polls. *)
     }
 
   type t =
@@ -142,18 +153,20 @@ module SymbolStore = struct
           ; ask_sz = 0.0
           ; valid = false
           ; ts = 0.0
+          ; quote_at = 0.0
           }
     ; mutex = Mutex.create ()
     }
   ;;
 
-  (** Publish [price] as top-of-book while the last quote is older than [stale_after].
-      Compare-and-swap, because a quote write and a promotion must not publish the same
-      [pos] (the domain's change detector keys on it) and a fresh quote must win. [ts] is
-      left stale so every print/poll re-promotes until quotes resume. *)
+  (** Publish [price] as top-of-book while no quote has arrived for [stale_after]. Gated
+      on arrival ([quote_at]), not the venue quote timestamp: a quiet symbol's quote
+      timestamp stays old while its quote is current, so using [ts] let prints and marks
+      overwrite the quote on alternate polls. Compare-and-swap, because a quote write and
+      a promotion must not publish the same [pos] and a fresh quote must win. *)
   let rec promote t ~price ~now ~stale_after =
     let prev = Atomic.get t.tob in
-    if price > 0.0 && now -. prev.ts > stale_after
+    if price > 0.0 && now -. prev.quote_at > stale_after
     then (
       let next =
         { prev with
@@ -192,6 +205,7 @@ module SymbolStore = struct
         ; ask_sz = q.ask_size
         ; valid = q.bid_price > 0.0 || q.ask_price > 0.0
         ; ts = q.timestamp
+        ; quote_at = now_s ()
         }
       in
       Mutex.unlock t.mutex;
@@ -216,7 +230,7 @@ module SymbolStore = struct
        [trade_tob_fallback_s], the print becomes the price and the tick: bid=ask=print,
        zero size, so the file's own rung/spread logic still decides what to place. This is
        a degraded price, not a fabricated quote - it is the venue's last traded price. *)
-    ignore (promote t ~price:tr.price ~now:tr.timestamp ~stale_after:trade_tob_fallback_s);
+    ignore (promote t ~price:tr.price ~now:(now_s ()) ~stale_after:trade_tob_fallback_s);
     Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
   ;;
 
@@ -226,7 +240,7 @@ module SymbolStore = struct
       while the last quote is older than [trade_tob_fallback_s], stale timestamp retained
       so each poll re-promotes. *)
   let push_mark t ~(price : float) =
-    if promote t ~price ~now:(Unix.gettimeofday ()) ~stale_after:trade_tob_fallback_s
+    if promote t ~price ~now:(now_s ()) ~stale_after:trade_tob_fallback_s
     then Concurrency.Exchange_wakeup.signal ~symbol:t.symbol
   ;;
 

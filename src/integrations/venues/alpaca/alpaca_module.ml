@@ -45,6 +45,38 @@ module Alpaca_impl = struct
     | Types.Sell -> Alpaca_types.Sell
   ;;
 
+  (** Book entry for a venue-accepted placement or amend. The response carries the id, so
+      the order is listed at submit time; the SSE event only refreshes it. *)
+  let open_order_from_submit
+    ~symbol
+    ~order_id
+    ~side
+    ~qty
+    ~filled
+    ?limit_price
+    ~cl_ord_id
+    ()
+    =
+    let user_ref =
+      match cl_ord_id with
+      | Some cid ->
+        (try Some (int_of_string cid) with
+         | _ -> None)
+      | None -> None
+    in
+    { Alpaca_executions.order_id
+    ; symbol
+    ; side
+    ; qty
+    ; cum_qty = filled
+    ; remaining_qty = Float.max 0.0 (qty -. filled)
+    ; limit_price
+    ; status = Types.New
+    ; user_ref
+    ; cl_ord_id
+    }
+  ;;
+
   let string_of_time_in_force = function
     | Types.GTC -> "GTC"
     | Types.IOC -> "IOC"
@@ -94,6 +126,17 @@ module Alpaca_impl = struct
       ()
     >|= function
     | Ok res ->
+      Alpaca_executions.upsert_open_order
+        symbol
+        (open_order_from_submit
+           ~symbol
+           ~order_id:res.order_id
+           ~side
+           ~qty
+           ~filled:0.0
+           ?limit_price
+           ~cl_ord_id:res.cl_ord_id
+           ());
       Ok
         { Types.order_id = res.order_id
         ; cl_ord_id = res.cl_ord_id
@@ -217,11 +260,45 @@ module Alpaca_impl = struct
           (fun s -> Alpaca_executions.remove_open_order s orig_id)
           (Alpaca_executions.get_all_symbols ())
     in
+    let find_existing () =
+      match symbol with
+      | Some s -> Alpaca_executions.get_open_order s order_id
+      | None ->
+        let all_syms = Alpaca_executions.get_all_symbols () in
+        List.find_map (fun s -> Alpaca_executions.get_open_order s order_id) all_syms
+    in
     let perform_rest_amend () =
+      (* Snapshot the pre-amend entry: the stream can update it while the request is in
+         flight, and the replacement needs its side and fills. *)
+      let existing = find_existing () in
       Alpaca_rest.amend_order ~order_id ?qty ?limit_price ?cl_ord_id ()
       >|= function
       | Ok res ->
-        remove_old_order res.original_order_id;
+        (* Alpaca's PATCH returns the amended id (normally the same order). Swap the book
+           entry in one publication so the order never leaves the open-order view. *)
+        (match existing with
+         | Some (existing : Alpaca_executions.open_order_internal) ->
+           let new_id =
+             if String.equal res.new_order_id ""
+             then res.original_order_id
+             else res.new_order_id
+           in
+           Alpaca_executions.replace_open_order
+             existing.symbol
+             ~old_id:res.original_order_id
+             (open_order_from_submit
+                ~symbol:existing.symbol
+                ~order_id:new_id
+                ~side:existing.side
+                ~qty:(Option.value qty ~default:existing.qty)
+                ~filled:existing.cum_qty
+                ?limit_price:
+                  (match limit_price with
+                   | Some _ -> limit_price
+                   | None -> existing.limit_price)
+                ~cl_ord_id:res.cl_ord_id
+                ())
+         | None -> remove_old_order res.original_order_id);
         Ok
           { Types.original_order_id = res.original_order_id
           ; new_order_id = res.new_order_id
@@ -242,7 +319,6 @@ module Alpaca_impl = struct
         q
         lp;
       let place_replacement () =
-        remove_old_order order_id;
         Alpaca_rest.place_order
           ~symbol:sym
           ~qty:q
@@ -253,6 +329,21 @@ module Alpaca_impl = struct
           ()
         >|= function
         | Ok res ->
+          Alpaca_executions.replace_open_order
+            sym
+            ~old_id:order_id
+            (open_order_from_submit
+               ~symbol:sym
+               ~order_id:res.order_id
+               ~side:
+                 (match side with
+                  | Alpaca_types.Buy -> Types.Buy
+                  | Sell -> Types.Sell)
+               ~qty:q
+               ~filled:0.0
+               ~limit_price:lp
+               ~cl_ord_id:res.cl_ord_id
+               ());
           Ok
             { Types.original_order_id = order_id
             ; new_order_id = res.order_id
@@ -284,13 +375,6 @@ module Alpaca_impl = struct
                    cancel_settle_timeout_s)))
       | Error e ->
         Lwt.return (Error (Printf.sprintf "Fallback cancel_order failed: %s" e))
-    in
-    let find_existing () =
-      match symbol with
-      | Some s -> Alpaca_executions.get_open_order s order_id
-      | None ->
-        let all_syms = Alpaca_executions.get_all_symbols () in
-        List.find_map (fun s -> Alpaca_executions.get_open_order s order_id) all_syms
     in
     (* A fractional amend is a cancel+replace, and re-requesting the resting price and
        size burns a cancel slot that can stall in [pending_cancel] past the fallback's

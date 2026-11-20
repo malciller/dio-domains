@@ -1001,22 +1001,22 @@ let load_overlay_instances ~(owner : trading_config) ~(all_trading : trading_con
           }
         in
         let inventory_legs =
-          match oi.oi_inventory_legs with
-          | [] -> []
-          | declared ->
-            let key exchange symbol =
-              Config.normalize_exchange exchange ^ "|" ^ Config.base_coin_of_symbol symbol
-            in
-            let seen = Hashtbl.create 8 in
-            List.filter
-              (fun (exchange, symbol) ->
-                let k = key exchange symbol in
-                if Hashtbl.mem seen k
-                then false
-                else (
-                  Hashtbl.add seen k ();
-                  true))
-              ((oi.oi_owner_exchange, oi.oi_owner_symbol) :: declared)
+          (* The owner leg always participates: without it a generic overlay falls back to
+             the grid's accumulation ledger as [accumulated_balance] instead of the spot
+             that actually backs the short. *)
+          let key exchange symbol =
+            Config.normalize_exchange exchange ^ "|" ^ Config.base_coin_of_symbol symbol
+          in
+          let seen = Hashtbl.create 8 in
+          List.filter
+            (fun (exchange, symbol) ->
+              let k = key exchange symbol in
+              if Hashtbl.mem seen k
+              then false
+              else (
+                Hashtbl.add seen k ();
+                true))
+            ((oi.oi_owner_exchange, oi.oi_owner_symbol) :: oi.oi_inventory_legs)
         in
         let inventory_caches =
           Array.init (List.length inventory_legs) (fun _ ->
@@ -4017,6 +4017,7 @@ let asset_domain_worker
             else 0.0
           in
           Exposure.breached
+            ~previously_breached:!exposure_high_prev
             ~venue_position_value:(venue_qty *. !current_price)
             ~portfolio_position_value:(total_qty *. !current_price)
             ~portfolio_value:snapshot.portfolio_value

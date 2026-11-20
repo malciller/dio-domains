@@ -157,6 +157,41 @@ let test_amend_body () =
      = `Null)
 ;;
 
+let test_open_order_book_survives_amend () =
+  (* A venue-accepted order is listed at submit time; a cancel+replace swaps the ids in
+     one publication, so the order never leaves the book between the two halves. *)
+  let symbol = "BOOK_AMEND_TEST" in
+  let mk id price : Alpaca.Executions.open_order_internal =
+    { order_id = id
+    ; symbol
+    ; side = Dio_exchange.Exchange_intf.Types.Sell
+    ; qty = 1.0
+    ; cum_qty = 0.0
+    ; remaining_qty = 1.0
+    ; limit_price = Some price
+    ; status = Dio_exchange.Exchange_intf.Types.New
+    ; user_ref = None
+    ; cl_ord_id = None
+    }
+  in
+  Alpaca.Executions.upsert_open_order symbol (mk "book-old" 100.0);
+  Alcotest.(check bool)
+    "submitted order is listed"
+    true
+    (Option.is_some (Alpaca.Executions.get_open_order symbol "book-old"));
+  Alpaca.Executions.replace_open_order symbol ~old_id:"book-old" (mk "book-new" 101.0);
+  Alcotest.(check bool)
+    "old id retired"
+    false
+    (Option.is_some (Alpaca.Executions.get_open_order symbol "book-old"));
+  Alcotest.(check bool)
+    "replacement listed at its new price"
+    true
+    (match Alpaca.Executions.get_open_order symbol "book-new" with
+     | Some (o : Alpaca.Executions.open_order_internal) -> o.limit_price = Some 101.0
+     | None -> false)
+;;
+
 let () =
   Alcotest.run
     "alpaca_rest"
@@ -181,6 +216,12 @@ let () =
     ; ( "order body"
       , [ Alcotest.test_case "place body" `Quick test_order_body
         ; Alcotest.test_case "amend body" `Quick test_amend_body
+        ] )
+    ; ( "order book"
+      , [ Alcotest.test_case
+            "order stays listed across a cancel+replace"
+            `Quick
+            test_open_order_book_survives_amend
         ] )
     ; ( "retry policy"
       , [ Alcotest.test_case "classification" `Quick test_retriable_classification

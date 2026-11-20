@@ -95,14 +95,18 @@ let get_position_updated_at ~exchange ~coin =
   Hashtbl.find_opt (Atomic.get position_updated) (key exchange coin)
 ;;
 
-(** Replaces the venue's whole position set. Dropping absent coins is what turns a closed
-    position into a zero position instead of a stale one. *)
-let replace_positions ~exchange ~updated_at positions =
+(** Replaces the venue positions the snapshot owns. [only] selects them (default: all), so
+    a main-dex snapshot cannot wipe positions a builder-dex channel owns. Dropping an
+    owned coin absent from the snapshot is what turns a closed position into a zero
+    position instead of a stale one. *)
+let replace_positions ?(only = fun _ -> true) ~exchange ~updated_at positions =
   update position_table (fun t ->
     Hashtbl.iter
       (fun k _ ->
         match String.index_opt k '|' with
-        | Some i when String.sub k 0 i = exchange -> Hashtbl.remove t k
+        | Some i when String.sub k 0 i = exchange ->
+          let coin = String.sub k (i + 1) (String.length k - i - 1) in
+          if only coin then Hashtbl.remove t k
         | _ -> ())
       t;
     List.iter (fun p -> Hashtbl.replace t (key exchange p.coin) p) positions);

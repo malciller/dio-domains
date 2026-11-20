@@ -246,22 +246,31 @@ let rekey_sell_commitment ~state ~old_id ~new_id ~price ~qty ~acked =
   touch_commitments state
 ;;
 
-(** Terminal event: the sell no longer holds base. *)
+(** Terminal event: the sell no longer holds base. A buy parked under this sell's floor is
+    released, so the next cycle can trail it up to the next rung. *)
 let remove_sell_commitment ~state ~id =
+  (match Hashtbl.find_opt state.sell_commitments id, state.buy_clamp with
+   | Some c, Some p when Float.abs (c.sc_price -. p) <= 1e-9 -> state.buy_clamp <- None
+   | _ -> ());
   Hashtbl.remove state.sell_commitments id;
   touch_commitments state
 ;;
 
-(** Terminal event for a placement that never got a venue id. *)
+(** Terminal event for a placement that never got a venue id. A buy parked on that pending
+    sell is released. *)
 let remove_pending_sell_commitments ~state =
   let pending =
     Hashtbl.fold
-      (fun id _ acc ->
-        if String.starts_with ~prefix:"pending_sell_" id then id :: acc else acc)
+      (fun id c acc ->
+        if String.starts_with ~prefix:"pending_sell_" id then (id, c) :: acc else acc)
       state.sell_commitments
       []
   in
-  List.iter (Hashtbl.remove state.sell_commitments) pending;
+  (match state.buy_clamp with
+   | Some p when List.exists (fun (_, c) -> Float.abs (c.sc_price -. p) <= 1e-9) pending
+     -> state.buy_clamp <- None
+   | _ -> ());
+  List.iter (fun (id, _) -> Hashtbl.remove state.sell_commitments id) pending;
   if pending <> [] then touch_commitments state
 ;;
 

@@ -133,6 +133,9 @@ type sync_scratch =
 type strategy_state =
   { mutable last_buy_order_price : float option
   ; mutable last_buy_order_id : string option
+  ; mutable buy_clamp : float option
+      (* Price of the sell whose 2*gi floor the resting buy is parked at. Dropped by a buy
+         placement, that sell's terminal event, or a moved clamp. *)
   ; mutable open_sell_orders : Strategy_sell_orders.t (* (order_id, price, qty) *)
   ; mutable persisted_sell_levels : (float * float) list
       (* (target_price, qty) stack for Alpaca GTC *)
@@ -699,6 +702,7 @@ let rec get_strategy_state asset_symbol =
     let new_state =
       { last_buy_order_price = None
       ; last_buy_order_id = None
+      ; buy_clamp = None
       ; open_sell_orders = Strategy_sell_orders.create 16
       ; persisted_sell_levels
       ; recently_injected_sells = []

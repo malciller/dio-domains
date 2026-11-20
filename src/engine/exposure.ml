@@ -290,28 +290,37 @@ let pct_ratio value denominator =
   else Float.nan
 ;;
 
+(** Clear band for the exposure latch: once breached, the ratio must fall this fraction
+    below the limit before buys resume, so a price tick at the boundary cannot flap the
+    pause (and the short-overlay fallback it drives). *)
+let clear_band = 0.05
+
 (** Hot-path decision: one bool. A zero/unknown denominator fails open. The portfolio
-    numerator includes configured inventory legs; the venue numerator is the primary leg. *)
+    numerator includes configured inventory legs; the venue numerator is the primary leg.
+    [previously_breached] applies [clear_band] to every limit so the latch releases only
+    after a real drop below the cap. *)
 let breached
+  ~previously_breached
   ~venue_position_value
   ~portfolio_position_value
   ~portfolio_value
   ~venue_value
   ~(limits : Dio_strategies.Strategy_common.exposure_limit option)
   =
+  let limit_of pct = if previously_breached then pct *. (1.0 -. clear_band) else pct in
   match limits with
   | None -> false
   | Some limits ->
     let portfolio_hit =
       match limits.portfolio_pct with
       | Some pct when portfolio_value > 0.0 ->
-        portfolio_position_value /. portfolio_value > pct /. 100.0
+        portfolio_position_value /. portfolio_value > limit_of pct /. 100.0
       | _ -> false
     in
     let venue_hit =
       match limits.venue_pct with
       | Some pct when venue_value > 0.0 ->
-        venue_position_value /. venue_value > pct /. 100.0
+        venue_position_value /. venue_value > limit_of pct /. 100.0
       | _ -> false
     in
     portfolio_hit || venue_hit
