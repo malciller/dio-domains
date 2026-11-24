@@ -5897,12 +5897,10 @@ let pushed_sell_for symbol =
 ;;
 
 let test_alpaca_owed_sell_survives_lagging_venue_free () =
-  (* A buy fill is owed its 1:1 sell at fill+gi. Alpaca's free-base figure (qty_available)
-     lags the fill, so the sellable basis can read 0 while the account holds the new base.
-     Discarding the trigger there left the ladder with no rung at all (the next persisted
-     rung sat ~10% above the buy) until a later fill re-armed it. The owed sell must be
-     retried while the ledger still reports free base the venue has not caught up to, and
-     place as soon as the venue figure agrees. *)
+  (* A buy fill is owed its 1:1 sell on the fill tick. Alpaca's free-base figure
+     (qty_available) lags the fill; sizing off it read 0 while the account held the new
+     base, which dropped the rung and left the next sell ~10% away. The ledger basis puts
+     Alpaca on the same footing as every other venue. *)
   let symbol = "ALPACA_LAG_FREE/USD" in
   let state = reset_alpaca_excess_state symbol in
   state.just_filled_buy <- true;
@@ -5928,23 +5926,24 @@ let test_alpaca_owed_sell_survives_lagging_venue_free () =
       ~base_balance_age:None
       ~oracle_halted:false
   in
-  (* Tick 1: venue free base is stale at 0 while the ledger holds the filled lot. *)
+  (* Tick 1: the venue free figure lags at 0, but the ledger holds the filled lot, so the
+     owed sell places on the fill tick like every other venue. *)
   evaluate ~now:100.0 ~balance:1.0;
-  check
-    bool
-    "no sell while the venue free figure lags"
-    true
-    (pushed_sell_for symbol = None);
-  check bool "the fill's owed sell is kept armed, not consumed" true state.just_filled_buy;
-  (* Tick 2: the venue free figure catches up - the owed sell places at fill+gi, 1:1. *)
+  (match pushed_sell_for symbol with
+   | Some o ->
+     check (float 1e-6) "the owed sell keeps the fill's qty" 1.0 o.qty;
+     check bool "the owed sell prices above the fill" (Option.get o.price > 100.0) true;
+     check bool "placing the rung clears the latch" false state.just_filled_buy
+   | None ->
+     failwith "expected the owed sell on the fill tick despite a lagging venue figure");
+  (* Tick 2: the venue figure catches up - no second rung at the same price. *)
   Alpaca.Balances.set_available_balance_for_test symbol 1.0;
   evaluate ~now:101.0 ~balance:1.0;
-  match pushed_sell_for symbol with
-  | Some o ->
-    check (float 1e-6) "the owed sell keeps the fill's qty" 1.0 o.qty;
-    check bool "the owed sell prices above the fill" (Option.get o.price > 100.0) true;
-    check bool "placing the rung clears the latch" false state.just_filled_buy
-  | None -> failwith "expected the deferred owed sell to place once the venue caught up"
+  check
+    bool
+    "no duplicate rung once the venue catches up"
+    true
+    (pushed_sell_for symbol = None)
 ;;
 
 let test_alpaca_excess_refills_before_dumping () =
@@ -6056,13 +6055,11 @@ let test_alpaca_inflight_amend_rung_not_restored () =
   | None -> failwith "expected the dropped rung to be restored once the amend resolved"
 ;;
 
-let test_alpaca_venue_available_blocks_reserve_dip () =
-  (* The venue's own free figure is authoritative. The account shows gross 3.0 but only
-     reserved_base is free (the rest held), while the engine's reconstructed
-     locked_in_sells is 0.0 (amend-window undercount). Sizing against
-     gross-minus-reconstructed-holds would offer a full lot out of the reserve; the
-     venue-authoritative basis places nothing. *)
-  let symbol = "ALPACA_VENUE_AVAIL/USD" in
+let test_alpaca_reserve_is_excluded_from_ledger_basis () =
+  (* Alpaca is sized off the ledger like every other venue: gross 3.0, reserved 0.00234,
+     nothing committed, so the free 2.9977 is sellable and the reserve is never offered.
+     With the whole balance reserved the same account places nothing. *)
+  let symbol = "ALPACA_RESERVE_LEDGER/USD" in
   let state = reset_alpaca_excess_state symbol in
   state.reserved_base <- 0.00234;
   Sell_orders.clear state.open_sell_orders;
@@ -6073,25 +6070,37 @@ let test_alpaca_venue_available_blocks_reserve_dip () =
   Alpaca.Balances.set_available_balance_for_test symbol 0.00234;
   let asset = alpaca_excess_asset ~symbol in
   let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
-  Dio_strategies.Strategy_api.evaluate_sell_leg
-    ~persisted_reconcile:
-      (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
-    ~state
-    ~now:100.0
-    ~asset
-    ~bid_price:100.0
-    ~ask_price:100.1
-    ~asset_balance:3.0
-    ~buy_attempted:false
-    ~ecfg
-    ~locked_in_sells:0.0
-    ~base_balance_age:None
-    ~oracle_halted:false;
-  check
-    bool
-    "venue free == reserved_base offers nothing (no sell out of the reserve)"
-    true
-    (pushed_sell_for symbol = None)
+  let evaluate () =
+    drain_order_buffer ();
+    Dio_strategies.Strategy_api.evaluate_sell_leg
+      ~persisted_reconcile:
+        (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
+      ~state
+      ~now:100.0
+      ~asset
+      ~bid_price:100.0
+      ~ask_price:100.1
+      ~asset_balance:3.0
+      ~buy_attempted:false
+      ~ecfg
+      ~locked_in_sells:0.0
+      ~base_balance_age:None
+      ~oracle_halted:false
+  in
+  evaluate ();
+  (match pushed_sell_for symbol with
+   | Some o ->
+     check
+       bool
+       "the sell is clamped to the ledger's un-reserved base"
+       (o.qty <= 3.0 -. 0.00234 +. 1e-6)
+       true
+   | None -> failwith "expected the un-reserved ledger base to be offered");
+  (* Nothing left above the reserve: the same account offers nothing. *)
+  drain_order_buffer ();
+  state.reserved_base <- 3.0;
+  evaluate ();
+  check bool "a fully reserved balance offers nothing" true (pushed_sell_for symbol = None)
 ;;
 
 let test_alpaca_restore_prunes_unfundable_rung () =
@@ -6526,11 +6535,9 @@ let test_alpaca_ladder_of_record_tracks_fills_and_cancels () =
        state.persisted_sell_levels)
 ;;
 
-let test_alpaca_sell_anchors_on_fill_not_ask () =
-  (* Alpaca sell placement anchors on the fill (fill + gi), not pushed up to the current
-     ask. Ask-clamping stacked new sells at the same price as the market bounced (SPCX
-     sells piling at 138.50) instead of laddering down. The fill anchor keeps rungs
-     equidistant and never places below fill + gi, preserving fill-anchored profitability. *)
+let test_sell_lifts_to_ask_not_fill () =
+  (* Every venue prices the owed sell at max(fill + gi, ask): a rung below the ask would
+     cross the book and take instead of resting. Alpaca used to skip the lift. *)
   let symbol = "ALPACA_ANCHOR/USD" in
   let state = Dio_strategies.Strategy_api.get_strategy_state symbol in
   state.exchange_id <- "alpaca";
@@ -6565,8 +6572,8 @@ let test_alpaca_sell_anchors_on_fill_not_ask () =
     | None -> ()
   in
   drain ();
-  (* Market above fill + gi: fill 100.00 + 1% = 101.00, ask 105.00. Sell lands at 101.00
-     (fill-anchored), not 105.00. *)
+  (* Market above fill + gi: fill 100.00 + 1% = 101.00, ask 105.00. The rung lifts to the
+     ask so it rests instead of crossing. *)
   Dio_strategies.Strategy_api.evaluate_sell_leg
     ~persisted_reconcile:
       (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
@@ -6586,12 +6593,12 @@ let test_alpaca_sell_anchors_on_fill_not_ask () =
   | [ (o : Dio_strategies.Strategy_common.strategy_order) ] ->
     check
       bool
-      "sell anchored on fill"
+      "sell is a sell order"
       true
       (o.operation = Dio_strategies.Strategy_common.Place
        && o.side = Dio_strategies.Strategy_common.Sell
        && o.symbol = symbol);
-    check (option (float 0.)) "sell at fill + gi, not the ask" (Some 101.0) o.price
+    check (option (float 0.)) "sell lifts to the ask" (Some 105.0) o.price
   | _ -> failwith "expected exactly one sell order"
 ;;
 
@@ -8840,9 +8847,6 @@ let sell_matrix_feed_and_size
   state.inflight_sell <- false;
   state.inflight_buy <- false;
   state.persisted_sell_levels <- [];
-  (* Alpaca's authoritative free figure already excludes resting holds. *)
-  if exchange = "alpaca"
-  then Alpaca.Balances.set_available_balance_for_test symbol (reserved +. free);
   let ecfg = Dio_strategies.Strategy_api.get_exchange_config exchange in
   let asset = sell_matrix_asset ~exchange ~symbol ~qty:(Printf.sprintf "%.4f" free) in
   drain_order_buffer ();
@@ -8878,12 +8882,12 @@ let test_sellable_base_matrix_all_venues () =
   let idx = ref 0 in
   List.iter
     (fun exchange ->
-      (* Hyperliquid/Alpaca net holds from the venue's OWN state, independent of our
-         executions feed, so their reported figure excludes the resting hold whether or
-         not our feed lists it. Kraken derives the hold from the same feed, so a dropped
-         feed leaves the locked base in its reported figure (compensated by the ledger
-         excess). IBKR/Lighter report gross. *)
-      let trust_feed = exchange = "hyperliquid" || exchange = "alpaca" in
+      (* Hyperliquid nets holds from the venue's OWN state, independent of our executions
+         feed, so its reported figure excludes the resting hold whether or not our feed
+         lists it. Kraken derives the hold from the same feed, so a dropped feed leaves
+         the locked base in its reported figure (compensated by the ledger excess).
+         IBKR/Lighter/Alpaca report a gross total and are sized off the ledger. *)
+      let trust_feed = exchange = "hyperliquid" in
       let nets_from_feed = exchange = "kraken" in
       List.iter
         (fun feed_healthy ->
@@ -9020,9 +9024,9 @@ let test_sell_commitment_lifecycle_all_venues () =
         (Dio_strategies.Strategy_api.committed_sell_base state);
       feed := [];
       ignore (sync ());
-      (* A feed absence is venue-specific: only venue state that is authoritative on
-         every scan (Hyperliquid's own hold ledger) evicts a dropped order; every other
-         venue keeps the base committed until a terminal event. *)
+      (* A feed absence is venue-specific: only venue state that is authoritative on every
+         scan (Hyperliquid's own hold ledger) evicts a dropped order; every other venue
+         keeps the base committed until a terminal event. *)
       let trust_feed = ecfg.Dio_strategies.Strategy_api.evict_unlisted_sells in
       check
         (float 1e-9)
@@ -9052,7 +9056,9 @@ let test_sell_commitment_lifecycle_all_venues () =
       check
         (float 1e-9)
         (label "dropped-feed base is subtracted only on feed-derived venues")
-        (if ecfg.Dio_strategies.Strategy_api.hold_netted_from_venue_state then 0.0 else 0.2)
+        (if ecfg.Dio_strategies.Strategy_api.hold_netted_from_venue_state
+         then 0.0
+         else 0.2)
         effective;
       (* 5. A full fill releases the commitment. *)
       Dio_strategies.Strategy_api.Strategy.handle_order_filled
@@ -9115,7 +9121,11 @@ let test_sell_commitment_evicts_after_unlisted_scans () =
          ~ecfg)
   in
   sync ();
-  check bool "listed sell is committed" true (Hashtbl.mem state.sell_commitments "age-oid");
+  check
+    bool
+    "listed sell is committed"
+    true
+    (Hashtbl.mem state.sell_commitments "age-oid");
   feed := [];
   for _ = 1 to Dio_strategies.Strategy_api.unlisted_sell_scan_limit do
     sync ();
@@ -9728,9 +9738,9 @@ let () =
             `Quick
             test_alpaca_ladder_of_record_tracks_fills_and_cancels
         ; test_case
-            "alpaca sell anchors on fill, not the ask"
+            "sell lifts to the ask, not the fill"
             `Quick
-            test_alpaca_sell_anchors_on_fill_not_ask
+            test_sell_lifts_to_ask_not_fill
         ; test_case
             "alpaca excess refills the ladder before dumping"
             `Quick
@@ -9740,9 +9750,9 @@ let () =
             `Quick
             test_alpaca_inflight_amend_rung_not_restored
         ; test_case
-            "alpaca venue free == reserved_base offers nothing"
+            "alpaca reserve is excluded from the ledger basis"
             `Quick
-            test_alpaca_venue_available_blocks_reserve_dip
+            test_alpaca_reserve_is_excluded_from_ledger_basis
         ; test_case
             "alpaca restore drops an un-fundable rung"
             `Quick

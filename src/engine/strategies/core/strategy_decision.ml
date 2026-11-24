@@ -44,37 +44,25 @@ let sell_commitment_at_price ~(state : strategy_state) price =
 let owed_sell_price
   ~(state : strategy_state)
   ~(asset : trading_config)
-  ~(ecfg : exchange_config)
   ~bid_price
   ~ask_price
   ~(capital_exhausted : bool)
   =
-  let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
   let grid_interval = asset.grid_interval in
   let base_price_for_sell =
-    if ecfg.remaintain_expired_sells
-    then (
-      match state.last_buy_fill_price with
-      | Some fill_p -> fill_p
-      | None -> bid_price)
-    else (
-      match state.last_buy_fill_price with
-      | Some fill_p
-        when capital_exhausted
-             || ((not state.resuming_after_balance_flag)
-                 && abs_float (bid_price -. fill_p)
-                    <= bid_price *. (grid_interval /. 100.0)) -> fill_p
-      | Some _ -> bid_price
-      | None -> bid_price)
+    match state.last_buy_fill_price with
+    | Some fill_p
+      when capital_exhausted
+           || ((not state.resuming_after_balance_flag)
+               && abs_float (bid_price -. fill_p) <= bid_price *. (grid_interval /. 100.0)
+              ) -> fill_p
+    | Some _ -> bid_price
+    | None -> bid_price
   in
   let raw_sell_price =
     calculate_grid_price base_price_for_sell grid_interval true state
   in
-  if is_alpaca
-  then raw_sell_price
-  else if ask_price > 0.0
-  then max raw_sell_price ask_price
-  else raw_sell_price
+  if ask_price > 0.0 then max raw_sell_price ask_price else raw_sell_price
 ;;
 
 (** Evaluates buy placement, multi-buy cancellation, and buy trailing. *)
@@ -272,7 +260,6 @@ let buy_place_plan
         owed_sell_price
           ~state
           ~asset
-          ~ecfg:state.cached_ecfg
           ~bid_price
           ~ask_price
           ~capital_exhausted:(oracle_halted || state.capital_low || state.exposure_high)
@@ -921,18 +908,12 @@ type sell_pre =
   ; mutable sp_venue_balance : float
   ; mutable sp_base_balance_age : float option
   ; mutable sp_ledger_balance : float
-  ; mutable sp_alpaca_available : float
   ; mutable sp_available_base : float
   ; mutable sp_committed_sell : float
   ; mutable sp_committed_total : float
   ; mutable sp_unnetted_hold : float
   ; mutable sp_unreflected_credit : float
   ; mutable sp_reservation_headroom : float
-  ; mutable sp_inventory_basis : float
-  ; mutable sp_inventory_ok : bool
-  ; mutable sp_inventory_unsettled : bool
-  ; mutable sp_min_notional : float
-  ; mutable sp_base_ref_price : float
   ; mutable sp_capital_exhausted : bool
   ; mutable sp_asset_low_residual_ok : bool
   ; mutable sp_should_trigger_sell : bool
@@ -950,18 +931,12 @@ let fresh_sell_pre () =
   ; sp_venue_balance = 0.0
   ; sp_base_balance_age = None
   ; sp_ledger_balance = 0.0
-  ; sp_alpaca_available = 0.0
   ; sp_available_base = 0.0
   ; sp_committed_sell = 0.0
   ; sp_committed_total = 0.0
   ; sp_unnetted_hold = 0.0
   ; sp_unreflected_credit = 0.0
   ; sp_reservation_headroom = 0.0
-  ; sp_inventory_basis = 0.0
-  ; sp_inventory_ok = false
-  ; sp_inventory_unsettled = false
-  ; sp_min_notional = 0.0
-  ; sp_base_ref_price = 0.0
   ; sp_capital_exhausted = false
   ; sp_asset_low_residual_ok = false
   ; sp_should_trigger_sell = false
@@ -995,7 +970,6 @@ let sell_leg_prepare_into
   let nothing_placeable = pre.sp_nothing_placeable in
   nothing_placeable := false;
   let is_alpaca = Exchange.Types.exchange_of_string asset.exchange = Alpaca in
-  let asset_available = venue_available_base ~asset in
   (* Placed-sell holds the balance feed may not yet be netting: until a balance message
      newer than a placement arrives, the venue's [total - hold] figure still counts that
      base as free, and sizing against it is the reserved_base leak under volatility. *)
@@ -1014,12 +988,18 @@ let sell_leg_prepare_into
       (Float.max locked_in_sells (Sell_orders.sum_qty state.open_sell_orders))
       unnetted_hold
   in
+  (* Alpaca's ledger is the venue's gross total (its free figure is a separate field), so
+     the whole commitment is subtracted there; hold-netted venues report a tradeable
+     ledger that already excludes it. *)
   let committed_sell =
-    effective_committed_sell_base
-      ~ecfg
-      ~ledger_total:locked_in_sells
-      ~feed_total:state.feed_locked_sell_base
-      ~unnetted_hold
+    if is_alpaca
+    then committed_total
+    else
+      effective_committed_sell_base
+        ~ecfg
+        ~ledger_total:locked_in_sells
+        ~feed_total:state.feed_locked_sell_base
+        ~unnetted_hold
   in
   (* Sizing reads the in-memory position ledger, not the raw venue snapshot: the ledger is
      the venue figure plus the timestamp-windowed buy credits the feed has not netted (see
@@ -1043,34 +1023,16 @@ let sell_leg_prepare_into
       ~venue_free:(asset_balance +. unreflected_credit)
       ~reserved:reserved_tradeable
   in
-  (* Alpaca's sellable base: venue [qty_available] (free of resting holds) plus un-polled
-     buy credits, minus the reserve. Moved to Platform_accounting (milestone 2). *)
-  let alpaca_available =
-    Platform_accounting.alpaca_available_base
-      ~venue_available:asset_available
-      ~ledger_balance
-      ~unreflected_credit
-      ~reserved_base:reserved_tradeable
-      ~committed_sell
-      ~unnetted_hold
-  in
+  (* One sizing basis on every venue: the ledger minus the reserve and every committed
+     sell. Alpaca's venue free figure is not a sizing input - it lags a fill. *)
   let available_base =
-    Platform_accounting.available_base
-      ~is_venue_authoritative:is_alpaca
-      ~asset_balance_nan:(Float.is_nan asset_balance)
-      ~venue_available:asset_available
-      ~ledger_balance
-      ~unreflected_credit
-      ~reserved_base:reserved_tradeable
-      ~committed_sell
-      ~unnetted_hold
+    if Float.is_nan asset_balance
+    then 0.0
+    else ledger_balance -. reserved_tradeable -. committed_sell
   in
   (* Reserve-bounded headroom from the local ledger. Always uses the full commitment, even
      when the venue-reported sizing basis collapses it, so a stale [qty_available] cannot
      authorize committing [reserved_base]. *)
-  let reserve_headroom =
-    Float.max 0.0 (ledger_balance -. reserved_tradeable -. committed_total)
-  in
   Strategy_state.sub_stop state Strategy_state.Splan_overlays _sp_ov;
   (* The persisted-sell grid is reconciled once per execution and the result is reused by
      the three persisted-sell branches below. After the pruning below rebuilds
@@ -1097,9 +1059,7 @@ let sell_leg_prepare_into
          order. After a manual cancel the order leaves the committed set but its base
          stays in [position_total], so the headroom still funds the rung - by exactly
          [target_q - reserved_base]. *)
-      let available_for_missing_sells =
-        if is_alpaca then reserve_headroom else Float.max 0.0 available_base
-      in
+      let available_for_missing_sells = Float.max 0.0 available_base in
       let missing_desc =
         List.sort (fun (p1, _) (p2, _) -> Float.compare p2 p1) missing_levels
       in
@@ -1155,20 +1115,15 @@ let sell_leg_prepare_into
   (* Balance basis per venue: [locked_in_sells] (the in-flight sell ledger total) is
      subtracted on EVERY venue so base committed to a resting or in-flight sell is never
      considered free, regardless of whether the venue's reported figure nets open-order
-     holds. The venue difference is only the spot figure: accumulation venues use
-     [ledger_balance], Alpaca uses its venue-authoritative [qty_available]. This MUST be
-     the same basis the sizing branch below uses ([available]), or the inventory gate and
-     the sizing disagree. *)
-  let is_accumulation_basis = ecfg.use_accumulation_sells in
+     holds. It MUST be the same basis the sizing branch below uses ([available]), or the
+     inventory gate and the sizing disagree. *)
   let inventory_basis =
     if Float.is_nan asset_balance
     then 0.0
-    else if is_accumulation_basis
-    then
+    else
       Float.min
         (ledger_balance -. reserved_tradeable -. committed_sell)
         reservation_headroom
-    else available_base
   in
   (* Inventory gate for sell placement: available non-accrued inventory must cover the
      VENUE MINIMUM accepted order size. The venue minimum is the exchange's floor -
@@ -1221,29 +1176,17 @@ let sell_leg_prepare_into
     then inventory_basis *. base_ref_price >= min_notional -. 1e-9
     else inventory_basis >= state.cached_venue_min_qty -. 1e-9
   in
-  (* A zero basis is only conclusive when the venue agrees with the ledger: right after a
-     buy fill [qty_available] can lag, reading 0 while the account holds the new base. The
-     ledger figure is a diagnostic only - placement stays venue-authoritative, so
-     deferring can never offer base the venue does not report as free. *)
-  let inventory_unsettled =
-    is_alpaca
-    && (not inventory_ok)
-    && (not (Float.is_nan asset_available))
-    && ledger_balance -. committed_total > asset_available -. unnetted_hold +. 1e-9
-  in
-  let missing_alpaca_sell_grid =
-    if ecfg.remaintain_expired_sells
-    then (
-      let missing_lvl_check = !missing_after_reconcile in
-      (not (has_active_sell state))
-      && inventory_ok
-      && (state.just_filled_buy
-          || buy_attempted
-          || state.resuming_after_balance_flag
-          || missing_lvl_check <> []
-          || (Sell_orders.is_empty state.open_sell_orders
-              && Option.is_some state.last_buy_fill_price)))
-    else false
+  (* Persist-then-restore is the only venue-specific trigger: Alpaca's fractional DAY
+     orders expire at the session boundary, so a rung the venue dropped is re-placed at
+     its recorded price. Every other trigger fires on a buy fill or placement. *)
+  let restore_trigger =
+    ecfg.remaintain_expired_sells
+    &&
+    match !missing_after_reconcile with
+    | _ :: _ -> true
+    | [] ->
+      Sell_orders.is_empty state.open_sell_orders
+      && Option.is_some state.last_buy_fill_price
   in
   (* Oracle-inactive: buys are halted but the sell leg always runs (sells need inventory,
      not quote). When the asset is first placed inactive, check whether placeable
@@ -1285,9 +1228,7 @@ let sell_leg_prepare_into
      still owed its rung: the sell leg retries it once the cooldown clears. *)
   let is_sell_on_cooldown = Hashtbl.mem state.amend_cooldowns "place_Sell" in
   let should_trigger_sell =
-    if ecfg.remaintain_expired_sells
-    then missing_alpaca_sell_grid || halt_inventory_check
-    else state.just_filled_buy || buy_attempted || halt_inventory_check
+    state.just_filled_buy || buy_attempted || halt_inventory_check || restore_trigger
   in
   (* Surface every path that ends a triggered sell leg without placing, so sell placement
      cannot stay silently wedged (dust persisted levels, wiped position snapshots) while
@@ -1323,18 +1264,12 @@ let sell_leg_prepare_into
   pre.sp_venue_balance <- asset_balance;
   pre.sp_base_balance_age <- base_balance_age;
   pre.sp_ledger_balance <- ledger_balance;
-  pre.sp_alpaca_available <- alpaca_available;
   pre.sp_available_base <- available_base;
   pre.sp_committed_sell <- committed_sell;
   pre.sp_committed_total <- committed_total;
   pre.sp_unnetted_hold <- unnetted_hold;
   pre.sp_unreflected_credit <- unreflected_credit;
   pre.sp_reservation_headroom <- reservation_headroom;
-  pre.sp_inventory_basis <- inventory_basis;
-  pre.sp_inventory_ok <- inventory_ok;
-  pre.sp_inventory_unsettled <- inventory_unsettled;
-  pre.sp_min_notional <- min_notional;
-  pre.sp_base_ref_price <- base_ref_price;
   pre.sp_capital_exhausted <- capital_exhausted;
   pre.sp_asset_low_residual_ok <- asset_low_residual_ok;
   pre.sp_should_trigger_sell <- should_trigger_sell;
@@ -1440,7 +1375,6 @@ let sell_place_body ~state ~now ~(asset : trading_config) ~bid_price ~ask_price 
   (* The grid's own instrument class, printed on every placement so a spot rung can never
      be mistaken for a carry perp order in the log. *)
   let market_label = if String.equal asset.exchange "lighter" then "perp" else "spot" in
-  let alpaca_available = pre.sp_alpaca_available in
   let ledger_balance = pre.sp_ledger_balance in
   let committed_sell = pre.sp_committed_sell in
   let committed_total = pre.sp_committed_total in
@@ -1514,7 +1448,7 @@ let sell_place_body ~state ~now ~(asset : trading_config) ~bid_price ~ask_price 
          same price when it clamps in this tick. Re-anchoring to the bid (rather than the
          drifted fill) is decided there, including the capital-exhaustion exception that
          keeps the recovery rung at fill + gi. *)
-      owed_sell_price ~state ~asset ~ecfg ~bid_price ~ask_price ~capital_exhausted
+      owed_sell_price ~state ~asset ~bid_price ~ask_price ~capital_exhausted
   in
   let min_order_size =
     if state.cached_qty_increment > 0.0 then state.cached_qty_increment else 1e-8
@@ -1527,7 +1461,6 @@ let sell_place_body ~state ~now ~(asset : trading_config) ~bid_price ~ask_price 
     then Float.max min_order_size state.cached_venue_min_qty
     else min_order_size
   in
-  let is_accumulation = ecfg.use_accumulation_sells in
   let sell_mult = Float.min 1.0 (Float.max 0.0 state.cached_sell_mult) in
   (* Sell sizing. Kraken's lot size and grid interval are large enough to withhold the
      [(1 - sell_mult)] slice inside the order itself, so the sell is [qty * sell_mult].
@@ -1542,23 +1475,14 @@ let sell_place_body ~state ~now ~(asset : trading_config) ~bid_price ~ask_price 
   (* Non-accrued, uncommitted sellable inventory. Base committed to a resting or in-flight
      sell is subtracted on EVERY venue via [locked_in_sells] (the in-flight sell ledger),
      so it can never be offered again - not even when the venue reports a gross figure or
-     its open-order feed momentarily drops a live order. Alpaca uses the venue's own
-     [qty_available], which is already free of resting holds. *)
+     its open-order feed momentarily drops a live order. *)
   (* Same venue bound the gate uses: a reservation is only backed once the venue's free
      base covers it, whatever the local ledger says. *)
   let reservation_headroom = pre.sp_reservation_headroom in
   let available =
-    if is_accumulation
-    then
-      Float.min
-        (Float.max 0.0 (asset_bal -. reserved_tradeable -. committed_sell))
-        reservation_headroom
-    else if is_alpaca
-    then alpaca_available
-    else
-      Float.min
-        (Float.max 0.0 (asset_bal -. reserved_tradeable -. committed_sell))
-        reservation_headroom
+    Float.min
+      (Float.max 0.0 (asset_bal -. reserved_tradeable -. committed_sell))
+      reservation_headroom
   in
   let target_q = round_qty sell_qty asset.symbol asset.exchange in
   let effective_sell_qty, balance_ok =
@@ -1890,21 +1814,16 @@ let sell_leg_place
   then sell_place_body ~state ~now ~asset ~bid_price ~ask_price ~ecfg ~pre
 ;;
 
-(** Sell finalize phase 1: retry-latch / nothing-to-sell bookkeeping. *)
+(** Sell finalize phase 1: retry-latch bookkeeping. *)
 let sell_leg_finalize_latch
   ~state
   ~now:_
-  ~(asset : trading_config)
-  ~asset_balance
+  ~asset:(_ : trading_config)
+  ~asset_balance:_
   ~buy_attempted
-  ~ecfg
+  ~ecfg:_
   ~pre
   =
-  let inventory_ok = pre.sp_inventory_ok in
-  let inventory_basis = pre.sp_inventory_basis in
-  let inventory_unsettled = pre.sp_inventory_unsettled in
-  let min_notional = pre.sp_min_notional in
-  let base_ref_price = pre.sp_base_ref_price in
   let sell_pushed = pre.sp_sell_pushed in
   let nothing_placeable = pre.sp_nothing_placeable in
   if !sell_pushed || !nothing_placeable
@@ -1912,34 +1831,7 @@ let sell_leg_finalize_latch
   else if buy_attempted && not state.just_filled_buy
   then (
     state.just_filled_buy <- true;
-    state.last_sell_block_reason <- "");
-  if ecfg.remaintain_expired_sells
-     && state.just_filled_buy
-     && (not (Float.is_nan asset_balance))
-     && not inventory_ok
-  then
-    if inventory_unsettled
-    then
-      (* Venue free base has not caught up with the fill, so the owed sell is still real:
-         keep the latch armed. The retry ends by itself - the sell places once the venue
-         reports the base as free, and equal figures consume a genuinely empty account. *)
-      Logging.debug_f
-        ~section
-        "Sell trigger deferred for %s: ledger holds %.8f sellable base, venue reports \
-         %.8f free - retrying the owed sell"
-        asset.symbol
-        (Float.max 0.0 (pre.sp_ledger_balance -. pre.sp_committed_total))
-        pre.sp_alpaca_available
-    else (
-      state.just_filled_buy <- false;
-      Logging.info_f
-        ~section
-        "Sell trigger consumed for %s: sellable %.8f below venue minimum %.4f notional \
-         at ref price %.4f (verified nothing-to-sell - a later buy fill re-arms it)"
-        asset.symbol
-        (Float.max 0.0 inventory_basis)
-        min_notional
-        base_ref_price)
+    state.last_sell_block_reason <- "")
 ;;
 
 (** Sell finalize phase 3: clear the one-cycle resume marker. *)

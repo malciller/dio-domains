@@ -79,6 +79,10 @@ let lighter_config =
   }
 ;;
 
+(* Alpaca reports a gross total plus a separate free figure, and its fractional DAY sells
+   expire at the session boundary - hence [remaintain_expired_sells]. Placement itself
+   (trigger, basis, price) follows the other venues; [use_accumulation_sells] stays false
+   because the ledger is gross and must drop the sold base on the fill. *)
 let alpaca_config =
   { time_in_force = "GTC"
   ; track_pending_sells = true
