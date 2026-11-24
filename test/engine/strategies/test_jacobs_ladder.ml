@@ -5896,6 +5896,57 @@ let pushed_sell_for symbol =
     (Dio_strategies.Strategy_api.get_pending_orders 100)
 ;;
 
+let test_alpaca_owed_sell_survives_lagging_venue_free () =
+  (* A buy fill is owed its 1:1 sell at fill+gi. Alpaca's free-base figure (qty_available)
+     lags the fill, so the sellable basis can read 0 while the account holds the new base.
+     Discarding the trigger there left the ladder with no rung at all (the next persisted
+     rung sat ~10% above the buy) until a later fill re-armed it. The owed sell must be
+     retried while the ledger still reports free base the venue has not caught up to, and
+     place as soon as the venue figure agrees. *)
+  let symbol = "ALPACA_LAG_FREE/USD" in
+  let state = reset_alpaca_excess_state symbol in
+  state.just_filled_buy <- true;
+  state.last_buy_fill_price <- Some 100.0;
+  state.last_buy_fill_qty <- Some 1.0;
+  Alpaca.Balances.set_available_balance_for_test symbol 0.0;
+  let asset = alpaca_excess_asset ~symbol in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  let evaluate ~now ~balance =
+    drain_order_buffer ();
+    Dio_strategies.Strategy_api.evaluate_sell_leg
+      ~persisted_reconcile:
+        (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
+      ~state
+      ~now
+      ~asset
+      ~bid_price:100.0
+      ~ask_price:100.1
+      ~asset_balance:balance
+      ~buy_attempted:false
+      ~ecfg
+      ~locked_in_sells:0.0
+      ~base_balance_age:None
+      ~oracle_halted:false
+  in
+  (* Tick 1: venue free base is stale at 0 while the ledger holds the filled lot. *)
+  evaluate ~now:100.0 ~balance:1.0;
+  check
+    bool
+    "no sell while the venue free figure lags"
+    true
+    (pushed_sell_for symbol = None);
+  check bool "the fill's owed sell is kept armed, not consumed" true state.just_filled_buy;
+  (* Tick 2: the venue free figure catches up - the owed sell places at fill+gi, 1:1. *)
+  Alpaca.Balances.set_available_balance_for_test symbol 1.0;
+  evaluate ~now:101.0 ~balance:1.0;
+  match pushed_sell_for symbol with
+  | Some o ->
+    check (float 1e-6) "the owed sell keeps the fill's qty" 1.0 o.qty;
+    check bool "the owed sell prices above the fill" (Option.get o.price > 100.0) true;
+    check bool "placing the rung clears the latch" false state.just_filled_buy
+  | None -> failwith "expected the deferred owed sell to place once the venue caught up"
+;;
+
 let test_alpaca_excess_refills_before_dumping () =
   (* Ladder [101 x1; 99 x1] entirely missing, 3.0 sellable (1.0 beyond the ladder). Excess
      must not fold into a restore: the top missing rung goes out at its own recorded qty
@@ -6126,6 +6177,58 @@ let test_alpaca_restore_replaces_top_down_and_prunes_the_bottom () =
        (List.exists
           (fun (p, _) -> abs_float (p -. 99.0) < 1e-6)
           state.persisted_sell_levels))
+;;
+
+(* A rung recorded before a buy was placed can sit at or below that buy's limit. The venue
+   rejects the sell as a wash trade (self-cross), so the rung is skipped and dropped from
+   the ladder of record instead of retrying into the same rejection every cycle. A rung
+   above the buy still restores. *)
+let test_alpaca_restore_skips_rung_below_resting_buy () =
+  let symbol = "ALPACA_RESTORE_WASH/USD" in
+  let state = reset_alpaca_excess_state symbol in
+  state.last_buy_order_id <- Some "buy-1";
+  state.last_buy_order_price <- Some 137.61;
+  state.persisted_sell_levels <- [ 131.73, 1.0 ];
+  let asset = alpaca_excess_asset ~symbol in
+  let ecfg = Dio_strategies.Strategy_api.get_exchange_config "alpaca" in
+  let run () =
+    Dio_strategies.Strategy_api.evaluate_sell_leg
+      ~persisted_reconcile:
+        (Dio_strategies.Strategy_api.reconcile_persisted_sell_levels ~state)
+      ~state
+      ~now:100.0
+      ~asset
+      ~bid_price:131.0
+      ~ask_price:131.1
+      ~asset_balance:1.0
+      ~buy_attempted:false
+      ~ecfg
+      ~locked_in_sells:0.0
+      ~base_balance_age:None
+      ~oracle_halted:false
+  in
+  run ();
+  check
+    bool
+    "a rung at or below the resting buy is not placed"
+    true
+    (pushed_sell_for symbol = None);
+  check
+    bool
+    "the crossing rung is pruned from the ladder of record"
+    true
+    (state.persisted_sell_levels = []);
+  drain_order_buffer ();
+  state.persisted_sell_levels <- [ 140.0, 1.0 ];
+  run ();
+  match pushed_sell_for symbol with
+  | Some o ->
+    check
+      (float 0.005)
+      "a rung above the resting buy still restores"
+      140.0
+      (Option.value o.price ~default:0.0)
+  | None -> failwith "expected the rung above the resting buy to be restored"
 ;;
 
 (* Alpaca sells 1:1 ([sell_uses_mult] false), so the slice it wants to keep has to be
@@ -9425,6 +9528,10 @@ let () =
             `Quick
             test_alpaca_verified_nothing_to_sell_consumes_latch
         ; test_case
+            "alpaca owed sell survives a lagging venue free figure"
+            `Quick
+            test_alpaca_owed_sell_survives_lagging_venue_free
+        ; test_case
             "alpaca persistence never hijacks an owed sell; dust levels prune"
             `Quick
             test_alpaca_persistence_never_hijacks_owed_sell
@@ -9644,6 +9751,10 @@ let () =
             "alpaca restore replaces top-down and prunes the bottom"
             `Quick
             test_alpaca_restore_replaces_top_down_and_prunes_the_bottom
+        ; test_case
+            "alpaca restore skips a rung at or below the resting buy"
+            `Quick
+            test_alpaca_restore_skips_rung_below_resting_buy
         ; test_case
             "alpaca restore keeps the sibling of an in-flight rung"
             `Quick

@@ -930,6 +930,7 @@ type sell_pre =
   ; mutable sp_reservation_headroom : float
   ; mutable sp_inventory_basis : float
   ; mutable sp_inventory_ok : bool
+  ; mutable sp_inventory_unsettled : bool
   ; mutable sp_min_notional : float
   ; mutable sp_base_ref_price : float
   ; mutable sp_capital_exhausted : bool
@@ -958,6 +959,7 @@ let fresh_sell_pre () =
   ; sp_reservation_headroom = 0.0
   ; sp_inventory_basis = 0.0
   ; sp_inventory_ok = false
+  ; sp_inventory_unsettled = false
   ; sp_min_notional = 0.0
   ; sp_base_ref_price = 0.0
   ; sp_capital_exhausted = false
@@ -1219,6 +1221,16 @@ let sell_leg_prepare_into
     then inventory_basis *. base_ref_price >= min_notional -. 1e-9
     else inventory_basis >= state.cached_venue_min_qty -. 1e-9
   in
+  (* A zero basis is only conclusive when the venue agrees with the ledger: right after a
+     buy fill [qty_available] can lag, reading 0 while the account holds the new base. The
+     ledger figure is a diagnostic only - placement stays venue-authoritative, so
+     deferring can never offer base the venue does not report as free. *)
+  let inventory_unsettled =
+    is_alpaca
+    && (not inventory_ok)
+    && (not (Float.is_nan asset_available))
+    && ledger_balance -. committed_total > asset_available -. unnetted_hold +. 1e-9
+  in
   let missing_alpaca_sell_grid =
     if ecfg.remaintain_expired_sells
     then (
@@ -1320,6 +1332,7 @@ let sell_leg_prepare_into
   pre.sp_reservation_headroom <- reservation_headroom;
   pre.sp_inventory_basis <- inventory_basis;
   pre.sp_inventory_ok <- inventory_ok;
+  pre.sp_inventory_unsettled <- inventory_unsettled;
   pre.sp_min_notional <- min_notional;
   pre.sp_base_ref_price <- base_ref_price;
   pre.sp_capital_exhausted <- capital_exhausted;
@@ -1373,6 +1386,49 @@ let sell_place_should ~state ~asset_balance ~pre =
   && (not (has_active_sell state))
   && ((not state.asset_low) || pre.sp_asset_low_residual_ok)
   && not pre.sp_is_sell_on_cooldown
+;;
+
+(** Highest limit price among the buy orders the venue may still hold: the tracked resting
+    buy plus any buy placement in flight. Venues reject a sell at or below a resting buy
+    as a wash trade (self-cross), so the sell leg must not place into one. *)
+let resting_buy_limit ~(state : strategy_state) =
+  let best acc p =
+    if p > 0.0
+    then
+      Some
+        (match acc with
+         | None -> p
+         | Some b -> Float.max b p)
+    else acc
+  in
+  let acc =
+    match state.last_buy_order_price with
+    | Some p -> best None p
+    | None -> None
+  in
+  List.fold_left
+    (fun acc (_, side, price, _) -> if side = Buy then best acc price else acc)
+    acc
+    state.pending_orders
+;;
+
+(** Drops the persisted sell level recorded at [price] (tolerance mirrors the restore
+    key). Returns whether a level was removed. *)
+let prune_persisted_sell_level ~(state : strategy_state) price =
+  let tol = Float.max (price *. 0.0001) 1e-4 in
+  let rec remove acc = function
+    | [] -> List.rev acc
+    | (p, _) :: rest when abs_float (p -. price) <= tol -> List.rev_append acc rest
+    | item :: rest -> remove (item :: acc) rest
+  in
+  let levels = state.persisted_sell_levels in
+  let pruned = remove [] levels in
+  if pruned = levels
+  then false
+  else (
+    state.persisted_sell_levels <- pruned;
+    state.persistence_dirty <- true;
+    true)
 ;;
 
 (** Branch: place the owed or restored sell. The owed/restore choice is decided in
@@ -1668,7 +1724,39 @@ let sell_place_body ~state ~now ~(asset : trading_config) ~bid_price ~ask_price 
       && q >= venue_min_qty -. 1e-9
       && (min_notional <= 0.0 || q *. sell_price >= min_notional -. 1e-9)
     in
-    if venue_min_ok effective_sell_qty
+    let crossing_buy = resting_buy_limit ~state in
+    let crosses_resting_buy =
+      match crossing_buy with
+      | Some b -> sell_price <= b +. 1e-9
+      | None -> false
+    in
+    if crosses_resting_buy
+    then (
+      (* A sell at or below a resting buy is a self-cross the venue rejects as a wash
+         trade. A restored rung recorded before the buy was placed drops out of the
+         ladder; an owed sell stays owed and retries once the buy trails below it. *)
+      let buy_limit = Option.value crossing_buy ~default:0.0 in
+      (match target_sell_price_opt with
+       | Some tp when prune_persisted_sell_level ~state tp ->
+         Logging.info_f
+           ~section
+           "Pruned persisted sell level %.4f for %s: at or below the resting buy limit \
+            %.4f (wash trade)"
+           tp
+           asset.symbol
+           buy_limit
+       | _ -> ());
+      log_sell_block
+        ~state
+        ~now
+        ~symbol:asset.symbol
+        ~kind:"sell price at or below a resting buy (wash trade)"
+        (fun () ->
+           Printf.sprintf
+             "sell %.4f <= resting buy limit %.4f - skipped"
+             sell_price
+             buy_limit))
+    else if venue_min_ok effective_sell_qty
     then (
       let sell_order =
         create_order
@@ -1760,19 +1848,7 @@ let sell_place_body ~state ~now ~(asset : trading_config) ~bid_price ~ask_price 
             notional floors are static per level, so retrying is a permanent wedge (legacy
             dust from clamped sizing). Prune it so the file keeps being a faithful record
             of what CAN be on the system. *)
-         let rec remove_one acc found = function
-           | [] -> List.rev acc
-           | (sp, _sq) :: rest
-             when (not found)
-                  && (abs_float (sp -. tp) <= tp *. 0.0001 || abs_float (sp -. tp) <= 1e-4)
-             -> remove_one acc true rest
-           | item :: rest -> remove_one (item :: acc) found rest
-         in
-         let new_levels = remove_one [] false state.persisted_sell_levels in
-         if new_levels <> state.persisted_sell_levels
-         then (
-           state.persisted_sell_levels <- new_levels;
-           state.persistence_dirty <- true);
+         ignore (prune_persisted_sell_level ~state tp);
          log_sell_block ~state ~now ~symbol:asset.symbol (fun () ->
            Printf.sprintf
              "persisted sell level %.4f x %.8f below venue minimum $%.2f - pruned from \
@@ -1826,6 +1902,7 @@ let sell_leg_finalize_latch
   =
   let inventory_ok = pre.sp_inventory_ok in
   let inventory_basis = pre.sp_inventory_basis in
+  let inventory_unsettled = pre.sp_inventory_unsettled in
   let min_notional = pre.sp_min_notional in
   let base_ref_price = pre.sp_base_ref_price in
   let sell_pushed = pre.sp_sell_pushed in
@@ -1840,16 +1917,29 @@ let sell_leg_finalize_latch
      && state.just_filled_buy
      && (not (Float.is_nan asset_balance))
      && not inventory_ok
-  then (
-    state.just_filled_buy <- false;
-    Logging.info_f
-      ~section
-      "Sell trigger consumed for %s: sellable %.8f below venue minimum %.4f notional at \
-       ref price %.4f (verified nothing-to-sell - a later buy fill re-arms it)"
-      asset.symbol
-      (Float.max 0.0 inventory_basis)
-      min_notional
-      base_ref_price)
+  then
+    if inventory_unsettled
+    then
+      (* Venue free base has not caught up with the fill, so the owed sell is still real:
+         keep the latch armed. The retry ends by itself - the sell places once the venue
+         reports the base as free, and equal figures consume a genuinely empty account. *)
+      Logging.debug_f
+        ~section
+        "Sell trigger deferred for %s: ledger holds %.8f sellable base, venue reports \
+         %.8f free - retrying the owed sell"
+        asset.symbol
+        (Float.max 0.0 (pre.sp_ledger_balance -. pre.sp_committed_total))
+        pre.sp_alpaca_available
+    else (
+      state.just_filled_buy <- false;
+      Logging.info_f
+        ~section
+        "Sell trigger consumed for %s: sellable %.8f below venue minimum %.4f notional \
+         at ref price %.4f (verified nothing-to-sell - a later buy fill re-arms it)"
+        asset.symbol
+        (Float.max 0.0 inventory_basis)
+        min_notional
+        base_ref_price)
 ;;
 
 (** Sell finalize phase 3: clear the one-cycle resume marker. *)
